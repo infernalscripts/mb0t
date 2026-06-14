@@ -8161,7 +8161,7 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
 })();
 
 (() => {
-  const TAG = "[StopOnTarget]";
+  const TAG = "[InfernalScript]";
 
   const state = {
     installed: false,
@@ -8222,8 +8222,9 @@ function hasTarget(client) {
   if (!target) return false;
 
   if (!isTargetOnScreen(client, target)) {
+	  state.pausedForCombat = false
     console.log(
-      "[StopOnTarget] ignoring off-screen target",
+      "target is too far away. starting cavebot again",
       target.name || target.id || target
     );
 
@@ -8257,7 +8258,7 @@ function isTargetOnScreen(client, target) {
     const dx = Math.abs(pp.x - tp.x);
     const dy = Math.abs(pp.y - tp.y);
 
-    return dx < 10 && dy < 8;
+    return dx < 8 && dy < 6;
   } catch {}
 
   return false;
@@ -8273,7 +8274,7 @@ function isTargetOnScreen(client, target) {
     try {
       if (typeof StopWalkPacket === "function") {
         client.send(new StopWalkPacket());
-        console.log(`${TAG} sent StopWalkPacket`);
+        //console.log(`${TAG} sent StopWalkPacket`);
       }
     } catch (e) {
       console.warn(`${TAG} failed to send StopWalkPacket`, e);
@@ -8360,7 +8361,7 @@ function isTargetOnScreen(client, target) {
         targetValue = value;
 
         if (value !== null && value !== undefined) {
-          console.log(`${TAG} target active`, value?.name || value?.id || value);
+          //console.log(`${TAG} target active`, value?.name || value?.id || value);
 
           state.forceStopUntil = performance.now() + 1200;
 
