@@ -2745,10 +2745,6 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     lastFollowProgressAt: 0,
     lastFollowStallAt: 0,
     skippedTargetIds: new Map(),
-	installed: false,
-    stopping: false,
-    lastStopPacketAt: 0,
-    forceStopUntil: 0,
   };
 
   const storedConfig = bot.storage.get(configStorageKey, {}) || {};
@@ -3063,527 +3059,15 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     const playerPosition = normalizePosition(bot.getPlayerPosition());
     const targetPosition = normalizePosition(target?.getPosition?.() || target?.__position);
     if (!playerPosition || !targetPosition) {
-
-    return false;
+      return false;
     }
 
     return getTileDistance(playerPosition, targetPosition) > maxTargetDistance;
   }
 
-function isTargetOnScreen(client, target) {
-  const p = client.player;
-
-  if (!p || !target) return false;
-
-  try {
-    if (typeof p.canSeeSmall === "function") {
-      return p.canSeeSmall(target);
-    }
-
-    if (typeof p.canSee === "function") {
-      return p.canSee(target);
-    }
-  } catch {}
-
-  // Fallback manual screen-distance check based on Creature.canSee()
-  try {
-    const pp = p.getPosition().projected();
-    const tp = target.getPosition().projected();
-
-    const dx = Math.abs(pp.x - tp.x);
-    const dy = Math.abs(pp.y - tp.y);
-
-    return dx < 10 && dy < 8;
-  } catch {}
-
-  return false;
-}
-
-  console.log(`page hook loaded`);
-
-  function waitForClient() {
-    const client =
-      window.gameClient ||
-      window.GameClient?.instance ||
-      window.client;
-
-    if (!client || !client.player || !client.world?.pathfinder) {
-      requestAnimationFrame(waitForClient);
-      return;
-    }
-
-    install(client);
-  }
-
-  function install(client) {
-    if (state.installed) return;
-    state.installed = true;
-
-    console.log(`gameClient found`);
-
-    guardPlayerTarget(client);
-    guardPathfinderProperties(client);
-    patchGameClientSend(client);
-    patchPathfinder(client);
-    patchPacketHandler(client);
-    patchPlayerUnlockMovement(client);
-    startStopLoop(client);
-
-    console.log(`FULL CONTROL ACTIVE - balanced smooth mode`);
-  }
-
-function hasTarget(client) {
-  const p = client.player;
-  if (!p) return false;
-
-  let target = null;
-
-  try {
-    if (typeof p.getTarget === "function") {
-      target = p.getTarget();
-    }
-  } catch {}
-
-  if (!target && p.__target !== null && p.__target !== undefined) {
-    target = p.__target;
-  }
-
-  if (!target) return false;
-
-  if (!isTargetOnScreen(client, target)) {
-    console.log(
-      "[StopOnTarget] ignoring off-screen target",
-      target.name || target.id || target
-    );
-
-    return false;
-  }
-
-  return true;
-}
-
-
-function isTargetOnScreen(client, target) {
-  const p = client.player;
-
-  if (!p || !target) return false;
-
-  try {
-    if (typeof p.canSeeSmall === "function") {
-      return p.canSeeSmall(target);
-    }
-
-    if (typeof p.canSee === "function") {
-      return p.canSee(target);
-    }
-  } catch {}
-
-  // Fallback manual screen-distance check based on Creature.canSee()
-  try {
-    const pp = p.getPosition().projected();
-    const tp = target.getPosition().projected();
-
-    const dx = Math.abs(pp.x - tp.x);
-    const dy = Math.abs(pp.y - tp.y);
-
-    return dx < 10 && dy < 8;
-  } catch {}
-
-  return false;
-}
-
-  function sendStopWalk(client, force = false) {
-    const now = performance.now();
-
-    if (!force && now - state.lastStopPacketAt < 250) return;
-
-    state.lastStopPacketAt = now;
-
-    try {
-      if (typeof StopWalkPacket === "function") {
-        client.send(new StopWalkPacket());
-        console.log(`sent StopWalkPacket`);
-      }
-    } catch (e) {
-      console.warn(`failed to send StopWalkPacket`, e);
-    }
-  }
-
-  function hardStop(client, forcePacket = false) {
-    if (state.stopping) return;
-    state.stopping = true;
-
-    try {
-      const p = client.player;
-      const pf = client.world?.pathfinder;
-
-      if (!p || !pf) return;
-
-      // Cancel server-side mapclick/autowalk.
-      sendStopWalk(client, forcePacket);
-
-      // Clear autowalk/server-mapclick state.
-      try { pf.__isAutoWalking = false; } catch {}
-      try { pf.__autoWalkStepsRemaining = 0; } catch {}
-      try { pf.__autowalkStartPosition = null; } catch {}
-      try { pf.__autowalkStartedAt = 0; } catch {}
-
-      // Clear final destination.
-      try { pf.__finalDestination = null; } catch {}
-
-      // Clear path cache.
-      try {
-        if (Array.isArray(pf.__pathfindCache)) {
-          pf.__pathfindCache.length = 0;
-        } else {
-          pf.__pathfindCache = [];
-        }
-      } catch {}
-
-      // Clear minimap continuation.
-      try { pf.__minimapWaypoints = null; } catch {}
-      try { pf.__recentMinimapStarts = []; } catch {}
-      try { pf.__lastCancelPosition = null; } catch {}
-      try { pf.__lastRetryDest = null; } catch {}
-      try { pf.__lastRetryTime = 0; } catch {}
-
-      // Clear hybrid prediction.
-      try { pf.__hybridPath = null; } catch {}
-      try { pf.__hybridNeedsAlign = false; } catch {}
-
-      // Clear buffered future movement only.
-      // Do NOT touch p.__movementEvent or p.__position.
-      // Touching those causes snapping/teleporting.
-      try { p.__movementBuffer = null; } catch {}
-      try { p.__lookDirectionBuffer = null; } catch {}
-
-      // Clear pending mouse walk-to actions.
-      try {
-        if (client.mouse) {
-          client.mouse.__pendingUseObject = null;
-          client.mouse.__pendingUsePosition = null;
-          client.mouse.__pendingUseWithSource = null;
-          client.mouse.__pendingMoveFrom = null;
-        }
-      } catch {}
-
-    } finally {
-      state.stopping = false;
-    }
-  }
-
-  function guardPlayerTarget(client) {
-    const p = client.player;
-    if (!p || p.__stopOnTargetTargetGuarded) return;
-
-    let targetValue = p.__target ?? null;
-
-    Object.defineProperty(p, "__target", {
-      configurable: true,
-
-      get() {
-        return targetValue;
-      },
-
-      set(value) {
-        targetValue = value;
-
-        if (value !== null && value !== undefined) {
-          console.log(`target active`, value?.name || value?.id || value);
-
-          state.forceStopUntil = performance.now() + 1200;
-
-          queueMicrotask(() => hardStop(client, true));
-        }
-      }
-    });
-
-    p.__stopOnTargetTargetGuarded = true;
-
-    console.log(`guarded player.__target`);
-  }
-
-  function guardPathfinderProperties(client) {
-    const pf = client.world?.pathfinder;
-    if (!pf || pf.__stopOnTargetPropertyGuarded) return;
-
-    let finalDestinationValue = pf.__finalDestination ?? null;
-    let isAutoWalkingValue = pf.__isAutoWalking ?? false;
-    let pathfindCacheValue = Array.isArray(pf.__pathfindCache)
-      ? pf.__pathfindCache
-      : [];
-    let hybridPathValue = pf.__hybridPath ?? null;
-
-    Object.defineProperty(pf, "__finalDestination", {
-      configurable: true,
-
-      get() {
-        return hasTarget(client) ? null : finalDestinationValue;
-      },
-
-      set(value) {
-        if (hasTarget(client)) {
-          finalDestinationValue = null;
-          state.forceStopUntil = performance.now() + 800;
-          hardStop(client, true);
-          return;
-        }
-
-        finalDestinationValue = value;
-      }
-    });
-
-    Object.defineProperty(pf, "__isAutoWalking", {
-      configurable: true,
-
-      get() {
-        return hasTarget(client) ? false : isAutoWalkingValue;
-      },
-
-      set(value) {
-        if (hasTarget(client)) {
-          isAutoWalkingValue = false;
-          state.forceStopUntil = performance.now() + 800;
-          hardStop(client, true);
-          return;
-        }
-
-        isAutoWalkingValue = value;
-      }
-    });
-
-    Object.defineProperty(pf, "__pathfindCache", {
-      configurable: true,
-
-      get() {
-        if (hasTarget(client)) {
-          pathfindCacheValue.length = 0;
-        }
-
-        return pathfindCacheValue;
-      },
-
-      set(value) {
-        if (hasTarget(client)) {
-          pathfindCacheValue = [];
-          state.forceStopUntil = performance.now() + 800;
-          hardStop(client, true);
-          return;
-        }
-
-        pathfindCacheValue = Array.isArray(value) ? value : [];
-      }
-    });
-
-    Object.defineProperty(pf, "__hybridPath", {
-      configurable: true,
-
-      get() {
-        return hasTarget(client) ? null : hybridPathValue;
-      },
-
-      set(value) {
-        if (hasTarget(client)) {
-          hybridPathValue = null;
-          state.forceStopUntil = performance.now() + 800;
-          hardStop(client, true);
-          return;
-        }
-
-        hybridPathValue = value;
-      }
-    });
-
-    pf.__stopOnTargetPropertyGuarded = true;
-
-    console.log(`guarded pathfinder properties`);
-  }
-
-  function patchGameClientSend(client) {
-    if (!client || typeof client.send !== "function" || client.__stopOnTargetSendPatched) {
-      return;
-    }
-
-    const originalSend = client.send;
-
-    client.send = function (packet) {
-      const packetName = packet?.constructor?.name || "";
-
-      // Always allow StopWalkPacket.
-      if (packetName === "StopWalkPacket") {
-        return originalSend.call(this, packet);
-      }
-
-      // Block fresh mapclick/autowalk packets while target exists.
-      if (
-        hasTarget(client) &&
-        (
-          packetName === "AutoWalkPacket" ||
-          packetName === "WalkToDestinationPacket"
-        )
-      ) {
-        console.log(`blocked outgoing ${packetName}`);
-        state.forceStopUntil = performance.now() + 1000;
-        hardStop(client, true);
-        return false;
-      }
-
-      return originalSend.call(this, packet);
-    };
-
-    client.__stopOnTargetSendPatched = true;
-
-    console.log(`patched gameClient.send`);
-  }
-
-  function patchPathfinder(client) {
-    const pf = client.world?.pathfinder;
-    if (!pf || pf.__stopOnTargetFunctionsPatched) return;
-
-    const methodsToBlock = [
-      "findPath",
-      "handlePathfind",
-      "__predictHybridStep",
-      "__findPathViaMinimap",
-      "__continueAlongWaypoints",
-      "getNextMove"
-    ];
-
-    for (const key of methodsToBlock) {
-      if (typeof pf[key] !== "function") continue;
-
-      const original = pf[key];
-
-      pf[key] = function (...args) {
-        if (hasTarget(client)) {
-          state.forceStopUntil = performance.now() + 800;
-          hardStop(client, true);
-          return false;
-        }
-
-        return original.apply(this, args);
-      };
-
-      console.log(`patched pathfinder.${key}`);
-    }
-
-    if (typeof pf.setPathfindCache === "function") {
-      const originalSetPathfindCache = pf.setPathfindCache;
-
-      pf.setPathfindCache = function (path) {
-        if (hasTarget(client)) {
-          if (path === null) {
-            return originalSetPathfindCache.call(this, path);
-          }
-
-          state.forceStopUntil = performance.now() + 800;
-          hardStop(client, true);
-          return false;
-        }
-
-        return originalSetPathfindCache.call(this, path);
-      };
-
-      console.log(`patched pathfinder.setPathfindCache`);
-    }
-
-    pf.__stopOnTargetFunctionsPatched = true;
-  }
-
-  function patchPacketHandler(client) {
-    const handler =
-      client.networkManager?.packetHandler ||
-      client.packetHandler;
-
-    if (!handler || handler.__stopOnTargetPacketHandlerPatched) return;
-
-    // Important:
-    // Block incoming server autowalk path setup,
-    // but DO NOT block handleCreatureServerMove.
-    // Blocking creature movement causes teleporting.
-    const methodsToBlock = [
-      "handleAutoWalkPath"
-    ];
-
-    for (const key of methodsToBlock) {
-      if (typeof handler[key] !== "function") continue;
-
-      const original = handler[key];
-
-      handler[key] = function (...args) {
-        if (hasTarget(client)) {
-          console.log(`blocked incoming ${key}`);
-          state.forceStopUntil = performance.now() + 1000;
-          hardStop(client, true);
-          return false;
-        }
-
-        return original.apply(this, args);
-      };
-
-      console.log(`patched packetHandler.${key}`);
-    }
-
-    handler.__stopOnTargetPacketHandlerPatched = true;
-  }
-
-  function patchPlayerUnlockMovement(client) {
-    const p = client.player;
-
-    if (!p || typeof p.unlockMovement !== "function" || p.__stopOnTargetUnlockPatched) {
-      return;
-    }
-
-    const originalUnlockMovement = p.unlockMovement;
-
-    p.unlockMovement = function (...args) {
-      if (hasTarget(client)) {
-        // Clear future path state before original unlockMovement runs.
-        // Original unlockMovement still gets to do normal end-of-step cleanup.
-        hardStop(client, false);
-
-        try {
-          this.__movementBuffer = null;
-          this.__lookDirectionBuffer = null;
-        } catch {}
-
-        return originalUnlockMovement.apply(this, args);
-      }
-
-      return originalUnlockMovement.apply(this, args);
-    };
-
-    p.__stopOnTargetUnlockPatched = true;
-
-    console.log(`patched player.unlockMovement - smooth cleanup mode`);
-  }
-
-  function startStopLoop(client) {
-    let lastHadTarget = false;
-
-    setInterval(() => {
-      const active = hasTarget(client);
-      const now = performance.now();
-
-      if (active) {
-        const shouldForce =
-          !lastHadTarget ||
-          now < state.forceStopUntil;
-
-        // Keep cancelling mapclick while target exists.
-        hardStop(client, shouldForce);
-      }
-
-      lastHadTarget = active;
-    }, 100);
-
-    console.log(`target stop loop running - balanced interval mode`);
-  }
-
-
   function resetTargetIfTooFar() {
     const currentTarget = getCurrentTarget();
-    if (currentTarget && shouldGiveUpTarget(currentTarget) || !isTargetOnScreen(client, target)) {
+    if (currentTarget && shouldGiveUpTarget(currentTarget)) {
       skipTarget(currentTarget, "target too far", Date.now(), 2500);
       bot.log("gave up distant auto attack target", {
         id: currentTarget.id,
@@ -3965,7 +3449,7 @@ function isTargetOnScreen(client, target) {
     }
 
     if (Object.prototype.hasOwnProperty.call(nextConfig, "maxTargetDistance")) {
-      nextConfig.maxTargetDistance = Math.max(1, Math.trunc(Number(nextConfig.maxTargetDistance) || config.maxTargetDistance || 8));
+      nextConfig.maxTargetDistance = Math.max(1, Math.trunc(Number(nextConfig.maxTargetDistance) || config.maxTargetDistance || 5));
     }
 
     Object.assign(config, nextConfig);
@@ -8676,3 +8160,496 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
   boot(bundle);
 })();
 
+(() => {
+  const TAG = "[StopOnTarget]";
+
+  const state = {
+    installed: false,
+    stopping: false,
+    lastStopPacketAt: 0,
+    forceStopUntil: 0
+  };
+
+  console.log(`${TAG} page hook loaded`);
+
+  function waitForClient() {
+    const client =
+      window.gameClient ||
+      window.GameClient?.instance ||
+      window.client;
+
+    if (!client || !client.player || !client.world?.pathfinder) {
+      requestAnimationFrame(waitForClient);
+      return;
+    }
+
+    install(client);
+  }
+
+  function install(client) {
+    if (state.installed) return;
+    state.installed = true;
+
+    console.log(`${TAG} gameClient found`);
+
+    guardPlayerTarget(client);
+    guardPathfinderProperties(client);
+    patchGameClientSend(client);
+    patchPathfinder(client);
+    patchPacketHandler(client);
+    patchPlayerUnlockMovement(client);
+    startStopLoop(client);
+
+    console.log(`${TAG} FULL CONTROL ACTIVE - balanced smooth mode`);
+  }
+
+function hasTarget(client) {
+  const p = client.player;
+  if (!p) return false;
+
+  let target = null;
+
+  try {
+    if (typeof p.getTarget === "function") {
+      target = p.getTarget();
+    }
+  } catch {}
+
+  if (!target && p.__target !== null && p.__target !== undefined) {
+    target = p.__target;
+  }
+
+  if (!target) return false;
+
+  if (!isTargetOnScreen(client, target)) {
+    console.log(
+      "[StopOnTarget] ignoring off-screen target",
+      target.name || target.id || target
+    );
+
+    return false;
+  }
+
+  return true;
+}
+
+
+function isTargetOnScreen(client, target) {
+  const p = client.player;
+
+  if (!p || !target) return false;
+
+  try {
+    if (typeof p.canSeeSmall === "function") {
+      return p.canSeeSmall(target);
+    }
+
+    if (typeof p.canSee === "function") {
+      return p.canSee(target);
+    }
+  } catch {}
+
+  // Fallback manual screen-distance check based on Creature.canSee()
+  try {
+    const pp = p.getPosition().projected();
+    const tp = target.getPosition().projected();
+
+    const dx = Math.abs(pp.x - tp.x);
+    const dy = Math.abs(pp.y - tp.y);
+
+    return dx < 10 && dy < 8;
+  } catch {}
+
+  return false;
+}
+
+  function sendStopWalk(client, force = false) {
+    const now = performance.now();
+
+    if (!force && now - state.lastStopPacketAt < 250) return;
+
+    state.lastStopPacketAt = now;
+
+    try {
+      if (typeof StopWalkPacket === "function") {
+        client.send(new StopWalkPacket());
+        console.log(`${TAG} sent StopWalkPacket`);
+      }
+    } catch (e) {
+      console.warn(`${TAG} failed to send StopWalkPacket`, e);
+    }
+  }
+
+  function hardStop(client, forcePacket = false) {
+    if (state.stopping) return;
+    state.stopping = true;
+
+    try {
+      const p = client.player;
+      const pf = client.world?.pathfinder;
+
+      if (!p || !pf) return;
+
+      // Cancel server-side mapclick/autowalk.
+      sendStopWalk(client, forcePacket);
+
+      // Clear autowalk/server-mapclick state.
+      try { pf.__isAutoWalking = false; } catch {}
+      try { pf.__autoWalkStepsRemaining = 0; } catch {}
+      try { pf.__autowalkStartPosition = null; } catch {}
+      try { pf.__autowalkStartedAt = 0; } catch {}
+
+      // Clear final destination.
+      try { pf.__finalDestination = null; } catch {}
+
+      // Clear path cache.
+      try {
+        if (Array.isArray(pf.__pathfindCache)) {
+          pf.__pathfindCache.length = 0;
+        } else {
+          pf.__pathfindCache = [];
+        }
+      } catch {}
+
+      // Clear minimap continuation.
+      try { pf.__minimapWaypoints = null; } catch {}
+      try { pf.__recentMinimapStarts = []; } catch {}
+      try { pf.__lastCancelPosition = null; } catch {}
+      try { pf.__lastRetryDest = null; } catch {}
+      try { pf.__lastRetryTime = 0; } catch {}
+
+      // Clear hybrid prediction.
+      try { pf.__hybridPath = null; } catch {}
+      try { pf.__hybridNeedsAlign = false; } catch {}
+
+      // Clear buffered future movement only.
+      // Do NOT touch p.__movementEvent or p.__position.
+      // Touching those causes snapping/teleporting.
+      try { p.__movementBuffer = null; } catch {}
+      try { p.__lookDirectionBuffer = null; } catch {}
+
+      // Clear pending mouse walk-to actions.
+      try {
+        if (client.mouse) {
+          client.mouse.__pendingUseObject = null;
+          client.mouse.__pendingUsePosition = null;
+          client.mouse.__pendingUseWithSource = null;
+          client.mouse.__pendingMoveFrom = null;
+        }
+      } catch {}
+
+    } finally {
+      state.stopping = false;
+    }
+  }
+
+  function guardPlayerTarget(client) {
+    const p = client.player;
+    if (!p || p.__stopOnTargetTargetGuarded) return;
+
+    let targetValue = p.__target ?? null;
+
+    Object.defineProperty(p, "__target", {
+      configurable: true,
+
+      get() {
+        return targetValue;
+      },
+
+      set(value) {
+        targetValue = value;
+
+        if (value !== null && value !== undefined) {
+          console.log(`${TAG} target active`, value?.name || value?.id || value);
+
+          state.forceStopUntil = performance.now() + 1200;
+
+          queueMicrotask(() => hardStop(client, true));
+        }
+      }
+    });
+
+    p.__stopOnTargetTargetGuarded = true;
+
+    console.log(`${TAG} guarded player.__target`);
+  }
+
+  function guardPathfinderProperties(client) {
+    const pf = client.world?.pathfinder;
+    if (!pf || pf.__stopOnTargetPropertyGuarded) return;
+
+    let finalDestinationValue = pf.__finalDestination ?? null;
+    let isAutoWalkingValue = pf.__isAutoWalking ?? false;
+    let pathfindCacheValue = Array.isArray(pf.__pathfindCache)
+      ? pf.__pathfindCache
+      : [];
+    let hybridPathValue = pf.__hybridPath ?? null;
+
+    Object.defineProperty(pf, "__finalDestination", {
+      configurable: true,
+
+      get() {
+        return hasTarget(client) ? null : finalDestinationValue;
+      },
+
+      set(value) {
+        if (hasTarget(client)) {
+          finalDestinationValue = null;
+          state.forceStopUntil = performance.now() + 800;
+          hardStop(client, true);
+          return;
+        }
+
+        finalDestinationValue = value;
+      }
+    });
+
+    Object.defineProperty(pf, "__isAutoWalking", {
+      configurable: true,
+
+      get() {
+        return hasTarget(client) ? false : isAutoWalkingValue;
+      },
+
+      set(value) {
+        if (hasTarget(client)) {
+          isAutoWalkingValue = false;
+          state.forceStopUntil = performance.now() + 800;
+          hardStop(client, true);
+          return;
+        }
+
+        isAutoWalkingValue = value;
+      }
+    });
+
+    Object.defineProperty(pf, "__pathfindCache", {
+      configurable: true,
+
+      get() {
+        if (hasTarget(client)) {
+          pathfindCacheValue.length = 0;
+        }
+
+        return pathfindCacheValue;
+      },
+
+      set(value) {
+        if (hasTarget(client)) {
+          pathfindCacheValue = [];
+          state.forceStopUntil = performance.now() + 800;
+          hardStop(client, true);
+          return;
+        }
+
+        pathfindCacheValue = Array.isArray(value) ? value : [];
+      }
+    });
+
+    Object.defineProperty(pf, "__hybridPath", {
+      configurable: true,
+
+      get() {
+        return hasTarget(client) ? null : hybridPathValue;
+      },
+
+      set(value) {
+        if (hasTarget(client)) {
+          hybridPathValue = null;
+          state.forceStopUntil = performance.now() + 800;
+          hardStop(client, true);
+          return;
+        }
+
+        hybridPathValue = value;
+      }
+    });
+
+    pf.__stopOnTargetPropertyGuarded = true;
+
+    console.log(`${TAG} guarded pathfinder properties`);
+  }
+
+  function patchGameClientSend(client) {
+    if (!client || typeof client.send !== "function" || client.__stopOnTargetSendPatched) {
+      return;
+    }
+
+    const originalSend = client.send;
+
+    client.send = function (packet) {
+      const packetName = packet?.constructor?.name || "";
+
+      // Always allow StopWalkPacket.
+      if (packetName === "StopWalkPacket") {
+        return originalSend.call(this, packet);
+      }
+
+      // Block fresh mapclick/autowalk packets while target exists.
+      if (
+        hasTarget(client) &&
+        (
+          packetName === "AutoWalkPacket" ||
+          packetName === "WalkToDestinationPacket"
+        )
+      ) {
+        console.log(`${TAG} blocked outgoing ${packetName}`);
+        state.forceStopUntil = performance.now() + 1000;
+        hardStop(client, true);
+        return false;
+      }
+
+      return originalSend.call(this, packet);
+    };
+
+    client.__stopOnTargetSendPatched = true;
+
+    console.log(`${TAG} patched gameClient.send`);
+  }
+
+  function patchPathfinder(client) {
+    const pf = client.world?.pathfinder;
+    if (!pf || pf.__stopOnTargetFunctionsPatched) return;
+
+    const methodsToBlock = [
+      "findPath",
+      "handlePathfind",
+      "__predictHybridStep",
+      "__findPathViaMinimap",
+      "__continueAlongWaypoints",
+      "getNextMove"
+    ];
+
+    for (const key of methodsToBlock) {
+      if (typeof pf[key] !== "function") continue;
+
+      const original = pf[key];
+
+      pf[key] = function (...args) {
+        if (hasTarget(client)) {
+          state.forceStopUntil = performance.now() + 800;
+          hardStop(client, true);
+          return false;
+        }
+
+        return original.apply(this, args);
+      };
+
+      console.log(`${TAG} patched pathfinder.${key}`);
+    }
+
+    if (typeof pf.setPathfindCache === "function") {
+      const originalSetPathfindCache = pf.setPathfindCache;
+
+      pf.setPathfindCache = function (path) {
+        if (hasTarget(client)) {
+          if (path === null) {
+            return originalSetPathfindCache.call(this, path);
+          }
+
+          state.forceStopUntil = performance.now() + 800;
+          hardStop(client, true);
+          return false;
+        }
+
+        return originalSetPathfindCache.call(this, path);
+      };
+
+      console.log(`${TAG} patched pathfinder.setPathfindCache`);
+    }
+
+    pf.__stopOnTargetFunctionsPatched = true;
+  }
+
+  function patchPacketHandler(client) {
+    const handler =
+      client.networkManager?.packetHandler ||
+      client.packetHandler;
+
+    if (!handler || handler.__stopOnTargetPacketHandlerPatched) return;
+
+    // Important:
+    // Block incoming server autowalk path setup,
+    // but DO NOT block handleCreatureServerMove.
+    // Blocking creature movement causes teleporting.
+    const methodsToBlock = [
+      "handleAutoWalkPath"
+    ];
+
+    for (const key of methodsToBlock) {
+      if (typeof handler[key] !== "function") continue;
+
+      const original = handler[key];
+
+      handler[key] = function (...args) {
+        if (hasTarget(client)) {
+          console.log(`${TAG} blocked incoming ${key}`);
+          state.forceStopUntil = performance.now() + 1000;
+          hardStop(client, true);
+          return false;
+        }
+
+        return original.apply(this, args);
+      };
+
+      console.log(`${TAG} patched packetHandler.${key}`);
+    }
+
+    handler.__stopOnTargetPacketHandlerPatched = true;
+  }
+
+  function patchPlayerUnlockMovement(client) {
+    const p = client.player;
+
+    if (!p || typeof p.unlockMovement !== "function" || p.__stopOnTargetUnlockPatched) {
+      return;
+    }
+
+    const originalUnlockMovement = p.unlockMovement;
+
+    p.unlockMovement = function (...args) {
+      if (hasTarget(client)) {
+        // Clear future path state before original unlockMovement runs.
+        // Original unlockMovement still gets to do normal end-of-step cleanup.
+        hardStop(client, false);
+
+        try {
+          this.__movementBuffer = null;
+          this.__lookDirectionBuffer = null;
+        } catch {}
+
+        return originalUnlockMovement.apply(this, args);
+      }
+
+      return originalUnlockMovement.apply(this, args);
+    };
+
+    p.__stopOnTargetUnlockPatched = true;
+
+    console.log(`${TAG} patched player.unlockMovement - smooth cleanup mode`);
+  }
+
+  function startStopLoop(client) {
+    let lastHadTarget = false;
+
+    setInterval(() => {
+      const active = hasTarget(client);
+      const now = performance.now();
+
+      if (active) {
+        const shouldForce =
+          !lastHadTarget ||
+          now < state.forceStopUntil;
+
+        // Keep cancelling mapclick while target exists.
+        hardStop(client, shouldForce);
+      }
+
+      lastHadTarget = active;
+    }, 100);
+
+    console.log(`${TAG} target stop loop running - balanced interval mode`);
+  }
+
+  waitForClient();
+})();
