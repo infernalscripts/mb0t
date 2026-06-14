@@ -3066,6 +3066,66 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     return getTileDistance(playerPosition, targetPosition) > maxTargetDistance;
   }
 
+function isTargetOnScreen(client, target) {
+  const p = client.player;
+
+  if (!p || !target) return false;
+
+  try {
+    if (typeof p.canSeeSmall === "function") {
+      return p.canSeeSmall(target);
+    }
+
+    if (typeof p.canSee === "function") {
+      return p.canSee(target);
+    }
+  } catch {}
+
+  // Fallback manual screen-distance check based on Creature.canSee()
+  try {
+    const pp = p.getPosition().projected();
+    const tp = target.getPosition().projected();
+
+    const dx = Math.abs(pp.x - tp.x);
+    const dy = Math.abs(pp.y - tp.y);
+
+    return dx < 10 && dy < 8;
+  } catch {}
+
+  return false;
+}
+
+
+	function isTargetOnScreen(client, target) {
+	  const p = client.player;
+
+	  if (!p || !target) return false;
+
+	  try {
+		if (typeof p.canSeeSmall === "function") {
+		  return p.canSeeSmall(target);
+		}
+
+		if (typeof p.canSee === "function") {
+		  return p.canSee(target);
+		}
+	  } catch {}
+
+	  // Fallback manual screen-distance check based on Creature.canSee()
+	  try {
+		const pp = p.getPosition().projected();
+		const tp = target.getPosition().projected();
+
+		const dx = Math.abs(pp.x - tp.x);
+		const dy = Math.abs(pp.y - tp.y);
+
+		return dx < 10 && dy < 8;
+	  } catch {}
+
+	  return false;
+	}
+
+
   function resetTargetIfTooFar() {
     const currentTarget = getCurrentTarget();
     if (currentTarget && shouldGiveUpTarget(currentTarget) || !isTargetOnScreen(client, target)) {
