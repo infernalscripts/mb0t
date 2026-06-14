@@ -3058,7 +3058,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     const maxTargetDistance = Math.max(1, Number(config.maxTargetDistance) || 5);
     const playerPosition = normalizePosition(bot.getPlayerPosition());
     const targetPosition = normalizePosition(target?.getPosition?.() || target?.__position);
-    if (!playerPosition || !targetPosition || !isTargetOnScreen(client, target)) {
+    if (!playerPosition || !targetPosition) {
 
     return false;
     }
@@ -3080,7 +3080,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     const engagedTarget = getEngagedTarget();
-    if (engagedTarget && shouldGiveUpTarget(engagedTarget) && isTargetOnScreen(client, target)) {
+    if (engagedTarget && shouldGiveUpTarget(engagedTarget)) {
       skipTarget(engagedTarget, "engaged target too far", Date.now(), 2500);
       bot.log("gave up distant auto attack target", {
         id: engagedTarget.id,
