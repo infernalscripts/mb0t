@@ -2745,6 +2745,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     lastFollowProgressAt: 0,
     lastFollowStallAt: 0,
     skippedTargetIds: new Map(),
+	installed: false,
+    stopping: false,
+    lastStopPacketAt: 0,
+    forceStopUntil: 0,
   };
 
   const storedConfig = bot.storage.get(configStorageKey, {}) || {};
@@ -3094,12 +3098,6 @@ function isTargetOnScreen(client, target) {
 
   return false;
 }
-  const state = {
-    installed: false,
-    stopping: false,
-    lastStopPacketAt: 0,
-    forceStopUntil: 0
-  };
 
   console.log(`page hook loaded`);
 
