@@ -3058,8 +3058,9 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     const maxTargetDistance = Math.max(1, Number(config.maxTargetDistance) || 5);
     const playerPosition = normalizePosition(bot.getPlayerPosition());
     const targetPosition = normalizePosition(target?.getPosition?.() || target?.__position);
-    if (!playerPosition || !targetPosition) {
-      return false;
+    if (!playerPosition || !targetPosition || !isTargetOnScreen(client, target)) {
+
+    return false;
     }
 
     return getTileDistance(playerPosition, targetPosition) > maxTargetDistance;
@@ -3067,7 +3068,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
   function resetTargetIfTooFar() {
     const currentTarget = getCurrentTarget();
-    if (currentTarget && shouldGiveUpTarget(currentTarget)) {
+    if (currentTarget && shouldGiveUpTarget(currentTarget) || !isTargetOnScreen(client, target)) {
       skipTarget(currentTarget, "target too far", Date.now(), 2500);
       bot.log("gave up distant auto attack target", {
         id: currentTarget.id,
@@ -3079,7 +3080,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     const engagedTarget = getEngagedTarget();
-    if (engagedTarget && shouldGiveUpTarget(engagedTarget)) {
+    if (engagedTarget && shouldGiveUpTarget(engagedTarget) && isTargetOnScreen(client, target)) {
       skipTarget(engagedTarget, "engaged target too far", Date.now(), 2500);
       bot.log("gave up distant auto attack target", {
         id: engagedTarget.id,
@@ -3449,7 +3450,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     if (Object.prototype.hasOwnProperty.call(nextConfig, "maxTargetDistance")) {
-      nextConfig.maxTargetDistance = Math.max(1, Math.trunc(Number(nextConfig.maxTargetDistance) || config.maxTargetDistance || 5));
+      nextConfig.maxTargetDistance = Math.max(1, Math.trunc(Number(nextConfig.maxTargetDistance) || config.maxTargetDistance || 8));
     }
 
     Object.assign(config, nextConfig);
