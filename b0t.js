@@ -1925,13 +1925,52 @@ window.__minibiaBotBundle.installRuneModule = function installRuneModule(bot) {
       };
   }
 
-  function updateConfig(nextConfig = {}) {
-    Object.assign(config, nextConfig);
-    config.tickMs = 250;
-    persistConfig();
-    bot.log("rune config updated", { ...config });
-    return { ...config };
+function updateConfig(nextConfig = {}) {
+  if (Object.prototype.hasOwnProperty.call(nextConfig, "targetHotbarSlot")) {
+    nextConfig.targetHotbarSlot =
+      normalizeHotbarSlot(nextConfig.targetHotbarSlot) ?? config.targetHotbarSlot;
   }
+
+  if (Object.prototype.hasOwnProperty.call(nextConfig, "runeHotbarSlot")) {
+    nextConfig.runeHotbarSlot = normalizeHotbarSlot(nextConfig.runeHotbarSlot);
+  }
+
+  if (Object.prototype.hasOwnProperty.call(nextConfig, "maxTargetDistance")) {
+    nextConfig.maxTargetDistance = Math.max(
+      1,
+      Math.trunc(Number(nextConfig.maxTargetDistance) || config.maxTargetDistance || 5)
+    );
+  }
+
+  if (Object.prototype.hasOwnProperty.call(nextConfig, "preferredTargetNames")) {
+    if (Array.isArray(nextConfig.preferredTargetNames)) {
+      nextConfig.preferredTargetNames = nextConfig.preferredTargetNames
+        .map((name) => String(name || "").trim())
+        .filter(Boolean);
+    } else {
+      nextConfig.preferredTargetNames = String(nextConfig.preferredTargetNames || "")
+        .split(/[\n,]/)
+        .map((name) => name.trim())
+        .filter(Boolean);
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(nextConfig, "preferredMatchMode")) {
+    if (
+      nextConfig.preferredMatchMode !== "exact" &&
+      nextConfig.preferredMatchMode !== "includes"
+    ) {
+      nextConfig.preferredMatchMode = "exact";
+    }
+  }
+
+  Object.assign(config, nextConfig);
+  persistConfig();
+
+  bot.log("auto attack config updated", { ...config });
+
+  return { ...config };
+}
 
   if (config.enabled) {
     start();
@@ -2748,19 +2787,24 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
   };
 
   const storedConfig = bot.storage.get(configStorageKey, {}) || {};
-  const config = Object.assign(
-    {
-      tickMs: 500,
-      targetHotbarSlot: 3,
-      runeHotbarSlot: null,
-      targetCooldownMs: 1200,
-      runeCooldownMs: 1200,
-      maxTargetDistance: 5,
-      meleeMode: true,
-      enabled: false,
-    },
-    storedConfig
-  );
+const config = Object.assign(
+  {
+    tickMs: 500,
+    targetHotbarSlot: 3,
+    runeHotbarSlot: null,
+    targetCooldownMs: 1200,
+    runeCooldownMs: 1200,
+    maxTargetDistance: 5,
+    meleeMode: true,
+    enabled: false,
+
+    // Preferred targeting:
+    // These mobs are sorted first, but non-preferred mobs are still allowed.
+    preferredTargetNames: [],
+    preferredMatchMode: "exact", // "exact" or "includes"
+  },
+  storedConfig
+);
   if (config.targetHotbarSlot == null && storedConfig.hotbarSlot != null) {
     config.targetHotbarSlot = storedConfig.hotbarSlot;
   }
@@ -2783,9 +2827,106 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     return normalized;
   }
 
-  function getNearbyMonsters() {
-    return bot.xray?.getVisibleMonsters?.({ sameFloorOnly: true }) || [];
+function normalizeCreatureName(name) {
+  return String(name || "")
+    .trim()
+    .toLowerCase();
+}
+
+function getPreferredTargetNames() {
+  if (!Array.isArray(config.preferredTargetNames)) {
+    return [];
   }
+
+  return config.preferredTargetNames
+    .map((name) => String(name || "").trim())
+    .filter(Boolean);
+}
+
+function isPreferredCreature(creature) {
+  const preferredNames = getPreferredTargetNames();
+
+  if (!creature?.name || preferredNames.length === 0) {
+    return false;
+  }
+
+  const creatureName = normalizeCreatureName(creature.name);
+
+  return preferredNames.some((preferredName) => {
+    const normalizedPreferred = normalizeCreatureName(preferredName);
+
+    if (!normalizedPreferred) {
+      return false;
+    }
+
+    if (config.preferredMatchMode === "includes") {
+      return (
+        creatureName === normalizedPreferred ||
+        creatureName.includes(normalizedPreferred)
+      );
+    }
+
+    return creatureName === normalizedPreferred;
+  });
+}
+
+function getCreatureDistanceFromPlayer(creature) {
+  const player = window.gameClient?.player;
+
+  if (!player || !creature) {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  if (typeof player.getPosition !== "function" || typeof creature.getPosition !== "function") {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  const playerPos = player.getPosition();
+  const creaturePos = creature.getPosition();
+
+  if (!playerPos || !creaturePos || playerPos.z !== creaturePos.z) {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  return Math.max(
+    Math.abs(Number(playerPos.x) - Number(creaturePos.x)),
+    Math.abs(Number(playerPos.y) - Number(creaturePos.y))
+  );
+}
+
+function getCreaturePriorityScore(creature) {
+  const distance = getCreatureDistanceFromPlayer(creature);
+  const preferred = isPreferredCreature(creature);
+
+  /*
+   * Lower score = better.
+   *
+   * Preferred creatures get a large bonus,
+   * but normal creatures are still valid when no preferred creature is nearby.
+   */
+  const preferredBonus = preferred ? -1000 : 0;
+
+  return preferredBonus + distance;
+}
+
+function sortMonstersByPriority(monsters) {
+  return [...monsters].sort((a, b) => {
+    const scoreA = getCreaturePriorityScore(a);
+    const scoreB = getCreaturePriorityScore(b);
+
+    if (scoreA !== scoreB) {
+      return scoreA - scoreB;
+    }
+
+    return String(a?.name || "").localeCompare(String(b?.name || ""));
+  });
+}
+
+function getNearbyMonsters() {
+  const monsters = bot.xray?.getVisibleMonsters?.({ sameFloorOnly: true }) || [];
+
+  return sortMonstersByPriority(monsters);
+}
 
   function normalizePosition(value) {
     if (!value) {
@@ -2975,96 +3116,128 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     return null;
   }
 
-//  function setCurrentTarget(target) {
-//    if (!target || !window.gameClient?.player || typeof window.gameClient.send !== "function") {
-//      return false;
-//    }
-//
-//    if (typeof TargetPacket !== "function") {
-//      return false;
-//    }
-//
-//    window.gameClient.player.setTarget(target);
-//    window.gameClient.send(new TargetPacket(target.id));
-//    state.engagedTargetId = target.id;
-//    return true;
-//  }
 
 
-function isTargetValidAndOnScreen(target) {
+// New targeting system
+
+function isTargetValidAndOnScreen(target, options = {}) {
   const client = window.gameClient;
   const player = client?.player;
   const world = client?.world;
 
-  if (!target || !player || !world) {
-    return false;
+  const returnDetails = options.returnDetails === true;
+  const maxDx = Number.isFinite(options.maxDx) ? options.maxDx : 7;
+  const maxDy = Number.isFinite(options.maxDy) ? options.maxDy : 5;
+
+  function result(valid, extra = {}) {
+    const details = {
+      valid,
+      reason: valid ? "valid" : "invalid",
+      dx: null,
+      dy: null,
+      distance: Number.POSITIVE_INFINITY,
+      preferred: false,
+      score: Number.POSITIVE_INFINITY,
+      ...extra
+    };
+
+    return returnDetails ? details : details.valid;
   }
 
-  // Must have an id.
+  if (!target) {
+    return result(false, { reason: "no target" });
+  }
+
+  if (!player) {
+    return result(false, { reason: "no player" });
+  }
+
+  if (!world) {
+    return result(false, { reason: "no world" });
+  }
+
   if (target.id == null) {
-    return false;
+    return result(false, { reason: "missing id" });
   }
 
-  // Must have position methods.
   if (typeof target.getPosition !== "function") {
-    return false;
+    return result(false, { reason: "target has no getPosition" });
   }
 
   if (typeof player.getPosition !== "function") {
-    return false;
+    return result(false, { reason: "player has no getPosition" });
   }
 
   const playerPos = player.getPosition();
   const targetPos = target.getPosition();
 
   if (!playerPos || !targetPos) {
-    return false;
+    return result(false, { reason: "missing position" });
   }
 
-  // Same floor only.
   if (targetPos.z !== playerPos.z) {
-    return false;
+    return result(false, { reason: "different floor" });
   }
 
-  // Reject dead/invalid targets when health exists.
-  if (target.state && typeof target.state.health === "number" && target.state.health <= 0) {
-    return false;
+  if (
+    target.state &&
+    typeof target.state.health === "number" &&
+    target.state.health <= 0
+  ) {
+    return result(false, { reason: "dead target" });
   }
 
-  // Reject stale creatures no longer tracked by the world.
   if (
     world.activeCreatures &&
     target.id !== player.id &&
     !Object.prototype.hasOwnProperty.call(world.activeCreatures, target.id)
   ) {
-    return false;
+    return result(false, { reason: "not in activeCreatures" });
   }
 
-  // Prefer the client’s own visibility logic.
-  try {
-    if (typeof player.canSeeSmall === "function") {
-      return player.canSeeSmall(target);
-    }
+  let dx = null;
+  let dy = null;
+  let distance = Number.POSITIVE_INFINITY;
 
-    if (typeof player.canSee === "function") {
-      return player.canSee(target);
-    }
-  } catch {}
-
-  // Manual fallback based on Creature.canSee logic.
   try {
     const projectedPlayer = playerPos.projected();
     const projectedTarget = targetPos.projected();
 
-    const dx = Math.abs(projectedPlayer.x - projectedTarget.x);
-    const dy = Math.abs(projectedPlayer.y - projectedTarget.y);
+    dx = Math.abs(projectedPlayer.x - projectedTarget.x);
+    dy = Math.abs(projectedPlayer.y - projectedTarget.y);
 
-    // Original client visibility was roughly dx < 10, dy < 8.
-    return dx < 7 && dy < 5;
-  } catch {}
+    distance = Math.max(
+      Math.abs(Number(playerPos.x) - Number(targetPos.x)),
+      Math.abs(Number(playerPos.y) - Number(targetPos.y))
+    );
+  } catch {
+    return result(false, { reason: "projection failed" });
+  }
 
-  return false;
+  const visible = dx < maxDx && dy < maxDy;
+
+  if (!visible) {
+    return result(false, {
+      reason: `off screen dx=${dx} dy=${dy}`,
+      dx,
+      dy,
+      distance
+    });
+  }
+
+  const preferred = isPreferredCreature(target);
+  const score = getCreaturePriorityScore(target);
+
+  return result(true, {
+    reason: preferred ? "valid preferred" : "valid normal",
+    dx,
+    dy,
+    distance,
+    preferred,
+    score
+  });
 }
+
 
 function setCurrentTarget(target) {
   if (!target || !window.gameClient?.player || typeof window.gameClient.send !== "function") {
@@ -3075,23 +3248,48 @@ function setCurrentTarget(target) {
     return false;
   }
 
-  if (!isTargetValidAndOnScreen(target)) {
-    console.log("[target] rejected off-screen/stale target", {
+  const targetInfo = isTargetValidAndOnScreen(target, {
+    preferredNames: config.preferredTargetNames || [],
+    requirePreferred: false,
+    returnDetails: true,
+    maxDx: 7,
+    maxDy: 5
+  });
+
+  if (!targetInfo.valid) {
+    console.log("[target] rejected", {
+      reason: targetInfo.reason,
       id: target?.id,
       name: target?.name,
+      dx: targetInfo.dx,
+      dy: targetInfo.dy,
       position: typeof target?.getPosition === "function" ? target.getPosition() : null
     });
+
+    if (state.engagedTargetId === target.id) {
+      clearEngagedTarget();
+    }
 
     return false;
   }
 
   window.gameClient.player.setTarget(target);
   window.gameClient.send(new TargetPacket(target.id));
+
   state.engagedTargetId = target.id;
+
+  console.log("[target] accepted", {
+    id: target.id,
+    name: target.name,
+    preferred: targetInfo.preferred,
+    score: targetInfo.score,
+    distance: targetInfo.distance
+  });
 
   return true;
 }
 
+///
 
 
 
@@ -3102,30 +3300,83 @@ function setCurrentTarget(target) {
 
 
 
+function getValidatedEngagedTargetInfo() {
+  const target = getEngagedTarget();
 
+  if (!target) {
+    return {
+      valid: false,
+      target: null,
+      reason: "no engaged target"
+    };
+  }
 
+  const info = isTargetValidAndOnScreen(target, {
+    returnDetails: true,
+    maxDx: 7,
+    maxDy: 5
+  });
+
+  if (!info.valid) {
+    return {
+      valid: false,
+      target,
+      reason: info.reason,
+      info
+    };
+  }
+
+  return {
+    valid: true,
+    target,
+    reason: "valid",
+    info
+  };
+}
 
 
 //
 //
 //
-  function setCurrentFollowTarget(target) {
-    if (!target || !window.gameClient?.player || typeof window.gameClient.send !== "function") {
-      return false;
+function setCurrentFollowTarget(target) {
+  if (!target || !window.gameClient?.player || typeof window.gameClient.send !== "function") {
+    return false;
+  }
+
+  if (typeof FollowPacket !== "function") {
+    return false;
+  }
+
+  const targetInfo = isTargetValidAndOnScreen(target, {
+    returnDetails: true,
+    maxDx: 7,
+    maxDy: 5
+  });
+
+  if (!targetInfo.valid) {
+    console.log("[follow] rejected invalid follow target", {
+      reason: targetInfo.reason,
+      id: target?.id,
+      name: target?.name,
+      dx: targetInfo.dx,
+      dy: targetInfo.dy
+    });
+
+    if (state.engagedTargetId === target.id) {
+      clearEngagedTarget();
     }
 
-    if (typeof FollowPacket !== "function") {
-      return false;
-    }
+    return false;
+  }
 
-    if (isSameCreature(getCurrentFollowTarget(), target)) {
-      return true;
-    }
-
-    window.gameClient.player.setFollowTarget(target);
-    window.gameClient.send(new FollowPacket(target.id));
+  if (isSameCreature(getCurrentFollowTarget(), target)) {
     return true;
   }
+
+  window.gameClient.player.setFollowTarget(target);
+  window.gameClient.send(new FollowPacket(target.id));
+  return true;
+}
 
   function skipTarget(target, reason, now = Date.now(), skipMs = 500) {
     if (!target?.id) {
@@ -3161,17 +3412,30 @@ function setCurrentTarget(target) {
   }
 
   function getMonsterCandidates(now = Date.now()) {
-    pruneSkippedTargets(now);
+  pruneSkippedTargets(now);
 
-    const playerPosition = normalizePosition(bot.getPlayerPosition());
-    return getNearbyMonsters()
-      .filter((monster) => !isTargetSkipped(monster, now))
-      .sort((left, right) => {
-        const leftDistance = getTileDistance(playerPosition, normalizePosition(left?.getPosition?.() || left?.__position));
-        const rightDistance = getTileDistance(playerPosition, normalizePosition(right?.getPosition?.() || right?.__position));
-        return leftDistance - rightDistance || Number(left?.id || 0) - Number(right?.id || 0);
+  return getNearbyMonsters()
+    .filter((monster) => !isTargetSkipped(monster, now))
+    .filter((monster) => {
+      const info = isTargetValidAndOnScreen(monster, {
+        returnDetails: true,
+        maxDx: 7,
+        maxDy: 5
       });
-  }
+
+      return info.valid;
+    })
+    .sort((left, right) => {
+      const leftScore = getCreaturePriorityScore(left);
+      const rightScore = getCreaturePriorityScore(right);
+
+      if (leftScore !== rightScore) {
+        return leftScore - rightScore;
+      }
+
+      return Number(left?.id || 0) - Number(right?.id || 0);
+    });
+}
 
   function shouldGiveUpTarget(target) {
     const maxTargetDistance = Math.max(1, Number(config.maxTargetDistance) || 5);
@@ -3278,16 +3542,26 @@ function setCurrentTarget(target) {
     return null;
   }
 
+
   function syncMeleeChase(now = Date.now()) {
     if (!config.meleeMode) {
       return false;
     }
 
-    const target = getEngagedTarget();
-    if (!target) {
-      clearEngagedTarget();
-      return false;
-    }
+const engaged = getValidatedEngagedTargetInfo();
+
+if (!engaged.valid) {
+  if (engaged.target) {
+    skipTarget(engaged.target, engaged.reason || "invalid engaged target", now, 1000);
+  } else {
+    clearEngagedTarget();
+  }
+
+  return false;
+}
+
+const target = engaged.target;
+
 
     const playerPosition = normalizePosition(bot.getPlayerPosition());
     const targetPosition = normalizePosition(target.getPosition?.() || target.__position);
@@ -6470,6 +6744,166 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
     document.getElementById("minibia-bot-panel")?.remove();
     document.getElementById("minibia-bot-style")?.remove();
   }
+  
+	function parsePreferredTargetNames(value) {
+	  return String(value || "")
+		.split(/[\n,]/)
+		.map((name) => name.trim())
+		.filter(Boolean)
+		.filter((name, index, array) => {
+		  return array.findIndex(
+			(other) => other.toLowerCase() === name.toLowerCase()
+		  ) === index;
+		});
+	}
+
+	function refreshAutoAttackPreferredStatus(options = {}) {
+	  const force = options.force === true;
+
+	  const preferredNamesInput = document.getElementById(
+		"minibia-bot-auto-attack-preferred-names"
+	  );
+
+	  const preferredMatchModeSelect = document.getElementById(
+		"minibia-bot-auto-attack-preferred-match-mode"
+	  );
+
+	  const preferredStatus = document.getElementById(
+		"minibia-bot-auto-attack-preferred-status"
+	  );
+
+	  const attackConfig =
+		bot.attack?.status?.().config ||
+		bot.attack?.config ||
+		{};
+
+	  const preferredNames = Array.isArray(attackConfig.preferredTargetNames)
+		? attackConfig.preferredTargetNames
+		: [];
+
+	  const preferredMatchMode =
+		attackConfig.preferredMatchMode === "includes"
+		  ? "includes"
+		  : "exact";
+
+	  if (
+		preferredNamesInput &&
+		(force || document.activeElement !== preferredNamesInput)
+	  ) {
+		preferredNamesInput.value = preferredNames.join(", ");
+	  }
+
+	  if (preferredMatchModeSelect) {
+		preferredMatchModeSelect.value = preferredMatchMode;
+	  }
+
+	  if (preferredStatus) {
+		const namesText = preferredNames.length
+		  ? preferredNames.join(", ")
+		  : "none";
+
+		const modeText =
+		  preferredMatchMode === "includes"
+			? "contains text"
+			: "exact name";
+
+		preferredStatus.textContent =
+		  `Preferred mobs: ${namesText} | Mode: ${modeText}`;
+	  }
+	}
+
+	function saveAutoAttackPreferredConfig() {
+	  const preferredNamesInput = document.getElementById(
+		"minibia-bot-auto-attack-preferred-names"
+	  );
+
+	  const preferredMatchModeSelect = document.getElementById(
+		"minibia-bot-auto-attack-preferred-match-mode"
+	  );
+
+	  const preferredTargetNames = parsePreferredTargetNames(
+		preferredNamesInput?.value || ""
+	  );
+
+	  const preferredMatchMode =
+		preferredMatchModeSelect?.value === "includes"
+		  ? "includes"
+		  : "exact";
+
+	  bot.attack?.updateConfig?.({
+		preferredTargetNames,
+		preferredMatchMode
+	  });
+
+	  refreshAutoAttackPreferredStatus({ force: true });
+
+	  bot.log?.("auto attack preferred targets updated", {
+		preferredTargetNames,
+		preferredMatchMode
+	  });
+	}
+
+
+/*
+ * Restored Auto Attack UI refresh.
+ * This uses document.getElementById() so it works from installPanel scope.
+ */
+function refreshAutoAttackStatus() {
+  const status = bot.attack?.status?.();
+  const attackConfig =
+    status?.config ||
+    bot.attack?.config ||
+    {};
+
+  const autoAttackEnabledInput = document.getElementById(
+    "minibia-bot-auto-attack-enabled"
+  );
+
+  const autoAttackMeleeInput = document.getElementById(
+    "minibia-bot-auto-attack-melee"
+  );
+
+  const autoAttackHotkeyInput = document.getElementById(
+    "minibia-bot-auto-attack-hotkey"
+  );
+
+  const autoAttackRuneHotkeyInput = document.getElementById(
+    "minibia-bot-auto-attack-rune-hotkey"
+  );
+
+  if (autoAttackEnabledInput) {
+    autoAttackEnabledInput.checked = !!status?.running;
+  }
+
+  if (autoAttackMeleeInput) {
+    autoAttackMeleeInput.checked = attackConfig.meleeMode !== false;
+  }
+
+  if (
+    autoAttackHotkeyInput &&
+    document.activeElement !== autoAttackHotkeyInput
+  ) {
+    autoAttackHotkeyInput.value = String(
+      attackConfig.targetHotbarSlot ?? 3
+    );
+  }
+
+  if (
+    autoAttackRuneHotkeyInput &&
+    document.activeElement !== autoAttackRuneHotkeyInput
+  ) {
+    autoAttackRuneHotkeyInput.value =
+      attackConfig.runeHotbarSlot
+        ? String(attackConfig.runeHotbarSlot)
+        : "";
+  }
+
+  refreshAutoAttackPreferredStatus();
+
+  if (typeof refreshTitlebarRunIndicators === "function") {
+    refreshTitlebarRunIndicators();
+  }
+}
 
   function savePanelPosition(position, key = panelPositionKey) {
     bot.storage.set(key, position);
@@ -6691,12 +7125,8 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
     autoMagicShieldToggle.checked = !!bot.magicShield?.status?.().running;
   }
 
-  function refreshAutoAttackStatus() {
-    const autoAttackToggle = document.getElementById("minibia-bot-auto-attack-enabled");
-    if (!autoAttackToggle) return;
 
-    autoAttackToggle.checked = !!bot.attack?.status?.().running;
-  }
+
 
   function refreshCaveStatus() {
     const statusLabel = document.getElementById("minibia-bot-cave-status");
@@ -7698,6 +8128,48 @@ panel.innerHTML = `
                 <input type="number" id="minibia-bot-auto-attack-rune-hotkey" min="1" max="12" placeholder="4" />
               </label>
             </div>
+			<div class="mb-section">
+			  <div class="mb-label">Target Priority</div>
+
+			  <div class="mb-stack">
+				<label class="mb-field" for="minibia-bot-auto-attack-preferred-names">
+				  <span class="mb-field-label">Preferred Mobs</span>
+				  <textarea
+					id="minibia-bot-auto-attack-preferred-names"
+					placeholder="Orc Shaman, Amazon, Orc Spearman"
+				  ></textarea>
+				</label>
+
+				<label class="mb-field" for="minibia-bot-auto-attack-preferred-match-mode">
+				  <span class="mb-field-label">Match Mode</span>
+				  <select id="minibia-bot-auto-attack-preferred-match-mode">
+					<option value="exact">Exact name</option>
+					<option value="includes">Contains text</option>
+				  </select>
+				</label>
+
+				<button
+				  type="button"
+				  class="mb-small-button"
+				  id="minibia-bot-auto-attack-preferred-save"
+				>
+				  Save Target Priority
+				</button>
+
+				<div
+				  class="mb-small-note"
+				  id="minibia-bot-auto-attack-preferred-status"
+				>
+				  Preferred mobs: none
+				</div>
+
+				<div class="mb-small-note">
+				  Preferred mobs are ranked first, but other visible mobs are still allowed.
+				</div>
+			  </div>
+			</div>
+
+
 
             <div class="mb-small-note">
               Existing attack module settings.
@@ -7762,6 +8234,7 @@ function refreshTitlebarRunIndicators() {
     attackIndicator.title = attackRunning ? "Targeting running" : "Targeting stopped";
   }
 }
+  
 
 function setActiveBotTab(tabId) {
   panel.querySelectorAll(".mb-tab-button").forEach((button) => {
@@ -7822,22 +8295,20 @@ panel.querySelector("#minibia-bot-collapsed-stop")?.addEventListener("click", (e
 });
 
 
-function getWholeSectionFromPanel(panel, selector) {
-  const element = panel.querySelector(selector);
-
-  if (!element) {
-    return null;
+function formatPreferredTargetNames(names) {
+  if (!Array.isArray(names) || names.length === 0) {
+    return "";
   }
 
-  return element.closest(".mb-section, .mb-actions.mb-column-section");
+  return names.join(", ");
 }
 
-function createPanelTab(id) {
-  const tabPanel = document.createElement("div");
-  tabPanel.className = "mb-tab-panel";
-  tabPanel.dataset.tabPanel = id;
-  return tabPanel;
+function getAttackConfigForUi() {
+  return bot.attack?.status?.().config || bot.attack?.config || {};
 }
+
+
+
 
 function appendSection(targetPanel, section) {
   if (!targetPanel || !section) {
@@ -7860,27 +8331,6 @@ function createPanelTab(id) {
   return tabPanel;
 }
 
-function stopCaveAndAttackManual() {
-  try {
-    bot.cave?.stop?.();
-    console.log("[minibia-bot-ui] cave stopped manually from collapsed panel");
-  } catch (error) {
-    console.warn("[minibia-bot-ui] failed to stop cave", error);
-  }
-
-  try {
-    bot.attack?.stop?.();
-    console.log("[minibia-bot-ui] attack stopped manually from collapsed panel");
-  } catch (error) {
-    console.warn("[minibia-bot-ui] failed to stop attack", error);
-  }
-
-  try {
-    refreshCaveStatus?.();
-    refreshAutoAttackStatus?.();
-  } catch {}
-}
-
 function updateCollapsedStopButton(panel) {
   if (!panel) return;
 
@@ -7888,66 +8338,6 @@ function updateCollapsedStopButton(panel) {
   if (!stopButton) return;
 
   stopButton.style.display = panel.dataset.collapsed === "true" ? "" : "none";
-}
-	
-
-	
-function stopCaveAndAttackBecauseCollapsed() {
-  try {
-    if (bot.cave?.status?.().running) {
-      bot.cave.stop();
-      console.log("[minibia-bot-ui] cave stopped because panel collapsed");
-    }
-  } catch (error) {
-    console.warn("[minibia-bot-ui] failed to stop cave on collapse", error);
-  }
-
-  try {
-    if (bot.attack?.status?.().running) {
-      bot.attack.stop();
-      console.log("[minibia-bot-ui] attack stopped because panel collapsed");
-    }
-  } catch (error) {
-    console.warn("[minibia-bot-ui] failed to stop attack on collapse", error);
-  }
-
-  try {
-    const caveStatus = panel.querySelector("#minibia-bot-cave-status");
-    if (caveStatus) {
-      caveStatus.textContent = "Status: stopped because panel collapsed";
-    }
-
-    const attackToggle = panel.querySelector("#minibia-bot-auto-attack-enabled");
-    if (attackToggle) {
-      attackToggle.checked = false;
-    }
-  } catch {}
-}
-
-
-function setupCollapsedSafety(panel) {
-  const guardTimerId = window.setInterval(() => {
-    if (panel.dataset.collapsed === "true") {
-      stopCaveAndAttackBecauseCollapsed();
-    }
-  }, 1000);
-
-  bot.addCleanup(() => {
-    window.clearInterval(guardTimerId);
-  });
-}
-
-
-function sectionFor(selector) {
-  const element = panel.querySelector(selector);
-  return element ? element.closest(".mb-section, .mb-actions") : null;
-}
-
-function createTabPanel(id) {
-  const tabPanel = document.createElement("div");
-  tabPanel.className = "mb-tab-panel";
-  tabPanel.dataset.tabPanel = id;
-  return tabPanel;
 }
 
 
@@ -7976,23 +8366,6 @@ function findSection(panel, selector) {
   }
 
   return section;
-}
-
-function addEmptyTabNotes(panels) {
-  Object.entries(panels).forEach(([id, panelElement]) => {
-    if (panelElement.children.length > 0) {
-      return;
-    }
-
-    const note = document.createElement("div");
-    note.className = "mb-section";
-    note.innerHTML = `
-      <div class="mb-label">${id}</div>
-      <div class="mb-small-note">No controls were found for this tab.</div>
-    `;
-
-    panelElement.appendChild(note);
-  });
 }
 
 function appendIfFound(target, section) {
@@ -8069,12 +8442,14 @@ function addCollapseSafetyNote(parent) {
 
     applySavedPanelPosition(panel);
     enableDrag(panel);
+
 	const savedCollapsed = getSavedPanelCollapsed();
-	setPanelCollapsed(panel, getSavedPanelCollapsed());
+	setPanelCollapsed(panel, savedCollapsed);
 	updateCollapsedStopButton(panel);
-	``
 
+	
 
+// selectors
     const spellInput = panel.querySelector("#minibia-bot-rune-spell");
     const manaInput = panel.querySelector("#minibia-bot-rune-mana");
     const runeEnabledInput = panel.querySelector("#minibia-bot-rune-enabled");
@@ -8113,8 +8488,11 @@ function addCollapseSafetyNote(parent) {
     const cavePresetSelect = panel.querySelector("#minibia-bot-cave-preset-select");
     const cavePresetNewButton = panel.querySelector("#minibia-bot-cave-preset-new");
     const cavePresetDeleteButton = panel.querySelector("#minibia-bot-cave-preset-delete");
+	const preferredSaveButton = panel.querySelector("#minibia-bot-auto-attack-preferred-save");
+	const preferredNamesInput = panel.querySelector("#minibia-bot-auto-attack-preferred-names");
+	const preferredMatchModeSelect = panel.querySelector("#minibia-bot-auto-attack-preferred-match-mode");
 
-
+//event listeners
 	if (collapseButton) {
 	  collapseButton.addEventListener("click", () => {
 		const isCollapsed = panel.dataset.collapsed === "true";
@@ -8123,6 +8501,30 @@ function addCollapseSafetyNote(parent) {
 	  });
 	}
 
+	if (preferredSaveButton) {
+	  preferredSaveButton.onclick = () => {
+		saveAutoAttackPreferredConfig();
+	  };
+	}
+
+	if (preferredNamesInput) {
+	  preferredNamesInput.onchange = () => {
+		saveAutoAttackPreferredConfig();
+	  };
+
+	  preferredNamesInput.onkeydown = (event) => {
+		if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+		  event.preventDefault();
+		  saveAutoAttackPreferredConfig();
+		}
+	  };
+	}
+
+	if (preferredMatchModeSelect) {
+	  preferredMatchModeSelect.onchange = () => {
+		saveAutoAttackPreferredConfig();
+	  };
+	}
 
     if (reloadButton) {
       reloadButton.addEventListener("click", () => {
@@ -8510,6 +8912,7 @@ function addCollapseSafetyNote(parent) {
         }
 
         refreshAutoAttackStatus();
+		refreshAutoAttackPreferredStatus({ force: true });
       });
     }
 
@@ -8593,6 +8996,21 @@ function addCollapseSafetyNote(parent) {
       bot.pz.setHomePzCurrentSpot();
       refreshHomeLabel();
     });
+	
+	panel.querySelector("#minibia-bot-auto-attack-preferred-save")
+	?.addEventListener("click", () => {
+	saveAutoAttackPreferredConfig();
+	});
+
+	panel.querySelector("#minibia-bot-auto-attack-preferred-names")
+	  ?.addEventListener("change", () => {
+		saveAutoAttackPreferredConfig();
+	});
+
+	panel.querySelector("#minibia-bot-auto-attack-preferred-match-mode")
+	  ?.addEventListener("change", () => {
+		saveAutoAttackPreferredConfig();
+	});
 
     refreshHomeLabel();
     refreshPanicStatus();
@@ -8604,6 +9022,7 @@ function addCollapseSafetyNote(parent) {
     refreshAutoInvisibleStatus();
     refreshAutoMagicShieldStatus();
     refreshAutoAttackStatus();
+	refreshAutoAttackPreferredStatus({ force: true });
     refreshAutoEatStatus();
     refreshCaveStatus();
     refreshEquipRingStatus();
@@ -8645,32 +9064,34 @@ function addCollapseSafetyNote(parent) {
 
   }
 
-  bot.ui = {
-    inject,
-    destroy,
-    refreshHomeLabel,
-    refreshPanicStatus,
-    refreshXrayStatus,
-    refreshRuneStatus,
-    refreshAutoHealStatus,
-    refreshAutoInvisibleStatus,
-    refreshAutoMagicShieldStatus,
-    refreshAutoAttackStatus,
-    refreshAutoEatStatus,
-    refreshCaveStatus,
-    refreshCavePresetControls,
-    refreshEquipRingStatus,
-    refreshTalkStatus,
-    refreshVisibleCreatures,
-    refreshCaveClosestStatus,
-    refreshCaveTransitionStatus,
-    getSavedPanelPosition,
-    getSavedPanelCollapsed,
-    setPanelCollapsed: (collapsed) => {
-      const panel = document.getElementById("minibia-bot-panel");
-      setPanelCollapsed(panel, collapsed);
-    },
-  };
+	bot.ui = {
+	  inject,
+	  destroy,
+	  refreshHomeLabel,
+	  refreshPanicStatus,
+	  refreshXrayStatus,
+	  refreshRuneStatus,
+	  refreshAutoHealStatus,
+	  refreshAutoInvisibleStatus,
+	  refreshAutoMagicShieldStatus,
+	  refreshAutoAttackStatus,
+	  refreshAutoAttackPreferredStatus,
+	  refreshAutoEatStatus,
+	  refreshCaveStatus,
+	  refreshCavePresetControls,
+	  refreshEquipRingStatus,
+	  refreshTalkStatus,
+	  refreshVisibleCreatures,
+	  refreshCaveClosestStatus,
+	  refreshCaveTransitionStatus,
+	  getSavedPanelPosition,
+	  getSavedPanelCollapsed,
+	  setPanelCollapsed: (collapsed) => {
+		const panel = document.getElementById("minibia-bot-panel");
+		setPanelCollapsed(panel, collapsed);
+	  },
+	};
+
 };
 (() => {
   const bundle = window.__minibiaBotBundle || window.__minibiaBotReloadBundle || {};
