@@ -2975,21 +2975,140 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     return null;
   }
 
-  function setCurrentTarget(target) {
-    if (!target || !window.gameClient?.player || typeof window.gameClient.send !== "function") {
-      return false;
-    }
+//  function setCurrentTarget(target) {
+//    if (!target || !window.gameClient?.player || typeof window.gameClient.send !== "function") {
+//      return false;
+//    }
+//
+//    if (typeof TargetPacket !== "function") {
+//      return false;
+//    }
+//
+//    window.gameClient.player.setTarget(target);
+//    window.gameClient.send(new TargetPacket(target.id));
+//    state.engagedTargetId = target.id;
+//    return true;
+//  }
 
-    if (typeof TargetPacket !== "function") {
-      return false;
-    }
 
-    window.gameClient.player.setTarget(target);
-    window.gameClient.send(new TargetPacket(target.id));
-    state.engagedTargetId = target.id;
-    return true;
+function isTargetValidAndOnScreen(target) {
+  const client = window.gameClient;
+  const player = client?.player;
+  const world = client?.world;
+
+  if (!target || !player || !world) {
+    return false;
   }
 
+  // Must have an id.
+  if (target.id == null) {
+    return false;
+  }
+
+  // Must have position methods.
+  if (typeof target.getPosition !== "function") {
+    return false;
+  }
+
+  if (typeof player.getPosition !== "function") {
+    return false;
+  }
+
+  const playerPos = player.getPosition();
+  const targetPos = target.getPosition();
+
+  if (!playerPos || !targetPos) {
+    return false;
+  }
+
+  // Same floor only.
+  if (targetPos.z !== playerPos.z) {
+    return false;
+  }
+
+  // Reject dead/invalid targets when health exists.
+  if (target.state && typeof target.state.health === "number" && target.state.health <= 0) {
+    return false;
+  }
+
+  // Reject stale creatures no longer tracked by the world.
+  if (
+    world.activeCreatures &&
+    target.id !== player.id &&
+    !Object.prototype.hasOwnProperty.call(world.activeCreatures, target.id)
+  ) {
+    return false;
+  }
+
+  // Prefer the client’s own visibility logic.
+  try {
+    if (typeof player.canSeeSmall === "function") {
+      return player.canSeeSmall(target);
+    }
+
+    if (typeof player.canSee === "function") {
+      return player.canSee(target);
+    }
+  } catch {}
+
+  // Manual fallback based on Creature.canSee logic.
+  try {
+    const projectedPlayer = playerPos.projected();
+    const projectedTarget = targetPos.projected();
+
+    const dx = Math.abs(projectedPlayer.x - projectedTarget.x);
+    const dy = Math.abs(projectedPlayer.y - projectedTarget.y);
+
+    // Original client visibility was roughly dx < 10, dy < 8.
+    return dx < 7 && dy < 5;
+  } catch {}
+
+  return false;
+}
+
+function setCurrentTarget(target) {
+  if (!target || !window.gameClient?.player || typeof window.gameClient.send !== "function") {
+    return false;
+  }
+
+  if (typeof TargetPacket !== "function") {
+    return false;
+  }
+
+  if (!isTargetValidAndOnScreen(target)) {
+    console.log("[target] rejected off-screen/stale target", {
+      id: target?.id,
+      name: target?.name,
+      position: typeof target?.getPosition === "function" ? target.getPosition() : null
+    });
+
+    return false;
+  }
+
+  window.gameClient.player.setTarget(target);
+  window.gameClient.send(new TargetPacket(target.id));
+  state.engagedTargetId = target.id;
+
+  return true;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+//
+//
+//
   function setCurrentFollowTarget(target) {
     if (!target || !window.gameClient?.player || typeof window.gameClient.send !== "function") {
       return false;
@@ -3008,7 +3127,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     return true;
   }
 
-  function skipTarget(target, reason, now = Date.now(), skipMs = 1000) {
+  function skipTarget(target, reason, now = Date.now(), skipMs = 500) {
     if (!target?.id) {
       return false;
     }
@@ -3176,7 +3295,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
       return false;
     }
 
-    const giveUpDelayMs = Math.max(5000, (Number(config.tickMs) || 0) * 10);
+    const giveUpDelayMs = Math.max(500, (Number(config.tickMs) || 0) * 10);
 
     if (isAdjacentTile(playerPosition, targetPosition)) {
       state.lastChaseDestinationKey = null;
@@ -6932,7 +7051,7 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
   z-index: 999999;
   top: 16px;
   right: 16px;
-  width: 590px;
+  width: 350px;
   max-width: calc(100vw - 32px);
   padding: 8px;
   border: 1px solid rgba(224, 200, 148, 0.45);
