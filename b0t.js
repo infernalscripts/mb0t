@@ -265,6 +265,29 @@ window.__minibiaBotBundle.createBot = function createBot() {
 
   startReconnectWatcher();
 
+  // __imB counter reset - keeps the input metrics counter clean
+  let __imbResetInterval = null;
+  
+  function startImbReset(intervalMs = 1000) {
+    if (__imbResetInterval) return;
+    
+    __imbResetInterval = setInterval(() => {
+      if (typeof __imB !== 'undefined') {
+        __imB = 0;
+      }
+    }, intervalMs);
+  }
+  
+  function stopImbReset() {
+    if (__imbResetInterval) {
+      clearInterval(__imbResetInterval);
+      __imbResetInterval = null;
+    }
+  }
+  
+  // Auto-start the reset
+  startImbReset(1000);
+
   return {
     version: "0.3.0",
     addCleanup,
@@ -310,6 +333,7 @@ window.__minibiaBotBundle.createBot = function createBot() {
       }
 
       stopReconnectWatcher();
+      stopImbReset();
       destroyAlarmAudio();
       runCleanups();
     },
@@ -465,6 +489,11 @@ window.__minibiaBotBundle.createBot = function createBot() {
         console.error("[minibia-bot] alarm failed", error);
         return false;
       }
+    },
+    imbReset: {
+      start: () => startImbReset(1000),
+      stop: stopImbReset,
+      reset: () => { if (typeof __imB !== 'undefined') __imB = 0; }
     },
   };
 };
@@ -1200,7 +1229,8 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
 
     return players.filter((creature) => {
       const z = Number(creature?.__position?.z);
-      return Number.isFinite(z) && Math.abs(z - me.z) <= 1;
+      //return Number.isFinite(z) && Math.abs(z - me.z) <= 1;
+	  return Number.isFinite(z) && z === me.z;
     });
   }
 
@@ -1998,12 +2028,9 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
   const state = {
     running: false,
     timerId: null,
-    lastHpHealAt: 0,
-    lastManaHealAt: 0,
-    lastHpAttemptAt: 0,
-    lastManaAttemptAt: 0,
-    pendingHpAttempt: null,
-    pendingManaAttempt: null,
+    lastHealAt: {},
+    lastAttemptAt: {},
+    pendingAttempt: {},
   };
 
   const config = Object.assign(
@@ -2012,304 +2039,245 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
       healCooldownMs: 1200,
       healRetryMs: 200,
       healConfirmMs: 250,
-      minHp: 250,
-      hpHotbarSlot: 1,
-      minMana: 150,
-      manaHotbarSlot: 2,
       enabled: false,
+      healRules: []
     },
     bot.storage.get(configStorageKey, {})
   );
+
+  // Clean up old legacy keys
+  delete config.hpHotbarSlot;
+  delete config.manaHotbarSlot;
+  delete config.minHp;
+  delete config.minMana;
+
+  // Backward compatibility (if old rules exist)
+  if (config.healRules && config.healRules.length > 0) {
+    const first = config.healRules[0];
+    if (first.thresholdPercent !== undefined && first.minHpPercent === undefined) {
+      config.healRules = config.healRules.map(r => ({
+        slot: r.slot || 1,
+        spellWords: r.spellWords || "",
+        manaCost: 0,
+        minHpPercent: r.type === "hp" ? 0 : 0,
+        maxHpPercent: r.type === "hp" ? r.thresholdPercent : 100,
+        minManaPercent: r.type === "mana" ? 0 : 0,
+        maxManaPercent: r.type === "mana" ? r.thresholdPercent : 100,
+      }));
+      bot.storage.set(configStorageKey, config);
+    }
+  }
 
   function persistConfig() {
     bot.storage.set(configStorageKey, { ...config });
   }
 
   function readStats() {
-    const playerState = bot.getPlayerSnapshot?.();
-
-    return playerState
-      ? {
-          hp: {
-            current: Number(playerState.health ?? 0),
-            max: Number(playerState.maxHealth ?? 0),
-          },
-          mana: {
-            current: Number(playerState.mana ?? 0),
-            max: Number(playerState.maxMana ?? 0),
-          },
-        }
-      : { hp: null, mana: null };
+    const ps = bot.getPlayerSnapshot?.();
+    return ps ? {
+      hp: { current: Number(ps.health ?? 0), max: Number(ps.maxHealth ?? 0) },
+      mana: { current: Number(ps.mana ?? 0), max: Number(ps.maxMana ?? 0) },
+    } : { hp: null, mana: null };
   }
 
   function normalizeHotbarSlot(slot) {
-    const value = Number(slot);
-    if (!Number.isFinite(value)) {
-      return null;
-    }
-
-    const normalized = Math.trunc(value);
-    if (normalized < 1 || normalized > 12) {
-      return null;
-    }
-
-    return normalized;
+    const v = Number(slot);
+    if (!Number.isFinite(v)) return null;
+    const n = Math.trunc(v);
+    if (n < 1 || n > 12) return null;
+    return n;
   }
 
-  function hasPendingAttempt() {
-    return !!(state.pendingHpAttempt || state.pendingManaAttempt);
+  function getHpPercent(stats) {
+    if (!stats?.hp || !stats.hp.max) return 100;
+    return (stats.hp.current / stats.hp.max) * 100;
   }
 
-  function didHpHealSucceed(stats, attempt) {
-    if (!stats?.hp || !attempt) {
-      return false;
-    }
-
-    return (
-      stats.hp.current > attempt.hpBefore ||
-      (Number.isFinite(attempt.manaBefore) && Number.isFinite(stats.mana?.current) && stats.mana.current < attempt.manaBefore)
-    );
+  function getManaPercent(stats) {
+    if (!stats?.mana || !stats.mana.max) return 100;
+    return (stats.mana.current / stats.mana.max) * 100;
   }
 
-  function didManaHealSucceed(stats, attempt) {
-    if (!stats?.mana || !attempt) {
-      return false;
-    }
-
-    return (
-      stats.mana.current > attempt.manaBefore ||
-      (Number.isFinite(attempt.hpBefore) && Number.isFinite(stats.hp?.current) && stats.hp.current > attempt.hpBefore)
-    );
+  function hasPending() {
+    return Object.keys(state.pendingAttempt).some(k => state.pendingAttempt[k] !== null);
   }
 
-  function resolvePendingAttempts(stats, now = Date.now()) {
-    const hpAttempt = state.pendingHpAttempt;
-    if (hpAttempt) {
-      if (didHpHealSucceed(stats, hpAttempt)) {
-        state.lastHpHealAt = hpAttempt.attemptedAt;
-        state.pendingHpAttempt = null;
-        bot.log("confirmed hp heal", { slot: hpAttempt.slot });
-      } else if (now - hpAttempt.attemptedAt >= Math.max(50, Number(config.healConfirmMs) || 0)) {
-        state.pendingHpAttempt = null;
-        bot.log("hp heal did not register", { slot: hpAttempt.slot });
+  function didSucceed(stats, attempt) {
+    if (!stats || !attempt) return false;
+    // Since we don't have type, we check both HP and mana increases
+    const hpUp = stats.hp ? stats.hp.current > attempt.hpBefore : false;
+    const manaUp = stats.mana ? stats.mana.current > attempt.manaBefore : false;
+    // If the action was a spell/hotkey that could restore either, we consider success if either increased.
+    return hpUp || manaUp;
+  }
+
+  function resolvePending(stats, now) {
+    Object.keys(state.pendingAttempt).forEach(slotKey => {
+      const a = state.pendingAttempt[slotKey];
+      if (!a) return;
+      if (didSucceed(stats, a)) {
+        state.lastHealAt[slotKey] = a.attemptedAt;
+        state.pendingAttempt[slotKey] = null;
+        bot.log("confirmed heal", { slot: a.slot });
+      } else if (now - a.attemptedAt >= (config.healConfirmMs || 250)) {
+        state.pendingAttempt[slotKey] = null;
+        bot.log("heal did not register", { slot: a.slot });
       }
+    });
+  }
+
+  function canUseRule(rule, now, stats) {
+    const slot = normalizeHotbarSlot(rule.slot);
+    if (!slot) return false;
+    const key = String(slot);
+
+    if (state.pendingAttempt[key]) return false;
+    if (now - (state.lastHealAt[key] || 0) < config.healCooldownMs) return false;
+    if (now - (state.lastAttemptAt[key] || 0) < (config.healRetryMs || 200)) return false;
+
+    const hp = getHpPercent(stats);
+    const mana = getManaPercent(stats);
+
+    const minHp = Number(rule.minHpPercent) ?? 0;
+    const maxHp = Number(rule.maxHpPercent) ?? 100;
+    const minMana = Number(rule.minManaPercent) ?? 0;
+    const maxMana = Number(rule.maxManaPercent) ?? 100;
+
+    if (hp < minHp || hp > maxHp) return false;
+    if (mana < minMana || mana > maxMana) return false;
+
+    // If spell, check mana cost
+    if (rule.spellWords && rule.spellWords.trim()) {
+      const cost = Math.max(1, Number(rule.manaCost) || 0);
+      if (stats.mana.current < cost) return false;
     }
 
-    const manaAttempt = state.pendingManaAttempt;
-    if (manaAttempt) {
-      if (didManaHealSucceed(stats, manaAttempt)) {
-        state.lastManaHealAt = manaAttempt.attemptedAt;
-        state.pendingManaAttempt = null;
-        bot.log("confirmed mana heal", { slot: manaAttempt.slot });
-      } else if (now - manaAttempt.attemptedAt >= Math.max(50, Number(config.healConfirmMs) || 0)) {
-        state.pendingManaAttempt = null;
-        bot.log("mana heal did not register", { slot: manaAttempt.slot });
+    // Don't try to heal if HP is 0 (dead)
+    if (stats.hp.current <= 0) return false;
+
+    return true;
+  }
+
+  function triggerRule(rule, now, stats) {
+    if (!canUseRule(rule, now, stats)) return false;
+    const slot = normalizeHotbarSlot(rule.slot);
+    const key = String(slot);
+
+    if (rule.spellWords && rule.spellWords.trim()) {
+      const sent = bot.sendChat(rule.spellWords.trim());
+      if (sent) {
+        state.lastAttemptAt[key] = now;
+        state.pendingAttempt[key] = {
+          attemptedAt: now,
+          slot,
+          hpBefore: stats.hp.current,
+          manaBefore: stats.mana.current,
+        };
+        bot.log("cast spell", { slot, words: rule.spellWords });
       }
-    }
-  }
-
-  function canUseHpHeal(now = Date.now(), stats = readStats()) {
-    const { hp } = stats;
-    const slot = normalizeHotbarSlot(config.hpHotbarSlot);
-    if (!hp || !slot || state.pendingHpAttempt) return false;
-
-    return (
-      hp.current > 0 &&
-      hp.current <= Math.max(0, Number(config.minHp) || 0) &&
-      now - state.lastHpHealAt >= config.healCooldownMs &&
-      now - state.lastHpAttemptAt >= Math.max(50, Number(config.healRetryMs) || 0)
-    );
-  }
-
-  function canUseManaHeal(now = Date.now(), stats = readStats()) {
-    const { mana } = stats;
-    const slot = normalizeHotbarSlot(config.manaHotbarSlot);
-    if (!mana || !slot || state.pendingManaAttempt || state.pendingHpAttempt) return false;
-
-    return (
-      mana.current <= Math.max(0, Number(config.minMana) || 0) &&
-      now - state.lastManaHealAt >= config.healCooldownMs &&
-      now - state.lastManaAttemptAt >= Math.max(50, Number(config.healRetryMs) || 0)
-    );
-  }
-
-  function triggerHpHeal(now = Date.now(), stats = readStats()) {
-    if (!canUseHpHeal(now, stats)) {
-      return false;
+      return sent;
     }
 
-    const slot = normalizeHotbarSlot(config.hpHotbarSlot);
     const clicked = bot.clickHotbar(slot - 1);
     if (clicked) {
-      state.lastHpAttemptAt = now;
-      state.pendingHpAttempt = {
+      state.lastAttemptAt[key] = now;
+      state.pendingAttempt[key] = {
         attemptedAt: now,
         slot,
-        hpBefore: Number(stats.hp?.current ?? 0),
-        manaBefore: Number(stats.mana?.current ?? 0),
+        hpBefore: stats.hp.current,
+        manaBefore: stats.mana.current,
       };
-      bot.log("pressed hp heal hotkey", { slot, minHp: config.minHp });
+      bot.log("pressed hotkey", { slot });
     }
-
-    return clicked;
-  }
-
-  function triggerManaHeal(now = Date.now(), stats = readStats()) {
-    if (!canUseManaHeal(now, stats)) {
-      return false;
-    }
-
-    const slot = normalizeHotbarSlot(config.manaHotbarSlot);
-    const clicked = bot.clickHotbar(slot - 1);
-    if (clicked) {
-      state.lastManaAttemptAt = now;
-      state.pendingManaAttempt = {
-        attemptedAt: now,
-        slot,
-        hpBefore: Number(stats.hp?.current ?? 0),
-        manaBefore: Number(stats.mana?.current ?? 0),
-      };
-      bot.log("pressed mana heal hotkey", { slot, minMana: config.minMana });
-    }
-
     return clicked;
   }
 
   function tryHeal() {
-    if (!config.enabled) {
-      return false;
-    }
-
+    if (!config.enabled) return false;
     const now = Date.now();
     const stats = readStats();
+    resolvePending(stats, now);
+    if (hasPending()) return false;
 
-    resolvePendingAttempts(stats, now);
-
-    if (hasPendingAttempt()) {
-      return false;
+    for (const rule of config.healRules || []) {
+      if (!rule || !rule.slot) continue;
+      if (triggerRule(rule, now, stats)) return true;
     }
-
-    if (triggerHpHeal(now, stats)) {
-      return true;
-    }
-
-    return triggerManaHeal(now, stats);
+    return false;
   }
 
+  // ... (keep scheduleNextTick, tick, start, stop, status, updateConfig as before, but updateConfig must not expect 'type')
   function scheduleNextTick() {
     if (!state.running) return;
-
-    state.timerId = window.setTimeout(() => {
-      tick();
-    }, config.tickMs);
+    state.timerId = setTimeout(() => tick(), config.tickMs);
   }
 
   function tick() {
     if (!state.running) return;
-
-    try {
-      tryHeal();
-    } catch (error) {
-      bot.log("auto heal tick failed", error?.message || error);
-    } finally {
-      scheduleNextTick();
-    }
+    try { tryHeal(); } catch (e) { bot.log("auto heal tick failed", e?.message || e); }
+    finally { scheduleNextTick(); }
   }
 
   function start(overrides = {}) {
     Object.assign(config, overrides, { enabled: true });
     persistConfig();
-
-    if (state.running) {
-      bot.log("auto heal already running");
-      return false;
-    }
-
+    if (state.running) return false;
     state.running = true;
-    bot.log("auto heal started", { ...config });
+    bot.log("auto heal started", { rules: config.healRules });
     tick();
     return true;
   }
 
   function stop(options = {}) {
-    const shouldPersistEnabled = options.persistEnabled !== false;
+    const persist = options.persistEnabled !== false;
     state.running = false;
-
-    if (state.timerId != null) {
-      window.clearTimeout(state.timerId);
-      state.timerId = null;
-    }
-
-    if (shouldPersistEnabled) {
-      config.enabled = false;
-      persistConfig();
-    }
+    if (state.timerId) clearTimeout(state.timerId);
+    state.timerId = null;
+    if (persist) { config.enabled = false; persistConfig(); }
     bot.log("auto heal stopped");
     return true;
   }
 
   function status() {
+    const stats = readStats();
     return {
       running: state.running,
       config: { ...config },
-      stats: readStats(),
-      lastHpHealAt: state.lastHpHealAt,
-      lastManaHealAt: state.lastManaHealAt,
-      lastHpAttemptAt: state.lastHpAttemptAt,
-      lastManaAttemptAt: state.lastManaAttemptAt,
-      pendingHpAttempt: state.pendingHpAttempt ? { ...state.pendingHpAttempt } : null,
-      pendingManaAttempt: state.pendingManaAttempt ? { ...state.pendingManaAttempt } : null,
+      stats,
+      hpPercent: getHpPercent(stats),
+      manaPercent: getManaPercent(stats),
+      lastHealAt: { ...state.lastHealAt },
+      pendingAttempt: { ...state.pendingAttempt },
     };
   }
 
-  function updateConfig(nextConfig = {}) {
-    if (Object.prototype.hasOwnProperty.call(nextConfig, "hpHotbarSlot")) {
-      nextConfig.hpHotbarSlot = normalizeHotbarSlot(nextConfig.hpHotbarSlot) ?? config.hpHotbarSlot;
+  function updateConfig(next) {
+    if (next.healRules) {
+      next.healRules = next.healRules.map(r => ({
+        slot: normalizeHotbarSlot(r.slot) || 1,
+        spellWords: String(r.spellWords || "").trim(),
+        manaCost: Math.max(0, Number(r.manaCost) || 0),
+        minHpPercent: Math.max(0, Math.min(100, Number(r.minHpPercent) ?? 0)),
+        maxHpPercent: Math.max(0, Math.min(100, Number(r.maxHpPercent) ?? 100)),
+        minManaPercent: Math.max(0, Math.min(100, Number(r.minManaPercent) ?? 0)),
+        maxManaPercent: Math.max(0, Math.min(100, Number(r.maxManaPercent) ?? 100)),
+      }));
     }
-
-    if (Object.prototype.hasOwnProperty.call(nextConfig, "manaHotbarSlot")) {
-      nextConfig.manaHotbarSlot = normalizeHotbarSlot(nextConfig.manaHotbarSlot) ?? config.manaHotbarSlot;
-    }
-
-    if (Object.prototype.hasOwnProperty.call(nextConfig, "minHp")) {
-      nextConfig.minHp = Math.max(0, Number(nextConfig.minHp) || 0);
-    }
-
-    if (Object.prototype.hasOwnProperty.call(nextConfig, "minMana")) {
-      nextConfig.minMana = Math.max(0, Number(nextConfig.minMana) || 0);
-    }
-
-    if (Object.prototype.hasOwnProperty.call(nextConfig, "healRetryMs")) {
-      nextConfig.healRetryMs = Math.max(50, Number(nextConfig.healRetryMs) || 50);
-    }
-
-    if (Object.prototype.hasOwnProperty.call(nextConfig, "healConfirmMs")) {
-      nextConfig.healConfirmMs = Math.max(50, Number(nextConfig.healConfirmMs) || 50);
-    }
-
-    Object.assign(config, nextConfig);
+    Object.assign(config, next);
+    delete config.hpHotbarSlot;
+    delete config.manaHotbarSlot;
+    delete config.minHp;
+    delete config.minMana;
     persistConfig();
     bot.log("auto heal config updated", { ...config });
     return { ...config };
   }
 
-  if (config.enabled) {
-    start();
-  }
+  if (config.enabled) start();
 
   bot.heal = {
-    start,
-    stop,
-    status,
-    updateConfig,
-    readStats,
-    tryHeal,
-    canUseHpHeal,
-    canUseManaHeal,
-    triggerHpHeal,
-    triggerManaHeal,
-    normalizeHotbarSlot,
-    config,
+    start, stop, status, updateConfig,
+    readStats, tryHeal, config,
   };
 };
 window.__minibiaBotBundle = window.__minibiaBotBundle || {};
@@ -6843,83 +6811,233 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
 	  });
 	}
 
+// --- Heal UI functions (no type) ---
+let healEditIndex = null;
 
-/*
- * Restored Auto Attack UI refresh.
- * This uses document.getElementById() so it works from installPanel scope.
- */
-function refreshAutoAttackStatus() {
-  const status = bot.attack?.status?.();
-  const attackConfig =
-    status?.config ||
-    bot.attack?.config ||
-    {};
-
-  const autoAttackEnabledInput = document.getElementById(
-    "minibia-bot-auto-attack-enabled"
-  );
-
-  const autoAttackMeleeInput = document.getElementById(
-    "minibia-bot-auto-attack-melee"
-  );
-
-  const autoAttackHotkeyInput = document.getElementById(
-    "minibia-bot-auto-attack-hotkey"
-  );
-
-  const autoAttackRuneHotkeyInput = document.getElementById(
-    "minibia-bot-auto-attack-rune-hotkey"
-  );
-
-  if (autoAttackEnabledInput) {
-    autoAttackEnabledInput.checked = !!status?.running;
-  }
-
-  if (autoAttackMeleeInput) {
-    autoAttackMeleeInput.checked = attackConfig.meleeMode !== false;
-  }
-
-  if (
-    autoAttackHotkeyInput &&
-    document.activeElement !== autoAttackHotkeyInput
-  ) {
-    autoAttackHotkeyInput.value = String(
-      attackConfig.targetHotbarSlot ?? 3
-    );
-  }
-
-  if (
-    autoAttackRuneHotkeyInput &&
-    document.activeElement !== autoAttackRuneHotkeyInput
-  ) {
-    autoAttackRuneHotkeyInput.value =
-      attackConfig.runeHotbarSlot
-        ? String(attackConfig.runeHotbarSlot)
-        : "";
-  }
-
-  refreshAutoAttackPreferredStatus();
-
-  if (typeof refreshTitlebarRunIndicators === "function") {
-    refreshTitlebarRunIndicators();
-  }
+function getHealRuleFormValues() {
+  const slot = parseInt(document.getElementById("minibia-bot-heal-slot")?.value || "1", 10) || 1;
+  const spellWords = document.getElementById("minibia-bot-heal-spell")?.value.trim() || "";
+  const manaCost = parseInt(document.getElementById("minibia-bot-heal-manacost")?.value || "0", 10) || 0;
+  const minHp = parseInt(document.getElementById("minibia-bot-heal-minhp")?.value || "0", 10) || 0;
+  const maxHp = parseInt(document.getElementById("minibia-bot-heal-maxhp")?.value || "100", 10) || 100;
+  const minMana = parseInt(document.getElementById("minibia-bot-heal-minmana")?.value || "0", 10) || 0;
+  const maxMana = parseInt(document.getElementById("minibia-bot-heal-maxmana")?.value || "100", 10) || 100;
+  return { slot, spellWords, manaCost, minHp, maxHp, minMana, maxMana };
 }
 
-  function savePanelPosition(position, key = panelPositionKey) {
-    bot.storage.set(key, position);
+function setHealRuleFormValues(rule) {
+  document.getElementById("minibia-bot-heal-slot").value = rule.slot || 1;
+  document.getElementById("minibia-bot-heal-spell").value = rule.spellWords || "";
+  document.getElementById("minibia-bot-heal-manacost").value = rule.manaCost || 0;
+  document.getElementById("minibia-bot-heal-minhp").value = rule.minHpPercent ?? 0;
+  document.getElementById("minibia-bot-heal-maxhp").value = rule.maxHpPercent ?? 100;
+  document.getElementById("minibia-bot-heal-minmana").value = rule.minManaPercent ?? 0;
+  document.getElementById("minibia-bot-heal-maxmana").value = rule.maxManaPercent ?? 100;
+}
+
+function clearHealRuleForm() {
+  document.getElementById("minibia-bot-heal-slot").value = "1";
+  document.getElementById("minibia-bot-heal-spell").value = "";
+  document.getElementById("minibia-bot-heal-manacost").value = "0";
+  document.getElementById("minibia-bot-heal-minhp").value = "0";
+  document.getElementById("minibia-bot-heal-maxhp").value = "100";
+  document.getElementById("minibia-bot-heal-minmana").value = "0";
+  document.getElementById("minibia-bot-heal-maxmana").value = "100";
+  document.getElementById("minibia-bot-heal-save").textContent = "Add Rule";
+  healEditIndex = null;
+}
+
+function refreshHealRules() {
+  const list = document.getElementById("minibia-bot-heal-rules-list");
+  if (!list) return;
+  const rules = bot.heal?.config?.healRules || [];
+  list.innerHTML = "";
+  if (rules.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "mb-small-note";
+    empty.textContent = "No heal rules configured.";
+    list.appendChild(empty);
+    return;
+  }
+  rules.forEach((rule, index) => {
+    const row = document.createElement("div");
+    row.className = "mb-list-row";
+    row.style.cssText = "display:grid;grid-template-columns:1fr auto auto;gap:6px;align-items:center;padding:4px 0;border-bottom:1px solid rgba(255,255,255,0.08);";
+
+    const info = document.createElement("div");
+    info.style.cssText = "display:flex;flex-wrap:wrap;gap:4px;align-items:center;font-size:11px;";
+
+    // Slot
+    const slotLabel = document.createElement("span");
+    slotLabel.textContent = `Slot ${rule.slot}`;
+    slotLabel.style.cssText = "font-weight:bold;color:#d4c48a;";
+    info.appendChild(slotLabel);
+
+    // Action
+    if (rule.spellWords) {
+      const spell = document.createElement("span");
+      spell.textContent = `"${rule.spellWords}"`;
+      spell.style.cssText = "color:#aad4ff;";
+      info.appendChild(spell);
+      if (rule.manaCost > 0) {
+        const cost = document.createElement("span");
+        cost.textContent = `(${rule.manaCost} MP)`;
+        cost.style.cssText = "opacity:0.7;";
+        info.appendChild(cost);
+      }
+    } else {
+      const action = document.createElement("span");
+      action.textContent = "(hotkey)";
+      action.style.cssText = "opacity:0.6;";
+      info.appendChild(action);
+    }
+
+    // HP range
+    const hp = document.createElement("span");
+    hp.textContent = `HP ${rule.minHpPercent}‑${rule.maxHpPercent}%`;
+    hp.style.cssText = "background:#2a1a1a;padding:0 4px;border-radius:3px;color:#ffb0b0;";
+    info.appendChild(hp);
+
+    // MP range
+    const mp = document.createElement("span");
+    mp.textContent = `MP ${rule.minManaPercent}‑${rule.maxManaPercent}%`;
+    mp.style.cssText = "background:#1a1a2a;padding:0 4px;border-radius:3px;color:#b0b0ff;";
+    info.appendChild(mp);
+
+    row.appendChild(info);
+
+    const editBtn = document.createElement("button");
+    editBtn.type = "button";
+    editBtn.className = "mb-small-button";
+    editBtn.textContent = "Edit";
+    editBtn.style.cssText = "width:auto;padding:2px 8px;";
+    editBtn.addEventListener("click", () => {
+      healEditIndex = index;
+      setHealRuleFormValues(rule);
+      document.getElementById("minibia-bot-heal-save").textContent = "Update Rule";
+    });
+    row.appendChild(editBtn);
+
+    const removeBtn = document.createElement("button");
+    removeBtn.type = "button";
+    removeBtn.className = "mb-small-button";
+    removeBtn.textContent = "\u2715";
+    removeBtn.title = "Remove rule";
+    removeBtn.style.cssText = "width:24px;padding:2px;background:#5a2020;color:#ff8888;border-color:#883030;";
+    removeBtn.addEventListener("click", () => {
+      const current = (bot.heal?.config?.healRules || []).slice();
+      current.splice(index, 1);
+      bot.heal.updateConfig({ healRules: current });
+      refreshHealRules();
+      refreshAutoHealStatus();
+      clearHealRuleForm();
+    });
+    row.appendChild(removeBtn);
+    list.appendChild(row);
+  });
+}
+
+function saveHealRule() {
+  const values = getHealRuleFormValues();
+
+  if (values.slot < 1 || values.slot > 12) { bot.log("Slot must be 1-12."); return; }
+  if (values.minHp < 0 || values.minHp > 100 || values.maxHp < 0 || values.maxHp > 100) { bot.log("HP % must be 0-100."); return; }
+  if (values.minHp > values.maxHp) { bot.log("Min HP cannot be greater than Max HP."); return; }
+  if (values.minMana < 0 || values.minMana > 100 || values.maxMana < 0 || values.maxMana > 100) { bot.log("MP % must be 0-100."); return; }
+  if (values.minMana > values.maxMana) { bot.log("Min MP cannot be greater than Max MP."); return; }
+
+  if (values.spellWords && values.manaCost <= 0) {
+    bot.log("Please enter a Mana Cost for the spell.");
+    return;
   }
 
-  function getSavedPanelPosition(key = panelPositionKey) {
-    return bot.storage.get(key, null);
-  }
+  const newRule = {
+    slot: values.slot,
+    spellWords: values.spellWords,
+    manaCost: values.manaCost,
+    minHpPercent: values.minHp,
+    maxHpPercent: values.maxHp,
+    minManaPercent: values.minMana,
+    maxManaPercent: values.maxMana,
+  };
 
-  function savePanelCollapsed(collapsed) {
-    bot.storage.set(panelCollapsedKey, !!collapsed);
+  let rules = (bot.heal?.config?.healRules || []).slice();
+  if (healEditIndex !== null) {
+    rules[healEditIndex] = newRule;
+  } else {
+    rules.push(newRule);
   }
+  bot.heal.updateConfig({ healRules: rules });
+  refreshHealRules();
+  refreshAutoHealStatus();
+  clearHealRuleForm();
+}
 
-  function getSavedPanelCollapsed() {
-    return !!bot.storage.get(panelCollapsedKey, false);
-  }
+function refreshAutoHealStatus() {
+  const toggle = document.getElementById("minibia-bot-auto-heal-enabled");
+  if (toggle) toggle.checked = !!bot.heal?.status?.().running;
+}
+
+  // --- end heal UI functions ---
+
+	function refreshAutoAttackStatus() {
+	  const status = bot.attack?.status?.();
+	  const attackConfig =
+		status?.config ||
+		bot.attack?.config ||
+		{};
+
+	  const autoAttackEnabledInput = document.getElementById(
+		"minibia-bot-auto-attack-enabled"
+	  );
+
+	  const autoAttackMeleeInput = document.getElementById(
+		"minibia-bot-auto-attack-melee"
+	  );
+
+	  const autoAttackHotkeyInput = document.getElementById(
+		"minibia-bot-auto-attack-hotkey"
+	  );
+
+	  const autoAttackRuneHotkeyInput = document.getElementById(
+		"minibia-bot-auto-attack-rune-hotkey"
+	  );
+
+	  if (autoAttackEnabledInput) {
+		autoAttackEnabledInput.checked = !!status?.running;
+	  }
+
+	  if (autoAttackMeleeInput) {
+		autoAttackMeleeInput.checked = attackConfig.meleeMode !== false;
+	  }
+
+	  if (
+		autoAttackHotkeyInput &&
+		document.activeElement !== autoAttackHotkeyInput
+	  ) {
+		autoAttackHotkeyInput.value = String(
+		  attackConfig.targetHotbarSlot ?? 3
+		);
+	  }
+
+	  if (
+		autoAttackRuneHotkeyInput &&
+		document.activeElement !== autoAttackRuneHotkeyInput
+	  ) {
+		autoAttackRuneHotkeyInput.value =
+		  attackConfig.runeHotbarSlot
+			? String(attackConfig.runeHotbarSlot)
+			: "";
+	  }
+
+	  refreshAutoAttackPreferredStatus();
+
+	  if (typeof refreshTitlebarRunIndicators === "function") {
+		refreshTitlebarRunIndicators();
+	  }
+	}
+
+
 
   function refreshHomeLabel() {
     const homeLabel = document.getElementById("minibia-bot-home");
@@ -7104,13 +7222,6 @@ function refreshAutoAttackStatus() {
     autoEatToggle.checked = !!bot.eat?.status?.().running;
   }
 
-  function refreshAutoHealStatus() {
-    const autoHealToggle = document.getElementById("minibia-bot-auto-heal-enabled");
-    if (!autoHealToggle) return;
-
-    autoHealToggle.checked = !!bot.heal?.status?.().running;
-  }
-
   function refreshAutoInvisibleStatus() {
     const autoInvisibleToggle = document.getElementById("minibia-bot-auto-invisible-enabled");
     if (!autoInvisibleToggle) return;
@@ -7124,9 +7235,6 @@ function refreshAutoAttackStatus() {
 
     autoMagicShieldToggle.checked = !!bot.magicShield?.status?.().running;
   }
-
-
-
 
   function refreshCaveStatus() {
     const statusLabel = document.getElementById("minibia-bot-cave-status");
@@ -7469,6 +7577,157 @@ function refreshAutoAttackStatus() {
     });
   }
 
+// --- UI helper functions (needed for panel positioning and collapse) ---
+
+function savePanelPosition(position, key = panelPositionKey) {
+  bot.storage.set(key, position);
+}
+
+function getSavedPanelPosition(key = panelPositionKey) {
+  return bot.storage.get(key, null);
+}
+
+function savePanelCollapsed(collapsed) {
+  bot.storage.set(panelCollapsedKey, !!collapsed);
+}
+
+function getSavedPanelCollapsed() {
+  return !!bot.storage.get(panelCollapsedKey, false);
+}
+
+function setPanelCollapsed(panel, collapsed) {
+  if (!panel) return;
+
+  const body = panel.querySelector(".mb-body");
+  const toggle = panel.querySelector("#minibia-bot-collapse");
+  const nextCollapsed = !!collapsed;
+
+  panel.dataset.collapsed = nextCollapsed ? "true" : "false";
+
+  if (body) {
+    body.hidden = nextCollapsed;
+  }
+
+  if (toggle) {
+    toggle.textContent = nextCollapsed ? "+" : "−";
+    toggle.setAttribute("aria-label", nextCollapsed ? "Maximize panel" : "Minimize panel");
+    toggle.setAttribute("title", nextCollapsed ? "Maximize" : "Minimize");
+  }
+
+  savePanelCollapsed(nextCollapsed);
+}
+
+function applySavedPanelPosition(panel, key = panelPositionKey) {
+  const position = getSavedPanelPosition(key);
+  if (!position) return;
+
+  if (typeof position.top === "number") {
+    panel.style.top = `${position.top}px`;
+  }
+
+  if (typeof position.left === "number") {
+    panel.style.left = `${position.left}px`;
+    panel.style.right = "auto";
+  }
+}
+
+function clampPanelPosition(panel, left, top) {
+  const maxLeft = Math.max(0, window.innerWidth - panel.offsetWidth);
+  const maxTop = Math.max(0, window.innerHeight - panel.offsetHeight);
+
+  return {
+    left: Math.min(Math.max(0, left), maxLeft),
+    top: Math.min(Math.max(0, top), maxTop),
+  };
+}
+
+function enableDrag(panel, key = panelPositionKey) {
+  const handle = panel.querySelector(".mb-title");
+  if (!handle) return;
+
+  let dragState = null;
+
+  const onMouseMove = (event) => {
+    if (!dragState) return;
+
+    const next = clampPanelPosition(
+      panel,
+      event.clientX - dragState.offsetX,
+      event.clientY - dragState.offsetY
+    );
+
+    panel.style.left = `${next.left}px`;
+    panel.style.top = `${next.top}px`;
+    panel.style.right = "auto";
+  };
+
+  const onMouseUp = () => {
+    if (!dragState) return;
+
+    dragState = null;
+    const rect = panel.getBoundingClientRect();
+    savePanelPosition({ left: rect.left, top: rect.top }, key);
+  };
+
+  handle.addEventListener("mousedown", (event) => {
+    if (event.button !== 0) return;
+
+    const rect = panel.getBoundingClientRect();
+    dragState = {
+      offsetX: event.clientX - rect.left,
+      offsetY: event.clientY - rect.top,
+    };
+
+    event.preventDefault();
+  });
+
+  window.addEventListener("mousemove", onMouseMove);
+  window.addEventListener("mouseup", onMouseUp);
+
+  bot.addCleanup(() => {
+    window.removeEventListener("mousemove", onMouseMove);
+    window.removeEventListener("mouseup", onMouseUp);
+  });
+}
+
+function updateCollapsedStopButton(panel) {
+  if (!panel) return;
+
+  const stopButton = panel.querySelector("#minibia-bot-collapsed-stop");
+  if (!stopButton) return;
+
+  stopButton.style.display = panel.dataset.collapsed === "true" ? "" : "none";
+}
+
+function refreshTitlebarRunIndicators() {
+  const panel = document.getElementById("minibia-bot-panel");
+  if (!panel) return;
+
+  const caveIndicator = panel.querySelector("#minibia-bot-title-cave-status");
+  const attackIndicator = panel.querySelector("#minibia-bot-title-attack-status");
+
+  let caveRunning = false;
+  let attackRunning = false;
+
+  try {
+    caveRunning = !!bot.cave?.status?.().running;
+  } catch {}
+
+  try {
+    attackRunning = !!bot.attack?.status?.().running;
+  } catch {}
+
+  if (caveIndicator) {
+    caveIndicator.dataset.running = caveRunning ? "true" : "false";
+    caveIndicator.title = caveRunning ? "Cavebot running" : "Cavebot stopped";
+  }
+
+  if (attackIndicator) {
+    attackIndicator.dataset.running = attackRunning ? "true" : "false";
+    attackIndicator.title = attackRunning ? "Targeting running" : "Targeting stopped";
+  }
+}
+
   function inject() {
     destroy();
 
@@ -7481,7 +7740,7 @@ function refreshAutoAttackStatus() {
   z-index: 999999;
   top: 16px;
   right: 16px;
-  width: 350px;
+  width: 500px;
   max-width: calc(100vw - 32px);
   padding: 8px;
   border: 1px solid rgba(224, 200, 148, 0.45);
@@ -7906,42 +8165,69 @@ panel.innerHTML = `
 
     <div class="mb-tab-content">
 
-      <div class="mb-tab-panel" data-tab-panel="healing">
-        <div class="mb-section">
-          <div class="mb-label">Auto Heal</div>
+<!-- HEALING TAB -->
+<div class="mb-tab-panel" data-tab-panel="healing">
+  <div class="mb-section">
+    <div class="mb-label">Auto Heal</div>
 
-          <label class="mb-toggle mb-toggle-main">
-            <input type="checkbox" id="minibia-bot-auto-heal-enabled" />
-            <span>Enable Auto Heal</span>
-          </label>
+    <label class="mb-toggle mb-toggle-main">
+      <input type="checkbox" id="minibia-bot-auto-heal-enabled" />
+      <span>Enable Auto Heal</span>
+    </label>
 
-          <div class="mb-form-grid">
-            <label class="mb-field" for="minibia-bot-auto-heal-min-hp">
-              <span class="mb-field-label">Minimum HP</span>
-              <input type="number" id="minibia-bot-auto-heal-min-hp" min="0" placeholder="250" />
-            </label>
+    <div id="minibia-bot-heal-rules-list" class="mb-list" style="margin:8px 0;"></div>
 
-            <label class="mb-field" for="minibia-bot-auto-heal-hp-hotkey">
-              <span class="mb-field-label">HP Hotkey</span>
-              <input type="number" id="minibia-bot-auto-heal-hp-hotkey" min="1" max="12" placeholder="1" />
-            </label>
+    <div class="mb-section" style="padding:10px;background:rgba(255,255,255,0.03);">
+      <div class="mb-label" style="font-size:12px;margin-bottom:6px;">Add / Edit Rule</div>
 
-            <label class="mb-field" for="minibia-bot-auto-heal-min-mana">
-              <span class="mb-field-label">Minimum Mana</span>
-              <input type="number" id="minibia-bot-auto-heal-min-mana" min="0" placeholder="150" />
-            </label>
-
-            <label class="mb-field" for="minibia-bot-auto-heal-mana-hotkey">
-              <span class="mb-field-label">Mana Hotkey</span>
-              <input type="number" id="minibia-bot-auto-heal-mana-hotkey" min="1" max="12" placeholder="2" />
-            </label>
-          </div>
-
-          <div class="mb-small-note">
-            Existing heal module settings. This tab is intentionally compact and readable.
-          </div>
-        </div>
+      <!-- Row 1: Slot, Spell Words, Mana Cost -->
+      <div style="display:grid;grid-template-columns:80px 1fr 80px;gap:6px;margin-bottom:6px;">
+        <label class="mb-field" for="minibia-bot-heal-slot">
+          <span class="mb-field-label">Slot</span>
+          <input type="number" id="minibia-bot-heal-slot" min="1" max="12" value="1" />
+        </label>
+        <label class="mb-field" for="minibia-bot-heal-spell">
+          <span class="mb-field-label">Spell Words (optional)</span>
+          <input type="text" id="minibia-bot-heal-spell" placeholder="ex: exura" />
+        </label>
+        <label class="mb-field" for="minibia-bot-heal-manacost">
+          <span class="mb-field-label">Mana Cost</span>
+          <input type="number" id="minibia-bot-heal-manacost" min="1" value="0" placeholder="0" />
+        </label>
       </div>
+
+      <!-- Row 2: HP min/max, MP min/max -->
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:6px;margin-bottom:6px;">
+        <label class="mb-field" for="minibia-bot-heal-minhp">
+          <span class="mb-field-label">Min HP %</span>
+          <input type="number" id="minibia-bot-heal-minhp" min="0" max="100" value="0" />
+        </label>
+        <label class="mb-field" for="minibia-bot-heal-maxhp">
+          <span class="mb-field-label">Max HP %</span>
+          <input type="number" id="minibia-bot-heal-maxhp" min="0" max="100" value="100" />
+        </label>
+        <label class="mb-field" for="minibia-bot-heal-minmana">
+          <span class="mb-field-label">Min MP %</span>
+          <input type="number" id="minibia-bot-heal-minmana" min="0" max="100" value="0" />
+        </label>
+        <label class="mb-field" for="minibia-bot-heal-maxmana">
+          <span class="mb-field-label">Max MP %</span>
+          <input type="number" id="minibia-bot-heal-maxmana" min="0" max="100" value="100" />
+        </label>
+      </div>
+
+      <div style="display:flex;gap:6px;">
+        <button type="button" id="minibia-bot-heal-save" style="flex:1;">Add Rule</button>
+        <button type="button" id="minibia-bot-heal-cancel" style="flex:0;width:auto;padding:8px 12px;">Cancel</button>
+      </div>
+    </div>
+
+    <div class="mb-small-note" style="margin-top:6px;">
+      Rules are checked in order. First rule whose HP and MP ranges match will trigger.
+      If spell words are given, mana cost must be set (and current mana must be ≥ that).
+    </div>
+  </div>
+</div>
 
       <div class="mb-tab-panel" data-tab-panel="panic">
         <div class="mb-section">
@@ -8459,10 +8745,8 @@ function addCollapseSafetyNote(parent) {
     const autoMagicShieldEnabledInput = panel.querySelector("#minibia-bot-auto-magic-shield-enabled");
     const equipRingEnabledInput = panel.querySelector("#minibia-bot-equip-ring-enabled");
     const autoHealEnabledInput = panel.querySelector("#minibia-bot-auto-heal-enabled");
-    const autoHealMinHpInput = panel.querySelector("#minibia-bot-auto-heal-min-hp");
-    const autoHealHpHotkeyInput = panel.querySelector("#minibia-bot-auto-heal-hp-hotkey");
-    const autoHealMinManaInput = panel.querySelector("#minibia-bot-auto-heal-min-mana");
-    const autoHealManaHotkeyInput = panel.querySelector("#minibia-bot-auto-heal-mana-hotkey");
+    const healAddRuleBtn = panel.querySelector("#minibia-bot-heal-add-rule"); // removed, but keep for compatibility
+    const healRulesList = panel.querySelector("#minibia-bot-heal-rules-list");
     const autoAttackEnabledInput = panel.querySelector("#minibia-bot-auto-attack-enabled");
     const autoAttackMeleeInput = panel.querySelector("#minibia-bot-auto-attack-melee");
     const autoAttackHotkeyInput = panel.querySelector("#minibia-bot-auto-attack-hotkey");
@@ -8492,7 +8776,19 @@ function addCollapseSafetyNote(parent) {
 	const preferredNamesInput = panel.querySelector("#minibia-bot-auto-attack-preferred-names");
 	const preferredMatchModeSelect = panel.querySelector("#minibia-bot-auto-attack-preferred-match-mode");
 
+    // new heal UI elements
+    const healTypeSelect = panel.querySelector("#minibia-bot-heal-type");
+    const healSlotInput = panel.querySelector("#minibia-bot-heal-slot");
+    const healSpellInput = panel.querySelector("#minibia-bot-heal-spell");
+    const healThresholdInput = panel.querySelector("#minibia-bot-heal-threshold");
+    const healMinManaInput = panel.querySelector("#minibia-bot-heal-minmana");
+    const healSaveButton = panel.querySelector("#minibia-bot-heal-save");
+    const healCancelButton = panel.querySelector("#minibia-bot-heal-cancel");
+
 //event listeners
+
+
+
 	if (collapseButton) {
 	  collapseButton.addEventListener("click", () => {
 		const isCollapsed = panel.dataset.collapsed === "true";
@@ -8796,65 +9092,26 @@ function addCollapseSafetyNote(parent) {
       });
     }
 
-    if (autoHealMinHpInput) {
-      autoHealMinHpInput.value = String(bot.heal?.config?.minHp ?? 0);
-      autoHealMinHpInput.addEventListener("change", () => {
-        const minHp = Math.max(0, Number(autoHealMinHpInput.value) || 0);
-        autoHealMinHpInput.value = String(minHp);
-        bot.heal.updateConfig({ minHp });
-      });
-    }
+// Heal UI: save / cancel
+const healSave = panel.querySelector("#minibia-bot-heal-save");
+const healCancel = panel.querySelector("#minibia-bot-heal-cancel");
+if (healSave) healSave.addEventListener("click", saveHealRule);
+if (healCancel) healCancel.addEventListener("click", clearHealRuleForm);
 
-    if (autoHealHpHotkeyInput) {
-      autoHealHpHotkeyInput.value = String(bot.heal?.config?.hpHotbarSlot ?? 1);
-      autoHealHpHotkeyInput.addEventListener("change", () => {
-        const hpHotbarSlot = Math.min(12, Math.max(1, Number(autoHealHpHotkeyInput.value) || 1));
-        autoHealHpHotkeyInput.value = String(hpHotbarSlot);
-        bot.heal.updateConfig({ hpHotbarSlot });
-      });
-    }
+// Auto Heal enable toggle
+const autoHealToggle = panel.querySelector("#minibia-bot-auto-heal-enabled");
+if (autoHealToggle) {
+  autoHealToggle.checked = !!bot.heal?.status?.().running;
+  autoHealToggle.addEventListener("change", () => {
+    if (autoHealToggle.checked) bot.heal.start();
+    else bot.heal.stop();
+    refreshAutoHealStatus();
+  });
+}
 
-    if (autoHealMinManaInput) {
-      autoHealMinManaInput.value = String(bot.heal?.config?.minMana ?? 0);
-      autoHealMinManaInput.addEventListener("change", () => {
-        const minMana = Math.max(0, Number(autoHealMinManaInput.value) || 0);
-        autoHealMinManaInput.value = String(minMana);
-        bot.heal.updateConfig({ minMana });
-      });
-    }
-
-    if (autoHealManaHotkeyInput) {
-      autoHealManaHotkeyInput.value = String(bot.heal?.config?.manaHotbarSlot ?? 1);
-      autoHealManaHotkeyInput.addEventListener("change", () => {
-        const manaHotbarSlot = Math.min(12, Math.max(1, Number(autoHealManaHotkeyInput.value) || 1));
-        autoHealManaHotkeyInput.value = String(manaHotbarSlot);
-        bot.heal.updateConfig({ manaHotbarSlot });
-      });
-    }
-
-    if (autoHealEnabledInput) {
-      autoHealEnabledInput.checked = !!bot.heal?.status?.().running;
-      autoHealEnabledInput.addEventListener("change", () => {
-        const minHp = Math.max(0, Number(autoHealMinHpInput?.value) || bot.heal.config.minHp || 0);
-        const hpHotbarSlot = Math.min(
-          12,
-          Math.max(1, Number(autoHealHpHotkeyInput?.value) || bot.heal.config.hpHotbarSlot || 1)
-        );
-        const minMana = Math.max(0, Number(autoHealMinManaInput?.value) || bot.heal.config.minMana || 0);
-        const manaHotbarSlot = Math.min(
-          12,
-          Math.max(1, Number(autoHealManaHotkeyInput?.value) || bot.heal.config.manaHotbarSlot || 1)
-        );
-
-        if (autoHealEnabledInput.checked) {
-          bot.heal.start({ minHp, hpHotbarSlot, minMana, manaHotbarSlot });
-        } else {
-          bot.heal.stop();
-        }
-
-        refreshAutoHealStatus();
-      });
-    }
+// Initial refresh
+refreshHealRules();
+refreshAutoHealStatus();
 
     if (autoAttackHotkeyInput) {
       autoAttackHotkeyInput.value = String(bot.attack?.config?.targetHotbarSlot ?? 3);
@@ -9019,6 +9276,7 @@ function addCollapseSafetyNote(parent) {
     renderTrustedNames();
     refreshRuneStatus();
     refreshAutoHealStatus();
+	refreshHealRules();
     refreshAutoInvisibleStatus();
     refreshAutoMagicShieldStatus();
     refreshAutoAttackStatus();
@@ -9093,6 +9351,8 @@ function addCollapseSafetyNote(parent) {
 	};
 
 };
+
+// Reload bootstrapping remains unchanged
 (() => {
   const bundle = window.__minibiaBotBundle || window.__minibiaBotReloadBundle || {};
   const persistedEnabledModules = [
@@ -9231,6 +9491,7 @@ function addCollapseSafetyNote(parent) {
   boot(bundle);
 })();
 
+// InfernalScript (unchanged)
 (() => {
   const TAG = "[InfernalScript]";
 
