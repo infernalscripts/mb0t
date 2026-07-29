@@ -925,6 +925,7 @@ window.__minibiaBotBundle.installXrayModule = function installXrayModule(bot) {
         background: rgba(11, 61, 43, 0.8);
         color: #d8ffea;
       }
+	  
     `;
     document.head.appendChild(style);
   }
@@ -3890,6 +3891,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
       waypointTolerance: 0,
       enabled: false,
       activePresetName: defaultPresetName,
+	  loopMode: false, 
     },
     bot.storage.get(configStorageKey, {})
   );
@@ -4811,14 +4813,11 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     return best;
   }
 
-  function isAtWaypoint(position, waypoint) {
-    const distance = getDistanceToWaypoint(position, waypoint);
-    if (!Number.isFinite(distance)) {
-      return false;
-    }
-
-    return distance <= Math.max(0, Number(config.waypointTolerance) || 0);
-  }
+	function isAtWaypoint(position, waypoint) {
+	  const distance = getDistanceToWaypoint(position, waypoint);
+	  if (!Number.isFinite(distance)) return false;
+	  return distance <= Math.max(0, Number(config.waypointTolerance) || 0);
+	}
 
   function goToWaypoint(waypoint) {
     const from = bot.getPlayerPosition();
@@ -5164,36 +5163,31 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     return false;
   }
 
-  function advanceWaypoint() {
-    if (!route.length) {
-      return null;
-    }
+	function advanceWaypoint() {
+	  if (!route.length) return null;
+	  if (route.length === 1) return route[0];
 
-    if (route.length === 1) {
-      return route[0];
-    }
-
-    let nextIndex = state.currentIndex + state.direction;
-
-    if (nextIndex >= route.length) {
-      state.direction = -1;
-      nextIndex = route.length - 2;
-    } else if (nextIndex < 0) {
-      state.direction = 1;
-      nextIndex = 1;
-    }
-
-    state.currentIndex = Math.max(0, Math.min(route.length - 1, nextIndex));
-
-    const nextWaypoint = getCurrentWaypoint();
-    bot.log("cave advanced waypoint", {
-      index: state.currentIndex + 1,
-      total: route.length,
-      direction: state.direction,
-      waypoint: nextWaypoint,
-    });
-    return nextWaypoint;
-  }
+	  let nextIndex = state.currentIndex + state.direction;
+	  if (nextIndex >= route.length) {
+		if (config.loopMode) {
+		  nextIndex = 0;
+		} else {
+		  state.direction = -1;
+		  nextIndex = route.length - 2;
+		}
+	  } else if (nextIndex < 0) {
+		if (config.loopMode) {
+		  nextIndex = route.length - 1;
+		} else {
+		  state.direction = 1;
+		  nextIndex = 1;
+		}
+	  }
+	  state.currentIndex = Math.max(0, Math.min(route.length - 1, nextIndex));
+	  const nextWaypoint = getCurrentWaypoint();
+	  bot.log("cave advanced waypoint", { index: state.currentIndex + 1, total: route.length, direction: state.direction, waypoint: nextWaypoint });
+	  return nextWaypoint;
+	}
 
   function scheduleNextTick() {
     if (!state.running) return;
@@ -5478,6 +5472,54 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     start();
   }
 
+function moveWaypointUp(index) {
+  if (!route.length || index <= 0 || index >= route.length) return false;
+  const temp = route[index];
+  route[index] = route[index - 1];
+  route[index - 1] = temp;
+  // If the current index is involved, update it
+  if (state.currentIndex === index) state.currentIndex = index - 1;
+  else if (state.currentIndex === index - 1) state.currentIndex = index;
+  persistRoute();
+  return true;
+}
+
+function moveWaypointDown(index) {
+  if (!route.length || index < 0 || index >= route.length - 1) return false;
+  const temp = route[index];
+  route[index] = route[index + 1];
+  route[index + 1] = temp;
+  if (state.currentIndex === index) state.currentIndex = index + 1;
+  else if (state.currentIndex === index + 1) state.currentIndex = index;
+  persistRoute();
+  return true;
+}
+
+function deleteWaypoint(index) {
+  if (!route.length || index < 0 || index >= route.length) return false;
+  route.splice(index, 1);
+  // Adjust current index if needed
+  if (state.currentIndex >= route.length) state.currentIndex = Math.max(0, route.length - 1);
+  if (route.length === 0) {
+    state.currentIndex = 0;
+    state.direction = 1;
+    if (state.running) stop();
+  }
+  persistRoute();
+  return true;
+}
+
+function setLoopMode(enabled) {
+  config.loopMode = !!enabled;
+  persistConfig();
+  bot.log("cave loop mode set", { loopMode: config.loopMode });
+  return config.loopMode;
+}
+
+function getLoopMode() {
+  return config.loopMode;
+}
+
   bot.cave = {
     start,
     stop,
@@ -5505,6 +5547,11 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     findClosestWaypointIndex,
     findRopeSource,
     findShovelSource,
+	moveWaypointUp,
+	moveWaypointDown,
+	deleteWaypoint,
+	setLoopMode,
+	getLoopMode,
     inspectNearbyTiles: (radius = 1) => {
       const position = normalizePosition(bot.getPlayerPosition());
       if (!position) {
@@ -7236,37 +7283,6 @@ function refreshAutoHealStatus() {
     autoMagicShieldToggle.checked = !!bot.magicShield?.status?.().running;
   }
 
-  function refreshCaveStatus() {
-    const statusLabel = document.getElementById("minibia-bot-cave-status");
-    const startButton = document.getElementById("minibia-bot-cave-start");
-    const stopButton = document.getElementById("minibia-bot-cave-stop");
-    const route = bot.cave?.getRoute?.() || [];
-    const status = bot.cave?.status?.();
-
-    if (statusLabel) {
-      if (!route.length) {
-        statusLabel.textContent = "Status: no waypoints";
-      } else if (status?.running) {
-        const waypointNumber = (status.currentIndex ?? 0) + 1;
-        const distanceLabel =
-          Number.isFinite(status?.distanceToWaypoint) && status.distanceToWaypoint >= 0
-            ? `, dist ${status.distanceToWaypoint}`
-            : "";
-        statusLabel.textContent = `Status: running (${waypointNumber}/${route.length}${distanceLabel})`;
-      } else {
-        statusLabel.textContent = `Status: idle (${route.length} waypoint${route.length === 1 ? "" : "s"})`;
-      }
-    }
-
-    if (startButton) {
-      startButton.disabled = !route.length || !!status?.running;
-    }
-
-    if (stopButton) {
-      stopButton.disabled = !status?.running;
-    }
-  }
-
   function refreshCavePresetControls() {
     const select = document.getElementById("minibia-bot-cave-preset-select");
     const label = document.getElementById("minibia-bot-cave-preset-status");
@@ -7363,6 +7379,146 @@ function refreshAutoHealStatus() {
       `Transitions learned: ${latest.from.x}, ${latest.from.y}, ${latest.from.z} -> ` +
       `${latest.to.x}, ${latest.to.y}, ${latest.to.z}${extra}`;
   }
+
+// --- Cave Waypoint List Management ---
+let selectedWaypointIndex = null;
+
+function refreshCaveWaypointList() {
+  const container = document.getElementById("minibia-bot-cave-waypoint-list");
+  if (!container) return;
+  const route = bot.cave?.getRoute?.() || [];
+  const status = bot.cave?.status?.();
+  const currentIndex = status?.currentIndex ?? 0;
+
+  container.innerHTML = "";
+  if (route.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "mb-small-note";
+    empty.textContent = "No waypoints recorded.";
+    container.appendChild(empty);
+    selectedWaypointIndex = null;
+    return;
+  }
+
+  route.forEach((wp, idx) => {
+    const row = document.createElement("div");
+    row.style.cssText = `display:flex;align-items:center;gap:6px;padding:2px 4px;border-radius:4px;cursor:pointer;${idx === currentIndex ? 'background:rgba(255,200,80,0.2);border:1px solid #ffcf5a;' : ''}`;
+    row.dataset.index = idx;
+
+    const number = document.createElement("span");
+    number.textContent = `${idx+1}.`;
+    number.style.cssText = "font-weight:bold;min-width:20px;";
+
+    const coords = document.createElement("span");
+    coords.textContent = `${wp.x}, ${wp.y}, ${wp.z}`;
+    if (idx === currentIndex) {
+      coords.style.cssText = "color:#ffcf5a;font-weight:bold;";
+    }
+
+    const dist = document.createElement("span");
+    dist.style.cssText = "margin-left:auto;font-size:10px;opacity:0.6;";
+    const pos = bot.getPlayerPosition?.();
+    if (pos && wp.z === pos.z) {
+      const dx = Math.abs(pos.x - wp.x);
+      const dy = Math.abs(pos.y - wp.y);
+      dist.textContent = `dist ${dx+dy}`;
+    }
+
+    row.appendChild(number);
+    row.appendChild(coords);
+    row.appendChild(dist);
+
+	row.addEventListener("click", () => {
+	  container.querySelectorAll("[data-selected]").forEach(el => el.dataset.selected = "false");
+	  row.dataset.selected = "true";
+	  selectedWaypointIndex = idx;
+	  // Set the bot's current waypoint index
+	  bot.cave.setCurrentIndex(idx);
+	  // If running, immediately path to the selected waypoint
+	  if (bot.cave?.status?.().running) {
+		bot.cave.goToWaypoint(route[idx]);
+	  }
+	  refreshCaveStatus();
+	  refreshCaveWaypointList();
+	  refreshTitlebarRunIndicators();
+	});
+
+    // Auto-select current if no selection
+    if (idx === currentIndex && selectedWaypointIndex === null) {
+      row.dataset.selected = "true";
+      selectedWaypointIndex = idx;
+    }
+
+    container.appendChild(row);
+  });
+
+  if (selectedWaypointIndex !== null && (selectedWaypointIndex < 0 || selectedWaypointIndex >= route.length)) {
+    selectedWaypointIndex = null;
+  }
+}
+
+function moveSelectedWaypoint(direction) {
+  if (selectedWaypointIndex === null) {
+    bot.log("No waypoint selected. Click a waypoint first.");
+    return;
+  }
+  const route = bot.cave?.getRoute?.() || [];
+  if (selectedWaypointIndex < 0 || selectedWaypointIndex >= route.length) return;
+  if (direction === "up" && selectedWaypointIndex === 0) return;
+  if (direction === "down" && selectedWaypointIndex === route.length - 1) return;
+
+  let moved = false;
+  if (direction === "up") {
+    moved = bot.cave.moveWaypointUp(selectedWaypointIndex);
+    if (moved) selectedWaypointIndex--;
+  } else if (direction === "down") {
+    moved = bot.cave.moveWaypointDown(selectedWaypointIndex);
+    if (moved) selectedWaypointIndex++;
+  }
+  if (moved) {
+    refreshCaveWaypointList();
+    refreshCaveStatus();
+    refreshCaveClosestStatus();
+    refreshCaveTransitionStatus();
+  }
+}
+
+function deleteSelectedWaypoint() {
+  if (selectedWaypointIndex === null) {
+    bot.log("No waypoint selected.");
+    return;
+  }
+  const route = bot.cave?.getRoute?.() || [];
+  if (selectedWaypointIndex < 0 || selectedWaypointIndex >= route.length) return;
+  const deleted = bot.cave.deleteWaypoint(selectedWaypointIndex);
+  if (deleted) {
+    selectedWaypointIndex = null;
+    refreshCaveWaypointList();
+    refreshCaveStatus();
+    refreshCaveClosestStatus();
+    refreshCaveTransitionStatus();
+  }
+}
+
+function refreshCaveStatus() {
+  const toggle = document.getElementById("minibia-bot-cave-toggle");
+  const statusLabel = document.getElementById("minibia-bot-cave-status");
+  const route = bot.cave?.getRoute?.() || [];
+  const status = bot.cave?.status?.();
+
+  if (toggle) toggle.checked = !!status?.running;
+
+  if (statusLabel) {
+    if (!route.length) statusLabel.textContent = "Status: no waypoints";
+    else if (status?.running) {
+      const waypointNumber = (status.currentIndex ?? 0) + 1;
+      const dist = Number.isFinite(status?.distanceToWaypoint) && status.distanceToWaypoint >= 0 ? `, dist ${status.distanceToWaypoint}` : "";
+      statusLabel.textContent = `Status: running (${waypointNumber}/${route.length}${dist})`;
+    } else {
+      statusLabel.textContent = `Status: idle (${route.length} waypoint${route.length===1?"":"s"})`;
+    }
+  }
+}
 
   function refreshEquipRingStatus() {
     const equipRingToggle = document.getElementById("minibia-bot-equip-ring-enabled");
@@ -7750,6 +7906,15 @@ function refreshTitlebarRunIndicators() {
   color: #f8e6b8;
   font: 12px/1.35 Verdana, sans-serif;
   user-select: none;
+}
+
+#minibia-bot-panel .mb-run-indicator {
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+#minibia-bot-panel .mb-run-indicator:hover {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(224, 200, 148, 0.6);
 }
 
 #minibia-bot-panel[data-collapsed="true"] {
@@ -8355,38 +8520,58 @@ panel.innerHTML = `
         </div>
       </div>
 
-      <div class="mb-tab-panel" data-tab-panel="cave">
-        <div class="mb-section">
-          <div class="mb-label">Cave Bot</div>
+<div class="mb-tab-panel" data-tab-panel="cave">
+  <div class="mb-section">
+	<div style="display:flex;justify-content:space-between;align-items:center;">
+	  <div class="mb-label" style="margin:0;">Cave Bot</div>
+	  <div style="display:flex;gap:12px;align-items:center;">
+		<label class="mb-toggle" style="margin:0;font-size:11px;">
+		  <input type="checkbox" id="minibia-bot-cave-loop" />
+		  <span>Loop</span>
+		</label>
+		<label class="mb-toggle" style="margin:0;font-size:11px;">
+		  <input type="checkbox" id="minibia-bot-cave-toggle" />
+		  <span>Enable</span>
+		</label>
+	  </div>
+	</div>
 
-          <div class="mb-stack">
-            <label class="mb-field" for="minibia-bot-cave-preset-select">
-              <span class="mb-field-label">Preset</span>
-              <select id="minibia-bot-cave-preset-select"></select>
-            </label>
+    <!-- Preset row -->
+    <div style="display:flex;gap:6px;align-items:center;margin:6px 0;">
+      <select id="minibia-bot-cave-preset-select" style="flex:1;padding:4px 6px;font-size:11px;"></select>
+      <button type="button" class="mb-small-button" id="minibia-bot-cave-preset-new" style="padding:2px 8px;font-size:10px;">New</button>
+      <button type="button" class="mb-small-button" id="minibia-bot-cave-preset-delete" style="padding:2px 8px;font-size:10px;">Del</button>
+    </div>
 
-            <div class="mb-button-grid">
-              <button type="button" class="mb-small-button" id="minibia-bot-cave-preset-new">New</button>
-              <button type="button" class="mb-small-button" id="minibia-bot-cave-preset-delete">Delete</button>
-            </div>
+    <!-- Tolerance -->
+    <div style="display:flex;gap:6px;align-items:center;margin:4px 0;">
+      <label style="font-size:11px;color:#e9d39b;">Skip if within</label>
+      <input type="number" id="minibia-bot-cave-tolerance" min="0" max="5" step="1" value="0" style="width:50px;padding:2px 4px;font-size:11px;" />
+      <span style="font-size:11px;color:#cdbb8b;">tiles</span>
+    </div>
 
-            <div class="mb-button-grid">
-              <button type="button" class="mb-small-button" id="minibia-bot-cave-record">Record Spot</button>
-              <button type="button" class="mb-small-button" id="minibia-bot-cave-remove-last">Remove Last</button>
-            </div>
+    <!-- Waypoint list -->
+    <div style="margin:6px 0;">
+      <div class="mb-label" style="font-size:11px;margin:0 0 4px;">Waypoints</div>
+      <div id="minibia-bot-cave-waypoint-list" style="max-height:120px;overflow-y:auto;border:1px solid rgba(224,200,148,0.2);border-radius:4px;padding:2px;font-size:11px;"></div>
+    </div>
 
-            <div class="mb-small-note" id="minibia-bot-cave-closest">Closest start: no waypoints</div>
-            <div class="mb-small-note" id="minibia-bot-cave-transition-status">Transitions learned: none</div>
+    <!-- Action buttons -->
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:4px;margin:4px 0;">
+      <button type="button" class="mb-small-button" id="minibia-bot-cave-add" style="padding:4px;">+ Add</button>
+      <button type="button" class="mb-small-button" id="minibia-bot-cave-move-up" style="padding:4px;">▲</button>
+      <button type="button" class="mb-small-button" id="minibia-bot-cave-move-down" style="padding:4px;">▼</button>
+      <button type="button" class="mb-small-button" id="minibia-bot-cave-delete-selected" style="padding:4px;background:#5a2020;border-color:#883030;">✕</button>
+    </div>
 
-            <div class="mb-button-grid">
-              <button type="button" class="mb-small-button" id="minibia-bot-cave-start">Start</button>
-              <button type="button" class="mb-small-button" id="minibia-bot-cave-stop">Stop</button>
-            </div>
-
-            <div class="mb-small-note" id="minibia-bot-cave-status">Status: no waypoints</div>
-          </div>
-        </div>
-      </div>
+    <!-- Info lines -->
+    <div style="font-size:10px;color:#cdbb8b;margin-top:4px;display:grid;gap:2px;">
+      <div id="minibia-bot-cave-status">Status: no waypoints</div>
+      <div id="minibia-bot-cave-closest">Closest start: none</div>
+      <div id="minibia-bot-cave-transition-status">Transitions learned: none</div>
+    </div>
+  </div>
+</div>
 
       <div class="mb-tab-panel" data-tab-panel="targeting">
         <div class="mb-section">
@@ -8765,10 +8950,7 @@ function addCollapseSafetyNote(parent) {
     const xrayFloorSelect = panel.querySelector("#minibia-bot-xray-floor-select");
     const collapseButton = panel.querySelector("#minibia-bot-collapse");
     const reloadButton = panel.querySelector("#minibia-bot-reload");
-    const caveRecordButton = panel.querySelector("#minibia-bot-cave-record");
-    const caveRemoveLastButton = panel.querySelector("#minibia-bot-cave-remove-last");
-    const caveStartButton = panel.querySelector("#minibia-bot-cave-start");
-    const caveStopButton = panel.querySelector("#minibia-bot-cave-stop");
+	const caveAddBtn = panel.querySelector("#minibia-bot-cave-add");
     const cavePresetSelect = panel.querySelector("#minibia-bot-cave-preset-select");
     const cavePresetNewButton = panel.querySelector("#minibia-bot-cave-preset-new");
     const cavePresetDeleteButton = panel.querySelector("#minibia-bot-cave-preset-delete");
@@ -8787,6 +8969,16 @@ function addCollapseSafetyNote(parent) {
 
 //event listeners
 
+	if (caveAddBtn) {
+	  caveAddBtn.addEventListener("click", () => {
+		bot.cave.addWaypointCurrentSpot();
+		refreshCaveWaypointList();
+		refreshCaveStatus();
+		refreshCaveClosestStatus();
+		refreshCaveTransitionStatus();
+		refreshCavePresetControls();
+	  });
+	}
 
 
 	if (collapseButton) {
@@ -8996,47 +9188,6 @@ function addCollapseSafetyNote(parent) {
       });
     }
 
-    if (caveRecordButton) {
-      caveRecordButton.addEventListener("click", () => {
-        bot.cave.addWaypointCurrentSpot();
-        refreshCavePresetControls();
-        refreshCaveClosestStatus();
-        refreshCaveTransitionStatus();
-      });
-    }
-
-    if (caveRemoveLastButton) {
-      caveRemoveLastButton.addEventListener("click", () => {
-        bot.cave.removeLastWaypoint();
-        refreshCavePresetControls();
-        refreshCaveStatus();
-        refreshCaveClosestStatus();
-        refreshCaveTransitionStatus();
-      });
-    }
-
-    if (caveStartButton) {
-      caveStartButton.addEventListener("click", () => {
-        bot.cave.start();
-		refreshTitlebarRunIndicators();
-        refreshCavePresetControls();
-        refreshCaveStatus();
-        refreshCaveClosestStatus();
-        refreshCaveTransitionStatus();
-      });
-    }
-
-    if (caveStopButton) {
-      caveStopButton.addEventListener("click", () => {
-        bot.cave.stop();
-		refreshTitlebarRunIndicators();
-        refreshCavePresetControls();
-        refreshCaveStatus();
-        refreshCaveClosestStatus();
-        refreshCaveTransitionStatus();
-      });
-    }
-
     if (cavePresetSelect) {
       cavePresetSelect.addEventListener("change", () => {
         const name = cavePresetSelect.value || "";
@@ -9091,6 +9242,149 @@ function addCollapseSafetyNote(parent) {
         refreshCaveTransitionStatus();
       });
     }
+	
+// --- Cave bot event listeners ---
+
+// Add waypoint (only one listener)
+const addBtn = panel.querySelector("#minibia-bot-cave-add");
+if (addBtn) {
+  // Remove any previous listener by cloning and replacing
+  const newAddBtn = addBtn.cloneNode(true);
+  addBtn.parentNode.replaceChild(newAddBtn, addBtn);
+  newAddBtn.addEventListener("click", function addWaypointClick(e) {
+    e.preventDefault();
+    bot.cave.addWaypointCurrentSpot();
+    refreshCaveWaypointList();
+    refreshCaveStatus();
+    refreshCaveClosestStatus();
+    refreshCaveTransitionStatus();
+    refreshCavePresetControls();
+    refreshTitlebarRunIndicators();
+  });
+}
+
+// Move up/down and delete (use the existing functions)
+const moveUpBtn = panel.querySelector("#minibia-bot-cave-move-up");
+const moveDownBtn = panel.querySelector("#minibia-bot-cave-move-down");
+const deleteBtn = panel.querySelector("#minibia-bot-cave-delete-selected");
+
+if (moveUpBtn) {
+  // Remove existing listeners by cloning
+  const newUp = moveUpBtn.cloneNode(true);
+  moveUpBtn.parentNode.replaceChild(newUp, moveUpBtn);
+  newUp.addEventListener("click", () => moveSelectedWaypoint("up"));
+}
+if (moveDownBtn) {
+  const newDown = moveDownBtn.cloneNode(true);
+  moveDownBtn.parentNode.replaceChild(newDown, moveDownBtn);
+  newDown.addEventListener("click", () => moveSelectedWaypoint("down"));
+}
+if (deleteBtn) {
+  const newDel = deleteBtn.cloneNode(true);
+  deleteBtn.parentNode.replaceChild(newDel, deleteBtn);
+  newDel.addEventListener("click", deleteSelectedWaypoint);
+}
+
+// Preset controls (keep as is, but ensure no duplicates)
+const presetSelect = panel.querySelector("#minibia-bot-cave-preset-select");
+const presetNew = panel.querySelector("#minibia-bot-cave-preset-new");
+const presetDelete = panel.querySelector("#minibia-bot-cave-preset-delete");
+
+if (presetSelect) {
+  // Remove existing listeners by cloning
+  const newSelect = presetSelect.cloneNode(true);
+  presetSelect.parentNode.replaceChild(newSelect, presetSelect);
+  newSelect.addEventListener("change", function() {
+    const name = this.value || "";
+    const activePresetName = bot.cave?.getActivePresetName?.() || "";
+    if (!name || name === activePresetName) {
+      refreshCavePresetControls();
+      return;
+    }
+    bot.cave.loadPreset(name);
+    refreshCavePresetControls();
+    refreshCaveStatus();
+    refreshCaveClosestStatus();
+    refreshCaveTransitionStatus();
+    refreshCaveWaypointList();
+    refreshTitlebarRunIndicators();
+  });
+}
+if (presetNew) {
+  const newNew = presetNew.cloneNode(true);
+  presetNew.parentNode.replaceChild(newNew, presetNew);
+  newNew.addEventListener("click", function() {
+    const name = window.prompt("Name the new cave preset:");
+    if (name == null) return;
+    const created = bot.cave.createPreset(name);
+    if (!created) return;
+    refreshCavePresetControls();
+    refreshCaveStatus();
+    refreshCaveClosestStatus();
+    refreshCaveTransitionStatus();
+    refreshCaveWaypointList();
+    refreshTitlebarRunIndicators();
+  });
+}
+if (presetDelete) {
+  const newDelPreset = presetDelete.cloneNode(true);
+  presetDelete.parentNode.replaceChild(newDelPreset, presetDelete);
+  newDelPreset.addEventListener("click", function() {
+    const name = presetSelect?.value || "";
+    if (!name) return;
+    const deleted = bot.cave.deletePreset(name);
+    if (!deleted) return;
+    refreshCavePresetControls();
+    refreshCaveStatus();
+    refreshCaveClosestStatus();
+    refreshCaveTransitionStatus();
+    refreshCaveWaypointList();
+    refreshTitlebarRunIndicators();
+  });
+}
+
+// Tolerance input
+const toleranceInput = panel.querySelector("#minibia-bot-cave-tolerance");
+if (toleranceInput) {
+  toleranceInput.value = bot.cave?.config?.waypointTolerance ?? 0;
+  // Remove old listener
+  const newTol = toleranceInput.cloneNode(true);
+  toleranceInput.parentNode.replaceChild(newTol, toleranceInput);
+  newTol.addEventListener("change", function() {
+    const val = Math.min(5, Math.max(0, parseInt(this.value) || 0));
+    this.value = val;
+    bot.cave.updateConfig({ waypointTolerance: val });
+  });
+}
+
+// Cave toggle (enable/disable)
+const caveToggle = panel.querySelector("#minibia-bot-cave-toggle");
+if (caveToggle) {
+  caveToggle.checked = !!bot.cave?.status?.().running;
+  const newToggle = caveToggle.cloneNode(true);
+  caveToggle.parentNode.replaceChild(newToggle, caveToggle);
+  newToggle.addEventListener("change", function() {
+    if (this.checked) {
+      bot.cave.start();
+    } else {
+      bot.cave.stop();
+    }
+    refreshCaveStatus();
+    refreshCaveWaypointList();
+    refreshTitlebarRunIndicators();
+  });
+}
+
+// Loop toggle
+const loopToggle = panel.querySelector("#minibia-bot-cave-loop");
+if (loopToggle) {
+  loopToggle.checked = bot.cave?.getLoopMode?.() ?? false;
+  const newLoop = loopToggle.cloneNode(true);
+  loopToggle.parentNode.replaceChild(newLoop, loopToggle);
+  newLoop.addEventListener("change", function() {
+    bot.cave.setLoopMode(this.checked);
+  });
+}
 
 // Heal UI: save / cancel
 const healSave = panel.querySelector("#minibia-bot-heal-save");
@@ -9269,6 +9563,40 @@ refreshAutoHealStatus();
 		saveAutoAttackPreferredConfig();
 	});
 
+	// --- Titlebar Cave / Target Toggles ---
+	const titleCaveStatus = panel.querySelector("#minibia-bot-title-cave-status");
+	const titleAttackStatus = panel.querySelector("#minibia-bot-title-attack-status");
+
+	if (titleCaveStatus) {
+	  titleCaveStatus.addEventListener("click", () => {
+		const running = !!bot.cave?.status?.().running;
+		if (running) {
+		  bot.cave.stop();
+		} else {
+		  bot.cave.start();
+		}
+		// Refresh the UI indicators and specific tabs
+		refreshTitlebarRunIndicators();
+		refreshCaveStatus();
+		refreshCaveWaypointList();
+	  });
+	}
+
+	if (titleAttackStatus) {
+	  titleAttackStatus.addEventListener("click", () => {
+		const running = !!bot.attack?.status?.().running;
+		if (running) {
+		  bot.attack.stop();
+		} else {
+		  bot.attack.start();
+		}
+		// Refresh the UI indicators and specific tabs
+		refreshTitlebarRunIndicators();
+		refreshAutoAttackStatus();
+	  });
+	}
+
+
     refreshHomeLabel();
     refreshPanicStatus();
     refreshXrayStatus();
@@ -9289,6 +9617,7 @@ refreshAutoHealStatus();
     refreshCavePresetControls();
     refreshCaveClosestStatus();
     refreshCaveTransitionStatus();
+	refreshCaveWaypointList();
 
 	const visibleCreaturesTimerId = window.setInterval(refreshVisibleCreatures, 1000);
 	bot.addCleanup(() => {
@@ -9305,6 +9634,9 @@ refreshAutoHealStatus();
 	  refreshCavePresetControls();
 	  refreshCaveClosestStatus();
 	  refreshCaveTransitionStatus();
+	  refreshCaveWaypointList();
+	  const loopToggle = document.getElementById("minibia-bot-cave-loop");
+	  if (loopToggle) loopToggle.checked = bot.cave?.getLoopMode?.() ?? false;  
 	}, 1000);
 	bot.addCleanup(() => {
 	  window.clearInterval(caveStatusTimerId);
