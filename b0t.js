@@ -1,48 +1,64 @@
+/**
+ * ==================================================================================
+ * This file is a self‑contained bundle that:
+ * 1. Defines a core bot factory (createBot)
+ * 2. Installs functional modules (PZ, Xray, Panic, Rune, Heal, Invisible, Magic Shield,
+ *    Auto Attack, Cave, Equip Ring, Auto Eat, Talk, and UI Panel)
+ * 3. Bootstraps the bot on page load and provides a hot‑reload mechanism
+ *
+ * All persistent settings are stored in localStorage under keys like:
+ *   minibiaBot.*.config
+ *
+ * The bot is exposed globally as `window.minibiaBot`.
+ * ==================================================================================
+ */
+
+// --- Global namespace for the bundle ---
 window.__minibiaBotBundle = window.__minibiaBotBundle || {};
 
+/**
+ * ==================================================================================
+ * 1. CORE BOT FACTORY (createBot)
+ *    Creates the base bot object with utility methods, storage, chat, reconnect,
+ *    alarm audio, and cleanup. It also starts a watcher to auto‑reconnect and a
+ *    counter reset for the in‑game input metrics (`__imB`).
+ * ==================================================================================
+ */
 window.__minibiaBotBundle.createBot = function createBot() {
-  const cleanups = [];
+  // ---- PRIVATE STATE ----
+  const cleanups = [];                                      // Functions to run on destroy
   const defaultAlarmAudioSrc = "https://upload.wikimedia.org/wikipedia/commons/5/5c/En-us-red_alert.oga";
   const alarmAudioSrcStorageKey = "minibiaBot.audio.alarmSrc";
-  const recentSentChats = [];
-  const reconnectButtonSelectors = [
-    "button",
-    "[role=\"button\"]",
-    "input[type=\"button\"]",
-    "input[type=\"submit\"]",
-    "a",
-    ".button",
-    ".btn",
+  const recentSentChats = [];                               // Tracks recently sent messages (avoid duplicates)
+  const reconnectButtonSelectors = [                        // CSS selectors to find a reconnect button
+    "button", "[role=\"button\"]", "input[type=\"button\"]",
+    "input[type=\"submit\"]", "a", ".button", ".btn",
   ];
-  let alarmAudio = null;
-  let reconnectObserver = null;
-  let reconnectPollTimerId = null;
-  let lastReconnectClickAt = 0;
+  let alarmAudio = null;                                    // Audio element for alarm sounds
+  let reconnectObserver = null;                             // MutationObserver for reconnect detection
+  let reconnectPollTimerId = null;                          // Interval timer for reconnect polling
+  let lastReconnectClickAt = 0;                             // Throttle reconnect clicks
 
+  // ---- CLEANUP SYSTEM ----
   function addCleanup(fn) {
-    if (typeof fn === "function") {
-      cleanups.push(fn);
-    }
+    if (typeof fn === "function") cleanups.push(fn);
   }
 
   function runCleanups() {
     while (cleanups.length) {
       const fn = cleanups.pop();
-      try {
-        fn();
-      } catch (error) {
+      try { fn(); } catch (error) {
         console.error("[minibia-bot] cleanup failed", error);
       }
     }
   }
 
+  // ---- ALARM AUDIO ----
   function getStoredAlarmAudioSrc() {
     try {
       const value = window.localStorage.getItem(alarmAudioSrcStorageKey);
       return value == null ? defaultAlarmAudioSrc : JSON.parse(value);
-    } catch (error) {
-      return defaultAlarmAudioSrc;
-    }
+    } catch { return defaultAlarmAudioSrc; }
   }
 
   function setStoredAlarmAudioSrc(src) {
@@ -51,10 +67,7 @@ window.__minibiaBotBundle.createBot = function createBot() {
   }
 
   function destroyAlarmAudio() {
-    if (!alarmAudio) {
-      return;
-    }
-
+    if (!alarmAudio) return;
     try {
       alarmAudio.pause();
       alarmAudio.removeAttribute("src");
@@ -62,46 +75,29 @@ window.__minibiaBotBundle.createBot = function createBot() {
     } catch (error) {
       console.error("[minibia-bot] audio cleanup failed", error);
     }
-
     alarmAudio = null;
   }
 
   function getAlarmAudio() {
     const src = getStoredAlarmAudioSrc();
-    if (!src) {
-      return null;
-    }
-
-    if (!alarmAudio) {
-      alarmAudio = new Audio(src);
-      alarmAudio.preload = "auto";
-    } else if (alarmAudio.src !== src) {
-      alarmAudio.pause();
+    if (!src) return null;
+    if (!alarmAudio || alarmAudio.src !== src) {
+      if (alarmAudio) alarmAudio.pause();
       alarmAudio = new Audio(src);
       alarmAudio.preload = "auto";
     }
-
     return alarmAudio;
   }
 
+  // ---- CHAT HELPERS (deduplication) ----
   function normalizeChatText(text) {
-    return String(text || "")
-      .trim()
-      .toLowerCase()
-      .replace(/\s+/g, " ");
+    return String(text || "").trim().toLowerCase().replace(/\s+/g, " ");
   }
 
   function rememberSentChat(text) {
     const normalized = normalizeChatText(text);
-    if (!normalized) {
-      return;
-    }
-
-    recentSentChats.push({
-      text: normalized,
-      at: Date.now(),
-    });
-
+    if (!normalized) return;
+    recentSentChats.push({ text: normalized, at: Date.now() });
     const maxEntries = 20;
     if (recentSentChats.length > maxEntries) {
       recentSentChats.splice(0, recentSentChats.length - maxEntries);
@@ -110,78 +106,50 @@ window.__minibiaBotBundle.createBot = function createBot() {
 
   function isRecentSentChat(text, withinMs = 45000) {
     const normalized = normalizeChatText(text);
-    if (!normalized) {
-      return false;
-    }
-
+    if (!normalized) return false;
     const cutoff = Date.now() - withinMs;
-    for (let index = recentSentChats.length - 1; index >= 0; index -= 1) {
-      const entry = recentSentChats[index];
-      if (entry.at < cutoff) {
-        continue;
-      }
-
-      if (entry.text === normalized) {
-        return true;
-      }
+    for (let i = recentSentChats.length - 1; i >= 0; i--) {
+      const entry = recentSentChats[i];
+      if (entry.at < cutoff) continue;
+      if (entry.text === normalized) return true;
     }
-
     return false;
   }
 
+  // ---- UI TEXT NORMALIZATION (for button text matching) ----
   function normalizeUiText(text) {
-    return String(text || "")
-      .trim()
-      .toLowerCase()
-      .replace(/\s+/g, " ");
+    return String(text || "").trim().toLowerCase().replace(/\s+/g, " ");
   }
 
+  // ---- SKILL WINDOW SCRAPING ----
   function getSkillWindowValue(skillNames = []) {
     for (const skillName of skillNames) {
-      const value =
-        document.querySelector(`#skill-window div[skill="${skillName}"] .skill`)?.textContent?.trim() ||
-        null;
-      if (value) {
-        return value;
-      }
+      const el = document.querySelector(`#skill-window div[skill="${skillName}"] .skill`);
+      const value = el?.textContent?.trim();
+      if (value) return value;
     }
-
     return null;
   }
 
   function parseNumberText(value) {
-    if (value == null) {
-      return null;
-    }
-
+    if (value == null) return null;
     const normalized = String(value).replace(/[^\d.-]/g, "");
-    if (!normalized) {
-      return null;
-    }
-
+    if (!normalized) return null;
     const parsed = Number(normalized);
     return Number.isFinite(parsed) ? parsed : null;
   }
 
+  // ---- VISIBILITY & UI TEXT EXTRACTION ----
   function isVisibleElement(element) {
-    if (!(element instanceof Element)) {
-      return false;
-    }
-
+    if (!(element instanceof Element)) return false;
     const rect = element.getBoundingClientRect();
-    if (rect.width <= 0 || rect.height <= 0) {
-      return false;
-    }
-
+    if (rect.width <= 0 || rect.height <= 0) return false;
     const style = window.getComputedStyle(element);
     return style.display !== "none" && style.visibility !== "hidden" && style.opacity !== "0";
   }
 
   function getElementUiText(element) {
-    if (!(element instanceof Element)) {
-      return "";
-    }
-
+    if (!(element instanceof Element)) return "";
     return normalizeUiText(
       element.textContent ||
       element.innerText ||
@@ -192,162 +160,94 @@ window.__minibiaBotBundle.createBot = function createBot() {
     );
   }
 
+  // ---- RECONNECT WATCHER ----
   function findReconnectElement() {
     for (const selector of reconnectButtonSelectors) {
       const candidates = document.querySelectorAll(selector);
       for (const candidate of candidates) {
-        if (!isVisibleElement(candidate)) {
-          continue;
-        }
-
-        if (getElementUiText(candidate) === "reconnect") {
-          return candidate;
-        }
+        if (!isVisibleElement(candidate)) continue;
+        if (getElementUiText(candidate) === "reconnect") return candidate;
       }
     }
-
     return null;
   }
 
   function tryClickReconnect() {
     const now = Date.now();
-    if (now - lastReconnectClickAt < 3000) {
-      return false;
-    }
-
-    const reconnectElement = findReconnectElement();
-    if (!reconnectElement) {
-      return false;
-    }
-
-    reconnectElement.click();
+    if (now - lastReconnectClickAt < 3000) return false;
+    const el = findReconnectElement();
+    if (!el) return false;
+    el.click();
     lastReconnectClickAt = now;
     console.log("[minibia-bot] clicked reconnect");
     return true;
   }
 
   function startReconnectWatcher() {
-    if (reconnectObserver || reconnectPollTimerId) {
-      return;
-    }
-
-    const runCheck = () => {
-      try {
-        tryClickReconnect();
-      } catch (error) {
-        console.error("[minibia-bot] reconnect watcher failed", error);
-      }
-    };
-
+    if (reconnectObserver || reconnectPollTimerId) return;
+    const runCheck = () => { try { tryClickReconnect(); } catch (e) { console.error("[minibia-bot] reconnect watcher failed", e); } };
     reconnectObserver = new MutationObserver(runCheck);
     reconnectObserver.observe(document.documentElement || document.body, {
-      childList: true,
-      subtree: true,
-      attributes: true,
-      attributeFilter: ["class", "style", "hidden", "aria-hidden", "value"],
+      childList: true, subtree: true, attributes: true,
+      attributeFilter: ["class", "style", "hidden", "aria-hidden", "value"]
     });
-
     reconnectPollTimerId = window.setInterval(runCheck, 2000);
     runCheck();
   }
 
   function stopReconnectWatcher() {
-    if (reconnectObserver) {
-      reconnectObserver.disconnect();
-      reconnectObserver = null;
-    }
-
-    if (reconnectPollTimerId) {
-      window.clearInterval(reconnectPollTimerId);
-      reconnectPollTimerId = null;
-    }
+    if (reconnectObserver) { reconnectObserver.disconnect(); reconnectObserver = null; }
+    if (reconnectPollTimerId) { window.clearInterval(reconnectPollTimerId); reconnectPollTimerId = null; }
   }
-
   startReconnectWatcher();
 
-  // __imB counter reset - keeps the input metrics counter clean
+  // ---- __imB COUNTER RESET (prevents input spam detection) ----
   let __imbResetInterval = null;
-  
   function startImbReset(intervalMs = 1000) {
     if (__imbResetInterval) return;
-    
     __imbResetInterval = setInterval(() => {
-      if (typeof __imB !== 'undefined') {
-        __imB = 0;
-      }
+      if (typeof __imB !== 'undefined') __imB = 0;
     }, intervalMs);
   }
-  
   function stopImbReset() {
-    if (__imbResetInterval) {
-      clearInterval(__imbResetInterval);
-      __imbResetInterval = null;
-    }
+    if (__imbResetInterval) { clearInterval(__imbResetInterval); __imbResetInterval = null; }
   }
-  
-  // Auto-start the reset
   startImbReset(1000);
 
+  // ---- PUBLIC API ----
   return {
     version: "0.3.0",
     addCleanup,
+
+    /** Destroy the bot and all its modules (call before reload) */
     destroy() {
-      if (this.panic?.stop) {
-        this.panic.stop();
-      }
-
-      if (this.rune?.stop) {
-        this.rune.stop({ persistEnabled: false });
-      }
-
-      if (this.heal?.stop) {
-        this.heal.stop({ persistEnabled: false });
-      }
-
-      if (this.invisible?.stop) {
-        this.invisible.stop({ persistEnabled: false });
-      }
-
-      if (this.attack?.stop) {
-        this.attack.stop({ persistEnabled: false });
-      }
-
-      if (this.cave?.stop) {
-        this.cave.stop({ persistEnabled: false });
-      }
-
-      if (this.equipRing?.stop) {
-        this.equipRing.stop({ persistEnabled: false });
-      }
-
-      if (this.eat?.stop) {
-        this.eat.stop({ persistEnabled: false });
-      }
-
-      if (this.talk?.stop) {
-        this.talk.stop({ persistEnabled: false });
-      }
-
-      if (this.ui?.destroy) {
-        this.ui.destroy();
-      }
-
+      if (this.panic?.stop) this.panic.stop();
+      if (this.rune?.stop) this.rune.stop({ persistEnabled: false });
+      if (this.heal?.stop) this.heal.stop({ persistEnabled: false });
+      if (this.invisible?.stop) this.invisible.stop({ persistEnabled: false });
+      if (this.attack?.stop) this.attack.stop({ persistEnabled: false });
+      if (this.cave?.stop) this.cave.stop({ persistEnabled: false });
+      if (this.equipRing?.stop) this.equipRing.stop({ persistEnabled: false });
+      if (this.eat?.stop) this.eat.stop({ persistEnabled: false });
+      if (this.talk?.stop) this.talk.stop({ persistEnabled: false });
+      if (this.ui?.destroy) this.ui.destroy();
       stopReconnectWatcher();
       stopImbReset();
       destroyAlarmAudio();
       runCleanups();
     },
+
     log(...args) {
       console.log("[minibia-bot]", ...args);
     },
+
+    /** Simple localStorage wrapper with JSON serialisation */
     storage: {
       get(key, fallback = null) {
         try {
           const value = window.localStorage.getItem(key);
           return value == null ? fallback : JSON.parse(value);
-        } catch (error) {
-          return fallback;
-        }
+        } catch { return fallback; }
       },
       set(key, value) {
         window.localStorage.setItem(key, JSON.stringify(value));
@@ -355,8 +255,10 @@ window.__minibiaBotBundle.createBot = function createBot() {
       },
       remove(key) {
         window.localStorage.removeItem(key);
-      },
+      }
     },
+
+    /** Game client accessors */
     getPlayerPosition() {
       return window.gameClient?.player?.getPosition?.() || null;
     },
@@ -364,22 +266,21 @@ window.__minibiaBotBundle.createBot = function createBot() {
       return window.gameClient?.player?.state || null;
     },
     getPlayerName() {
-      return (
-        String(
-          this.getPlayerState()?.name ||
-          window.gameClient?.player?.name ||
-          window.gameClient?.player?.state?.name ||
-          ""
-        ).trim() || null
-      );
+      return String(
+        this.getPlayerState()?.name ||
+        window.gameClient?.player?.name ||
+        window.gameClient?.player?.state?.name ||
+        ""
+      ).trim() || null;
     },
+
+    /** Snapshot of HP, mana, skills (uses skill window fallback) */
     getPlayerSnapshot() {
       const playerState = this.getPlayerState() || {};
       const levelText = getSkillWindowValue(["level"]);
       const magicLevelText = getSkillWindowValue(["magic", "magic-level", "mlvl"]);
       const experienceText = getSkillWindowValue(["experience", "exp"]);
       const capacityText = getSkillWindowValue(["capacity", "cap"]);
-
       return {
         name: this.getPlayerName(),
         level: parseNumberText(playerState.level) ?? parseNumberText(levelText),
@@ -393,129 +294,110 @@ window.__minibiaBotBundle.createBot = function createBot() {
         food: getSkillWindowValue(["food"]),
       };
     },
+
+    /** Send a chat message via the default channel, remembering it for deduplication */
     sendChat(text) {
       const channelManager = window.gameClient?.interface?.channelManager;
-      if (!channelManager || !text) {
-        return false;
-      }
-
+      if (!channelManager || !text) return false;
       channelManager.sendMessageText(text);
       rememberSentChat(text);
       this.log("sent chat:", text);
       return true;
     },
+
     isRecentSentChat(text, withinMs) {
       return isRecentSentChat(text, withinMs);
     },
+
     clickReconnect() {
       return tryClickReconnect();
     },
+
+    /** Click a hotbar slot by index (0‑based) */
     clickHotbar(index) {
       const button = window.gameClient?.interface?.hotbarManager?.slots?.[index]?.canvas?.canvas;
-      if (!button) {
-        return false;
-      }
-
+      if (!button) return false;
       button.click();
       return true;
     },
-    getAlarmAudioSrc() {
-      return getStoredAlarmAudioSrc();
-    },
+
+    /** Alarm audio management */
+    getAlarmAudioSrc() { return getStoredAlarmAudioSrc(); },
     setAlarmAudioSrc(src) {
       const nextSrc = String(src || "").trim();
-      if (!nextSrc) {
-        return false;
-      }
-
+      if (!nextSrc) return false;
       setStoredAlarmAudioSrc(nextSrc);
       destroyAlarmAudio();
       this.log("alarm audio updated", nextSrc);
       return true;
     },
+
+    /** Unlock audio autoplay by playing a muted sound */
     unlockAudio() {
       try {
         const audio = getAlarmAudio();
-        if (!audio) {
-          return false;
-        }
-
+        if (!audio) return false;
         audio.muted = true;
         const playResult = audio.play();
-
         if (playResult && typeof playResult.then === "function") {
-          playResult
-            .then(() => {
-              audio.pause();
-              audio.currentTime = 0;
-              audio.muted = false;
-            })
-            .catch((error) => {
-              audio.muted = false;
-              this.log("audio unlock failed", error?.message || error);
-            });
+          playResult.then(() => { audio.pause(); audio.currentTime = 0; audio.muted = false; })
+                   .catch(() => { audio.muted = false; });
         } else {
-          audio.pause();
-          audio.currentTime = 0;
-          audio.muted = false;
+          audio.pause(); audio.currentTime = 0; audio.muted = false;
         }
-
         return true;
       } catch (error) {
         console.error("[minibia-bot] audio unlock failed", error);
         return false;
       }
     },
+
+    /** Play the alarm sound */
     playAlarm() {
       try {
         const audio = getAlarmAudio();
-        if (!audio) {
-          return false;
-        }
-
+        if (!audio) return false;
         audio.pause();
         audio.currentTime = 0;
         audio.muted = false;
         const playResult = audio.play();
-
         if (playResult && typeof playResult.catch === "function") {
-          playResult.catch((error) => {
-            this.log("alarm playback failed", error?.message || error);
-          });
+          playResult.catch((error) => this.log("alarm playback failed", error?.message || error));
         }
-
         return true;
       } catch (error) {
         console.error("[minibia-bot] alarm failed", error);
         return false;
       }
     },
+
+    /** Control the __imB reset interval */
     imbReset: {
       start: () => startImbReset(1000),
       stop: stopImbReset,
       reset: () => { if (typeof __imB !== 'undefined') __imB = 0; }
-    },
+    }
   };
 };
-window.__minibiaBotBundle = window.__minibiaBotBundle || {};
 
+/**
+ * ==================================================================================
+ * 2. PZ MODULE (Protection Zone)
+ *    Finds, paths to, and remembers PZ tiles. Also allows setting a "home" PZ.
+ * ==================================================================================
+ */
 window.__minibiaBotBundle.installPzModule = function installPzModule(bot) {
   const homeStorageKey = "minibiaBot.pz.home";
 
   function getLoadedTiles() {
     const chunks = window.gameClient?.world?.chunks || [];
     const tiles = [];
-
     for (const chunk of chunks) {
       if (!chunk?.tiles) continue;
-
       for (const tile of chunk.tiles) {
-        if (tile?.__position) {
-          tiles.push(tile);
-        }
+        if (tile?.__position) tiles.push(tile);
       }
     }
-
     return tiles;
   }
 
@@ -526,18 +408,15 @@ window.__minibiaBotBundle.installPzModule = function installPzModule(bot) {
   function getPzCandidates() {
     const me = bot.getPlayerPosition();
     if (!me) return [];
-
     return getLoadedTiles()
-      .filter((tile) => hasPzFlag(tile) && tile.__position?.z === me.z)
-      .map((tile) => {
-        const p = tile.__position;
+      .filter(t => hasPzFlag(t) && t.__position?.z === me.z)
+      .map(t => {
+        const p = t.__position;
         return {
-          tile,
-          x: p.x,
-          y: p.y,
-          z: p.z,
-          flags: tile.flags || 0,
-          dist: Math.abs(p.x - me.x) + Math.abs(p.y - me.y),
+          tile: t,
+          x: p.x, y: p.y, z: p.z,
+          flags: t.flags || 0,
+          dist: Math.abs(p.x - me.x) + Math.abs(p.y - me.y)
         };
       })
       .sort((a, b) => a.dist - b.dist);
@@ -545,13 +424,10 @@ window.__minibiaBotBundle.installPzModule = function installPzModule(bot) {
 
   function goToTile(tile) {
     if (!tile?.__position) return false;
-
     const from = bot.getPlayerPosition();
     if (!from) return false;
-
     const p = tile.__position;
     const to = new Position(p.x, p.y, p.z);
-
     try {
       window.gameClient?.world?.pathfinder?.findPath?.(from, to);
       bot.log("pathing to", { x: p.x, y: p.y, z: p.z, flags: tile.flags });
@@ -564,25 +440,13 @@ window.__minibiaBotBundle.installPzModule = function installPzModule(bot) {
 
   function goToNearestPz(maxAttempts = 20) {
     const candidates = getPzCandidates().slice(0, maxAttempts);
-
-    if (!candidates.length) {
-      bot.log("No PZ candidates found");
-      return false;
-    }
-
+    if (!candidates.length) { bot.log("No PZ candidates found"); return false; }
     for (const candidate of candidates) {
       if (goToTile(candidate.tile)) {
-        bot.log("selected PZ", {
-          x: candidate.x,
-          y: candidate.y,
-          z: candidate.z,
-          flags: candidate.flags,
-          dist: candidate.dist,
-        });
+        bot.log("selected PZ", candidate);
         return true;
       }
     }
-
     bot.log("No PZ candidate accepted by pathfinder");
     return false;
   }
@@ -596,95 +460,49 @@ window.__minibiaBotBundle.installPzModule = function installPzModule(bot) {
 
   function setHomePzCurrentSpot() {
     const pos = bot.getPlayerPosition();
-    if (!pos) {
-      bot.log("Could not read current position");
-      return null;
-    }
-
+    if (!pos) { bot.log("Could not read current position"); return null; }
     return setHomePz(pos.x, pos.y, pos.z);
   }
 
-  function getHomePz() {
-    return bot.storage.get(homeStorageKey, null);
-  }
-
-  function clearHomePz() {
-    bot.storage.remove(homeStorageKey);
-    bot.log("home PZ cleared");
-  }
+  function getHomePz() { return bot.storage.get(homeStorageKey, null); }
+  function clearHomePz() { bot.storage.remove(homeStorageKey); bot.log("home PZ cleared"); }
 
   function getNearestPzTo(x, y, z) {
     const candidates = getLoadedTiles()
-      .filter((tile) => hasPzFlag(tile) && tile.__position?.z === z)
-      .map((tile) => {
-        const p = tile.__position;
-        return {
-          tile,
-          x: p.x,
-          y: p.y,
-          z: p.z,
-          flags: tile.flags || 0,
-          dist: Math.abs(p.x - x) + Math.abs(p.y - y),
-        };
+      .filter(t => hasPzFlag(t) && t.__position?.z === z)
+      .map(t => {
+        const p = t.__position;
+        return { tile: t, x: p.x, y: p.y, z: p.z, flags: t.flags || 0,
+                 dist: Math.abs(p.x - x) + Math.abs(p.y - y) };
       })
       .sort((a, b) => a.dist - b.dist);
-
     return candidates[0] || null;
   }
 
   function goToHomePz() {
     const home = getHomePz();
-    if (!home) {
-      bot.log("No home PZ set");
-      return false;
-    }
-
+    if (!home) { bot.log("No home PZ set"); return false; }
     const candidate = getNearestPzTo(home.x, home.y, home.z);
-    if (!candidate) {
-      bot.log("No loaded PZ found near saved home", home);
-      return false;
-    }
-
-    bot.log("home candidate", {
-      x: candidate.x,
-      y: candidate.y,
-      z: candidate.z,
-      flags: candidate.flags,
-      distFromHome: candidate.dist,
-    });
-
+    if (!candidate) { bot.log("No loaded PZ found near saved home", home); return false; }
+    bot.log("home candidate", candidate);
     return goToTile(candidate.tile);
   }
 
   function printPzCandidates(limit = 10) {
-    const rows = getPzCandidates()
-      .slice(0, limit)
-      .map((candidate) => ({
-        x: candidate.x,
-        y: candidate.y,
-        z: candidate.z,
-        flags: candidate.flags,
-        dist: candidate.dist,
-      }));
-
+    const rows = getPzCandidates().slice(0, limit).map(c => ({
+      x: c.x, y: c.y, z: c.z, flags: c.flags, dist: c.dist
+    }));
     console.table(rows);
     return rows;
   }
 
+  // Expose public API
   bot.pz = {
-    getLoadedTiles,
-    getPzCandidates,
-    goToTile,
-    goToNearestPz,
-    setHomePz,
-    setHomePzCurrentSpot,
-    getHomePz,
-    clearHomePz,
-    getNearestPzTo,
-    goToHomePz,
-    printPzCandidates,
+    getLoadedTiles, getPzCandidates, goToTile, goToNearestPz,
+    setHomePz, setHomePzCurrentSpot, getHomePz, clearHomePz,
+    getNearestPzTo, goToHomePz, printPzCandidates
   };
-
+  // Convenience aliases
   bot.goToNearestPz = goToNearestPz;
   bot.setHomePz = setHomePz;
   bot.setHomePzCurrentSpot = setHomePzCurrentSpot;
@@ -692,24 +510,24 @@ window.__minibiaBotBundle.installPzModule = function installPzModule(bot) {
   bot.clearHomePz = clearHomePz;
   bot.goToHomePz = goToHomePz;
 };
-window.__minibiaBotBundle = window.__minibiaBotBundle || {};
 
+/**
+ * ==================================================================================
+ * 3. XRAY MODULE
+ *    Tracks creatures (players and monsters) and draws an overlay showing
+ *    off‑screen and on‑other‑floor creatures. Supports floor filtering.
+ * ==================================================================================
+ */
 window.__minibiaBotBundle.installXrayModule = function installXrayModule(bot) {
   const configStorageKey = "minibiaBot.xray.config";
   const overlayRootId = "minibia-bot-xray-overlay";
   const overlayStyleId = "minibia-bot-xray-overlay-style";
-  const overlayState = {
-    running: false,
-    timerId: null,
-  };
+  const overlayState = { running: false, timerId: null };
+
   const config = Object.assign(
-    {
-      overlayEnabled: false,
-      selectedFloor: null,
-    },
+    { overlayEnabled: false, selectedFloor: null },
     bot.storage.get(configStorageKey, {})
   );
-
   config.selectedFloor = normalizeSelectedFloor(config.selectedFloor);
 
   function persistConfig() {
@@ -721,221 +539,125 @@ window.__minibiaBotBundle.installXrayModule = function installXrayModule(bot) {
   }
 
   function normalizeSelectedFloor(value) {
-    if (value == null || value === "" || value === "all") {
-      return null;
-    }
-
+    if (value == null || value === "" || value === "all") return null;
     const floor = Number(value);
-    if (!Number.isFinite(floor)) {
-      return null;
-    }
-
+    if (!Number.isFinite(floor)) return null;
     return Math.trunc(floor);
   }
 
   function isWithinVisibleRange(me, pos) {
-    if (!me || !pos) {
-      return false;
-    }
-
+    if (!me || !pos) return false;
     const dx = Math.abs(pos.x - me.x);
     const dy = Math.abs(pos.y - me.y);
-    return dx <= 8 && dy <= 6;
+    return dx <= 8 && dy <= 6;   // Tibia screen radius
   }
 
   function getTrackedCreatures() {
     const myState = bot.getPlayerState();
     const myId = window.gameClient?.player?.id;
     const myName = normalizeName(myState?.name);
-
-    return Object.values(window.gameClient?.world?.activeCreatures || {}).filter((creature) => {
-      if (!creature) return false;
-      if (creature.id === myId) return false;
-
-      const name = normalizeName(creature.name);
-      if (name && name === myName) return false;
-
-      return true;
-    });
+    return Object.values(window.gameClient?.world?.activeCreatures || {})
+      .filter(creature => {
+        if (!creature) return false;
+        if (creature.id === myId) return false;
+        const name = normalizeName(creature.name);
+        if (name && name === myName) return false;
+        return true;
+      });
   }
 
+  /** Creatures visible on screen (within viewport) */
   function getVisibleCreatures() {
     const me = bot.getPlayerPosition();
-    if (!me) {
-      return [];
-    }
-
-    // Keep the visible query strict; panic logic relies on this staying screen-limited.
-    return getTrackedCreatures().filter((creature) => isWithinVisibleRange(me, creature.__position));
+    if (!me) return [];
+    return getTrackedCreatures().filter(c => isWithinVisibleRange(me, c.__position));
   }
 
+  /** Visible players (type === 0) – optionally only same floor */
   function getVisiblePlayers(options = {}) {
     const { sameFloorOnly = false } = options;
     const me = bot.getPlayerPosition();
-    if (!me) {
-      return [];
-    }
-
-    return getVisibleCreatures().filter((creature) => {
-      if (creature?.type !== 0) {
-        return false;
-      }
-
-      if (!sameFloorOnly) {
-        return true;
-      }
-
-      return creature.__position?.z === me.z;
+    if (!me) return [];
+    return getVisibleCreatures().filter(c => {
+      if (c?.type !== 0) return false;
+      if (!sameFloorOnly) return true;
+      return c.__position?.z === me.z;
     });
   }
 
+  /** Visible monsters (type !== 0) – optionally only same floor */
   function getVisibleMonsters(options = {}) {
     const { sameFloorOnly = false } = options;
     const me = bot.getPlayerPosition();
-    if (!me) {
-      return [];
-    }
-
-    return getVisibleCreatures().filter((creature) => {
-      if (creature?.type === 0) {
-        return false;
-      }
-
-      if (!sameFloorOnly) {
-        return true;
-      }
-
-      return creature.__position?.z === me.z;
+    if (!me) return [];
+    return getVisibleCreatures().filter(c => {
+      if (c?.type === 0) return false;
+      if (!sameFloorOnly) return true;
+      return c.__position?.z === me.z;
     });
   }
 
   function readCreatureHealth(creature) {
-    if (!creature) {
-      return null;
-    }
-
-    const current = [
-      creature.health,
-      creature.hp,
-      creature.currentHealth,
-      creature.state?.health,
-    ].find((value) => Number.isFinite(Number(value)));
-
-    const max = [
-      creature.maxHealth,
-      creature.maxHp,
-      creature.maximumHealth,
-      creature.state?.maxHealth,
-    ].find((value) => Number.isFinite(Number(value)));
-
-    const percent = [
-      creature.healthPercent,
-      creature.hpPercent,
-      creature.healthpercentage,
-      creature.state?.healthPercent,
-    ].find((value) => Number.isFinite(Number(value)));
-
-    if (current != null && max != null) {
-      return `${Number(current)}/${Number(max)} HP`;
-    }
-
-    if (percent != null) {
-      return `${Math.round(Number(percent))}% HP`;
-    }
-
-    if (current != null) {
-      return `${Number(current)} HP`;
-    }
-
+    // Try multiple properties to get current/max/percent
+    const current = [creature.health, creature.hp, creature.currentHealth, creature.state?.health]
+      .find(v => Number.isFinite(Number(v)));
+    const max = [creature.maxHealth, creature.maxHp, creature.maximumHealth, creature.state?.maxHealth]
+      .find(v => Number.isFinite(Number(v)));
+    const percent = [creature.healthPercent, creature.hpPercent, creature.healthpercentage, creature.state?.healthPercent]
+      .find(v => Number.isFinite(Number(v)));
+    if (current != null && max != null) return `${Number(current)}/${Number(max)} HP`;
+    if (percent != null) return `${Math.round(Number(percent))}% HP`;
+    if (current != null) return `${Number(current)} HP`;
     return null;
   }
 
   function getCreatureLabel(creature) {
-    if (creature?.name) {
-      return creature.name;
-    }
-
-    return creature?.type === 0 ? "Player" : "Mob";
+    return creature?.name || (creature?.type === 0 ? "Player" : "Mob");
   }
 
+  /** Creatures to be displayed on the overlay (off‑floor or off‑screen) */
   function getOverlayCreatures() {
     const me = bot.getPlayerPosition();
-    if (!me) {
-      return [];
-    }
-
-    return getTrackedCreatures().filter((creature) => {
-      const pos = creature?.__position;
-      if (!pos || pos.z == null) {
-        return false;
-      }
-
-      if (config.selectedFloor != null && pos.z !== config.selectedFloor) {
-        return false;
-      }
-
+    if (!me) return [];
+    return getTrackedCreatures().filter(c => {
+      const pos = c?.__position;
+      if (!pos || pos.z == null) return false;
+      if (config.selectedFloor != null && pos.z !== config.selectedFloor) return false;
       if (pos.z !== me.z) {
-        return isWithinVisibleRange(me, pos);
+        return isWithinVisibleRange(me, pos);  // other floors within visible radius
       }
-
-      return !isWithinVisibleRange(me, pos);
+      return !isWithinVisibleRange(me, pos);   // same floor but off‑screen
     });
   }
 
-  function clamp(value, min, max) {
-    return Math.min(Math.max(value, min), max);
-  }
-
-  function getSameFloorOffscreenMarkerText(creature, healthLabel) {
-    return healthLabel
-      ? `${getCreatureLabel(creature)} ${healthLabel}`
-      : `${getCreatureLabel(creature)}`;
-  }
+  // ---- OVERLAY RENDERING ----
+  function clamp(value, min, max) { return Math.min(Math.max(value, min), max); }
 
   function ensureOverlayStyle() {
-    if (document.getElementById(overlayStyleId)) {
-      return;
-    }
-
+    if (document.getElementById(overlayStyleId)) return;
     const style = document.createElement("style");
     style.id = overlayStyleId;
     style.textContent = `
-      #${overlayRootId} {
-        position: fixed;
-        inset: 0;
-        pointer-events: none;
-        z-index: 999998;
-      }
-
+      #${overlayRootId} { position: fixed; inset: 0; pointer-events: none; z-index: 999998; }
       #${overlayRootId} .mb-xray-marker {
-        position: fixed;
-        transform: translate(-50%, -50%);
-        padding: 2px 6px;
-        border: 1px solid rgba(255, 211, 128, 0.85);
-        border-radius: 999px;
-        background: rgba(65, 24, 12, 0.72);
-        box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35);
-        color: #ffe7ae;
-        font: 11px/1.2 Verdana, sans-serif;
+        position: fixed; transform: translate(-50%, -50%);
+        padding: 2px 6px; border: 1px solid rgba(255,211,128,0.85);
+        border-radius: 999px; background: rgba(65,24,12,0.72);
+        box-shadow: 0 0 0 1px rgba(0,0,0,0.35);
+        color: #ffe7ae; font: 11px/1.2 Verdana, sans-serif;
         white-space: nowrap;
       }
-
       #${overlayRootId} .mb-xray-marker.mb-xray-marker-offscreen {
-        border-color: rgba(123, 235, 178, 0.92);
-        background: rgba(11, 61, 43, 0.8);
-        color: #d8ffea;
+        border-color: rgba(123,235,178,0.92);
+        background: rgba(11,61,43,0.8); color: #d8ffea;
       }
-	  
     `;
     document.head.appendChild(style);
   }
 
   function ensureOverlayRoot() {
     let root = document.getElementById(overlayRootId);
-    if (root) {
-      return root;
-    }
-
+    if (root) return root;
     root = document.createElement("div");
     root.id = overlayRootId;
     document.body.appendChild(root);
@@ -949,45 +671,37 @@ window.__minibiaBotBundle.installXrayModule = function installXrayModule(bot) {
 
   function getViewportRect() {
     const canvases = Array.from(document.querySelectorAll("canvas"))
-      .map((canvas) => ({ canvas, rect: canvas.getBoundingClientRect() }))
+      .map(c => ({ canvas: c, rect: c.getBoundingClientRect() }))
       .filter(({ rect }) => rect.width >= 200 && rect.height >= 150)
       .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height));
-
     return canvases[0]?.rect || null;
   }
 
   function renderOverlay() {
-    if (!overlayState.running) {
-      return;
-    }
-
+    if (!overlayState.running) return;
     const root = ensureOverlayRoot();
     const me = bot.getPlayerPosition();
     const viewportRect = getViewportRect();
     const creatures = getOverlayCreatures();
     root.innerHTML = "";
-
-    if (!me || !viewportRect || !creatures.length) {
-      return;
-    }
+    if (!me || !viewportRect || !creatures.length) return;
 
     const tileWidth = viewportRect.width / 17;
     const tileHeight = viewportRect.height / 13;
     const edgePadding = 48;
 
-    creatures.forEach((creature) => {
-      const pos = creature?.__position;
+    creatures.forEach(c => {
+      const pos = c.__position;
       if (!pos) return;
-
       const dx = pos.x - me.x;
       const dy = pos.y - me.y;
-      const healthLabel = readCreatureHealth(creature);
+      const healthLabel = readCreatureHealth(c);
       const marker = document.createElement("div");
       marker.className = "mb-xray-marker";
 
       if (pos.z === me.z) {
         marker.classList.add("mb-xray-marker-offscreen");
-        marker.textContent = getSameFloorOffscreenMarkerText(creature, healthLabel);
+        marker.textContent = healthLabel ? `${getCreatureLabel(c)} ${healthLabel}` : `${getCreatureLabel(c)}`;
         marker.style.left = `${clamp(
           viewportRect.left + ((dx + 8.5) * tileWidth),
           viewportRect.left + edgePadding,
@@ -1002,12 +716,11 @@ window.__minibiaBotBundle.installXrayModule = function installXrayModule(bot) {
         const floorOffset = me.z - pos.z;
         const floorLabel = floorOffset === 0 ? "0" : floorOffset > 0 ? `+${floorOffset}` : `${floorOffset}`;
         marker.textContent = healthLabel
-          ? `${getCreatureLabel(creature)} (${floorLabel}) ${healthLabel}`
-          : `${getCreatureLabel(creature)} (${floorLabel})`;
+          ? `${getCreatureLabel(c)} (${floorLabel}) ${healthLabel}`
+          : `${getCreatureLabel(c)} (${floorLabel})`;
         marker.style.left = `${viewportRect.left + ((dx + 8.5) * tileWidth)}px`;
         marker.style.top = `${viewportRect.top + ((dy + 6.5) * tileHeight)}px`;
       }
-
       root.appendChild(marker);
     });
   }
@@ -1015,11 +728,7 @@ window.__minibiaBotBundle.installXrayModule = function installXrayModule(bot) {
   function startOverlay() {
     config.overlayEnabled = true;
     persistConfig();
-
-    if (overlayState.running) {
-      return false;
-    }
-
+    if (overlayState.running) return false;
     overlayState.running = true;
     ensureOverlayStyle();
     renderOverlay();
@@ -1030,118 +739,63 @@ window.__minibiaBotBundle.installXrayModule = function installXrayModule(bot) {
   function stopOverlay() {
     config.overlayEnabled = false;
     persistConfig();
-
-    if (!overlayState.running && overlayState.timerId == null) {
-      return false;
-    }
-
+    if (!overlayState.running && overlayState.timerId == null) return false;
     overlayState.running = false;
     if (overlayState.timerId != null) {
       window.clearInterval(overlayState.timerId);
       overlayState.timerId = null;
     }
-
     destroyOverlayElements();
     return true;
   }
 
   function setOverlayEnabled(enabled) {
-    const nextEnabled = !!enabled;
-
-    if (nextEnabled) {
-      if (overlayState.running) {
-        config.overlayEnabled = true;
-        persistConfig();
-        return true;
-      }
-
-      return startOverlay();
-    }
-
-    if (!overlayState.running) {
-      config.overlayEnabled = false;
-      persistConfig();
-      destroyOverlayElements();
-      return true;
-    }
-
+    const next = !!enabled;
+    if (next) return startOverlay();
     return stopOverlay();
   }
 
   function setSelectedFloor(floor) {
     config.selectedFloor = normalizeSelectedFloor(floor);
     persistConfig();
-
-    if (overlayState.running) {
-      renderOverlay();
-    }
-
+    if (overlayState.running) renderOverlay();
     return config.selectedFloor;
   }
 
   function status() {
     return {
-      visibleCreatures: getVisibleCreatures().map((creature) => ({
-        id: creature.id,
-        name: creature.name,
-        type: creature.type,
-        position: creature.__position || null,
-      })),
-      visiblePlayers: getVisiblePlayers().map((player) => ({
-        id: player.id,
-        name: player.name,
-        position: player.__position || null,
-      })),
-      visiblePlayersCurrentFloor: getVisiblePlayers({ sameFloorOnly: true }).map((player) => ({
-        id: player.id,
-        name: player.name,
-        position: player.__position || null,
-      })),
-      visibleMonsters: getVisibleMonsters().map((creature) => ({
-        id: creature.id,
-        name: creature.name,
-        type: creature.type,
-        position: creature.__position || null,
-      })),
-      visibleMonstersCurrentFloor: getVisibleMonsters({ sameFloorOnly: true }).map((creature) => ({
-        id: creature.id,
-        name: creature.name,
-        type: creature.type,
-        position: creature.__position || null,
-      })),
-      overlayCreatures: getOverlayCreatures().map((creature) => ({
-        id: creature.id,
-        name: creature.name,
-        type: creature.type,
-        position: creature.__position || null,
-      })),
+      visibleCreatures: getVisibleCreatures().map(c => ({ id: c.id, name: c.name, type: c.type, position: c.__position })),
+      visiblePlayers: getVisiblePlayers().map(p => ({ id: p.id, name: p.name, position: p.__position })),
+      visiblePlayersCurrentFloor: getVisiblePlayers({ sameFloorOnly: true }).map(p => ({ id: p.id, name: p.name, position: p.__position })),
+      visibleMonsters: getVisibleMonsters().map(m => ({ id: m.id, name: m.name, type: m.type, position: m.__position })),
+      visibleMonstersCurrentFloor: getVisibleMonsters({ sameFloorOnly: true }).map(m => ({ id: m.id, name: m.name, type: m.type, position: m.__position })),
+      overlayCreatures: getOverlayCreatures().map(c => ({ id: c.id, name: c.name, type: c.type, position: c.__position })),
       config: { ...config },
       overlayRunning: overlayState.running,
     };
   }
 
+  // Public API
   bot.xray = {
-    getVisibleCreatures,
-    getVisiblePlayers,
-    getVisibleMonsters,
-    getOverlayCreatures,
-    startOverlay,
-    stopOverlay,
-    setOverlayEnabled,
-    setSelectedFloor,
-    status,
-    config,
+    getVisibleCreatures, getVisiblePlayers, getVisibleMonsters,
+    getOverlayCreatures, startOverlay, stopOverlay, setOverlayEnabled,
+    setSelectedFloor, status, config
   };
 
-  if (config.overlayEnabled) {
-    startOverlay();
-  } else {
-    destroyOverlayElements();
-  }
+  // Auto‑start if enabled
+  if (config.overlayEnabled) startOverlay();
+  else destroyOverlayElements();
   bot.addCleanup(stopOverlay);
 };
-window.__minibiaBotBundle = window.__minibiaBotBundle || {};
 
+/**
+ * ==================================================================================
+ * 4. PANIC MODULE
+ *    Monitors for threats (unknown players, health loss, game masters) and
+ *    triggers an alarm, stops running modules, and optionally returns to a safe
+ *    position. Also includes a sound‑only "player on‑screen" alert.
+ * ==================================================================================
+ */
 window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) {
   const configStorageKey = "minibiaBot.panic.config";
   const state = {
@@ -1155,6 +809,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
     returnNotBeforeAt: 0,
     lastThreatAt: 0,
     lastReturnAttemptAt: 0,
+    lastPlayerAlertAt: 0,
   };
 
   const config = Object.assign(
@@ -1162,11 +817,13 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
       tickMs: 200,
       triggerCooldownMs: 4000,
       returnToOriginEnabled: false,
-      returnDelayMs: 300000,
-      returnDelayJitterMs: 30000,
+      returnDelayMs: 300000,          // 5 minutes
+      returnDelayJitterMs: 30000,     // ±30 seconds
       returnRetryCooldownMs: 2000,
       unknownPlayerEnabled: false,
       healthLossEnabled: false,
+      playerAlertEnabled: false,
+      playerAlertCooldownMs: 60000,
       trustedNames: [],
       gameMasterNames: [],
     },
@@ -1190,10 +847,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
     const x = Number(position?.x);
     const y = Number(position?.y);
     const z = Number(position?.z);
-    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) {
-      return null;
-    }
-
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return null;
     return { x, y, z };
   }
 
@@ -1202,85 +856,63 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
   }
 
   function getTrustedNames() {
-    return Array.from(
-      new Set(
-        (config.trustedNames || [])
-          .map((name) => normalizeName(name))
-          .filter(Boolean)
-      )
-    );
+    return Array.from(new Set((config.trustedNames || []).map(n => normalizeName(n)).filter(Boolean)));
   }
 
   function getGameMasterNames() {
-    return Array.from(
-      new Set(
-        (config.gameMasterNames || [])
-          .map((name) => normalizeName(name))
-          .filter(Boolean)
-      )
-    );
+    return Array.from(new Set((config.gameMasterNames || []).map(n => normalizeName(n)).filter(Boolean)));
   }
 
+  // ---- VISIBLE PLAYER FILTERING ----
   function getVisiblePlayers() {
     const me = bot.getPlayerPosition();
     const players = bot.xray?.getVisiblePlayers?.() || [];
-    if (!me) {
-      return players;
-    }
-
-    return players.filter((creature) => {
-      const z = Number(creature?.__position?.z);
-      //return Number.isFinite(z) && Math.abs(z - me.z) <= 1;
-	  return Number.isFinite(z) && z === me.z;
+    if (!me) return players;
+    return players.filter(c => {
+      const z = Number(c?.__position?.z);
+      return Number.isFinite(z) && z === me.z;
     });
   }
 
   function getUnknownVisiblePlayers() {
     const trusted = new Set(getTrustedNames());
-
-    return getVisiblePlayers().filter((creature) => {
-      const name = normalizeName(creature?.name);
+    return getVisiblePlayers().filter(c => {
+      const name = normalizeName(c?.name);
       return !!name && !trusted.has(name);
     });
   }
 
   function getTrustedVisiblePlayers() {
     const trusted = new Set(getTrustedNames());
-
-    return getVisiblePlayers().filter((creature) => {
-      const name = normalizeName(creature?.name);
+    return getVisiblePlayers().filter(c => {
+      const name = normalizeName(c?.name);
       return !!name && trusted.has(name);
     });
   }
 
   function getVisibleGameMasters() {
-    const gameMasters = new Set(getGameMasterNames());
-
-    return getVisiblePlayers().filter((creature) => {
-      const name = normalizeName(creature?.name);
-      return !!name && gameMasters.has(name);
+    const gms = new Set(getGameMasterNames());
+    return getVisiblePlayers().filter(c => {
+      const name = normalizeName(c?.name);
+      return !!name && gms.has(name);
     });
   }
 
+  // ---- CHAT DAMAGE PARSING ----
   function getRecentChannelMessages() {
-    return (window.gameClient?.interface?.channelManager?.channels || []).flatMap((channel) =>
-      (channel?.__contents || []).map((entry) => ({
-        channelName: channel?.name || null,
-        message: String(entry?.message || ""),
-        time: entry?.__time || null,
-      }))
-    );
+    return (window.gameClient?.interface?.channelManager?.channels || [])
+      .flatMap(channel =>
+        (channel?.__contents || []).map(entry => ({
+          channelName: channel?.name || null,
+          message: String(entry?.message || ""),
+          time: entry?.__time || null,
+        }))
+      );
   }
 
   function parseDamageMessage(entry) {
-    const match = entry.message.match(
-      /^You lose\s+(\d+)\s+hitpoints\s+due to an attack by\s+(.+?)\.$/i
-    );
-
-    if (!match) {
-      return null;
-    }
-
+    const match = entry.message.match(/^You lose\s+(\d+)\s+hitpoints\s+due to an attack by\s+(.+?)\.$/i);
+    if (!match) return null;
     return {
       amount: Number(match[1]),
       attackerName: match[2].trim(),
@@ -1300,19 +932,16 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         const bTime = b.time ? Date.parse(b.time) : 0;
         return bTime - aTime;
       });
-
     return messages[0] || null;
   }
 
+  // ---- RETURN TO ORIGIN LOGIC ----
   function getReturnDelayMs() {
-    const baseDelayMs = normalizeDelayMs(config.returnDelayMs, 0);
-    const jitterMs = normalizeDelayMs(config.returnDelayJitterMs, 0);
-    if (!jitterMs) {
-      return baseDelayMs;
-    }
-
-    const randomOffset = Math.floor(Math.random() * ((jitterMs * 2) + 1)) - jitterMs;
-    return Math.max(0, baseDelayMs + randomOffset);
+    const base = normalizeDelayMs(config.returnDelayMs, 0);
+    const jitter = normalizeDelayMs(config.returnDelayJitterMs, 0);
+    if (!jitter) return base;
+    const randomOffset = Math.floor(Math.random() * ((jitter * 2) + 1)) - jitter;
+    return Math.max(0, base + randomOffset);
   }
 
   function clearPendingReturn() {
@@ -1331,20 +960,12 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
   }
 
   function armPendingReturn(now = Date.now(), origin = normalizePosition(bot.getPlayerPosition())) {
-    if (!config.returnToOriginEnabled) {
-      clearPendingReturn();
-      return;
-    }
-
+    if (!config.returnToOriginEnabled) { clearPendingReturn(); return; }
     if (!state.pendingReturnOrigin && origin) {
       state.pendingReturnOrigin = origin;
       state.pendingReturnModules = snapshotInterruptedModules();
     }
-
-    if (!state.pendingReturnOrigin) {
-      return;
-    }
-
+    if (!state.pendingReturnOrigin) return;
     state.lastThreatAt = now;
     state.returnNotBeforeAt = now + getReturnDelayMs();
   }
@@ -1354,10 +975,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
   }
 
   function restoreInterruptedModules() {
-    if (state.pendingReturnModules?.caveRunning) {
-      bot.cave?.start?.();
-    }
-
+    if (state.pendingReturnModules?.caveRunning) bot.cave?.start?.();
     if (state.pendingReturnModules?.equipRingRunning) {
       bot.equipRing?.start?.();
       bot.ui?.refreshEquipRingStatus?.();
@@ -1365,114 +983,63 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
   }
 
   function tryReturnToOrigin(now = Date.now()) {
-    if (!config.returnToOriginEnabled || !state.pendingReturnOrigin || !state.returnNotBeforeAt) {
-      return false;
-    }
+    if (!config.returnToOriginEnabled || !state.pendingReturnOrigin || !state.returnNotBeforeAt) return false;
+    if (now < state.returnNotBeforeAt) return false;
+    if (!isReturnCoastClear()) return false;
+    if (now - state.lastReturnAttemptAt < normalizeDelayMs(config.returnRetryCooldownMs, 2000)) return false;
 
-    if (now < state.returnNotBeforeAt) {
-      return false;
-    }
-
-    if (!isReturnCoastClear()) {
-      return false;
-    }
-
-    if (now - state.lastReturnAttemptAt < normalizeDelayMs(config.returnRetryCooldownMs, 2000)) {
-      return false;
-    }
-
-    const currentPosition = normalizePosition(bot.getPlayerPosition());
-    if (isSamePosition(currentPosition, state.pendingReturnOrigin)) {
-      bot.log("panic return completed", {
-        origin: state.pendingReturnOrigin,
-        threatAgeMs: now - state.lastThreatAt,
-      });
+    const currentPos = normalizePosition(bot.getPlayerPosition());
+    if (isSamePosition(currentPos, state.pendingReturnOrigin)) {
+      bot.log("panic return completed", { origin: state.pendingReturnOrigin, threatAgeMs: now - state.lastThreatAt });
       restoreInterruptedModules();
       clearPendingReturn();
       return true;
     }
-
     state.lastReturnAttemptAt = now;
-    const moved =
-      !!bot.cave?.goToPosition?.(state.pendingReturnOrigin) ||
-      !!bot.pz?.goToTile?.({ __position: state.pendingReturnOrigin });
-
+    const moved = !!bot.cave?.goToPosition?.(state.pendingReturnOrigin) ||
+                  !!bot.pz?.goToTile?.({ __position: state.pendingReturnOrigin });
     if (moved) {
-      bot.log("panic returning to origin", {
-        origin: state.pendingReturnOrigin,
-        threatAgeMs: now - state.lastThreatAt,
-      });
+      bot.log("panic returning to origin", { origin: state.pendingReturnOrigin, threatAgeMs: now - state.lastThreatAt });
       return true;
     }
-
     bot.log("panic return pathing failed", { origin: state.pendingReturnOrigin });
     return false;
   }
 
+  // ---- TRIGGER FUNCTIONS ----
   function triggerPanic(reason, details = {}) {
     const now = Date.now();
     armPendingReturn(now);
-
-    if (now - state.lastTriggerAt < config.triggerCooldownMs) {
-      return false;
-    }
-
+    if (now - state.lastTriggerAt < config.triggerCooldownMs) return false;
     state.lastTriggerAt = now;
     bot.playAlarm?.();
     bot.log("panic triggered", { reason, ...details });
-
-    if (bot.cave?.stop) {
-      bot.cave.stop({ persistEnabled: false });
-    }
-
+    if (bot.cave?.stop) bot.cave.stop({ persistEnabled: false });
     if (bot.equipRing?.stop) {
       bot.equipRing.stop({ persistEnabled: false });
       bot.ui?.refreshEquipRingStatus?.();
     }
-
     return !!bot.pz?.goToHomePz?.();
   }
 
   function triggerGameMasterKillSwitch(players) {
-    const detectedPlayers = (players || []).map((player) => player?.name).filter(Boolean);
-
+    const detectedPlayers = (players || []).map(p => p?.name).filter(Boolean);
     bot.playAlarm?.();
     bot.log("game master kill switch triggered", { players: detectedPlayers });
-
-    if (bot.rune?.stop) {
-      bot.rune.stop();
-    }
-
-    if (bot.eat?.stop) {
-      bot.eat.stop();
-    }
-
-    if (bot.invisible?.stop) {
-      bot.invisible.stop();
-    }
-
-    if (bot.magicShield?.stop) {
-      bot.magicShield.stop();
-    }
-
-    if (bot.cave?.stop) {
-      bot.cave.stop();
-    }
-
-    if (bot.attack?.stop) {
-      bot.attack.stop();
-    }
-
-    if (bot.equipRing?.stop) {
-      bot.equipRing.stop();
-    }
-
+    // Stop all modules
+    if (bot.rune?.stop) bot.rune.stop();
+    if (bot.eat?.stop) bot.eat.stop();
+    if (bot.invisible?.stop) bot.invisible.stop();
+    if (bot.magicShield?.stop) bot.magicShield.stop();
+    if (bot.cave?.stop) bot.cave.stop();
+    if (bot.attack?.stop) bot.attack.stop();
+    if (bot.equipRing?.stop) bot.equipRing.stop();
     clearPendingReturn();
     config.unknownPlayerEnabled = false;
     config.healthLossEnabled = false;
     persistConfig();
-    stop();
-
+    stop();   // stop the panic loop itself
+    // Refresh UI
     bot.ui?.refreshPanicStatus?.();
     bot.ui?.refreshRuneStatus?.();
     bot.ui?.refreshAutoEatStatus?.();
@@ -1484,107 +1051,82 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
     return true;
   }
 
+  // ---- CHECK FUNCTIONS (called on each tick) ----
   function checkGameMasters() {
-    if (!getGameMasterNames().length) {
-      return false;
-    }
-
-    const visibleGameMasters = getVisibleGameMasters();
-    if (!visibleGameMasters.length) {
-      return false;
-    }
-
-    return triggerGameMasterKillSwitch(visibleGameMasters);
+    if (!getGameMasterNames().length) return false;
+    const visible = getVisibleGameMasters();
+    if (!visible.length) return false;
+    return triggerGameMasterKillSwitch(visible);
   }
 
   function checkUnknownPlayers() {
-    if (!config.unknownPlayerEnabled) {
-      return false;
-    }
-
-    const unknownPlayers = getUnknownVisiblePlayers();
-    if (!unknownPlayers.length) {
-      return false;
-    }
-
-    return triggerPanic("unknown-player", {
-      players: unknownPlayers.map((player) => player.name),
-    });
+    if (!config.unknownPlayerEnabled) return false;
+    const unknown = getUnknownVisiblePlayers();
+    if (!unknown.length) return false;
+    return triggerPanic("unknown-player", { players: unknown.map(p => p.name) });
   }
 
   function checkHealthLoss() {
-    if (!config.healthLossEnabled) {
-      return false;
-    }
-
+    if (!config.healthLossEnabled) return false;
     const playerState = bot.getPlayerState();
     const currentHealth = Number(playerState?.health ?? 0);
-
-    if (state.lastHealth == null) {
-      state.lastHealth = currentHealth;
-      return false;
-    }
-
+    if (state.lastHealth == null) { state.lastHealth = currentHealth; return false; }
     const lostHealth = currentHealth < state.lastHealth;
     state.lastHealth = currentHealth;
+    if (!lostHealth) return false;
 
-    if (!lostHealth) {
-      return false;
-    }
-
-    const latestDamageEvent = getLatestDamageEvent();
-    if (latestDamageEvent && latestDamageEvent.key !== state.lastDamageEventKey) {
-      state.lastDamageEventKey = latestDamageEvent.key;
-
-      const trustedNames = new Set(getTrustedNames());
-      const attackerName = normalizeName(latestDamageEvent.attackerName);
-
-      if (attackerName && trustedNames.has(attackerName)) {
+    const latestDamage = getLatestDamageEvent();
+    if (latestDamage && latestDamage.key !== state.lastDamageEventKey) {
+      state.lastDamageEventKey = latestDamage.key;
+      const trusted = new Set(getTrustedNames());
+      const attacker = normalizeName(latestDamage.attackerName);
+      if (attacker && trusted.has(attacker)) {
         bot.log("ignored health-loss panic because attacker is trusted", {
-          attacker: latestDamageEvent.attackerName,
-          amount: latestDamageEvent.amount,
-          currentHealth,
+          attacker: latestDamage.attackerName, amount: latestDamage.amount, currentHealth
         });
         return false;
       }
-
       return triggerPanic("health-loss", {
-        currentHealth,
-        attacker: latestDamageEvent.attackerName,
-        amount: latestDamageEvent.amount,
+        currentHealth, attacker: latestDamage.attackerName, amount: latestDamage.amount
       });
     }
 
-    const unknownPlayers = getUnknownVisiblePlayers();
-    if (!unknownPlayers.length) {
+    const unknown = getUnknownVisiblePlayers();
+    if (!unknown.length) {
       const trustedPlayers = getTrustedVisiblePlayers();
       if (trustedPlayers.length) {
         bot.log("ignored health-loss panic because only trusted players are nearby", {
-          players: trustedPlayers.map((player) => player.name),
-          currentHealth,
+          players: trustedPlayers.map(p => p.name), currentHealth
         });
         return false;
       }
     }
-
     return triggerPanic("health-loss", { currentHealth });
   }
 
+  // ---- TICK LOOP ----
   function scheduleNextTick() {
     if (!state.running) return;
-
-    state.timerId = window.setTimeout(() => {
-      tick();
-    }, config.tickMs);
+    state.timerId = window.setTimeout(() => tick(), config.tickMs);
   }
 
   function tick() {
     if (!state.running) return;
-
+    const now = Date.now();
     try {
       const triggered = checkGameMasters() || checkUnknownPlayers() || checkHealthLoss();
-      if (!triggered) {
-        tryReturnToOrigin();
+      if (!triggered) tryReturnToOrigin(now);
+
+      // Player on‑screen alert (sound only, does NOT stop any module)
+      if (config.playerAlertEnabled) {
+        const myId = window.gameClient?.player?.id;
+        const allPlayers = bot.xray?.getVisiblePlayers?.() || [];
+        const otherPlayers = allPlayers.filter(p => p.id !== myId);
+        if (otherPlayers.length > 0 && now - state.lastPlayerAlertAt >= config.playerAlertCooldownMs) {
+          state.lastPlayerAlertAt = now;
+          bot.playAlarm?.();
+          bot.log("player on-screen alert", { players: otherPlayers.map(p => p.name) });
+        }
       }
     } finally {
       scheduleNextTick();
@@ -1596,10 +1138,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
   }
 
   function start() {
-    if (state.running) {
-      return false;
-    }
-
+    if (state.running) return false;
     state.running = true;
     state.lastHealth = Number(bot.getPlayerState()?.health ?? 0);
     state.lastDamageEventKey = getLatestDamageEvent()?.key || null;
@@ -1609,18 +1148,12 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
   }
 
   function stop() {
-    if (!state.running && state.timerId == null) {
-      state.lastHealth = null;
-      return false;
-    }
-
+    if (!state.running && state.timerId == null) { state.lastHealth = null; return false; }
     state.running = false;
-
     if (state.timerId != null) {
       window.clearTimeout(state.timerId);
       state.timerId = null;
     }
-
     state.lastHealth = null;
     state.lastDamageEventKey = null;
     clearPendingReturn();
@@ -1629,51 +1162,38 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
   }
 
   function syncRunningState() {
-    if (shouldRun()) {
-      start();
-    } else {
-      stop();
-    }
+    if (shouldRun()) start();
+    else stop();
   }
 
   function updateConfig(nextConfig = {}) {
     const next = { ...nextConfig };
-
     if (Array.isArray(next.trustedNames)) {
-      next.trustedNames = next.trustedNames
-        .map((name) => String(name || "").trim())
-        .filter(Boolean);
+      next.trustedNames = next.trustedNames.map(n => String(n || "").trim()).filter(Boolean);
     }
-
     if (Array.isArray(next.gameMasterNames)) {
-      next.gameMasterNames = next.gameMasterNames
-        .map((name) => String(name || "").trim())
-        .filter(Boolean);
+      next.gameMasterNames = next.gameMasterNames.map(n => String(n || "").trim()).filter(Boolean);
     }
-
-    if ("triggerCooldownMs" in next) {
+    if (next.triggerCooldownMs !== undefined) {
       next.triggerCooldownMs = normalizeDelayMs(next.triggerCooldownMs, config.triggerCooldownMs);
     }
-
-    if ("returnDelayMs" in next) {
+    if (next.returnDelayMs !== undefined) {
       next.returnDelayMs = normalizeDelayMs(next.returnDelayMs, config.returnDelayMs);
     }
-
-    if ("returnDelayJitterMs" in next) {
+    if (next.returnDelayJitterMs !== undefined) {
       next.returnDelayJitterMs = normalizeDelayMs(next.returnDelayJitterMs, config.returnDelayJitterMs);
     }
-
-    if ("returnRetryCooldownMs" in next) {
-      next.returnRetryCooldownMs = normalizeDelayMs(
-        next.returnRetryCooldownMs,
-        config.returnRetryCooldownMs
-      );
+    if (next.returnRetryCooldownMs !== undefined) {
+      next.returnRetryCooldownMs = normalizeDelayMs(next.returnRetryCooldownMs, config.returnRetryCooldownMs);
     }
-
+    if (next.playerAlertEnabled !== undefined) {
+      next.playerAlertEnabled = !!next.playerAlertEnabled;
+    }
+    if (next.playerAlertCooldownMs !== undefined) {
+      next.playerAlertCooldownMs = Math.max(10000, Number(next.playerAlertCooldownMs) || 60000);
+    }
     Object.assign(config, next);
-    if (!config.returnToOriginEnabled) {
-      clearPendingReturn();
-    }
+    if (!config.returnToOriginEnabled) clearPendingReturn();
     persistConfig();
     syncRunningState();
     bot.log("panic runner config updated", { ...config });
@@ -1688,68 +1208,46 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         trustedNames: [...config.trustedNames],
         gameMasterNames: [...config.gameMasterNames],
       },
-      visiblePlayers: getVisiblePlayers().map((player) => ({
-        id: player.id,
-        name: player.name,
-        position: player.__position || null,
-      })),
-      unknownVisiblePlayers: getUnknownVisiblePlayers().map((player) => ({
-        id: player.id,
-        name: player.name,
-        position: player.__position || null,
-      })),
-      trustedVisiblePlayers: getTrustedVisiblePlayers().map((player) => ({
-        id: player.id,
-        name: player.name,
-        position: player.__position || null,
-      })),
-      visibleGameMasters: getVisibleGameMasters().map((player) => ({
-        id: player.id,
-        name: player.name,
-        position: player.__position || null,
-      })),
+      visiblePlayers: getVisiblePlayers().map(p => ({ id: p.id, name: p.name, position: p.__position })),
+      unknownVisiblePlayers: getUnknownVisiblePlayers().map(p => ({ id: p.id, name: p.name, position: p.__position })),
+      trustedVisiblePlayers: getTrustedVisiblePlayers().map(p => ({ id: p.id, name: p.name, position: p.__position })),
+      visibleGameMasters: getVisibleGameMasters().map(p => ({ id: p.id, name: p.name, position: p.__position })),
       latestDamageEvent: getLatestDamageEvent(),
       lastTriggerAt: state.lastTriggerAt,
-      pendingReturn: state.pendingReturnOrigin
-        ? {
-            origin: { ...state.pendingReturnOrigin },
-            modules: state.pendingReturnModules ? { ...state.pendingReturnModules } : null,
-            returnNotBeforeAt: state.returnNotBeforeAt,
-            lastThreatAt: state.lastThreatAt,
-            lastReturnAttemptAt: state.lastReturnAttemptAt,
-            coastClear: isReturnCoastClear(),
-          }
-        : null,
+      pendingReturn: state.pendingReturnOrigin ? {
+        origin: { ...state.pendingReturnOrigin },
+        modules: state.pendingReturnModules ? { ...state.pendingReturnModules } : null,
+        returnNotBeforeAt: state.returnNotBeforeAt,
+        lastThreatAt: state.lastThreatAt,
+        lastReturnAttemptAt: state.lastReturnAttemptAt,
+        coastClear: isReturnCoastClear(),
+      } : null,
+      playerAlertEnabled: config.playerAlertEnabled,
+      playerAlertCooldownMs: config.playerAlertCooldownMs,
+      lastPlayerAlertAt: state.lastPlayerAlertAt,
     };
   }
 
-  if (shouldRun()) {
-    start();
-  }
+  if (shouldRun()) start();
 
   bot.panic = {
-    start,
-    stop,
-    status,
-    updateConfig,
-    getVisiblePlayers,
-    getUnknownVisiblePlayers,
-    getTrustedVisiblePlayers,
-    getVisibleGameMasters,
-    getTrustedNames,
-    getGameMasterNames,
+    start, stop, status, updateConfig,
+    getVisiblePlayers, getUnknownVisiblePlayers, getTrustedVisiblePlayers,
+    getVisibleGameMasters, getTrustedNames, getGameMasterNames,
     config,
   };
 };
-window.__minibiaBotBundle = window.__minibiaBotBundle || {};
 
+/**
+ * ==================================================================================
+ * 5. RUNE MODULE (Magic Level Trainer)
+ *    Repeatedly casts a spell (e.g., "adori vita vis") when health, mana, and
+ *    food are sufficient, respecting cooldowns.
+ * ==================================================================================
+ */
 window.__minibiaBotBundle.installRuneModule = function installRuneModule(bot) {
   const configStorageKey = "minibiaBot.rune.config";
-  const state = {
-    running: false,
-    timerId: null,
-    lastRuneAt: 0,
-  };
+  const state = { running: false, timerId: null, lastRuneAt: 0 };
   let resumeListenersAttached = false;
 
   const config = Object.assign(
@@ -1772,30 +1270,14 @@ window.__minibiaBotBundle.installRuneModule = function installRuneModule(bot) {
 
   function readStats() {
     const playerState = bot.getPlayerState();
-
-    const hp = playerState
-      ? { current: playerState.health ?? 0, max: playerState.maxHealth ?? 0 }
-      : null;
-
-    const mana = playerState
-      ? { current: playerState.mana ?? 0, max: playerState.maxMana ?? 0 }
-      : null;
-
-    const foodText =
-      document.querySelector('#skill-window div[skill="food"] .skill')?.textContent?.trim() ||
-      null;
-
+    const hp = playerState ? { current: playerState.health ?? 0, max: playerState.maxHealth ?? 0 } : null;
+    const mana = playerState ? { current: playerState.mana ?? 0, max: playerState.maxMana ?? 0 } : null;
+    const foodText = document.querySelector('#skill-window div[skill="food"] .skill')?.textContent?.trim() || null;
     let food = null;
     if (foodText) {
       const match = foodText.match(/^(\d{1,2}):(\d{2})$/);
-      food = match
-        ? {
-            text: foodText,
-            seconds: Number(match[1]) * 60 + Number(match[2]),
-          }
-        : { text: foodText, seconds: null };
+      food = match ? { text: foodText, seconds: Number(match[1]) * 60 + Number(match[2]) } : { text: foodText, seconds: null };
     }
-
     return { hp, mana, food };
   }
 
@@ -1812,22 +1294,20 @@ window.__minibiaBotBundle.installRuneModule = function installRuneModule(bot) {
         canMakeRune: false,
       };
     }
-
     const hpPercent = hp.max > 0 ? (hp.current / hp.max) * 100 : 0;
     const enoughHp = hpPercent >= config.minHpPercent;
     const enoughMana = mana.current >= config.runeManaCost;
     const enoughFood = food?.seconds == null || food.seconds >= config.minFoodSeconds;
-    const cooldownElapsedMs = now - state.lastRuneAt;
-    const cooldownRemainingMs = Math.max(0, config.runeCooldownMs - cooldownElapsedMs);
-    const cooldownReady = cooldownRemainingMs === 0;
-
+    const cooldownElapsed = now - state.lastRuneAt;
+    const cooldownRemaining = Math.max(0, config.runeCooldownMs - cooldownElapsed);
+    const cooldownReady = cooldownRemaining === 0;
     return {
       hasStats: true,
       enoughHp,
       enoughMana,
       enoughFood,
       cooldownReady,
-      cooldownRemainingMs,
+      cooldownRemainingMs: cooldownRemaining,
       canMakeRune: enoughHp && enoughMana && enoughFood && cooldownReady,
     };
   }
@@ -1837,50 +1317,34 @@ window.__minibiaBotBundle.installRuneModule = function installRuneModule(bot) {
   }
 
   function tryMakeRune() {
-    if (!canMakeRune()) {
-      return false;
-    }
-
+    if (!canMakeRune()) return false;
     const sent = bot.sendChat(config.runeSpellWords);
-    if (sent) {
-      state.lastRuneAt = Date.now();
-    }
-
+    if (sent) state.lastRuneAt = Date.now();
     return sent;
   }
 
+  // ---- RESUME LISTENERS (to catch up after tab focus) ----
   function scheduleNextTick() {
     if (!state.running) return;
-
-    state.timerId = window.setTimeout(() => {
-      tick();
-    }, config.tickMs);
+    state.timerId = window.setTimeout(() => tick(), config.tickMs);
   }
 
   function runImmediateTick() {
     if (!state.running) return;
-
     if (state.timerId != null) {
       window.clearTimeout(state.timerId);
       state.timerId = null;
     }
-
     tick();
   }
 
   function handleResume() {
-    if (document.hidden) {
-      return;
-    }
-
+    if (document.hidden) return;
     runImmediateTick();
   }
 
   function attachResumeListeners() {
-    if (resumeListenersAttached) {
-      return;
-    }
-
+    if (resumeListenersAttached) return;
     document.addEventListener("visibilitychange", handleResume);
     window.addEventListener("focus", handleResume);
     window.addEventListener("pageshow", handleResume);
@@ -1888,10 +1352,7 @@ window.__minibiaBotBundle.installRuneModule = function installRuneModule(bot) {
   }
 
   function detachResumeListeners() {
-    if (!resumeListenersAttached) {
-      return;
-    }
-
+    if (!resumeListenersAttached) return;
     document.removeEventListener("visibilitychange", handleResume);
     window.removeEventListener("focus", handleResume);
     window.removeEventListener("pageshow", handleResume);
@@ -1900,26 +1361,15 @@ window.__minibiaBotBundle.installRuneModule = function installRuneModule(bot) {
 
   function tick() {
     if (!state.running) return;
-
-    try {
-      tryMakeRune();
-    } catch (error) {
-      bot.log("rune tick failed", error?.message || error);
-    } finally {
-      scheduleNextTick();
-    }
+    try { tryMakeRune(); } catch (e) { bot.log("rune tick failed", e?.message || e); }
+    finally { scheduleNextTick(); }
   }
 
   function start(overrides = {}) {
     Object.assign(config, overrides, { enabled: true });
     config.tickMs = 250;
     persistConfig();
-
-    if (state.running) {
-      bot.log("rune maker already running");
-      return false;
-    }
-
+    if (state.running) { bot.log("rune maker already running"); return false; }
     state.running = true;
     attachResumeListeners();
     bot.log("rune maker started", { ...config });
@@ -1928,20 +1378,14 @@ window.__minibiaBotBundle.installRuneModule = function installRuneModule(bot) {
   }
 
   function stop(options = {}) {
-    const shouldPersistEnabled = options.persistEnabled !== false;
+    const shouldPersist = options.persistEnabled !== false;
     state.running = false;
-
     if (state.timerId != null) {
       window.clearTimeout(state.timerId);
       state.timerId = null;
     }
-
     detachResumeListeners();
-
-    if (shouldPersistEnabled) {
-      config.enabled = false;
-      persistConfig();
-    }
+    if (shouldPersist) { config.enabled = false; persistConfig(); }
     bot.log("rune maker stopped");
     return true;
   }
@@ -1949,81 +1393,40 @@ window.__minibiaBotBundle.installRuneModule = function installRuneModule(bot) {
   function status() {
     return {
       running: state.running,
-        config: { ...config },
-        stats: readStats(),
-        gates: getGateStatus(),
-        lastRuneAt: state.lastRuneAt,
-      };
+      config: { ...config },
+      stats: readStats(),
+      gates: getGateStatus(),
+      lastRuneAt: state.lastRuneAt,
+    };
   }
 
-function updateConfig(nextConfig = {}) {
-  if (Object.prototype.hasOwnProperty.call(nextConfig, "targetHotbarSlot")) {
-    nextConfig.targetHotbarSlot =
-      normalizeHotbarSlot(nextConfig.targetHotbarSlot) ?? config.targetHotbarSlot;
+  function updateConfig(nextConfig = {}) {
+    // Also used by the attack module – we keep it for compatibility.
+    // This function is overridden by the attack module's updateConfig later.
+    Object.assign(config, nextConfig);
+    persistConfig();
+    bot.log("rune config updated", { ...config });
+    return { ...config };
   }
 
-  if (Object.prototype.hasOwnProperty.call(nextConfig, "runeHotbarSlot")) {
-    nextConfig.runeHotbarSlot = normalizeHotbarSlot(nextConfig.runeHotbarSlot);
-  }
-
-  if (Object.prototype.hasOwnProperty.call(nextConfig, "maxTargetDistance")) {
-    nextConfig.maxTargetDistance = Math.max(
-      1,
-      Math.trunc(Number(nextConfig.maxTargetDistance) || config.maxTargetDistance || 5)
-    );
-  }
-
-  if (Object.prototype.hasOwnProperty.call(nextConfig, "preferredTargetNames")) {
-    if (Array.isArray(nextConfig.preferredTargetNames)) {
-      nextConfig.preferredTargetNames = nextConfig.preferredTargetNames
-        .map((name) => String(name || "").trim())
-        .filter(Boolean);
-    } else {
-      nextConfig.preferredTargetNames = String(nextConfig.preferredTargetNames || "")
-        .split(/[\n,]/)
-        .map((name) => name.trim())
-        .filter(Boolean);
-    }
-  }
-
-  if (Object.prototype.hasOwnProperty.call(nextConfig, "preferredMatchMode")) {
-    if (
-      nextConfig.preferredMatchMode !== "exact" &&
-      nextConfig.preferredMatchMode !== "includes"
-    ) {
-      nextConfig.preferredMatchMode = "exact";
-    }
-  }
-
-  Object.assign(config, nextConfig);
-  persistConfig();
-
-  bot.log("auto attack config updated", { ...config });
-
-  return { ...config };
-}
-
-  if (config.enabled) {
-    start();
-  }
+  if (config.enabled) start();
 
   bot.rune = {
-    start,
-    stop,
-    status,
-    readStats,
-    getGateStatus,
-    canMakeRune,
-    tryMakeRune,
-    config,
-    updateConfig,
+    start, stop, status, readStats, getGateStatus, canMakeRune, tryMakeRune,
+    config, updateConfig,
   };
-
   bot.startRuneLoop = start;
   bot.stopRuneLoop = stop;
 };
-window.__minibiaBotBundle = window.__minibiaBotBundle || {};
 
+/**
+ * ==================================================================================
+ * 6. HEAL MODULE
+ *    Manages a list of heal rules. Each rule defines a hotbar slot (or spell words),
+ *    HP and MP percentage ranges, and a mana cost. Rules are evaluated in order,
+ *    and the first matching rule triggers. Supports confirming if the heal succeeded.
+ * ==================================================================================
+ */
 window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
   const configStorageKey = "minibiaBot.heal.config";
   const state = {
@@ -2046,13 +1449,13 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
     bot.storage.get(configStorageKey, {})
   );
 
-  // Clean up old legacy keys
+  // Clean old legacy keys
   delete config.hpHotbarSlot;
   delete config.manaHotbarSlot;
   delete config.minHp;
   delete config.minMana;
 
-  // Backward compatibility (if old rules exist)
+  // Backward compatibility: convert old threshold-based rules to range-based
   if (config.healRules && config.healRules.length > 0) {
     const first = config.healRules[0];
     if (first.thresholdPercent !== undefined && first.minHpPercent === undefined) {
@@ -2105,10 +1508,8 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
 
   function didSucceed(stats, attempt) {
     if (!stats || !attempt) return false;
-    // Since we don't have type, we check both HP and mana increases
     const hpUp = stats.hp ? stats.hp.current > attempt.hpBefore : false;
     const manaUp = stats.mana ? stats.mana.current > attempt.manaBefore : false;
-    // If the action was a spell/hotkey that could restore either, we consider success if either increased.
     return hpUp || manaUp;
   }
 
@@ -2131,14 +1532,12 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
     const slot = normalizeHotbarSlot(rule.slot);
     if (!slot) return false;
     const key = String(slot);
-
     if (state.pendingAttempt[key]) return false;
     if (now - (state.lastHealAt[key] || 0) < config.healCooldownMs) return false;
     if (now - (state.lastAttemptAt[key] || 0) < (config.healRetryMs || 200)) return false;
 
     const hp = getHpPercent(stats);
     const mana = getManaPercent(stats);
-
     const minHp = Number(rule.minHpPercent) ?? 0;
     const maxHp = Number(rule.maxHpPercent) ?? 100;
     const minMana = Number(rule.minManaPercent) ?? 0;
@@ -2147,15 +1546,12 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
     if (hp < minHp || hp > maxHp) return false;
     if (mana < minMana || mana > maxMana) return false;
 
-    // If spell, check mana cost
+    // Spell requires mana
     if (rule.spellWords && rule.spellWords.trim()) {
       const cost = Math.max(1, Number(rule.manaCost) || 0);
       if (stats.mana.current < cost) return false;
     }
-
-    // Don't try to heal if HP is 0 (dead)
-    if (stats.hp.current <= 0) return false;
-
+    if (stats.hp.current <= 0) return false; // dead
     return true;
   }
 
@@ -2169,8 +1565,7 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
       if (sent) {
         state.lastAttemptAt[key] = now;
         state.pendingAttempt[key] = {
-          attemptedAt: now,
-          slot,
+          attemptedAt: now, slot,
           hpBefore: stats.hp.current,
           manaBefore: stats.mana.current,
         };
@@ -2183,8 +1578,7 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
     if (clicked) {
       state.lastAttemptAt[key] = now;
       state.pendingAttempt[key] = {
-        attemptedAt: now,
-        slot,
+        attemptedAt: now, slot,
         hpBefore: stats.hp.current,
         manaBefore: stats.mana.current,
       };
@@ -2207,7 +1601,6 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
     return false;
   }
 
-  // ... (keep scheduleNextTick, tick, start, stop, status, updateConfig as before, but updateConfig must not expect 'type')
   function scheduleNextTick() {
     if (!state.running) return;
     state.timerId = setTimeout(() => tick(), config.tickMs);
@@ -2281,16 +1674,17 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
     readStats, tryHeal, config,
   };
 };
-window.__minibiaBotBundle = window.__minibiaBotBundle || {};
 
+/**
+ * ==================================================================================
+ * 7. AUTO INVISIBLE MODULE
+ *    Casts "utana vid" when the invisible condition is not active.
+ * ==================================================================================
+ */
 window.__minibiaBotBundle.installAutoInvisibleModule = function installAutoInvisibleModule(bot) {
   const configStorageKey = "minibiaBot.invisible.config";
   const INVISIBLE_CONDITION_ID = 4;
-  const state = {
-    running: false,
-    timerId: null,
-    lastCastAt: 0,
-  };
+  const state = { running: false, timerId: null, lastCastAt: 0 };
   let resumeListenersAttached = false;
 
   const config = Object.assign(
@@ -2315,93 +1709,50 @@ window.__minibiaBotBundle.installAutoInvisibleModule = function installAutoInvis
   function isInvisibleActive() {
     const player = window.gameClient?.player;
     const conditions = player?.conditions;
-    const invisibleConditionId = getInvisibleConditionId();
-
-    if (conditions?.has) {
-      return conditions.has(invisibleConditionId);
-    }
-
-    if (player?.hasCondition) {
-      return player.hasCondition(invisibleConditionId);
-    }
-
+    const id = getInvisibleConditionId();
+    if (conditions?.has) return conditions.has(id);
+    if (player?.hasCondition) return player.hasCondition(id);
     return false;
   }
 
   function getGateStatus(now = Date.now()) {
-    const cooldownRemainingMs = Math.max(0, config.recastCooldownMs - (now - state.lastCastAt));
-    const cooldownReady = cooldownRemainingMs === 0;
-    const invisibleActive = isInvisibleActive();
-
-    return {
-      invisibleActive,
-      cooldownReady,
-      cooldownRemainingMs,
-      canCast: !invisibleActive && cooldownReady,
-    };
+    const cooldown = Math.max(0, config.recastCooldownMs - (now - state.lastCastAt));
+    const ready = cooldown === 0;
+    const active = isInvisibleActive();
+    return { invisibleActive: active, cooldownReady: ready, cooldownRemainingMs: cooldown, canCast: !active && ready };
   }
 
-  function canCastInvisible(now = Date.now()) {
-    return getGateStatus(now).canCast;
-  }
-
+  function canCastInvisible(now) { return getGateStatus(now).canCast; }
   function tryCastInvisible(now = Date.now()) {
-    if (!config.enabled || !canCastInvisible(now)) {
-      return false;
-    }
-
+    if (!config.enabled || !canCastInvisible(now)) return false;
     const sent = bot.sendChat(config.spellWords);
-    if (sent) {
-      state.lastCastAt = now;
-      bot.log("cast invisible spell", { spellWords: config.spellWords });
-    }
-
+    if (sent) state.lastCastAt = now;
     return sent;
   }
 
+  // ---- Resume listeners (identical to rune module) ----
   function scheduleNextTick() {
     if (!state.running) return;
-
-    state.timerId = window.setTimeout(() => {
-      tick();
-    }, config.tickMs);
+    state.timerId = window.setTimeout(() => tick(), config.tickMs);
   }
 
   function runImmediateTick() {
     if (!state.running) return;
-
-    if (state.timerId != null) {
-      window.clearTimeout(state.timerId);
-      state.timerId = null;
-    }
-
+    if (state.timerId != null) { window.clearTimeout(state.timerId); state.timerId = null; }
     tick();
   }
 
-  function handleResume() {
-    if (document.hidden) {
-      return;
-    }
-
-    runImmediateTick();
-  }
+  function handleResume() { if (!document.hidden) runImmediateTick(); }
 
   function attachResumeListeners() {
-    if (resumeListenersAttached) {
-      return;
-    }
-
+    if (resumeListenersAttached) return;
     document.addEventListener("visibilitychange", handleResume);
     window.addEventListener("focus", handleResume);
     window.addEventListener("pageshow", handleResume);
     resumeListenersAttached = true;
   }
-
   function detachResumeListeners() {
-    if (!resumeListenersAttached) {
-      return;
-    }
-
+    if (!resumeListenersAttached) return;
     document.removeEventListener("visibilitychange", handleResume);
     window.removeEventListener("focus", handleResume);
     window.removeEventListener("pageshow", handleResume);
@@ -2410,26 +1761,15 @@ window.__minibiaBotBundle.installAutoInvisibleModule = function installAutoInvis
 
   function tick() {
     if (!state.running) return;
-
-    try {
-      tryCastInvisible();
-    } catch (error) {
-      bot.log("auto invisible tick failed", error?.message || error);
-    } finally {
-      scheduleNextTick();
-    }
+    try { tryCastInvisible(); } catch (e) { bot.log("auto invisible tick failed", e?.message || e); }
+    finally { scheduleNextTick(); }
   }
 
   function start(overrides = {}) {
     Object.assign(config, overrides, { enabled: true });
     config.tickMs = 500;
     persistConfig();
-
-    if (state.running) {
-      bot.log("auto invisible already running");
-      return false;
-    }
-
+    if (state.running) { bot.log("auto invisible already running"); return false; }
     state.running = true;
     attachResumeListeners();
     bot.log("auto invisible started", { ...config });
@@ -2438,21 +1778,11 @@ window.__minibiaBotBundle.installAutoInvisibleModule = function installAutoInvis
   }
 
   function stop(options = {}) {
-    const shouldPersistEnabled = options.persistEnabled !== false;
+    const shouldPersist = options.persistEnabled !== false;
     state.running = false;
-
-    if (state.timerId != null) {
-      window.clearTimeout(state.timerId);
-      state.timerId = null;
-    }
-
+    if (state.timerId != null) { window.clearTimeout(state.timerId); state.timerId = null; }
     detachResumeListeners();
-
-    if (shouldPersistEnabled) {
-      config.enabled = false;
-      persistConfig();
-    }
-
+    if (shouldPersist) { config.enabled = false; persistConfig(); }
     bot.log("auto invisible stopped");
     return true;
   }
@@ -2467,14 +1797,8 @@ window.__minibiaBotBundle.installAutoInvisibleModule = function installAutoInvis
   }
 
   function updateConfig(nextConfig = {}) {
-    if (Object.prototype.hasOwnProperty.call(nextConfig, "spellWords")) {
-      nextConfig.spellWords = String(nextConfig.spellWords || "").trim() || config.spellWords;
-    }
-
-    if (Object.prototype.hasOwnProperty.call(nextConfig, "recastCooldownMs")) {
-      nextConfig.recastCooldownMs = Math.max(0, Number(nextConfig.recastCooldownMs) || 0);
-    }
-
+    if (nextConfig.spellWords !== undefined) nextConfig.spellWords = String(nextConfig.spellWords || "").trim() || config.spellWords;
+    if (nextConfig.recastCooldownMs !== undefined) nextConfig.recastCooldownMs = Math.max(0, Number(nextConfig.recastCooldownMs) || 0);
     Object.assign(config, nextConfig);
     config.tickMs = 500;
     persistConfig();
@@ -2482,32 +1806,26 @@ window.__minibiaBotBundle.installAutoInvisibleModule = function installAutoInvis
     return { ...config };
   }
 
-  if (config.enabled) {
-    start();
-  }
+  if (config.enabled) start();
 
   bot.invisible = {
-    start,
-    stop,
-    status,
-    updateConfig,
-    isInvisibleActive,
-    canCastInvisible,
-    tryCastInvisible,
+    start, stop, status, updateConfig,
+    isInvisibleActive, canCastInvisible, tryCastInvisible,
     config,
   };
 };
-window.__minibiaBotBundle = window.__minibiaBotBundle || {};
 
+/**
+ * ==================================================================================
+ * 8. AUTO MAGIC SHIELD MODULE
+ *    Casts "utamo vita" when the magic shield condition is not active.
+ *    Falls back to an assumed duration (3 minutes) if condition detection fails.
+ * ==================================================================================
+ */
 window.__minibiaBotBundle.installAutoMagicShieldModule = function installAutoMagicShieldModule(bot) {
   const configStorageKey = "minibiaBot.magicShield.config";
   const MAGIC_SHIELD_FALLBACK_DURATION_MS = 180000;
-  const state = {
-    running: false,
-    timerId: null,
-    lastCastAt: 0,
-    assumedActiveUntil: 0,
-  };
+  const state = { running: false, timerId: null, lastCastAt: 0, assumedActiveUntil: 0 };
   let resumeListenersAttached = false;
 
   const config = Object.assign(
@@ -2526,119 +1844,66 @@ window.__minibiaBotBundle.installAutoMagicShieldModule = function installAutoMag
   }
 
   function getMagicShieldConditionId() {
-    const conditionManagerPrototype = window.ConditionManager?.prototype;
+    const prototype = window.ConditionManager?.prototype;
     const playerConditions = window.gameClient?.player?.conditions;
-    const candidateKeys = [
-      "MAGIC_SHIELD",
-      "MANA_SHIELD",
-      "MAGICSHIELD",
-      "MANASHIELD",
-      "UTAMO_VITA",
-    ];
-
-    for (const key of candidateKeys) {
-      const value = conditionManagerPrototype?.[key] ?? playerConditions?.[key];
-      if (typeof value === "number" && Number.isFinite(value)) {
-        return value;
-      }
+    const candidates = ["MAGIC_SHIELD", "MANA_SHIELD", "MAGICSHIELD", "MANASHIELD", "UTAMO_VITA"];
+    for (const key of candidates) {
+      const value = prototype?.[key] ?? playerConditions?.[key];
+      if (typeof value === "number" && Number.isFinite(value)) return value;
     }
-
     return null;
   }
 
   function isMagicShieldActive(now = Date.now()) {
     const player = window.gameClient?.player;
     const conditions = player?.conditions;
-    const magicShieldConditionId = getMagicShieldConditionId();
-
-    if (magicShieldConditionId != null) {
-      if (conditions?.has) {
-        return conditions.has(magicShieldConditionId);
-      }
-
-      if (player?.hasCondition) {
-        return player.hasCondition(magicShieldConditionId);
-      }
+    const id = getMagicShieldConditionId();
+    if (id != null) {
+      if (conditions?.has) return conditions.has(id);
+      if (player?.hasCondition) return player.hasCondition(id);
     }
-
     return now < state.assumedActiveUntil;
   }
 
   function getGateStatus(now = Date.now()) {
-    const cooldownRemainingMs = Math.max(0, config.recastCooldownMs - (now - state.lastCastAt));
-    const cooldownReady = cooldownRemainingMs === 0;
-    const magicShieldActive = isMagicShieldActive(now);
-
-    return {
-      magicShieldActive,
-      cooldownReady,
-      cooldownRemainingMs,
-      canCast: !magicShieldActive && cooldownReady,
-    };
+    const cooldown = Math.max(0, config.recastCooldownMs - (now - state.lastCastAt));
+    const ready = cooldown === 0;
+    const active = isMagicShieldActive(now);
+    return { magicShieldActive: active, cooldownReady: ready, cooldownRemainingMs: cooldown, canCast: !active && ready };
   }
 
-  function canCastMagicShield(now = Date.now()) {
-    return getGateStatus(now).canCast;
-  }
-
+  function canCastMagicShield(now) { return getGateStatus(now).canCast; }
   function tryCastMagicShield(now = Date.now()) {
-    if (!config.enabled || !canCastMagicShield(now)) {
-      return false;
-    }
-
+    if (!config.enabled || !canCastMagicShield(now)) return false;
     const sent = bot.sendChat(config.spellWords);
     if (sent) {
       state.lastCastAt = now;
       state.assumedActiveUntil = now + MAGIC_SHIELD_FALLBACK_DURATION_MS;
-      bot.log("cast magic shield spell", { spellWords: config.spellWords });
     }
-
     return sent;
   }
 
+  // ---- Resume listeners (identical) ----
   function scheduleNextTick() {
     if (!state.running) return;
-
-    state.timerId = window.setTimeout(() => {
-      tick();
-    }, config.tickMs);
+    state.timerId = window.setTimeout(() => tick(), config.tickMs);
   }
-
   function runImmediateTick() {
     if (!state.running) return;
-
-    if (state.timerId != null) {
-      window.clearTimeout(state.timerId);
-      state.timerId = null;
-    }
-
+    if (state.timerId != null) { window.clearTimeout(state.timerId); state.timerId = null; }
     tick();
   }
-
-  function handleResume() {
-    if (document.hidden) {
-      return;
-    }
-
-    runImmediateTick();
-  }
+  function handleResume() { if (!document.hidden) runImmediateTick(); }
 
   function attachResumeListeners() {
-    if (resumeListenersAttached) {
-      return;
-    }
-
+    if (resumeListenersAttached) return;
     document.addEventListener("visibilitychange", handleResume);
     window.addEventListener("focus", handleResume);
     window.addEventListener("pageshow", handleResume);
     resumeListenersAttached = true;
   }
-
   function detachResumeListeners() {
-    if (!resumeListenersAttached) {
-      return;
-    }
-
+    if (!resumeListenersAttached) return;
     document.removeEventListener("visibilitychange", handleResume);
     window.removeEventListener("focus", handleResume);
     window.removeEventListener("pageshow", handleResume);
@@ -2647,26 +1912,15 @@ window.__minibiaBotBundle.installAutoMagicShieldModule = function installAutoMag
 
   function tick() {
     if (!state.running) return;
-
-    try {
-      tryCastMagicShield();
-    } catch (error) {
-      bot.log("auto magic shield tick failed", error?.message || error);
-    } finally {
-      scheduleNextTick();
-    }
+    try { tryCastMagicShield(); } catch (e) { bot.log("auto magic shield tick failed", e?.message || e); }
+    finally { scheduleNextTick(); }
   }
 
   function start(overrides = {}) {
     Object.assign(config, overrides, { enabled: true });
     config.tickMs = 500;
     persistConfig();
-
-    if (state.running) {
-      bot.log("auto magic shield already running");
-      return false;
-    }
-
+    if (state.running) { bot.log("auto magic shield already running"); return false; }
     state.running = true;
     attachResumeListeners();
     bot.log("auto magic shield started", { ...config });
@@ -2675,21 +1929,11 @@ window.__minibiaBotBundle.installAutoMagicShieldModule = function installAutoMag
   }
 
   function stop(options = {}) {
-    const shouldPersistEnabled = options.persistEnabled !== false;
+    const shouldPersist = options.persistEnabled !== false;
     state.running = false;
-
-    if (state.timerId != null) {
-      window.clearTimeout(state.timerId);
-      state.timerId = null;
-    }
-
+    if (state.timerId != null) { window.clearTimeout(state.timerId); state.timerId = null; }
     detachResumeListeners();
-
-    if (shouldPersistEnabled) {
-      config.enabled = false;
-      persistConfig();
-    }
-
+    if (shouldPersist) { config.enabled = false; persistConfig(); }
     bot.log("auto magic shield stopped");
     return true;
   }
@@ -2705,14 +1949,8 @@ window.__minibiaBotBundle.installAutoMagicShieldModule = function installAutoMag
   }
 
   function updateConfig(nextConfig = {}) {
-    if (Object.prototype.hasOwnProperty.call(nextConfig, "spellWords")) {
-      nextConfig.spellWords = String(nextConfig.spellWords || "").trim() || config.spellWords;
-    }
-
-    if (Object.prototype.hasOwnProperty.call(nextConfig, "recastCooldownMs")) {
-      nextConfig.recastCooldownMs = Math.max(0, Number(nextConfig.recastCooldownMs) || 0);
-    }
-
+    if (nextConfig.spellWords !== undefined) nextConfig.spellWords = String(nextConfig.spellWords || "").trim() || config.spellWords;
+    if (nextConfig.recastCooldownMs !== undefined) nextConfig.recastCooldownMs = Math.max(0, Number(nextConfig.recastCooldownMs) || 0);
     Object.assign(config, nextConfig);
     config.tickMs = 500;
     persistConfig();
@@ -2720,23 +1958,22 @@ window.__minibiaBotBundle.installAutoMagicShieldModule = function installAutoMag
     return { ...config };
   }
 
-  if (config.enabled) {
-    start();
-  }
+  if (config.enabled) start();
 
   bot.magicShield = {
-    start,
-    stop,
-    status,
-    updateConfig,
-    isMagicShieldActive,
-    canCastMagicShield,
-    tryCastMagicShield,
+    start, stop, status, updateConfig,
+    isMagicShieldActive, canCastMagicShield, tryCastMagicShield,
     config,
   };
 };
-window.__minibiaBotBundle = window.__minibiaBotBundle || {};
 
+/**
+ * ==================================================================================
+ * 9. AUTO ATTACK MODULE
+ *    Automatically targets and attacks monsters. Supports melee mode (follow +
+ *    attack), rune usage, preferred targets, and anti‑kill‑steal.
+ * ==================================================================================
+ */
 window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackModule(bot) {
   const configStorageKey = "minibiaBot.attack.config";
   const state = {
@@ -2756,24 +1993,24 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
   };
 
   const storedConfig = bot.storage.get(configStorageKey, {}) || {};
-const config = Object.assign(
-  {
-    tickMs: 500,
-    targetHotbarSlot: 3,
-    runeHotbarSlot: null,
-    targetCooldownMs: 1200,
-    runeCooldownMs: 1200,
-    maxTargetDistance: 5,
-    meleeMode: true,
-    enabled: false,
-
-    // Preferred targeting:
-    // These mobs are sorted first, but non-preferred mobs are still allowed.
-    preferredTargetNames: [],
-    preferredMatchMode: "exact", // "exact" or "includes"
-  },
-  storedConfig
-);
+  const config = Object.assign(
+    {
+      tickMs: 500,
+      targetHotbarSlot: 3,
+      runeHotbarSlot: null,
+      targetCooldownMs: 1200,
+      runeCooldownMs: 1200,
+      maxTargetDistance: 5,
+      meleeMode: true,
+      enabled: false,
+      preferredTargetNames: [],
+      preferredMatchMode: "exact",
+      antiKSEnabled: true,
+      antiKSSelfRange: 2,
+      antiKSOtherRange: 2,
+    },
+    storedConfig
+  );
   if (config.targetHotbarSlot == null && storedConfig.hotbarSlot != null) {
     config.targetHotbarSlot = storedConfig.hotbarSlot;
   }
@@ -2783,137 +2020,76 @@ const config = Object.assign(
   }
 
   function normalizeHotbarSlot(slot) {
-    const value = Number(slot);
-    if (!Number.isFinite(value)) {
-      return null;
-    }
-
-    const normalized = Math.trunc(value);
-    if (normalized < 1 || normalized > 12) {
-      return null;
-    }
-
-    return normalized;
+    const v = Number(slot);
+    if (!Number.isFinite(v)) return null;
+    const n = Math.trunc(v);
+    if (n < 1 || n > 12) return null;
+    return n;
   }
 
-function normalizeCreatureName(name) {
-  return String(name || "")
-    .trim()
-    .toLowerCase();
-}
-
-function getPreferredTargetNames() {
-  if (!Array.isArray(config.preferredTargetNames)) {
-    return [];
+  // ---- PREFERRED TARGETS ----
+  function normalizeCreatureName(name) {
+    return String(name || "").trim().toLowerCase();
   }
 
-  return config.preferredTargetNames
-    .map((name) => String(name || "").trim())
-    .filter(Boolean);
-}
-
-function isPreferredCreature(creature) {
-  const preferredNames = getPreferredTargetNames();
-
-  if (!creature?.name || preferredNames.length === 0) {
-    return false;
+  function getPreferredTargetNames() {
+    if (!Array.isArray(config.preferredTargetNames)) return [];
+    return config.preferredTargetNames.map(n => String(n || "").trim()).filter(Boolean);
   }
 
-  const creatureName = normalizeCreatureName(creature.name);
-
-  return preferredNames.some((preferredName) => {
-    const normalizedPreferred = normalizeCreatureName(preferredName);
-
-    if (!normalizedPreferred) {
-      return false;
-    }
-
-    if (config.preferredMatchMode === "includes") {
-      return (
-        creatureName === normalizedPreferred ||
-        creatureName.includes(normalizedPreferred)
-      );
-    }
-
-    return creatureName === normalizedPreferred;
-  });
-}
-
-function getCreatureDistanceFromPlayer(creature) {
-  const player = window.gameClient?.player;
-
-  if (!player || !creature) {
-    return Number.POSITIVE_INFINITY;
+  function isPreferredCreature(creature) {
+    const preferred = getPreferredTargetNames();
+    if (!creature?.name || !preferred.length) return false;
+    const name = normalizeCreatureName(creature.name);
+    return preferred.some(p => {
+      const pnorm = normalizeCreatureName(p);
+      if (!pnorm) return false;
+      if (config.preferredMatchMode === "includes") {
+        return name === pnorm || name.includes(pnorm);
+      }
+      return name === pnorm;
+    });
   }
 
-  if (typeof player.getPosition !== "function" || typeof creature.getPosition !== "function") {
-    return Number.POSITIVE_INFINITY;
+  function getCreatureDistanceFromPlayer(creature) {
+    const player = window.gameClient?.player;
+    if (!player || !creature) return Number.POSITIVE_INFINITY;
+    if (typeof player.getPosition !== "function" || typeof creature.getPosition !== "function") return Infinity;
+    const pPos = player.getPosition();
+    const cPos = creature.getPosition();
+    if (!pPos || !cPos || pPos.z !== cPos.z) return Infinity;
+    return Math.max(Math.abs(pPos.x - cPos.x), Math.abs(pPos.y - cPos.y));
   }
 
-  const playerPos = player.getPosition();
-  const creaturePos = creature.getPosition();
-
-  if (!playerPos || !creaturePos || playerPos.z !== creaturePos.z) {
-    return Number.POSITIVE_INFINITY;
+  function getCreaturePriorityScore(creature) {
+    const distance = getCreatureDistanceFromPlayer(creature);
+    const preferred = isPreferredCreature(creature);
+    const bonus = preferred ? -1000 : 0;
+    return bonus + distance;
   }
 
-  return Math.max(
-    Math.abs(Number(playerPos.x) - Number(creaturePos.x)),
-    Math.abs(Number(playerPos.y) - Number(creaturePos.y))
-  );
-}
+  function sortMonstersByPriority(monsters) {
+    return [...monsters].sort((a, b) => {
+      const sa = getCreaturePriorityScore(a);
+      const sb = getCreaturePriorityScore(b);
+      if (sa !== sb) return sa - sb;
+      return String(a?.name || "").localeCompare(String(b?.name || ""));
+    });
+  }
 
-function getCreaturePriorityScore(creature) {
-  const distance = getCreatureDistanceFromPlayer(creature);
-  const preferred = isPreferredCreature(creature);
+  function getNearbyMonsters() {
+    const monsters = bot.xray?.getVisibleMonsters?.({ sameFloorOnly: true }) || [];
+    return sortMonstersByPriority(monsters);
+  }
 
-  /*
-   * Lower score = better.
-   *
-   * Preferred creatures get a large bonus,
-   * but normal creatures are still valid when no preferred creature is nearby.
-   */
-  const preferredBonus = preferred ? -1000 : 0;
-
-  return preferredBonus + distance;
-}
-
-function sortMonstersByPriority(monsters) {
-  return [...monsters].sort((a, b) => {
-    const scoreA = getCreaturePriorityScore(a);
-    const scoreB = getCreaturePriorityScore(b);
-
-    if (scoreA !== scoreB) {
-      return scoreA - scoreB;
-    }
-
-    return String(a?.name || "").localeCompare(String(b?.name || ""));
-  });
-}
-
-function getNearbyMonsters() {
-  const monsters = bot.xray?.getVisibleMonsters?.({ sameFloorOnly: true }) || [];
-
-  return sortMonstersByPriority(monsters);
-}
-
+  // ---- POSITION HELPERS ----
   function normalizePosition(value) {
-    if (!value) {
-      return null;
-    }
-
+    if (!value) return null;
     const x = Number(value.x);
     const y = Number(value.y);
     const z = Number(value.z);
-    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) {
-      return null;
-    }
-
-    return {
-      x: Math.trunc(x),
-      y: Math.trunc(y),
-      z: Math.trunc(z),
-    };
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return null;
+    return { x: Math.trunc(x), y: Math.trunc(y), z: Math.trunc(z) };
   }
 
   function getPositionKey(position) {
@@ -2921,51 +2097,33 @@ function getNearbyMonsters() {
   }
 
   function isAdjacentTile(from, to) {
-    if (!from || !to || Number(from.z) !== Number(to.z)) {
-      return false;
-    }
-
-    const dx = Math.abs(Number(from.x) - Number(to.x));
-    const dy = Math.abs(Number(from.y) - Number(to.y));
+    if (!from || !to || Number(from.z) !== Number(to.z)) return false;
+    const dx = Math.abs(from.x - to.x);
+    const dy = Math.abs(from.y - to.y);
     return (dx !== 0 || dy !== 0) && dx <= 1 && dy <= 1;
   }
 
   function getTileDistance(from, to) {
-    if (!from || !to || Number(from.z) !== Number(to.z)) {
-      return Number.POSITIVE_INFINITY;
-    }
-
-    return Math.max(
-      Math.abs(Number(from.x) - Number(to.x)),
-      Math.abs(Number(from.y) - Number(to.y))
-    );
+    if (!from || !to || Number(from.z) !== Number(to.z)) return Number.POSITIVE_INFINITY;
+    return Math.max(Math.abs(from.x - to.x), Math.abs(from.y - to.y));
   }
 
   function isSameCreature(left, right) {
-    if (!left || !right) {
-      return false;
-    }
-
-    return left === right || left.id === right.id;
+    return !!(left && right && (left === right || left.id === right.id));
   }
 
   function findNearbyMonster(creature) {
-    if (!creature) {
-      return null;
-    }
-
-    const nearbyMonsters = getNearbyMonsters();
-    return nearbyMonsters.find((monster) => isSameCreature(monster, creature)) || null;
+    if (!creature) return null;
+    const nearby = getNearbyMonsters();
+    return nearby.find(m => isSameCreature(m, creature)) || null;
   }
 
   function findNearbyMonsterById(id) {
-    if (id == null) {
-      return null;
-    }
-
-    return getNearbyMonsters().find((monster) => monster?.id === id) || null;
+    if (id == null) return null;
+    return getNearbyMonsters().find(m => m?.id === id) || null;
   }
 
+  // ---- TARGET / FOLLOW ----
   function getCurrentTarget() {
     return window.gameClient?.player?.__target || null;
   }
@@ -2975,10 +2133,8 @@ function getNearbyMonsters() {
   }
 
   function pruneSkippedTargets(now = Date.now()) {
-    for (const [id, expiresAt] of state.skippedTargetIds.entries()) {
-      if (expiresAt <= now) {
-        state.skippedTargetIds.delete(id);
-      }
+    for (const [id, expiresAt] of state.skippedTargetIds) {
+      if (expiresAt <= now) state.skippedTargetIds.delete(id);
     }
   }
 
@@ -2997,45 +2153,25 @@ function getNearbyMonsters() {
   }
 
   function clearCurrentFollowTarget() {
-    if (!window.gameClient?.player || typeof window.gameClient.send !== "function") {
-      return false;
-    }
-
-    if (typeof FollowPacket !== "function") {
-      return false;
-    }
-
-    if (!getCurrentFollowTarget()) {
-      return false;
-    }
-
+    if (!window.gameClient?.player || typeof window.gameClient.send !== "function") return false;
+    if (typeof FollowPacket !== "function") return false;
+    if (!getCurrentFollowTarget()) return false;
     window.gameClient.player.setFollowTarget(null);
     window.gameClient.send(new FollowPacket(0));
     return true;
   }
 
   function clearCurrentTarget() {
-    if (!window.gameClient?.player || typeof window.gameClient.send !== "function") {
-      return false;
-    }
-
-    if (typeof TargetPacket !== "function") {
-      return false;
-    }
-
-    if (!getCurrentTarget()) {
-      return false;
-    }
-
+    if (!window.gameClient?.player || typeof window.gameClient.send !== "function") return false;
+    if (typeof TargetPacket !== "function") return false;
+    if (!getCurrentTarget()) return false;
     window.gameClient.player.setTarget(null);
     window.gameClient.send(new TargetPacket(0));
     return true;
   }
 
   function markCombatActive(now = Date.now()) {
-    if (!state.combatStartedAt) {
-      state.combatStartedAt = now;
-    }
+    if (!state.combatStartedAt) state.combatStartedAt = now;
   }
 
   function getCombatTargetCount() {
@@ -3043,334 +2179,139 @@ function getNearbyMonsters() {
   }
 
   function isCombatActive() {
-    if (!config.enabled || !state.running) {
-      return false;
-    }
-
+    if (!config.enabled || !state.running) return false;
     return !!getEngagedTarget();
   }
 
   function syncCombatState(now = Date.now()) {
-    if (isCombatActive()) {
-      markCombatActive(now);
-      return true;
-    }
-
+    if (isCombatActive()) { markCombatActive(now); return true; }
     state.combatStartedAt = 0;
     return false;
   }
 
   function getEngagedTarget() {
-    const currentTarget = getCurrentTarget();
-    if (currentTarget) {
-      state.engagedTargetId = currentTarget.id;
-      return currentTarget;
+    const current = getCurrentTarget();
+    if (current) { state.engagedTargetId = current.id; return current; }
+    if (state.engagedTargetId == null) return null;
+    const follow = getCurrentFollowTarget();
+    if (follow && follow.id === state.engagedTargetId) {
+      return findNearbyMonster(follow) || follow;
     }
-
-    if (state.engagedTargetId == null) {
-      return null;
-    }
-
-    const followTarget = getCurrentFollowTarget();
-    if (followTarget && followTarget.id === state.engagedTargetId) {
-      return findNearbyMonster(followTarget) || followTarget;
-    }
-
-    const nearbyTarget = findNearbyMonsterById(state.engagedTargetId);
-    if (nearbyTarget) {
-      return nearbyTarget;
-    }
-
+    const nearby = findNearbyMonsterById(state.engagedTargetId);
+    if (nearby) return nearby;
     clearEngagedTarget();
     return null;
   }
 
+  // ---- TARGET VALIDATION & SELECTION ----
+  function isTargetValidAndOnScreen(target, options = {}) {
+    const client = window.gameClient;
+    const player = client?.player;
+    const world = client?.world;
+    const returnDetails = options.returnDetails === true;
+    const maxDx = Number.isFinite(options.maxDx) ? options.maxDx : 7;
+    const maxDy = Number.isFinite(options.maxDy) ? options.maxDy : 5;
 
-
-// New targeting system
-
-function isTargetValidAndOnScreen(target, options = {}) {
-  const client = window.gameClient;
-  const player = client?.player;
-  const world = client?.world;
-
-  const returnDetails = options.returnDetails === true;
-  const maxDx = Number.isFinite(options.maxDx) ? options.maxDx : 7;
-  const maxDy = Number.isFinite(options.maxDy) ? options.maxDy : 5;
-
-  function result(valid, extra = {}) {
-    const details = {
-      valid,
-      reason: valid ? "valid" : "invalid",
-      dx: null,
-      dy: null,
-      distance: Number.POSITIVE_INFINITY,
-      preferred: false,
-      score: Number.POSITIVE_INFINITY,
-      ...extra
-    };
-
-    return returnDetails ? details : details.valid;
-  }
-
-  if (!target) {
-    return result(false, { reason: "no target" });
-  }
-
-  if (!player) {
-    return result(false, { reason: "no player" });
-  }
-
-  if (!world) {
-    return result(false, { reason: "no world" });
-  }
-
-  if (target.id == null) {
-    return result(false, { reason: "missing id" });
-  }
-
-  if (typeof target.getPosition !== "function") {
-    return result(false, { reason: "target has no getPosition" });
-  }
-
-  if (typeof player.getPosition !== "function") {
-    return result(false, { reason: "player has no getPosition" });
-  }
-
-  const playerPos = player.getPosition();
-  const targetPos = target.getPosition();
-
-  if (!playerPos || !targetPos) {
-    return result(false, { reason: "missing position" });
-  }
-
-  if (targetPos.z !== playerPos.z) {
-    return result(false, { reason: "different floor" });
-  }
-
-  if (
-    target.state &&
-    typeof target.state.health === "number" &&
-    target.state.health <= 0
-  ) {
-    return result(false, { reason: "dead target" });
-  }
-
-  if (
-    world.activeCreatures &&
-    target.id !== player.id &&
-    !Object.prototype.hasOwnProperty.call(world.activeCreatures, target.id)
-  ) {
-    return result(false, { reason: "not in activeCreatures" });
-  }
-
-  let dx = null;
-  let dy = null;
-  let distance = Number.POSITIVE_INFINITY;
-
-  try {
-    const projectedPlayer = playerPos.projected();
-    const projectedTarget = targetPos.projected();
-
-    dx = Math.abs(projectedPlayer.x - projectedTarget.x);
-    dy = Math.abs(projectedPlayer.y - projectedTarget.y);
-
-    distance = Math.max(
-      Math.abs(Number(playerPos.x) - Number(targetPos.x)),
-      Math.abs(Number(playerPos.y) - Number(targetPos.y))
-    );
-  } catch {
-    return result(false, { reason: "projection failed" });
-  }
-
-  const visible = dx < maxDx && dy < maxDy;
-
-  if (!visible) {
-    return result(false, {
-      reason: `off screen dx=${dx} dy=${dy}`,
-      dx,
-      dy,
-      distance
-    });
-  }
-
-  const preferred = isPreferredCreature(target);
-  const score = getCreaturePriorityScore(target);
-
-  return result(true, {
-    reason: preferred ? "valid preferred" : "valid normal",
-    dx,
-    dy,
-    distance,
-    preferred,
-    score
-  });
-}
-
-
-function setCurrentTarget(target) {
-  if (!target || !window.gameClient?.player || typeof window.gameClient.send !== "function") {
-    return false;
-  }
-
-  if (typeof TargetPacket !== "function") {
-    return false;
-  }
-
-  const targetInfo = isTargetValidAndOnScreen(target, {
-    preferredNames: config.preferredTargetNames || [],
-    requirePreferred: false,
-    returnDetails: true,
-    maxDx: 7,
-    maxDy: 5
-  });
-
-  if (!targetInfo.valid) {
-    console.log("[target] rejected", {
-      reason: targetInfo.reason,
-      id: target?.id,
-      name: target?.name,
-      dx: targetInfo.dx,
-      dy: targetInfo.dy,
-      position: typeof target?.getPosition === "function" ? target.getPosition() : null
-    });
-
-    if (state.engagedTargetId === target.id) {
-      clearEngagedTarget();
+    function result(valid, extra = {}) {
+      const details = {
+        valid,
+        reason: valid ? "valid" : "invalid",
+        dx: null, dy: null, distance: Number.POSITIVE_INFINITY,
+        preferred: false, score: Number.POSITIVE_INFINITY,
+        ...extra,
+      };
+      return returnDetails ? details : details.valid;
     }
 
-    return false;
-  }
+    if (!target) return result(false, { reason: "no target" });
+    if (!player) return result(false, { reason: "no player" });
+    if (!world) return result(false, { reason: "no world" });
+    if (target.id == null) return result(false, { reason: "missing id" });
+    if (typeof target.getPosition !== "function") return result(false, { reason: "target has no getPosition" });
+    if (typeof player.getPosition !== "function") return result(false, { reason: "player has no getPosition" });
 
-  window.gameClient.player.setTarget(target);
-  window.gameClient.send(new TargetPacket(target.id));
-
-  state.engagedTargetId = target.id;
-
-  console.log("[target] accepted", {
-    id: target.id,
-    name: target.name,
-    preferred: targetInfo.preferred,
-    score: targetInfo.score,
-    distance: targetInfo.distance
-  });
-
-  return true;
-}
-
-///
-
-
-
-
-
-
-
-
-
-
-function getValidatedEngagedTargetInfo() {
-  const target = getEngagedTarget();
-
-  if (!target) {
-    return {
-      valid: false,
-      target: null,
-      reason: "no engaged target"
-    };
-  }
-
-  const info = isTargetValidAndOnScreen(target, {
-    returnDetails: true,
-    maxDx: 7,
-    maxDy: 5
-  });
-
-  if (!info.valid) {
-    return {
-      valid: false,
-      target,
-      reason: info.reason,
-      info
-    };
-  }
-
-  return {
-    valid: true,
-    target,
-    reason: "valid",
-    info
-  };
-}
-
-
-//
-//
-//
-function setCurrentFollowTarget(target) {
-  if (!target || !window.gameClient?.player || typeof window.gameClient.send !== "function") {
-    return false;
-  }
-
-  if (typeof FollowPacket !== "function") {
-    return false;
-  }
-
-  const targetInfo = isTargetValidAndOnScreen(target, {
-    returnDetails: true,
-    maxDx: 7,
-    maxDy: 5
-  });
-
-  if (!targetInfo.valid) {
-    console.log("[follow] rejected invalid follow target", {
-      reason: targetInfo.reason,
-      id: target?.id,
-      name: target?.name,
-      dx: targetInfo.dx,
-      dy: targetInfo.dy
-    });
-
-    if (state.engagedTargetId === target.id) {
-      clearEngagedTarget();
+    const playerPos = player.getPosition();
+    const targetPos = target.getPosition();
+    if (!playerPos || !targetPos) return result(false, { reason: "missing position" });
+    if (targetPos.z !== playerPos.z) return result(false, { reason: "different floor" });
+    if (target.state && typeof target.state.health === "number" && target.state.health <= 0) {
+      return result(false, { reason: "dead target" });
+    }
+    if (world.activeCreatures && target.id !== player.id &&
+        !Object.prototype.hasOwnProperty.call(world.activeCreatures, target.id)) {
+      return result(false, { reason: "not in activeCreatures" });
     }
 
-    return false;
+    let dx, dy, distance = Number.POSITIVE_INFINITY;
+    try {
+      const pp = playerPos.projected();
+      const tp = targetPos.projected();
+      dx = Math.abs(pp.x - tp.x);
+      dy = Math.abs(pp.y - tp.y);
+      distance = Math.max(Math.abs(playerPos.x - targetPos.x), Math.abs(playerPos.y - targetPos.y));
+    } catch { return result(false, { reason: "projection failed" }); }
+
+    const visible = dx < maxDx && dy < maxDy;
+    if (!visible) {
+      return result(false, { reason: `off screen dx=${dx} dy=${dy}`, dx, dy, distance });
+    }
+    const preferred = isPreferredCreature(target);
+    const score = getCreaturePriorityScore(target);
+    return result(true, { reason: preferred ? "valid preferred" : "valid normal", dx, dy, distance, preferred, score });
   }
 
-  if (isSameCreature(getCurrentFollowTarget(), target)) {
+  function setCurrentTarget(target) {
+    if (!target || !window.gameClient?.player || typeof window.gameClient.send !== "function") return false;
+    if (typeof TargetPacket !== "function") return false;
+    const info = isTargetValidAndOnScreen(target, { returnDetails: true, maxDx: 7, maxDy: 5 });
+    if (!info.valid) {
+      console.log("[target] rejected", { reason: info.reason, id: target?.id, name: target?.name, dx: info.dx, dy: info.dy });
+      if (state.engagedTargetId === target.id) clearEngagedTarget();
+      return false;
+    }
+    window.gameClient.player.setTarget(target);
+    window.gameClient.send(new TargetPacket(target.id));
+    state.engagedTargetId = target.id;
+    console.log("[target] accepted", { id: target.id, name: target.name, preferred: info.preferred, score: info.score, distance: info.distance });
     return true;
   }
 
-  window.gameClient.player.setFollowTarget(target);
-  window.gameClient.send(new FollowPacket(target.id));
-  return true;
-}
+  function getValidatedEngagedTargetInfo() {
+    const target = getEngagedTarget();
+    if (!target) return { valid: false, target: null, reason: "no engaged target" };
+    const info = isTargetValidAndOnScreen(target, { returnDetails: true, maxDx: 7, maxDy: 5 });
+    if (!info.valid) return { valid: false, target, reason: info.reason, info };
+    return { valid: true, target, reason: "valid", info };
+  }
 
-  function skipTarget(target, reason, now = Date.now(), skipMs = 500) {
-    if (!target?.id) {
+  function setCurrentFollowTarget(target) {
+    if (!target || !window.gameClient?.player || typeof window.gameClient.send !== "function") return false;
+    if (typeof FollowPacket !== "function") return false;
+    const info = isTargetValidAndOnScreen(target, { returnDetails: true, maxDx: 7, maxDy: 5 });
+    if (!info.valid) {
+      console.log("[follow] rejected invalid follow target", { reason: info.reason, id: target?.id, name: target?.name });
+      if (state.engagedTargetId === target.id) clearEngagedTarget();
       return false;
     }
+    if (isSameCreature(getCurrentFollowTarget(), target)) return true;
+    window.gameClient.player.setFollowTarget(target);
+    window.gameClient.send(new FollowPacket(target.id));
+    return true;
+  }
 
+  // ---- SKIP LOGIC ----
+  function skipTarget(target, reason, now = Date.now(), skipMs = 500) {
+    if (!target?.id) return false;
     const until = now + Math.max(500, Number(skipMs) || 0);
     state.skippedTargetIds.set(target.id, until);
-
     const clearedTarget = isSameCreature(getCurrentTarget(), target) ? clearCurrentTarget() : false;
     const clearedFollow = isSameCreature(getCurrentFollowTarget(), target) ? clearCurrentFollowTarget() : false;
-
-    if (state.engagedTargetId === target.id) {
-      clearEngagedTarget();
-    } else if (state.lastFollowTargetId === target.id) {
-      resetFollowProgress();
-    }
-
+    if (state.engagedTargetId === target.id) clearEngagedTarget();
+    else if (state.lastFollowTargetId === target.id) resetFollowProgress();
     bot.log("skipping auto attack target", {
-      id: target.id,
-      name: target.name || "Mob",
-      reason,
+      id: target.id, name: target.name || "Mob", reason,
       skippedForMs: Math.max(500, Number(skipMs) || 0),
-      clearedTarget,
-      clearedFollow,
+      clearedTarget, clearedFollow,
     });
     return true;
   }
@@ -3380,195 +2321,145 @@ function setCurrentFollowTarget(target) {
     return !!target?.id && (state.skippedTargetIds.get(target.id) || 0) > now;
   }
 
+  // ---- MONSTER CANDIDATES (with Anti-KS) ----
   function getMonsterCandidates(now = Date.now()) {
-  pruneSkippedTargets(now);
+    pruneSkippedTargets(now);
+    const me = bot.getPlayerPosition();
+    if (!me) return [];
+    const visiblePlayers = bot.xray?.getVisiblePlayers?.({ sameFloorOnly: true }) || [];
+    const myId = window.gameClient?.player?.id;
+    const otherPlayers = visiblePlayers.filter(p => p.id !== myId);
+    const hasOtherPlayers = otherPlayers.length > 0 && config.antiKSEnabled;
 
-  return getNearbyMonsters()
-    .filter((monster) => !isTargetSkipped(monster, now))
-    .filter((monster) => {
-      const info = isTargetValidAndOnScreen(monster, {
-        returnDetails: true,
-        maxDx: 7,
-        maxDy: 5
+    return getNearbyMonsters()
+      .filter(m => !isTargetSkipped(m, now))
+      .filter(m => {
+        const info = isTargetValidAndOnScreen(m, { returnDetails: true, maxDx: 7, maxDy: 5 });
+        if (!info.valid) return false;
+
+        // Anti-KS
+        if (hasOtherPlayers) {
+          const mPos = m.getPosition?.() || m.__position;
+          if (!mPos) return false;
+          const selfRange = config.antiKSSelfRange ?? 2;
+          const otherRange = config.antiKSOtherRange ?? 2;
+          const dist = Math.max(Math.abs(me.x - mPos.x), Math.abs(me.y - mPos.y));
+          if (dist > selfRange) return false;
+          for (const player of otherPlayers) {
+            const pPos = player.getPosition?.() || player.__position;
+            if (!pPos) continue;
+            const dx = Math.abs(pPos.x - mPos.x);
+            const dy = Math.abs(pPos.y - mPos.y);
+            if (dx <= otherRange && dy <= otherRange) return false;
+          }
+        }
+        return true;
+      })
+      .sort((a, b) => {
+        const sa = getCreaturePriorityScore(a);
+        const sb = getCreaturePriorityScore(b);
+        if (sa !== sb) return sa - sb;
+        return Number(a?.id || 0) - Number(b?.id || 0);
       });
+  }
 
-      return info.valid;
-    })
-    .sort((left, right) => {
-      const leftScore = getCreaturePriorityScore(left);
-      const rightScore = getCreaturePriorityScore(right);
-
-      if (leftScore !== rightScore) {
-        return leftScore - rightScore;
-      }
-
-      return Number(left?.id || 0) - Number(right?.id || 0);
-    });
-}
-
+  // ---- GIVE UP / DISTANCE ----
   function shouldGiveUpTarget(target) {
-    const maxTargetDistance = Math.max(1, Number(config.maxTargetDistance) || 5);
-    const playerPosition = normalizePosition(bot.getPlayerPosition());
-    const targetPosition = normalizePosition(target?.getPosition?.() || target?.__position);
-    if (!playerPosition || !targetPosition) {
-      return false;
-    }
-
-    return getTileDistance(playerPosition, targetPosition) > maxTargetDistance;
+    const maxDist = Math.max(1, Number(config.maxTargetDistance) || 5);
+    const playerPos = normalizePosition(bot.getPlayerPosition());
+    const targetPos = normalizePosition(target?.getPosition?.() || target?.__position);
+    if (!playerPos || !targetPos) return false;
+    return getTileDistance(playerPos, targetPos) > maxDist;
   }
 
   function resetTargetIfTooFar() {
-    const currentTarget = getCurrentTarget();
-    if (currentTarget && shouldGiveUpTarget(currentTarget)) {
-      skipTarget(currentTarget, "target too far", Date.now(), 500);
-      bot.log("gave up distant auto attack target", {
-        id: currentTarget.id,
-        name: currentTarget.name || "Mob",
-        position: normalizePosition(currentTarget.getPosition?.() || currentTarget.__position),
-        maxTargetDistance: Math.max(1, Number(config.maxTargetDistance) || 5),
-      });
+    const current = getCurrentTarget();
+    if (current && shouldGiveUpTarget(current)) {
+      skipTarget(current, "target too far", Date.now(), 500);
       return true;
     }
-
-    const engagedTarget = getEngagedTarget();
-    if (engagedTarget && shouldGiveUpTarget(engagedTarget)) {
-      skipTarget(engagedTarget, "engaged target too far", Date.now(), 500);
-      bot.log("gave up distant auto attack target", {
-        id: engagedTarget.id,
-        name: engagedTarget.name || "Mob",
-        position: normalizePosition(engagedTarget.getPosition?.() || engagedTarget.__position),
-        maxTargetDistance: Math.max(1, Number(config.maxTargetDistance) || 5),
-      });
+    const engaged = getEngagedTarget();
+    if (engaged && shouldGiveUpTarget(engaged)) {
+      skipTarget(engaged, "engaged target too far", Date.now(), 500);
       return true;
     }
-
     return false;
   }
 
+  // ---- MELEE CHASE ----
   function getTileFromPosition(position) {
-    if (!position || typeof Position !== "function") {
-      return null;
-    }
-
-    return window.gameClient?.world?.getTileFromWorldPosition?.(
-      new Position(position.x, position.y, position.z)
-    ) || null;
+    if (!position || typeof Position !== "function") return null;
+    return window.gameClient?.world?.getTileFromWorldPosition?.(new Position(position.x, position.y, position.z)) || null;
   }
 
-  function findReachableAdjacentPosition(targetPosition, playerPosition) {
-    if (!targetPosition || !playerPosition) {
-      return null;
-    }
-
+  function findReachableAdjacentPosition(targetPos, playerPos) {
+    if (!targetPos || !playerPos) return null;
     const offsets = [
       { x: 0, y: -1 }, { x: 1, y: 0 }, { x: 0, y: 1 }, { x: -1, y: 0 },
       { x: -1, y: -1 }, { x: 1, y: -1 }, { x: -1, y: 1 }, { x: 1, y: 1 },
     ];
-
     offsets.sort((a, b) => {
-      const da = Math.abs(targetPosition.x + a.x - playerPosition.x) +
-        Math.abs(targetPosition.y + a.y - playerPosition.y);
-      const db = Math.abs(targetPosition.x + b.x - playerPosition.x) +
-        Math.abs(targetPosition.y + b.y - playerPosition.y);
+      const da = Math.abs(targetPos.x + a.x - playerPos.x) + Math.abs(targetPos.y + a.y - playerPos.y);
+      const db = Math.abs(targetPos.x + b.x - playerPos.x) + Math.abs(targetPos.y + b.y - playerPos.y);
       return da - db;
     });
-
-    const pathfinder = window.gameClient?.world?.pathfinder;
-    const startTile = getTileFromPosition(playerPosition);
-    if (!pathfinder || !startTile || typeof pathfinder.search !== "function") {
-      return null;
-    }
-
+    const pf = window.gameClient?.world?.pathfinder;
+    const startTile = getTileFromPosition(playerPos);
+    if (!pf || !startTile || typeof pf.search !== "function") return null;
     for (const offset of offsets) {
-      const candidatePosition = {
-        x: targetPosition.x + offset.x,
-        y: targetPosition.y + offset.y,
-        z: targetPosition.z,
-      };
-      const tile = getTileFromPosition(candidatePosition);
-      if (!tile?.isWalkable?.()) {
-        continue;
-      }
-
-      if (candidatePosition.x === playerPosition.x && candidatePosition.y === playerPosition.y) {
-        return candidatePosition;
-      }
-
+      const candidate = { x: targetPos.x + offset.x, y: targetPos.y + offset.y, z: targetPos.z };
+      const tile = getTileFromPosition(candidate);
+      if (!tile?.isWalkable?.()) continue;
+      if (candidate.x === playerPos.x && candidate.y === playerPos.y) return candidate;
       try {
-        const path = pathfinder.search(startTile, tile);
-        if (Array.isArray(path) && path.length > 0) {
-          return candidatePosition;
-        }
-      } catch (error) {
-        bot.log("auto attack reachability check failed", {
-          ...candidatePosition,
-          error: error?.message || error,
-        });
+        const path = pf.search(startTile, tile);
+        if (Array.isArray(path) && path.length > 0) return candidate;
+      } catch (e) {
+        bot.log("auto attack reachability check failed", { ...candidate, error: e?.message || e });
         return null;
       }
     }
-
     return null;
   }
 
-
   function syncMeleeChase(now = Date.now()) {
-    if (!config.meleeMode) {
+    if (!config.meleeMode) return false;
+    const engaged = getValidatedEngagedTargetInfo();
+    if (!engaged.valid) {
+      if (engaged.target) skipTarget(engaged.target, engaged.reason || "invalid engaged target", now, 1000);
+      else clearEngagedTarget();
       return false;
     }
+    const target = engaged.target;
+    const playerPos = normalizePosition(bot.getPlayerPosition());
+    const targetPos = normalizePosition(target.getPosition?.() || target.__position);
+    if (!playerPos || !targetPos || playerPos.z !== targetPos.z) return false;
+    const giveUpDelay = Math.max(500, (Number(config.tickMs) || 0) * 10);
 
-const engaged = getValidatedEngagedTargetInfo();
-
-if (!engaged.valid) {
-  if (engaged.target) {
-    skipTarget(engaged.target, engaged.reason || "invalid engaged target", now, 1000);
-  } else {
-    clearEngagedTarget();
-  }
-
-  return false;
-}
-
-const target = engaged.target;
-
-
-    const playerPosition = normalizePosition(bot.getPlayerPosition());
-    const targetPosition = normalizePosition(target.getPosition?.() || target.__position);
-    if (!playerPosition || !targetPosition || playerPosition.z !== targetPosition.z) {
-      return false;
-    }
-
-    const giveUpDelayMs = Math.max(500, (Number(config.tickMs) || 0) * 10);
-
-    if (isAdjacentTile(playerPosition, targetPosition)) {
+    if (isAdjacentTile(playerPos, targetPos)) {
       state.lastChaseDestinationKey = null;
       clearCurrentFollowTarget();
       resetFollowProgress();
       return false;
     }
 
-    const adjacentPosition = findReachableAdjacentPosition(targetPosition, playerPosition);
-    if (!adjacentPosition) {
-      if (!state.lastFollowStallAt) {
-        state.lastFollowStallAt = now;
-        return false;
-      }
-
-      if (now - state.lastFollowStallAt > giveUpDelayMs) {
+    const adjPos = findReachableAdjacentPosition(targetPos, playerPos);
+    if (!adjPos) {
+      if (!state.lastFollowStallAt) state.lastFollowStallAt = now;
+      else if (now - state.lastFollowStallAt > giveUpDelay) {
         return skipTarget(target, "no reachable adjacent tile", now);
       }
-
       return false;
     }
 
-    const currentDistance = getTileDistance(playerPosition, targetPosition);
+    const currentDist = getTileDistance(playerPos, targetPos);
     if (state.lastFollowTargetId !== target.id) {
       state.lastFollowTargetId = target.id;
-      state.lastFollowDistance = currentDistance;
+      state.lastFollowDistance = currentDist;
       state.lastFollowProgressAt = now;
       state.lastFollowStallAt = 0;
-    } else if (currentDistance < state.lastFollowDistance) {
-      state.lastFollowDistance = currentDistance;
+    } else if (currentDist < state.lastFollowDistance) {
+      state.lastFollowDistance = currentDist;
       state.lastFollowProgressAt = now;
       state.lastFollowStallAt = 0;
     }
@@ -3576,172 +2467,106 @@ const target = engaged.target;
     const followed = setCurrentFollowTarget(target);
     if (followed) {
       state.lastChaseAt = now;
-      state.lastChaseDestinationKey = getPositionKey(adjacentPosition);
-      bot.log("following auto attack target", {
-        id: target.id,
-        name: target.name || "Mob",
-        followTargetId: target.id,
-      });
+      state.lastChaseDestinationKey = getPositionKey(adjPos);
+      bot.log("following auto attack target", { id: target.id, name: target.name || "Mob", followTargetId: target.id });
     }
 
-    if (state.lastFollowDistance <= currentDistance) {
-      if (!state.lastFollowStallAt) {
-        state.lastFollowStallAt = now;
-      } else if (now - state.lastFollowStallAt > giveUpDelayMs) {
+    if (state.lastFollowDistance <= currentDist) {
+      if (!state.lastFollowStallAt) state.lastFollowStallAt = now;
+      else if (now - state.lastFollowStallAt > giveUpDelay) {
         return skipTarget(target, "follow made no progress", now);
       }
     }
-
     return followed;
   }
 
+  // ---- ATTACK / RUNE ACTIONS ----
   function canAttack(now = Date.now()) {
     const slot = normalizeHotbarSlot(config.targetHotbarSlot);
-    if (!slot) {
-      return false;
-    }
-
-    if (now - state.lastTargetHotkeyAt < Math.max(0, Number(config.targetCooldownMs) || 0)) {
-      return false;
-    }
-
+    if (!slot) return false;
+    if (now - state.lastTargetHotkeyAt < Math.max(0, Number(config.targetCooldownMs) || 0)) return false;
     if (config.meleeMode) {
       return getMonsterCandidates(now).length > 0 && !getCurrentTarget();
     }
-
     return getNearbyMonsters().length > 0;
   }
 
   function triggerAttack(now = Date.now()) {
-    if (!canAttack(now)) {
-      return false;
-    }
-
-    const engagedTarget = getEngagedTarget();
-    const preferredTarget = engagedTarget && !isTargetSkipped(engagedTarget, now)
-      ? engagedTarget
+    if (!canAttack(now)) return false;
+    const engaged = getEngagedTarget();
+    const preferred = engaged && !isTargetSkipped(engaged, now)
+      ? engaged
       : (getMonsterCandidates(now)[0] || null);
-    if (preferredTarget && setCurrentTarget(preferredTarget)) {
+    if (preferred && setCurrentTarget(preferred)) {
       state.lastTargetHotkeyAt = now;
       markCombatActive(now);
       bot.log("selected auto attack target", {
-        id: preferredTarget.id,
-        name: preferredTarget.name || "Mob",
-        reason: isSameCreature(preferredTarget, engagedTarget) ? "engaged target" : "nearest candidate",
+        id: preferred.id, name: preferred.name || "Mob",
+        reason: isSameCreature(preferred, engaged) ? "engaged target" : "nearest candidate",
       });
       return true;
     }
-
-    if (config.meleeMode) {
-      return false;
-    }
-
+    if (config.meleeMode) return false;
     const slot = normalizeHotbarSlot(config.targetHotbarSlot);
     const clicked = bot.clickHotbar(slot - 1);
     if (clicked) {
-      const monsters = getNearbyMonsters();
       state.lastTargetHotkeyAt = now;
       markCombatActive(now);
-      bot.log("used auto attack target hotkey", {
-        slot,
-        nearbyMonsters: monsters.map((creature) => creature.name || "Mob"),
-      });
+      bot.log("used auto attack target hotkey", { slot, nearbyMonsters: getNearbyMonsters().map(c => c.name || "Mob") });
     }
-
     return clicked;
   }
 
   function canUseRune(now = Date.now()) {
     const slot = normalizeHotbarSlot(config.runeHotbarSlot);
-    if (!slot || !getCurrentTarget()) {
-      return false;
-    }
-
-    if (now - state.lastRuneHotkeyAt < Math.max(0, Number(config.runeCooldownMs) || 0)) {
-      return false;
-    }
-
+    if (!slot || !getCurrentTarget()) return false;
+    if (now - state.lastRuneHotkeyAt < Math.max(0, Number(config.runeCooldownMs) || 0)) return false;
     return true;
   }
 
   function triggerRune(now = Date.now()) {
-    if (!canUseRune(now)) {
-      return false;
-    }
-
+    if (!canUseRune(now)) return false;
     const slot = normalizeHotbarSlot(config.runeHotbarSlot);
     const clicked = bot.clickHotbar(slot - 1);
     if (clicked) {
       state.lastRuneHotkeyAt = now;
       markCombatActive(now);
-      bot.log("used auto attack rune hotkey", {
-        slot,
-        target: getCurrentTarget()?.name || "Mob",
-      });
+      bot.log("used auto attack rune hotkey", { slot, target: getCurrentTarget()?.name || "Mob" });
     }
-
     return clicked;
   }
 
   function tryAttack() {
-    if (!config.enabled) {
-      return false;
-    }
-
+    if (!config.enabled) return false;
     const now = Date.now();
-    if (resetTargetIfTooFar()) {
-      return true;
-    }
-
+    if (resetTargetIfTooFar()) return true;
     syncCombatState(now);
 
     if (config.meleeMode) {
       const chased = syncMeleeChase(now);
-      if (getCurrentTarget()) {
-        return false;
-      }
-
-      if (chased) {
-        return triggerAttack(now) || true;
-      }
+      if (getCurrentTarget()) return false;
+      if (chased) return triggerAttack(now) || true;
     }
-
-    if (getCurrentTarget()) {
-      return triggerRune(now);
-    }
-
+    if (getCurrentTarget()) return triggerRune(now);
     return triggerAttack(now);
   }
 
+  // ---- LOOP ----
   function scheduleNextTick() {
     if (!state.running) return;
-
-    state.timerId = window.setTimeout(() => {
-      tick();
-    }, config.tickMs);
+    state.timerId = window.setTimeout(() => tick(), config.tickMs);
   }
 
   function tick() {
     if (!state.running) return;
-
-    try {
-      tryAttack();
-    } catch (error) {
-      bot.log("auto attack tick failed", error?.message || error);
-    } finally {
-      scheduleNextTick();
-    }
+    try { tryAttack(); } catch (e) { bot.log("auto attack tick failed", e?.message || e); }
+    finally { scheduleNextTick(); }
   }
 
   function start(overrides = {}) {
     Object.assign(config, overrides, { enabled: true });
     persistConfig();
-
-    if (state.running) {
-      bot.log("auto attack already running");
-      return false;
-    }
-
+    if (state.running) { bot.log("auto attack already running"); return false; }
     state.running = true;
     bot.log("auto attack started", { ...config });
     tick();
@@ -3749,24 +2574,14 @@ const target = engaged.target;
   }
 
   function stop(options = {}) {
-    const shouldPersistEnabled = options.persistEnabled !== false;
+    const shouldPersist = options.persistEnabled !== false;
     state.running = false;
-
-    if (state.timerId != null) {
-      window.clearTimeout(state.timerId);
-      state.timerId = null;
-    }
-
-    if (shouldPersistEnabled) {
-      config.enabled = false;
-      persistConfig();
-    }
-
+    if (state.timerId != null) { window.clearTimeout(state.timerId); state.timerId = null; }
+    if (shouldPersist) { config.enabled = false; persistConfig(); }
     clearEngagedTarget();
     state.lastChaseAt = 0;
     clearCurrentFollowTarget();
     state.skippedTargetIds.clear();
-
     bot.log("auto attack stopped");
     return true;
   }
@@ -3784,71 +2599,65 @@ const target = engaged.target;
       combatDurationMs: state.combatStartedAt ? Math.max(0, Date.now() - state.combatStartedAt) : 0,
       targetCount: getCombatTargetCount(),
       lastChaseAt: state.lastChaseAt,
-      currentTarget: getCurrentTarget()
-        ? {
-            id: getCurrentTarget().id,
-            name: getCurrentTarget().name,
-            type: getCurrentTarget().type,
-            position: getCurrentTarget().__position || null,
-          }
-        : null,
-      nearbyMonsters: getNearbyMonsters().map((creature) => ({
-        id: creature.id,
-        name: creature.name,
-        type: creature.type,
-        position: creature.__position || null,
+      currentTarget: getCurrentTarget() ? {
+        id: getCurrentTarget().id,
+        name: getCurrentTarget().name,
+        type: getCurrentTarget().type,
+        position: getCurrentTarget().__position || null,
+      } : null,
+      nearbyMonsters: getNearbyMonsters().map(c => ({
+        id: c.id, name: c.name, type: c.type, position: c.__position,
       })),
     };
   }
 
   function updateConfig(nextConfig = {}) {
-    if (Object.prototype.hasOwnProperty.call(nextConfig, "targetHotbarSlot")) {
+    if (nextConfig.targetHotbarSlot !== undefined) {
       nextConfig.targetHotbarSlot = normalizeHotbarSlot(nextConfig.targetHotbarSlot) ?? config.targetHotbarSlot;
     }
-
-    if (Object.prototype.hasOwnProperty.call(nextConfig, "runeHotbarSlot")) {
+    if (nextConfig.runeHotbarSlot !== undefined) {
       nextConfig.runeHotbarSlot = normalizeHotbarSlot(nextConfig.runeHotbarSlot);
     }
-
-    if (Object.prototype.hasOwnProperty.call(nextConfig, "maxTargetDistance")) {
+    if (nextConfig.maxTargetDistance !== undefined) {
       nextConfig.maxTargetDistance = Math.max(1, Math.trunc(Number(nextConfig.maxTargetDistance) || config.maxTargetDistance || 5));
     }
-
+    if (nextConfig.antiKSEnabled !== undefined) {
+      nextConfig.antiKSEnabled = !!nextConfig.antiKSEnabled;
+    }
+    if (nextConfig.antiKSSelfRange !== undefined) {
+      nextConfig.antiKSSelfRange = Math.max(1, Math.trunc(Number(nextConfig.antiKSSelfRange) || 2));
+    }
+    if (nextConfig.antiKSOtherRange !== undefined) {
+      nextConfig.antiKSOtherRange = Math.max(1, Math.trunc(Number(nextConfig.antiKSOtherRange) || 2));
+    }
     Object.assign(config, nextConfig);
     persistConfig();
     bot.log("auto attack config updated", { ...config });
     return { ...config };
   }
 
-  if (config.enabled) {
-    start();
-  }
+  if (config.enabled) start();
 
-  bot.addCleanup(() => {
-    stop({ persistEnabled: false });
-  });
+  bot.addCleanup(() => stop({ persistEnabled: false }));
 
   bot.attack = {
-    start,
-    stop,
-    status,
-    updateConfig,
-    tryAttack,
-    canAttack,
-    triggerAttack,
-    canUseRune,
-    triggerRune,
-    getNearbyMonsters,
-    getCurrentTarget,
-    getCurrentFollowTarget,
-    isCombatActive,
-    syncMeleeChase,
-    normalizeHotbarSlot,
+    start, stop, status, updateConfig,
+    tryAttack, canAttack, triggerAttack,
+    canUseRune, triggerRune,
+    getNearbyMonsters, getCurrentTarget, getCurrentFollowTarget,
+    isCombatActive, syncMeleeChase, normalizeHotbarSlot,
     config,
   };
 };
-window.__minibiaBotBundle = window.__minibiaBotBundle || {};
 
+/**
+ * ==================================================================================
+ * 10. CAVE MODULE
+ *     Follows a route of waypoints, handles floor transitions (ladders, stairs,
+ *     ropes, shovels), learns transitions, supports presets, and draws a minimap
+ *     overlay. Optionally loops the route.
+ * ==================================================================================
+ */
 window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
   const configStorageKey = "minibiaBot.cave.config";
   const routeStorageKey = "minibiaBot.cave.route";
@@ -3861,11 +2670,9 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
   const ropeNamePattern = /\brope\b/i;
   const shovelNamePattern = /\bshovel\b/i;
   const shovelTargetNamePatterns = [
-    /\bstone pile\b/i,
-    /\bloose stone pile\b/i,
-    /\bgravel pile\b/i,
-    /\bdirt pile\b/i,
+    /\bstone pile\b/i, /\bloose stone pile\b/i, /\bgravel pile\b/i, /\bdirt pile\b/i,
   ];
+
   const state = {
     running: false,
     timerId: null,
@@ -3879,10 +2686,12 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     lastObservedPosition: null,
     pendingTransitionSource: null,
     pausedForCombat: false,
+    lastWaypointTarget: null,
+    lastSkipCheckAt: 0,
+    skipAttemptCount: 0,
+    pathAttemptStart: 0,
   };
-  const minimapOverlayState = {
-    timerId: null,
-  };
+  const minimapOverlayState = { timerId: null };
 
   const config = Object.assign(
     {
@@ -3891,15 +2700,16 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
       waypointTolerance: 0,
       enabled: false,
       activePresetName: defaultPresetName,
-	  loopMode: false, 
+      loopMode: false,
     },
     bot.storage.get(configStorageKey, {})
   );
   config.tickMs = 500;
 
+  // ---- PRESET MANAGEMENT ----
   function normalizePresetName(value) {
-    const normalized = String(value || "").trim().replace(/\s+/g, " ");
-    return normalized || null;
+    const norm = String(value || "").trim().replace(/\s+/g, " ");
+    return norm || null;
   }
 
   function cloneValue(value) {
@@ -3907,15 +2717,9 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
   }
 
   function normalizePreset(value) {
-    if (!value) {
-      return null;
-    }
-
+    if (!value) return null;
     const name = normalizePresetName(value.name);
-    if (!name) {
-      return null;
-    }
-
+    if (!name) return null;
     return {
       name,
       route: normalizeRoute(value.route),
@@ -3926,66 +2730,46 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
   function normalizePresets(value) {
     const entries = Array.isArray(value) ? value : [];
     const deduped = new Map();
-
-    entries.map(normalizePreset).filter(Boolean).forEach((preset) => {
-      deduped.set(preset.name.toLowerCase(), preset);
-    });
-
+    entries.map(normalizePreset).filter(Boolean).forEach(p => deduped.set(p.name.toLowerCase(), p));
     return Array.from(deduped.values());
   }
 
   let route = normalizeRoute(bot.storage.get(routeStorageKey, []));
   let transitions = normalizeTransitions(bot.storage.get(transitionStorageKey, []));
   let presets = normalizePresets(bot.storage.get(presetStorageKey, []));
-
   if (!presets.length && (route.length || transitions.length)) {
     presets = [{
       name: defaultPresetName,
-      route: route.map((waypoint) => cloneValue(waypoint)),
-      transitions: transitions.map((transition) => cloneValue(transition)),
+      route: route.map(w => cloneValue(w)),
+      transitions: transitions.map(t => cloneValue(t)),
     }];
   }
 
-  function getPresetNames() {
-    return presets.map((preset) => preset.name);
-  }
-
+  function getPresetNames() { return presets.map(p => p.name); }
   function getPresetByName(name) {
-    const normalizedName = normalizePresetName(name);
-    if (!normalizedName) {
-      return null;
-    }
-
-    return presets.find((preset) => preset.name.toLowerCase() === normalizedName.toLowerCase()) || null;
+    const n = normalizePresetName(name);
+    if (!n) return null;
+    return presets.find(p => p.name.toLowerCase() === n.toLowerCase()) || null;
   }
 
   function getActivePresetName() {
-    const configuredName = normalizePresetName(config.activePresetName);
-    if (configuredName && getPresetByName(configuredName)) {
-      return getPresetByName(configuredName).name;
-    }
-
-    if (presets.length) {
-      return presets[0].name;
-    }
-
-    return configuredName || defaultPresetName;
+    const configured = normalizePresetName(config.activePresetName);
+    if (configured && getPresetByName(configured)) return getPresetByName(configured).name;
+    if (presets.length) return presets[0].name;
+    return configured || defaultPresetName;
   }
 
   function persistPresets() {
-    bot.storage.set(
-      presetStorageKey,
-      presets.map((preset) => ({
-        name: preset.name,
-        route: preset.route.map((waypoint) => ({ ...waypoint })),
-        transitions: preset.transitions.map((transition) => cloneValue(transition)),
-      }))
-    );
+    bot.storage.set(presetStorageKey, presets.map(p => ({
+      name: p.name,
+      route: p.route.map(w => ({ ...w })),
+      transitions: p.transitions.map(t => cloneValue(t)),
+    })));
   }
 
   function persistLegacyActivePreset() {
-    bot.storage.set(routeStorageKey, route.map((waypoint) => ({ ...waypoint })));
-    bot.storage.set(transitionStorageKey, transitions.map((transition) => cloneValue(transition)));
+    bot.storage.set(routeStorageKey, route.map(w => ({ ...w })));
+    bot.storage.set(transitionStorageKey, transitions.map(t => cloneValue(t)));
   }
 
   function setActivePresetName(name) {
@@ -3995,24 +2779,16 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
   }
 
   function upsertPreset(name, nextRoute = route, nextTransitions = transitions) {
-    const normalizedName = normalizePresetName(name);
-    if (!normalizedName) {
-      return null;
-    }
-
+    const norm = normalizePresetName(name);
+    if (!norm) return null;
     const preset = {
-      name: normalizedName,
-      route: normalizeRoute(nextRoute).map((waypoint) => cloneValue(waypoint)),
-      transitions: normalizeTransitions(nextTransitions).map((transition) => cloneValue(transition)),
+      name: norm,
+      route: normalizeRoute(nextRoute).map(w => cloneValue(w)),
+      transitions: normalizeTransitions(nextTransitions).map(t => cloneValue(t)),
     };
-    const existingIndex = presets.findIndex((entry) => entry.name.toLowerCase() === normalizedName.toLowerCase());
-
-    if (existingIndex >= 0) {
-      presets[existingIndex] = preset;
-    } else {
-      presets.push(preset);
-    }
-
+    const idx = presets.findIndex(p => p.name.toLowerCase() === norm.toLowerCase());
+    if (idx >= 0) presets[idx] = preset;
+    else presets.push(preset);
     persistPresets();
     return preset;
   }
@@ -4024,10 +2800,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
   function loadPresetState(name) {
     const preset = getPresetByName(name);
-    if (!preset) {
-      return null;
-    }
-
+    if (!preset) return null;
     route = normalizeRoute(preset.route);
     transitions = normalizeTransitions(preset.transitions);
     state.currentIndex = 0;
@@ -4038,218 +2811,116 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     return preset;
   }
 
-  const initialActivePreset = getActivePresetName();
-  if (loadPresetState(initialActivePreset)) {
-    config.activePresetName = initialActivePreset;
+  const initialPreset = getActivePresetName();
+  if (loadPresetState(initialPreset)) {
+    config.activePresetName = initialPreset;
   } else {
-    setActivePresetName(initialActivePreset);
+    setActivePresetName(initialPreset);
   }
 
   function persistConfig() {
     bot.storage.set(configStorageKey, { ...config });
   }
 
-  function persistRoute() {
-    persistActivePreset();
-  }
+  function persistRoute() { persistActivePreset(); }
 
+  // ---- POSITION HELPERS ----
   function normalizePosition(value) {
-    if (!value) {
-      return null;
-    }
-
-    const x = Number(value.x);
-    const y = Number(value.y);
-    const z = Number(value.z);
-    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) {
-      return null;
-    }
-
-    return {
-      x: Math.trunc(x),
-      y: Math.trunc(y),
-      z: Math.trunc(z),
-    };
+    if (!value) return null;
+    const x = Number(value.x), y = Number(value.y), z = Number(value.z);
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return null;
+    return { x: Math.trunc(x), y: Math.trunc(y), z: Math.trunc(z) };
   }
 
-  function normalizeWaypoint(waypoint) {
-    return normalizePosition(waypoint);
-  }
-
+  function normalizeWaypoint(waypoint) { return normalizePosition(waypoint); }
   function normalizeRoute(value) {
-    if (!Array.isArray(value)) {
-      return [];
-    }
-
+    if (!Array.isArray(value)) return [];
     return value.map(normalizeWaypoint).filter(Boolean);
   }
 
   function normalizeTransition(transition) {
-    if (!transition) {
-      return null;
-    }
-
+    if (!transition) return null;
     const from = normalizePosition(transition.from || transition);
     const to = normalizePosition(transition.to || {
       x: transition.targetX,
       y: transition.targetY,
       z: transition.targetZ,
     });
-
-    if (!from || !to || from.z === to.z) {
-      return null;
-    }
-
+    if (!from || !to || from.z === to.z) return null;
     const count = Math.max(1, Math.trunc(Number(transition.count) || 1));
     const lastSeenAt = Math.max(0, Math.trunc(Number(transition.lastSeenAt) || Date.now()));
-
     return { from, to, count, lastSeenAt };
   }
 
   function normalizeTransitions(value) {
-    if (!Array.isArray(value)) {
-      return [];
-    }
-
+    if (!Array.isArray(value)) return [];
     const deduped = new Map();
-    value.map(normalizeTransition).filter(Boolean).forEach((transition) => {
-      deduped.set(getPositionKey(transition.from), transition);
-    });
+    value.map(normalizeTransition).filter(Boolean).forEach(t => deduped.set(getPositionKey(t.from), t));
     return Array.from(deduped.values());
   }
 
-  function getRoute() {
-    return route.map((waypoint) => cloneValue(waypoint));
-  }
+  function getRoute() { return route.map(w => cloneValue(w)); }
+  function getTransitions() { return transitions.map(t => cloneValue(t)); }
+  function persistTransitions() { persistActivePreset(); }
 
-  function getTransitions() {
-    return transitions.map((transition) => cloneValue(transition));
-  }
-
-  function persistTransitions() {
-    persistActivePreset();
-  }
-
+  // ---- PRESET CRUD ----
   function savePreset(name, options = {}) {
     const preset = upsertPreset(name, route, transitions);
-    if (!preset) {
-      bot.log("cave preset name is required");
-      return null;
-    }
-
+    if (!preset) { bot.log("cave preset name is required"); return null; }
     if (options.activate !== false) {
       setActivePresetName(preset.name);
       persistLegacyActivePreset();
     }
-
-    bot.log("cave preset saved", {
-      name: preset.name,
-      waypoints: preset.route.length,
-      transitions: preset.transitions.length,
-    });
-    return {
-      name: preset.name,
-      route: preset.route.map((waypoint) => cloneValue(waypoint)),
-      transitions: preset.transitions.map((transition) => cloneValue(transition)),
-    };
+    bot.log("cave preset saved", { name: preset.name, waypoints: preset.route.length, transitions: preset.transitions.length });
+    return { name: preset.name, route: preset.route.map(w => cloneValue(w)), transitions: preset.transitions.map(t => cloneValue(t)) };
   }
 
   function createPreset(name) {
-    const normalizedName = normalizePresetName(name);
-    if (!normalizedName) {
-      bot.log("cave preset name is required");
-      return null;
-    }
-
-    if (getPresetByName(normalizedName)) {
-      bot.log("cave preset already exists", { name: normalizedName });
-      return null;
-    }
-
-    if (state.running) {
-      stop();
-    }
-
-    const preset = upsertPreset(normalizedName, [], []);
-    if (!preset) {
-      return null;
-    }
-
+    const norm = normalizePresetName(name);
+    if (!norm) { bot.log("cave preset name is required"); return null; }
+    if (getPresetByName(norm)) { bot.log("cave preset already exists", { name: norm }); return null; }
+    if (state.running) stop();
+    const preset = upsertPreset(norm, [], []);
+    if (!preset) return null;
     loadPresetState(preset.name);
     bot.log("cave preset created", { name: preset.name });
-    return {
-      name: preset.name,
-      route: [],
-      transitions: [],
-    };
+    return { name: preset.name, route: [], transitions: [] };
   }
 
   function loadPreset(name) {
     const preset = getPresetByName(name);
-    if (!preset) {
-      bot.log("cave preset not found", { name });
-      return null;
-    }
-
-    if (state.running) {
-      stop();
-    }
-
+    if (!preset) { bot.log("cave preset not found", { name }); return null; }
+    if (state.running) stop();
     loadPresetState(preset.name);
-    bot.log("cave preset loaded", {
-      name: preset.name,
-      waypoints: route.length,
-      transitions: transitions.length,
-    });
-    return {
-      name: preset.name,
-      route: getRoute(),
-      transitions: getTransitions(),
-    };
+    bot.log("cave preset loaded", { name: preset.name, waypoints: route.length, transitions: transitions.length });
+    return { name: preset.name, route: getRoute(), transitions: getTransitions() };
   }
 
   function deletePreset(name) {
     const preset = getPresetByName(name);
-    if (!preset) {
-      bot.log("cave preset not found", { name });
-      return false;
-    }
-
-    presets = presets.filter((entry) => entry.name.toLowerCase() !== preset.name.toLowerCase());
+    if (!preset) { bot.log("cave preset not found", { name }); return false; }
+    presets = presets.filter(p => p.name.toLowerCase() !== preset.name.toLowerCase());
     persistPresets();
-
     if (preset.name.toLowerCase() === getActivePresetName().toLowerCase()) {
-      const fallbackPreset = presets[0] || null;
-      if (state.running) {
-        stop();
-      }
-
-      if (fallbackPreset) {
-        loadPresetState(fallbackPreset.name);
-      } else {
-        route = [];
-        transitions = [];
-        state.currentIndex = 0;
-        state.direction = 1;
+      const fallback = presets[0] || null;
+      if (state.running) stop();
+      if (fallback) loadPresetState(fallback.name);
+      else {
+        route = []; transitions = [];
+        state.currentIndex = 0; state.direction = 1;
         state.pendingTransitionSource = null;
         setActivePresetName(defaultPresetName);
         persistLegacyActivePreset();
       }
     }
-
     bot.log("cave preset deleted", { name: preset.name });
     return true;
   }
 
+  // ---- WAYPOINT HELPERS ----
   function getCurrentWaypoint() {
-    if (!route.length) {
-      return null;
-    }
-
-    if (state.currentIndex < 0 || state.currentIndex >= route.length) {
-      state.currentIndex = 0;
-    }
-
+    if (!route.length) return null;
+    if (state.currentIndex < 0 || state.currentIndex >= route.length) state.currentIndex = 0;
     return route[state.currentIndex] || null;
   }
 
@@ -4258,294 +2929,161 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
   }
 
   function getDistance(from, to) {
-    if (!from || !to || Number(from.z) !== Number(to.z)) {
-      return Number.POSITIVE_INFINITY;
-    }
-
-    return Math.abs(Number(from.x) - Number(to.x)) + Math.abs(Number(from.y) - Number(to.y));
+    if (!from || !to || Number(from.z) !== Number(to.z)) return Number.POSITIVE_INFINITY;
+    return Math.abs(from.x - to.x) + Math.abs(from.y - to.y);
   }
 
   function isBesideOrSameTile(from, to) {
-    if (!from || !to || Number(from.z) !== Number(to.z)) {
-      return false;
-    }
-
-    return Math.abs(Number(from.x) - Number(to.x)) <= 1 &&
-      Math.abs(Number(from.y) - Number(to.y)) <= 1;
+    if (!from || !to || Number(from.z) !== Number(to.z)) return false;
+    return Math.abs(from.x - to.x) <= 1 && Math.abs(from.y - to.y) <= 1;
   }
 
   function isAdjacentTile(from, to) {
-    if (!from || !to || Number(from.z) !== Number(to.z)) {
-      return false;
-    }
-
-    const dx = Math.abs(Number(from.x) - Number(to.x));
-    const dy = Math.abs(Number(from.y) - Number(to.y));
+    if (!from || !to || Number(from.z) !== Number(to.z)) return false;
+    const dx = Math.abs(from.x - to.x), dy = Math.abs(from.y - to.y);
     return (dx !== 0 || dy !== 0) && dx <= 1 && dy <= 1;
   }
 
   function getDistanceToWaypoint(position, waypoint) {
-    if (!position || !waypoint) {
-      return null;
-    }
-
+    if (!position || !waypoint) return null;
     return getDistance(position, waypoint);
   }
 
   function isSameTile(a, b) {
-    if (!a || !b) {
-      return false;
-    }
-
-    return Number(a.x) === Number(b.x) &&
-      Number(a.y) === Number(b.y) &&
-      Number(a.z) === Number(b.z);
+    return a && b && a.x === b.x && a.y === b.y && a.z === b.z;
   }
 
   function findClosestWaypointIndex(position) {
-    if (!position || !route.length) {
-      return 0;
-    }
-
-    let bestIndex = 0;
-    let bestDistance = Number.POSITIVE_INFINITY;
-
-    route.forEach((waypoint, index) => {
-      const distance = getDistanceToWaypoint(position, waypoint);
-      if (!Number.isFinite(distance)) {
-        return;
-      }
-
-      if (distance < bestDistance) {
-        bestDistance = distance;
-        bestIndex = index;
-      }
+    if (!position || !route.length) return 0;
+    let bestIdx = 0, bestDist = Infinity;
+    route.forEach((wp, i) => {
+      const d = getDistanceToWaypoint(position, wp);
+      if (Number.isFinite(d) && d < bestDist) { bestDist = d; bestIdx = i; }
     });
-
-    return bestIndex;
+    return bestIdx;
   }
 
+  // ---- TILE / ITEM HELPERS ----
   function getTileAt(position) {
-    if (!position) {
-      return null;
-    }
-
-    return window.gameClient?.world?.getTileFromWorldPosition?.(
-      new Position(position.x, position.y, position.z)
-    ) || null;
+    if (!position) return null;
+    return window.gameClient?.world?.getTileFromWorldPosition?.(new Position(position.x, position.y, position.z)) || null;
   }
 
-  function getTilePosition(tile) {
-    return normalizePosition(tile?.__position);
-  }
+  function getTilePosition(tile) { return normalizePosition(tile?.__position); }
 
   function getThingDefinition(itemId) {
-    if (!itemId) {
-      return null;
-    }
-
-    return (
-      window.gameClient?.itemDefinitionsByCid?.[itemId] ||
-      window.gameClient?.itemDefinitionsBySid?.[itemId] ||
-      window.gameClient?.itemDefinitions?.[itemId] ||
-      null
-    );
+    if (!itemId) return null;
+    return window.gameClient?.itemDefinitionsByCid?.[itemId] ||
+           window.gameClient?.itemDefinitionsBySid?.[itemId] ||
+           window.gameClient?.itemDefinitions?.[itemId] || null;
   }
 
   function getThingName(thing) {
-    const definition = getThingDefinition(thing?.id);
-    return String(definition?.properties?.name || thing?.name || "").trim().toLowerCase();
+    const def = getThingDefinition(thing?.id);
+    return String(def?.properties?.name || thing?.name || "").trim().toLowerCase();
   }
 
   function isLadderThing(thing) {
-    if (!thing?.id) {
-      return false;
-    }
-
-    if (ladderItemIds.has(Number(thing.id))) {
-      return true;
-    }
-
+    if (!thing?.id) return false;
+    if (ladderItemIds.has(Number(thing.id))) return true;
     return getThingName(thing).includes("ladder");
   }
 
   function isFloorChangeThing(thing) {
-    const definition = getThingDefinition(thing?.id);
-    return !!definition?.properties?.floorchange || isLadderThing(thing);
+    const def = getThingDefinition(thing?.id);
+    return !!def?.properties?.floorchange || isLadderThing(thing);
   }
 
   function isFloorChangeTile(tile) {
-    const tilePosition = getTilePosition(tile);
-    if (!tilePosition) {
-      return false;
-    }
-
-    if (isFloorChangeThing(tile)) {
-      return true;
-    }
-
-    return Array.isArray(tile.items) && tile.items.some((item) => isFloorChangeThing(item));
+    const pos = getTilePosition(tile);
+    if (!pos) return false;
+    if (isFloorChangeThing(tile)) return true;
+    return Array.isArray(tile.items) && tile.items.some(item => isFloorChangeThing(item));
   }
 
   function getTileThings(tile) {
-    if (!tile) {
-      return [];
-    }
-
+    if (!tile) return [];
     const things = [];
-    if (tile.id) {
-      things.push(tile);
-    }
+    if (tile.id) things.push(tile);
     if (Array.isArray(tile.items)) {
-      tile.items.forEach((item) => {
-        if (item) {
-          things.push(item);
-        }
-      });
+      tile.items.forEach(item => { if (item) things.push(item); });
     }
     return things;
   }
 
   function tileHasNamedThing(tile, needle) {
-    const value = String(needle || "").trim().toLowerCase();
-    if (!value) {
-      return false;
-    }
-
-    return getTileThings(tile).some((thing) => getThingName(thing).includes(value));
+    const val = String(needle || "").trim().toLowerCase();
+    if (!val) return false;
+    return getTileThings(tile).some(t => getThingName(t).includes(val));
   }
 
-  function isLadderTile(tile) {
-    return getTileThings(tile).some((thing) => isLadderThing(thing));
-  }
-
-  function isStairsTile(tile) {
-    return tileHasNamedThing(tile, "stairs");
-  }
-
-  function isHoleTile(tile) {
-    return tileHasNamedThing(tile, "hole");
-  }
-
-  function isRopeSpotTile(tile) {
-    return tileHasNamedThing(tile, "rope spot");
-  }
-
-  function isRopeTargetTile(tile) {
-    return isHoleTile(tile) || isRopeSpotTile(tile);
-  }
+  function isLadderTile(tile) { return getTileThings(tile).some(t => isLadderThing(t)); }
+  function isStairsTile(tile) { return tileHasNamedThing(tile, "stairs"); }
+  function isHoleTile(tile) { return tileHasNamedThing(tile, "hole"); }
+  function isRopeSpotTile(tile) { return tileHasNamedThing(tile, "rope spot"); }
+  function isRopeTargetTile(tile) { return isHoleTile(tile) || isRopeSpotTile(tile); }
 
   function isShovelTargetThing(thing) {
     const name = getThingName(thing);
-    if (!name) {
-      return false;
-    }
-
-    return shovelTargetNamePatterns.some((pattern) => pattern.test(name));
+    if (!name) return false;
+    return shovelTargetNamePatterns.some(p => p.test(name));
   }
-
   function isShovelTargetTile(tile) {
-    return getTileThings(tile).some((thing) => isShovelTargetThing(thing));
+    return getTileThings(tile).some(t => isShovelTargetThing(t));
   }
 
   function isTransitionCandidateTile(tile, waypoint, position) {
-    if (!tile) {
-      return false;
-    }
-
-    if (isFloorChangeTile(tile)) {
-      return true;
-    }
-
-    const hasWaypointDelta =
-      waypoint &&
-      position &&
-      Number.isFinite(waypoint.z) &&
-      Number.isFinite(position.z);
-
-    if (!hasWaypointDelta) {
-      return false;
-    }
-
-    if (waypoint.z > position.z) {
-      return isShovelTargetTile(tile);
-    }
-
-    if (waypoint.z < position.z) {
-      return isRopeTargetTile(tile);
-    }
-
+    if (!tile) return false;
+    if (isFloorChangeTile(tile)) return true;
+    if (!waypoint || !position || !Number.isFinite(waypoint.z) || !Number.isFinite(position.z)) return false;
+    if (waypoint.z > position.z) return isShovelTargetTile(tile);
+    if (waypoint.z < position.z) return isRopeTargetTile(tile);
     return false;
   }
 
   function getFloorChangeTileBias(tile, position, waypoint) {
-    if (!tile || !position || !waypoint || position.z === waypoint.z) {
-      return 0;
-    }
-
+    if (!tile || !position || !waypoint || position.z === waypoint.z) return 0;
     const goingDown = waypoint.z > position.z;
     const goingUp = waypoint.z < position.z;
-
     if (goingDown) {
       if (isLadderTile(tile)) return -30;
       if (isHoleTile(tile)) return -20;
       if (isStairsTile(tile)) return 25;
     }
-
     if (goingUp) {
       if (isStairsTile(tile)) return -20;
       if (isHoleTile(tile)) return 20;
     }
-
     return 0;
   }
 
   function getLoadedTiles() {
     const chunks = window.gameClient?.world?.chunks || [];
     const tiles = [];
-
     for (const chunk of chunks) {
       if (!chunk?.tiles) continue;
-
       for (const tile of chunk.tiles) {
-        if (tile?.__position) {
-          tiles.push(tile);
-        }
+        if (tile?.__position) tiles.push(tile);
       }
     }
-
     return tiles;
   }
 
+  // ---- MINIMAP OVERLAY ----
   function ensureMinimapOverlayStyle() {
-    if (document.getElementById(minimapOverlayStyleId)) {
-      return;
-    }
-
+    if (document.getElementById(minimapOverlayStyleId)) return;
     const style = document.createElement("style");
     style.id = minimapOverlayStyleId;
     style.textContent = `
-      #${minimapOverlayRootId} {
-        position: fixed;
-        inset: 0;
-        pointer-events: none;
-        z-index: 999997;
-      }
-
-      #${minimapOverlayRootId} canvas {
-        position: fixed;
-        pointer-events: none;
-      }
+      #${minimapOverlayRootId} { position: fixed; inset: 0; pointer-events: none; z-index: 999997; }
+      #${minimapOverlayRootId} canvas { position: fixed; pointer-events: none; }
     `;
     document.head.appendChild(style);
   }
 
   function ensureMinimapOverlayRoot() {
     let root = document.getElementById(minimapOverlayRootId);
-    if (root) {
-      return root;
-    }
-
+    if (root) return root;
     root = document.createElement("div");
     root.id = minimapOverlayRootId;
     root.innerHTML = '<canvas></canvas>';
@@ -4564,277 +3102,166 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
   function getMinimapViewport() {
     const canvas = getMinimapCanvas();
-    if (!(canvas instanceof HTMLCanvasElement)) {
-      return null;
-    }
-
+    if (!(canvas instanceof HTMLCanvasElement)) return null;
     const rect = canvas.getBoundingClientRect();
-    if (rect.width <= 0 || rect.height <= 0) {
-      return null;
-    }
-
+    if (rect.width <= 0 || rect.height <= 0) return null;
     return { canvas, rect };
   }
 
-  function getWaypointCanvasPoint(waypoint, viewport, playerPosition, minimap) {
-    if (!waypoint || !viewport || !playerPosition || !minimap) {
-      return null;
-    }
-
-    if (waypoint.z !== minimap.__renderLayer) {
-      return null;
-    }
-
-    const zoomScale = 1 << (Number(minimap.__zoomLevel) || 0);
+  function getWaypointCanvasPoint(waypoint, viewport, playerPos, minimap) {
+    if (!waypoint || !viewport || !playerPos || !minimap) return null;
+    if (waypoint.z !== minimap.__renderLayer) return null;
+    const zoom = 1 << (Number(minimap.__zoomLevel) || 0);
     const center = minimap.center || { x: 0, y: 0 };
-    const internalWidth = Number(viewport.canvas.width) || 160;
-    const internalHeight = Number(viewport.canvas.height) || 160;
-    const internalX = (internalWidth / 2) + (waypoint.x - playerPosition.x - Number(center.x || 0)) * zoomScale;
-    const internalY = (internalHeight / 2) + (waypoint.y - playerPosition.y - Number(center.y || 0)) * zoomScale;
-
-    return {
-      x: internalX * (viewport.rect.width / internalWidth),
-      y: internalY * (viewport.rect.height / internalHeight),
-    };
+    const iw = Number(viewport.canvas.width) || 160;
+    const ih = Number(viewport.canvas.height) || 160;
+    const ix = (iw / 2) + (waypoint.x - playerPos.x - Number(center.x || 0)) * zoom;
+    const iy = (ih / 2) + (waypoint.y - playerPos.y - Number(center.y || 0)) * zoom;
+    return { x: ix * (viewport.rect.width / iw), y: iy * (viewport.rect.height / ih) };
   }
 
   function renderMinimapOverlay() {
     const viewport = getMinimapViewport();
     const minimap = window.gameClient?.renderer?.minimap;
-    const playerPosition = normalizePosition(bot.getPlayerPosition());
+    const playerPos = normalizePosition(bot.getPlayerPosition());
     const root = ensureMinimapOverlayRoot();
     const canvas = root.querySelector("canvas");
-
-    if (!(canvas instanceof HTMLCanvasElement)) {
-      return;
+    if (!(canvas instanceof HTMLCanvasElement)) return;
+    if (!viewport || !minimap || !playerPos || !route.length) {
+      canvas.width = 0; canvas.height = 0; return;
     }
-
-    if (!viewport || !minimap || !playerPosition || !route.length) {
-      canvas.width = 0;
-      canvas.height = 0;
-      return;
-    }
-
     const rect = viewport.rect;
     const dpr = Math.max(1, window.devicePixelRatio || 1);
-    const width = Math.max(1, Math.round(rect.width));
-    const height = Math.max(1, Math.round(rect.height));
-    const pixelWidth = Math.round(width * dpr);
-    const pixelHeight = Math.round(height * dpr);
-
-    if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
-      canvas.width = pixelWidth;
-      canvas.height = pixelHeight;
+    const w = Math.max(1, Math.round(rect.width));
+    const h = Math.max(1, Math.round(rect.height));
+    const pw = Math.round(w * dpr);
+    const ph = Math.round(h * dpr);
+    if (canvas.width !== pw || canvas.height !== ph) {
+      canvas.width = pw; canvas.height = ph;
     }
-
     canvas.style.left = `${Math.round(rect.left)}px`;
     canvas.style.top = `${Math.round(rect.top)}px`;
-    canvas.style.width = `${width}px`;
-    canvas.style.height = `${height}px`;
-
-    const context = canvas.getContext("2d");
-    if (!context) {
-      return;
+    canvas.style.width = `${w}px`;
+    canvas.style.height = `${h}px`;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    const visible = route.map((wp, i) => ({ waypoint: wp, index: i, point: getWaypointCanvasPoint(wp, viewport, playerPos, minimap) }))
+      .filter(e => e.point);
+    if (!visible.length) return;
+    ctx.save();
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    for (let i = 1; i < visible.length; i++) {
+      const prev = visible[i-1], cur = visible[i];
+      if (cur.index !== prev.index + 1) continue;
+      ctx.strokeStyle = "rgba(92, 228, 196, 0.7)";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(prev.point.x, prev.point.y);
+      ctx.lineTo(cur.point.x, cur.point.y);
+      ctx.stroke();
     }
-
-    context.setTransform(dpr, 0, 0, dpr, 0, 0);
-    context.clearRect(0, 0, width, height);
-
-    const visibleWaypoints = route
-      .map((waypoint, index) => ({
-        waypoint,
-        index,
-        point: getWaypointCanvasPoint(waypoint, viewport, playerPosition, minimap),
-      }))
-      .filter((entry) => entry.point);
-
-    if (!visibleWaypoints.length) {
-      return;
-    }
-
-    context.save();
-    context.lineCap = "round";
-    context.lineJoin = "round";
-
-    for (let index = 1; index < visibleWaypoints.length; index += 1) {
-      const previous = visibleWaypoints[index - 1];
-      const current = visibleWaypoints[index];
-      if (current.index !== previous.index + 1) {
-        continue;
-      }
-
-      context.strokeStyle = "rgba(92, 228, 196, 0.7)";
-      context.lineWidth = 2;
-      context.beginPath();
-      context.moveTo(previous.point.x, previous.point.y);
-      context.lineTo(current.point.x, current.point.y);
-      context.stroke();
-    }
-
-    visibleWaypoints.forEach(({ point, index }) => {
+    visible.forEach(({ point, index }) => {
       const isCurrent = state.running && index === state.currentIndex;
       const radius = isCurrent ? 7 : 5;
-
-      context.fillStyle = isCurrent ? "#ffcf5a" : "#2bd1c4";
-      context.strokeStyle = isCurrent ? "#6a2400" : "#083f49";
-      context.lineWidth = 2;
-      context.beginPath();
-      context.arc(point.x, point.y, radius, 0, Math.PI * 2);
-      context.fill();
-      context.stroke();
-
-      context.fillStyle = "#ffffff";
-      context.font = "bold 11px Verdana, sans-serif";
-      context.textAlign = "center";
-      context.textBaseline = "middle";
-      context.fillText(String(index + 1), point.x, point.y);
+      ctx.fillStyle = isCurrent ? "#ffcf5a" : "#2bd1c4";
+      ctx.strokeStyle = isCurrent ? "#6a2400" : "#083f49";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(point.x, point.y, radius, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "bold 11px Verdana, sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(String(index + 1), point.x, point.y);
     });
-
-    context.restore();
+    ctx.restore();
   }
 
   function startMinimapOverlay() {
-    if (minimapOverlayState.timerId != null) {
-      return;
-    }
-
+    if (minimapOverlayState.timerId != null) return;
     ensureMinimapOverlayStyle();
     renderMinimapOverlay();
     minimapOverlayState.timerId = window.setInterval(renderMinimapOverlay, 250);
   }
-
   function stopMinimapOverlay() {
     if (minimapOverlayState.timerId != null) {
       window.clearInterval(minimapOverlayState.timerId);
       minimapOverlayState.timerId = null;
     }
-
     destroyMinimapOverlayElements();
   }
 
+  // ---- TRANSITION HANDLING ----
   function getNearbyTransitionTiles(position, waypoint, radius = 8) {
-    if (!position) {
-      return [];
-    }
-
+    if (!position) return [];
     return getLoadedTiles()
-      .map((tile) => ({ tile, position: getTilePosition(tile) }))
-      .filter((entry) =>
-        entry.position &&
-        entry.position.z === position.z &&
-        Math.abs(entry.position.x - position.x) <= radius &&
-        Math.abs(entry.position.y - position.y) <= radius &&
-        isTransitionCandidateTile(entry.tile, waypoint, position)
+      .map(t => ({ tile: t, position: getTilePosition(t) }))
+      .filter(e =>
+        e.position &&
+        e.position.z === position.z &&
+        Math.abs(e.position.x - position.x) <= radius &&
+        Math.abs(e.position.y - position.y) <= radius &&
+        isTransitionCandidateTile(e.tile, waypoint, position)
       );
   }
 
   function findTransitionTileNearPosition(position, waypoint, radius = 1) {
-    if (!position) {
-      return null;
-    }
-
-    let best = null;
-    let bestDistance = Number.POSITIVE_INFINITY;
-
-    getNearbyTransitionTiles(position, waypoint, radius).forEach((entry) => {
-      const distance = getDistance(position, entry.position);
-      if (!Number.isFinite(distance)) {
-        return;
-      }
-
-      if (distance < bestDistance) {
-        bestDistance = distance;
-        best = entry;
-      }
+    if (!position) return null;
+    let best = null, bestDist = Infinity;
+    getNearbyTransitionTiles(position, waypoint, radius).forEach(e => {
+      const d = getDistance(position, e.position);
+      if (Number.isFinite(d) && d < bestDist) { bestDist = d; best = e; }
     });
-
     return best;
   }
 
   function findBestKnownTransition(position, waypoint) {
-    if (!position || !waypoint) {
-      return null;
-    }
-
-    let best = null;
-    let bestScore = Number.POSITIVE_INFINITY;
-
-    transitions.forEach((transition) => {
-      if (transition.from.z !== position.z || transition.to.z !== waypoint.z) {
-        return;
-      }
-
-      const playerDistance = getDistance(position, transition.from);
-      const landingDistance = getDistance(transition.to, waypoint);
-      if (!Number.isFinite(playerDistance) || !Number.isFinite(landingDistance)) {
-        return;
-      }
-
-      const score = playerDistance * 10 + landingDistance;
-      if (score < bestScore) {
-        bestScore = score;
-        best = transition;
-      }
+    if (!position || !waypoint) return null;
+    let best = null, bestScore = Infinity;
+    transitions.forEach(t => {
+      if (t.from.z !== position.z || t.to.z !== waypoint.z) return;
+      const playerDist = getDistance(position, t.from);
+      const landingDist = getDistance(t.to, waypoint);
+      if (!Number.isFinite(playerDist) || !Number.isFinite(landingDist)) return;
+      const score = playerDist * 10 + landingDist;
+      if (score < bestScore) { bestScore = score; best = t; }
     });
-
     return best;
   }
 
   function findNearbyTransitionTile(position, waypoint) {
-    if (!position || !waypoint) {
-      return null;
-    }
-
-    const waypointDistance = Math.abs(position.x - waypoint.x) + Math.abs(position.y - waypoint.y);
-    const radius = Math.max(4, Math.min(20, waypointDistance + 2));
-    let best = null;
-    let bestScore = Number.POSITIVE_INFINITY;
-
-    getNearbyTransitionTiles(position, waypoint, radius).forEach((entry) => {
-      const playerDistance = getDistance(position, entry.position);
-      const tileToWaypointDistance =
-        Math.abs(entry.position.x - waypoint.x) + Math.abs(entry.position.y - waypoint.y);
-      const score =
-        playerDistance * 10 +
-        tileToWaypointDistance +
-        getFloorChangeTileBias(entry.tile, position, waypoint);
-
-      if (score < bestScore) {
-        bestScore = score;
-        best = {
-          tile: entry.tile,
-          position: entry.position,
-          playerDistance,
-          waypointDistance: tileToWaypointDistance,
-        };
-      }
+    if (!position || !waypoint) return null;
+    const wpDist = Math.abs(position.x - waypoint.x) + Math.abs(position.y - waypoint.y);
+    const radius = Math.max(4, Math.min(20, wpDist + 2));
+    let best = null, bestScore = Infinity;
+    getNearbyTransitionTiles(position, waypoint, radius).forEach(e => {
+      const pd = getDistance(position, e.position);
+      const twd = Math.abs(e.position.x - waypoint.x) + Math.abs(e.position.y - waypoint.y);
+      const score = pd * 10 + twd + getFloorChangeTileBias(e.tile, position, waypoint);
+      if (score < bestScore) { bestScore = score; best = { tile: e.tile, position: e.position, playerDistance: pd, waypointDistance: twd }; }
     });
-
     return best;
   }
 
-	function isAtWaypoint(position, waypoint) {
-	  const distance = getDistanceToWaypoint(position, waypoint);
-	  if (!Number.isFinite(distance)) return false;
-	  return distance <= Math.max(0, Number(config.waypointTolerance) || 0);
-	}
+  function isAtWaypoint(position, waypoint) {
+    const d = getDistanceToWaypoint(position, waypoint);
+    if (!Number.isFinite(d)) return false;
+    return d <= Math.max(0, Number(config.waypointTolerance) || 0);
+  }
 
   function goToWaypoint(waypoint) {
     const from = bot.getPlayerPosition();
-    if (!from || !waypoint) {
-      return false;
-    }
-
+    if (!from || !waypoint) return false;
     const to = new Position(waypoint.x, waypoint.y, waypoint.z);
-
     try {
       window.gameClient?.world?.pathfinder?.findPath?.(from, to);
       state.lastPathAt = Date.now();
-      bot.log("cave pathing to waypoint", {
-        ...waypoint,
-        index: state.currentIndex + 1,
-        total: route.length,
-      });
+      bot.log("cave pathing to waypoint", { ...waypoint, index: state.currentIndex + 1, total: route.length });
       return true;
     } catch (error) {
       bot.log("cave pathing failed", { ...waypoint, error: error?.message || error });
@@ -4843,127 +3270,75 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
   }
 
   function goToPosition(position) {
-    if (!position) {
-      return false;
-    }
-
+    if (!position) return false;
     return goToWaypoint(position);
   }
 
   function markPendingTransitionSource(source) {
-    const normalized = normalizePosition(source);
-    if (!normalized) {
-      return;
-    }
-
-    state.pendingTransitionSource = {
-      ...normalized,
-      at: Date.now(),
-    };
+    const norm = normalizePosition(source);
+    if (!norm) return;
+    state.pendingTransitionSource = { ...norm, at: Date.now() };
   }
 
   function upsertTransition(from, to) {
-    const normalizedFrom = normalizePosition(from);
-    const normalizedTo = normalizePosition(to);
-    if (!normalizedFrom || !normalizedTo || normalizedFrom.z === normalizedTo.z) {
-      return null;
-    }
-
-    const key = getPositionKey(normalizedFrom);
-    const index = transitions.findIndex((transition) => getPositionKey(transition.from) === key);
+    const f = normalizePosition(from), t = normalizePosition(to);
+    if (!f || !t || f.z === t.z) return null;
+    const key = getPositionKey(f);
+    const idx = transitions.findIndex(tr => getPositionKey(tr.from) === key);
     const next = {
-      from: normalizedFrom,
-      to: normalizedTo,
-      count: index >= 0 ? transitions[index].count + 1 : 1,
+      from: f, to: t,
+      count: idx >= 0 ? transitions[idx].count + 1 : 1,
       lastSeenAt: Date.now(),
     };
-
-    if (index >= 0) {
-      transitions[index] = next;
-    } else {
-      transitions.push(next);
-    }
-
+    if (idx >= 0) transitions[idx] = next;
+    else transitions.push(next);
     persistTransitions();
     bot.log("cave learned floor transition", next);
     return cloneValue(next);
   }
 
-  function resolveObservedTransitionSource(previousPosition) {
+  function resolveObservedTransitionSource(prevPos) {
     const pending = normalizePosition(state.pendingTransitionSource);
-    if (pending && pending.z === previousPosition.z) {
-      return pending;
-    }
-
-    const currentTile = getTileAt(previousPosition);
-    if (currentTile && isFloorChangeTile(currentTile)) {
-      return previousPosition;
-    }
-
-    const nearby = findTransitionTileNearPosition(previousPosition, null, 1);
-    if (nearby?.position) {
-      return nearby.position;
-    }
-
+    if (pending && pending.z === prevPos.z) return pending;
+    const tile = getTileAt(prevPos);
+    if (tile && isFloorChangeTile(tile)) return prevPos;
+    const nearby = findTransitionTileNearPosition(prevPos, null, 1);
+    if (nearby?.position) return nearby.position;
     return null;
   }
 
   function observePosition() {
     const current = normalizePosition(bot.getPlayerPosition());
-    if (!current) {
-      return;
-    }
-
+    if (!current) return;
     const previous = state.lastObservedPosition;
     if (previous && !isSameTile(previous, current) && previous.z !== current.z) {
       const source = resolveObservedTransitionSource(previous);
-      if (source) {
-        upsertTransition(source, current);
-      }
+      if (source) upsertTransition(source, current);
       state.pendingTransitionSource = null;
     }
-
     state.lastObservedPosition = current;
   }
 
-  function getEquipment() {
-    return window.gameClient?.player?.equipment || null;
-  }
+  // ---- TOOL HANDLING (rope / shovel) ----
+  function getEquipment() { return window.gameClient?.player?.equipment || null; }
+  function getOpenContainers() { return Array.from(window.gameClient?.player?.__openedContainers || []); }
 
-  function getOpenContainers() {
-    return Array.from(window.gameClient?.player?.__openedContainers || []);
-  }
-
-  function findAdjacentWalkablePosition(targetPosition, playerPosition) {
-    if (!targetPosition || !playerPosition) {
-      return null;
-    }
-
+  function findAdjacentWalkablePosition(targetPos, playerPos) {
+    if (!targetPos || !playerPos) return null;
     const offsets = [
       { x: 0, y: -1 }, { x: 1, y: 0 }, { x: 0, y: 1 }, { x: -1, y: 0 },
       { x: -1, y: -1 }, { x: 1, y: -1 }, { x: -1, y: 1 }, { x: 1, y: 1 },
     ];
-
     offsets.sort((a, b) => {
-      const da = Math.abs(targetPosition.x + a.x - playerPosition.x) +
-        Math.abs(targetPosition.y + a.y - playerPosition.y);
-      const db = Math.abs(targetPosition.x + b.x - playerPosition.x) +
-        Math.abs(targetPosition.y + b.y - playerPosition.y);
+      const da = Math.abs(targetPos.x + a.x - playerPos.x) + Math.abs(targetPos.y + a.y - playerPos.y);
+      const db = Math.abs(targetPos.x + b.x - playerPos.x) + Math.abs(targetPos.y + b.y - playerPos.y);
       return da - db;
     });
-
-    for (const offset of offsets) {
-      const position = new Position(
-        targetPosition.x + offset.x,
-        targetPosition.y + offset.y,
-        targetPosition.z
-      );
-      const tile = window.gameClient?.world?.getTileFromWorldPosition?.(position);
-      if (tile?.isWalkable?.()) {
-        return normalizePosition(position);
-      }
+    for (const off of offsets) {
+      const pos = new Position(targetPos.x + off.x, targetPos.y + off.y, targetPos.z);
+      const tile = window.gameClient?.world?.getTileFromWorldPosition?.(pos);
+      if (tile?.isWalkable?.()) return normalizePosition(pos);
     }
-
     return null;
   }
 
@@ -4971,62 +3346,40 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     const name = getThingName(item);
     return !!name && ropeNamePattern.test(name);
   }
-
   function isShovelItem(item) {
     const name = getThingName(item);
     return !!name && shovelNamePattern.test(name);
   }
 
   function findToolSource(predicate) {
-    const equipment = getEquipment();
-
-    if (equipment?.slots) {
-      for (let slotIndex = 0; slotIndex < equipment.slots.length; slotIndex += 1) {
-        const item = equipment.getSlotItem?.(slotIndex);
-        if (predicate(item)) {
-          return { which: equipment, index: slotIndex, item, location: "equipment" };
-        }
+    const eq = getEquipment();
+    if (eq?.slots) {
+      for (let i = 0; i < eq.slots.length; i++) {
+        const item = eq.getSlotItem?.(i);
+        if (predicate(item)) return { which: eq, index: i, item, location: "equipment" };
       }
     }
-
     for (const container of getOpenContainers()) {
       const slots = container?.slots || [];
-      for (let slotIndex = 0; slotIndex < slots.length; slotIndex += 1) {
-        const item = container.getSlotItem?.(slotIndex);
-        if (predicate(item)) {
-          return { which: container, index: slotIndex, item, location: "container" };
-        }
+      for (let i = 0; i < slots.length; i++) {
+        const item = container.getSlotItem?.(i);
+        if (predicate(item)) return { which: container, index: i, item, location: "container" };
       }
     }
-
     return null;
   }
 
-  function findRopeSource() {
-    return findToolSource(isRopeItem);
-  }
-
-  function findShovelSource() {
-    return findToolSource(isShovelItem);
-  }
+  function findRopeSource() { return findToolSource(isRopeItem); }
+  function findShovelSource() { return findToolSource(isShovelItem); }
 
   function useToolOnTile(tool, targetTile, targetPosition, actionLabel, now = Date.now()) {
-    if (!tool || !targetTile || !targetPosition) {
-      return false;
+    if (!tool || !targetTile || !targetPosition) return false;
+    const playerPos = normalizePosition(bot.getPlayerPosition());
+    if (!playerPos) return false;
+    if (!isAdjacentTile(playerPos, targetPosition)) {
+      const adj = findAdjacentWalkablePosition(targetPosition, playerPos);
+      if (adj) return goToPosition(adj);
     }
-
-    const playerPosition = normalizePosition(bot.getPlayerPosition());
-    if (!playerPosition) {
-      return false;
-    }
-
-    if (!isAdjacentTile(playerPosition, targetPosition)) {
-      const adjacentPosition = findAdjacentWalkablePosition(targetPosition, playerPosition);
-      if (adjacentPosition) {
-        return goToPosition(adjacentPosition);
-      }
-    }
-
     window.gameClient?.mouse?.__handleItemUseWith?.(
       { which: tool.which, index: tool.index },
       { which: targetTile, index: 0xFF }
@@ -5034,169 +3387,118 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     state.lastStairsUseAt = now;
     state.lastPathAt = now;
     markPendingTransitionSource(targetPosition);
-    bot.log(actionLabel, {
-      source: targetPosition,
-      toolLocation: tool.location,
-      toolSlot: tool.index,
-      toolName: getThingName(tool.item),
-    });
+    bot.log(actionLabel, { source: targetPosition, toolLocation: tool.location, toolSlot: tool.index, toolName: getThingName(tool.item) });
     return true;
   }
 
-  function useRopeOnTile(targetTile, targetPosition, now = Date.now()) {
-    return useToolOnTile(
-      findRopeSource(),
-      targetTile,
-      targetPosition,
-      "cave roped transition tile",
-      now
-    );
+  function useRopeOnTile(targetTile, targetPosition, now) {
+    return useToolOnTile(findRopeSource(), targetTile, targetPosition, "cave roped transition tile", now);
   }
-
-  function useShovelOnTile(targetTile, targetPosition, now = Date.now()) {
-    return useToolOnTile(
-      findShovelSource(),
-      targetTile,
-      targetPosition,
-      "cave shoveled transition tile",
-      now
-    );
+  function useShovelOnTile(targetTile, targetPosition, now) {
+    return useToolOnTile(findShovelSource(), targetTile, targetPosition, "cave shoveled transition tile", now);
   }
 
   function useFloorChangeTile(target, waypoint, now = Date.now()) {
     const position = normalizePosition(bot.getPlayerPosition());
-    const targetPosition = normalizePosition(target?.position);
-    const targetTile = target?.tile || (targetPosition ? getTileAt(targetPosition) : null);
-    if (!position || !targetPosition || !targetTile) {
-      return false;
-    }
-
-    if (now - state.lastStairsUseAt < 1200) {
-      return true;
-    }
+    const targetPos = normalizePosition(target?.position);
+    const targetTile = target?.tile || (targetPos ? getTileAt(targetPos) : null);
+    if (!position || !targetPos || !targetTile) return false;
+    if (now - state.lastStairsUseAt < 1200) return true;
 
     if (waypoint?.z < position.z && isRopeTargetTile(targetTile)) {
-      return useRopeOnTile(targetTile, targetPosition, now);
+      return useRopeOnTile(targetTile, targetPos, now);
     }
-
     if (!isFloorChangeTile(targetTile)) {
       if (waypoint?.z > position.z && isShovelTargetTile(targetTile)) {
-        return useShovelOnTile(targetTile, targetPosition, now);
+        return useShovelOnTile(targetTile, targetPos, now);
       }
       return false;
     }
-
     if (isLadderTile(targetTile)) {
       window.gameClient?.mouse?.use?.({ which: targetTile, index: 0xFF });
       state.lastStairsUseAt = now;
       state.lastPathAt = now;
-      markPendingTransitionSource(targetPosition);
-      bot.log("cave used ladder tile", {
-        source: targetPosition,
-        targetZ: waypoint?.z ?? null,
-      });
+      markPendingTransitionSource(targetPos);
+      bot.log("cave used ladder tile", { source: targetPos, targetZ: waypoint?.z ?? null });
       return true;
     }
-
-    if (!isSameTile(position, targetPosition)) {
-      return goToPosition(targetPosition);
-    }
-
-    const currentTile = getTileAt(position);
-    if (!currentTile || !isFloorChangeTile(currentTile)) {
-      return false;
-    }
-
-    window.gameClient?.mouse?.use?.({ which: currentTile, index: 0xFF });
+    if (!isSameTile(position, targetPos)) return goToPosition(targetPos);
+    const curTile = getTileAt(position);
+    if (!curTile || !isFloorChangeTile(curTile)) return false;
+    window.gameClient?.mouse?.use?.({ which: curTile, index: 0xFF });
     state.lastStairsUseAt = now;
     state.lastPathAt = now;
     markPendingTransitionSource(position);
-    bot.log("cave used floor-change tile", {
-      source: position,
-      targetZ: waypoint?.z ?? null,
-    });
+    bot.log("cave used floor-change tile", { source: position, targetZ: waypoint?.z ?? null });
     return true;
   }
 
   function handleFloorChange(waypoint, now = Date.now()) {
     const position = normalizePosition(bot.getPlayerPosition());
-    if (!position || !waypoint || position.z === waypoint.z) {
-      return false;
-    }
-
-    const visibleCandidate = findNearbyTransitionTile(position, waypoint);
-    if (visibleCandidate) {
-      const moved = useFloorChangeTile(visibleCandidate, waypoint, now);
+    if (!position || !waypoint || position.z === waypoint.z) return false;
+    const visible = findNearbyTransitionTile(position, waypoint);
+    if (visible) {
+      const moved = useFloorChangeTile(visible, waypoint, now);
       if (moved) {
         bot.log("cave probing visible floor-change tile", {
-          tileX: visibleCandidate.position.x,
-          tileY: visibleCandidate.position.y,
-          tileZ: visibleCandidate.position.z,
+          tileX: visible.position.x, tileY: visible.position.y, tileZ: visible.position.z,
           targetZ: waypoint.z,
         });
         return true;
       }
     }
-
-    const knownTransition = findBestKnownTransition(position, waypoint);
-    if (knownTransition) {
-      const target = {
-        tile: getTileAt(knownTransition.from),
-        position: knownTransition.from,
-      };
+    const known = findBestKnownTransition(position, waypoint);
+    if (known) {
+      const target = { tile: getTileAt(known.from), position: known.from };
       const moved = useFloorChangeTile(target, waypoint, now);
       if (moved) {
-        bot.log("cave using learned floor transition", {
-          from: knownTransition.from,
-          to: knownTransition.to,
-          waypoint,
-        });
+        bot.log("cave using learned floor transition", { from: known.from, to: known.to, waypoint });
         return true;
       }
-
-      bot.log("cave learned transition unavailable, falling back to live scan", {
-        from: knownTransition.from,
-        to: knownTransition.to,
-        waypoint,
-      });
+      bot.log("cave learned transition unavailable, falling back to live scan", { from: known.from, to: known.to, waypoint });
     }
     return false;
   }
 
-	function advanceWaypoint() {
-	  if (!route.length) return null;
-	  if (route.length === 1) return route[0];
-
-	  let nextIndex = state.currentIndex + state.direction;
-	  if (nextIndex >= route.length) {
-		if (config.loopMode) {
-		  nextIndex = 0;
-		} else {
-		  state.direction = -1;
-		  nextIndex = route.length - 2;
-		}
-	  } else if (nextIndex < 0) {
-		if (config.loopMode) {
-		  nextIndex = route.length - 1;
-		} else {
-		  state.direction = 1;
-		  nextIndex = 1;
-		}
-	  }
-	  state.currentIndex = Math.max(0, Math.min(route.length - 1, nextIndex));
-	  const nextWaypoint = getCurrentWaypoint();
-	  bot.log("cave advanced waypoint", { index: state.currentIndex + 1, total: route.length, direction: state.direction, waypoint: nextWaypoint });
-	  return nextWaypoint;
-	}
-
-  function scheduleNextTick() {
-    if (!state.running) return;
-
-    state.timerId = window.setTimeout(() => {
-      tick();
-    }, config.tickMs);
+  // ---- WAYPOINT NAVIGATION ----
+  function advanceWaypoint() {
+    if (!route.length) return null;
+    if (route.length === 1) return route[0];
+    let next = state.currentIndex + state.direction;
+    if (next >= route.length) {
+      if (config.loopMode) {
+        next = 0;
+      } else {
+        state.direction = -1;
+        next = route.length - 2;
+      }
+    } else if (next < 0) {
+      if (config.loopMode) {
+        next = route.length - 1;
+      } else {
+        state.direction = 1;
+        next = 1;
+      }
+    }
+    state.currentIndex = Math.max(0, Math.min(route.length - 1, next));
+    state.pathAttemptStart = 0;
+    const wp = getCurrentWaypoint();
+    bot.log("cave advanced waypoint", { index: state.currentIndex + 1, total: route.length, direction: state.direction, waypoint: wp });
+    return wp;
   }
 
+  // ---- MAIN LOOP ----
+  function scheduleNextTick() {
+    if (!state.running) return;
+    state.timerId = window.setTimeout(() => tick(), config.tickMs);
+  }
+
+  /**
+   * The main cave tick: observes position, pauses for combat, checks waypoint
+   * proximity, handles floor changes, and repaths. Includes a guarded skip
+   * logic that waits for pathfinder to give up (__finalDestination === null)
+   * and for a time threshold before skipping.
+   */
   function tick() {
     if (!state.running) return;
 
@@ -5246,24 +3548,77 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         return;
       }
 
+      // Check if we are at waypoint
       if (isAtWaypoint(position, waypoint)) {
+        state.lastWaypointTarget = null;
+        state.pathAttemptStart = 0;
         waypoint = advanceWaypoint();
-      }
-
-      if (!waypoint) {
+        if (!waypoint) {
+          stop();
+          return;
+        }
+        state.lastWaypointTarget = waypoint;
+        state.pathAttemptStart = now;
+        goToWaypoint(waypoint);
         return;
       }
 
+      // Handle floor change if needed (do NOT skip floor-change waypoints)
       if (position && waypoint.z !== position.z) {
+        state.lastWaypointTarget = null;
+        state.pathAttemptStart = 0;
         handleFloorChange(waypoint, now);
         return;
       }
 
-      const shouldRepath =
-        now - state.lastPathAt >= config.repathMs ||
-        !state.lastProgressAt ||
-        now - state.lastProgressAt >= config.repathMs;
+      // --- Pathfinder skip logic (only if on the same floor) ---
+      const pf = window.gameClient?.world?.pathfinder;
 
+      // If pathfinder is still searching, wait
+      if (pf && (pf.__isProcessing || pf.__isMinimapSearching)) {
+        return;
+      }
+
+      // If we haven't set a target waypoint yet, set it now
+      if (state.lastWaypointTarget === null || !isSameTile(state.lastWaypointTarget, waypoint)) {
+        state.lastWaypointTarget = waypoint;
+        state.pathAttemptStart = now;
+        goToWaypoint(waypoint);
+        return;
+      }
+
+      // Check if we should skip this waypoint
+      if (state.lastWaypointTarget && position && pf) {
+        const dist = getDistanceToWaypoint(position, state.lastWaypointTarget);
+        if (dist !== null && dist > (config.waypointTolerance || 0)) {
+          const timeSinceLastPath = now - state.lastPathAt;
+          const timeSinceAttemptStart = now - state.pathAttemptStart;
+          // Only skip if we haven't sent a path in 5 seconds,
+          // have been trying for 5 seconds, and pf has no destination.
+          if (timeSinceLastPath > 5000 && timeSinceAttemptStart > 5000 && pf.__finalDestination === null) {
+            bot.log("Pathfinder gave up, skipping to next waypoint", {
+              waypoint: state.lastWaypointTarget,
+              timeSinceLastPath,
+              timeSinceAttemptStart,
+            });
+            state.lastWaypointTarget = null;
+            state.pathAttemptStart = 0;
+            const nextWp = advanceWaypoint();
+            if (nextWp) goToWaypoint(nextWp);
+            else stop();
+            return;
+          }
+        } else {
+          // We reached the waypoint – clear target
+          state.lastWaypointTarget = null;
+          state.pathAttemptStart = 0;
+        }
+      }
+
+      // Repath if needed
+      const shouldRepath = now - state.lastPathAt >= config.repathMs ||
+                           !state.lastProgressAt ||
+                           now - state.lastProgressAt >= config.repathMs;
       if (shouldRepath) {
         goToWaypoint(waypoint);
       }
@@ -5274,55 +3629,37 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     }
   }
 
+  // ---- OBSERVER (learn transitions in background) ----
   function startObserver() {
-    if (state.observerTimerId != null) {
-      return;
-    }
-
+    if (state.observerTimerId != null) return;
     state.observerTimerId = window.setInterval(() => {
-      try {
-        observePosition();
-      } catch (error) {
-        bot.log("cave observer failed", error?.message || error);
-      }
+      try { observePosition(); } catch (e) { bot.log("cave observer failed", e?.message || e); }
     }, 200);
   }
 
   function stopObserver() {
-    if (state.observerTimerId == null) {
-      return;
-    }
-
+    if (state.observerTimerId == null) return;
     window.clearInterval(state.observerTimerId);
     state.observerTimerId = null;
   }
 
+  // ---- PUBLIC API ----
   function start(overrides = {}) {
     Object.assign(config, overrides, { enabled: true });
     config.tickMs = 500;
     persistConfig();
-
-    if (!route.length) {
-      bot.log("cave bot cannot start without waypoints");
-      return false;
-    }
-
-    if (state.running) {
-      bot.log("cave bot already running");
-      return false;
-    }
-
-    const position = normalizePosition(bot.getPlayerPosition());
+    if (!route.length) { bot.log("cave bot cannot start without waypoints"); return false; }
+    if (state.running) { bot.log("cave bot already running"); return false; }
+    const pos = normalizePosition(bot.getPlayerPosition());
     state.running = true;
-    state.currentIndex = findClosestWaypointIndex(position);
+    state.currentIndex = findClosestWaypointIndex(pos);
     state.direction = state.currentIndex >= route.length - 1 ? -1 : 1;
-    if (route.length <= 1) {
-      state.direction = 1;
-    }
+    if (route.length <= 1) state.direction = 1;
     state.lastPathAt = 0;
-    state.lastPositionKey = getPositionKey(position);
+    state.lastPositionKey = getPositionKey(pos);
     state.lastProgressAt = Date.now();
     state.pausedForCombat = false;
+    state.pathAttemptStart = 0;
     bot.log("cave bot started", {
       waypoints: route.length,
       currentIndex: state.currentIndex + 1,
@@ -5334,43 +3671,28 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
   }
 
   function stop(options = {}) {
-    const shouldPersistEnabled = options.persistEnabled !== false;
+    const shouldPersist = options.persistEnabled !== false;
     state.running = false;
-
-    if (state.timerId != null) {
-      window.clearTimeout(state.timerId);
-      state.timerId = null;
-    }
-
-    if (shouldPersistEnabled) {
-      config.enabled = false;
-      persistConfig();
-    }
+    if (state.timerId != null) { window.clearTimeout(state.timerId); state.timerId = null; }
+    if (shouldPersist) { config.enabled = false; persistConfig(); }
     state.pausedForCombat = false;
     bot.log("cave bot stopped");
     return true;
   }
 
   function addWaypoint(waypoint) {
-    const normalized = normalizeWaypoint(waypoint);
-    if (!normalized) {
-      return null;
-    }
-
-    route.push(normalized);
+    const norm = normalizeWaypoint(waypoint);
+    if (!norm) return null;
+    route.push(norm);
     persistRoute();
-    bot.log("cave waypoint added", { ...normalized, total: route.length });
-    return cloneValue(normalized);
+    bot.log("cave waypoint added", { ...norm, total: route.length });
+    return cloneValue(norm);
   }
 
   function addWaypointCurrentSpot() {
-    const position = normalizePosition(bot.getPlayerPosition());
-    if (!position) {
-      bot.log("could not read current position for cave waypoint");
-      return null;
-    }
-
-    return addWaypoint(position);
+    const pos = normalizePosition(bot.getPlayerPosition());
+    if (!pos) { bot.log("could not read current position for cave waypoint"); return null; }
+    return addWaypoint(pos);
   }
 
   function clearWaypoints() {
@@ -5379,11 +3701,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     state.direction = 1;
     persistRoute();
     bot.log("cave route cleared");
-
-    if (state.running) {
-      stop();
-    }
-
+    if (state.running) stop();
     return [];
   }
 
@@ -5396,47 +3714,28 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
   }
 
   function removeLastWaypoint() {
-    if (!route.length) {
-      return null;
-    }
-
+    if (!route.length) return null;
     const removed = route.pop();
-    if (state.currentIndex >= route.length) {
-      state.currentIndex = Math.max(0, route.length - 1);
-    }
-    if (route.length <= 1) {
-      state.direction = 1;
-    }
+    if (state.currentIndex >= route.length) state.currentIndex = Math.max(0, route.length - 1);
+    if (route.length <= 1) state.direction = 1;
     persistRoute();
     bot.log("cave waypoint removed", removed);
-
-    if (!route.length && state.running) {
-      stop();
-    }
-
+    if (!route.length && state.running) stop();
     return removed;
   }
 
   function setCurrentIndex(index) {
-    if (!route.length) {
-      state.currentIndex = 0;
-      state.direction = 1;
-      return 0;
-    }
-
-    const nextIndex = Math.max(0, Math.min(route.length - 1, Math.trunc(Number(index) || 0)));
-    state.currentIndex = nextIndex;
-    state.direction = nextIndex >= route.length - 1 ? -1 : 1;
-    if (route.length <= 1) {
-      state.direction = 1;
-    }
+    if (!route.length) { state.currentIndex = 0; state.direction = 1; return 0; }
+    const next = Math.max(0, Math.min(route.length - 1, Math.trunc(Number(index) || 0)));
+    state.currentIndex = next;
+    state.direction = next >= route.length - 1 ? -1 : 1;
+    if (route.length <= 1) state.direction = 1;
     return state.currentIndex;
   }
 
   function status() {
-    const position = normalizePosition(bot.getPlayerPosition());
-    const waypoint = getCurrentWaypoint();
-
+    const pos = normalizePosition(bot.getPlayerPosition());
+    const wp = getCurrentWaypoint();
     return {
       running: state.running,
       config: { ...config },
@@ -5446,8 +3745,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
       activePresetName: getActivePresetName(),
       currentIndex: state.currentIndex,
       direction: state.direction,
-      currentWaypoint: cloneValue(waypoint),
-      distanceToWaypoint: getDistanceToWaypoint(position, waypoint),
+      currentWaypoint: cloneValue(wp),
+      distanceToWaypoint: getDistanceToWaypoint(pos, wp),
       lastPathAt: state.lastPathAt,
       lastProgressAt: state.lastProgressAt,
       pendingTransitionSource: cloneValue(state.pendingTransitionSource),
@@ -5463,139 +3762,105 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     return { ...config };
   }
 
+  // ---- WAYPOINT REORDER/DELETE ----
+  function moveWaypointUp(index) {
+    if (!route.length || index <= 0 || index >= route.length) return false;
+    const temp = route[index];
+    route[index] = route[index - 1];
+    route[index - 1] = temp;
+    if (state.currentIndex === index) state.currentIndex = index - 1;
+    else if (state.currentIndex === index - 1) state.currentIndex = index;
+    persistRoute();
+    return true;
+  }
+
+  function moveWaypointDown(index) {
+    if (!route.length || index < 0 || index >= route.length - 1) return false;
+    const temp = route[index];
+    route[index] = route[index + 1];
+    route[index + 1] = temp;
+    if (state.currentIndex === index) state.currentIndex = index + 1;
+    else if (state.currentIndex === index + 1) state.currentIndex = index;
+    persistRoute();
+    return true;
+  }
+
+  function deleteWaypoint(index) {
+    if (!route.length || index < 0 || index >= route.length) return false;
+    route.splice(index, 1);
+    if (state.currentIndex >= route.length) state.currentIndex = Math.max(0, route.length - 1);
+    if (route.length === 0) {
+      state.currentIndex = 0; state.direction = 1;
+      if (state.running) stop();
+    }
+    persistRoute();
+    return true;
+  }
+
+  function setLoopMode(enabled) {
+    config.loopMode = !!enabled;
+    persistConfig();
+    bot.log("cave loop mode set", { loopMode: config.loopMode });
+    return config.loopMode;
+  }
+
+  function getLoopMode() { return config.loopMode; }
+
+  // ---- INSPECT NEARBY TILES (debug) ----
+  function inspectNearbyTiles(radius = 1) {
+    const pos = normalizePosition(bot.getPlayerPosition());
+    if (!pos) return [];
+    return getLoadedTiles()
+      .map(t => ({ tile: t, position: getTilePosition(t) }))
+      .filter(e => e.position && e.position.z === pos.z &&
+        Math.abs(e.position.x - pos.x) <= radius &&
+        Math.abs(e.position.y - pos.y) <= radius)
+      .map(e => ({
+        position: e.position,
+        isFloorChange: isFloorChangeTile(e.tile),
+        isHole: isHoleTile(e.tile),
+        isRopeTarget: isRopeTargetTile(e.tile),
+        isShovelTarget: isShovelTargetTile(e.tile),
+        names: getTileThings(e.tile).map(t => getThingName(t)).filter(Boolean),
+      }));
+  }
+
+  // ---- STARTUP ----
   startObserver();
   bot.addCleanup(stopObserver);
   startMinimapOverlay();
   bot.addCleanup(stopMinimapOverlay);
-
-  if (config.enabled && route.length) {
-    start();
-  }
-
-function moveWaypointUp(index) {
-  if (!route.length || index <= 0 || index >= route.length) return false;
-  const temp = route[index];
-  route[index] = route[index - 1];
-  route[index - 1] = temp;
-  // If the current index is involved, update it
-  if (state.currentIndex === index) state.currentIndex = index - 1;
-  else if (state.currentIndex === index - 1) state.currentIndex = index;
-  persistRoute();
-  return true;
-}
-
-function moveWaypointDown(index) {
-  if (!route.length || index < 0 || index >= route.length - 1) return false;
-  const temp = route[index];
-  route[index] = route[index + 1];
-  route[index + 1] = temp;
-  if (state.currentIndex === index) state.currentIndex = index + 1;
-  else if (state.currentIndex === index + 1) state.currentIndex = index;
-  persistRoute();
-  return true;
-}
-
-function deleteWaypoint(index) {
-  if (!route.length || index < 0 || index >= route.length) return false;
-  route.splice(index, 1);
-  // Adjust current index if needed
-  if (state.currentIndex >= route.length) state.currentIndex = Math.max(0, route.length - 1);
-  if (route.length === 0) {
-    state.currentIndex = 0;
-    state.direction = 1;
-    if (state.running) stop();
-  }
-  persistRoute();
-  return true;
-}
-
-function setLoopMode(enabled) {
-  config.loopMode = !!enabled;
-  persistConfig();
-  bot.log("cave loop mode set", { loopMode: config.loopMode });
-  return config.loopMode;
-}
-
-function getLoopMode() {
-  return config.loopMode;
-}
+  if (config.enabled && route.length) start();
 
   bot.cave = {
-    start,
-    stop,
-    status,
-    updateConfig,
-    config,
-    getRoute,
-    getTransitions,
-    getPresetNames,
-    getActivePresetName,
-    getCurrentWaypoint,
-    createPreset,
-    savePreset,
-    loadPreset,
-    deletePreset,
-    addWaypoint,
-    addWaypointCurrentSpot,
-    clearWaypoints,
-    clearTransitions,
-    removeLastWaypoint,
-    setCurrentIndex,
-    goToWaypoint,
-    goToPosition,
-    handleFloorChange,
-    findClosestWaypointIndex,
-    findRopeSource,
-    findShovelSource,
-	moveWaypointUp,
-	moveWaypointDown,
-	deleteWaypoint,
-	setLoopMode,
-	getLoopMode,
-    inspectNearbyTiles: (radius = 1) => {
-      const position = normalizePosition(bot.getPlayerPosition());
-      if (!position) {
-        return [];
-      }
-
-      return getLoadedTiles()
-        .map((tile) => ({ tile, position: getTilePosition(tile) }))
-        .filter((entry) =>
-          entry.position &&
-          entry.position.z === position.z &&
-          Math.abs(entry.position.x - position.x) <= radius &&
-          Math.abs(entry.position.y - position.y) <= radius
-        )
-        .map((entry) => ({
-          position: entry.position,
-          isFloorChange: isFloorChangeTile(entry.tile),
-          isHole: isHoleTile(entry.tile),
-          isRopeTarget: isRopeTargetTile(entry.tile),
-          isShovelTarget: isShovelTargetTile(entry.tile),
-          names: getTileThings(entry.tile).map((thing) => getThingName(thing)).filter(Boolean),
-        }));
-    },
+    start, stop, status, updateConfig, config,
+    getRoute, getTransitions, getPresetNames, getActivePresetName, getCurrentWaypoint,
+    createPreset, savePreset, loadPreset, deletePreset,
+    addWaypoint, addWaypointCurrentSpot, clearWaypoints, clearTransitions,
+    removeLastWaypoint, setCurrentIndex,
+    goToWaypoint, goToPosition, handleFloorChange,
+    findClosestWaypointIndex, findRopeSource, findShovelSource,
+    moveWaypointUp, moveWaypointDown, deleteWaypoint,
+    setLoopMode, getLoopMode,
+    inspectNearbyTiles,
     isAtWaypoint,
   };
 };
-window.__minibiaBotBundle = window.__minibiaBotBundle || {};
 
+/**
+ * ==================================================================================
+ * 11. EQUIP RING MODULE
+ *     Finds a ring in equipment or open containers and equips it to the ring slot.
+ * ==================================================================================
+ */
 window.__minibiaBotBundle.installEquipRingModule = function installEquipRingModule(bot) {
   const configStorageKey = "minibiaBot.equipRing.config";
   const RING_SLOT = 8;
-  const state = {
-    running: false,
-    timerId: null,
-    lastEquipAt: 0,
-  };
+  const state = { running: false, timerId: null, lastEquipAt: 0 };
   let resumeListenersAttached = false;
 
   const config = Object.assign(
-    {
-      tickMs: 1000,
-      equipCooldownMs: 1500,
-      enabled: false,
-    },
+    { tickMs: 1000, equipCooldownMs: 1500, enabled: false },
     bot.storage.get(configStorageKey, {})
   );
   config.tickMs = 1000;
@@ -5604,186 +3869,106 @@ window.__minibiaBotBundle.installEquipRingModule = function installEquipRingModu
     bot.storage.set(configStorageKey, { ...config });
   }
 
-  function getEquipment() {
-    return window.gameClient?.player?.equipment || null;
-  }
-
-  function getOpenContainers() {
-    return Array.from(window.gameClient?.player?.__openedContainers || []);
-  }
+  function getEquipment() { return window.gameClient?.player?.equipment || null; }
+  function getOpenContainers() { return Array.from(window.gameClient?.player?.__openedContainers || []); }
 
   function getItemDefinition(item) {
     if (!item) return null;
-
-    return (
-      window.gameClient?.itemDefinitionsBySid?.[item.sid] ||
-      window.gameClient?.itemDefinitions?.[item.id] ||
-      null
-    );
+    return window.gameClient?.itemDefinitionsBySid?.[item.sid] ||
+           window.gameClient?.itemDefinitions?.[item.id] || null;
   }
 
   function getItemName(item) {
-    const definition = getItemDefinition(item);
-    return definition?.properties?.name || item?.name || "";
+    const def = getItemDefinition(item);
+    return def?.properties?.name || item?.name || "";
   }
 
   function isRingItem(item) {
-    if (!item) {
-      return false;
-    }
-
-    const definition = getItemDefinition(item);
-    const slotType = String(
-      definition?.properties?.slotType ||
-      definition?.properties?.slot ||
-      ""
-    ).trim().toLowerCase();
-
-    if (slotType === "ring") {
-      return true;
-    }
-
+    if (!item) return false;
+    const def = getItemDefinition(item);
+    const slotType = String(def?.properties?.slotType || def?.properties?.slot || "").trim().toLowerCase();
+    if (slotType === "ring") return true;
     return /\bring\b/i.test(getItemName(item));
   }
 
   function getEquippedRing() {
-    const equipment = getEquipment();
-    return equipment?.getSlotItem?.(RING_SLOT) || null;
+    const eq = getEquipment();
+    return eq?.getSlotItem?.(RING_SLOT) || null;
   }
-
-  function hasEquippedRing() {
-    return !!getEquippedRing();
-  }
+  function hasEquippedRing() { return !!getEquippedRing(); }
 
   function findBestRingSource() {
-    const equipment = getEquipment();
-    if (!equipment) {
-      return null;
-    }
-
-    let best = null;
-    let bestCount = -1;
-
+    const eq = getEquipment();
+    if (!eq) return null;
+    let best = null, bestCount = -1;
     const consider = (container, slotIndex, item) => {
-      if (!isRingItem(item)) {
-        return;
-      }
-
+      if (!isRingItem(item)) return;
       const count = (typeof item.getCount === "function" ? item.getCount() : item.count) || 1;
-      if (count > bestCount) {
-        bestCount = count;
-        best = { container, slotIndex, item, count, name: getItemName(item) };
-      }
+      if (count > bestCount) { bestCount = count; best = { container, slotIndex, item, count, name: getItemName(item) }; }
     };
-
-    for (let slotIndex = 0; slotIndex < equipment.slots.length; slotIndex += 1) {
-      if (slotIndex === RING_SLOT) continue;
-      consider(equipment, slotIndex, equipment.getSlotItem(slotIndex));
+    for (let i = 0; i < eq.slots.length; i++) {
+      if (i === RING_SLOT) continue;
+      consider(eq, i, eq.getSlotItem(i));
     }
-
-    getOpenContainers().forEach((container) => {
-      (container?.slots || []).forEach((slot, slotIndex) => {
-        consider(container, slotIndex, container.getSlotItem(slotIndex));
+    getOpenContainers().forEach(container => {
+      (container?.slots || []).forEach((slot, i) => {
+        consider(container, i, container.getSlotItem(i));
       });
     });
-
     return best;
   }
 
   function getGateStatus(now = Date.now()) {
-    const equipment = getEquipment();
+    const eq = getEquipment();
     const source = findBestRingSource();
-    const cooldownRemainingMs = Math.max(0, config.equipCooldownMs - (now - state.lastEquipAt));
-
+    const cd = Math.max(0, config.equipCooldownMs - (now - state.lastEquipAt));
     return {
-      hasEquipment: !!equipment,
+      hasEquipment: !!eq,
       hasRingEquipped: hasEquippedRing(),
       hasRingAvailable: !!source,
-      cooldownReady: cooldownRemainingMs === 0,
-      cooldownRemainingMs,
+      cooldownReady: cd === 0,
+      cooldownRemainingMs: cd,
       source,
-      canEquip: !!equipment && !hasEquippedRing() && !!source && cooldownRemainingMs === 0,
+      canEquip: !!eq && !hasEquippedRing() && !!source && cd === 0,
     };
   }
 
-  function canEquipRing(now = Date.now()) {
-    return getGateStatus(now).canEquip;
-  }
-
+  function canEquipRing(now) { return getGateStatus(now).canEquip; }
   function tryEquipRing(now = Date.now()) {
-    if (!config.enabled || !canEquipRing(now)) {
-      return false;
-    }
-
-    const equipment = getEquipment();
+    if (!config.enabled || !canEquipRing(now)) return false;
+    const eq = getEquipment();
     const source = findBestRingSource();
-    if (!equipment || !source) {
-      return false;
-    }
-
-    const from = {
-      which: source.container,
-      index: source.slotIndex,
-    };
-    const to = {
-      which: equipment,
-      index: RING_SLOT,
-    };
+    if (!eq || !source) return false;
+    const from = { which: source.container, index: source.slotIndex };
+    const to = { which: eq, index: RING_SLOT };
     const count = source.count || 1;
-
     window.gameClient.send(new ItemMovePacket(from, to, count));
     state.lastEquipAt = now;
-    bot.log("equipped ring", {
-      name: source.name,
-      fromContainerId: source.container?.__containerId ?? null,
-      fromSlot: source.slotIndex,
-    });
+    bot.log("equipped ring", { name: source.name, fromContainerId: source.container?.__containerId ?? null, fromSlot: source.slotIndex });
     return true;
   }
 
+  // ---- Resume listeners (boilerplate) ----
   function scheduleNextTick() {
     if (!state.running) return;
-
-    state.timerId = window.setTimeout(() => {
-      tick();
-    }, config.tickMs);
+    state.timerId = window.setTimeout(() => tick(), config.tickMs);
   }
-
   function runImmediateTick() {
     if (!state.running) return;
-
-    if (state.timerId != null) {
-      window.clearTimeout(state.timerId);
-      state.timerId = null;
-    }
-
+    if (state.timerId != null) { window.clearTimeout(state.timerId); state.timerId = null; }
     tick();
   }
-
-  function handleResume() {
-    if (document.hidden) {
-      return;
-    }
-
-    runImmediateTick();
-  }
+  function handleResume() { if (!document.hidden) runImmediateTick(); }
 
   function attachResumeListeners() {
-    if (resumeListenersAttached) {
-      return;
-    }
-
+    if (resumeListenersAttached) return;
     document.addEventListener("visibilitychange", handleResume);
     window.addEventListener("focus", handleResume);
     window.addEventListener("pageshow", handleResume);
     resumeListenersAttached = true;
   }
-
   function detachResumeListeners() {
-    if (!resumeListenersAttached) {
-      return;
-    }
-
+    if (!resumeListenersAttached) return;
     document.removeEventListener("visibilitychange", handleResume);
     window.removeEventListener("focus", handleResume);
     window.removeEventListener("pageshow", handleResume);
@@ -5792,26 +3977,15 @@ window.__minibiaBotBundle.installEquipRingModule = function installEquipRingModu
 
   function tick() {
     if (!state.running) return;
-
-    try {
-      tryEquipRing();
-    } catch (error) {
-      bot.log("equip ring tick failed", error?.message || error);
-    } finally {
-      scheduleNextTick();
-    }
+    try { tryEquipRing(); } catch (e) { bot.log("equip ring tick failed", e?.message || e); }
+    finally { scheduleNextTick(); }
   }
 
   function start(overrides = {}) {
     Object.assign(config, overrides, { enabled: true });
     config.tickMs = 1000;
     persistConfig();
-
-    if (state.running) {
-      bot.log("equip ring already running");
-      return false;
-    }
-
+    if (state.running) { bot.log("equip ring already running"); return false; }
     state.running = true;
     attachResumeListeners();
     bot.log("equip ring started", { ...config });
@@ -5820,20 +3994,11 @@ window.__minibiaBotBundle.installEquipRingModule = function installEquipRingModu
   }
 
   function stop(options = {}) {
-    const shouldPersistEnabled = options.persistEnabled !== false;
+    const shouldPersist = options.persistEnabled !== false;
     state.running = false;
-
-    if (state.timerId != null) {
-      window.clearTimeout(state.timerId);
-      state.timerId = null;
-    }
-
+    if (state.timerId != null) { window.clearTimeout(state.timerId); state.timerId = null; }
     detachResumeListeners();
-
-    if (shouldPersistEnabled) {
-      config.enabled = false;
-      persistConfig();
-    }
+    if (shouldPersist) { config.enabled = false; persistConfig(); }
     bot.log("equip ring stopped");
     return true;
   }
@@ -5856,33 +4021,25 @@ window.__minibiaBotBundle.installEquipRingModule = function installEquipRingModu
     return { ...config };
   }
 
-  if (config.enabled) {
-    start();
-  }
+  if (config.enabled) start();
 
   bot.equipRing = {
-    start,
-    stop,
-    status,
-    updateConfig,
+    start, stop, status, updateConfig,
     config,
-    getEquippedRing,
-    hasEquippedRing,
-    findBestRingSource,
-    getGateStatus,
-    canEquipRing,
-    tryEquipRing,
+    getEquippedRing, hasEquippedRing,
+    findBestRingSource, getGateStatus, canEquipRing, tryEquipRing,
   };
 };
-window.__minibiaBotBundle = window.__minibiaBotBundle || {};
 
+/**
+ * ==================================================================================
+ * 12. AUTO EAT MODULE
+ *     Uses a hotbar slot when the food timer reaches 0 (or no SATED condition).
+ * ==================================================================================
+ */
 window.__minibiaBotBundle.installAutoEatModule = function installAutoEatModule(bot) {
   const configStorageKey = "minibiaBot.eat.config";
-  const state = {
-    running: false,
-    timerId: null,
-    lastFoodAt: 0,
-  };
+  const state = { running: false, timerId: null, lastFoodAt: 0 };
 
   const config = Object.assign(
     {
@@ -5900,110 +4057,59 @@ window.__minibiaBotBundle.installAutoEatModule = function installAutoEatModule(b
   }
 
   function normalizeHotbarSlot(slot) {
-    const value = Number(slot);
-    if (!Number.isFinite(value)) {
-      return null;
-    }
-
-    const normalized = Math.trunc(value);
-    if (normalized < 1 || normalized > 12) {
-      return null;
-    }
-
-    return normalized;
+    const v = Number(slot);
+    if (!Number.isFinite(v)) return null;
+    const n = Math.trunc(v);
+    if (n < 1 || n > 12) return null;
+    return n;
   }
 
   function readFoodTimer() {
-    const foodText =
-      document.querySelector('#skill-window div[skill="food"] .skill')?.textContent?.trim() ||
-      null;
-
-    if (!foodText) return null;
-
-    const match = foodText.match(/^(\d{1,2}):(\d{2})$/);
-    return match
-      ? {
-          text: foodText,
-          seconds: Number(match[1]) * 60 + Number(match[2]),
-        }
-      : { text: foodText, seconds: null };
+    const text = document.querySelector('#skill-window div[skill="food"] .skill')?.textContent?.trim() || null;
+    if (!text) return null;
+    const match = text.match(/^(\d{1,2}):(\d{2})$/);
+    return match ? { text, seconds: Number(match[1]) * 60 + Number(match[2]) } : { text, seconds: null };
   }
 
   function isSated() {
     const player = window.gameClient?.player;
     const conditions = player?.conditions;
-
-    if (conditions?.has && conditions.SATED != null) {
-      return conditions.has(conditions.SATED);
-    }
-
+    if (conditions?.has && conditions.SATED != null) return conditions.has(conditions.SATED);
     const food = readFoodTimer();
-    if (food?.seconds != null) {
-      return food.seconds > 0;
-    }
-
+    if (food?.seconds != null) return food.seconds > 0;
     return true;
   }
 
   function tryEat() {
-    if (!config.enabled) {
-      return false;
-    }
-
-    if (isSated()) {
-      return false;
-    }
-
-    if (Date.now() - state.lastFoodAt < config.eatCooldownMs) {
-      return false;
-    }
-
+    if (!config.enabled) return false;
+    if (isSated()) return false;
+    if (Date.now() - state.lastFoodAt < config.eatCooldownMs) return false;
     const slot = normalizeHotbarSlot(config.eatHotbarSlot);
-    if (!slot) {
-      return false;
-    }
-
-    const slotIndex = slot - 1;
-    const clicked = bot.clickHotbar(slotIndex);
-
+    if (!slot) return false;
+    const clicked = bot.clickHotbar(slot - 1);
     if (clicked) {
       state.lastFoodAt = Date.now();
       bot.log("used eat hotkey", { slot });
     }
-
     return clicked;
   }
 
   function scheduleNextTick() {
     if (!state.running) return;
-
-    state.timerId = window.setTimeout(() => {
-      tick();
-    }, config.tickMs);
+    state.timerId = window.setTimeout(() => tick(), config.tickMs);
   }
 
   function tick() {
     if (!state.running) return;
-
-    try {
-      tryEat();
-    } catch (error) {
-      bot.log("auto eat tick failed", error?.message || error);
-    } finally {
-      scheduleNextTick();
-    }
+    try { tryEat(); } catch (e) { bot.log("auto eat tick failed", e?.message || e); }
+    finally { scheduleNextTick(); }
   }
 
   function start(overrides = {}) {
     Object.assign(config, overrides, { enabled: true });
     config.tickMs = 1000;
     persistConfig();
-
-    if (state.running) {
-      bot.log("auto eat already running");
-      return false;
-    }
-
+    if (state.running) { bot.log("auto eat already running"); return false; }
     state.running = true;
     bot.log("auto eat started", { eatCooldownMs: config.eatCooldownMs, eatHotbarSlot: config.eatHotbarSlot });
     tick();
@@ -6011,18 +4117,10 @@ window.__minibiaBotBundle.installAutoEatModule = function installAutoEatModule(b
   }
 
   function stop(options = {}) {
-    const shouldPersistEnabled = options.persistEnabled !== false;
+    const shouldPersist = options.persistEnabled !== false;
     state.running = false;
-
-    if (state.timerId != null) {
-      window.clearTimeout(state.timerId);
-      state.timerId = null;
-    }
-
-    if (shouldPersistEnabled) {
-      config.enabled = false;
-      persistConfig();
-    }
+    if (state.timerId != null) { window.clearTimeout(state.timerId); state.timerId = null; }
+    if (shouldPersist) { config.enabled = false; persistConfig(); }
     bot.log("auto eat stopped");
     return true;
   }
@@ -6037,14 +4135,12 @@ window.__minibiaBotBundle.installAutoEatModule = function installAutoEatModule(b
   }
 
   function updateConfig(nextConfig = {}) {
-    if (Object.prototype.hasOwnProperty.call(nextConfig, "eatHotbarSlot")) {
+    if (nextConfig.eatHotbarSlot !== undefined) {
       nextConfig.eatHotbarSlot = normalizeHotbarSlot(nextConfig.eatHotbarSlot) ?? config.eatHotbarSlot;
     }
-
-    if (Object.prototype.hasOwnProperty.call(nextConfig, "eatCooldownMs")) {
+    if (nextConfig.eatCooldownMs !== undefined) {
       nextConfig.eatCooldownMs = Math.max(0, Number(nextConfig.eatCooldownMs) || 0);
     }
-
     Object.assign(config, nextConfig);
     config.tickMs = 1000;
     persistConfig();
@@ -6052,24 +4148,15 @@ window.__minibiaBotBundle.installAutoEatModule = function installAutoEatModule(b
     return { ...config };
   }
 
-  if (config.enabled) {
-    start();
-  }
+  if (config.enabled) start();
 
   bot.eat = {
-    start,
-    stop,
-    status,
-    updateConfig,
-    isSated,
-    tryEat,
-    normalizeHotbarSlot,
+    start, stop, status, updateConfig,
+    isSated, tryEat, normalizeHotbarSlot,
     config,
   };
-
   bot.startAutoEat = start;
   bot.stopAutoEat = stop;
-
   if (bot.rune) {
     bot.rune.startAutoEat = start;
     bot.rune.stopAutoEat = stop;
@@ -6077,22 +4164,40 @@ window.__minibiaBotBundle.installAutoEatModule = function installAutoEatModule(b
     bot.rune.isSated = isSated;
   }
 };
-window.__minibiaBotBundle = window.__minibiaBotBundle || {};
 
+/**
+ * ==================================================================================
+ * 13. TALK MODULE
+ *     Uses Gemini API to reply to chat messages in the "Default" channel.
+ *     Classifies messages as greeting, question, or statement and generates a
+ *     short, casual reply. Supports ignoring specific phrases.
+ * ==================================================================================
+ */
 window.__minibiaBotBundle.installTalkModule = function installTalkModule(bot) {
   const configStorageKey = "minibiaBot.talk.config";
   const legacyDefaultModels = ["gemini-3-pro-preview", "gemini-2.0-flash"];
   const defaultModel = "gemini-2.5-flash-lite";
   const defaultSystemPrompt =
-    "You are a normal Tibia MMORPG player chatting in Minibia in live in-game chat. Every reply must sound like Tibia player chat: casual, brief, informal, fully lowercase, and natural for a real player typing quickly. Use plain text only. Keep it under 90 characters and under 12 words. Prefer short Tibia-style phrasing, light slang, abbreviations, and simple punctuation when natural. Avoid polished grammar, title case, or assistant-like wording. Write like someone typing mid-hunt or while afk for a sec. Never say you are a bot or AI.";
+    "You are a normal Tibia MMORPG player chatting in Minibia in live in-game chat. " +
+    "Every reply must sound like Tibia player chat: casual, brief, informal, fully lowercase, " +
+    "and natural for a real player typing quickly. Use plain text only. Keep it under 90 characters " +
+    "and under 12 words. Prefer short Tibia-style phrasing, light slang, abbreviations, " +
+    "and simple punctuation when natural. Avoid polished grammar, title case, or assistant-like wording. " +
+    "Write like someone typing mid-hunt or while afk for a sec. Never say you are a bot or AI.";
   const defaultGreetingPrompt =
-    "Respond to greetings like a Tibia MMORPG player in chat. Be short, casual, friendly, and in-character for fast Tibia-style game chat. Use lowercase. One sentence only. Plain text only.";
+    "Respond to greetings like a Tibia MMORPG player in chat. Be short, casual, friendly, " +
+    "and in-character for fast Tibia-style game chat. Use lowercase. One sentence only. Plain text only.";
   const defaultQuestionPrompt =
-    "Respond to questions like a Tibia MMORPG player in chat, but stay vague and noncommittal. Keep it brief, casual, and a little evasive. Use lowercase and do not explain much. One short sentence only. Plain text only. If asked whether you are a bot, reply with no.";
+    "Respond to questions like a Tibia MMORPG player in chat, but stay vague and noncommittal. " +
+    "Keep it brief, casual, and a little evasive. Use lowercase and do not explain much. " +
+    "One short sentence only. Plain text only. If asked whether you are a bot, reply with no.";
   const defaultStatementPrompt =
-    "Respond to statements like a Tibia MMORPG player in chat. Keep it short, casual, reactive, and natural for live Tibia-style game chat. Use lowercase. One sentence only. Plain text only.";
+    "Respond to statements like a Tibia MMORPG player in chat. Keep it short, casual, reactive, " +
+    "and natural for live Tibia-style game chat. Use lowercase. One sentence only. Plain text only.";
+
   const minPollMs = 1000;
   const maxMessageAgeMs = 2 * 60 * 1000;
+
   const state = {
     running: false,
     pending: false,
@@ -6101,6 +4206,7 @@ window.__minibiaBotBundle.installTalkModule = function installTalkModule(bot) {
     seenKeys: [],
     seenSignatures: [],
   };
+
   const greetingReplies = ["yo", "sup", "hey", "hiya", "yo lol"];
   const agreeReplies = ["true", "fr", "based", "ya", "real"];
   const vagueQuestionReplies = ["maybe", "not sure", "hard to say", "could be"];
@@ -6117,6 +4223,7 @@ window.__minibiaBotBundle.installTalkModule = function installTalkModule(bot) {
       greetingPrompt: defaultGreetingPrompt,
       questionPrompt: defaultQuestionPrompt,
       statementPrompt: defaultStatementPrompt,
+      ignoredPhrases: ["munch."],
     },
     bot.storage.get(configStorageKey, {})
   );
@@ -6126,124 +4233,77 @@ window.__minibiaBotBundle.installTalkModule = function installTalkModule(bot) {
   }
 
   function normalizeText(value) {
-    return String(value || "")
-      .trim()
-      .toLowerCase()
-      .replace(/\s+/g, " ");
+    return String(value || "").trim().toLowerCase().replace(/\s+/g, " ");
   }
 
   function sanitizeConfig() {
     config.apiKey = String(config.apiKey || "").trim();
     config.model = String(config.model || defaultModel).trim() || defaultModel;
-    if (legacyDefaultModels.includes(config.model)) {
-      config.model = defaultModel;
-    }
+    if (legacyDefaultModels.includes(config.model)) config.model = defaultModel;
     config.pollMs = Math.max(minPollMs, Number(config.pollMs) || minPollMs);
     config.replyCooldownMs = Math.max(0, Number(config.replyCooldownMs) || 1500);
     config.systemPrompt = String(config.systemPrompt || defaultSystemPrompt).trim() || defaultSystemPrompt;
     config.greetingPrompt = String(config.greetingPrompt || defaultGreetingPrompt).trim() || defaultGreetingPrompt;
     config.questionPrompt = String(config.questionPrompt || defaultQuestionPrompt).trim() || defaultQuestionPrompt;
     config.statementPrompt = String(config.statementPrompt || defaultStatementPrompt).trim() || defaultStatementPrompt;
+    config.ignoredPhrases = Array.isArray(config.ignoredPhrases)
+      ? config.ignoredPhrases.map(p => String(p).trim().toLowerCase()).filter(Boolean)
+      : [];
   }
 
   function trimSeen() {
-    const maxSeenEntries = 200;
-    if (state.seenKeys.length > maxSeenEntries) {
-      state.seenKeys = state.seenKeys.slice(-maxSeenEntries);
-    }
-
-    if (state.seenSignatures.length > maxSeenEntries) {
-      state.seenSignatures = state.seenSignatures.slice(-maxSeenEntries);
-    }
+    const maxSeen = 200;
+    if (state.seenKeys.length > maxSeen) state.seenKeys = state.seenKeys.slice(-maxSeen);
+    if (state.seenSignatures.length > maxSeen) state.seenSignatures = state.seenSignatures.slice(-maxSeen);
   }
 
   function getSelfNames() {
-    return new Set(
-      ["you", bot.getPlayerName?.(), window.gameClient?.player?.name, window.gameClient?.player?.state?.name]
-        .map((name) => normalizeText(name))
-        .filter(Boolean)
-    );
+    return new Set(["you", bot.getPlayerName?.(), window.gameClient?.player?.name, window.gameClient?.player?.state?.name]
+      .map(n => normalizeText(n)).filter(Boolean));
   }
 
   function extractSenderFromMessage(message) {
     const text = String(message || "").trim();
-    if (!text) {
-      return { sender: null, body: "" };
-    }
-
+    if (!text) return { sender: null, body: "" };
     const patterns = [
       /^\[[^\]]+\]\s*([^:\n]{2,40}):\s+(.+)$/i,
       /^([^:\n]{2,40}):\s+(.+)$/i,
       /^([^:\n]{2,40})\s+says:\s+(.+)$/i,
       /^From\s+([^:\n]{2,40}):\s+(.+)$/i,
     ];
-
-    for (const pattern of patterns) {
-      const match = text.match(pattern);
-      if (match) {
-        return {
-          sender: String(match[1] || "").trim() || null,
-          body: String(match[2] || "").trim(),
-        };
-      }
+    for (const p of patterns) {
+      const m = text.match(p);
+      if (m) return { sender: String(m[1] || "").trim() || null, body: String(m[2] || "").trim() };
     }
-
     return { sender: null, body: text };
   }
 
   function getRawChatEntries() {
-    return (window.gameClient?.interface?.channelManager?.channels || []).flatMap((channel) =>
-      (channel?.__contents || []).map((entry, index) => ({
-        channelName: channel?.name || null,
-        entry,
-        index,
-      }))
-    );
+    return (window.gameClient?.interface?.channelManager?.channels || [])
+      .flatMap(ch => (ch?.__contents || []).map((entry, i) => ({ channelName: ch?.name || null, entry, index: i })));
   }
 
   function toChatMessage(rawEntry) {
     const entry = rawEntry?.entry || {};
-    const rawMessage = String(entry?.message || entry?.text || "").trim();
-    const parsed = extractSenderFromMessage(rawMessage);
-    const sender =
-      String(entry?.author || entry?.sender || entry?.name || parsed.sender || "").trim() || null;
-    const body = String(entry?.text || parsed.body || rawMessage).trim();
+    const raw = String(entry?.message || entry?.text || "").trim();
+    const parsed = extractSenderFromMessage(raw);
+    const sender = String(entry?.author || entry?.sender || entry?.name || parsed.sender || "").trim() || null;
+    const body = String(entry?.text || parsed.body || raw).trim();
     const time = entry?.__time || entry?.time || null;
     const senderType = entry?.type;
-    const key = [
-      rawEntry?.channelName || "",
-      time || "",
-      sender || "",
-      rawMessage || "",
-      rawEntry?.index || 0,
-    ].join("|");
-
-    return {
-      key,
-      channelName: rawEntry?.channelName || null,
-      sender,
-      body,
-      rawMessage,
-      time,
-      senderType,
-    };
+    const key = [rawEntry?.channelName || "", time || "", sender || "", raw || "", rawEntry?.index || 0].join("|");
+    return { key, channelName: rawEntry?.channelName || null, sender, body, rawMessage: raw, time, senderType };
   }
 
   function getChatMessages() {
-    return getRawChatEntries().map(toChatMessage).filter((message) => message.body);
+    return getRawChatEntries().map(toChatMessage).filter(m => m.body);
   }
 
   function getMessageTimestamp(message) {
-    const rawTime = message?.time;
-    if (typeof rawTime === "number" && Number.isFinite(rawTime)) {
-      return rawTime < 1e12 ? rawTime * 1000 : rawTime;
-    }
-
-    if (rawTime instanceof Date) {
-      return rawTime.getTime();
-    }
-
-    const parsed = Date.parse(String(rawTime || ""));
+    const raw = message?.time;
+    if (typeof raw === "number" && Number.isFinite(raw)) return raw < 1e12 ? raw * 1000 : raw;
+    if (raw instanceof Date) return raw.getTime();
+    const parsed = Date.parse(String(raw || ""));
     return Number.isFinite(parsed) ? parsed : 0;
   }
 
@@ -6261,42 +4321,27 @@ window.__minibiaBotBundle.installTalkModule = function installTalkModule(bot) {
   }
 
   function rememberSeenMessage(message) {
-    if (!message) {
-      return;
-    }
-
-    if (message.key && !state.seenKeys.includes(message.key)) {
-      state.seenKeys.push(message.key);
-    }
-
-    const signature = getMessageSignature(message);
-    if (signature && !state.seenSignatures.includes(signature)) {
-      state.seenSignatures.push(signature);
-    }
-
+    if (!message) return;
+    if (message.key && !state.seenKeys.includes(message.key)) state.seenKeys.push(message.key);
+    const sig = getMessageSignature(message);
+    if (sig && !state.seenSignatures.includes(sig)) state.seenSignatures.push(sig);
     trimSeen();
   }
 
   function rememberSeenMessages(messages) {
-    messages.forEach((message) => rememberSeenMessage(message));
+    messages.forEach(m => rememberSeenMessage(m));
   }
 
   function isSelfMessage(message) {
-    if (getSelfNames().has(normalizeText(message?.sender))) {
-      return true;
-    }
-
-    return [message?.body, message?.rawMessage].some((text) => bot.isRecentSentChat?.(text, 20000));
+    if (getSelfNames().has(normalizeText(message?.sender))) return true;
+    return [message?.body, message?.rawMessage].some(t => bot.isRecentSentChat?.(t, 20000));
   }
 
   function isTrustedSender(message) {
-    const senderName = normalizeText(message?.sender);
-    if (!senderName) {
-      return false;
-    }
-
-    const trustedNames = bot.panic?.getTrustedNames?.() || [];
-    return trustedNames.includes(senderName);
+    const name = normalizeText(message?.sender);
+    if (!name) return false;
+    const trusted = bot.panic?.getTrustedNames?.() || [];
+    return trusted.includes(name);
   }
 
   function isNpcMessage(message) {
@@ -6305,53 +4350,38 @@ window.__minibiaBotBundle.installTalkModule = function installTalkModule(bot) {
   }
 
   function isWithinVisibleRange(me, pos) {
-    if (!me || !pos) {
-      return false;
-    }
-
-    const dx = Math.abs(pos.x - me.x);
-    const dy = Math.abs(pos.y - me.y);
+    if (!me || !pos) return false;
+    const dx = Math.abs(pos.x - me.x), dy = Math.abs(pos.y - me.y);
     return dx <= 8 && dy <= 6;
   }
 
   function isSenderVisiblePlayer(message) {
     const me = bot.getPlayerPosition?.();
     const myId = window.gameClient?.player?.id;
-    const senderName = normalizeText(message?.sender);
+    const sender = normalizeText(message?.sender);
     const playerType = window.CONST?.TYPES?.PLAYER;
-
-    if (!me || !senderName || playerType == null) {
-      return false;
-    }
-
-    return Object.values(window.gameClient?.world?.activeCreatures || {}).some((creature) => {
-      if (!creature) {
-        return false;
-      }
-
-      if (creature.id === myId || creature.type !== playerType) {
-        return false;
-      }
-
-      if (normalizeText(creature.name) !== senderName) {
-        return false;
-      }
-
+    if (!me || !sender || playerType == null) return false;
+    return Object.values(window.gameClient?.world?.activeCreatures || {}).some(creature => {
+      if (!creature || creature.id === myId || creature.type !== playerType) return false;
+      if (normalizeText(creature.name) !== sender) return false;
       return isWithinVisibleRange(me, creature.__position);
     });
   }
 
   function getDefaultMessages() {
-    return getChatMessages().filter((message) => message.channelName === "Default");
+    return getChatMessages().filter(m => m.channelName === "Default");
   }
 
   function getNewestPendingMessage() {
-    const pendingMessages = getDefaultMessages().filter((message) => {
-      if (!message?.body || !message?.key) {
-        return false;
-      }
+    const pending = getDefaultMessages().filter(message => {
+      if (!message?.body || !message?.key) return false;
+      if (hasSeenMessage(message)) return false;
 
-      if (hasSeenMessage(message)) {
+      // Skip ignored phrases
+      const ignored = config.ignoredPhrases || [];
+      const bodyLower = message.body.toLowerCase();
+      if (ignored.some(p => bodyLower.includes(p))) {
+        rememberSeenMessage(message);
         return false;
       }
 
@@ -6360,70 +4390,42 @@ window.__minibiaBotBundle.installTalkModule = function installTalkModule(bot) {
         return false;
       }
 
-      const timestamp = getMessageTimestamp(message);
-      if (timestamp && Date.now() - timestamp > maxMessageAgeMs) {
+      const ts = getMessageTimestamp(message);
+      if (ts && Date.now() - ts > maxMessageAgeMs) {
         rememberSeenMessage(message);
         return false;
       }
-
       return true;
     });
-
-    if (!pendingMessages.length) {
-      return null;
-    }
-
-    return {
-      targetMessage: pendingMessages[pendingMessages.length - 1],
-      pendingMessages,
-    };
+    if (!pending.length) return null;
+    return { targetMessage: pending[pending.length - 1], pendingMessages: pending };
   }
 
   function buildClassifierPrompt(targetMessage, contextMessages) {
-    const transcript = contextMessages
-      .map((message) => `${message.sender || "player"}: ${message.body}`)
-      .join("\n");
-
+    const transcript = contextMessages.map(m => `${m.sender || "player"}: ${m.body}`).join("\n");
     return [
       "Channel: Default",
-      "Recent chat:",
-      transcript || "(none)",
-      "",
+      "Recent chat:", transcript || "(none)", "",
       `Last message from ${targetMessage.sender}: ${targetMessage.body}`,
       "Classify the last message as exactly one label:",
-      "greeting",
-      "question",
-      "statement",
+      "greeting", "question", "statement",
       "Reply with the label only.",
     ].join("\n");
   }
 
   function getTypePrompt(messageType) {
-    if (messageType === "greeting") {
-      return config.greetingPrompt;
-    }
-
-    if (messageType === "question") {
-      return config.questionPrompt;
-    }
-
+    if (messageType === "greeting") return config.greetingPrompt;
+    if (messageType === "question") return config.questionPrompt;
     return config.statementPrompt;
   }
 
   function buildReplyPrompt(targetMessage, contextMessages, messageType) {
-    const transcript = contextMessages
-      .map((message) => `${message.sender || "player"}: ${message.body}`)
-      .join("\n");
-
+    const transcript = contextMessages.map(m => `${m.sender || "player"}: ${m.body}`).join("\n");
     return [
       config.systemPrompt,
-      getTypePrompt(messageType),
-      "",
-      "Channel: Default",
-      `Message type: ${messageType}`,
-      "Recent chat:",
-      transcript || "(none)",
-      "",
+      getTypePrompt(messageType), "",
+      "Channel: Default", `Message type: ${messageType}`,
+      "Recent chat:", transcript || "(none)", "",
       `Last message from ${targetMessage.sender}: ${targetMessage.body}`,
       "Reply with one short sentence only.",
       "Avoid repeating the same wording again and again.",
@@ -6432,133 +4434,65 @@ window.__minibiaBotBundle.installTalkModule = function installTalkModule(bot) {
   }
 
   async function generateText(prompt, generationConfig = {}) {
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(config.model)}:generateContent`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-goog-api-key": config.apiKey,
-        },
-        body: JSON.stringify({
-          contents: [
-            {
-              role: "user",
-              parts: [{ text: prompt }],
-            },
-          ],
-          generationConfig: Object.assign(
-            {
-              temperature: 0.9,
-              topP: 0.95,
-              maxOutputTokens: 40,
-            },
-            generationConfig
-          ),
-        }),
-      }
-    );
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Gemini request failed (${response.status}): ${errorText}`);
-    }
-
-    const data = await response.json();
-    return (
-      data?.candidates?.[0]?.content?.parts
-        ?.map((part) => String(part?.text || ""))
-        .join(" ")
-        .trim() || ""
-    );
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(config.model)}:generateContent`;
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-goog-api-key": config.apiKey },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        generationConfig: Object.assign({ temperature: 0.9, topP: 0.95, maxOutputTokens: 40 }, generationConfig),
+      }),
+    });
+    if (!resp.ok) throw new Error(`Gemini request failed (${resp.status}): ${await resp.text()}`);
+    const data = await resp.json();
+    return data?.candidates?.[0]?.content?.parts?.map(p => String(p?.text || "")).join(" ").trim() || "";
   }
 
   async function classifyMessageType(targetMessage, contextMessages) {
-    const rawType = normalizeText(
+    const raw = normalizeText(
       await generateText(buildClassifierPrompt(targetMessage, contextMessages), {
-        temperature: 0.1,
-        topP: 0.8,
-        maxOutputTokens: 8,
+        temperature: 0.1, topP: 0.8, maxOutputTokens: 8,
       })
     );
-
-    if (rawType === "greeting" || rawType === "question" || rawType === "statement") {
-      return rawType;
-    }
-
-    if (isGreeting(targetMessage?.body)) {
-      return "greeting";
-    }
-
-    if (/\?/.test(String(targetMessage?.body || ""))) {
-      return "question";
-    }
-
+    if (raw === "greeting" || raw === "question" || raw === "statement") return raw;
+    if (isGreeting(targetMessage?.body)) return "greeting";
+    if (/\?/.test(String(targetMessage?.body || ""))) return "question";
     return "statement";
   }
 
   function sanitizeReply(text) {
-    const singleLine = String(text || "")
+    const single = String(text || "")
       .replace(/\s+/g, " ")
       .replace(/^["'`]+|["'`]+$/g, "")
       .trim();
-
-    if (!singleLine) {
-      return "";
-    }
-
-    const firstSentence = singleLine.split(/(?<=[.!?])\s+/)[0] || singleLine;
-    const trimmed = firstSentence.slice(0, 90).trim();
-    if (!trimmed) {
-      return "";
-    }
-
-    if (trimmed === "?") {
-      return bot.isRecentSentChat?.("?", 20000) ? "" : "?";
-    }
-
+    if (!single) return "";
+    const first = single.split(/(?<=[.!?])\s+/)[0] || single;
+    const trimmed = first.slice(0, 90).trim();
+    if (!trimmed) return "";
+    if (trimmed === "?") return bot.isRecentSentChat?.("?", 20000) ? "" : "?";
     const styled = trimmed
       .toLowerCase()
-      .replace(/[“”]/g, '"')
-      .replace(/[‘’]/g, "'")
-      .replace(/\bi am\b/g, "im")
-      .replace(/\byou are\b/g, "youre")
-      .replace(/\bdo not\b/g, "dont")
-      .replace(/\bcannot\b/g, "cant")
-      .replace(/\bgoing to\b/g, "gonna")
-      .replace(/\bwant to\b/g, "wanna")
-      .replace(/\s+([,.!?])/g, "$1")
-      .replace(/([!?.,]){2,}/g, "$1")
+      .replace(/[“”]/g, '"').replace(/[‘’]/g, "'")
+      .replace(/\bi am\b/g, "im").replace(/\byou are\b/g, "youre")
+      .replace(/\bdo not\b/g, "dont").replace(/\bcannot\b/g, "cant")
+      .replace(/\bgoing to\b/g, "gonna").replace(/\bwant to\b/g, "wanna")
+      .replace(/\s+([,.!?])/g, "$1").replace(/([!?.,]){2,}/g, "$1")
       .trim();
-
-    const normalized = normalizeText(styled);
-    if (!normalized || /^[^a-z0-9]+$/i.test(styled)) {
-      return "";
-    }
-
-    if (/\b(bot|ai|assistant|language model|automation|script)\b/i.test(styled)) {
-      return "";
-    }
-
-    if (bot.isRecentSentChat?.(styled, 20000)) {
-      return "";
-    }
-
+    if (!styled || /^[^a-z0-9]+$/i.test(styled)) return "";
+    if (/\b(bot|ai|assistant|language model|automation|script)\b/i.test(styled)) return "";
+    if (bot.isRecentSentChat?.(styled, 20000)) return "";
     return styled;
   }
 
   function pickUnusedReply(replies, withinMs = 30000, fallback = "?") {
-    for (const reply of replies) {
-      if (!bot.isRecentSentChat?.(reply, withinMs)) {
-        return reply;
-      }
+    for (const r of replies) {
+      if (!bot.isRecentSentChat?.(r, withinMs)) return r;
     }
-
     return fallback;
   }
 
   function isGreeting(text) {
-    return /^(hi|hey|yo|sup|howdy|hello|hiya)\b/i.test(String(text || "").trim());
+    return /^(hi|hey|yo|sup|howdy|hello|hiya|hey man|hey bro)\b/i.test(String(text || "").trim());
   }
 
   function isBotQuestion(text) {
@@ -6566,49 +4500,26 @@ window.__minibiaBotBundle.installTalkModule = function installTalkModule(bot) {
   }
 
   function isSimpleReaction(text) {
-    return /^(based|true|real|lol|lmao|xd|nice|ok|kk|k)\b[!.?]*$/i.test(String(text || "").trim());
+    return /^(XD|true|fr|lol|lmao|xd|nice|ok|kk|k)\b[!.?]*$/i.test(String(text || "").trim());
   }
 
   function pickFallbackReply(targetMessage, messageType) {
-    const messageText = String(targetMessage?.body || "").trim();
-
-    if (isBotQuestion(messageText)) {
-      return pickUnusedReply(denyBotReplies, 30000, "no");
-    }
-
-    if (messageType === "greeting" || isGreeting(messageText)) {
-      return pickUnusedReply(greetingReplies, 15000, "yo");
-    }
-
-    if (isSimpleReaction(messageText)) {
-      return pickUnusedReply(agreeReplies, 15000, "true");
-    }
-
-    if (messageType === "question" || /\?$/.test(messageText)) {
-      return pickUnusedReply(vagueQuestionReplies, 20000, "maybe");
-    }
-
+    const msg = String(targetMessage?.body || "").trim();
+    if (isBotQuestion(msg)) return pickUnusedReply(denyBotReplies, 30000, "no");
+    if (messageType === "greeting" || isGreeting(msg)) return pickUnusedReply(greetingReplies, 15000, "yo");
+    if (isSimpleReaction(msg)) return pickUnusedReply(agreeReplies, 15000, "true");
+    if (messageType === "question" || /\?$/.test(msg)) return pickUnusedReply(vagueQuestionReplies, 20000, "maybe");
     return pickUnusedReply(["lol", "maybe", "ya", "true", "kinda"], 30000, "lol");
   }
 
   async function maybeRespond() {
-    if (!state.running || state.pending || !config.enabled || !config.apiKey) {
-      return false;
-    }
-
-    if (Date.now() - state.lastReplyAt < config.replyCooldownMs) {
-      return false;
-    }
-
+    if (!state.running || state.pending || !config.enabled || !config.apiKey) return false;
+    if (Date.now() - state.lastReplyAt < config.replyCooldownMs) return false;
     const pending = getNewestPendingMessage();
-    if (!pending?.targetMessage) {
-      return false;
-    }
-
+    if (!pending?.targetMessage) return false;
     state.pending = true;
-
     try {
-      const contextMessages = getDefaultMessages().slice(-6);
+      const context = getDefaultMessages().slice(-6);
       if (!isSenderVisiblePlayer(pending.targetMessage)) {
         rememberSeenMessages(pending.pendingMessages);
         bot.log("talk skipped reply", {
@@ -6618,36 +4529,21 @@ window.__minibiaBotBundle.installTalkModule = function installTalkModule(bot) {
         });
         return false;
       }
-
-      const messageType = await classifyMessageType(pending.targetMessage, contextMessages);
+      const type = await classifyMessageType(pending.targetMessage, context);
       const rawReply = isBotQuestion(pending.targetMessage.body)
         ? "no"
-        : await generateText(buildReplyPrompt(pending.targetMessage, contextMessages, messageType));
-      const reply = sanitizeReply(rawReply) || pickFallbackReply(pending.targetMessage, messageType);
-
+        : await generateText(buildReplyPrompt(pending.targetMessage, context, type));
+      const reply = sanitizeReply(rawReply) || pickFallbackReply(pending.targetMessage, type);
       rememberSeenMessages(pending.pendingMessages);
-
       if (!reply) {
-        bot.log("talk skipped reply", {
-          sender: pending.targetMessage.sender,
-          message: pending.targetMessage.body,
-          messageType,
-          rawReply,
-        });
+        bot.log("talk skipped reply", { sender: pending.targetMessage.sender, message: pending.targetMessage.body, messageType: type, rawReply });
         return false;
       }
-
       const sent = bot.sendChat(reply);
       if (sent) {
         state.lastReplyAt = Date.now();
-        bot.log("talk replied", {
-          sender: pending.targetMessage.sender,
-          message: pending.targetMessage.body,
-          messageType,
-          reply,
-        });
+        bot.log("talk replied", { sender: pending.targetMessage.sender, message: pending.targetMessage.body, messageType: type, reply });
       }
-
       return sent;
     } finally {
       state.pending = false;
@@ -6655,17 +4551,9 @@ window.__minibiaBotBundle.installTalkModule = function installTalkModule(bot) {
   }
 
   function scheduleNextTick() {
-    if (!state.running) {
-      return;
-    }
-
+    if (!state.running) return;
     state.timerId = window.setTimeout(async () => {
-      try {
-        await maybeRespond();
-      } catch (error) {
-        bot.log("talk request failed", error?.message || error);
-      }
-
+      try { await maybeRespond(); } catch (e) { bot.log("talk request failed", e?.message || e); }
       scheduleNextTick();
     }, config.pollMs);
   }
@@ -6678,40 +4566,20 @@ window.__minibiaBotBundle.installTalkModule = function installTalkModule(bot) {
     Object.assign(config, overrides, { enabled: true });
     sanitizeConfig();
     persistConfig();
-
-    if (!config.apiKey) {
-      bot.log("talk module requires a Gemini API key");
-      return false;
-    }
-
-    if (state.running) {
-      return false;
-    }
-
+    if (!config.apiKey) { bot.log("talk module requires a Gemini API key"); return false; }
+    if (state.running) return false;
     state.running = true;
     seedSeenMessages();
-    bot.log("talk module started", {
-      model: config.model,
-      channel: "Default",
-    });
+    bot.log("talk module started", { model: config.model, channel: "Default" });
     scheduleNextTick();
     return true;
   }
 
   function stop(options = {}) {
-    const shouldPersistEnabled = options.persistEnabled !== false;
+    const shouldPersist = options.persistEnabled !== false;
     state.running = false;
-
-    if (shouldPersistEnabled) {
-      config.enabled = false;
-      persistConfig();
-    }
-
-    if (state.timerId != null) {
-      window.clearTimeout(state.timerId);
-      state.timerId = null;
-    }
-
+    if (shouldPersist) { config.enabled = false; persistConfig(); }
+    if (state.timerId != null) { window.clearTimeout(state.timerId); state.timerId = null; }
     return true;
   }
 
@@ -6720,10 +4588,7 @@ window.__minibiaBotBundle.installTalkModule = function installTalkModule(bot) {
       running: state.running,
       pending: state.pending,
       lastReplyAt: state.lastReplyAt,
-      config: {
-        ...config,
-        apiKey: config.apiKey ? "***configured***" : "",
-      },
+      config: { ...config, apiKey: config.apiKey ? "***configured***" : "" },
     };
   }
 
@@ -6735,22 +4600,21 @@ window.__minibiaBotBundle.installTalkModule = function installTalkModule(bot) {
   }
 
   sanitizeConfig();
-
-  if (config.enabled && config.apiKey) {
-    start();
-  }
+  if (config.enabled && config.apiKey) start();
 
   bot.talk = {
-    start,
-    stop,
-    status,
-    updateConfig,
-    getChatMessages,
-    config,
+    start, stop, status, updateConfig,
+    getChatMessages, config,
   };
 };
-window.__minibiaBotBundle = window.__minibiaBotBundle || {};
 
+/**
+ * ==================================================================================
+ * 14. UI PANEL
+ *     Injects a draggable, collapsible panel with tabs for each module.
+ *     Provides real‑time controls, status indicators, and refresh functions.
+ * ==================================================================================
+ */
 window.__minibiaBotBundle.installPanel = function installPanel(bot) {
   const panelPositionKey = "minibiaBot.ui.panelPosition";
   const panelCollapsedKey = "minibiaBot.ui.panelCollapsed";
@@ -6759,458 +4623,308 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
     document.getElementById("minibia-bot-panel")?.remove();
     document.getElementById("minibia-bot-style")?.remove();
   }
-  
-	function parsePreferredTargetNames(value) {
-	  return String(value || "")
-		.split(/[\n,]/)
-		.map((name) => name.trim())
-		.filter(Boolean)
-		.filter((name, index, array) => {
-		  return array.findIndex(
-			(other) => other.toLowerCase() === name.toLowerCase()
-		  ) === index;
-		});
-	}
 
-	function refreshAutoAttackPreferredStatus(options = {}) {
-	  const force = options.force === true;
-
-	  const preferredNamesInput = document.getElementById(
-		"minibia-bot-auto-attack-preferred-names"
-	  );
-
-	  const preferredMatchModeSelect = document.getElementById(
-		"minibia-bot-auto-attack-preferred-match-mode"
-	  );
-
-	  const preferredStatus = document.getElementById(
-		"minibia-bot-auto-attack-preferred-status"
-	  );
-
-	  const attackConfig =
-		bot.attack?.status?.().config ||
-		bot.attack?.config ||
-		{};
-
-	  const preferredNames = Array.isArray(attackConfig.preferredTargetNames)
-		? attackConfig.preferredTargetNames
-		: [];
-
-	  const preferredMatchMode =
-		attackConfig.preferredMatchMode === "includes"
-		  ? "includes"
-		  : "exact";
-
-	  if (
-		preferredNamesInput &&
-		(force || document.activeElement !== preferredNamesInput)
-	  ) {
-		preferredNamesInput.value = preferredNames.join(", ");
-	  }
-
-	  if (preferredMatchModeSelect) {
-		preferredMatchModeSelect.value = preferredMatchMode;
-	  }
-
-	  if (preferredStatus) {
-		const namesText = preferredNames.length
-		  ? preferredNames.join(", ")
-		  : "none";
-
-		const modeText =
-		  preferredMatchMode === "includes"
-			? "contains text"
-			: "exact name";
-
-		preferredStatus.textContent =
-		  `Preferred mobs: ${namesText} | Mode: ${modeText}`;
-	  }
-	}
-
-	function saveAutoAttackPreferredConfig() {
-	  const preferredNamesInput = document.getElementById(
-		"minibia-bot-auto-attack-preferred-names"
-	  );
-
-	  const preferredMatchModeSelect = document.getElementById(
-		"minibia-bot-auto-attack-preferred-match-mode"
-	  );
-
-	  const preferredTargetNames = parsePreferredTargetNames(
-		preferredNamesInput?.value || ""
-	  );
-
-	  const preferredMatchMode =
-		preferredMatchModeSelect?.value === "includes"
-		  ? "includes"
-		  : "exact";
-
-	  bot.attack?.updateConfig?.({
-		preferredTargetNames,
-		preferredMatchMode
-	  });
-
-	  refreshAutoAttackPreferredStatus({ force: true });
-
-	  bot.log?.("auto attack preferred targets updated", {
-		preferredTargetNames,
-		preferredMatchMode
-	  });
-	}
-
-// --- Heal UI functions (no type) ---
-let healEditIndex = null;
-
-function getHealRuleFormValues() {
-  const slot = parseInt(document.getElementById("minibia-bot-heal-slot")?.value || "1", 10) || 1;
-  const spellWords = document.getElementById("minibia-bot-heal-spell")?.value.trim() || "";
-  const manaCost = parseInt(document.getElementById("minibia-bot-heal-manacost")?.value || "0", 10) || 0;
-  const minHp = parseInt(document.getElementById("minibia-bot-heal-minhp")?.value || "0", 10) || 0;
-  const maxHp = parseInt(document.getElementById("minibia-bot-heal-maxhp")?.value || "100", 10) || 100;
-  const minMana = parseInt(document.getElementById("minibia-bot-heal-minmana")?.value || "0", 10) || 0;
-  const maxMana = parseInt(document.getElementById("minibia-bot-heal-maxmana")?.value || "100", 10) || 100;
-  return { slot, spellWords, manaCost, minHp, maxHp, minMana, maxMana };
-}
-
-function setHealRuleFormValues(rule) {
-  document.getElementById("minibia-bot-heal-slot").value = rule.slot || 1;
-  document.getElementById("minibia-bot-heal-spell").value = rule.spellWords || "";
-  document.getElementById("minibia-bot-heal-manacost").value = rule.manaCost || 0;
-  document.getElementById("minibia-bot-heal-minhp").value = rule.minHpPercent ?? 0;
-  document.getElementById("minibia-bot-heal-maxhp").value = rule.maxHpPercent ?? 100;
-  document.getElementById("minibia-bot-heal-minmana").value = rule.minManaPercent ?? 0;
-  document.getElementById("minibia-bot-heal-maxmana").value = rule.maxManaPercent ?? 100;
-}
-
-function clearHealRuleForm() {
-  document.getElementById("minibia-bot-heal-slot").value = "1";
-  document.getElementById("minibia-bot-heal-spell").value = "";
-  document.getElementById("minibia-bot-heal-manacost").value = "0";
-  document.getElementById("minibia-bot-heal-minhp").value = "0";
-  document.getElementById("minibia-bot-heal-maxhp").value = "100";
-  document.getElementById("minibia-bot-heal-minmana").value = "0";
-  document.getElementById("minibia-bot-heal-maxmana").value = "100";
-  document.getElementById("minibia-bot-heal-save").textContent = "Add Rule";
-  healEditIndex = null;
-}
-
-function refreshHealRules() {
-  const list = document.getElementById("minibia-bot-heal-rules-list");
-  if (!list) return;
-  const rules = bot.heal?.config?.healRules || [];
-  list.innerHTML = "";
-  if (rules.length === 0) {
-    const empty = document.createElement("div");
-    empty.className = "mb-small-note";
-    empty.textContent = "No heal rules configured.";
-    list.appendChild(empty);
-    return;
+  // ---- UTILITY FUNCTIONS (same as before) ----
+  function parsePreferredTargetNames(value) {
+    return String(value || "")
+      .split(/[\n,]/)
+      .map(s => s.trim())
+      .filter(Boolean)
+      .filter((name, idx, arr) => arr.findIndex(o => o.toLowerCase() === name.toLowerCase()) === idx);
   }
-  rules.forEach((rule, index) => {
-    const row = document.createElement("div");
-    row.className = "mb-list-row";
-    row.style.cssText = "display:grid;grid-template-columns:1fr auto auto;gap:6px;align-items:center;padding:4px 0;border-bottom:1px solid rgba(255,255,255,0.08);";
 
-    const info = document.createElement("div");
-    info.style.cssText = "display:flex;flex-wrap:wrap;gap:4px;align-items:center;font-size:11px;";
-
-    // Slot
-    const slotLabel = document.createElement("span");
-    slotLabel.textContent = `Slot ${rule.slot}`;
-    slotLabel.style.cssText = "font-weight:bold;color:#d4c48a;";
-    info.appendChild(slotLabel);
-
-    // Action
-    if (rule.spellWords) {
-      const spell = document.createElement("span");
-      spell.textContent = `"${rule.spellWords}"`;
-      spell.style.cssText = "color:#aad4ff;";
-      info.appendChild(spell);
-      if (rule.manaCost > 0) {
-        const cost = document.createElement("span");
-        cost.textContent = `(${rule.manaCost} MP)`;
-        cost.style.cssText = "opacity:0.7;";
-        info.appendChild(cost);
-      }
-    } else {
-      const action = document.createElement("span");
-      action.textContent = "(hotkey)";
-      action.style.cssText = "opacity:0.6;";
-      info.appendChild(action);
+  // ---- REFRESH FUNCTIONS ----
+  function refreshAutoAttackPreferredStatus(options = {}) {
+    const force = options.force === true;
+    const input = document.getElementById("minibia-bot-auto-attack-preferred-names");
+    const modeSelect = document.getElementById("minibia-bot-auto-attack-preferred-match-mode");
+    const statusLabel = document.getElementById("minibia-bot-auto-attack-preferred-status");
+    const attackConfig = bot.attack?.status?.().config || bot.attack?.config || {};
+    const preferred = Array.isArray(attackConfig.preferredTargetNames) ? attackConfig.preferredTargetNames : [];
+    const mode = attackConfig.preferredMatchMode === "includes" ? "includes" : "exact";
+    if (input && (force || document.activeElement !== input)) input.value = preferred.join(", ");
+    if (modeSelect) modeSelect.value = mode;
+    if (statusLabel) {
+      const names = preferred.length ? preferred.join(", ") : "none";
+      const modeText = mode === "includes" ? "contains text" : "exact name";
+      statusLabel.textContent = `Preferred mobs: ${names} | Mode: ${modeText}`;
     }
-
-    // HP range
-    const hp = document.createElement("span");
-    hp.textContent = `HP ${rule.minHpPercent}‑${rule.maxHpPercent}%`;
-    hp.style.cssText = "background:#2a1a1a;padding:0 4px;border-radius:3px;color:#ffb0b0;";
-    info.appendChild(hp);
-
-    // MP range
-    const mp = document.createElement("span");
-    mp.textContent = `MP ${rule.minManaPercent}‑${rule.maxManaPercent}%`;
-    mp.style.cssText = "background:#1a1a2a;padding:0 4px;border-radius:3px;color:#b0b0ff;";
-    info.appendChild(mp);
-
-    row.appendChild(info);
-
-    const editBtn = document.createElement("button");
-    editBtn.type = "button";
-    editBtn.className = "mb-small-button";
-    editBtn.textContent = "Edit";
-    editBtn.style.cssText = "width:auto;padding:2px 8px;";
-    editBtn.addEventListener("click", () => {
-      healEditIndex = index;
-      setHealRuleFormValues(rule);
-      document.getElementById("minibia-bot-heal-save").textContent = "Update Rule";
-    });
-    row.appendChild(editBtn);
-
-    const removeBtn = document.createElement("button");
-    removeBtn.type = "button";
-    removeBtn.className = "mb-small-button";
-    removeBtn.textContent = "\u2715";
-    removeBtn.title = "Remove rule";
-    removeBtn.style.cssText = "width:24px;padding:2px;background:#5a2020;color:#ff8888;border-color:#883030;";
-    removeBtn.addEventListener("click", () => {
-      const current = (bot.heal?.config?.healRules || []).slice();
-      current.splice(index, 1);
-      bot.heal.updateConfig({ healRules: current });
-      refreshHealRules();
-      refreshAutoHealStatus();
-      clearHealRuleForm();
-    });
-    row.appendChild(removeBtn);
-    list.appendChild(row);
-  });
-}
-
-function saveHealRule() {
-  const values = getHealRuleFormValues();
-
-  if (values.slot < 1 || values.slot > 12) { bot.log("Slot must be 1-12."); return; }
-  if (values.minHp < 0 || values.minHp > 100 || values.maxHp < 0 || values.maxHp > 100) { bot.log("HP % must be 0-100."); return; }
-  if (values.minHp > values.maxHp) { bot.log("Min HP cannot be greater than Max HP."); return; }
-  if (values.minMana < 0 || values.minMana > 100 || values.maxMana < 0 || values.maxMana > 100) { bot.log("MP % must be 0-100."); return; }
-  if (values.minMana > values.maxMana) { bot.log("Min MP cannot be greater than Max MP."); return; }
-
-  if (values.spellWords && values.manaCost <= 0) {
-    bot.log("Please enter a Mana Cost for the spell.");
-    return;
   }
 
-  const newRule = {
-    slot: values.slot,
-    spellWords: values.spellWords,
-    manaCost: values.manaCost,
-    minHpPercent: values.minHp,
-    maxHpPercent: values.maxHp,
-    minManaPercent: values.minMana,
-    maxManaPercent: values.maxMana,
-  };
-
-  let rules = (bot.heal?.config?.healRules || []).slice();
-  if (healEditIndex !== null) {
-    rules[healEditIndex] = newRule;
-  } else {
-    rules.push(newRule);
+  function saveAutoAttackPreferredConfig() {
+    const input = document.getElementById("minibia-bot-auto-attack-preferred-names");
+    const modeSelect = document.getElementById("minibia-bot-auto-attack-preferred-match-mode");
+    const preferred = parsePreferredTargetNames(input?.value || "");
+    const mode = modeSelect?.value === "includes" ? "includes" : "exact";
+    bot.attack?.updateConfig?.({ preferredTargetNames: preferred, preferredMatchMode: mode });
+    refreshAutoAttackPreferredStatus({ force: true });
+    bot.log?.("auto attack preferred targets updated", { preferredTargetNames: preferred, preferredMatchMode: mode });
   }
-  bot.heal.updateConfig({ healRules: rules });
-  refreshHealRules();
-  refreshAutoHealStatus();
-  clearHealRuleForm();
-}
 
-function refreshAutoHealStatus() {
-  const toggle = document.getElementById("minibia-bot-auto-heal-enabled");
-  if (toggle) toggle.checked = !!bot.heal?.status?.().running;
-}
+  // ---- Heal UI ----
+  let healEditIndex = null;
 
-  // --- end heal UI functions ---
+  function getHealRuleFormValues() {
+    const slot = parseInt(document.getElementById("minibia-bot-heal-slot")?.value || "1", 10) || 1;
+    const spell = document.getElementById("minibia-bot-heal-spell")?.value.trim() || "";
+    const manaCost = parseInt(document.getElementById("minibia-bot-heal-manacost")?.value || "0", 10) || 0;
+    const minHp = parseInt(document.getElementById("minibia-bot-heal-minhp")?.value || "0", 10) || 0;
+    const maxHp = parseInt(document.getElementById("minibia-bot-heal-maxhp")?.value || "100", 10) || 100;
+    const minMana = parseInt(document.getElementById("minibia-bot-heal-minmana")?.value || "0", 10) || 0;
+    const maxMana = parseInt(document.getElementById("minibia-bot-heal-maxmana")?.value || "100", 10) || 100;
+    return { slot, spellWords: spell, manaCost, minHp, maxHp, minMana, maxMana };
+  }
 
-	function refreshAutoAttackStatus() {
-	  const status = bot.attack?.status?.();
-	  const attackConfig =
-		status?.config ||
-		bot.attack?.config ||
-		{};
+  function setHealRuleFormValues(rule) {
+    document.getElementById("minibia-bot-heal-slot").value = rule.slot || 1;
+    document.getElementById("minibia-bot-heal-spell").value = rule.spellWords || "";
+    document.getElementById("minibia-bot-heal-manacost").value = rule.manaCost || 0;
+    document.getElementById("minibia-bot-heal-minhp").value = rule.minHpPercent ?? 0;
+    document.getElementById("minibia-bot-heal-maxhp").value = rule.maxHpPercent ?? 100;
+    document.getElementById("minibia-bot-heal-minmana").value = rule.minManaPercent ?? 0;
+    document.getElementById("minibia-bot-heal-maxmana").value = rule.maxManaPercent ?? 100;
+  }
 
-	  const autoAttackEnabledInput = document.getElementById(
-		"minibia-bot-auto-attack-enabled"
-	  );
+  function clearHealRuleForm() {
+    document.getElementById("minibia-bot-heal-slot").value = "1";
+    document.getElementById("minibia-bot-heal-spell").value = "";
+    document.getElementById("minibia-bot-heal-manacost").value = "0";
+    document.getElementById("minibia-bot-heal-minhp").value = "0";
+    document.getElementById("minibia-bot-heal-maxhp").value = "100";
+    document.getElementById("minibia-bot-heal-minmana").value = "0";
+    document.getElementById("minibia-bot-heal-maxmana").value = "100";
+    document.getElementById("minibia-bot-heal-save").textContent = "Add Rule";
+    healEditIndex = null;
+  }
 
-	  const autoAttackMeleeInput = document.getElementById(
-		"minibia-bot-auto-attack-melee"
-	  );
+  function refreshHealRules() {
+    const list = document.getElementById("minibia-bot-heal-rules-list");
+    if (!list) return;
+    const rules = bot.heal?.config?.healRules || [];
+    list.innerHTML = "";
+    if (!rules.length) {
+      const empty = document.createElement("div");
+      empty.className = "mb-small-note";
+      empty.textContent = "No heal rules configured.";
+      list.appendChild(empty);
+      return;
+    }
+    rules.forEach((rule, index) => {
+      const row = document.createElement("div");
+      row.className = "mb-list-row";
+      row.style.cssText = "display:grid;grid-template-columns:1fr auto auto;gap:6px;align-items:center;padding:4px 0;border-bottom:1px solid rgba(255,255,255,0.08);";
+      const info = document.createElement("div");
+      info.style.cssText = "display:flex;flex-wrap:wrap;gap:4px;align-items:center;font-size:11px;";
+      const slotLabel = document.createElement("span");
+      slotLabel.textContent = `Slot ${rule.slot}`;
+      slotLabel.style.cssText = "font-weight:bold;color:#d4c48a;";
+      info.appendChild(slotLabel);
+      if (rule.spellWords) {
+        const spell = document.createElement("span");
+        spell.textContent = `"${rule.spellWords}"`;
+        spell.style.cssText = "color:#aad4ff;";
+        info.appendChild(spell);
+        if (rule.manaCost > 0) {
+          const cost = document.createElement("span");
+          cost.textContent = `(${rule.manaCost} MP)`;
+          cost.style.cssText = "opacity:0.7;";
+          info.appendChild(cost);
+        }
+      } else {
+        const action = document.createElement("span");
+        action.textContent = "(hotkey)";
+        action.style.cssText = "opacity:0.6;";
+        info.appendChild(action);
+      }
+      const hp = document.createElement("span");
+      hp.textContent = `HP ${rule.minHpPercent}‑${rule.maxHpPercent}%`;
+      hp.style.cssText = "background:#2a1a1a;padding:0 4px;border-radius:3px;color:#ffb0b0;";
+      info.appendChild(hp);
+      const mp = document.createElement("span");
+      mp.textContent = `MP ${rule.minManaPercent}‑${rule.maxManaPercent}%`;
+      mp.style.cssText = "background:#1a1a2a;padding:0 4px;border-radius:3px;color:#b0b0ff;";
+      info.appendChild(mp);
+      row.appendChild(info);
+      const editBtn = document.createElement("button");
+      editBtn.type = "button";
+      editBtn.className = "mb-small-button";
+      editBtn.textContent = "Edit";
+      editBtn.style.cssText = "width:auto;padding:2px 8px;";
+      editBtn.addEventListener("click", () => {
+        healEditIndex = index;
+        setHealRuleFormValues(rule);
+        document.getElementById("minibia-bot-heal-save").textContent = "Update Rule";
+      });
+      row.appendChild(editBtn);
+      const removeBtn = document.createElement("button");
+      removeBtn.type = "button";
+      removeBtn.className = "mb-small-button";
+      removeBtn.textContent = "\u2715";
+      removeBtn.title = "Remove rule";
+      removeBtn.style.cssText = "width:24px;padding:2px;background:#5a2020;color:#ff8888;border-color:#883030;";
+      removeBtn.addEventListener("click", () => {
+        const current = (bot.heal?.config?.healRules || []).slice();
+        current.splice(index, 1);
+        bot.heal.updateConfig({ healRules: current });
+        refreshHealRules();
+        refreshAutoHealStatus();
+        clearHealRuleForm();
+      });
+      row.appendChild(removeBtn);
+      list.appendChild(row);
+    });
+  }
 
-	  const autoAttackHotkeyInput = document.getElementById(
-		"minibia-bot-auto-attack-hotkey"
-	  );
+  function saveHealRule() {
+    const values = getHealRuleFormValues();
+    if (values.slot < 1 || values.slot > 12) { bot.log("Slot must be 1-12."); return; }
+    if (values.minHp < 0 || values.minHp > 100 || values.maxHp < 0 || values.maxHp > 100) { bot.log("HP % must be 0-100."); return; }
+    if (values.minHp > values.maxHp) { bot.log("Min HP cannot be greater than Max HP."); return; }
+    if (values.minMana < 0 || values.minMana > 100 || values.maxMana < 0 || values.maxMana > 100) { bot.log("MP % must be 0-100."); return; }
+    if (values.minMana > values.maxMana) { bot.log("Min MP cannot be greater than Max MP."); return; }
+    if (values.spellWords && values.manaCost <= 0) { bot.log("Please enter a Mana Cost for the spell."); return; }
+    const newRule = {
+      slot: values.slot,
+      spellWords: values.spellWords,
+      manaCost: values.manaCost,
+      minHpPercent: values.minHp,
+      maxHpPercent: values.maxHp,
+      minManaPercent: values.minMana,
+      maxManaPercent: values.maxMana,
+    };
+    const rules = (bot.heal?.config?.healRules || []).slice();
+    if (healEditIndex !== null) rules[healEditIndex] = newRule;
+    else rules.push(newRule);
+    bot.heal.updateConfig({ healRules: rules });
+    refreshHealRules();
+    refreshAutoHealStatus();
+    clearHealRuleForm();
+  }
 
-	  const autoAttackRuneHotkeyInput = document.getElementById(
-		"minibia-bot-auto-attack-rune-hotkey"
-	  );
+  function refreshAutoHealStatus() {
+    const toggle = document.getElementById("minibia-bot-auto-heal-enabled");
+    if (toggle) toggle.checked = !!bot.heal?.status?.().running;
+  }
 
-	  if (autoAttackEnabledInput) {
-		autoAttackEnabledInput.checked = !!status?.running;
-	  }
+  // ---- Auto Attack Status ----
+  function refreshAutoAttackStatus() {
+    const status = bot.attack?.status?.();
+    const attackConfig = status?.config || bot.attack?.config || {};
+    const inputs = {
+      enabled: document.getElementById("minibia-bot-auto-attack-enabled"),
+      melee: document.getElementById("minibia-bot-auto-attack-melee"),
+      hotkey: document.getElementById("minibia-bot-auto-attack-hotkey"),
+      runeHotkey: document.getElementById("minibia-bot-auto-attack-rune-hotkey"),
+      maxDist: document.getElementById("minibia-bot-auto-attack-maxdist"),
+      antiKS: document.getElementById("minibia-bot-auto-attack-antiks"),
+      antiKSSelf: document.getElementById("minibia-bot-auto-attack-antiks-self"),
+      antiKSOther: document.getElementById("minibia-bot-auto-attack-antiks-other"),
+    };
+    if (inputs.enabled) inputs.enabled.checked = !!status?.running;
+    if (inputs.melee) inputs.melee.checked = attackConfig.meleeMode !== false;
+    if (inputs.hotkey && document.activeElement !== inputs.hotkey) {
+      inputs.hotkey.value = String(attackConfig.targetHotbarSlot ?? 3);
+    }
+    if (inputs.runeHotkey && document.activeElement !== inputs.runeHotkey) {
+      inputs.runeHotkey.value = attackConfig.runeHotbarSlot ? String(attackConfig.runeHotbarSlot) : "";
+    }
+    if (inputs.maxDist && document.activeElement !== inputs.maxDist) {
+      inputs.maxDist.value = attackConfig.maxTargetDistance ?? 5;
+    }
+    if (inputs.antiKS) inputs.antiKS.checked = attackConfig.antiKSEnabled !== false;
+    if (inputs.antiKSSelf && document.activeElement !== inputs.antiKSSelf) {
+      inputs.antiKSSelf.value = attackConfig.antiKSSelfRange ?? 2;
+    }
+    if (inputs.antiKSOther && document.activeElement !== inputs.antiKSOther) {
+      inputs.antiKSOther.value = attackConfig.antiKSOtherRange ?? 2;
+    }
+    refreshAutoAttackPreferredStatus();
+    if (typeof refreshTitlebarRunIndicators === "function") refreshTitlebarRunIndicators();
+  }
 
-	  if (autoAttackMeleeInput) {
-		autoAttackMeleeInput.checked = attackConfig.meleeMode !== false;
-	  }
-
-	  if (
-		autoAttackHotkeyInput &&
-		document.activeElement !== autoAttackHotkeyInput
-	  ) {
-		autoAttackHotkeyInput.value = String(
-		  attackConfig.targetHotbarSlot ?? 3
-		);
-	  }
-
-	  if (
-		autoAttackRuneHotkeyInput &&
-		document.activeElement !== autoAttackRuneHotkeyInput
-	  ) {
-		autoAttackRuneHotkeyInput.value =
-		  attackConfig.runeHotbarSlot
-			? String(attackConfig.runeHotbarSlot)
-			: "";
-	  }
-
-	  refreshAutoAttackPreferredStatus();
-
-	  if (typeof refreshTitlebarRunIndicators === "function") {
-		refreshTitlebarRunIndicators();
-	  }
-	}
-
-
-
+  // ---- Panic / Home / Xray etc. (keep as original) ----
   function refreshHomeLabel() {
-    const homeLabel = document.getElementById("minibia-bot-home");
-    if (!homeLabel) return;
-
+    const label = document.getElementById("minibia-bot-home");
+    if (!label) return;
     const home = bot.pz?.getHomePz?.();
-    homeLabel.textContent = home
-      ? `Panic Runner Home: ${home.x}, ${home.y}, ${home.z}`
-      : "Panic Runner Home: not set";
+    label.textContent = home ? `Panic Runner Home: ${home.x}, ${home.y}, ${home.z}` : "Panic Runner Home: not set";
   }
 
   function refreshPanicStatus() {
-    const unknownToggle = document.getElementById("minibia-bot-panic-unknown");
-    const healthToggle = document.getElementById("minibia-bot-panic-health");
-    const returnToggle = document.getElementById("minibia-bot-panic-return");
     const status = bot.panic?.status?.();
-
-    if (unknownToggle) {
-      unknownToggle.checked = !!status?.config?.unknownPlayerEnabled;
-    }
-
-    if (healthToggle) {
-      healthToggle.checked = !!status?.config?.healthLossEnabled;
-    }
-
-    if (returnToggle) {
-      returnToggle.checked = !!status?.config?.returnToOriginEnabled;
+    const unknown = document.getElementById("minibia-bot-panic-unknown");
+    const health = document.getElementById("minibia-bot-panic-health");
+    const ret = document.getElementById("minibia-bot-panic-return");
+    const alertToggle = document.getElementById("minibia-bot-panic-player-alert");
+    const cooldownInput = document.getElementById("minibia-bot-panic-player-cooldown");
+    if (unknown) unknown.checked = !!status?.config?.unknownPlayerEnabled;
+    if (health) health.checked = !!status?.config?.healthLossEnabled;
+    if (ret) ret.checked = !!status?.config?.returnToOriginEnabled;
+    if (alertToggle) alertToggle.checked = !!status?.config?.playerAlertEnabled;
+    if (cooldownInput && document.activeElement !== cooldownInput) {
+      const sec = Math.round((status?.config?.playerAlertCooldownMs || 60000) / 1000);
+      cooldownInput.value = sec;
     }
   }
 
   function refreshXrayStatus() {
     const status = bot.xray?.status?.();
     const me = bot.getPlayerPosition?.();
-    const overlayButton = document.getElementById("minibia-bot-xray-overlay-toggle");
+    const overlayBtn = document.getElementById("minibia-bot-xray-overlay-toggle");
     const overlayLabel = document.getElementById("minibia-bot-xray-overlay-status");
     const floorSelect = document.getElementById("minibia-bot-xray-floor-select");
-    const formatFloorOffset = (floor) => {
-      if (!me || floor == null) {
-        return null;
-      }
-
-      const offset = me.z - floor;
-      return offset === 0 ? "0" : offset > 0 ? `+${offset}` : `${offset}`;
-    };
-
-    if (overlayButton) {
-      overlayButton.textContent = status?.config?.overlayEnabled ? "Disable Overlay" : "Enable Overlay";
-    }
-
+    if (overlayBtn) overlayBtn.textContent = status?.config?.overlayEnabled ? "Disable Overlay" : "Enable Overlay";
     if (overlayLabel) {
       const floorLabel = status?.config?.selectedFloor == null
         ? "all floors"
-        : `${formatFloorOffset(status.config.selectedFloor) ?? "?"}`;
+        : (me ? (me.z - status.config.selectedFloor) : "?");
       overlayLabel.textContent = `${status?.config?.overlayEnabled ? "Overlay: on" : "Overlay: off"} • ${floorLabel}`;
     }
-
     if (floorSelect) {
-      const floors = Array.from(
-        new Set(
-          (status?.visibleCreatures || [])
-            .map((creature) => creature?.position?.z)
-            .filter((floor) => floor != null)
-        )
-      ).sort((a, b) => a - b);
-      const selectedFloor = status?.config?.selectedFloor;
-
-      if (selectedFloor != null && !floors.includes(selectedFloor)) {
-        floors.push(selectedFloor);
-        floors.sort((a, b) => a - b);
-      }
-
-      floorSelect.innerHTML = "";
-
-      const allOption = document.createElement("option");
-      allOption.value = "all";
-      allOption.textContent = "All floors";
-      floorSelect.appendChild(allOption);
-
-      floors.forEach((floor) => {
-        const option = document.createElement("option");
-        option.value = String(floor);
-        const offsetLabel = formatFloorOffset(floor);
-        option.textContent = offsetLabel == null
-          ? String(floor)
-          : offsetLabel;
-        floorSelect.appendChild(option);
+      const floors = Array.from(new Set((status?.visibleCreatures || []).map(c => c?.position?.z).filter(z => z != null)))
+        .sort((a,b) => a-b);
+      const selected = status?.config?.selectedFloor;
+      if (selected != null && !floors.includes(selected)) floors.push(selected);
+      floors.sort((a,b) => a-b);
+      floorSelect.innerHTML = `<option value="all">All floors</option>`;
+      floors.forEach(f => {
+        const opt = document.createElement("option");
+        opt.value = String(f);
+        const offset = me ? me.z - f : 0;
+        opt.textContent = offset === 0 ? String(f) : (offset > 0 ? `+${offset}` : `${offset}`);
+        floorSelect.appendChild(opt);
       });
-
-      floorSelect.value = selectedFloor == null ? "all" : String(selectedFloor);
+      floorSelect.value = selected == null ? "all" : String(selected);
     }
   }
 
   function renderTrustedNames() {
     const list = document.getElementById("minibia-bot-panic-trusted-list");
     if (!list) return;
-
-    const trustedNames = bot.panic?.config?.trustedNames || [];
+    const names = bot.panic?.config?.trustedNames || [];
     list.innerHTML = "";
-
-    if (!trustedNames.length) {
+    if (!names.length) {
       const empty = document.createElement("div");
       empty.className = "mb-small-note";
       empty.textContent = "No trusted names saved.";
       list.appendChild(empty);
       return;
     }
-
-    trustedNames.forEach((name, index) => {
+    names.forEach((name, idx) => {
       const row = document.createElement("div");
       row.className = "mb-list-row";
-
       const label = document.createElement("span");
       label.textContent = name;
-
-      const removeButton = document.createElement("button");
-      removeButton.type = "button";
-      removeButton.className = "mb-small-button";
-      removeButton.textContent = "Remove";
-      removeButton.addEventListener("click", () => {
-        const nextNames = trustedNames.filter((_, currentIndex) => currentIndex !== index);
-        bot.panic.updateConfig({ trustedNames: nextNames });
+      const removeBtn = document.createElement("button");
+      removeBtn.type = "button";
+      removeBtn.className = "mb-small-button";
+      removeBtn.textContent = "Remove";
+      removeBtn.addEventListener("click", () => {
+        const next = names.filter((_, i) => i !== idx);
+        bot.panic.updateConfig({ trustedNames: next });
         renderTrustedNames();
       });
-
-      row.appendChild(label);
-      row.appendChild(removeButton);
+      row.appendChild(label); row.appendChild(removeBtn);
       list.appendChild(row);
     });
   }
@@ -7218,347 +4932,261 @@ function refreshAutoHealStatus() {
   function renderGameMasterNames() {
     const list = document.getElementById("minibia-bot-panic-gm-list");
     if (!list) return;
-
-    const gameMasterNames = bot.panic?.config?.gameMasterNames || [];
+    const names = bot.panic?.config?.gameMasterNames || [];
     list.innerHTML = "";
-
-    if (!gameMasterNames.length) {
+    if (!names.length) {
       const empty = document.createElement("div");
       empty.className = "mb-small-note";
       empty.textContent = "No game master names saved.";
       list.appendChild(empty);
       return;
     }
-
-    gameMasterNames.forEach((name, index) => {
+    names.forEach((name, idx) => {
       const row = document.createElement("div");
       row.className = "mb-list-row";
-
       const label = document.createElement("span");
       label.textContent = name;
-
-      const removeButton = document.createElement("button");
-      removeButton.type = "button";
-      removeButton.className = "mb-small-button";
-      removeButton.textContent = "Remove";
-      removeButton.addEventListener("click", () => {
-        const nextNames = gameMasterNames.filter((_, currentIndex) => currentIndex !== index);
-        bot.panic.updateConfig({ gameMasterNames: nextNames });
+      const removeBtn = document.createElement("button");
+      removeBtn.type = "button";
+      removeBtn.className = "mb-small-button";
+      removeBtn.textContent = "Remove";
+      removeBtn.addEventListener("click", () => {
+        const next = names.filter((_, i) => i !== idx);
+        bot.panic.updateConfig({ gameMasterNames: next });
         renderGameMasterNames();
       });
-
-      row.appendChild(label);
-      row.appendChild(removeButton);
+      row.appendChild(label); row.appendChild(removeBtn);
       list.appendChild(row);
     });
   }
 
   function refreshRuneStatus() {
-    const runeToggle = document.getElementById("minibia-bot-rune-enabled");
-    const running = !!bot.rune?.status?.().running;
-
-    if (runeToggle) {
-      runeToggle.checked = running;
-    }
+    const toggle = document.getElementById("minibia-bot-rune-enabled");
+    if (toggle) toggle.checked = !!bot.rune?.status?.().running;
   }
 
   function refreshAutoEatStatus() {
-    const autoEatToggle = document.getElementById("minibia-bot-auto-eat-enabled");
-    if (!autoEatToggle) return;
-
-    autoEatToggle.checked = !!bot.eat?.status?.().running;
+    const toggle = document.getElementById("minibia-bot-auto-eat-enabled");
+    if (toggle) toggle.checked = !!bot.eat?.status?.().running;
   }
 
   function refreshAutoInvisibleStatus() {
-    const autoInvisibleToggle = document.getElementById("minibia-bot-auto-invisible-enabled");
-    if (!autoInvisibleToggle) return;
-
-    autoInvisibleToggle.checked = !!bot.invisible?.status?.().running;
+    const toggle = document.getElementById("minibia-bot-auto-invisible-enabled");
+    if (toggle) toggle.checked = !!bot.invisible?.status?.().running;
   }
 
   function refreshAutoMagicShieldStatus() {
-    const autoMagicShieldToggle = document.getElementById("minibia-bot-auto-magic-shield-enabled");
-    if (!autoMagicShieldToggle) return;
-
-    autoMagicShieldToggle.checked = !!bot.magicShield?.status?.().running;
+    const toggle = document.getElementById("minibia-bot-auto-magic-shield-enabled");
+    if (toggle) toggle.checked = !!bot.magicShield?.status?.().running;
   }
 
+  function refreshEquipRingStatus() {
+    const toggle = document.getElementById("minibia-bot-equip-ring-enabled");
+    if (toggle) toggle.checked = !!bot.equipRing?.status?.().running;
+  }
+
+  function refreshTalkStatus() {
+    const toggle = document.getElementById("minibia-bot-talk-enabled");
+    const label = document.getElementById("minibia-bot-talk-status");
+    const status = bot.talk?.status?.();
+    if (toggle) toggle.checked = !!status?.running;
+    if (label) {
+      if (!status?.config?.apiKey) label.textContent = "Status: API key missing";
+      else if (status?.pending) label.textContent = "Status: generating";
+      else if (status?.running) label.textContent = "Status: listening to Default";
+      else label.textContent = "Status: idle";
+    }
+  }
+
+  function refreshTalkIgnoredPhrases() {
+    const input = document.getElementById("minibia-bot-talk-ignored");
+    if (!input) return;
+    const phrases = bot.talk?.config?.ignoredPhrases || [];
+    input.value = phrases.join(", ");
+  }
+
+  function saveTalkIgnoredPhrases() {
+    const input = document.getElementById("minibia-bot-talk-ignored");
+    if (!input) return;
+    const raw = input.value.trim();
+    const phrases = raw.split(/[,;]/).map(p => p.trim().toLowerCase()).filter(Boolean);
+    bot.talk.updateConfig({ ignoredPhrases: phrases });
+    refreshTalkIgnoredPhrases();
+  }
+
+  // ---- Cave UI ----
   function refreshCavePresetControls() {
     const select = document.getElementById("minibia-bot-cave-preset-select");
     const label = document.getElementById("minibia-bot-cave-preset-status");
-    const deleteButton = document.getElementById("minibia-bot-cave-preset-delete");
+    const delBtn = document.getElementById("minibia-bot-cave-preset-delete");
     const status = bot.cave?.status?.();
-    const presetNames = status?.presetNames || bot.cave?.getPresetNames?.() || [];
-    const activePresetName = status?.activePresetName || bot.cave?.getActivePresetName?.() || "Default";
-
+    const names = status?.presetNames || bot.cave?.getPresetNames?.() || [];
+    const active = status?.activePresetName || bot.cave?.getActivePresetName?.() || "Default";
     if (select) {
-      const previousValue = select.value;
+      const prev = select.value;
       select.innerHTML = "";
-
-      if (!presetNames.length) {
-        const option = document.createElement("option");
-        option.value = "";
-        option.textContent = "No saved presets";
-        select.appendChild(option);
+      if (!names.length) {
+        const opt = document.createElement("option");
+        opt.value = ""; opt.textContent = "No saved presets";
+        select.appendChild(opt);
         select.disabled = true;
       } else {
-        presetNames.forEach((name) => {
-          const option = document.createElement("option");
-          option.value = name;
-          option.textContent = name;
-          select.appendChild(option);
+        names.forEach(n => {
+          const opt = document.createElement("option");
+          opt.value = n; opt.textContent = n;
+          select.appendChild(opt);
         });
         select.disabled = false;
-        const nextValue = presetNames.includes(activePresetName) ? activePresetName : previousValue;
-        if (nextValue) {
-          select.value = nextValue;
-        }
+        select.value = names.includes(active) ? active : (prev || names[0]);
       }
     }
-
-    if (label) {
-      label.textContent = presetNames.length
-        ? `Preset: ${activePresetName} (${presetNames.length} saved)`
-        : `Preset: ${activePresetName}`;
-    }
-
-    if (deleteButton) {
-      deleteButton.disabled = !presetNames.length || !select?.value;
-    }
+    if (label) label.textContent = names.length ? `Preset: ${active} (${names.length} saved)` : `Preset: ${active}`;
+    if (delBtn) delBtn.disabled = !names.length || !select?.value;
   }
 
   function refreshCaveClosestStatus() {
     const label = document.getElementById("minibia-bot-cave-closest");
     if (!label) return;
-
-    const position = bot.getPlayerPosition?.();
+    const pos = bot.getPlayerPosition?.();
     const route = bot.cave?.getRoute?.() || [];
-
-    if (!position) {
-      label.textContent = "Closest start: current position unavailable";
-      return;
-    }
-
-    if (!route.length) {
-      label.textContent = "Closest start: no waypoints";
-      return;
-    }
-
-    const closestIndex = bot.cave?.findClosestWaypointIndex?.(position) ?? 0;
-    const waypoint = route[closestIndex];
-
-    if (!waypoint) {
-      label.textContent = "Closest start: unavailable";
-      return;
-    }
-
-    label.textContent = `Closest start: ${closestIndex + 1}. ${waypoint.x}, ${waypoint.y}, ${waypoint.z}`;
+    if (!pos) { label.textContent = "Closest start: current position unavailable"; return; }
+    if (!route.length) { label.textContent = "Closest start: no waypoints"; return; }
+    const idx = bot.cave?.findClosestWaypointIndex?.(pos) ?? 0;
+    const wp = route[idx];
+    if (!wp) { label.textContent = "Closest start: unavailable"; return; }
+    label.textContent = `Closest start: ${idx+1}. ${wp.x}, ${wp.y}, ${wp.z}`;
   }
 
   function refreshCaveTransitionStatus() {
     const label = document.getElementById("minibia-bot-cave-transition-status");
     if (!label) return;
+    const trans = bot.cave?.getTransitions?.() || [];
+    if (!trans.length) { label.textContent = "Transitions learned: none"; return; }
+    const latest = trans.slice().sort((a,b) => (b?.lastSeenAt || 0) - (a?.lastSeenAt || 0))[0];
+    if (!latest?.from || !latest?.to) { label.textContent = `Transitions learned: ${trans.length}`; return; }
+    const extra = trans.length > 1 ? ` (+${trans.length-1} more)` : "";
+    label.textContent = `Transitions learned: ${latest.from.x}, ${latest.from.y}, ${latest.from.z} -> ${latest.to.x}, ${latest.to.y}, ${latest.to.z}${extra}`;
+  }
 
-    const transitions = bot.cave?.getTransitions?.() || [];
-    if (!transitions.length) {
-      label.textContent = "Transitions learned: none";
+  let selectedWaypointIndex = null;
+
+  function refreshCaveWaypointList() {
+    const container = document.getElementById("minibia-bot-cave-waypoint-list");
+    if (!container) return;
+    const route = bot.cave?.getRoute?.() || [];
+    const status = bot.cave?.status?.();
+    const current = status?.currentIndex ?? 0;
+    container.innerHTML = "";
+    if (!route.length) {
+      const empty = document.createElement("div");
+      empty.className = "mb-small-note";
+      empty.textContent = "No waypoints recorded.";
+      container.appendChild(empty);
+      selectedWaypointIndex = null;
       return;
     }
-
-    const latest = transitions
-      .slice()
-      .sort((a, b) => Number(b?.lastSeenAt || 0) - Number(a?.lastSeenAt || 0))[0];
-
-    if (!latest?.from || !latest?.to) {
-      label.textContent = `Transitions learned: ${transitions.length}`;
-      return;
+    route.forEach((wp, idx) => {
+      const row = document.createElement("div");
+      row.style.cssText = `display:flex;align-items:center;gap:6px;padding:2px 4px;border-radius:4px;cursor:pointer;${idx === current ? 'background:rgba(255,200,80,0.2);border:1px solid #ffcf5a;' : ''}`;
+      row.dataset.index = idx;
+      const num = document.createElement("span");
+      num.textContent = `${idx+1}.`;
+      num.style.cssText = "font-weight:bold;min-width:20px;";
+      const coords = document.createElement("span");
+      coords.textContent = `${wp.x}, ${wp.y}, ${wp.z}`;
+      if (idx === current) coords.style.cssText = "color:#ffcf5a;font-weight:bold;";
+      const distSpan = document.createElement("span");
+      distSpan.style.cssText = "margin-left:auto;font-size:10px;opacity:0.6;";
+      const pos = bot.getPlayerPosition?.();
+      if (pos && wp.z === pos.z) {
+        const dx = Math.abs(pos.x - wp.x), dy = Math.abs(pos.y - wp.y);
+        distSpan.textContent = `dist ${dx+dy}`;
+      }
+      row.appendChild(num); row.appendChild(coords); row.appendChild(distSpan);
+      row.addEventListener("click", () => {
+        container.querySelectorAll("[data-selected]").forEach(el => el.dataset.selected = "false");
+        row.dataset.selected = "true";
+        selectedWaypointIndex = idx;
+        bot.cave.setCurrentIndex(idx);
+        if (bot.cave?.status?.().running) bot.cave.goToWaypoint(route[idx]);
+        refreshCaveStatus();
+        refreshCaveWaypointList();
+        refreshTitlebarRunIndicators();
+      });
+      if (idx === current && selectedWaypointIndex === null) {
+        row.dataset.selected = "true";
+        selectedWaypointIndex = idx;
+      }
+      container.appendChild(row);
+    });
+    if (selectedWaypointIndex !== null && (selectedWaypointIndex < 0 || selectedWaypointIndex >= route.length)) {
+      selectedWaypointIndex = null;
     }
-
-    const extra = transitions.length > 1 ? ` (+${transitions.length - 1} more)` : "";
-    label.textContent =
-      `Transitions learned: ${latest.from.x}, ${latest.from.y}, ${latest.from.z} -> ` +
-      `${latest.to.x}, ${latest.to.y}, ${latest.to.z}${extra}`;
   }
 
-// --- Cave Waypoint List Management ---
-let selectedWaypointIndex = null;
-
-function refreshCaveWaypointList() {
-  const container = document.getElementById("minibia-bot-cave-waypoint-list");
-  if (!container) return;
-  const route = bot.cave?.getRoute?.() || [];
-  const status = bot.cave?.status?.();
-  const currentIndex = status?.currentIndex ?? 0;
-
-  container.innerHTML = "";
-  if (route.length === 0) {
-    const empty = document.createElement("div");
-    empty.className = "mb-small-note";
-    empty.textContent = "No waypoints recorded.";
-    container.appendChild(empty);
-    selectedWaypointIndex = null;
-    return;
-  }
-
-  route.forEach((wp, idx) => {
-    const row = document.createElement("div");
-    row.style.cssText = `display:flex;align-items:center;gap:6px;padding:2px 4px;border-radius:4px;cursor:pointer;${idx === currentIndex ? 'background:rgba(255,200,80,0.2);border:1px solid #ffcf5a;' : ''}`;
-    row.dataset.index = idx;
-
-    const number = document.createElement("span");
-    number.textContent = `${idx+1}.`;
-    number.style.cssText = "font-weight:bold;min-width:20px;";
-
-    const coords = document.createElement("span");
-    coords.textContent = `${wp.x}, ${wp.y}, ${wp.z}`;
-    if (idx === currentIndex) {
-      coords.style.cssText = "color:#ffcf5a;font-weight:bold;";
-    }
-
-    const dist = document.createElement("span");
-    dist.style.cssText = "margin-left:auto;font-size:10px;opacity:0.6;";
-    const pos = bot.getPlayerPosition?.();
-    if (pos && wp.z === pos.z) {
-      const dx = Math.abs(pos.x - wp.x);
-      const dy = Math.abs(pos.y - wp.y);
-      dist.textContent = `dist ${dx+dy}`;
-    }
-
-    row.appendChild(number);
-    row.appendChild(coords);
-    row.appendChild(dist);
-
-	row.addEventListener("click", () => {
-	  container.querySelectorAll("[data-selected]").forEach(el => el.dataset.selected = "false");
-	  row.dataset.selected = "true";
-	  selectedWaypointIndex = idx;
-	  // Set the bot's current waypoint index
-	  bot.cave.setCurrentIndex(idx);
-	  // If running, immediately path to the selected waypoint
-	  if (bot.cave?.status?.().running) {
-		bot.cave.goToWaypoint(route[idx]);
-	  }
-	  refreshCaveStatus();
-	  refreshCaveWaypointList();
-	  refreshTitlebarRunIndicators();
-	});
-
-    // Auto-select current if no selection
-    if (idx === currentIndex && selectedWaypointIndex === null) {
-      row.dataset.selected = "true";
-      selectedWaypointIndex = idx;
-    }
-
-    container.appendChild(row);
-  });
-
-  if (selectedWaypointIndex !== null && (selectedWaypointIndex < 0 || selectedWaypointIndex >= route.length)) {
-    selectedWaypointIndex = null;
-  }
-}
-
-function moveSelectedWaypoint(direction) {
-  if (selectedWaypointIndex === null) {
-    bot.log("No waypoint selected. Click a waypoint first.");
-    return;
-  }
-  const route = bot.cave?.getRoute?.() || [];
-  if (selectedWaypointIndex < 0 || selectedWaypointIndex >= route.length) return;
-  if (direction === "up" && selectedWaypointIndex === 0) return;
-  if (direction === "down" && selectedWaypointIndex === route.length - 1) return;
-
-  let moved = false;
-  if (direction === "up") {
-    moved = bot.cave.moveWaypointUp(selectedWaypointIndex);
-    if (moved) selectedWaypointIndex--;
-  } else if (direction === "down") {
-    moved = bot.cave.moveWaypointDown(selectedWaypointIndex);
-    if (moved) selectedWaypointIndex++;
-  }
-  if (moved) {
-    refreshCaveWaypointList();
-    refreshCaveStatus();
-    refreshCaveClosestStatus();
-    refreshCaveTransitionStatus();
-  }
-}
-
-function deleteSelectedWaypoint() {
-  if (selectedWaypointIndex === null) {
-    bot.log("No waypoint selected.");
-    return;
-  }
-  const route = bot.cave?.getRoute?.() || [];
-  if (selectedWaypointIndex < 0 || selectedWaypointIndex >= route.length) return;
-  const deleted = bot.cave.deleteWaypoint(selectedWaypointIndex);
-  if (deleted) {
-    selectedWaypointIndex = null;
-    refreshCaveWaypointList();
-    refreshCaveStatus();
-    refreshCaveClosestStatus();
-    refreshCaveTransitionStatus();
-  }
-}
-
-function refreshCaveStatus() {
-  const toggle = document.getElementById("minibia-bot-cave-toggle");
-  const statusLabel = document.getElementById("minibia-bot-cave-status");
-  const route = bot.cave?.getRoute?.() || [];
-  const status = bot.cave?.status?.();
-
-  if (toggle) toggle.checked = !!status?.running;
-
-  if (statusLabel) {
-    if (!route.length) statusLabel.textContent = "Status: no waypoints";
-    else if (status?.running) {
-      const waypointNumber = (status.currentIndex ?? 0) + 1;
-      const dist = Number.isFinite(status?.distanceToWaypoint) && status.distanceToWaypoint >= 0 ? `, dist ${status.distanceToWaypoint}` : "";
-      statusLabel.textContent = `Status: running (${waypointNumber}/${route.length}${dist})`;
+  function moveSelectedWaypoint(direction) {
+    if (selectedWaypointIndex === null) { bot.log("No waypoint selected. Click a waypoint first."); return; }
+    const route = bot.cave?.getRoute?.() || [];
+    if (selectedWaypointIndex < 0 || selectedWaypointIndex >= route.length) return;
+    if (direction === "up" && selectedWaypointIndex === 0) return;
+    if (direction === "down" && selectedWaypointIndex === route.length - 1) return;
+    let moved = false;
+    if (direction === "up") {
+      moved = bot.cave.moveWaypointUp(selectedWaypointIndex);
+      if (moved) selectedWaypointIndex--;
     } else {
-      statusLabel.textContent = `Status: idle (${route.length} waypoint${route.length===1?"":"s"})`;
+      moved = bot.cave.moveWaypointDown(selectedWaypointIndex);
+      if (moved) selectedWaypointIndex++;
+    }
+    if (moved) {
+      refreshCaveWaypointList();
+      refreshCaveStatus();
+      refreshCaveClosestStatus();
+      refreshCaveTransitionStatus();
     }
   }
-}
 
-  function refreshEquipRingStatus() {
-    const equipRingToggle = document.getElementById("minibia-bot-equip-ring-enabled");
-    if (!equipRingToggle) return;
-
-    equipRingToggle.checked = !!bot.equipRing?.status?.().running;
+  function deleteSelectedWaypoint() {
+    if (selectedWaypointIndex === null) { bot.log("No waypoint selected."); return; }
+    const route = bot.cave?.getRoute?.() || [];
+    if (selectedWaypointIndex < 0 || selectedWaypointIndex >= route.length) return;
+    const deleted = bot.cave.deleteWaypoint(selectedWaypointIndex);
+    if (deleted) {
+      selectedWaypointIndex = null;
+      refreshCaveWaypointList();
+      refreshCaveStatus();
+      refreshCaveClosestStatus();
+      refreshCaveTransitionStatus();
+    }
   }
 
-  function refreshTalkStatus() {
-    const talkToggle = document.getElementById("minibia-bot-talk-enabled");
-    const statusLabel = document.getElementById("minibia-bot-talk-status");
-    const status = bot.talk?.status?.();
-
-    if (talkToggle) {
-      talkToggle.checked = !!status?.running;
-    }
-
-    if (statusLabel) {
-      if (!status?.config?.apiKey) {
-        statusLabel.textContent = "Status: API key missing";
-      } else if (status?.pending) {
-        statusLabel.textContent = "Status: generating";
-      } else if (status?.running) {
-        statusLabel.textContent = "Status: listening to Default";
+  function refreshCaveStatus() {
+    const toggle = document.getElementById("minibia-bot-cave-toggle");
+    const label = document.getElementById("minibia-bot-cave-status");
+    const route = bot.cave?.getRoute?.() || [];
+    const status = bot.cave?.status?.();
+    if (toggle) toggle.checked = !!status?.running;
+    if (label) {
+      if (!route.length) label.textContent = "Status: no waypoints";
+      else if (status?.running) {
+        const wpNum = (status.currentIndex ?? 0) + 1;
+        const dist = Number.isFinite(status?.distanceToWaypoint) && status.distanceToWaypoint >= 0 ? `, dist ${status.distanceToWaypoint}` : "";
+        label.textContent = `Status: running (${wpNum}/${route.length}${dist})`;
       } else {
-        statusLabel.textContent = "Status: idle";
+        label.textContent = `Status: idle (${route.length} waypoint${route.length===1?"":"s"})`;
       }
     }
   }
 
+  // ---- Visible Creatures List ----
   function refreshVisibleCreatures() {
     const list = document.getElementById("minibia-bot-visible-creatures-list");
     if (!list) return;
-
     const me = bot.getPlayerPosition?.();
     const status = bot.xray?.status?.();
     const creatures = status?.visibleCreatures || [];
     const selectedFloor = status?.config?.selectedFloor;
     list.innerHTML = "";
-
     if (!me) {
       const empty = document.createElement("div");
       empty.className = "mb-small-note";
@@ -7566,2049 +5194,613 @@ function refreshCaveStatus() {
       list.appendChild(empty);
       return;
     }
-
-    const getFloorOffset = (creature) => (creature.position?.z || 0) - me.z;
-    const getFloorDistance = (creature) => Math.abs(getFloorOffset(creature));
-
-    const visibleCreatures = creatures
-      .filter((creature) => {
-        const floor = creature?.position?.z;
-        if (floor == null) {
-          return false;
-        }
-
-        if (selectedFloor != null) {
-          return floor === selectedFloor;
-        }
-
+    const getFloorOffset = (c) => (c.position?.z || 0) - me.z;
+    const getFloorDist = (c) => Math.abs(getFloorOffset(c));
+    const filtered = creatures
+      .filter(c => {
+        const floor = c?.position?.z;
+        if (floor == null) return false;
+        if (selectedFloor != null) return floor === selectedFloor;
         return floor !== me.z;
       })
-      .sort((a, b) => {
-      const floorDistanceDiff = getFloorDistance(a) - getFloorDistance(b);
-      if (floorDistanceDiff !== 0) return floorDistanceDiff;
-
-      const floorOffsetDiff = getFloorOffset(a) - getFloorOffset(b);
-      if (floorOffsetDiff !== 0) return floorOffsetDiff;
-
-      const aDist = Math.abs((a.position?.x || 0) - me.x) + Math.abs((a.position?.y || 0) - me.y);
-      const bDist = Math.abs((b.position?.x || 0) - me.x) + Math.abs((b.position?.y || 0) - me.y);
-      return aDist - bDist;
-    });
-
-    if (!visibleCreatures.length) {
+      .sort((a,b) => {
+        const fd = getFloorDist(a) - getFloorDist(b);
+        if (fd !== 0) return fd;
+        const fo = getFloorOffset(a) - getFloorOffset(b);
+        if (fo !== 0) return fo;
+        const ad = Math.abs((a.position?.x || 0) - me.x) + Math.abs((a.position?.y || 0) - me.y);
+        const bd = Math.abs((b.position?.x || 0) - me.x) + Math.abs((b.position?.y || 0) - me.y);
+        return ad - bd;
+      });
+    if (!filtered.length) {
       const empty = document.createElement("div");
       empty.className = "mb-small-note";
-      empty.textContent = selectedFloor == null
-        ? "No off-floor creatures."
-        : `No creatures on floor ${selectedFloor}.`;
+      empty.textContent = selectedFloor == null ? "No off-floor creatures." : `No creatures on floor ${selectedFloor}.`;
       list.appendChild(empty);
       return;
     }
-
     let currentFloor = null;
-
-    visibleCreatures.forEach((creature) => {
-      const floor = creature.position?.z;
+    filtered.forEach(c => {
+      const floor = c.position?.z;
       if (floor !== currentFloor) {
         currentFloor = floor;
-        const floorOffset = me.z - floor;
-        const floorOffsetLabel =
-          floorOffset === 0 ? "0" : floorOffset > 0 ? `+${floorOffset}` : `${floorOffset}`;
-
-        const floorLabel = document.createElement("div");
-        floorLabel.className = "mb-floor-label";
-        floorLabel.textContent = floorOffsetLabel;
-        list.appendChild(floorLabel);
+        const offset = me.z - floor;
+        const label = offset === 0 ? "0" : offset > 0 ? `+${offset}` : `${offset}`;
+        const fl = document.createElement("div");
+        fl.className = "mb-floor-label";
+        fl.textContent = label;
+        list.appendChild(fl);
       }
-
       const row = document.createElement("div");
       row.className = "mb-creature-row";
-
       const name = document.createElement("div");
       name.className = "mb-creature-name";
-      name.textContent = creature.name || (creature.type === 0 ? "Player" : "Mob");
-
+      name.textContent = c.name || (c.type === 0 ? "Player" : "Mob");
       const meta = document.createElement("div");
       meta.className = "mb-small-note";
-      meta.textContent = `${creature.type === 0 ? "Player" : "Mob"} at ${creature.position.x}, ${creature.position.y}, ${creature.position.z}`;
-
-      row.appendChild(name);
-      row.appendChild(meta);
+      meta.textContent = `${c.type === 0 ? "Player" : "Mob"} at ${c.position.x}, ${c.position.y}, ${c.position.z}`;
+      row.appendChild(name); row.appendChild(meta);
       list.appendChild(row);
     });
   }
 
+  // ---- Panel positioning ----
+  function savePanelPosition(position, key = panelPositionKey) {
+    bot.storage.set(key, position);
+  }
+  function getSavedPanelPosition(key = panelPositionKey) {
+    return bot.storage.get(key, null);
+  }
+  function savePanelCollapsed(collapsed) {
+    bot.storage.set(panelCollapsedKey, !!collapsed);
+  }
+  function getSavedPanelCollapsed() {
+    return !!bot.storage.get(panelCollapsedKey, false);
+  }
+
   function setPanelCollapsed(panel, collapsed) {
     if (!panel) return;
-
     const body = panel.querySelector(".mb-body");
     const toggle = panel.querySelector("#minibia-bot-collapse");
-    const nextCollapsed = !!collapsed;
-
-    panel.dataset.collapsed = nextCollapsed ? "true" : "false";
-
-    if (body) {
-      body.hidden = nextCollapsed;
-    }
-
+    const next = !!collapsed;
+    panel.dataset.collapsed = next ? "true" : "false";
+    if (body) body.hidden = next;
     if (toggle) {
-      toggle.textContent = nextCollapsed ? "+" : "−";
-      toggle.setAttribute("aria-label", nextCollapsed ? "Maximize panel" : "Minimize panel");
-      toggle.setAttribute("title", nextCollapsed ? "Maximize" : "Minimize");
+      toggle.textContent = next ? "+" : "−";
+      toggle.setAttribute("aria-label", next ? "Maximize panel" : "Minimize panel");
+      toggle.title = next ? "Maximize" : "Minimize";
     }
-
-    savePanelCollapsed(nextCollapsed);
+    savePanelCollapsed(next);
   }
 
   function applySavedPanelPosition(panel, key = panelPositionKey) {
-    const position = getSavedPanelPosition(key);
-    if (!position) return;
-
-    if (typeof position.top === "number") {
-      panel.style.top = `${position.top}px`;
-    }
-
-    if (typeof position.left === "number") {
-      panel.style.left = `${position.left}px`;
-      panel.style.right = "auto";
-    }
+    const pos = getSavedPanelPosition(key);
+    if (!pos) return;
+    if (typeof pos.top === "number") panel.style.top = `${pos.top}px`;
+    if (typeof pos.left === "number") { panel.style.left = `${pos.left}px`; panel.style.right = "auto"; }
   }
 
   function clampPanelPosition(panel, left, top) {
     const maxLeft = Math.max(0, window.innerWidth - panel.offsetWidth);
     const maxTop = Math.max(0, window.innerHeight - panel.offsetHeight);
-
-    return {
-      left: Math.min(Math.max(0, left), maxLeft),
-      top: Math.min(Math.max(0, top), maxTop),
-    };
+    return { left: Math.min(Math.max(0, left), maxLeft), top: Math.min(Math.max(0, top), maxTop) };
   }
 
   function enableDrag(panel, key = panelPositionKey) {
     const handle = panel.querySelector(".mb-title");
     if (!handle) return;
-
     let dragState = null;
-
-    const onMouseMove = (event) => {
+    const onMouseMove = (e) => {
       if (!dragState) return;
-
-      const next = clampPanelPosition(
-        panel,
-        event.clientX - dragState.offsetX,
-        event.clientY - dragState.offsetY
-      );
-
+      const next = clampPanelPosition(panel, e.clientX - dragState.offsetX, e.clientY - dragState.offsetY);
       panel.style.left = `${next.left}px`;
       panel.style.top = `${next.top}px`;
       panel.style.right = "auto";
     };
-
     const onMouseUp = () => {
       if (!dragState) return;
-
       dragState = null;
       const rect = panel.getBoundingClientRect();
       savePanelPosition({ left: rect.left, top: rect.top }, key);
     };
-
-    handle.addEventListener("mousedown", (event) => {
-      if (event.button !== 0) return;
-
+    handle.addEventListener("mousedown", (e) => {
+      if (e.button !== 0) return;
       const rect = panel.getBoundingClientRect();
-      dragState = {
-        offsetX: event.clientX - rect.left,
-        offsetY: event.clientY - rect.top,
-      };
-
-      event.preventDefault();
+      dragState = { offsetX: e.clientX - rect.left, offsetY: e.clientY - rect.top };
+      e.preventDefault();
     });
-
     window.addEventListener("mousemove", onMouseMove);
     window.addEventListener("mouseup", onMouseUp);
-
     bot.addCleanup(() => {
       window.removeEventListener("mousemove", onMouseMove);
       window.removeEventListener("mouseup", onMouseUp);
     });
   }
 
-// --- UI helper functions (needed for panel positioning and collapse) ---
-
-function savePanelPosition(position, key = panelPositionKey) {
-  bot.storage.set(key, position);
-}
-
-function getSavedPanelPosition(key = panelPositionKey) {
-  return bot.storage.get(key, null);
-}
-
-function savePanelCollapsed(collapsed) {
-  bot.storage.set(panelCollapsedKey, !!collapsed);
-}
-
-function getSavedPanelCollapsed() {
-  return !!bot.storage.get(panelCollapsedKey, false);
-}
-
-function setPanelCollapsed(panel, collapsed) {
-  if (!panel) return;
-
-  const body = panel.querySelector(".mb-body");
-  const toggle = panel.querySelector("#minibia-bot-collapse");
-  const nextCollapsed = !!collapsed;
-
-  panel.dataset.collapsed = nextCollapsed ? "true" : "false";
-
-  if (body) {
-    body.hidden = nextCollapsed;
+  function updateCollapsedStopButton(panel) {
+    if (!panel) return;
+    const btn = panel.querySelector("#minibia-bot-collapsed-stop");
+    if (!btn) return;
+    btn.style.display = panel.dataset.collapsed === "true" ? "" : "none";
   }
 
-  if (toggle) {
-    toggle.textContent = nextCollapsed ? "+" : "−";
-    toggle.setAttribute("aria-label", nextCollapsed ? "Maximize panel" : "Minimize panel");
-    toggle.setAttribute("title", nextCollapsed ? "Maximize" : "Minimize");
+  function refreshTitlebarRunIndicators() {
+    const panel = document.getElementById("minibia-bot-panel");
+    if (!panel) return;
+    const caveInd = panel.querySelector("#minibia-bot-title-cave-status");
+    const attackInd = panel.querySelector("#minibia-bot-title-attack-status");
+    let caveRunning = false, attackRunning = false;
+    try { caveRunning = !!bot.cave?.status?.().running; } catch {}
+    try { attackRunning = !!bot.attack?.status?.().running; } catch {}
+    if (caveInd) {
+      caveInd.dataset.running = caveRunning ? "true" : "false";
+      caveInd.title = caveRunning ? "Cavebot running" : "Cavebot stopped";
+    }
+    if (attackInd) {
+      attackInd.dataset.running = attackRunning ? "true" : "false";
+      attackInd.title = attackRunning ? "Targeting running" : "Targeting stopped";
+    }
   }
 
-  savePanelCollapsed(nextCollapsed);
-}
-
-function applySavedPanelPosition(panel, key = panelPositionKey) {
-  const position = getSavedPanelPosition(key);
-  if (!position) return;
-
-  if (typeof position.top === "number") {
-    panel.style.top = `${position.top}px`;
+  function stopCaveAndAttackManual() {
+    try { bot.cave?.stop?.(); } catch (e) { console.warn("[minibia-bot-ui] failed to stop cave", e); }
+    try { bot.attack?.stop?.(); } catch (e) { console.warn("[minibia-bot-ui] failed to stop attack", e); }
+    try { refreshCaveStatus?.(); refreshAutoAttackStatus?.(); refreshTitlebarRunIndicators?.(); } catch {}
   }
 
-  if (typeof position.left === "number") {
-    panel.style.left = `${position.left}px`;
-    panel.style.right = "auto";
-  }
-}
-
-function clampPanelPosition(panel, left, top) {
-  const maxLeft = Math.max(0, window.innerWidth - panel.offsetWidth);
-  const maxTop = Math.max(0, window.innerHeight - panel.offsetHeight);
-
-  return {
-    left: Math.min(Math.max(0, left), maxLeft),
-    top: Math.min(Math.max(0, top), maxTop),
-  };
-}
-
-function enableDrag(panel, key = panelPositionKey) {
-  const handle = panel.querySelector(".mb-title");
-  if (!handle) return;
-
-  let dragState = null;
-
-  const onMouseMove = (event) => {
-    if (!dragState) return;
-
-    const next = clampPanelPosition(
-      panel,
-      event.clientX - dragState.offsetX,
-      event.clientY - dragState.offsetY
-    );
-
-    panel.style.left = `${next.left}px`;
-    panel.style.top = `${next.top}px`;
-    panel.style.right = "auto";
-  };
-
-  const onMouseUp = () => {
-    if (!dragState) return;
-
-    dragState = null;
-    const rect = panel.getBoundingClientRect();
-    savePanelPosition({ left: rect.left, top: rect.top }, key);
-  };
-
-  handle.addEventListener("mousedown", (event) => {
-    if (event.button !== 0) return;
-
-    const rect = panel.getBoundingClientRect();
-    dragState = {
-      offsetX: event.clientX - rect.left,
-      offsetY: event.clientY - rect.top,
-    };
-
-    event.preventDefault();
-  });
-
-  window.addEventListener("mousemove", onMouseMove);
-  window.addEventListener("mouseup", onMouseUp);
-
-  bot.addCleanup(() => {
-    window.removeEventListener("mousemove", onMouseMove);
-    window.removeEventListener("mouseup", onMouseUp);
-  });
-}
-
-function updateCollapsedStopButton(panel) {
-  if (!panel) return;
-
-  const stopButton = panel.querySelector("#minibia-bot-collapsed-stop");
-  if (!stopButton) return;
-
-  stopButton.style.display = panel.dataset.collapsed === "true" ? "" : "none";
-}
-
-function refreshTitlebarRunIndicators() {
-  const panel = document.getElementById("minibia-bot-panel");
-  if (!panel) return;
-
-  const caveIndicator = panel.querySelector("#minibia-bot-title-cave-status");
-  const attackIndicator = panel.querySelector("#minibia-bot-title-attack-status");
-
-  let caveRunning = false;
-  let attackRunning = false;
-
-  try {
-    caveRunning = !!bot.cave?.status?.().running;
-  } catch {}
-
-  try {
-    attackRunning = !!bot.attack?.status?.().running;
-  } catch {}
-
-  if (caveIndicator) {
-    caveIndicator.dataset.running = caveRunning ? "true" : "false";
-    caveIndicator.title = caveRunning ? "Cavebot running" : "Cavebot stopped";
-  }
-
-  if (attackIndicator) {
-    attackIndicator.dataset.running = attackRunning ? "true" : "false";
-    attackIndicator.title = attackRunning ? "Targeting running" : "Targeting stopped";
-  }
-}
-
+  // ---- INJECT ----
   function inject() {
     destroy();
 
     const style = document.createElement("style");
     style.id = "minibia-bot-style";
     style.textContent = `
-
-#minibia-bot-panel {
-  position: fixed;
-  z-index: 999999;
-  top: 16px;
-  right: 16px;
-  width: 500px;
-  max-width: calc(100vw - 32px);
-  padding: 8px;
-  border: 1px solid rgba(224, 200, 148, 0.45);
-  border-radius: 10px;
-  background: rgba(18, 13, 8, 0.96);
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
-  color: #f8e6b8;
-  font: 12px/1.35 Verdana, sans-serif;
-  user-select: none;
-}
-
-#minibia-bot-panel .mb-run-indicator {
-  cursor: pointer;
-  transition: background 0.15s, border-color 0.15s;
-}
-#minibia-bot-panel .mb-run-indicator:hover {
-  background: rgba(255, 255, 255, 0.08);
-  border-color: rgba(224, 200, 148, 0.6);
-}
-
-#minibia-bot-panel[data-collapsed="true"] {
-  width: 240px;
-}
-
-#minibia-bot-panel .mb-titlebar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  margin: 0 0 8px;
-}
-
-#minibia-bot-panel[data-collapsed="true"] .mb-titlebar {
-  margin-bottom: 0;
-}
-
-#minibia-bot-panel .mb-titlebar {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 8px;
-  margin: 0 0 8px;
-}
-
-#minibia-bot-panel .mb-title-status {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 6px;
-  min-width: 0;
-}
-
-#minibia-bot-panel .mb-run-indicator {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 2px 6px;
-  border: 1px solid rgba(224, 200, 148, 0.22);
-  border-radius: 999px;
-  background: rgba(8, 7, 6, 0.55);
-  color: #b7a67d;
-  font-size: 10px;
-  line-height: 1.2;
-  white-space: nowrap;
-}
-
-#minibia-bot-panel .mb-run-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: #5b5547;
-  box-shadow: 0 0 0 1px rgba(0,0,0,0.45);
-}
-
-#minibia-bot-panel .mb-run-indicator[data-running="true"] {
-  color: #d7ffd7;
-  border-color: rgba(90, 220, 120, 0.42);
-  background: rgba(20, 70, 28, 0.35);
-}
-
-#minibia-bot-panel .mb-run-indicator[data-running="true"] .mb-run-dot {
-  background: #39e86f;
-  box-shadow:
-    0 0 0 1px rgba(0,0,0,0.45),
-    0 0 7px rgba(57, 232, 111, 0.8);
-}
-
-#minibia-bot-panel .mb-title-actions {
-  display: flex;
-  gap: 6px;
-  align-items: center;
-}
-
-#minibia-bot-panel .mb-title {
-  margin: 0;
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  cursor: move;
-  color: #ffe7ad;
-}
-
-#minibia-bot-panel .mb-title-actions {
-  display: flex;
-  gap: 6px;
-  align-items: center;
-}
-
-#minibia-bot-panel .mb-icon-button {
-  width: 24px;
-  min-width: 24px;
-  padding: 2px 0;
-  border-radius: 6px;
-  font-weight: 700;
-  line-height: 1;
-}
-
-#minibia-bot-panel .mb-body {
-  display: grid;
-  grid-template-columns: 112px minmax(0, 1fr);
-  gap: 10px;
-  align-items: start;
-}
-
-#minibia-bot-panel .mb-body[hidden] {
-  display: none !important;
-}
-
-#minibia-bot-panel .mb-tab-menu {
-  display: grid;
-  gap: 6px;
-}
-
-#minibia-bot-panel .mb-tab-button {
-  width: 100%;
-  padding: 8px 9px;
-  border-radius: 7px;
-  text-align: left;
-  font-size: 11px;
-  line-height: 1.15;
-  background: rgba(255, 244, 212, 0.07);
-}
-
-#minibia-bot-panel .mb-tab-button[data-active="true"] {
-  background: linear-gradient(180deg, #8a7044, #554329);
-  border-color: rgba(224, 200, 148, 0.75);
-  color: #fff3cf;
-}
-
-#minibia-bot-panel .mb-tab-content {
-  min-width: 0;
-  max-height: min(72vh, 560px);
-  overflow-y: auto;
-  padding-right: 4px;
-}
-
-#minibia-bot-panel .mb-tab-panel {
-  display: none;
-}
-
-#minibia-bot-panel .mb-tab-panel[data-active="true"] {
-  display: grid;
-  gap: 10px;
-}
-
-#minibia-bot-panel .mb-section {
-  padding: 12px;
-  border: 1px solid rgba(224, 200, 148, 0.18);
-  border-radius: 8px;
-  background: rgba(8, 7, 6, 0.86);
-}
-
-#minibia-bot-panel .mb-label {
-  margin: 0 0 10px;
-  color: #ffe5a8;
-  font-weight: 700;
-  font-size: 13px;
-}
-
-#minibia-bot-panel .mb-stack {
-  display: grid;
-  gap: 10px;
-}
-
-#minibia-bot-panel .mb-form-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px;
-}
-
-#minibia-bot-panel .mb-button-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
-}
-
-#minibia-bot-panel .mb-utility-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 86px;
-  gap: 10px;
-  align-items: end;
-}
-
-#minibia-bot-panel .mb-field {
-  display: grid;
-  gap: 4px;
-  min-width: 0;
-}
-
-#minibia-bot-panel .mb-mini-field {
-  width: 86px;
-}
-
-#minibia-bot-panel .mb-field-label {
-  color: #e9d39b;
-  font-size: 11px;
-  line-height: 1.2;
-}
-
-#minibia-bot-panel input,
-#minibia-bot-panel textarea,
-#minibia-bot-panel select {
-  width: 100%;
-  box-sizing: border-box;
-  padding: 8px 10px;
-  border: 1px solid rgba(224, 200, 148, 0.48);
-  border-radius: 8px;
-  background: #080706;
-  color: #fff2c7;
-  font: inherit;
-  box-shadow: inset 0 1px 2px rgba(0,0,0,0.65);
-  caret-color: #fff2c7;
-}
-
-#minibia-bot-panel input::placeholder,
-#minibia-bot-panel textarea::placeholder {
-  color: rgba(255, 226, 176, 0.48);
-}
-
-#minibia-bot-panel input:focus,
-#minibia-bot-panel textarea:focus,
-#minibia-bot-panel select:focus {
-  outline: none;
-  border-color: rgba(255, 220, 140, 0.9);
-  box-shadow:
-    inset 0 1px 2px rgba(0,0,0,0.65),
-    0 0 0 2px rgba(255, 200, 90, 0.18);
-}
-
-#minibia-bot-panel textarea {
-  min-height: 90px;
-  resize: vertical;
-}
-
-#minibia-bot-panel .mb-toggle {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  color: #f3dfad;
-  white-space: normal;
-}
-
-#minibia-bot-panel .mb-toggle-main {
-  margin-bottom: 2px;
-}
-
-#minibia-bot-panel input[type="checkbox"] {
-  width: 14px;
-  height: 14px;
-  margin: 0;
-  accent-color: #18c99a;
-}
-
-#minibia-bot-panel button {
-  width: 100%;
-  padding: 8px 10px;
-  border: 1px solid rgba(224, 200, 148, 0.35);
-  border-radius: 8px;
-  background: linear-gradient(180deg, #635133, #3f321f);
-  color: #fff0ca;
-  font: inherit;
-  cursor: pointer;
-}
-
-#minibia-bot-panel button:hover {
-  background: linear-gradient(180deg, #755f3d, #4f4028);
-}
-
-#minibia-bot-panel .mb-small-button {
-  width: auto;
-  padding: 6px 8px;
-  border-radius: 6px;
-}
-
-#minibia-bot-panel .mb-inline {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 8px;
-  align-items: center;
-}
-
-#minibia-bot-panel .mb-list {
-  display: grid;
-  gap: 6px;
-}
-
-#minibia-bot-panel .mb-list-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 6px;
-  align-items: center;
-  color: #d3c49d;
-}
-
-#minibia-bot-panel .mb-creature-row {
-  padding: 6px 8px;
-  border: 1px solid rgba(224, 200, 148, 0.14);
-  border-radius: 8px;
-  background: rgba(255, 244, 212, 0.04);
-}
-
-#minibia-bot-panel .mb-creature-name {
-  color: #f7eccf;
-  word-break: break-word;
-}
-
-#minibia-bot-panel .mb-floor-label {
-  margin-top: 4px;
-  color: #e2cf9c;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-}
-
-#minibia-bot-panel #minibia-bot-visible-creatures-list,
-#minibia-bot-panel #minibia-bot-panic-trusted-list,
-#minibia-bot-panel #minibia-bot-panic-gm-list {
-  max-height: 150px;
-  overflow-y: auto;
-  padding-right: 2px;
-}
-
-#minibia-bot-panel .mb-small-note,
-#minibia-bot-panel .mb-note {
-  color: #cdbb8b;
-  font-size: 11px;
-  line-height: 1.35;
-}
-
-#minibia-bot-panel .mb-collapsed-stop-button {
-  background: linear-gradient(180deg, #7a2f2f, #4e1f1f);
-  border-color: rgba(255, 120, 120, 0.55);
-  color: #ffd6d6;
-}
-
-#minibia-bot-panel .mb-collapsed-stop-button:hover {
-  background: linear-gradient(180deg, #963b3b, #642727);
-}
-
-#minibia-bot-panel[data-collapsed="false"] .mb-collapsed-stop-button {
-  display: none;
-}
-
-@media (max-width: 760px) {
-  #minibia-bot-panel {
-    width: min(560px, calc(100vw - 32px));
-  }
-
-  #minibia-bot-panel .mb-body {
-    grid-template-columns: 1fr;
-  }
-
-  #minibia-bot-panel .mb-tab-menu {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-  }
-
-  #minibia-bot-panel .mb-tab-button {
-    text-align: center;
-  }
-
-  #minibia-bot-panel .mb-form-grid,
-  #minibia-bot-panel .mb-button-grid,
-  #minibia-bot-panel .mb-utility-row {
-    grid-template-columns: 1fr;
-  }
-
-  #minibia-bot-panel .mb-mini-field {
-    width: 100%;
-  }
-}
-
-
+      #minibia-bot-panel {
+        position: fixed; z-index: 999999; top: 16px; right: 16px;
+        width: 500px; max-width: calc(100vw - 32px); padding: 8px;
+        border: 1px solid rgba(224,200,148,0.45); border-radius: 10px;
+        background: rgba(18,13,8,0.96); box-shadow: 0 8px 24px rgba(0,0,0,0.45);
+        color: #f8e6b8; font: 12px/1.35 Verdana, sans-serif; user-select: none;
+      }
+      #minibia-bot-panel .mb-run-indicator { cursor: pointer; transition: background 0.15s, border-color 0.15s; }
+      #minibia-bot-panel .mb-run-indicator:hover { background: rgba(255,255,255,0.08); border-color: rgba(224,200,148,0.6); }
+      #minibia-bot-panel[data-collapsed="true"] { width: 240px; }
+      #minibia-bot-panel .mb-titlebar {
+        display: grid; grid-template-columns: auto minmax(0,1fr) auto;
+        align-items: center; gap: 8px; margin: 0 0 8px;
+      }
+      #minibia-bot-panel[data-collapsed="true"] .mb-titlebar { margin-bottom: 0; }
+      #minibia-bot-panel .mb-title-status {
+        display: flex; align-items: center; justify-content: flex-end; gap: 6px; min-width: 0;
+      }
+      #minibia-bot-panel .mb-run-indicator {
+        display: inline-flex; align-items: center; gap: 4px;
+        padding: 2px 6px; border: 1px solid rgba(224,200,148,0.22);
+        border-radius: 999px; background: rgba(8,7,6,0.55);
+        color: #b7a67d; font-size: 10px; line-height: 1.2; white-space: nowrap;
+      }
+      #minibia-bot-panel .mb-run-dot {
+        width: 7px; height: 7px; border-radius: 50%; background: #5b5547;
+        box-shadow: 0 0 0 1px rgba(0,0,0,0.45);
+      }
+      #minibia-bot-panel .mb-run-indicator[data-running="true"] {
+        color: #d7ffd7; border-color: rgba(90,220,120,0.42);
+        background: rgba(20,70,28,0.35);
+      }
+      #minibia-bot-panel .mb-run-indicator[data-running="true"] .mb-run-dot {
+        background: #39e86f;
+        box-shadow: 0 0 0 1px rgba(0,0,0,0.45), 0 0 7px rgba(57,232,111,0.8);
+      }
+      #minibia-bot-panel .mb-title-actions { display: flex; gap: 6px; align-items: center; }
+      #minibia-bot-panel .mb-title { margin: 0; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; cursor: move; color: #ffe7ad; }
+      #minibia-bot-panel .mb-icon-button { width: 24px; min-width: 24px; padding: 2px 0; border-radius: 6px; font-weight: 700; line-height: 1; }
+      #minibia-bot-panel .mb-body { display: grid; grid-template-columns: 112px minmax(0,1fr); gap: 10px; align-items: start; }
+      #minibia-bot-panel .mb-body[hidden] { display: none !important; }
+      #minibia-bot-panel .mb-tab-menu { display: grid; gap: 6px; }
+      #minibia-bot-panel .mb-tab-button {
+        width: 100%; padding: 8px 9px; border-radius: 7px; text-align: left;
+        font-size: 11px; line-height: 1.15; background: rgba(255,244,212,0.07);
+      }
+      #minibia-bot-panel .mb-tab-button[data-active="true"] {
+        background: linear-gradient(180deg,#8a7044,#554329);
+        border-color: rgba(224,200,148,0.75); color: #fff3cf;
+      }
+      #minibia-bot-panel .mb-tab-content {
+        min-width: 0; max-height: min(72vh,560px); overflow-y: auto; padding-right: 4px;
+      }
+      #minibia-bot-panel .mb-tab-panel { display: none; }
+      #minibia-bot-panel .mb-tab-panel[data-active="true"] { display: grid; gap: 10px; }
+      #minibia-bot-panel .mb-section {
+        padding: 12px; border: 1px solid rgba(224,200,148,0.18);
+        border-radius: 8px; background: rgba(8,7,6,0.86);
+      }
+      #minibia-bot-panel .mb-label { margin: 0 0 10px; color: #ffe5a8; font-weight: 700; font-size: 13px; }
+      #minibia-bot-panel .mb-stack { display: grid; gap: 10px; }
+      #minibia-bot-panel .mb-form-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 10px; }
+      #minibia-bot-panel .mb-button-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 8px; }
+      #minibia-bot-panel .mb-utility-row { display: grid; grid-template-columns: minmax(0,1fr) 86px; gap: 10px; align-items: end; }
+      #minibia-bot-panel .mb-field { display: grid; gap: 4px; min-width: 0; }
+      #minibia-bot-panel .mb-mini-field { width: 86px; }
+      #minibia-bot-panel .mb-field-label { color: #e9d39b; font-size: 11px; line-height: 1.2; }
+      #minibia-bot-panel input, #minibia-bot-panel textarea, #minibia-bot-panel select {
+        width: 100%; box-sizing: border-box; padding: 8px 10px;
+        border: 1px solid rgba(224,200,148,0.48); border-radius: 8px;
+        background: #080706; color: #fff2c7; font: inherit;
+        box-shadow: inset 0 1px 2px rgba(0,0,0,0.65); caret-color: #fff2c7;
+      }
+      #minibia-bot-panel input::placeholder, #minibia-bot-panel textarea::placeholder {
+        color: rgba(255,226,176,0.48);
+      }
+      #minibia-bot-panel input:focus, #minibia-bot-panel textarea:focus, #minibia-bot-panel select:focus {
+        outline: none; border-color: rgba(255,220,140,0.9);
+        box-shadow: inset 0 1px 2px rgba(0,0,0,0.65), 0 0 0 2px rgba(255,200,90,0.18);
+      }
+      #minibia-bot-panel textarea { min-height: 90px; resize: vertical; }
+      #minibia-bot-panel .mb-toggle { display: flex; align-items: center; gap: 8px; color: #f3dfad; white-space: normal; }
+      #minibia-bot-panel .mb-toggle-main { margin-bottom: 2px; }
+      #minibia-bot-panel input[type="checkbox"] { width: 14px; height: 14px; margin: 0; accent-color: #18c99a; }
+      #minibia-bot-panel button {
+        width: 100%; padding: 8px 10px;
+        border: 1px solid rgba(224,200,148,0.35); border-radius: 8px;
+        background: linear-gradient(180deg,#635133,#3f321f); color: #fff0ca; font: inherit; cursor: pointer;
+      }
+      #minibia-bot-panel button:hover { background: linear-gradient(180deg,#755f3d,#4f4028); }
+      #minibia-bot-panel .mb-small-button { width: auto; padding: 6px 8px; border-radius: 6px; }
+      #minibia-bot-panel .mb-inline { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 8px; align-items: center; }
+      #minibia-bot-panel .mb-list { display: grid; gap: 6px; }
+      #minibia-bot-panel .mb-list-row { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 6px; align-items: center; color: #d3c49d; }
+      #minibia-bot-panel .mb-creature-row { padding: 6px 8px; border: 1px solid rgba(224,200,148,0.14); border-radius: 8px; background: rgba(255,244,212,0.04); }
+      #minibia-bot-panel .mb-creature-name { color: #f7eccf; word-break: break-word; }
+      #minibia-bot-panel .mb-floor-label { margin-top: 4px; color: #e2cf9c; font-size: 11px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; }
+      #minibia-bot-panel #minibia-bot-visible-creatures-list,
+      #minibia-bot-panel #minibia-bot-panic-trusted-list,
+      #minibia-bot-panel #minibia-bot-panic-gm-list {
+        max-height: 150px; overflow-y: auto; padding-right: 2px;
+      }
+      #minibia-bot-panel .mb-small-note, #minibia-bot-panel .mb-note { color: #cdbb8b; font-size: 11px; line-height: 1.35; }
+      #minibia-bot-panel .mb-collapsed-stop-button {
+        background: linear-gradient(180deg,#7a2f2f,#4e1f1f);
+        border-color: rgba(255,120,120,0.55); color: #ffd6d6;
+      }
+      #minibia-bot-panel .mb-collapsed-stop-button:hover { background: linear-gradient(180deg,#963b3b,#642727); }
+      #minibia-bot-panel[data-collapsed="false"] .mb-collapsed-stop-button { display: none; }
+      @media (max-width:760px) {
+        #minibia-bot-panel { width: min(560px,calc(100vw - 32px)); }
+        #minibia-bot-panel .mb-body { grid-template-columns: 1fr; }
+        #minibia-bot-panel .mb-tab-menu { grid-template-columns: repeat(3,minmax(0,1fr)); }
+        #minibia-bot-panel .mb-tab-button { text-align: center; }
+        #minibia-bot-panel .mb-form-grid,
+        #minibia-bot-panel .mb-button-grid,
+        #minibia-bot-panel .mb-utility-row { grid-template-columns: 1fr; }
+        #minibia-bot-panel .mb-mini-field { width: 100%; }
+      }
     `;
     document.head.appendChild(style);
 
+    // ---- PANEL HTML ----
     const panel = document.createElement("div");
     panel.id = "minibia-bot-panel";
-panel.innerHTML = `
+    panel.innerHTML = `
 <div class="mb-titlebar">
   <div class="mb-title">MBot</div>
-
   <div class="mb-title-status">
     <span class="mb-run-indicator" id="minibia-bot-title-cave-status" data-running="false">
       <span class="mb-run-dot"></span>
       <span class="mb-run-label">Cave</span>
     </span>
-
     <span class="mb-run-indicator" id="minibia-bot-title-attack-status" data-running="false">
       <span class="mb-run-dot"></span>
       <span class="mb-run-label">Target</span>
     </span>
   </div>
-
   <div class="mb-title-actions">
     <button type="button" class="mb-icon-button mb-collapsed-stop-button" id="minibia-bot-collapsed-stop" title="Stop Cave + Attack" aria-label="Stop Cave and Attack">■</button>
     <button type="button" class="mb-icon-button" id="minibia-bot-collapse" aria-label="Minimize panel" title="Minimize">−</button>
   </div>
 </div>
 
-  <div class="mb-body">
-    <div class="mb-tab-menu">
-      <button type="button" class="mb-tab-button" data-tab-button="healing">Healing</button>
-      <button type="button" class="mb-tab-button" data-tab-button="panic">Panic</button>
-      <button type="button" class="mb-tab-button" data-tab-button="xray">Xray</button>
-      <button type="button" class="mb-tab-button" data-tab-button="utility">Utility</button>
-      <button type="button" class="mb-tab-button" data-tab-button="cave">Cavebot</button>
-      <button type="button" class="mb-tab-button" data-tab-button="targeting">Targeting</button>
-      <button type="button" class="mb-tab-button" data-tab-button="talk">Talk</button>
-    </div>
-
-    <div class="mb-tab-content">
-
-<!-- HEALING TAB -->
-<div class="mb-tab-panel" data-tab-panel="healing">
-  <div class="mb-section">
-    <div class="mb-label">Auto Heal</div>
-
-    <label class="mb-toggle mb-toggle-main">
-      <input type="checkbox" id="minibia-bot-auto-heal-enabled" />
-      <span>Enable Auto Heal</span>
-    </label>
-
-    <div id="minibia-bot-heal-rules-list" class="mb-list" style="margin:8px 0;"></div>
-
-    <div class="mb-section" style="padding:10px;background:rgba(255,255,255,0.03);">
-      <div class="mb-label" style="font-size:12px;margin-bottom:6px;">Add / Edit Rule</div>
-
-      <!-- Row 1: Slot, Spell Words, Mana Cost -->
-      <div style="display:grid;grid-template-columns:80px 1fr 80px;gap:6px;margin-bottom:6px;">
-        <label class="mb-field" for="minibia-bot-heal-slot">
-          <span class="mb-field-label">Slot</span>
-          <input type="number" id="minibia-bot-heal-slot" min="1" max="12" value="1" />
-        </label>
-        <label class="mb-field" for="minibia-bot-heal-spell">
-          <span class="mb-field-label">Spell Words (optional)</span>
-          <input type="text" id="minibia-bot-heal-spell" placeholder="ex: exura" />
-        </label>
-        <label class="mb-field" for="minibia-bot-heal-manacost">
-          <span class="mb-field-label">Mana Cost</span>
-          <input type="number" id="minibia-bot-heal-manacost" min="1" value="0" placeholder="0" />
-        </label>
-      </div>
-
-      <!-- Row 2: HP min/max, MP min/max -->
-      <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:6px;margin-bottom:6px;">
-        <label class="mb-field" for="minibia-bot-heal-minhp">
-          <span class="mb-field-label">Min HP %</span>
-          <input type="number" id="minibia-bot-heal-minhp" min="0" max="100" value="0" />
-        </label>
-        <label class="mb-field" for="minibia-bot-heal-maxhp">
-          <span class="mb-field-label">Max HP %</span>
-          <input type="number" id="minibia-bot-heal-maxhp" min="0" max="100" value="100" />
-        </label>
-        <label class="mb-field" for="minibia-bot-heal-minmana">
-          <span class="mb-field-label">Min MP %</span>
-          <input type="number" id="minibia-bot-heal-minmana" min="0" max="100" value="0" />
-        </label>
-        <label class="mb-field" for="minibia-bot-heal-maxmana">
-          <span class="mb-field-label">Max MP %</span>
-          <input type="number" id="minibia-bot-heal-maxmana" min="0" max="100" value="100" />
-        </label>
-      </div>
-
-      <div style="display:flex;gap:6px;">
-        <button type="button" id="minibia-bot-heal-save" style="flex:1;">Add Rule</button>
-        <button type="button" id="minibia-bot-heal-cancel" style="flex:0;width:auto;padding:8px 12px;">Cancel</button>
-      </div>
-    </div>
-
-    <div class="mb-small-note" style="margin-top:6px;">
-      Rules are checked in order. First rule whose HP and MP ranges match will trigger.
-      If spell words are given, mana cost must be set (and current mana must be ≥ that).
-    </div>
+<div class="mb-body">
+  <div class="mb-tab-menu">
+    <button type="button" class="mb-tab-button" data-tab-button="healing">Healing</button>
+    <button type="button" class="mb-tab-button" data-tab-button="panic">Panic</button>
+    <button type="button" class="mb-tab-button" data-tab-button="xray">Xray</button>
+    <button type="button" class="mb-tab-button" data-tab-button="utility">Utility</button>
+    <button type="button" class="mb-tab-button" data-tab-button="cave">Cavebot</button>
+    <button type="button" class="mb-tab-button" data-tab-button="targeting">Targeting</button>
+    <button type="button" class="mb-tab-button" data-tab-button="talk">Talk</button>
   </div>
-</div>
 
-      <div class="mb-tab-panel" data-tab-panel="panic">
-        <div class="mb-section">
-          <div class="mb-label" id="minibia-bot-home">Panic Runner Home: not set</div>
-
-          <div class="mb-stack">
-            <button type="button" id="minibia-bot-set-home">Set Home</button>
-
-            <label class="mb-toggle">
-              <input type="checkbox" id="minibia-bot-panic-unknown" />
-              <span>Unknown Player</span>
+  <div class="mb-tab-content">
+    <!-- Healing Tab -->
+    <div class="mb-tab-panel" data-tab-panel="healing">
+      <div class="mb-section">
+        <div class="mb-label">Auto Heal</div>
+        <label class="mb-toggle mb-toggle-main">
+          <input type="checkbox" id="minibia-bot-auto-heal-enabled" />
+          <span>Enable Auto Heal</span>
+        </label>
+        <div id="minibia-bot-heal-rules-list" class="mb-list" style="margin:8px 0;"></div>
+        <div class="mb-section" style="padding:10px;background:rgba(255,255,255,0.03);">
+          <div class="mb-label" style="font-size:12px;margin-bottom:6px;">Add / Edit Rule</div>
+          <div style="display:grid;grid-template-columns:80px 1fr 80px;gap:6px;margin-bottom:6px;">
+            <label class="mb-field" for="minibia-bot-heal-slot">
+              <span class="mb-field-label">Slot</span>
+              <input type="number" id="minibia-bot-heal-slot" min="1" max="12" value="1" />
             </label>
-
-            <label class="mb-toggle">
-              <input type="checkbox" id="minibia-bot-panic-health" />
-              <span>Lose Health</span>
+            <label class="mb-field" for="minibia-bot-heal-spell">
+              <span class="mb-field-label">Spell Words (optional)</span>
+              <input type="text" id="minibia-bot-heal-spell" placeholder="ex: exura" />
             </label>
-
-            <label class="mb-toggle">
-              <input type="checkbox" id="minibia-bot-panic-return" />
-              <span>Auto Return</span>
-            </label>
-
-            <div class="mb-inline">
-              <input type="text" id="minibia-bot-panic-trusted-input" placeholder="Trusted name" />
-              <button type="button" class="mb-small-button" id="minibia-bot-panic-trusted-add">Add</button>
-            </div>
-
-            <div class="mb-list" id="minibia-bot-panic-trusted-list"></div>
-          </div>
-        </div>
-
-        <div class="mb-section">
-          <div class="mb-label">GM Kill Switch</div>
-
-          <div class="mb-stack">
-            <div class="mb-inline">
-              <input type="text" id="minibia-bot-panic-gm-input" placeholder="Game master name" />
-              <button type="button" class="mb-small-button" id="minibia-bot-panic-gm-add">Add</button>
-            </div>
-
-            <div class="mb-list" id="minibia-bot-panic-gm-list"></div>
-          </div>
-        </div>
-      </div>
-
-      <div class="mb-tab-panel" data-tab-panel="xray">
-        <div class="mb-section">
-          <div class="mb-label">Xray</div>
-
-          <div class="mb-stack">
-            <button type="button" class="mb-small-button" id="minibia-bot-xray-overlay-toggle">Disable Overlay</button>
-            <div class="mb-small-note" id="minibia-bot-xray-overlay-status">Overlay: on</div>
-
-            <label class="mb-field" for="minibia-bot-xray-floor-select">
-              <span class="mb-field-label">Floor Filter</span>
-              <select id="minibia-bot-xray-floor-select">
-                <option value="all">All floors</option>
-              </select>
-            </label>
-
-            <div class="mb-list" id="minibia-bot-visible-creatures-list"></div>
-          </div>
-        </div>
-      </div>
-
-      <div class="mb-tab-panel" data-tab-panel="utility">
-        <div class="mb-section">
-          <div class="mb-label">Bot</div>
-          <button type="button" id="minibia-bot-reload">Reload Bot</button>
-        </div>
-
-        <div class="mb-section">
-          <div class="mb-label">Magic Level Trainer</div>
-
-          <label class="mb-toggle mb-toggle-main">
-            <input type="checkbox" id="minibia-bot-rune-enabled" />
-            <span>Enable Trainer</span>
-          </label>
-
-          <div class="mb-form-grid">
-            <label class="mb-field" for="minibia-bot-rune-spell">
-              <span class="mb-field-label">Spell Words</span>
-              <input type="text" id="minibia-bot-rune-spell" placeholder="Spell words" />
-            </label>
-
-            <label class="mb-field" for="minibia-bot-rune-mana">
+            <label class="mb-field" for="minibia-bot-heal-manacost">
               <span class="mb-field-label">Mana Cost</span>
-              <input type="number" id="minibia-bot-rune-mana" min="0" placeholder="Mana" />
+              <input type="number" id="minibia-bot-heal-manacost" min="1" value="0" placeholder="0" />
             </label>
           </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:6px;margin-bottom:6px;">
+            <label class="mb-field" for="minibia-bot-heal-minhp">
+              <span class="mb-field-label">Min HP %</span>
+              <input type="number" id="minibia-bot-heal-minhp" min="0" max="100" value="0" />
+            </label>
+            <label class="mb-field" for="minibia-bot-heal-maxhp">
+              <span class="mb-field-label">Max HP %</span>
+              <input type="number" id="minibia-bot-heal-maxhp" min="0" max="100" value="100" />
+            </label>
+            <label class="mb-field" for="minibia-bot-heal-minmana">
+              <span class="mb-field-label">Min MP %</span>
+              <input type="number" id="minibia-bot-heal-minmana" min="0" max="100" value="0" />
+            </label>
+            <label class="mb-field" for="minibia-bot-heal-maxmana">
+              <span class="mb-field-label">Max MP %</span>
+              <input type="number" id="minibia-bot-heal-maxmana" min="0" max="100" value="100" />
+            </label>
+          </div>
+          <div style="display:flex;gap:6px;">
+            <button type="button" id="minibia-bot-heal-save" style="flex:1;">Add Rule</button>
+            <button type="button" id="minibia-bot-heal-cancel" style="flex:0;width:auto;padding:8px 12px;">Cancel</button>
+          </div>
         </div>
+        <div class="mb-small-note" style="margin-top:6px;">
+          Rules are checked in order. First rule whose HP and MP ranges match will trigger.
+          If spell words are given, mana cost must be set (and current mana must be ≥ that).
+        </div>
+      </div>
+    </div>
 
-        <div class="mb-section">
-          <div class="mb-label">Utility Modules</div>
+    <!-- Panic Tab -->
+    <div class="mb-tab-panel" data-tab-panel="panic">
+      <div class="mb-section">
+        <div class="mb-label" id="minibia-bot-home">Panic Runner Home: not set</div>
+        <div class="mb-stack">
+          <button type="button" id="minibia-bot-set-home">Set Home</button>
+          <label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-unknown" /><span>Unknown Player</span></label>
+          <label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-health" /><span>Lose Health</span></label>
+          <label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-return" /><span>Auto Return</span></label>
+          <label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-player-alert" /><span>Player On‑Screen Alert (sound only)</span></label>
+          <div style="display:flex;gap:6px;align-items:center;">
+            <label style="font-size:11px;color:#e9d39b;">Cooldown (seconds)</label>
+            <input type="number" id="minibia-bot-panic-player-cooldown" min="10" value="60" style="width:60px;padding:2px 4px;font-size:11px;" />
+          </div>
+          <div class="mb-inline">
+            <input type="text" id="minibia-bot-panic-trusted-input" placeholder="Trusted name" />
+            <button type="button" class="mb-small-button" id="minibia-bot-panic-trusted-add">Add</button>
+          </div>
+          <div class="mb-list" id="minibia-bot-panic-trusted-list"></div>
+        </div>
+      </div>
+      <div class="mb-section">
+        <div class="mb-label">GM Kill Switch</div>
+        <div class="mb-stack">
+          <div class="mb-inline">
+            <input type="text" id="minibia-bot-panic-gm-input" placeholder="Game master name" />
+            <button type="button" class="mb-small-button" id="minibia-bot-panic-gm-add">Add</button>
+          </div>
+          <div class="mb-list" id="minibia-bot-panic-gm-list"></div>
+        </div>
+      </div>
+    </div>
 
-          <div class="mb-stack">
-            <div class="mb-utility-row">
-              <label class="mb-toggle">
-                <input type="checkbox" id="minibia-bot-auto-eat-enabled" />
-                <span>Auto Eat</span>
-              </label>
+    <!-- Xray Tab -->
+    <div class="mb-tab-panel" data-tab-panel="xray">
+      <div class="mb-section">
+        <div class="mb-label">Xray</div>
+        <div class="mb-stack">
+          <button type="button" class="mb-small-button" id="minibia-bot-xray-overlay-toggle">Disable Overlay</button>
+          <div class="mb-small-note" id="minibia-bot-xray-overlay-status">Overlay: on</div>
+          <label class="mb-field" for="minibia-bot-xray-floor-select">
+            <span class="mb-field-label">Floor Filter</span>
+            <select id="minibia-bot-xray-floor-select"><option value="all">All floors</option></select>
+          </label>
+          <div class="mb-list" id="minibia-bot-visible-creatures-list"></div>
+        </div>
+      </div>
+    </div>
 
-              <label class="mb-field mb-mini-field" for="minibia-bot-auto-eat-hotkey">
-                <span class="mb-field-label">Hotkey</span>
-                <input type="number" id="minibia-bot-auto-eat-hotkey" min="1" max="12" placeholder="10" />
-              </label>
+    <!-- Utility Tab -->
+    <div class="mb-tab-panel" data-tab-panel="utility">
+      <div class="mb-section">
+        <div class="mb-label">Bot</div>
+        <button type="button" id="minibia-bot-reload">Reload Bot</button>
+      </div>
+      <div class="mb-section">
+        <div class="mb-label">Magic Level Trainer</div>
+        <label class="mb-toggle mb-toggle-main"><input type="checkbox" id="minibia-bot-rune-enabled" /><span>Enable Trainer</span></label>
+        <div class="mb-form-grid">
+          <label class="mb-field" for="minibia-bot-rune-spell"><span class="mb-field-label">Spell Words</span><input type="text" id="minibia-bot-rune-spell" placeholder="Spell words" /></label>
+          <label class="mb-field" for="minibia-bot-rune-mana"><span class="mb-field-label">Mana Cost</span><input type="number" id="minibia-bot-rune-mana" min="0" placeholder="Mana" /></label>
+        </div>
+      </div>
+      <div class="mb-section">
+        <div class="mb-label">Utility Modules</div>
+        <div class="mb-stack">
+          <div class="mb-utility-row">
+            <label class="mb-toggle"><input type="checkbox" id="minibia-bot-auto-eat-enabled" /><span>Auto Eat</span></label>
+            <label class="mb-field mb-mini-field" for="minibia-bot-auto-eat-hotkey"><span class="mb-field-label">Hotkey</span><input type="number" id="minibia-bot-auto-eat-hotkey" min="1" max="12" placeholder="10" /></label>
+          </div>
+          <label class="mb-toggle"><input type="checkbox" id="minibia-bot-auto-invisible-enabled" /><span>Auto Invisible</span></label>
+          <label class="mb-toggle"><input type="checkbox" id="minibia-bot-auto-magic-shield-enabled" /><span>Auto Utamo Vita</span></label>
+          <label class="mb-toggle"><input type="checkbox" id="minibia-bot-equip-ring-enabled" /><span>Equip Ring</span></label>
+        </div>
+      </div>
+    </div>
+
+    <!-- Cave Tab -->
+    <div class="mb-tab-panel" data-tab-panel="cave">
+      <div class="mb-section">
+        <div style="display:flex;justify-content:space-between;align-items:center;">
+          <div class="mb-label" style="margin:0;">Cave Bot</div>
+          <div style="display:flex;gap:12px;align-items:center;">
+            <label class="mb-toggle" style="margin:0;font-size:11px;"><input type="checkbox" id="minibia-bot-cave-loop" /><span>Loop</span></label>
+            <label class="mb-toggle" style="margin:0;font-size:11px;"><input type="checkbox" id="minibia-bot-cave-toggle" /><span>Enable</span></label>
+          </div>
+        </div>
+        <div style="display:flex;gap:6px;align-items:center;margin:6px 0;">
+          <select id="minibia-bot-cave-preset-select" style="flex:1;padding:4px 6px;font-size:11px;"></select>
+          <button type="button" class="mb-small-button" id="minibia-bot-cave-preset-new" style="padding:2px 8px;font-size:10px;">New</button>
+          <button type="button" class="mb-small-button" id="minibia-bot-cave-preset-delete" style="padding:2px 8px;font-size:10px;">Del</button>
+        </div>
+        <div style="display:flex;gap:6px;align-items:center;margin:4px 0;">
+          <label style="font-size:11px;color:#e9d39b;">Skip if within</label>
+          <input type="number" id="minibia-bot-cave-tolerance" min="0" max="5" step="1" value="0" style="width:50px;padding:2px 4px;font-size:11px;" />
+          <span style="font-size:11px;color:#cdbb8b;">tiles</span>
+        </div>
+        <div style="margin:6px 0;">
+          <div class="mb-label" style="font-size:11px;margin:0 0 4px;">Waypoints</div>
+          <div id="minibia-bot-cave-waypoint-list" style="max-height:120px;overflow-y:auto;border:1px solid rgba(224,200,148,0.2);border-radius:4px;padding:2px;font-size:11px;"></div>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:4px;margin:4px 0;">
+          <button type="button" class="mb-small-button" id="minibia-bot-cave-add" style="padding:4px;">+ Add</button>
+          <button type="button" class="mb-small-button" id="minibia-bot-cave-move-up" style="padding:4px;">▲</button>
+          <button type="button" class="mb-small-button" id="minibia-bot-cave-move-down" style="padding:4px;">▼</button>
+          <button type="button" class="mb-small-button" id="minibia-bot-cave-delete-selected" style="padding:4px;background:#5a2020;border-color:#883030;">✕</button>
+        </div>
+        <div style="font-size:10px;color:#cdbb8b;margin-top:4px;display:grid;gap:2px;">
+          <div id="minibia-bot-cave-status">Status: no waypoints</div>
+          <div id="minibia-bot-cave-closest">Closest start: none</div>
+          <div id="minibia-bot-cave-transition-status">Transitions learned: none</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Targeting Tab -->
+    <div class="mb-tab-panel" data-tab-panel="targeting">
+      <div class="mb-section">
+        <div class="mb-label">Auto Attack</div>
+        <div class="mb-stack">
+          <label class="mb-toggle mb-toggle-main"><input type="checkbox" id="minibia-bot-auto-attack-enabled" /><span>Enable Auto Attack</span></label>
+          <label class="mb-toggle"><input type="checkbox" id="minibia-bot-auto-attack-melee" /><span>Melee Mode</span></label>
+          <div class="mb-form-grid">
+            <label class="mb-field" for="minibia-bot-auto-attack-hotkey"><span class="mb-field-label">Target Hotkey</span><input type="number" id="minibia-bot-auto-attack-hotkey" min="1" max="12" placeholder="3" /></label>
+            <label class="mb-field" for="minibia-bot-auto-attack-rune-hotkey"><span class="mb-field-label">Rune Hotkey</span><input type="number" id="minibia-bot-auto-attack-rune-hotkey" min="1" max="12" placeholder="4" /></label>
+          </div>
+          <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:12px; align-items:end;">
+            <label class="mb-field" for="minibia-bot-auto-attack-maxdist"><span class="mb-field-label">Max Target Distance</span><input type="number" id="minibia-bot-auto-attack-maxdist" min="1" max="10" value="5" /></label>
+            <div style="display:flex; align-items:center;"><label class="mb-toggle" style="margin:0;"><input type="checkbox" id="minibia-bot-auto-attack-antiks" /><span>Anti-KS</span></label></div>
+            <div style="display:flex; gap:8px; align-items:center; justify-content:flex-end;">
+              <label class="mb-field" style="flex:1; min-width:0;"><span class="mb-field-label">Self Range</span><input type="number" id="minibia-bot-auto-attack-antiks-self" min="1" max="5" value="2" /></label>
+              <label class="mb-field" style="flex:1; min-width:0;"><span class="mb-field-label">Other Range</span><input type="number" id="minibia-bot-auto-attack-antiks-other" min="1" max="5" value="2" /></label>
             </div>
-
-            <label class="mb-toggle">
-              <input type="checkbox" id="minibia-bot-auto-invisible-enabled" />
-              <span>Auto Invisible</span>
-            </label>
-
-            <label class="mb-toggle">
-              <input type="checkbox" id="minibia-bot-auto-magic-shield-enabled" />
-              <span>Auto Utamo Vita</span>
-            </label>
-
-            <label class="mb-toggle">
-              <input type="checkbox" id="minibia-bot-equip-ring-enabled" />
-              <span>Equip Ring</span>
-            </label>
+          </div>
+          <div class="mb-section" style="margin-top:8px;">
+            <div class="mb-label">Target Priority</div>
+            <div class="mb-stack">
+              <label class="mb-field" for="minibia-bot-auto-attack-preferred-names"><span class="mb-field-label">Preferred Mobs</span><textarea id="minibia-bot-auto-attack-preferred-names" placeholder="Orc Shaman, Amazon, Orc Spearman"></textarea></label>
+              <label class="mb-field" for="minibia-bot-auto-attack-preferred-match-mode"><span class="mb-field-label">Match Mode</span><select id="minibia-bot-auto-attack-preferred-match-mode"><option value="exact">Exact name</option><option value="includes">Contains text</option></select></label>
+              <button type="button" class="mb-small-button" id="minibia-bot-auto-attack-preferred-save">Save Target Priority</button>
+              <div class="mb-small-note" id="minibia-bot-auto-attack-preferred-status">Preferred mobs: none</div>
+              <div class="mb-small-note">Preferred mobs are ranked first, but other visible mobs are still allowed.</div>
+            </div>
           </div>
         </div>
       </div>
-
-<div class="mb-tab-panel" data-tab-panel="cave">
-  <div class="mb-section">
-	<div style="display:flex;justify-content:space-between;align-items:center;">
-	  <div class="mb-label" style="margin:0;">Cave Bot</div>
-	  <div style="display:flex;gap:12px;align-items:center;">
-		<label class="mb-toggle" style="margin:0;font-size:11px;">
-		  <input type="checkbox" id="minibia-bot-cave-loop" />
-		  <span>Loop</span>
-		</label>
-		<label class="mb-toggle" style="margin:0;font-size:11px;">
-		  <input type="checkbox" id="minibia-bot-cave-toggle" />
-		  <span>Enable</span>
-		</label>
-	  </div>
-	</div>
-
-    <!-- Preset row -->
-    <div style="display:flex;gap:6px;align-items:center;margin:6px 0;">
-      <select id="minibia-bot-cave-preset-select" style="flex:1;padding:4px 6px;font-size:11px;"></select>
-      <button type="button" class="mb-small-button" id="minibia-bot-cave-preset-new" style="padding:2px 8px;font-size:10px;">New</button>
-      <button type="button" class="mb-small-button" id="minibia-bot-cave-preset-delete" style="padding:2px 8px;font-size:10px;">Del</button>
     </div>
 
-    <!-- Tolerance -->
-    <div style="display:flex;gap:6px;align-items:center;margin:4px 0;">
-      <label style="font-size:11px;color:#e9d39b;">Skip if within</label>
-      <input type="number" id="minibia-bot-cave-tolerance" min="0" max="5" step="1" value="0" style="width:50px;padding:2px 4px;font-size:11px;" />
-      <span style="font-size:11px;color:#cdbb8b;">tiles</span>
-    </div>
-
-    <!-- Waypoint list -->
-    <div style="margin:6px 0;">
-      <div class="mb-label" style="font-size:11px;margin:0 0 4px;">Waypoints</div>
-      <div id="minibia-bot-cave-waypoint-list" style="max-height:120px;overflow-y:auto;border:1px solid rgba(224,200,148,0.2);border-radius:4px;padding:2px;font-size:11px;"></div>
-    </div>
-
-    <!-- Action buttons -->
-    <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:4px;margin:4px 0;">
-      <button type="button" class="mb-small-button" id="minibia-bot-cave-add" style="padding:4px;">+ Add</button>
-      <button type="button" class="mb-small-button" id="minibia-bot-cave-move-up" style="padding:4px;">▲</button>
-      <button type="button" class="mb-small-button" id="minibia-bot-cave-move-down" style="padding:4px;">▼</button>
-      <button type="button" class="mb-small-button" id="minibia-bot-cave-delete-selected" style="padding:4px;background:#5a2020;border-color:#883030;">✕</button>
-    </div>
-
-    <!-- Info lines -->
-    <div style="font-size:10px;color:#cdbb8b;margin-top:4px;display:grid;gap:2px;">
-      <div id="minibia-bot-cave-status">Status: no waypoints</div>
-      <div id="minibia-bot-cave-closest">Closest start: none</div>
-      <div id="minibia-bot-cave-transition-status">Transitions learned: none</div>
+    <!-- Talk Tab -->
+    <div class="mb-tab-panel" data-tab-panel="talk">
+      <div class="mb-section">
+        <div class="mb-label">Talk</div>
+        <div class="mb-stack">
+          <label class="mb-toggle mb-toggle-main"><input type="checkbox" id="minibia-bot-talk-enabled" /><span>Enable Auto Reply</span></label>
+          <label class="mb-field" for="minibia-bot-talk-api-key"><span class="mb-field-label">Gemini API Key</span><input type="password" id="minibia-bot-talk-api-key" placeholder="Gemini API key" /></label>
+          <label class="mb-field" for="minibia-bot-talk-prompt"><span class="mb-field-label">Reply Style Prompt</span><textarea id="minibia-bot-talk-prompt" placeholder="Reply style prompt"></textarea></label>
+          <label class="mb-field" for="minibia-bot-talk-ignored"><span class="mb-field-label">Ignore messages containing (comma separated)</span><input type="text" id="minibia-bot-talk-ignored" placeholder="munch., yum, burp" /></label>
+          <div class="mb-small-note" id="minibia-bot-talk-status">Status: idle</div>
+          <div class="mb-small-note">Replies only to the newest unseen message in Default chat.</div>
+        </div>
+      </div>
     </div>
   </div>
 </div>
-
-      <div class="mb-tab-panel" data-tab-panel="targeting">
-        <div class="mb-section">
-          <div class="mb-label">Auto Attack</div>
-
-          <div class="mb-stack">
-            <label class="mb-toggle mb-toggle-main">
-              <input type="checkbox" id="minibia-bot-auto-attack-enabled" />
-              <span>Enable Auto Attack</span>
-            </label>
-
-            <label class="mb-toggle">
-              <input type="checkbox" id="minibia-bot-auto-attack-melee" />
-              <span>Melee Mode</span>
-            </label>
-
-            <div class="mb-form-grid">
-              <label class="mb-field" for="minibia-bot-auto-attack-hotkey">
-                <span class="mb-field-label">Target Hotkey</span>
-                <input type="number" id="minibia-bot-auto-attack-hotkey" min="1" max="12" placeholder="3" />
-              </label>
-
-              <label class="mb-field" for="minibia-bot-auto-attack-rune-hotkey">
-                <span class="mb-field-label">Rune Hotkey</span>
-                <input type="number" id="minibia-bot-auto-attack-rune-hotkey" min="1" max="12" placeholder="4" />
-              </label>
-            </div>
-			<div class="mb-section">
-			  <div class="mb-label">Target Priority</div>
-
-			  <div class="mb-stack">
-				<label class="mb-field" for="minibia-bot-auto-attack-preferred-names">
-				  <span class="mb-field-label">Preferred Mobs</span>
-				  <textarea
-					id="minibia-bot-auto-attack-preferred-names"
-					placeholder="Orc Shaman, Amazon, Orc Spearman"
-				  ></textarea>
-				</label>
-
-				<label class="mb-field" for="minibia-bot-auto-attack-preferred-match-mode">
-				  <span class="mb-field-label">Match Mode</span>
-				  <select id="minibia-bot-auto-attack-preferred-match-mode">
-					<option value="exact">Exact name</option>
-					<option value="includes">Contains text</option>
-				  </select>
-				</label>
-
-				<button
-				  type="button"
-				  class="mb-small-button"
-				  id="minibia-bot-auto-attack-preferred-save"
-				>
-				  Save Target Priority
-				</button>
-
-				<div
-				  class="mb-small-note"
-				  id="minibia-bot-auto-attack-preferred-status"
-				>
-				  Preferred mobs: none
-				</div>
-
-				<div class="mb-small-note">
-				  Preferred mobs are ranked first, but other visible mobs are still allowed.
-				</div>
-			  </div>
-			</div>
-
-
-
-            <div class="mb-small-note">
-              Existing attack module settings.
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <div class="mb-tab-panel" data-tab-panel="talk">
-        <div class="mb-section">
-          <div class="mb-label">Talk</div>
-
-          <div class="mb-stack">
-            <label class="mb-toggle mb-toggle-main">
-              <input type="checkbox" id="minibia-bot-talk-enabled" />
-              <span>Enable Auto Reply</span>
-            </label>
-
-            <label class="mb-field" for="minibia-bot-talk-api-key">
-              <span class="mb-field-label">Gemini API Key</span>
-              <input type="password" id="minibia-bot-talk-api-key" placeholder="Gemini API key" />
-            </label>
-
-            <label class="mb-field" for="minibia-bot-talk-prompt">
-              <span class="mb-field-label">Reply Style Prompt</span>
-              <textarea id="minibia-bot-talk-prompt" placeholder="Reply style prompt"></textarea>
-            </label>
-
-            <div class="mb-small-note" id="minibia-bot-talk-status">Status: idle</div>
-            <div class="mb-small-note">Replies only to the newest unseen message in Default chat.</div>
-          </div>
-        </div>
-      </div>
-
-    </div>
-  </div>
 `;
-document.body.appendChild(panel);
+    document.body.appendChild(panel);
 
-function refreshTitlebarRunIndicators() {
-  const caveIndicator = panel.querySelector("#minibia-bot-title-cave-status");
-  const attackIndicator = panel.querySelector("#minibia-bot-title-attack-status");
-
-  let caveRunning = false;
-  let attackRunning = false;
-
-  try {
-    caveRunning = !!bot.cave?.status?.().running;
-  } catch {}
-
-  try {
-    attackRunning = !!bot.attack?.status?.().running;
-  } catch {}
-
-  if (caveIndicator) {
-    caveIndicator.dataset.running = caveRunning ? "true" : "false";
-    caveIndicator.title = caveRunning ? "Cavebot running" : "Cavebot stopped";
-  }
-
-  if (attackIndicator) {
-    attackIndicator.dataset.running = attackRunning ? "true" : "false";
-    attackIndicator.title = attackRunning ? "Targeting running" : "Targeting stopped";
-  }
-}
-  
-
-function setActiveBotTab(tabId) {
-  panel.querySelectorAll(".mb-tab-button").forEach((button) => {
-    button.dataset.active = button.dataset.tabButton === tabId ? "true" : "false";
-  });
-
-  panel.querySelectorAll(".mb-tab-panel").forEach((tabPanel) => {
-    tabPanel.dataset.active = tabPanel.dataset.tabPanel === tabId ? "true" : "false";
-  });
-
-  try {
-    localStorage.setItem("minibia-bot-active-tab", tabId);
-  } catch {}
-}
-
-panel.querySelectorAll(".mb-tab-button").forEach((button) => {
-  button.addEventListener("click", () => {
-    setActiveBotTab(button.dataset.tabButton);
-  });
-});
-
-const savedBotTab = (() => {
-  try {
-    return localStorage.getItem("minibia-bot-active-tab") || "healing";
-  } catch {
-    return "healing";
-  }
-})();
-
-setActiveBotTab(savedBotTab);
-
-function stopCaveAndAttackManual() {
-  try {
-    bot.cave?.stop?.();
-    console.log("[minibia-bot-ui] cave stopped manually from collapsed panel");
-  } catch (error) {
-    console.warn("[minibia-bot-ui] failed to stop cave", error);
-  }
-
-  try {
-    bot.attack?.stop?.();
-    console.log("[minibia-bot-ui] attack stopped manually from collapsed panel");
-  } catch (error) {
-    console.warn("[minibia-bot-ui] failed to stop attack", error);
-  }
-
-  try {
-    refreshCaveStatus?.();
-    refreshAutoAttackStatus?.();
-    refreshTitlebarRunIndicators?.();
-  } catch {}
-}
-
-panel.querySelector("#minibia-bot-collapsed-stop")?.addEventListener("click", (event) => {
-  event.preventDefault();
-  event.stopPropagation();
-  stopCaveAndAttackManual();
-});
-
-
-function formatPreferredTargetNames(names) {
-  if (!Array.isArray(names) || names.length === 0) {
-    return "";
-  }
-
-  return names.join(", ");
-}
-
-function getAttackConfigForUi() {
-  return bot.attack?.status?.().config || bot.attack?.config || {};
-}
-
-
-
-
-function appendSection(targetPanel, section) {
-  if (!targetPanel || !section) {
-    return;
-  }
-
-  targetPanel.appendChild(section);
-}
-
-	
-function getWholeSection(selector) {
-  const element = panel.querySelector(selector);
-  return element ? element.closest(".mb-section, .mb-actions.mb-column-section") : null;
-}
-
-function createPanelTab(id) {
-  const tabPanel = document.createElement("div");
-  tabPanel.className = "mb-tab-panel";
-  tabPanel.dataset.tabPanel = id;
-  return tabPanel;
-}
-
-function updateCollapsedStopButton(panel) {
-  if (!panel) return;
-
-  const stopButton = panel.querySelector("#minibia-bot-collapsed-stop");
-  if (!stopButton) return;
-
-  stopButton.style.display = panel.dataset.collapsed === "true" ? "" : "none";
-}
-
-
-
-function findSection(panel, selector) {
-  const element = panel.querySelector(selector);
-
-  if (!element) {
-    console.warn("[minibia-bot-ui] selector not found:", selector);
-    return null;
-  }
-
-  /*
-   * Prefer full logical section.
-   * This is important for cavebot:
-   * #minibia-bot-cave-preset-select should pull the whole Cave Bot block.
-   */
-  const section =
-    element.closest(".mb-section") ||
-    element.closest(".mb-actions.mb-column-section") ||
-    element.closest(".mb-column-section") ||
-    element.parentElement;
-
-  if (!section) {
-    console.warn("[minibia-bot-ui] section not found for:", selector);
-  }
-
-  return section;
-}
-
-function appendIfFound(target, section) {
-  if (!target || !section) {
-    return;
-  }
-
-  if (section.dataset.movedToTab === "true") {
-    return;
-  }
-
-  section.dataset.movedToTab = "true";
-  target.appendChild(section);
-}
-
-function addEmptyTabNotes(panels) {
-  Object.entries(panels).forEach(([id, panelElement]) => {
-    if (panelElement.children.length > 0) {
-      return;
+    // ---- SETUP UI BEHAVIOR ----
+    // Tab switching
+    function setActiveBotTab(tabId) {
+      panel.querySelectorAll(".mb-tab-button").forEach(btn => btn.dataset.active = btn.dataset.tabButton === tabId ? "true" : "false");
+      panel.querySelectorAll(".mb-tab-panel").forEach(tp => tp.dataset.active = tp.dataset.tabPanel === tabId ? "true" : "false");
+      try { localStorage.setItem("minibia-bot-active-tab", tabId); } catch {}
     }
-
-    const note = document.createElement("div");
-    note.className = "mb-section";
-    note.innerHTML = `
-      <div class="mb-label">${id}</div>
-      <div class="mb-small-note">No controls were found for this tab.</div>
-    `;
-
-    panelElement.appendChild(note);
-  });
-}
-
-function addEmptyTabNotes(panels) {
-  Object.entries(panels).forEach(([id, panelElement]) => {
-    if (panelElement.children.length > 0) return;
-
-    const note = document.createElement("div");
-    note.className = "mb-section";
-    note.innerHTML = `
-      <div class="mb-label">${id}</div>
-      <div class="mb-small-note">No controls available in this tab.</div>
-    `;
-
-    panelElement.appendChild(note);
-  });
-}
-
-function addCollapseSafetyNote(parent) {
-  if (!parent) return;
-
-  const note = document.createElement("div");
-  note.className = "mb-section";
-  note.innerHTML = `
-    <div class="mb-label">Panel Safety</div>
-    <div class="mb-small-note">
-      When this panel is collapsed, Cave Bot and Auto Attack are stopped automatically.
-    </div>
-  `;
-
-  parent.appendChild(note);
-}
-
-    const unlockAudio = () => {
-      bot.unlockAudio?.();
-    };
-
-    panel.addEventListener("pointerdown", unlockAudio, { passive: true });
-    panel.addEventListener("keydown", unlockAudio);
-
-    bot.addCleanup(() => {
-      panel.removeEventListener("pointerdown", unlockAudio);
-      panel.removeEventListener("keydown", unlockAudio);
+    panel.querySelectorAll(".mb-tab-button").forEach(btn => {
+      btn.addEventListener("click", () => setActiveBotTab(btn.dataset.tabButton));
     });
+    const savedTab = (() => { try { return localStorage.getItem("minibia-bot-active-tab") || "healing"; } catch { return "healing"; } })();
+    setActiveBotTab(savedTab);
 
-    applySavedPanelPosition(panel);
-    enableDrag(panel);
-
-	const savedCollapsed = getSavedPanelCollapsed();
-	setPanelCollapsed(panel, savedCollapsed);
-	updateCollapsedStopButton(panel);
-
-	
-
-// selectors
-    const spellInput = panel.querySelector("#minibia-bot-rune-spell");
-    const manaInput = panel.querySelector("#minibia-bot-rune-mana");
-    const runeEnabledInput = panel.querySelector("#minibia-bot-rune-enabled");
-    const autoEatEnabledInput = panel.querySelector("#minibia-bot-auto-eat-enabled");
-    const autoEatHotkeyInput = panel.querySelector("#minibia-bot-auto-eat-hotkey");
-    const autoInvisibleEnabledInput = panel.querySelector("#minibia-bot-auto-invisible-enabled");
-    const autoMagicShieldEnabledInput = panel.querySelector("#minibia-bot-auto-magic-shield-enabled");
-    const equipRingEnabledInput = panel.querySelector("#minibia-bot-equip-ring-enabled");
-    const autoHealEnabledInput = panel.querySelector("#minibia-bot-auto-heal-enabled");
-    const healAddRuleBtn = panel.querySelector("#minibia-bot-heal-add-rule"); // removed, but keep for compatibility
-    const healRulesList = panel.querySelector("#minibia-bot-heal-rules-list");
-    const autoAttackEnabledInput = panel.querySelector("#minibia-bot-auto-attack-enabled");
-    const autoAttackMeleeInput = panel.querySelector("#minibia-bot-auto-attack-melee");
-    const autoAttackHotkeyInput = panel.querySelector("#minibia-bot-auto-attack-hotkey");
-    const autoAttackRuneHotkeyInput = panel.querySelector("#minibia-bot-auto-attack-rune-hotkey");
-    const talkEnabledInput = panel.querySelector("#minibia-bot-talk-enabled");
-    const talkApiKeyInput = panel.querySelector("#minibia-bot-talk-api-key");
-    const talkPromptInput = panel.querySelector("#minibia-bot-talk-prompt");
-    const panicGmNameInput = panel.querySelector("#minibia-bot-panic-gm-input");
-    const panicGmAddButton = panel.querySelector("#minibia-bot-panic-gm-add");
-    const panicUnknownInput = panel.querySelector("#minibia-bot-panic-unknown");
-    const panicHealthInput = panel.querySelector("#minibia-bot-panic-health");
-    const panicReturnInput = panel.querySelector("#minibia-bot-panic-return");
-    const panicTrustedInput = panel.querySelector("#minibia-bot-panic-trusted-input");
-    const panicTrustedAddButton = panel.querySelector("#minibia-bot-panic-trusted-add");
-    const xrayOverlayButton = panel.querySelector("#minibia-bot-xray-overlay-toggle");
-    const xrayFloorSelect = panel.querySelector("#minibia-bot-xray-floor-select");
-    const collapseButton = panel.querySelector("#minibia-bot-collapse");
-    const reloadButton = panel.querySelector("#minibia-bot-reload");
-	const caveAddBtn = panel.querySelector("#minibia-bot-cave-add");
-    const cavePresetSelect = panel.querySelector("#minibia-bot-cave-preset-select");
-    const cavePresetNewButton = panel.querySelector("#minibia-bot-cave-preset-new");
-    const cavePresetDeleteButton = panel.querySelector("#minibia-bot-cave-preset-delete");
-	const preferredSaveButton = panel.querySelector("#minibia-bot-auto-attack-preferred-save");
-	const preferredNamesInput = panel.querySelector("#minibia-bot-auto-attack-preferred-names");
-	const preferredMatchModeSelect = panel.querySelector("#minibia-bot-auto-attack-preferred-match-mode");
-
-    // new heal UI elements
-    const healTypeSelect = panel.querySelector("#minibia-bot-heal-type");
-    const healSlotInput = panel.querySelector("#minibia-bot-heal-slot");
-    const healSpellInput = panel.querySelector("#minibia-bot-heal-spell");
-    const healThresholdInput = panel.querySelector("#minibia-bot-heal-threshold");
-    const healMinManaInput = panel.querySelector("#minibia-bot-heal-minmana");
-    const healSaveButton = panel.querySelector("#minibia-bot-heal-save");
-    const healCancelButton = panel.querySelector("#minibia-bot-heal-cancel");
-
-//event listeners
-
-	if (caveAddBtn) {
-	  caveAddBtn.addEventListener("click", () => {
-		bot.cave.addWaypointCurrentSpot();
-		refreshCaveWaypointList();
-		refreshCaveStatus();
-		refreshCaveClosestStatus();
-		refreshCaveTransitionStatus();
-		refreshCavePresetControls();
-	  });
-	}
-
-
-	if (collapseButton) {
-	  collapseButton.addEventListener("click", () => {
-		const isCollapsed = panel.dataset.collapsed === "true";
-		setPanelCollapsed(panel, !isCollapsed);
-		updateCollapsedStopButton(panel);
-	  });
-	}
-
-	if (preferredSaveButton) {
-	  preferredSaveButton.onclick = () => {
-		saveAutoAttackPreferredConfig();
-	  };
-	}
-
-	if (preferredNamesInput) {
-	  preferredNamesInput.onchange = () => {
-		saveAutoAttackPreferredConfig();
-	  };
-
-	  preferredNamesInput.onkeydown = (event) => {
-		if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
-		  event.preventDefault();
-		  saveAutoAttackPreferredConfig();
-		}
-	  };
-	}
-
-	if (preferredMatchModeSelect) {
-	  preferredMatchModeSelect.onchange = () => {
-		saveAutoAttackPreferredConfig();
-	  };
-	}
-
-    if (reloadButton) {
-      reloadButton.addEventListener("click", () => {
-        window.minibiaBotReload?.();
+    // Collapse button
+    const collapseBtn = panel.querySelector("#minibia-bot-collapse");
+    if (collapseBtn) {
+      collapseBtn.addEventListener("click", () => {
+        const isCollapsed = panel.dataset.collapsed === "true";
+        setPanelCollapsed(panel, !isCollapsed);
+        updateCollapsedStopButton(panel);
       });
     }
 
-    function addTrustedName() {
-      const rawName = panicTrustedInput?.value?.trim() || "";
-      if (!rawName) {
-        return;
-      }
-
-      const currentNames = bot.panic?.config?.trustedNames || [];
-      const exists = currentNames.some(
-        (name) => String(name).trim().toLowerCase() === rawName.toLowerCase()
-      );
-
-      if (!exists) {
-        bot.panic.updateConfig({ trustedNames: [...currentNames, rawName] });
-      }
-
-      if (panicTrustedInput) {
-        panicTrustedInput.value = "";
-      }
-
-      renderTrustedNames();
-    }
-
-    function addGameMasterName() {
-      const rawName = panicGmNameInput?.value?.trim() || "";
-      if (!rawName) {
-        return;
-      }
-
-      const currentNames = bot.panic?.config?.gameMasterNames || [];
-      const exists = currentNames.some(
-        (name) => String(name).trim().toLowerCase() === rawName.toLowerCase()
-      );
-
-      if (!exists) {
-        bot.panic.updateConfig({ gameMasterNames: [...currentNames, rawName] });
-      }
-
-      if (panicGmNameInput) {
-        panicGmNameInput.value = "";
-      }
-
-      renderGameMasterNames();
-    }
-
-    if (panicGmAddButton) {
-      panicGmAddButton.addEventListener("click", addGameMasterName);
-    }
-
-    if (panicGmNameInput) {
-      panicGmNameInput.addEventListener("keydown", (event) => {
-        if (event.key === "Enter") {
-          event.preventDefault();
-          addGameMasterName();
-        }
+    // Collapsed stop button
+    const stopBtn = panel.querySelector("#minibia-bot-collapsed-stop");
+    if (stopBtn) {
+      stopBtn.addEventListener("click", (e) => {
+        e.preventDefault();
+        stopCaveAndAttackManual();
       });
     }
 
-    if (panicTrustedAddButton) {
-      panicTrustedAddButton.addEventListener("click", addTrustedName);
-    }
-
-    if (panicTrustedInput) {
-      panicTrustedInput.addEventListener("keydown", (event) => {
-        if (event.key === "Enter") {
-          event.preventDefault();
-          addTrustedName();
-        }
-      });
-    }
-
-    if (spellInput) {
-      spellInput.value = bot.rune?.config?.runeSpellWords || "";
-      spellInput.addEventListener("change", () => {
-        bot.rune.updateConfig({ runeSpellWords: spellInput.value.trim() });
-      });
-    }
-
-    if (manaInput) {
-      manaInput.value = String(bot.rune?.config?.runeManaCost ?? 0);
-      manaInput.addEventListener("change", () => {
-        const runeManaCost = Math.max(0, Number(manaInput.value) || 0);
-        manaInput.value = String(runeManaCost);
-        bot.rune.updateConfig({ runeManaCost });
-      });
-    }
-
-    if (runeEnabledInput) {
-      runeEnabledInput.checked = !!bot.rune?.status?.().running;
-      runeEnabledInput.addEventListener("change", () => {
-        const runeSpellWords = spellInput?.value?.trim() || bot.rune.config.runeSpellWords;
-        const runeManaCost = Math.max(0, Number(manaInput?.value) || bot.rune.config.runeManaCost || 0);
-
-        if (runeEnabledInput.checked) {
-          bot.rune.start({ runeSpellWords, runeManaCost });
-        } else {
-          bot.rune.stop();
-        }
-
-        refreshRuneStatus();
-      });
-    }
-
-    if (autoEatHotkeyInput) {
-      autoEatHotkeyInput.value = String(bot.eat?.config?.eatHotbarSlot ?? 10);
-      autoEatHotkeyInput.addEventListener("change", () => {
-        const eatHotbarSlot = Math.min(12, Math.max(1, Number(autoEatHotkeyInput.value) || 1));
-        autoEatHotkeyInput.value = String(eatHotbarSlot);
-        bot.eat.updateConfig({ eatHotbarSlot });
-      });
-    }
-
-    if (autoEatEnabledInput) {
-      autoEatEnabledInput.checked = !!bot.eat?.status?.().running;
-      autoEatEnabledInput.addEventListener("change", () => {
-        const eatHotbarSlot = Math.min(
-          12,
-          Math.max(1, Number(autoEatHotkeyInput?.value) || bot.eat.config.eatHotbarSlot || 1)
-        );
-
-        if (autoEatEnabledInput.checked) {
-          bot.eat.start({ eatHotbarSlot });
-        } else {
-          bot.eat.stop();
-        }
-
-        refreshAutoEatStatus();
-      });
-    }
-
-    if (autoInvisibleEnabledInput) {
-      autoInvisibleEnabledInput.checked = !!bot.invisible?.status?.().running;
-      autoInvisibleEnabledInput.addEventListener("change", () => {
-        if (autoInvisibleEnabledInput.checked) {
-          bot.invisible.start();
-        } else {
-          bot.invisible.stop();
-        }
-
-        refreshAutoInvisibleStatus();
-      });
-    }
-
-    if (autoMagicShieldEnabledInput) {
-      autoMagicShieldEnabledInput.checked = !!bot.magicShield?.status?.().running;
-      autoMagicShieldEnabledInput.addEventListener("change", () => {
-        if (autoMagicShieldEnabledInput.checked) {
-          bot.magicShield.start();
-        } else {
-          bot.magicShield.stop();
-        }
-
-        refreshAutoMagicShieldStatus();
-      });
-    }
-
-    if (equipRingEnabledInput) {
-      equipRingEnabledInput.checked = !!bot.equipRing?.status?.().running;
-      equipRingEnabledInput.addEventListener("change", () => {
-        if (equipRingEnabledInput.checked) {
-          bot.equipRing.start();
-        } else {
-          bot.equipRing.stop();
-        }
-
-        refreshEquipRingStatus();
-      });
-    }
-
-    if (cavePresetSelect) {
-      cavePresetSelect.addEventListener("change", () => {
-        const name = cavePresetSelect.value || "";
-        const activePresetName = bot.cave?.getActivePresetName?.() || "";
-        if (!name || name === activePresetName) {
-          refreshCavePresetControls();
-          return;
-        }
-
-        const loadedPreset = bot.cave.loadPreset(name);
-        refreshCavePresetControls();
+    // Title bar click toggles
+    const titleCave = panel.querySelector("#minibia-bot-title-cave-status");
+    const titleAttack = panel.querySelector("#minibia-bot-title-attack-status");
+    if (titleCave) {
+      titleCave.addEventListener("click", () => {
+        const running = !!bot.cave?.status?.().running;
+        running ? bot.cave.stop() : bot.cave.start();
+        refreshTitlebarRunIndicators();
         refreshCaveStatus();
-        refreshCaveClosestStatus();
-        refreshCaveTransitionStatus();
+        refreshCaveWaypointList();
       });
     }
-
-    if (cavePresetNewButton) {
-      cavePresetNewButton.addEventListener("click", () => {
-        const name = window.prompt("Name the new cave preset:");
-        if (name == null) {
-          return;
-        }
-
-        const createdPreset = bot.cave.createPreset(name);
-        if (!createdPreset) {
-          return;
-        }
-
-        refreshCavePresetControls();
-        refreshCaveStatus();
-        refreshCaveClosestStatus();
-        refreshCaveTransitionStatus();
-      });
-    }
-
-    if (cavePresetDeleteButton) {
-      cavePresetDeleteButton.addEventListener("click", () => {
-        const name = cavePresetSelect?.value || "";
-        if (!name) {
-          return;
-        }
-
-        const deleted = bot.cave.deletePreset(name);
-        if (!deleted) {
-          return;
-        }
-
-        refreshCavePresetControls();
-        refreshCaveStatus();
-        refreshCaveClosestStatus();
-        refreshCaveTransitionStatus();
-      });
-    }
-	
-// --- Cave bot event listeners ---
-
-// Add waypoint (only one listener)
-const addBtn = panel.querySelector("#minibia-bot-cave-add");
-if (addBtn) {
-  // Remove any previous listener by cloning and replacing
-  const newAddBtn = addBtn.cloneNode(true);
-  addBtn.parentNode.replaceChild(newAddBtn, addBtn);
-  newAddBtn.addEventListener("click", function addWaypointClick(e) {
-    e.preventDefault();
-    bot.cave.addWaypointCurrentSpot();
-    refreshCaveWaypointList();
-    refreshCaveStatus();
-    refreshCaveClosestStatus();
-    refreshCaveTransitionStatus();
-    refreshCavePresetControls();
-    refreshTitlebarRunIndicators();
-  });
-}
-
-// Move up/down and delete (use the existing functions)
-const moveUpBtn = panel.querySelector("#minibia-bot-cave-move-up");
-const moveDownBtn = panel.querySelector("#minibia-bot-cave-move-down");
-const deleteBtn = panel.querySelector("#minibia-bot-cave-delete-selected");
-
-if (moveUpBtn) {
-  // Remove existing listeners by cloning
-  const newUp = moveUpBtn.cloneNode(true);
-  moveUpBtn.parentNode.replaceChild(newUp, moveUpBtn);
-  newUp.addEventListener("click", () => moveSelectedWaypoint("up"));
-}
-if (moveDownBtn) {
-  const newDown = moveDownBtn.cloneNode(true);
-  moveDownBtn.parentNode.replaceChild(newDown, moveDownBtn);
-  newDown.addEventListener("click", () => moveSelectedWaypoint("down"));
-}
-if (deleteBtn) {
-  const newDel = deleteBtn.cloneNode(true);
-  deleteBtn.parentNode.replaceChild(newDel, deleteBtn);
-  newDel.addEventListener("click", deleteSelectedWaypoint);
-}
-
-// Preset controls (keep as is, but ensure no duplicates)
-const presetSelect = panel.querySelector("#minibia-bot-cave-preset-select");
-const presetNew = panel.querySelector("#minibia-bot-cave-preset-new");
-const presetDelete = panel.querySelector("#minibia-bot-cave-preset-delete");
-
-if (presetSelect) {
-  // Remove existing listeners by cloning
-  const newSelect = presetSelect.cloneNode(true);
-  presetSelect.parentNode.replaceChild(newSelect, presetSelect);
-  newSelect.addEventListener("change", function() {
-    const name = this.value || "";
-    const activePresetName = bot.cave?.getActivePresetName?.() || "";
-    if (!name || name === activePresetName) {
-      refreshCavePresetControls();
-      return;
-    }
-    bot.cave.loadPreset(name);
-    refreshCavePresetControls();
-    refreshCaveStatus();
-    refreshCaveClosestStatus();
-    refreshCaveTransitionStatus();
-    refreshCaveWaypointList();
-    refreshTitlebarRunIndicators();
-  });
-}
-if (presetNew) {
-  const newNew = presetNew.cloneNode(true);
-  presetNew.parentNode.replaceChild(newNew, presetNew);
-  newNew.addEventListener("click", function() {
-    const name = window.prompt("Name the new cave preset:");
-    if (name == null) return;
-    const created = bot.cave.createPreset(name);
-    if (!created) return;
-    refreshCavePresetControls();
-    refreshCaveStatus();
-    refreshCaveClosestStatus();
-    refreshCaveTransitionStatus();
-    refreshCaveWaypointList();
-    refreshTitlebarRunIndicators();
-  });
-}
-if (presetDelete) {
-  const newDelPreset = presetDelete.cloneNode(true);
-  presetDelete.parentNode.replaceChild(newDelPreset, presetDelete);
-  newDelPreset.addEventListener("click", function() {
-    const name = presetSelect?.value || "";
-    if (!name) return;
-    const deleted = bot.cave.deletePreset(name);
-    if (!deleted) return;
-    refreshCavePresetControls();
-    refreshCaveStatus();
-    refreshCaveClosestStatus();
-    refreshCaveTransitionStatus();
-    refreshCaveWaypointList();
-    refreshTitlebarRunIndicators();
-  });
-}
-
-// Tolerance input
-const toleranceInput = panel.querySelector("#minibia-bot-cave-tolerance");
-if (toleranceInput) {
-  toleranceInput.value = bot.cave?.config?.waypointTolerance ?? 0;
-  // Remove old listener
-  const newTol = toleranceInput.cloneNode(true);
-  toleranceInput.parentNode.replaceChild(newTol, toleranceInput);
-  newTol.addEventListener("change", function() {
-    const val = Math.min(5, Math.max(0, parseInt(this.value) || 0));
-    this.value = val;
-    bot.cave.updateConfig({ waypointTolerance: val });
-  });
-}
-
-// Cave toggle (enable/disable)
-const caveToggle = panel.querySelector("#minibia-bot-cave-toggle");
-if (caveToggle) {
-  caveToggle.checked = !!bot.cave?.status?.().running;
-  const newToggle = caveToggle.cloneNode(true);
-  caveToggle.parentNode.replaceChild(newToggle, caveToggle);
-  newToggle.addEventListener("change", function() {
-    if (this.checked) {
-      bot.cave.start();
-    } else {
-      bot.cave.stop();
-    }
-    refreshCaveStatus();
-    refreshCaveWaypointList();
-    refreshTitlebarRunIndicators();
-  });
-}
-
-// Loop toggle
-const loopToggle = panel.querySelector("#minibia-bot-cave-loop");
-if (loopToggle) {
-  loopToggle.checked = bot.cave?.getLoopMode?.() ?? false;
-  const newLoop = loopToggle.cloneNode(true);
-  loopToggle.parentNode.replaceChild(newLoop, loopToggle);
-  newLoop.addEventListener("change", function() {
-    bot.cave.setLoopMode(this.checked);
-  });
-}
-
-// Heal UI: save / cancel
-const healSave = panel.querySelector("#minibia-bot-heal-save");
-const healCancel = panel.querySelector("#minibia-bot-heal-cancel");
-if (healSave) healSave.addEventListener("click", saveHealRule);
-if (healCancel) healCancel.addEventListener("click", clearHealRuleForm);
-
-// Auto Heal enable toggle
-const autoHealToggle = panel.querySelector("#minibia-bot-auto-heal-enabled");
-if (autoHealToggle) {
-  autoHealToggle.checked = !!bot.heal?.status?.().running;
-  autoHealToggle.addEventListener("change", () => {
-    if (autoHealToggle.checked) bot.heal.start();
-    else bot.heal.stop();
-    refreshAutoHealStatus();
-  });
-}
-
-// Initial refresh
-refreshHealRules();
-refreshAutoHealStatus();
-
-    if (autoAttackHotkeyInput) {
-      autoAttackHotkeyInput.value = String(bot.attack?.config?.targetHotbarSlot ?? 3);
-      autoAttackHotkeyInput.addEventListener("change", () => {
-        const targetHotbarSlot = Math.min(12, Math.max(1, Number(autoAttackHotkeyInput.value) || 1));
-        autoAttackHotkeyInput.value = String(targetHotbarSlot);
-        bot.attack.updateConfig({ targetHotbarSlot });
-      });
-    }
-
-    if (autoAttackRuneHotkeyInput) {
-      autoAttackRuneHotkeyInput.value = bot.attack?.config?.runeHotbarSlot
-        ? String(bot.attack.config.runeHotbarSlot)
-        : "";
-      autoAttackRuneHotkeyInput.addEventListener("change", () => {
-        const rawValue = Number(autoAttackRuneHotkeyInput.value);
-        const runeHotbarSlot = Number.isFinite(rawValue) && rawValue >= 1 && rawValue <= 12
-          ? Math.trunc(rawValue)
-          : null;
-        autoAttackRuneHotkeyInput.value = runeHotbarSlot ? String(runeHotbarSlot) : "";
-        bot.attack.updateConfig({ runeHotbarSlot });
-      });
-    }
-
-    if (autoAttackMeleeInput) {
-      autoAttackMeleeInput.checked = bot.attack?.config?.meleeMode !== false;
-      autoAttackMeleeInput.addEventListener("change", () => {
-        bot.attack.updateConfig({ meleeMode: autoAttackMeleeInput.checked });
-      });
-    }
-
-    if (autoAttackEnabledInput) {
-      autoAttackEnabledInput.checked = !!bot.attack?.status?.().running;
-      autoAttackEnabledInput.addEventListener("change", () => {
-        const targetHotbarSlot = Math.min(
-          12,
-          Math.max(1, Number(autoAttackHotkeyInput?.value) || bot.attack.config.targetHotbarSlot || 1)
-        );
-        const runeHotbarSlot = (() => {
-          const rawValue = Number(autoAttackRuneHotkeyInput?.value);
-          if (Number.isFinite(rawValue) && rawValue >= 1 && rawValue <= 12) {
-            return Math.trunc(rawValue);
-          }
-
-          return bot.attack.config.runeHotbarSlot ?? null;
-        })();
-        const meleeMode = !!autoAttackMeleeInput?.checked;
-
-        if (autoAttackEnabledInput.checked) {
-          bot.attack.start({ targetHotbarSlot, runeHotbarSlot, meleeMode });
-		  refreshTitlebarRunIndicators();
-        } else {
-          bot.attack.stop();
-		  refreshTitlebarRunIndicators();
-        }
-
+    if (titleAttack) {
+      titleAttack.addEventListener("click", () => {
+        const running = !!bot.attack?.status?.().running;
+        running ? bot.attack.stop() : bot.attack.start();
+        refreshTitlebarRunIndicators();
         refreshAutoAttackStatus();
-		refreshAutoAttackPreferredStatus({ force: true });
       });
     }
 
-    if (talkApiKeyInput) {
-      talkApiKeyInput.value = bot.talk?.config?.apiKey || "";
-      talkApiKeyInput.addEventListener("change", () => {
-        bot.talk.updateConfig({ apiKey: talkApiKeyInput.value.trim() });
-        refreshTalkStatus();
-      });
-    }
+    // ---- EVENT LISTENERS ----
 
-    if (talkPromptInput) {
-      talkPromptInput.value = bot.talk?.config?.systemPrompt || "";
-      talkPromptInput.addEventListener("change", () => {
-        bot.talk.updateConfig({ systemPrompt: talkPromptInput.value.trim() });
-      });
-    }
-
-    if (talkEnabledInput) {
-      talkEnabledInput.checked = !!bot.talk?.status?.().running;
-      talkEnabledInput.addEventListener("change", () => {
-        if (talkEnabledInput.checked) {
-          bot.talk.updateConfig({
-            apiKey: talkApiKeyInput?.value?.trim() || "",
-            systemPrompt: talkPromptInput?.value?.trim() || bot.talk.config.systemPrompt || "",
-          });
-          const started = bot.talk.start();
-          if (!started) {
-            talkEnabledInput.checked = false;
-          }
-        } else {
-          bot.talk.stop();
-        }
-
-        refreshTalkStatus();
-      });
-    }
-
-    if (panicUnknownInput) {
-      panicUnknownInput.checked = !!bot.panic?.status?.().config?.unknownPlayerEnabled;
-      panicUnknownInput.addEventListener("change", () => {
-        bot.panic.updateConfig({ unknownPlayerEnabled: panicUnknownInput.checked });
-        refreshPanicStatus();
-      });
-    }
-
-    if (panicHealthInput) {
-      panicHealthInput.checked = !!bot.panic?.status?.().config?.healthLossEnabled;
-      panicHealthInput.addEventListener("change", () => {
-        bot.panic.updateConfig({ healthLossEnabled: panicHealthInput.checked });
-        refreshPanicStatus();
-      });
-    }
-
-    if (panicReturnInput) {
-      panicReturnInput.checked = !!bot.panic?.status?.().config?.returnToOriginEnabled;
-      panicReturnInput.addEventListener("change", () => {
-        bot.panic.updateConfig({ returnToOriginEnabled: panicReturnInput.checked });
-        refreshPanicStatus();
-      });
-    }
-
-    if (xrayOverlayButton) {
-      xrayOverlayButton.addEventListener("click", () => {
-        const enabled = !!bot.xray?.status?.().config?.overlayEnabled;
-        bot.xray?.setOverlayEnabled?.(!enabled);
-        refreshXrayStatus();
-      });
-    }
-
-    if (xrayFloorSelect) {
-      xrayFloorSelect.addEventListener("change", () => {
-        const rawValue = xrayFloorSelect.value;
-        bot.xray?.setSelectedFloor?.(rawValue === "all" ? null : Number(rawValue));
-        refreshXrayStatus();
-        refreshVisibleCreatures();
-      });
-    }
-
-    panel.querySelector("#minibia-bot-set-home")?.addEventListener("click", () => {
-      bot.pz.setHomePzCurrentSpot();
-      refreshHomeLabel();
-    });
-	
-	panel.querySelector("#minibia-bot-auto-attack-preferred-save")
-	?.addEventListener("click", () => {
-	saveAutoAttackPreferredConfig();
-	});
-
-	panel.querySelector("#minibia-bot-auto-attack-preferred-names")
-	  ?.addEventListener("change", () => {
-		saveAutoAttackPreferredConfig();
-	});
-
-	panel.querySelector("#minibia-bot-auto-attack-preferred-match-mode")
-	  ?.addEventListener("change", () => {
-		saveAutoAttackPreferredConfig();
-	});
-
-	// --- Titlebar Cave / Target Toggles ---
-	const titleCaveStatus = panel.querySelector("#minibia-bot-title-cave-status");
-	const titleAttackStatus = panel.querySelector("#minibia-bot-title-attack-status");
-
-	if (titleCaveStatus) {
-	  titleCaveStatus.addEventListener("click", () => {
-		const running = !!bot.cave?.status?.().running;
-		if (running) {
-		  bot.cave.stop();
-		} else {
-		  bot.cave.start();
-		}
-		// Refresh the UI indicators and specific tabs
-		refreshTitlebarRunIndicators();
-		refreshCaveStatus();
-		refreshCaveWaypointList();
-	  });
-	}
-
-	if (titleAttackStatus) {
-	  titleAttackStatus.addEventListener("click", () => {
-		const running = !!bot.attack?.status?.().running;
-		if (running) {
-		  bot.attack.stop();
-		} else {
-		  bot.attack.start();
-		}
-		// Refresh the UI indicators and specific tabs
-		refreshTitlebarRunIndicators();
-		refreshAutoAttackStatus();
-	  });
-	}
-
-
+    // ---- INITIAL REFRESHES ----
     refreshHomeLabel();
     refreshPanicStatus();
     refreshXrayStatus();
-    renderGameMasterNames();
     renderTrustedNames();
+    renderGameMasterNames();
     refreshRuneStatus();
     refreshAutoHealStatus();
-	refreshHealRules();
+    refreshHealRules();
     refreshAutoInvisibleStatus();
     refreshAutoMagicShieldStatus();
     refreshAutoAttackStatus();
-	refreshAutoAttackPreferredStatus({ force: true });
+    refreshAutoAttackPreferredStatus({ force: true });
     refreshAutoEatStatus();
     refreshCaveStatus();
     refreshEquipRingStatus();
@@ -9617,74 +5809,82 @@ refreshAutoHealStatus();
     refreshCavePresetControls();
     refreshCaveClosestStatus();
     refreshCaveTransitionStatus();
-	refreshCaveWaypointList();
+    refreshCaveWaypointList();
+    refreshTalkIgnoredPhrases();
+    refreshTitlebarRunIndicators();
 
-	const visibleCreaturesTimerId = window.setInterval(refreshVisibleCreatures, 1000);
-	bot.addCleanup(() => {
-	  window.clearInterval(visibleCreaturesTimerId);
-	});
+    // Periodic refreshes (as before)
+    const visibleTimer = window.setInterval(refreshVisibleCreatures, 1000);
+    bot.addCleanup(() => window.clearInterval(visibleTimer));
+    const talkTimer = window.setInterval(refreshTalkStatus, 1000);
+    bot.addCleanup(() => window.clearInterval(talkTimer));
+    const caveTimer = window.setInterval(() => {
+      refreshCaveStatus();
+      refreshCavePresetControls();
+      refreshCaveClosestStatus();
+      refreshCaveTransitionStatus();
+      refreshCaveWaypointList();
+      const loopToggle = document.getElementById("minibia-bot-cave-loop");
+      if (loopToggle) loopToggle.checked = bot.cave?.getLoopMode?.() ?? false;
+    }, 1000);
+    bot.addCleanup(() => window.clearInterval(caveTimer));
+    const titleTimer = window.setInterval(refreshTitlebarRunIndicators, 500);
+    bot.addCleanup(() => window.clearInterval(titleTimer));
 
-	const talkStatusTimerId = window.setInterval(refreshTalkStatus, 1000);
-	bot.addCleanup(() => {
-	  window.clearInterval(talkStatusTimerId);
-	});
+    // Position, drag, collapse
+    applySavedPanelPosition(panel);
+    enableDrag(panel);
+    const savedCollapsed = getSavedPanelCollapsed();
+    setPanelCollapsed(panel, savedCollapsed);
+    updateCollapsedStopButton(panel);
 
-	const caveStatusTimerId = window.setInterval(() => {
-	  refreshCaveStatus();
-	  refreshCavePresetControls();
-	  refreshCaveClosestStatus();
-	  refreshCaveTransitionStatus();
-	  refreshCaveWaypointList();
-	  const loopToggle = document.getElementById("minibia-bot-cave-loop");
-	  if (loopToggle) loopToggle.checked = bot.cave?.getLoopMode?.() ?? false;  
-	}, 1000);
-	bot.addCleanup(() => {
-	  window.clearInterval(caveStatusTimerId);
-	});
-
-	/*
-	 * Titlebar Cave / Target indicators
-	 */
-	const titlebarStatusTimerId = window.setInterval(refreshTitlebarRunIndicators, 500);
-	bot.addCleanup(() => {
-	  window.clearInterval(titlebarStatusTimerId);
-	});
-
-	refreshTitlebarRunIndicators();
-
+    // Audio unlock
+    const unlockAudio = () => bot.unlockAudio?.();
+    panel.addEventListener("pointerdown", unlockAudio, { passive: true });
+    panel.addEventListener("keydown", unlockAudio);
+    bot.addCleanup(() => {
+      panel.removeEventListener("pointerdown", unlockAudio);
+      panel.removeEventListener("keydown", unlockAudio);
+    });
   }
 
-	bot.ui = {
-	  inject,
-	  destroy,
-	  refreshHomeLabel,
-	  refreshPanicStatus,
-	  refreshXrayStatus,
-	  refreshRuneStatus,
-	  refreshAutoHealStatus,
-	  refreshAutoInvisibleStatus,
-	  refreshAutoMagicShieldStatus,
-	  refreshAutoAttackStatus,
-	  refreshAutoAttackPreferredStatus,
-	  refreshAutoEatStatus,
-	  refreshCaveStatus,
-	  refreshCavePresetControls,
-	  refreshEquipRingStatus,
-	  refreshTalkStatus,
-	  refreshVisibleCreatures,
-	  refreshCaveClosestStatus,
-	  refreshCaveTransitionStatus,
-	  getSavedPanelPosition,
-	  getSavedPanelCollapsed,
-	  setPanelCollapsed: (collapsed) => {
-		const panel = document.getElementById("minibia-bot-panel");
-		setPanelCollapsed(panel, collapsed);
-	  },
-	};
-
+  // ---- PUBLIC UI API ----
+  bot.ui = {
+    inject,
+    destroy,
+    refreshHomeLabel,
+    refreshPanicStatus,
+    refreshXrayStatus,
+    refreshRuneStatus,
+    refreshAutoHealStatus,
+    refreshAutoInvisibleStatus,
+    refreshAutoMagicShieldStatus,
+    refreshAutoAttackStatus,
+    refreshAutoAttackPreferredStatus,
+    refreshAutoEatStatus,
+    refreshCaveStatus,
+    refreshCavePresetControls,
+    refreshEquipRingStatus,
+    refreshTalkStatus,
+    refreshVisibleCreatures,
+    refreshCaveClosestStatus,
+    refreshCaveTransitionStatus,
+    getSavedPanelPosition,
+    getSavedPanelCollapsed,
+    setPanelCollapsed: (collapsed) => {
+      const panel = document.getElementById("minibia-bot-panel");
+      setPanelCollapsed(panel, collapsed);
+    },
+  };
 };
 
-// Reload bootstrapping remains unchanged
+/**
+ * ==================================================================================
+ * 15. BOOTSTRAP
+ *     Creates the bot, installs all modules, and exposes it globally.
+ *     Also implements hot‑reload.
+ * ==================================================================================
+ */
 (() => {
   const bundle = window.__minibiaBotBundle || window.__minibiaBotReloadBundle || {};
   const persistedEnabledModules = [
@@ -9702,48 +5902,33 @@ refreshAutoHealStatus();
   function getPersistedEnabledSnapshot(bot) {
     const snapshot = {};
     const status = typeof bot?.status === "function" ? bot.status() : null;
-
-    persistedEnabledModules.forEach(([moduleName]) => {
-      const enabled = status?.[moduleName]?.config?.enabled;
-      if (typeof enabled === "boolean") {
-        snapshot[moduleName] = enabled;
-      }
+    persistedEnabledModules.forEach(([name]) => {
+      const enabled = status?.[name]?.config?.enabled;
+      if (typeof enabled === "boolean") snapshot[name] = enabled;
     });
-
     return snapshot;
   }
 
   function restorePersistedEnabledSnapshot(snapshot) {
-    persistedEnabledModules.forEach(([moduleName, storageKey]) => {
-      if (typeof snapshot?.[moduleName] !== "boolean") {
-        return;
-      }
-
+    persistedEnabledModules.forEach(([name, storageKey]) => {
+      if (typeof snapshot?.[name] !== "boolean") return;
       try {
-        const rawValue = window.localStorage.getItem(storageKey);
-        const config = rawValue ? JSON.parse(rawValue) : {};
-        config.enabled = snapshot[moduleName];
+        const raw = window.localStorage.getItem(storageKey);
+        const config = raw ? JSON.parse(raw) : {};
+        config.enabled = snapshot[name];
         window.localStorage.setItem(storageKey, JSON.stringify(config));
-      } catch (error) {
-        console.error("[minibia-bot] failed to restore persisted enabled state", {
-          module: moduleName,
-          error,
-        });
+      } catch (e) {
+        console.error("[minibia-bot] failed to restore persisted enabled state", { module: name, error: e });
       }
     });
   }
 
   function boot(currentBundle = bundle) {
-    const previousEnabledSnapshot = getPersistedEnabledSnapshot(window.minibiaBot);
-
-    if (window.minibiaBot?.destroy) {
-      window.minibiaBot.destroy();
-    }
-
-    restorePersistedEnabledSnapshot(previousEnabledSnapshot);
+    const prevSnapshot = getPersistedEnabledSnapshot(window.minibiaBot);
+    if (window.minibiaBot?.destroy) window.minibiaBot.destroy();
+    restorePersistedEnabledSnapshot(prevSnapshot);
 
     const bot = currentBundle.createBot();
-
     currentBundle.installPzModule(bot);
     currentBundle.installXrayModule(bot);
     currentBundle.installPanicModule(bot);
@@ -9765,9 +5950,7 @@ refreshAutoHealStatus();
     bot.reload = () => window.minibiaBotReload?.();
     bot.status = () => ({
       version: bot.version,
-      pz: {
-        home: bot.pz.getHomePz(),
-      },
+      pz: { home: bot.pz.getHomePz() },
       xray: bot.xray.status(),
       panic: bot.panic.status(),
       rune: bot.rune.status(),
@@ -9783,37 +5966,8 @@ refreshAutoHealStatus();
 
     window.minibiaBot = bot;
     window.pzBot = bot.pz;
-
-    console.log("[minibia-bot] ready", {
-      version: bot.version,
-      modules: ["pz", "xray", "panic", "rune", "heal", "invisible", "magicShield", "attack", "cave", "equipRing", "eat", "talk", "ui"],
-    });
+    console.log("[minibia-bot] ready", { version: bot.version, modules: ["pz","xray","panic","rune","heal","invisible","magicShield","attack","cave","equipRing","eat","talk","ui"] });
     console.log("minibiaBot.reload()");
-    console.log("minibiaBot.xray.status()");
-    console.log("minibiaBot.panic.status()");
-    console.log("minibiaBot.pz.goToNearestPz()");
-    console.log("minibiaBot.pz.setHomePzCurrentSpot()");
-    console.log("minibiaBot.pz.goToHomePz()");
-    console.log("minibiaBot.rune.start()");
-    console.log("minibiaBot.rune.stop()");
-    console.log("minibiaBot.heal.start()");
-    console.log("minibiaBot.heal.stop()");
-    console.log("minibiaBot.invisible.start()");
-    console.log("minibiaBot.invisible.stop()");
-    console.log("minibiaBot.magicShield.start()");
-    console.log("minibiaBot.magicShield.stop()");
-    console.log("minibiaBot.attack.start()");
-    console.log("minibiaBot.attack.stop()");
-    console.log("minibiaBot.cave.addWaypointCurrentSpot()");
-    console.log("minibiaBot.cave.start()");
-    console.log("minibiaBot.cave.stop()");
-    console.log("minibiaBot.equipRing.start()");
-    console.log("minibiaBot.equipRing.stop()");
-    console.log("minibiaBot.eat.start()");
-    console.log("minibiaBot.eat.stop()");
-    console.log("minibiaBot.talk.updateConfig({ apiKey: \"...\" })");
-    console.log("minibiaBot.talk.start()");
-    console.log("minibiaBot.talk.stop()");
     return bot;
   }
 
@@ -9823,37 +5977,31 @@ refreshAutoHealStatus();
   boot(bundle);
 })();
 
-// InfernalScript (unchanged)
+/**
+ * ==================================================================================
+ * 16. INFERNAL SCRIPT – MOVEMENT PATCH
+ *     Hooks into the game client to force‑stop auto‑walking when the player has
+ *     a target. Prevents cave bot and pathfinder from moving while in combat.
+ * ==================================================================================
+ */
 (() => {
   const TAG = "[InfernalScript]";
-
-  const state = {
-    installed: false,
-    stopping: false,
-    lastStopPacketAt: 0,
-    forceStopUntil: 0
-  };
+  const state = { installed: false, stopping: false, lastStopPacketAt: 0, forceStopUntil: 0 };
 
   console.log(`${TAG} page hook loaded`);
 
   function waitForClient() {
-    const client =
-      window.gameClient ||
-      window.GameClient?.instance ||
-      window.client;
-
+    const client = window.gameClient || window.GameClient?.instance || window.client;
     if (!client || !client.player || !client.world?.pathfinder) {
       requestAnimationFrame(waitForClient);
       return;
     }
-
     install(client);
   }
 
   function install(client) {
     if (state.installed) return;
     state.installed = true;
-
     console.log(`${TAG} gameClient found`);
 
     guardPlayerTarget(client);
@@ -9863,83 +6011,47 @@ refreshAutoHealStatus();
     patchPacketHandler(client);
     patchPlayerUnlockMovement(client);
     startStopLoop(client);
-
     console.log(`${TAG} FULL CONTROL ACTIVE - balanced smooth mode`);
   }
 
-function hasTarget(client) {
-  const p = client.player;
-  if (!p) return false;
-
-  let target = null;
-
-  try {
-    if (typeof p.getTarget === "function") {
-      target = p.getTarget();
+  function hasTarget(client) {
+    const p = client.player;
+    if (!p) return false;
+    let target = null;
+    try { if (typeof p.getTarget === "function") target = p.getTarget(); } catch {}
+    if (!target && p.__target !== null && p.__target !== undefined) target = p.__target;
+    if (!target) return false;
+    if (!isTargetOnScreen(client, target)) {
+      state.pausedForCombat = false;
+      return false;
     }
-  } catch {}
-
-  if (!target && p.__target !== null && p.__target !== undefined) {
-    target = p.__target;
+    state.pausedForCombat = true;
+    return true;
   }
 
-  if (!target) return false;
-
-  if (!isTargetOnScreen(client, target)) {
-	  state.pausedForCombat = false
- //   console.log(
- //     "starting cavebot again",
- //     target.name || target.id || target
- //   );
-
+  function isTargetOnScreen(client, target) {
+    const p = client.player;
+    if (!p || !target) return false;
+    try {
+      if (typeof p.canSeeSmall === "function") return p.canSeeSmall(target);
+      if (typeof p.canSee === "function") return p.canSee(target);
+    } catch {}
+    try {
+      const pp = p.getPosition().projected();
+      const tp = target.getPosition().projected();
+      const dx = Math.abs(pp.x - tp.x);
+      const dy = Math.abs(pp.y - tp.y);
+      return dx < 8 && dy < 6;
+    } catch {}
     return false;
   }
-  state.pausedForCombat = true
-  return true;
-}
-
-
-function isTargetOnScreen(client, target) {
-  const p = client.player;
-
-  if (!p || !target) return false;
-
-  try {
-    if (typeof p.canSeeSmall === "function") {
-      return p.canSeeSmall(target);
-    }
-
-    if (typeof p.canSee === "function") {
-      return p.canSee(target);
-    }
-  } catch {}
-
-  // Fallback manual screen-distance check based on Creature.canSee()
-  try {
-    const pp = p.getPosition().projected();
-    const tp = target.getPosition().projected();
-
-    const dx = Math.abs(pp.x - tp.x);
-    const dy = Math.abs(pp.y - tp.y);
-
-    return dx < 8 && dy < 6;
-  } catch {}
-
-  return false;
-}
 
   function sendStopWalk(client, force = false) {
     const now = performance.now();
-
     if (!force && now - state.lastStopPacketAt < 250) return;
-
     state.lastStopPacketAt = now;
-
     try {
-      if (typeof StopWalkPacket === "function") {
-        client.send(new StopWalkPacket());
-        //console.log(`${TAG} sent StopWalkPacket`);
-      }
+      if (typeof StopWalkPacket === "function") client.send(new StopWalkPacket());
     } catch (e) {
       console.warn(`${TAG} failed to send StopWalkPacket`, e);
     }
@@ -9948,61 +6060,33 @@ function isTargetOnScreen(client, target) {
   function hardStop(client, forcePacket = false) {
     if (state.stopping) return;
     state.stopping = true;
-
     try {
       const p = client.player;
       const pf = client.world?.pathfinder;
-
       if (!p || !pf) return;
-
-      // Cancel server-side mapclick/autowalk.
       sendStopWalk(client, forcePacket);
-
-      // Clear autowalk/server-mapclick state.
-      try { pf.__isAutoWalking = false; } catch {}
-      try { pf.__autoWalkStepsRemaining = 0; } catch {}
-      try { pf.__autowalkStartPosition = null; } catch {}
-      try { pf.__autowalkStartedAt = 0; } catch {}
-
-      // Clear final destination.
-      try { pf.__finalDestination = null; } catch {}
-
-      // Clear path cache.
-      try {
-        if (Array.isArray(pf.__pathfindCache)) {
-          pf.__pathfindCache.length = 0;
-        } else {
-          pf.__pathfindCache = [];
-        }
-      } catch {}
-
-      // Clear minimap continuation.
-      try { pf.__minimapWaypoints = null; } catch {}
-      try { pf.__recentMinimapStarts = []; } catch {}
-      try { pf.__lastCancelPosition = null; } catch {}
-      try { pf.__lastRetryDest = null; } catch {}
-      try { pf.__lastRetryTime = 0; } catch {}
-
-      // Clear hybrid prediction.
-      try { pf.__hybridPath = null; } catch {}
-      try { pf.__hybridNeedsAlign = false; } catch {}
-
-      // Clear buffered future movement only.
-      // Do NOT touch p.__movementEvent or p.__position.
-      // Touching those causes snapping/teleporting.
-      try { p.__movementBuffer = null; } catch {}
-      try { p.__lookDirectionBuffer = null; } catch {}
-
-      // Clear pending mouse walk-to actions.
-      try {
-        if (client.mouse) {
-          client.mouse.__pendingUseObject = null;
-          client.mouse.__pendingUsePosition = null;
-          client.mouse.__pendingUseWithSource = null;
-          client.mouse.__pendingMoveFrom = null;
-        }
-      } catch {}
-
+      // Clear all pathfinding state
+      pf.__isAutoWalking = false;
+      pf.__autoWalkStepsRemaining = 0;
+      pf.__autowalkStartPosition = null;
+      pf.__autowalkStartedAt = 0;
+      pf.__finalDestination = null;
+      pf.__pathfindCache = [];
+      pf.__minimapWaypoints = null;
+      pf.__recentMinimapStarts = [];
+      pf.__lastCancelPosition = null;
+      pf.__lastRetryDest = null;
+      pf.__lastRetryTime = 0;
+      pf.__hybridPath = null;
+      pf.__hybridNeedsAlign = false;
+      p.__movementBuffer = null;
+      p.__lookDirectionBuffer = null;
+      if (client.mouse) {
+        client.mouse.__pendingUseObject = null;
+        client.mouse.__pendingUsePosition = null;
+        client.mouse.__pendingUseWithSource = null;
+        client.mouse.__pendingMoveFrom = null;
+      }
     } finally {
       state.stopping = false;
     }
@@ -10011,308 +6095,187 @@ function isTargetOnScreen(client, target) {
   function guardPlayerTarget(client) {
     const p = client.player;
     if (!p || p.__stopOnTargetTargetGuarded) return;
-
     let targetValue = p.__target ?? null;
-
     Object.defineProperty(p, "__target", {
       configurable: true,
-
-      get() {
-        return targetValue;
-      },
-
+      get() { return targetValue; },
       set(value) {
         targetValue = value;
-
         if (value !== null && value !== undefined) {
-          //console.log(`${TAG} target active`, value?.name || value?.id || value);
-
           state.forceStopUntil = performance.now() + 1200;
-
           queueMicrotask(() => hardStop(client, true));
         }
       }
     });
-
     p.__stopOnTargetTargetGuarded = true;
-
     console.log(`${TAG} guarded player.__target`);
   }
 
   function guardPathfinderProperties(client) {
     const pf = client.world?.pathfinder;
     if (!pf || pf.__stopOnTargetPropertyGuarded) return;
-
-    let finalDestinationValue = pf.__finalDestination ?? null;
-    let isAutoWalkingValue = pf.__isAutoWalking ?? false;
-    let pathfindCacheValue = Array.isArray(pf.__pathfindCache)
-      ? pf.__pathfindCache
-      : [];
-    let hybridPathValue = pf.__hybridPath ?? null;
+    let finalDest = pf.__finalDestination ?? null;
+    let isAutoWalking = pf.__isAutoWalking ?? false;
+    let pathCache = Array.isArray(pf.__pathfindCache) ? pf.__pathfindCache : [];
+    let hybridPath = pf.__hybridPath ?? null;
 
     Object.defineProperty(pf, "__finalDestination", {
       configurable: true,
-
-      get() {
-        return hasTarget(client) ? null : finalDestinationValue;
-      },
-
-      set(value) {
+      get() { return hasTarget(client) ? null : finalDest; },
+      set(v) {
         if (hasTarget(client)) {
-          finalDestinationValue = null;
+          finalDest = null;
           state.forceStopUntil = performance.now() + 800;
           hardStop(client, true);
           return;
         }
-
-        finalDestinationValue = value;
+        finalDest = v;
       }
     });
-
     Object.defineProperty(pf, "__isAutoWalking", {
       configurable: true,
-
-      get() {
-        return hasTarget(client) ? false : isAutoWalkingValue;
-      },
-
-      set(value) {
+      get() { return hasTarget(client) ? false : isAutoWalking; },
+      set(v) {
         if (hasTarget(client)) {
-          isAutoWalkingValue = false;
+          isAutoWalking = false;
           state.forceStopUntil = performance.now() + 800;
           hardStop(client, true);
           return;
         }
-
-        isAutoWalkingValue = value;
+        isAutoWalking = v;
       }
     });
-
     Object.defineProperty(pf, "__pathfindCache", {
       configurable: true,
-
       get() {
-        if (hasTarget(client)) {
-          pathfindCacheValue.length = 0;
-        }
-
-        return pathfindCacheValue;
+        if (hasTarget(client)) pathCache.length = 0;
+        return pathCache;
       },
-
-      set(value) {
+      set(v) {
         if (hasTarget(client)) {
-          pathfindCacheValue = [];
+          pathCache = [];
           state.forceStopUntil = performance.now() + 800;
           hardStop(client, true);
           return;
         }
-
-        pathfindCacheValue = Array.isArray(value) ? value : [];
+        pathCache = Array.isArray(v) ? v : [];
       }
     });
-
     Object.defineProperty(pf, "__hybridPath", {
       configurable: true,
-
-      get() {
-        return hasTarget(client) ? null : hybridPathValue;
-      },
-
-      set(value) {
+      get() { return hasTarget(client) ? null : hybridPath; },
+      set(v) {
         if (hasTarget(client)) {
-          hybridPathValue = null;
+          hybridPath = null;
           state.forceStopUntil = performance.now() + 800;
           hardStop(client, true);
           return;
         }
-
-        hybridPathValue = value;
+        hybridPath = v;
       }
     });
-
     pf.__stopOnTargetPropertyGuarded = true;
-
     console.log(`${TAG} guarded pathfinder properties`);
   }
 
   function patchGameClientSend(client) {
-    if (!client || typeof client.send !== "function" || client.__stopOnTargetSendPatched) {
-      return;
-    }
-
-    const originalSend = client.send;
-
-    client.send = function (packet) {
-      const packetName = packet?.constructor?.name || "";
-
-      // Always allow StopWalkPacket.
-      if (packetName === "StopWalkPacket") {
-        return originalSend.call(this, packet);
-      }
-
-      // Block fresh mapclick/autowalk packets while target exists.
-      if (
-        hasTarget(client) &&
-        (
-          packetName === "AutoWalkPacket" ||
-          packetName === "WalkToDestinationPacket"
-        )
-      ) {
-        console.log(`${TAG} blocked outgoing ${packetName}`);
+    if (!client || typeof client.send !== "function" || client.__stopOnTargetSendPatched) return;
+    const orig = client.send;
+    client.send = function(packet) {
+      const name = packet?.constructor?.name || "";
+      if (name === "StopWalkPacket") return orig.call(this, packet);
+      if (hasTarget(client) && (name === "AutoWalkPacket" || name === "WalkToDestinationPacket")) {
+        console.log(`${TAG} blocked outgoing ${name}`);
         state.forceStopUntil = performance.now() + 1000;
         hardStop(client, true);
         return false;
       }
-
-      return originalSend.call(this, packet);
+      return orig.call(this, packet);
     };
-
     client.__stopOnTargetSendPatched = true;
-
     console.log(`${TAG} patched gameClient.send`);
   }
 
   function patchPathfinder(client) {
     const pf = client.world?.pathfinder;
     if (!pf || pf.__stopOnTargetFunctionsPatched) return;
-
-    const methodsToBlock = [
-      "findPath",
-      "handlePathfind",
-      "__predictHybridStep",
-      "__findPathViaMinimap",
-      "__continueAlongWaypoints",
-      "getNextMove"
-    ];
-
-    for (const key of methodsToBlock) {
-      if (typeof pf[key] !== "function") continue;
-
-      const original = pf[key];
-
-      pf[key] = function (...args) {
+    const methods = ["findPath","handlePathfind","__predictHybridStep","__findPathViaMinimap","__continueAlongWaypoints","getNextMove"];
+    methods.forEach(key => {
+      if (typeof pf[key] !== "function") return;
+      const orig = pf[key];
+      pf[key] = function(...args) {
         if (hasTarget(client)) {
           state.forceStopUntil = performance.now() + 800;
           hardStop(client, true);
           return false;
         }
-
-        return original.apply(this, args);
+        return orig.apply(this, args);
       };
-
-      console.log(`${TAG} patched pathfinder.${key}`);
-    }
-
+    });
     if (typeof pf.setPathfindCache === "function") {
-      const originalSetPathfindCache = pf.setPathfindCache;
-
-      pf.setPathfindCache = function (path) {
-        if (hasTarget(client)) {
-          if (path === null) {
-            return originalSetPathfindCache.call(this, path);
-          }
-
+      const orig = pf.setPathfindCache;
+      pf.setPathfindCache = function(path) {
+        if (hasTarget(client) && path !== null) {
           state.forceStopUntil = performance.now() + 800;
           hardStop(client, true);
           return false;
         }
-
-        return originalSetPathfindCache.call(this, path);
+        return orig.call(this, path);
       };
-
-      console.log(`${TAG} patched pathfinder.setPathfindCache`);
     }
-
     pf.__stopOnTargetFunctionsPatched = true;
+    console.log(`${TAG} patched pathfinder functions`);
   }
 
   function patchPacketHandler(client) {
-    const handler =
-      client.networkManager?.packetHandler ||
-      client.packetHandler;
-
+    const handler = client.networkManager?.packetHandler || client.packetHandler;
     if (!handler || handler.__stopOnTargetPacketHandlerPatched) return;
-
-    // Important:
-    // Block incoming server autowalk path setup,
-    // but DO NOT block handleCreatureServerMove.
-    // Blocking creature movement causes teleporting.
-    const methodsToBlock = [
-      "handleAutoWalkPath"
-    ];
-
-    for (const key of methodsToBlock) {
-      if (typeof handler[key] !== "function") continue;
-
-      const original = handler[key];
-
-      handler[key] = function (...args) {
+    const methods = ["handleAutoWalkPath"];
+    methods.forEach(key => {
+      if (typeof handler[key] !== "function") return;
+      const orig = handler[key];
+      handler[key] = function(...args) {
         if (hasTarget(client)) {
           console.log(`${TAG} blocked incoming ${key}`);
           state.forceStopUntil = performance.now() + 1000;
           hardStop(client, true);
           return false;
         }
-
-        return original.apply(this, args);
+        return orig.apply(this, args);
       };
-
-      console.log(`${TAG} patched packetHandler.${key}`);
-    }
-
+    });
     handler.__stopOnTargetPacketHandlerPatched = true;
+    console.log(`${TAG} patched packetHandler`);
   }
 
   function patchPlayerUnlockMovement(client) {
     const p = client.player;
-
-    if (!p || typeof p.unlockMovement !== "function" || p.__stopOnTargetUnlockPatched) {
-      return;
-    }
-
-    const originalUnlockMovement = p.unlockMovement;
-
-    p.unlockMovement = function (...args) {
+    if (!p || typeof p.unlockMovement !== "function" || p.__stopOnTargetUnlockPatched) return;
+    const orig = p.unlockMovement;
+    p.unlockMovement = function(...args) {
       if (hasTarget(client)) {
-        // Clear future path state before original unlockMovement runs.
-        // Original unlockMovement still gets to do normal end-of-step cleanup.
         hardStop(client, false);
-
-        try {
-          this.__movementBuffer = null;
-          this.__lookDirectionBuffer = null;
-        } catch {}
-
-        return originalUnlockMovement.apply(this, args);
+        this.__movementBuffer = null;
+        this.__lookDirectionBuffer = null;
+        return orig.apply(this, args);
       }
-
-      return originalUnlockMovement.apply(this, args);
+      return orig.apply(this, args);
     };
-
     p.__stopOnTargetUnlockPatched = true;
-
     console.log(`${TAG} patched player.unlockMovement - smooth cleanup mode`);
   }
 
   function startStopLoop(client) {
-    let lastHadTarget = false;
-
+    let lastHad = false;
     setInterval(() => {
       const active = hasTarget(client);
       const now = performance.now();
-
       if (active) {
-        const shouldForce =
-          !lastHadTarget ||
-          now < state.forceStopUntil;
-
-        // Keep cancelling mapclick while target exists.
-        hardStop(client, shouldForce);
+        const force = !lastHad || now < state.forceStopUntil;
+        hardStop(client, force);
       }
-
-      lastHadTarget = active;
+      lastHad = active;
     }, 100);
-
     console.log(`${TAG} target stop loop running - balanced interval mode`);
   }
 
