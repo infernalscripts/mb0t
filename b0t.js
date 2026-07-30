@@ -216,7 +216,7 @@ window.__minibiaBotBundle.createBot = function createBot() {
 
   // ---- PUBLIC API ----
   return {
-    version: "0.3.0",
+    version: "0.5.0",
     addCleanup,
 
     /** Destroy the bot and all its modules (call before reload) */
@@ -3083,6 +3083,16 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     }
     return tiles;
   }
+  
+// -- container helper
+  
+function getContainerById(containerId) {
+  const containers = window.gameClient?.player?.__openedContainers;
+  if (!containers) return null;
+  // Convert to array if needed
+  const arr = Array.isArray(containers) ? containers : Array.from(containers);
+  return arr.find(c => c.__containerId === containerId) || null;
+}
 
   // ---- MINIMAP OVERLAY ----
   function ensureMinimapOverlayStyle() {
@@ -4623,6 +4633,674 @@ window.__minibiaBotBundle.installTalkModule = function installTalkModule(bot) {
   };
 };
 
+// Paladin
+
+window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(bot) {
+  const configStorageKey = "minibiaBot.paladin.config";
+  const LEFT_HAND_SLOT = 5;
+  const RIGHT_HAND_SLOT = 4;
+
+  const state = {
+    running: false,
+    timerId: null,
+    lastCraftAt: 0,
+    lastEquipAt: 0,
+    captureMode: false,
+  };
+
+  const config = Object.assign(
+    {
+      enabled: false,
+      tickMs: 2000,
+      ammoThreshold: 15,
+      craftManaCost: 140,
+      craftSpellWords: "exeta con",
+      highManaSpellWords: "utani hur",
+      highManaThreshold: 98,
+      weaponId: null,
+      equipWeapon: false,
+      equipCooldownMs: 5000,
+    },
+    bot.storage.get(configStorageKey, {})
+  );
+
+  function persistConfig() {
+    bot.storage.set(configStorageKey, { ...config });
+  }
+
+  function getContainerById(containerId) {
+    const containers = window.gameClient?.player?.__openedContainers;
+    if (!containers) return null;
+    let arr;
+    if (Array.isArray(containers)) arr = containers;
+    else if (containers instanceof Set) arr = Array.from(containers);
+    else if (containers instanceof Map) arr = Array.from(containers.values());
+    else if (typeof containers === 'object') arr = Object.values(containers);
+    else return null;
+    return arr.find(c => c.__containerId === containerId) || null;
+  }
+
+  function getContainersArray() {
+    const containers = window.gameClient?.player?.__openedContainers;
+    if (!containers) return [];
+    if (Array.isArray(containers)) return containers;
+    if (containers instanceof Set) return Array.from(containers);
+    if (containers instanceof Map) return Array.from(containers.values());
+    if (typeof containers === 'object') return Object.values(containers);
+    return [];
+  }
+
+  function readStats() {
+    const ps = bot.getPlayerState();
+    if (!ps) return null;
+    return {
+      hp: { current: ps.health ?? 0, max: ps.maxHealth ?? 0 },
+      mana: { current: ps.mana ?? 0, max: ps.maxMana ?? 0 },
+    };
+  }
+
+  function getManaPercent(stats) {
+    if (!stats || stats.mana.max <= 0) return 0;
+    return (stats.mana.current / stats.mana.max) * 100;
+  }
+
+  function getAmmoCount() {
+    const eq = window.gameClient?.player?.equipment;
+    if (!eq) return 0;
+
+    const leftItem = eq.getSlotItem(LEFT_HAND_SLOT);
+    const rightItem = eq.getSlotItem(RIGHT_HAND_SLOT);
+    const weaponId = config.weaponId;
+
+    let targetId = weaponId;
+    if (!targetId) {
+      targetId = leftItem ? leftItem.id : (rightItem ? rightItem.id : null);
+    }
+    if (!targetId) return 0;
+
+    let total = 0;
+    if (leftItem && leftItem.id === targetId) total += leftItem.count || 1;
+    if (rightItem && rightItem.id === targetId) total += rightItem.count || 1;
+
+    for (const container of getContainersArray()) {
+      if (!container || typeof container.size !== 'number') continue;
+      for (let i = 0; i < container.size; i++) {
+        const item = container.getSlotItem(i);
+        if (item && item.id === targetId) total += item.count || 1;
+      }
+    }
+    return total;
+  }
+
+  function findWeaponInContainers(weaponId, includeRightHand = false) {
+    if (!weaponId) return null;
+
+    if (includeRightHand) {
+      const eq = window.gameClient?.player?.equipment;
+      if (eq) {
+        const rightItem = eq.getSlotItem(RIGHT_HAND_SLOT);
+        if (rightItem && rightItem.id === weaponId) {
+          return { container: eq, slot: RIGHT_HAND_SLOT, item: rightItem };
+        }
+      }
+    }
+
+    for (const container of getContainersArray()) {
+      if (!container || typeof container.size !== 'number') continue;
+      for (let i = 0; i < container.size; i++) {
+        const item = container.getSlotItem(i);
+        if (item && item.id === weaponId) {
+          return { container, slot: i, item };
+        }
+      }
+    }
+
+    const eq = window.gameClient?.player?.equipment;
+    if (eq) {
+      for (let i = 0; i < eq.slots.length; i++) {
+        if (i === LEFT_HAND_SLOT || i === RIGHT_HAND_SLOT) continue;
+        const item = eq.getSlotItem(i);
+        if (item && item.id === weaponId) {
+          return { container: eq, slot: i, item };
+        }
+      }
+    }
+    return null;
+  }
+
+  function equipWeapon(weaponId) {
+    if (!weaponId) return false;
+
+    const eq = window.gameClient?.player?.equipment;
+    if (!eq) return false;
+
+    const source = findWeaponInContainers(weaponId, true);
+    if (!source) return false;
+
+    const from = { which: source.container, index: source.slot };
+    const to = { which: eq, index: LEFT_HAND_SLOT };
+    const count = source.item.count || 1;
+
+    try {
+      if (window.gameClient?.send) {
+        window.gameClient.send(new ItemMovePacket(from, to, count));
+        state.lastEquipAt = Date.now();
+        bot.log("Paladin: equipped weapon (moved from slot " + source.slot + " to left hand)", { weaponId });
+        return true;
+      }
+    } catch (e) {
+      bot.log("Paladin: ItemMovePacket failed", e);
+    }
+    return false;
+  }
+
+  function startCaptureWeapon() {
+    if (state.captureMode) return;
+    state.captureMode = true;
+    bot.log("Paladin: click a weapon slot (any container or equipment) to capture its ID");
+
+    const handler = (event) => {
+      const slot = event.target.closest(".slot[slotindex]");
+      if (!slot) return;
+      event.preventDefault();
+      event.stopPropagation();
+
+      let containerEl = slot.closest("[containerindex]");
+      if (!containerEl) containerEl = slot.closest("[containerIndex]");
+      if (!containerEl) {
+        const eq = window.gameClient?.player?.equipment;
+        if (eq) {
+          for (let i = 0; i < eq.slots.length; i++) {
+            const slotEl = eq.slots[i]?.element;
+            if (slotEl && slotEl.contains(slot)) {
+              const item = eq.getSlotItem(i);
+              if (item) {
+                config.weaponId = item.id;
+                persistConfig();
+                bot.log("Paladin: captured weapon ID from equipment", { weaponId: item.id });
+                const weaponIdInput = document.getElementById("minibia-bot-paladin-weapon-id");
+                if (weaponIdInput) weaponIdInput.value = item.id;
+                if (typeof bot.ui?.refreshPaladinStatus === "function") bot.ui.refreshPaladinStatus();
+                state.captureMode = false;
+                document.removeEventListener("click", handler, true);
+                return;
+              }
+            }
+          }
+        }
+        bot.log("Paladin: no container or equipment slot found");
+        state.captureMode = false;
+        document.removeEventListener("click", handler, true);
+        return;
+      }
+
+      const containerId = Number(containerEl.getAttribute("containerindex") || containerEl.getAttribute("containerIndex"));
+      const container = getContainerById(containerId);
+      if (!container) {
+        bot.log("Paladin: container not found", { containerId });
+        const available = getContainersArray().map(c => c.__containerId);
+        bot.log("Available containers:", available);
+        state.captureMode = false;
+        document.removeEventListener("click", handler, true);
+        return;
+      }
+
+      const slotIndex = Number(slot.getAttribute("slotindex"));
+      const item = container.getSlotItem(slotIndex);
+      if (!item) {
+        bot.log("Paladin: no item in slot");
+        state.captureMode = false;
+        document.removeEventListener("click", handler, true);
+        return;
+      }
+
+      config.weaponId = item.id;
+      persistConfig();
+      bot.log("Paladin: captured weapon ID", { weaponId: item.id });
+      const weaponIdInput = document.getElementById("minibia-bot-paladin-weapon-id");
+      if (weaponIdInput) weaponIdInput.value = item.id;
+      if (typeof bot.ui?.refreshPaladinStatus === "function") bot.ui.refreshPaladinStatus();
+
+      state.captureMode = false;
+      document.removeEventListener("click", handler, true);
+    };
+
+    document.addEventListener("click", handler, true);
+  }
+
+  // ---- Crafting - NO annoying logs ----
+  function tryCraft() {
+    if (!config.enabled) return false;
+    const stats = readStats();
+    if (!stats) return false;
+    const manaPercent = getManaPercent(stats);
+    const ammo = getAmmoCount();
+
+    if (manaPercent > config.highManaThreshold && config.highManaSpellWords) {
+      const sent = bot.sendChat(config.highManaSpellWords.trim());
+      if (sent) {
+        bot.log("Paladin: cast high mana spell", { spell: config.highManaSpellWords });
+        return true;
+      }
+    }
+
+    if (ammo <= config.ammoThreshold) {
+      if (stats.mana.current >= config.craftManaCost && config.craftSpellWords) {
+        const sent = bot.sendChat(config.craftSpellWords.trim());
+        if (sent) {
+          bot.log("Paladin: crafted ammo", { ammo, mana: stats.mana.current });
+          return true;
+        }
+      }
+      // SILENT: no log for insufficient mana
+    }
+    return false;
+  }
+
+  // ---- Loop ----
+  function tick() {
+    if (!state.running) return;
+    try {
+      if (config.equipWeapon && config.weaponId) {
+        const now = Date.now();
+        if (now - state.lastEquipAt > (config.equipCooldownMs || 5000)) {
+          equipWeapon(config.weaponId);
+        }
+      }
+      tryCraft();
+    } catch (e) {
+      bot.log("Paladin tick failed", e);
+    } finally {
+      scheduleNextTick();
+    }
+  }
+
+  function scheduleNextTick() {
+    if (!state.running) return;
+    state.timerId = window.setTimeout(tick, config.tickMs);
+  }
+
+  // ---- Public API ----
+  function start(overrides = {}) {
+    Object.assign(config, overrides, { enabled: true });
+    persistConfig();
+    if (state.running) return false;
+    state.running = true;
+    bot.log("Paladin started", { config });
+    tick();
+    return true;
+  }
+
+  function stop(options = {}) {
+    const shouldPersist = options.persistEnabled !== false;
+    state.running = false;
+    if (state.timerId != null) {
+      window.clearTimeout(state.timerId);
+      state.timerId = null;
+    }
+    if (shouldPersist) {
+      config.enabled = false;
+      persistConfig();
+    }
+    bot.log("Paladin stopped");
+    return true;
+  }
+
+  function status() {
+    const stats = readStats();
+    return {
+      running: state.running,
+      config: { ...config },
+      stats,
+      manaPercent: stats ? getManaPercent(stats) : 0,
+      ammoCount: getAmmoCount(),
+    };
+  }
+
+  function updateConfig(nextConfig = {}) {
+    Object.assign(config, nextConfig);
+    config.ammoThreshold = Math.max(0, Number(config.ammoThreshold) || 0);
+    config.craftManaCost = Math.max(0, Number(config.craftManaCost) || 0);
+    config.highManaThreshold = Math.min(100, Math.max(0, Number(config.highManaThreshold) || 0));
+    config.equipCooldownMs = Math.max(1000, Number(config.equipCooldownMs) || 5000);
+    if (config.weaponId !== null && config.weaponId !== undefined) {
+      config.weaponId = Number(config.weaponId) || null;
+    }
+    persistConfig();
+    bot.log("Paladin config updated", { ...config });
+    const weaponIdInput = document.getElementById("minibia-bot-paladin-weapon-id");
+    if (weaponIdInput) weaponIdInput.value = config.weaponId || "";
+    return { ...config };
+  }
+
+  if (config.enabled) start();
+
+  bot.paladin = {
+    start, stop, status, updateConfig,
+    config,
+    getAmmoCount,
+    equipWeapon,
+    tryCraft,
+    startCaptureWeapon,
+  };
+};
+
+// Looter
+
+window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot) {
+  const configStorageKey = "minibiaBot.looter.config";
+
+  const state = {
+    running: false,
+    timerId: null,
+    destinationId: null,
+    destinationTitle: null,
+    trackedItems: new Map(),
+    captureMode: false,
+  };
+
+  // Load config
+  const stored = bot.storage.get(configStorageKey, {});
+  state.destinationId = stored.destinationId || null;
+  state.destinationTitle = stored.destinationTitle || null;
+  if (Array.isArray(stored.trackedItems)) {
+    for (const [id, name] of stored.trackedItems) {
+      state.trackedItems.set(id, name);
+    }
+  }
+
+  function persistConfig() {
+    bot.storage.set(configStorageKey, {
+      destinationId: state.destinationId,
+      destinationTitle: state.destinationTitle,
+      trackedItems: Array.from(state.trackedItems.entries()),
+    });
+  }
+
+  // ---- Helper: get container by ID (works with number or string) ----
+  function getContainerById(containerId) {
+    const containers = window.gameClient?.player?.__openedContainers;
+    if (!containers) return null;
+    let arr;
+    if (Array.isArray(containers)) arr = containers;
+    else if (containers instanceof Set) arr = Array.from(containers);
+    else if (containers instanceof Map) arr = Array.from(containers.values());
+    else if (typeof containers === 'object') arr = Object.values(containers);
+    else return null;
+
+    // Convert to number for comparison (container IDs are numbers)
+    const id = Number(containerId);
+    if (isNaN(id)) return null;
+    return arr.find(c => c.__containerId === id) || null;
+  }
+
+  function getContainersArray() {
+    const containers = window.gameClient?.player?.__openedContainers;
+    if (!containers) return [];
+    if (Array.isArray(containers)) return containers;
+    if (containers instanceof Set) return Array.from(containers);
+    if (containers instanceof Map) return Array.from(containers.values());
+    if (typeof containers === 'object') return Object.values(containers);
+    return [];
+  }
+
+  // ---- Get destination container (fallback to title if ID fails) ----
+  function getDestinationContainer() {
+    let dest = null;
+
+    // 1) Try by ID
+    if (state.destinationId != null) {
+      dest = getContainerById(state.destinationId);
+      if (dest) return dest;
+    }
+
+    // 2) Try by title (if we have one)
+    if (state.destinationTitle) {
+      const containers = getContainersArray();
+      dest = containers.find(c => c.__title === state.destinationTitle);
+      if (dest) {
+        // Update stored ID to the new one for future lookups
+        state.destinationId = dest.__containerId;
+        persistConfig();
+        return dest;
+      }
+    }
+
+    return null;
+  }
+
+  function findEmptySlot(container) {
+    if (!container) return -1;
+    for (let i = 0; i < container.size; i++) {
+      if (!container.getSlotItem(i)) return i;
+    }
+    return -1;
+  }
+
+  function moveItems() {
+    if (!state.running) return false;
+    const dest = getDestinationContainer();
+    if (!dest) {
+      if (!state._lastDestLog || Date.now() - state._lastDestLog > 30000) {
+        state._lastDestLog = Date.now();
+        bot.log("Looter: no destination container found. Make sure it's open and selected.");
+      }
+      return false;
+    }
+
+    const containers = getContainersArray();
+    let moved = 0;
+
+    for (const container of containers) {
+      if (container.__containerId === dest.__containerId) continue;
+      for (let slot = 0; slot < container.size; slot++) {
+        const item = container.getSlotItem(slot);
+        if (!item) continue;
+        if (!state.trackedItems.has(item.id)) continue;
+
+        const targetSlot = findEmptySlot(dest);
+        if (targetSlot === -1) {
+          bot.log("Looter: destination container full");
+          return moved > 0;
+        }
+
+        try {
+          if (window.gameClient?.mouse?.sendItemMove) {
+            window.gameClient.mouse.sendItemMove(
+              { which: container, index: slot },
+              { which: dest, index: targetSlot },
+              item.count
+            );
+          } else if (window.gameClient?.send) {
+            const from = { which: container, index: slot };
+            const to = { which: dest, index: targetSlot };
+            window.gameClient.send(new ItemMovePacket(from, to, item.count));
+          }
+          moved++;
+        } catch (e) {
+          bot.log("Looter: move failed", e);
+        }
+      }
+    }
+
+    if (moved > 0) {
+      bot.log("Looter: moved", moved, "items");
+    }
+    return moved > 0;
+  }
+
+  function tick() {
+    if (!state.running) return;
+    try {
+      moveItems();
+    } catch (e) {
+      bot.log("Looter tick failed", e);
+    } finally {
+      scheduleNextTick();
+    }
+  }
+
+  function scheduleNextTick() {
+    if (!state.running) return;
+    state.timerId = window.setTimeout(tick, 1000);
+  }
+
+  function start() {
+    if (state.running) return false;
+    state.running = true;
+    bot.log("Looter started");
+    tick();
+    return true;
+  }
+
+  function stop() {
+    state.running = false;
+    if (state.timerId != null) {
+      window.clearTimeout(state.timerId);
+      state.timerId = null;
+    }
+    bot.log("Looter stopped");
+    return true;
+  }
+
+  function status() {
+    return {
+      running: state.running,
+      destinationId: state.destinationId,
+      destinationTitle: state.destinationTitle,
+      trackedItems: Array.from(state.trackedItems.entries()),
+    };
+  }
+
+  function updateConfig(next) {
+    if (next.destinationId !== undefined) {
+      state.destinationId = next.destinationId;
+    }
+    if (next.destinationTitle !== undefined) {
+      state.destinationTitle = next.destinationTitle;
+    }
+    if (Array.isArray(next.trackedItems)) {
+      state.trackedItems = new Map(next.trackedItems);
+    }
+    persistConfig();
+    return { destinationId: state.destinationId, destinationTitle: state.destinationTitle, trackedItems: Array.from(state.trackedItems.entries()) };
+  }
+
+  // ---- Capture item by clicking ----
+  function startCaptureItem() {
+    if (state.captureMode) return;
+    state.captureMode = true;
+    bot.log("Looter: click an item slot to track it");
+
+    const handler = (event) => {
+      const slot = event.target.closest(".slot[slotindex]");
+      if (!slot) return;
+      event.preventDefault();
+      event.stopPropagation();
+
+      const containerEl = slot.closest("[containerindex]");
+      if (!containerEl) {
+        bot.log("Looter: not in a container");
+        state.captureMode = false;
+        document.removeEventListener("click", handler, true);
+        return;
+      }
+
+      const containerId = Number(containerEl.getAttribute("containerindex"));
+      const container = getContainerById(containerId);
+      if (!container) {
+        bot.log("Looter: container not found", { containerId });
+        // Debug: list available container IDs
+        const available = getContainersArray().map(c => c.__containerId);
+        bot.log("Available containers:", available);
+        state.captureMode = false;
+        document.removeEventListener("click", handler, true);
+        return;
+      }
+
+      const slotIndex = Number(slot.getAttribute("slotindex"));
+      const item = container.getSlotItem(slotIndex);
+      if (!item) {
+        bot.log("Looter: no item in slot");
+        state.captureMode = false;
+        document.removeEventListener("click", handler, true);
+        return;
+      }
+
+      const itemName = window.gameClient?.itemDefinitionsBySid?.[item.sid]?.properties?.name || `Item ${item.id}`;
+      state.trackedItems.set(item.id, itemName);
+      persistConfig();
+      bot.log("Looter: added tracked item", { id: item.id, name: itemName });
+      state.captureMode = false;
+      document.removeEventListener("click", handler, true);
+      if (typeof bot.ui?.refreshLooterStatus === "function") bot.ui.refreshLooterStatus();
+    };
+
+    document.addEventListener("click", handler, true);
+  }
+
+  // ---- Select destination container by clicking ----
+  function startSelectDestination() {
+    if (state.captureMode) return;
+    state.captureMode = true;
+    bot.log("Looter: click a container window to set as destination");
+
+    const handler = (event) => {
+      const containerEl = event.target.closest("[containerindex]");
+      if (!containerEl) return;
+      event.preventDefault();
+      event.stopPropagation();
+
+      const containerId = Number(containerEl.getAttribute("containerindex"));
+      const container = getContainerById(containerId);
+      if (!container) {
+        bot.log("Looter: container not found", { containerId });
+        // Debug: list available container IDs
+        const available = getContainersArray().map(c => c.__containerId);
+        bot.log("Available containers:", available);
+        state.captureMode = false;
+        document.removeEventListener("click", handler, true);
+        return;
+      }
+
+      state.destinationId = containerId;
+      state.destinationTitle = container.__title || null;
+      persistConfig();
+      bot.log("Looter: destination set to", { containerId, title: state.destinationTitle });
+      state.captureMode = false;
+      document.removeEventListener("click", handler, true);
+      if (typeof bot.ui?.refreshLooterStatus === "function") bot.ui.refreshLooterStatus();
+    };
+
+    document.addEventListener("click", handler, true);
+  }
+
+  function removeTrackedItem(id) {
+    if (state.trackedItems.has(id)) {
+      state.trackedItems.delete(id);
+      persistConfig();
+      if (typeof bot.ui?.refreshLooterStatus === "function") bot.ui.refreshLooterStatus();
+      return true;
+    }
+    return false;
+  }
+
+  // ---- Public API ----
+  bot.looter = {
+    start,
+    stop,
+    status,
+    updateConfig,
+    startCaptureItem,
+    startSelectDestination,
+    removeTrackedItem,
+    getTrackedItems: () => Array.from(state.trackedItems.entries()),
+    getDestinationId: () => state.destinationId,
+    getDestinationTitle: () => state.destinationTitle,
+  };
+};
+
+
 /**
  * ==================================================================================
  * 14. UI PANEL
@@ -4665,6 +5343,75 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
       statusLabel.textContent = `Preferred mobs: ${names} | Mode: ${modeText}`;
     }
   }
+
+// ---- Paladin UI ----
+function refreshPaladinStatus() {
+  const toggle = document.getElementById("minibia-bot-paladin-enabled");
+  const statusLabel = document.getElementById("minibia-bot-paladin-status");
+  const ammoLabel = document.getElementById("minibia-bot-paladin-ammo");
+  const status = bot.paladin?.status?.();
+  if (toggle && document.activeElement !== toggle) {
+    toggle.checked = !!status?.running;
+  }
+  if (statusLabel) {
+    statusLabel.textContent = status?.running ? "Status: running" : "Status: idle";
+  }
+  if (ammoLabel) {
+    ammoLabel.textContent = status?.ammoCount ?? 0;
+  }
+}
+
+// ---- Looter UI ----
+function refreshLooterStatus() {
+  const toggle = document.getElementById("minibia-bot-looter-enabled");
+  const statusLabel = document.getElementById("minibia-bot-looter-status");
+  const destLabel = document.getElementById("minibia-bot-looter-dest-status");
+  const listContainer = document.getElementById("minibia-bot-looter-item-list");
+
+  const status = bot.looter?.status?.();
+  if (toggle && document.activeElement !== toggle) {
+    toggle.checked = !!status?.running;
+  }
+  if (statusLabel) {
+    statusLabel.textContent = status?.running ? "Status: running" : "Status: idle";
+  }
+  if (destLabel) {
+    const destId = bot.looter?.getDestinationId?.();
+    destLabel.textContent = destId ? `Destination: container ${destId}` : "No destination selected";
+  }
+
+  // Render tracked items
+  if (listContainer) {
+    const items = bot.looter?.getTrackedItems?.() || [];
+    listContainer.innerHTML = "";
+    if (!items.length) {
+      const empty = document.createElement("div");
+      empty.className = "mb-small-note";
+      empty.textContent = "No items tracked.";
+      listContainer.appendChild(empty);
+    } else {
+      for (const [id, name] of items) {
+        const row = document.createElement("div");
+        row.className = "mb-list-row";
+        row.style.cssText = "display:flex;justify-content:space-between;align-items:center;padding:2px 0;border-bottom:1px solid rgba(255,255,255,0.05);";
+        const label = document.createElement("span");
+        label.textContent = `${name} (${id})`;
+        const removeBtn = document.createElement("button");
+        removeBtn.type = "button";
+        removeBtn.className = "mb-small-button";
+        removeBtn.textContent = "✕";
+        removeBtn.style.cssText = "width:24px;padding:2px;background:#5a2020;color:#ff8888;border-color:#883030;";
+        removeBtn.addEventListener("click", () => {
+          bot.looter.removeTrackedItem(id);
+          refreshLooterStatus();
+        });
+        row.appendChild(label);
+        row.appendChild(removeBtn);
+        listContainer.appendChild(row);
+      }
+    }
+  }
+}
 
   function saveAutoAttackPreferredConfig() {
     const input = document.getElementById("minibia-bot-auto-attack-preferred-names");
@@ -5486,6 +6233,8 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
     <button type="button" class="mb-tab-button" data-tab-button="cave">Cavebot</button>
     <button type="button" class="mb-tab-button" data-tab-button="targeting">Targeting</button>
     <button type="button" class="mb-tab-button" data-tab-button="talk">Talk</button>
+	<button type="button" class="mb-tab-button" data-tab-button="paladin">Paladin</button>
+	<button type="button" class="mb-tab-button" data-tab-button="looter">Looter</button>
   </div>
   <div class="mb-tab-content">
     <!-- Healing Tab -->
@@ -5657,8 +6406,88 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
         </div>
       </div>
     </div>
-  </div>
-</div>
+
+    <!-- Paladin Tab -->
+    <div class="mb-tab-panel" data-tab-panel="paladin">
+      <div class="mb-section">
+        <div class="mb-label">Paladin Utilities</div>
+        <div class="mb-stack">
+          <label class="mb-toggle mb-toggle-main">
+            <input type="checkbox" id="minibia-bot-paladin-enabled" />
+            <span>Enable</span>
+          </label>
+          <div class="mb-form-grid">
+            <label class="mb-field" for="minibia-bot-paladin-ammo-threshold">
+              <span class="mb-field-label">Ammo Threshold</span>
+              <input type="number" id="minibia-bot-paladin-ammo-threshold" min="0" value="15" />
+            </label>
+            <label class="mb-field" for="minibia-bot-paladin-craft-mana">
+              <span class="mb-field-label">Craft Mana Cost</span>
+              <input type="number" id="minibia-bot-paladin-craft-mana" min="0" value="140" />
+            </label>
+          </div>
+          <label class="mb-field" for="minibia-bot-paladin-craft-spell">
+            <span class="mb-field-label">Craft Spell Words</span>
+            <input type="text" id="minibia-bot-paladin-craft-spell" placeholder="exeta con" />
+          </label>
+          <label class="mb-field" for="minibia-bot-paladin-high-mana-spell">
+            <span class="mb-field-label">High Mana Spell</span>
+            <input type="text" id="minibia-bot-paladin-high-mana-spell" placeholder="utani hur" />
+          </label>
+          <div class="mb-form-grid">
+            <label class="mb-field" for="minibia-bot-paladin-high-mana-threshold">
+              <span class="mb-field-label">High Mana %</span>
+              <input type="number" id="minibia-bot-paladin-high-mana-threshold" min="0" max="100" value="98" />
+            </label>
+            <label class="mb-field" for="minibia-bot-paladin-equip-cooldown">
+              <span class="mb-field-label">Equip Cooldown (ms)</span>
+              <input type="number" id="minibia-bot-paladin-equip-cooldown" min="1000" value="5000" />
+            </label>
+          </div>
+          <div style="display:flex; gap:6px; align-items:center;">
+            <label class="mb-toggle" style="margin:0;">
+              <input type="checkbox" id="minibia-bot-paladin-equip-weapon" />
+              <span>Equip Weapon</span>
+            </label>
+            <label class="mb-field" style="flex:1;">
+              <span class="mb-field-label">Weapon ID</span>
+              <input type="number" id="minibia-bot-paladin-weapon-id" placeholder="e.g., 1234" />
+            </label>
+            <button type="button" class="mb-small-button" id="minibia-bot-paladin-capture-weapon" style="width:auto;">Click to Capture</button>
+          </div>
+          <div class="mb-small-note" id="minibia-bot-paladin-status">Status: idle</div>
+          <div class="mb-small-note">Ammo count: <span id="minibia-bot-paladin-ammo">0</span></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Looter Tab -->
+    <div class="mb-tab-panel" data-tab-panel="looter">
+      <div class="mb-section">
+        <div class="mb-label">Auto Looter</div>
+        <div class="mb-stack">
+          <label class="mb-toggle mb-toggle-main">
+            <input type="checkbox" id="minibia-bot-looter-enabled" />
+            <span>Enable Looter</span>
+          </label>
+          <div style="display:flex; gap:6px;">
+            <button type="button" class="mb-small-button" id="minibia-bot-looter-select-dest" style="flex:1;">Set Destination</button>
+            <button type="button" class="mb-small-button" id="minibia-bot-looter-capture-item" style="flex:1;">Track Item</button>
+          </div>
+          <div class="mb-small-note" id="minibia-bot-looter-dest-status">No destination selected</div>
+          <div class="mb-label" style="font-size:12px; margin-top:4px;">Tracked Items</div>
+          <div id="minibia-bot-looter-item-list" style="max-height:150px; overflow-y:auto; border:1px solid rgba(224,200,148,0.2); border-radius:4px; padding:4px; font-size:11px;"></div>
+          <div style="display:flex; gap:6px; margin-top:4px;">
+            <input type="text" id="minibia-bot-looter-manual-input" placeholder="Item name" style="flex:1;" />
+            <button type="button" class="mb-small-button" id="minibia-bot-looter-manual-add">Add</button>
+          </div>
+          <div class="mb-small-note" id="minibia-bot-looter-status">Status: idle</div>
+        </div>
+      </div>
+    </div>
+
+  </div> <!-- end mb-tab-content -->
+</div> <!-- end mb-body -->
 `;
     document.body.appendChild(panel);
 
@@ -5716,6 +6545,137 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
     }
 
     // ---- EVENT LISTENERS ----
+	
+	// ---- Paladin listeners ----
+	const paladinToggle = panel.querySelector("#minibia-bot-paladin-enabled");
+	const paladinAmmoThreshold = panel.querySelector("#minibia-bot-paladin-ammo-threshold");
+	const paladinCraftMana = panel.querySelector("#minibia-bot-paladin-craft-mana");
+	const paladinCraftSpell = panel.querySelector("#minibia-bot-paladin-craft-spell");
+	const paladinHighManaSpell = panel.querySelector("#minibia-bot-paladin-high-mana-spell");
+	const paladinHighManaThreshold = panel.querySelector("#minibia-bot-paladin-high-mana-threshold");
+	const paladinEquipCooldown = panel.querySelector("#minibia-bot-paladin-equip-cooldown");
+	const paladinEquipWeapon = panel.querySelector("#minibia-bot-paladin-equip-weapon");
+	const paladinWeaponId = panel.querySelector("#minibia-bot-paladin-weapon-id");
+	const paladinCaptureBtn = panel.querySelector("#minibia-bot-paladin-capture-weapon");
+
+	function getPaladinConfigFromUI() {
+	  return {
+		ammoThreshold: parseInt(document.getElementById("minibia-bot-paladin-ammo-threshold")?.value, 10) || 20,
+		craftManaCost: parseInt(document.getElementById("minibia-bot-paladin-craft-mana")?.value, 10) || 100,
+		craftSpellWords: document.getElementById("minibia-bot-paladin-craft-spell")?.value?.trim() || "",
+		highManaSpellWords: document.getElementById("minibia-bot-paladin-high-mana-spell")?.value?.trim() || "",
+		highManaThreshold: parseInt(document.getElementById("minibia-bot-paladin-high-mana-threshold")?.value, 10) || 98,
+		equipCooldownMs: parseInt(document.getElementById("minibia-bot-paladin-equip-cooldown")?.value, 10) || 5000,
+		equipWeapon: document.getElementById("minibia-bot-paladin-equip-weapon")?.checked || false,
+		weaponId: parseInt(document.getElementById("minibia-bot-paladin-weapon-id")?.value, 10) || null,
+	  };
+	}
+
+	// Load initial values
+	if (paladinAmmoThreshold) paladinAmmoThreshold.value = bot.paladin?.config?.ammoThreshold ?? 20;
+	if (paladinCraftMana) paladinCraftMana.value = bot.paladin?.config?.craftManaCost ?? 100;
+	if (paladinCraftSpell) paladinCraftSpell.value = bot.paladin?.config?.craftSpellWords || "";
+	if (paladinHighManaSpell) paladinHighManaSpell.value = bot.paladin?.config?.highManaSpellWords || "";
+	if (paladinHighManaThreshold) paladinHighManaThreshold.value = bot.paladin?.config?.highManaThreshold ?? 98;
+	if (paladinEquipCooldown) paladinEquipCooldown.value = bot.paladin?.config?.equipCooldownMs ?? 5000;
+	// ---- Paladin UI  ----
+	if (paladinEquipWeapon) {
+	  paladinEquipWeapon.checked = bot.paladin?.config?.equipWeapon || false;
+	  paladinEquipWeapon.addEventListener("change", function() {
+		const config = getPaladinConfigFromUI();
+		config.equipWeapon = this.checked;
+		bot.paladin.updateConfig(config);
+		// ✅ If the box is checked AND the module is running, equip immediately
+		if (this.checked && bot.paladin?.status?.().running) {
+		  bot.paladin.equipWeapon(bot.paladin.config.weaponId);
+		}
+	  });
+	}
+	if (paladinWeaponId) paladinWeaponId.value = bot.paladin?.config?.weaponId ?? "";
+
+	if (paladinToggle) {
+	  paladinToggle.checked = !!bot.paladin?.status?.().running;
+	  paladinToggle.addEventListener("change", () => {
+		if (paladinToggle.checked) {
+		  const config = getPaladinConfigFromUI();
+		  bot.paladin.updateConfig(config);
+		  bot.paladin.start();
+		} else {
+		  bot.paladin.stop();
+		}
+		refreshPaladinStatus();
+	  });
+	}
+
+	// Capture weapon ID from left hand
+	if (paladinCaptureBtn) {
+	  paladinCaptureBtn.addEventListener("click", () => {
+		bot.paladin.startCaptureWeapon();
+	  });
+	}
+
+	// ---- Looter listeners ----
+	const looterToggle = panel.querySelector("#minibia-bot-looter-enabled");
+	const selectDestBtn = panel.querySelector("#minibia-bot-looter-select-dest");
+	const captureItemBtn = panel.querySelector("#minibia-bot-looter-capture-item");
+	const manualInput = panel.querySelector("#minibia-bot-looter-manual-input");
+	const manualAddBtn = panel.querySelector("#minibia-bot-looter-manual-add");
+
+	if (looterToggle) {
+	  looterToggle.checked = !!bot.looter?.status?.().running;
+	  looterToggle.addEventListener("change", () => {
+		if (looterToggle.checked) {
+		  bot.looter.start();
+		} else {
+		  bot.looter.stop();
+		}
+		refreshLooterStatus();
+	  });
+	}
+
+	if (selectDestBtn) {
+	  selectDestBtn.addEventListener("click", () => {
+		bot.looter.startSelectDestination();
+	  });
+	}
+
+	if (captureItemBtn) {
+	  captureItemBtn.addEventListener("click", () => {
+		bot.looter.startCaptureItem();
+	  });
+	}
+
+	if (manualAddBtn && manualInput) {
+	  const addManualItem = () => {
+		const name = manualInput.value.trim();
+		if (!name) return;
+		// Find item by name
+		const defs = window.gameClient?.itemDefinitionsBySid || {};
+		let found = null;
+		for (const [sid, def] of Object.entries(defs)) {
+		  if (def?.properties?.name?.toLowerCase() === name.toLowerCase()) {
+			found = { id: def.id, name: def.properties.name };
+			break;
+		  }
+		}
+		if (!found) {
+		  bot.log("Looter: item not found", name);
+		  return;
+		}
+		const current = bot.looter.getTrackedItems();
+		bot.looter.updateConfig({ trackedItems: [...current, [found.id, found.name]] });
+		refreshLooterStatus();
+		manualInput.value = "";
+	  };
+	  manualAddBtn.addEventListener("click", addManualItem);
+	  manualInput.addEventListener("keydown", (e) => {
+		if (e.key === "Enter") {
+		  e.preventDefault();
+		  addManualItem();
+		}
+	  });
+	}
+	
 	
     // Heal UI
     const healSave = panel.querySelector("#minibia-bot-heal-save");
@@ -5995,12 +6955,18 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
     refreshCaveWaypointList();
     refreshTalkIgnoredPhrases();
     refreshTitlebarRunIndicators();
+	refreshPaladinStatus();
+	refreshLooterStatus();
 
     // Periodic refreshes
     const visibleTimer = window.setInterval(refreshVisibleCreatures, 1000);
     bot.addCleanup(() => window.clearInterval(visibleTimer));
     const talkTimer = window.setInterval(refreshTalkStatus, 1000);
     bot.addCleanup(() => window.clearInterval(talkTimer));
+	const paladinTimer = window.setInterval(refreshPaladinStatus, 2000);
+	bot.addCleanup(() => window.clearInterval(paladinTimer));
+	const looterTimer = window.setInterval(refreshLooterStatus, 1000);
+	bot.addCleanup(() => window.clearInterval(looterTimer));
     const caveTimer = window.setInterval(() => {
       refreshCaveStatus();
       refreshCavePresetControls();
@@ -6124,6 +7090,8 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
     currentBundle.installEquipRingModule(bot);
     currentBundle.installAutoEatModule(bot);
     currentBundle.installTalkModule(bot);
+	currentBundle.installPaladinModule(bot);
+	currentBundle.installLooterModule(bot);
     currentBundle.installPanel(bot);
 
     bot.ui.inject();
