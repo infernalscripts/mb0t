@@ -4986,16 +4986,26 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
   }
 
   function refreshTalkStatus() {
-    const toggle = document.getElementById("minibia-bot-talk-enabled");
-    const label = document.getElementById("minibia-bot-talk-status");
-    const status = bot.talk?.status?.();
-    if (toggle) toggle.checked = !!status?.running;
-    if (label) {
-      if (!status?.config?.apiKey) label.textContent = "Status: API key missing";
-      else if (status?.pending) label.textContent = "Status: generating";
-      else if (status?.running) label.textContent = "Status: listening to Default";
-      else label.textContent = "Status: idle";
-    }
+	const toggle = document.getElementById("minibia-bot-talk-enabled");
+	const label = document.getElementById("minibia-bot-talk-status");
+	const status = bot.talk?.status?.();
+
+	// Only update checkbox if it's not currently focused (to avoid flicker)
+	if (toggle && document.activeElement !== toggle) {
+      toggle.checked = !!status?.running;
+	}
+
+	if (label) {
+	  if (!status?.config?.apiKey) {
+		label.textContent = "Status: API key missing";
+	  } else if (status?.pending) {
+		label.textContent = "Status: generating";
+	  } else if (status?.running) {
+		label.textContent = "Status: listening to Default";
+	  } else {
+		label.textContent = "Status: idle";
+	  }
+	}
   }
 
   function refreshTalkIgnoredPhrases() {
@@ -5812,6 +5822,46 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
       talkIgnoredInput.addEventListener("change", saveTalkIgnoredPhrases);
       talkIgnoredInput.addEventListener("blur", saveTalkIgnoredPhrases);
     }
+
+	//Talk main
+	const talkEnabledInput = panel.querySelector("#minibia-bot-talk-enabled");
+	const talkApiKeyInput = panel.querySelector("#minibia-bot-talk-api-key");
+	const talkPromptInput = panel.querySelector("#minibia-bot-talk-prompt");
+	
+	// --- Load talk config into UI ---
+	if (talkApiKeyInput) {
+	  talkApiKeyInput.value = bot.talk?.config?.apiKey || "";
+	}
+	if (talkPromptInput) {
+	  talkPromptInput.value = bot.talk?.config?.systemPrompt || "";
+	}
+
+	if (talkEnabledInput) {
+	  talkEnabledInput.checked = !!bot.talk?.status?.().running;
+	  talkEnabledInput.addEventListener("change", function () {
+		// Disable the checkbox briefly to prevent rapid clicks
+		this.disabled = true;
+
+		const apiKey = talkApiKeyInput?.value?.trim() || "";
+		const systemPrompt = talkPromptInput?.value?.trim() || bot.talk.config.systemPrompt || "";
+
+		if (this.checked) {
+		  // Save config first
+		  bot.talk.updateConfig({ apiKey, systemPrompt });
+		  const started = bot.talk.start();
+		  if (!started) {
+			// If start failed, uncheck and show status
+			this.checked = false;
+			// The refresh will show the error
+		  }
+		} else {
+		  bot.talk.stop();
+		}
+
+		refreshTalkStatus();
+		this.disabled = false;
+	  });
+	}
 
     // Cave bot waypoint actions
     const addBtn = panel.querySelector("#minibia-bot-cave-add");
