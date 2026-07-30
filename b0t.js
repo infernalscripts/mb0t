@@ -1,14 +1,14 @@
 /**
  * ==================================================================================
- * This file is a self‑contained bundle that:
+ * This file is a self-contained bundle that:
  * 1. Defines a core bot factory (createBot)
- * 2. Installs functional modules (PZ, Xray, Panic, Rune, Heal, Invisible, Magic Shield,
- *    Auto Attack, Cave, Equip Ring, Auto Eat, Talk, and UI Panel)
- * 3. Bootstraps the bot on page load and provides a hot‑reload mechanism
- *
+ * 2. Installs functional modules (PZ, Xray, Panic, Rune, Heal, Invisible,
+ *    Magic Shield, Auto Attack, Cave, Equip Ring, Auto Eat, Talk, and UI Panel)
+ * 3. Bootstraps the bot on page load and provides a hot-reload mechanism
+ * 
  * All persistent settings are stored in localStorage under keys like:
  *   minibiaBot.*.config
- *
+ * 
  * The bot is exposed globally as `window.minibiaBot`.
  * ==================================================================================
  */
@@ -4619,12 +4619,12 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
   const panelPositionKey = "minibiaBot.ui.panelPosition";
   const panelCollapsedKey = "minibiaBot.ui.panelCollapsed";
 
+  // ---- UTILITY FUNCTIONS ----
   function destroy() {
     document.getElementById("minibia-bot-panel")?.remove();
     document.getElementById("minibia-bot-style")?.remove();
   }
 
-  // ---- UTILITY FUNCTIONS (same as before) ----
   function parsePreferredTargetNames(value) {
     return String(value || "")
       .split(/[\n,]/)
@@ -4633,7 +4633,7 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
       .filter((name, idx, arr) => arr.findIndex(o => o.toLowerCase() === name.toLowerCase()) === idx);
   }
 
-  // ---- REFRESH FUNCTIONS ----
+  // ---- REFRESH FUNCTIONS (tie UI to bot state) ----
   function refreshAutoAttackPreferredStatus(options = {}) {
     const force = options.force === true;
     const input = document.getElementById("minibia-bot-auto-attack-preferred-names");
@@ -4661,7 +4661,7 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
     bot.log?.("auto attack preferred targets updated", { preferredTargetNames: preferred, preferredMatchMode: mode });
   }
 
-  // ---- Heal UI ----
+  // ---- HEAL UI ----
   let healEditIndex = null;
 
   function getHealRuleFormValues() {
@@ -4806,7 +4806,7 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
     if (toggle) toggle.checked = !!bot.heal?.status?.().running;
   }
 
-  // ---- Auto Attack Status ----
+  // ---- AUTO ATTACK STATUS ----
   function refreshAutoAttackStatus() {
     const status = bot.attack?.status?.();
     const attackConfig = status?.config || bot.attack?.config || {};
@@ -4842,7 +4842,7 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
     if (typeof refreshTitlebarRunIndicators === "function") refreshTitlebarRunIndicators();
   }
 
-  // ---- Panic / Home / Xray etc. (keep as original) ----
+  // ---- PANIC / HOME / XRAY / etc. ----
   function refreshHomeLabel() {
     const label = document.getElementById("minibia-bot-home");
     if (!label) return;
@@ -5014,7 +5014,7 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
     refreshTalkIgnoredPhrases();
   }
 
-  // ---- Cave UI ----
+  // ---- CAVE UI ----
   function refreshCavePresetControls() {
     const select = document.getElementById("minibia-bot-cave-preset-select");
     const label = document.getElementById("minibia-bot-cave-preset-status");
@@ -5068,6 +5068,7 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
     label.textContent = `Transitions learned: ${latest.from.x}, ${latest.from.y}, ${latest.from.z} -> ${latest.to.x}, ${latest.to.y}, ${latest.to.z}${extra}`;
   }
 
+  // ---- CAVE WAYPOINT LIST ----
   let selectedWaypointIndex = null;
 
   function refreshCaveWaypointList() {
@@ -5178,7 +5179,7 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
     }
   }
 
-  // ---- Visible Creatures List ----
+  // ---- VISIBLE CREATURES LIST ----
   function refreshVisibleCreatures() {
     const list = document.getElementById("minibia-bot-visible-creatures-list");
     if (!list) return;
@@ -5244,7 +5245,7 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
     });
   }
 
-  // ---- Panel positioning ----
+  // ---- PANEL POSITION / COLLAPSE ----
   function savePanelPosition(position, key = panelPositionKey) {
     bot.storage.set(key, position);
   }
@@ -5324,6 +5325,7 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
     btn.style.display = panel.dataset.collapsed === "true" ? "" : "none";
   }
 
+  // ---- TITLE BAR RUN INDICATORS (clickable) ----
   function refreshTitlebarRunIndicators() {
     const panel = document.getElementById("minibia-bot-panel");
     if (!panel) return;
@@ -5348,10 +5350,11 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
     try { refreshCaveStatus?.(); refreshAutoAttackStatus?.(); refreshTitlebarRunIndicators?.(); } catch {}
   }
 
-  // ---- INJECT ----
+  // ---- INJECT THE PANEL ----
   function inject() {
     destroy();
 
+    // Inject styles
     const style = document.createElement("style");
     style.id = "minibia-bot-style";
     style.textContent = `
@@ -5365,55 +5368,25 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
       #minibia-bot-panel .mb-run-indicator { cursor: pointer; transition: background 0.15s, border-color 0.15s; }
       #minibia-bot-panel .mb-run-indicator:hover { background: rgba(255,255,255,0.08); border-color: rgba(224,200,148,0.6); }
       #minibia-bot-panel[data-collapsed="true"] { width: 240px; }
-      #minibia-bot-panel .mb-titlebar {
-        display: grid; grid-template-columns: auto minmax(0,1fr) auto;
-        align-items: center; gap: 8px; margin: 0 0 8px;
-      }
+      #minibia-bot-panel .mb-titlebar { display: grid; grid-template-columns: auto minmax(0,1fr) auto; align-items: center; gap: 8px; margin: 0 0 8px; }
       #minibia-bot-panel[data-collapsed="true"] .mb-titlebar { margin-bottom: 0; }
-      #minibia-bot-panel .mb-title-status {
-        display: flex; align-items: center; justify-content: flex-end; gap: 6px; min-width: 0;
-      }
-      #minibia-bot-panel .mb-run-indicator {
-        display: inline-flex; align-items: center; gap: 4px;
-        padding: 2px 6px; border: 1px solid rgba(224,200,148,0.22);
-        border-radius: 999px; background: rgba(8,7,6,0.55);
-        color: #b7a67d; font-size: 10px; line-height: 1.2; white-space: nowrap;
-      }
-      #minibia-bot-panel .mb-run-dot {
-        width: 7px; height: 7px; border-radius: 50%; background: #5b5547;
-        box-shadow: 0 0 0 1px rgba(0,0,0,0.45);
-      }
-      #minibia-bot-panel .mb-run-indicator[data-running="true"] {
-        color: #d7ffd7; border-color: rgba(90,220,120,0.42);
-        background: rgba(20,70,28,0.35);
-      }
-      #minibia-bot-panel .mb-run-indicator[data-running="true"] .mb-run-dot {
-        background: #39e86f;
-        box-shadow: 0 0 0 1px rgba(0,0,0,0.45), 0 0 7px rgba(57,232,111,0.8);
-      }
+      #minibia-bot-panel .mb-title-status { display: flex; align-items: center; justify-content: flex-end; gap: 6px; min-width: 0; }
+      #minibia-bot-panel .mb-run-indicator { display: inline-flex; align-items: center; gap: 4px; padding: 2px 6px; border: 1px solid rgba(224,200,148,0.22); border-radius: 999px; background: rgba(8,7,6,0.55); color: #b7a67d; font-size: 10px; line-height: 1.2; white-space: nowrap; }
+      #minibia-bot-panel .mb-run-dot { width: 7px; height: 7px; border-radius: 50%; background: #5b5547; box-shadow: 0 0 0 1px rgba(0,0,0,0.45); }
+      #minibia-bot-panel .mb-run-indicator[data-running="true"] { color: #d7ffd7; border-color: rgba(90,220,120,0.42); background: rgba(20,70,28,0.35); }
+      #minibia-bot-panel .mb-run-indicator[data-running="true"] .mb-run-dot { background: #39e86f; box-shadow: 0 0 0 1px rgba(0,0,0,0.45), 0 0 7px rgba(57,232,111,0.8); }
       #minibia-bot-panel .mb-title-actions { display: flex; gap: 6px; align-items: center; }
       #minibia-bot-panel .mb-title { margin: 0; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; cursor: move; color: #ffe7ad; }
       #minibia-bot-panel .mb-icon-button { width: 24px; min-width: 24px; padding: 2px 0; border-radius: 6px; font-weight: 700; line-height: 1; }
       #minibia-bot-panel .mb-body { display: grid; grid-template-columns: 112px minmax(0,1fr); gap: 10px; align-items: start; }
       #minibia-bot-panel .mb-body[hidden] { display: none !important; }
       #minibia-bot-panel .mb-tab-menu { display: grid; gap: 6px; }
-      #minibia-bot-panel .mb-tab-button {
-        width: 100%; padding: 8px 9px; border-radius: 7px; text-align: left;
-        font-size: 11px; line-height: 1.15; background: rgba(255,244,212,0.07);
-      }
-      #minibia-bot-panel .mb-tab-button[data-active="true"] {
-        background: linear-gradient(180deg,#8a7044,#554329);
-        border-color: rgba(224,200,148,0.75); color: #fff3cf;
-      }
-      #minibia-bot-panel .mb-tab-content {
-        min-width: 0; max-height: min(72vh,560px); overflow-y: auto; padding-right: 4px;
-      }
+      #minibia-bot-panel .mb-tab-button { width: 100%; padding: 8px 9px; border-radius: 7px; text-align: left; font-size: 11px; line-height: 1.15; background: rgba(255,244,212,0.07); }
+      #minibia-bot-panel .mb-tab-button[data-active="true"] { background: linear-gradient(180deg,#8a7044,#554329); border-color: rgba(224,200,148,0.75); color: #fff3cf; }
+      #minibia-bot-panel .mb-tab-content { min-width: 0; max-height: min(72vh,560px); overflow-y: auto; padding-right: 4px; }
       #minibia-bot-panel .mb-tab-panel { display: none; }
       #minibia-bot-panel .mb-tab-panel[data-active="true"] { display: grid; gap: 10px; }
-      #minibia-bot-panel .mb-section {
-        padding: 12px; border: 1px solid rgba(224,200,148,0.18);
-        border-radius: 8px; background: rgba(8,7,6,0.86);
-      }
+      #minibia-bot-panel .mb-section { padding: 12px; border: 1px solid rgba(224,200,148,0.18); border-radius: 8px; background: rgba(8,7,6,0.86); }
       #minibia-bot-panel .mb-label { margin: 0 0 10px; color: #ffe5a8; font-weight: 700; font-size: 13px; }
       #minibia-bot-panel .mb-stack { display: grid; gap: 10px; }
       #minibia-bot-panel .mb-form-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 10px; }
@@ -5428,9 +5401,7 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
         background: #080706; color: #fff2c7; font: inherit;
         box-shadow: inset 0 1px 2px rgba(0,0,0,0.65); caret-color: #fff2c7;
       }
-      #minibia-bot-panel input::placeholder, #minibia-bot-panel textarea::placeholder {
-        color: rgba(255,226,176,0.48);
-      }
+      #minibia-bot-panel input::placeholder, #minibia-bot-panel textarea::placeholder { color: rgba(255,226,176,0.48); }
       #minibia-bot-panel input:focus, #minibia-bot-panel textarea:focus, #minibia-bot-panel select:focus {
         outline: none; border-color: rgba(255,220,140,0.9);
         box-shadow: inset 0 1px 2px rgba(0,0,0,0.65), 0 0 0 2px rgba(255,200,90,0.18);
@@ -5439,11 +5410,7 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
       #minibia-bot-panel .mb-toggle { display: flex; align-items: center; gap: 8px; color: #f3dfad; white-space: normal; }
       #minibia-bot-panel .mb-toggle-main { margin-bottom: 2px; }
       #minibia-bot-panel input[type="checkbox"] { width: 14px; height: 14px; margin: 0; accent-color: #18c99a; }
-      #minibia-bot-panel button {
-        width: 100%; padding: 8px 10px;
-        border: 1px solid rgba(224,200,148,0.35); border-radius: 8px;
-        background: linear-gradient(180deg,#635133,#3f321f); color: #fff0ca; font: inherit; cursor: pointer;
-      }
+      #minibia-bot-panel button { width: 100%; padding: 8px 10px; border: 1px solid rgba(224,200,148,0.35); border-radius: 8px; background: linear-gradient(180deg,#635133,#3f321f); color: #fff0ca; font: inherit; cursor: pointer; }
       #minibia-bot-panel button:hover { background: linear-gradient(180deg,#755f3d,#4f4028); }
       #minibia-bot-panel .mb-small-button { width: auto; padding: 6px 8px; border-radius: 6px; }
       #minibia-bot-panel .mb-inline { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 8px; align-items: center; }
@@ -5454,14 +5421,9 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
       #minibia-bot-panel .mb-floor-label { margin-top: 4px; color: #e2cf9c; font-size: 11px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; }
       #minibia-bot-panel #minibia-bot-visible-creatures-list,
       #minibia-bot-panel #minibia-bot-panic-trusted-list,
-      #minibia-bot-panel #minibia-bot-panic-gm-list {
-        max-height: 150px; overflow-y: auto; padding-right: 2px;
-      }
+      #minibia-bot-panel #minibia-bot-panic-gm-list { max-height: 150px; overflow-y: auto; padding-right: 2px; }
       #minibia-bot-panel .mb-small-note, #minibia-bot-panel .mb-note { color: #cdbb8b; font-size: 11px; line-height: 1.35; }
-      #minibia-bot-panel .mb-collapsed-stop-button {
-        background: linear-gradient(180deg,#7a2f2f,#4e1f1f);
-        border-color: rgba(255,120,120,0.55); color: #ffd6d6;
-      }
+      #minibia-bot-panel .mb-collapsed-stop-button { background: linear-gradient(180deg,#7a2f2f,#4e1f1f); border-color: rgba(255,120,120,0.55); color: #ffd6d6; }
       #minibia-bot-panel .mb-collapsed-stop-button:hover { background: linear-gradient(180deg,#963b3b,#642727); }
       #minibia-bot-panel[data-collapsed="false"] .mb-collapsed-stop-button { display: none; }
       @media (max-width:760px) {
@@ -5469,36 +5431,27 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
         #minibia-bot-panel .mb-body { grid-template-columns: 1fr; }
         #minibia-bot-panel .mb-tab-menu { grid-template-columns: repeat(3,minmax(0,1fr)); }
         #minibia-bot-panel .mb-tab-button { text-align: center; }
-        #minibia-bot-panel .mb-form-grid,
-        #minibia-bot-panel .mb-button-grid,
-        #minibia-bot-panel .mb-utility-row { grid-template-columns: 1fr; }
+        #minibia-bot-panel .mb-form-grid, #minibia-bot-panel .mb-button-grid, #minibia-bot-panel .mb-utility-row { grid-template-columns: 1fr; }
         #minibia-bot-panel .mb-mini-field { width: 100%; }
       }
     `;
     document.head.appendChild(style);
 
-    // ---- PANEL HTML ----
+    // ---- PANEL HTML (full) ----
     const panel = document.createElement("div");
     panel.id = "minibia-bot-panel";
     panel.innerHTML = `
 <div class="mb-titlebar">
   <div class="mb-title">MBot</div>
   <div class="mb-title-status">
-    <span class="mb-run-indicator" id="minibia-bot-title-cave-status" data-running="false">
-      <span class="mb-run-dot"></span>
-      <span class="mb-run-label">Cave</span>
-    </span>
-    <span class="mb-run-indicator" id="minibia-bot-title-attack-status" data-running="false">
-      <span class="mb-run-dot"></span>
-      <span class="mb-run-label">Target</span>
-    </span>
+    <span class="mb-run-indicator" id="minibia-bot-title-cave-status" data-running="false"><span class="mb-run-dot"></span><span class="mb-run-label">Cave</span></span>
+    <span class="mb-run-indicator" id="minibia-bot-title-attack-status" data-running="false"><span class="mb-run-dot"></span><span class="mb-run-label">Target</span></span>
   </div>
   <div class="mb-title-actions">
-    <button type="button" class="mb-icon-button mb-collapsed-stop-button" id="minibia-bot-collapsed-stop" title="Stop Cave + Attack" aria-label="Stop Cave and Attack">■</button>
-    <button type="button" class="mb-icon-button" id="minibia-bot-collapse" aria-label="Minimize panel" title="Minimize">−</button>
+    <button type="button" class="mb-icon-button mb-collapsed-stop-button" id="minibia-bot-collapsed-stop" title="Stop Cave + Attack">■</button>
+    <button type="button" class="mb-icon-button" id="minibia-bot-collapse" title="Minimize">−</button>
   </div>
 </div>
-
 <div class="mb-body">
   <div class="mb-tab-menu">
     <button type="button" class="mb-tab-button" data-tab-button="healing">Healing</button>
@@ -5509,60 +5462,29 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
     <button type="button" class="mb-tab-button" data-tab-button="targeting">Targeting</button>
     <button type="button" class="mb-tab-button" data-tab-button="talk">Talk</button>
   </div>
-
   <div class="mb-tab-content">
     <!-- Healing Tab -->
     <div class="mb-tab-panel" data-tab-panel="healing">
       <div class="mb-section">
         <div class="mb-label">Auto Heal</div>
-        <label class="mb-toggle mb-toggle-main">
-          <input type="checkbox" id="minibia-bot-auto-heal-enabled" />
-          <span>Enable Auto Heal</span>
-        </label>
+        <label class="mb-toggle mb-toggle-main"><input type="checkbox" id="minibia-bot-auto-heal-enabled" /><span>Enable Auto Heal</span></label>
         <div id="minibia-bot-heal-rules-list" class="mb-list" style="margin:8px 0;"></div>
         <div class="mb-section" style="padding:10px;background:rgba(255,255,255,0.03);">
           <div class="mb-label" style="font-size:12px;margin-bottom:6px;">Add / Edit Rule</div>
           <div style="display:grid;grid-template-columns:80px 1fr 80px;gap:6px;margin-bottom:6px;">
-            <label class="mb-field" for="minibia-bot-heal-slot">
-              <span class="mb-field-label">Slot</span>
-              <input type="number" id="minibia-bot-heal-slot" min="1" max="12" value="1" />
-            </label>
-            <label class="mb-field" for="minibia-bot-heal-spell">
-              <span class="mb-field-label">Spell Words (optional)</span>
-              <input type="text" id="minibia-bot-heal-spell" placeholder="ex: exura" />
-            </label>
-            <label class="mb-field" for="minibia-bot-heal-manacost">
-              <span class="mb-field-label">Mana Cost</span>
-              <input type="number" id="minibia-bot-heal-manacost" min="1" value="0" placeholder="0" />
-            </label>
+            <label class="mb-field" for="minibia-bot-heal-slot"><span class="mb-field-label">Slot</span><input type="number" id="minibia-bot-heal-slot" min="1" max="12" value="1" /></label>
+            <label class="mb-field" for="minibia-bot-heal-spell"><span class="mb-field-label">Spell Words (optional)</span><input type="text" id="minibia-bot-heal-spell" placeholder="ex: exura" /></label>
+            <label class="mb-field" for="minibia-bot-heal-manacost"><span class="mb-field-label">Mana Cost</span><input type="number" id="minibia-bot-heal-manacost" min="1" value="0" placeholder="0" /></label>
           </div>
           <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:6px;margin-bottom:6px;">
-            <label class="mb-field" for="minibia-bot-heal-minhp">
-              <span class="mb-field-label">Min HP %</span>
-              <input type="number" id="minibia-bot-heal-minhp" min="0" max="100" value="0" />
-            </label>
-            <label class="mb-field" for="minibia-bot-heal-maxhp">
-              <span class="mb-field-label">Max HP %</span>
-              <input type="number" id="minibia-bot-heal-maxhp" min="0" max="100" value="100" />
-            </label>
-            <label class="mb-field" for="minibia-bot-heal-minmana">
-              <span class="mb-field-label">Min MP %</span>
-              <input type="number" id="minibia-bot-heal-minmana" min="0" max="100" value="0" />
-            </label>
-            <label class="mb-field" for="minibia-bot-heal-maxmana">
-              <span class="mb-field-label">Max MP %</span>
-              <input type="number" id="minibia-bot-heal-maxmana" min="0" max="100" value="100" />
-            </label>
+            <label class="mb-field" for="minibia-bot-heal-minhp"><span class="mb-field-label">Min HP %</span><input type="number" id="minibia-bot-heal-minhp" min="0" max="100" value="0" /></label>
+            <label class="mb-field" for="minibia-bot-heal-maxhp"><span class="mb-field-label">Max HP %</span><input type="number" id="minibia-bot-heal-maxhp" min="0" max="100" value="100" /></label>
+            <label class="mb-field" for="minibia-bot-heal-minmana"><span class="mb-field-label">Min MP %</span><input type="number" id="minibia-bot-heal-minmana" min="0" max="100" value="0" /></label>
+            <label class="mb-field" for="minibia-bot-heal-maxmana"><span class="mb-field-label">Max MP %</span><input type="number" id="minibia-bot-heal-maxmana" min="0" max="100" value="100" /></label>
           </div>
-          <div style="display:flex;gap:6px;">
-            <button type="button" id="minibia-bot-heal-save" style="flex:1;">Add Rule</button>
-            <button type="button" id="minibia-bot-heal-cancel" style="flex:0;width:auto;padding:8px 12px;">Cancel</button>
-          </div>
+          <div style="display:flex;gap:6px;"><button type="button" id="minibia-bot-heal-save" style="flex:1;">Add Rule</button><button type="button" id="minibia-bot-heal-cancel" style="flex:0;width:auto;padding:8px 12px;">Cancel</button></div>
         </div>
-        <div class="mb-small-note" style="margin-top:6px;">
-          Rules are checked in order. First rule whose HP and MP ranges match will trigger.
-          If spell words are given, mana cost must be set (and current mana must be ≥ that).
-        </div>
+        <div class="mb-small-note" style="margin-top:6px;">Rules are checked in order. First rule whose HP and MP ranges match will trigger. If spell words are given, mana cost must be set (and current mana must be ≥ that).</div>
       </div>
     </div>
 
@@ -5576,24 +5498,15 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
           <label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-health" /><span>Lose Health</span></label>
           <label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-return" /><span>Auto Return</span></label>
           <label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-player-alert" /><span>Player On‑Screen Alert (sound only)</span></label>
-          <div style="display:flex;gap:6px;align-items:center;">
-            <label style="font-size:11px;color:#e9d39b;">Cooldown (seconds)</label>
-            <input type="number" id="minibia-bot-panic-player-cooldown" min="10" value="60" style="width:60px;padding:2px 4px;font-size:11px;" />
-          </div>
-          <div class="mb-inline">
-            <input type="text" id="minibia-bot-panic-trusted-input" placeholder="Trusted name" />
-            <button type="button" class="mb-small-button" id="minibia-bot-panic-trusted-add">Add</button>
-          </div>
+          <div style="display:flex;gap:6px;align-items:center;"><label style="font-size:11px;color:#e9d39b;">Cooldown (seconds)</label><input type="number" id="minibia-bot-panic-player-cooldown" min="10" value="60" style="width:60px;padding:2px 4px;font-size:11px;" /></div>
+          <div class="mb-inline"><input type="text" id="minibia-bot-panic-trusted-input" placeholder="Trusted name" /><button type="button" class="mb-small-button" id="minibia-bot-panic-trusted-add">Add</button></div>
           <div class="mb-list" id="minibia-bot-panic-trusted-list"></div>
         </div>
       </div>
       <div class="mb-section">
         <div class="mb-label">GM Kill Switch</div>
         <div class="mb-stack">
-          <div class="mb-inline">
-            <input type="text" id="minibia-bot-panic-gm-input" placeholder="Game master name" />
-            <button type="button" class="mb-small-button" id="minibia-bot-panic-gm-add">Add</button>
-          </div>
+          <div class="mb-inline"><input type="text" id="minibia-bot-panic-gm-input" placeholder="Game master name" /><button type="button" class="mb-small-button" id="minibia-bot-panic-gm-add">Add</button></div>
           <div class="mb-list" id="minibia-bot-panic-gm-list"></div>
         </div>
       </div>
@@ -5606,10 +5519,7 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
         <div class="mb-stack">
           <button type="button" class="mb-small-button" id="minibia-bot-xray-overlay-toggle">Disable Overlay</button>
           <div class="mb-small-note" id="minibia-bot-xray-overlay-status">Overlay: on</div>
-          <label class="mb-field" for="minibia-bot-xray-floor-select">
-            <span class="mb-field-label">Floor Filter</span>
-            <select id="minibia-bot-xray-floor-select"><option value="all">All floors</option></select>
-          </label>
+          <label class="mb-field" for="minibia-bot-xray-floor-select"><span class="mb-field-label">Floor Filter</span><select id="minibia-bot-xray-floor-select"><option value="all">All floors</option></select></label>
           <div class="mb-list" id="minibia-bot-visible-creatures-list"></div>
         </div>
       </div>
@@ -5617,10 +5527,7 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
 
     <!-- Utility Tab -->
     <div class="mb-tab-panel" data-tab-panel="utility">
-      <div class="mb-section">
-        <div class="mb-label">Bot</div>
-        <button type="button" id="minibia-bot-reload">Reload Bot</button>
-      </div>
+      <div class="mb-section"><div class="mb-label">Bot</div><button type="button" id="minibia-bot-reload">Reload Bot</button></div>
       <div class="mb-section">
         <div class="mb-label">Magic Level Trainer</div>
         <label class="mb-toggle mb-toggle-main"><input type="checkbox" id="minibia-bot-rune-enabled" /><span>Enable Trainer</span></label>
@@ -5632,10 +5539,7 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
       <div class="mb-section">
         <div class="mb-label">Utility Modules</div>
         <div class="mb-stack">
-          <div class="mb-utility-row">
-            <label class="mb-toggle"><input type="checkbox" id="minibia-bot-auto-eat-enabled" /><span>Auto Eat</span></label>
-            <label class="mb-field mb-mini-field" for="minibia-bot-auto-eat-hotkey"><span class="mb-field-label">Hotkey</span><input type="number" id="minibia-bot-auto-eat-hotkey" min="1" max="12" placeholder="10" /></label>
-          </div>
+          <div class="mb-utility-row"><label class="mb-toggle"><input type="checkbox" id="minibia-bot-auto-eat-enabled" /><span>Auto Eat</span></label><label class="mb-field mb-mini-field" for="minibia-bot-auto-eat-hotkey"><span class="mb-field-label">Hotkey</span><input type="number" id="minibia-bot-auto-eat-hotkey" min="1" max="12" placeholder="10" /></label></div>
           <label class="mb-toggle"><input type="checkbox" id="minibia-bot-auto-invisible-enabled" /><span>Auto Invisible</span></label>
           <label class="mb-toggle"><input type="checkbox" id="minibia-bot-auto-magic-shield-enabled" /><span>Auto Utamo Vita</span></label>
           <label class="mb-toggle"><input type="checkbox" id="minibia-bot-equip-ring-enabled" /><span>Equip Ring</span></label>
@@ -5787,6 +5691,220 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
     }
 
     // ---- EVENT LISTENERS ----
+	
+    // Heal UI
+    const healSave = panel.querySelector("#minibia-bot-heal-save");
+    const healCancel = panel.querySelector("#minibia-bot-heal-cancel");
+    if (healSave) healSave.addEventListener("click", saveHealRule);
+    if (healCancel) healCancel.addEventListener("click", clearHealRuleForm);
+
+    const autoHealToggle = panel.querySelector("#minibia-bot-auto-heal-enabled");
+    if (autoHealToggle) {
+      autoHealToggle.checked = !!bot.heal?.status?.().running;
+      autoHealToggle.addEventListener("change", () => {
+        if (autoHealToggle.checked) bot.heal.start();
+        else bot.heal.stop();
+        refreshAutoHealStatus();
+      });
+    }
+
+    // Auto Attack
+    const autoAttackEnabledInput = panel.querySelector("#minibia-bot-auto-attack-enabled");
+    const autoAttackMeleeInput = panel.querySelector("#minibia-bot-auto-attack-melee");
+    const autoAttackHotkeyInput = panel.querySelector("#minibia-bot-auto-attack-hotkey");
+    const autoAttackRuneHotkeyInput = panel.querySelector("#minibia-bot-auto-attack-rune-hotkey");
+    const maxDistInput = panel.querySelector("#minibia-bot-auto-attack-maxdist");
+    const antiKSInput = panel.querySelector("#minibia-bot-auto-attack-antiks");
+    const antiKSSelfInput = panel.querySelector("#minibia-bot-auto-attack-antiks-self");
+    const antiKSOtherInput = panel.querySelector("#minibia-bot-auto-attack-antiks-other");
+
+    if (autoAttackHotkeyInput) {
+      autoAttackHotkeyInput.value = String(bot.attack?.config?.targetHotbarSlot ?? 3);
+      autoAttackHotkeyInput.addEventListener("change", () => {
+        const val = Math.min(12, Math.max(1, Number(autoAttackHotkeyInput.value) || 1));
+        autoAttackHotkeyInput.value = String(val);
+        bot.attack.updateConfig({ targetHotbarSlot: val });
+      });
+    }
+    if (autoAttackRuneHotkeyInput) {
+      autoAttackRuneHotkeyInput.value = bot.attack?.config?.runeHotbarSlot ? String(bot.attack.config.runeHotbarSlot) : "";
+      autoAttackRuneHotkeyInput.addEventListener("change", () => {
+        const raw = Number(autoAttackRuneHotkeyInput.value);
+        const slot = Number.isFinite(raw) && raw >= 1 && raw <= 12 ? Math.trunc(raw) : null;
+        autoAttackRuneHotkeyInput.value = slot ? String(slot) : "";
+        bot.attack.updateConfig({ runeHotbarSlot: slot });
+      });
+    }
+    if (autoAttackMeleeInput) {
+      autoAttackMeleeInput.checked = bot.attack?.config?.meleeMode !== false;
+      autoAttackMeleeInput.addEventListener("change", () => {
+        bot.attack.updateConfig({ meleeMode: autoAttackMeleeInput.checked });
+      });
+    }
+    if (autoAttackEnabledInput) {
+      autoAttackEnabledInput.checked = !!bot.attack?.status?.().running;
+      autoAttackEnabledInput.addEventListener("change", () => {
+        const targetSlot = Math.min(12, Math.max(1, Number(autoAttackHotkeyInput?.value) || bot.attack.config.targetHotbarSlot || 1));
+        const runeSlot = (() => {
+          const raw = Number(autoAttackRuneHotkeyInput?.value);
+          return Number.isFinite(raw) && raw >= 1 && raw <= 12 ? Math.trunc(raw) : null;
+        })();
+        const melee = !!autoAttackMeleeInput?.checked;
+        if (autoAttackEnabledInput.checked) bot.attack.start({ targetHotbarSlot: targetSlot, runeHotbarSlot: runeSlot, meleeMode: melee });
+        else bot.attack.stop();
+        refreshAutoAttackStatus();
+        refreshTitlebarRunIndicators();
+      });
+    }
+    if (maxDistInput) {
+      maxDistInput.value = bot.attack?.config?.maxTargetDistance ?? 5;
+      maxDistInput.addEventListener("change", () => {
+        const val = Math.min(10, Math.max(1, Number(maxDistInput.value) || 5));
+        maxDistInput.value = val;
+        bot.attack.updateConfig({ maxTargetDistance: val });
+      });
+    }
+    if (antiKSInput) {
+      antiKSInput.checked = bot.attack?.config?.antiKSEnabled !== false;
+      antiKSInput.addEventListener("change", () => {
+        bot.attack.updateConfig({ antiKSEnabled: antiKSInput.checked });
+      });
+    }
+    if (antiKSSelfInput) {
+      antiKSSelfInput.value = bot.attack?.config?.antiKSSelfRange ?? 2;
+      antiKSSelfInput.addEventListener("change", () => {
+        const val = Math.min(5, Math.max(1, Number(antiKSSelfInput.value) || 2));
+        antiKSSelfInput.value = val;
+        bot.attack.updateConfig({ antiKSSelfRange: val });
+      });
+    }
+    if (antiKSOtherInput) {
+      antiKSOtherInput.value = bot.attack?.config?.antiKSOtherRange ?? 2;
+      antiKSOtherInput.addEventListener("change", () => {
+        const val = Math.min(5, Math.max(1, Number(antiKSOtherInput.value) || 2));
+        antiKSOtherInput.value = val;
+        bot.attack.updateConfig({ antiKSOtherRange: val });
+      });
+    }
+
+    // Panic player alert
+    const playerAlertToggle = panel.querySelector("#minibia-bot-panic-player-alert");
+    const playerCooldownInput = panel.querySelector("#minibia-bot-panic-player-cooldown");
+    if (playerAlertToggle) {
+      playerAlertToggle.checked = bot.panic?.config?.playerAlertEnabled ?? false;
+      playerAlertToggle.addEventListener("change", () => {
+        bot.panic.updateConfig({ playerAlertEnabled: playerAlertToggle.checked });
+      });
+    }
+    if (playerCooldownInput) {
+      playerCooldownInput.value = (bot.panic?.config?.playerAlertCooldownMs ?? 60000) / 1000;
+      playerCooldownInput.addEventListener("change", () => {
+        const sec = Math.max(10, Number(playerCooldownInput.value) || 60);
+        playerCooldownInput.value = sec;
+        bot.panic.updateConfig({ playerAlertCooldownMs: sec * 1000 });
+      });
+    }
+
+    // Talk ignored phrases
+    const talkIgnoredInput = panel.querySelector("#minibia-bot-talk-ignored");
+    if (talkIgnoredInput) {
+      talkIgnoredInput.value = (bot.talk?.config?.ignoredPhrases || []).join(", ");
+      talkIgnoredInput.addEventListener("change", saveTalkIgnoredPhrases);
+      talkIgnoredInput.addEventListener("blur", saveTalkIgnoredPhrases);
+    }
+
+    // Cave bot waypoint actions
+    const addBtn = panel.querySelector("#minibia-bot-cave-add");
+    const moveUpBtn = panel.querySelector("#minibia-bot-cave-move-up");
+    const moveDownBtn = panel.querySelector("#minibia-bot-cave-move-down");
+    const delBtn = panel.querySelector("#minibia-bot-cave-delete-selected");
+    if (addBtn) addBtn.addEventListener("click", () => {
+      bot.cave.addWaypointCurrentSpot();
+      refreshCaveWaypointList();
+      refreshCaveStatus();
+      refreshCaveClosestStatus();
+      refreshCaveTransitionStatus();
+      refreshCavePresetControls();
+    });
+    if (moveUpBtn) moveUpBtn.addEventListener("click", () => moveSelectedWaypoint("up"));
+    if (moveDownBtn) moveDownBtn.addEventListener("click", () => moveSelectedWaypoint("down"));
+    if (delBtn) delBtn.addEventListener("click", deleteSelectedWaypoint);
+
+    // Cave preset
+    const presetSelect = panel.querySelector("#minibia-bot-cave-preset-select");
+    const presetNew = panel.querySelector("#minibia-bot-cave-preset-new");
+    const presetDelete = panel.querySelector("#minibia-bot-cave-preset-delete");
+    if (presetSelect) {
+      presetSelect.addEventListener("change", () => {
+        const name = presetSelect.value;
+        if (!name) return;
+        bot.cave.loadPreset(name);
+        refreshCavePresetControls();
+        refreshCaveStatus();
+        refreshCaveClosestStatus();
+        refreshCaveTransitionStatus();
+        refreshCaveWaypointList();
+      });
+    }
+    if (presetNew) {
+      presetNew.addEventListener("click", () => {
+        const name = window.prompt("Name the new cave preset:");
+        if (name == null) return;
+        bot.cave.createPreset(name);
+        refreshCavePresetControls();
+        refreshCaveStatus();
+        refreshCaveClosestStatus();
+        refreshCaveTransitionStatus();
+        refreshCaveWaypointList();
+      });
+    }
+    if (presetDelete) {
+      presetDelete.addEventListener("click", () => {
+        const name = presetSelect?.value;
+        if (!name) return;
+        bot.cave.deletePreset(name);
+        refreshCavePresetControls();
+        refreshCaveStatus();
+        refreshCaveClosestStatus();
+        refreshCaveTransitionStatus();
+        refreshCaveWaypointList();
+      });
+    }
+
+    // Cave tolerance
+    const toleranceInput = panel.querySelector("#minibia-bot-cave-tolerance");
+    if (toleranceInput) {
+      toleranceInput.value = bot.cave?.config?.waypointTolerance ?? 0;
+      toleranceInput.addEventListener("change", () => {
+        const val = Math.min(5, Math.max(0, Number(toleranceInput.value) || 0));
+        toleranceInput.value = val;
+        bot.cave.updateConfig({ waypointTolerance: val });
+      });
+    }
+
+    // Cave toggle
+    const caveToggle = panel.querySelector("#minibia-bot-cave-toggle");
+    if (caveToggle) {
+      caveToggle.checked = !!bot.cave?.status?.().running;
+      caveToggle.addEventListener("change", () => {
+        if (caveToggle.checked) bot.cave.start();
+        else bot.cave.stop();
+        refreshCaveStatus();
+        refreshCaveWaypointList();
+        refreshTitlebarRunIndicators();
+      });
+    }
+
+    // Cave loop toggle
+    const loopToggle = panel.querySelector("#minibia-bot-cave-loop");
+    if (loopToggle) {
+      loopToggle.checked = bot.cave?.getLoopMode?.() ?? false;
+      loopToggle.addEventListener("change", () => {
+        bot.cave.setLoopMode(loopToggle.checked);
+      });
+    }
+
+    // ---- OLDER EXISTING LISTENERS (reload, trusted, GM, rune, eat, invisible, shield, equip, talk, panic, xray, home) ----
 
     // ---- INITIAL REFRESHES ----
     refreshHomeLabel();
@@ -5813,7 +5931,7 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
     refreshTalkIgnoredPhrases();
     refreshTitlebarRunIndicators();
 
-    // Periodic refreshes (as before)
+    // Periodic refreshes
     const visibleTimer = window.setInterval(refreshVisibleCreatures, 1000);
     bot.addCleanup(() => window.clearInterval(visibleTimer));
     const talkTimer = window.setInterval(refreshTalkStatus, 1000);
