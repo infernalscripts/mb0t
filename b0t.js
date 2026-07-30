@@ -2322,46 +2322,61 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
   }
 
   // ---- MONSTER CANDIDATES (with Anti-KS) ----
-  function getMonsterCandidates(now = Date.now()) {
-    pruneSkippedTargets(now);
-    const me = bot.getPlayerPosition();
-    if (!me) return [];
-    const visiblePlayers = bot.xray?.getVisiblePlayers?.({ sameFloorOnly: true }) || [];
-    const myId = window.gameClient?.player?.id;
-    const otherPlayers = visiblePlayers.filter(p => p.id !== myId);
-    const hasOtherPlayers = otherPlayers.length > 0 && config.antiKSEnabled;
+function getMonsterCandidates(now = Date.now()) {
+  pruneSkippedTargets(now);
 
-    return getNearbyMonsters()
-      .filter(m => !isTargetSkipped(m, now))
-      .filter(m => {
-        const info = isTargetValidAndOnScreen(m, { returnDetails: true, maxDx: 7, maxDy: 5 });
-        if (!info.valid) return false;
+  const me = bot.getPlayerPosition();
+  if (!me) return [];
 
-        // Anti-KS
-        if (hasOtherPlayers) {
-          const mPos = m.getPosition?.() || m.__position;
-          if (!mPos) return false;
-          const selfRange = config.antiKSSelfRange ?? 2;
-          const otherRange = config.antiKSOtherRange ?? 2;
-          const dist = Math.max(Math.abs(me.x - mPos.x), Math.abs(me.y - mPos.y));
-          if (dist > selfRange) return false;
-          for (const player of otherPlayers) {
-            const pPos = player.getPosition?.() || player.__position;
-            if (!pPos) continue;
-            const dx = Math.abs(pPos.x - mPos.x);
-            const dy = Math.abs(pPos.y - mPos.y);
-            if (dx <= otherRange && dy <= otherRange) return false;
-          }
-        }
-        return true;
-      })
-      .sort((a, b) => {
-        const sa = getCreaturePriorityScore(a);
-        const sb = getCreaturePriorityScore(b);
-        if (sa !== sb) return sa - sb;
-        return Number(a?.id || 0) - Number(b?.id || 0);
+  const visiblePlayers = bot.xray?.getVisiblePlayers?.({ sameFloorOnly: true }) || [];
+  const myId = window.gameClient?.player?.id;
+  const otherPlayers = visiblePlayers.filter(p => p.id !== myId);
+  const hasOtherPlayers = otherPlayers.length > 0 && config.antiKSEnabled;
+  const maxDist = Math.max(1, Number(config.maxTargetDistance) || 5);
+
+  return getNearbyMonsters()
+    .filter((monster) => !isTargetSkipped(monster, now))
+    .filter((monster) => {
+      const info = isTargetValidAndOnScreen(monster, {
+        returnDetails: true,
+        maxDx: 7,
+        maxDy: 5
       });
-  }
+      if (!info.valid) return false;
+
+      // --- Apply max target distance filter ---
+      const monsterPos = monster.getPosition?.() || monster.__position;
+      if (!monsterPos) return false;
+      const dist = Math.max(Math.abs(me.x - monsterPos.x), Math.abs(me.y - monsterPos.y));
+      if (dist > maxDist) return false;
+
+      // Anti‑KS: if other players are present, only attack monsters within self range,
+      // and not within other range of any other player.
+      if (hasOtherPlayers) {
+        const selfRange = config.antiKSSelfRange ?? 2;
+        const otherRange = config.antiKSOtherRange ?? 2;
+
+        // Must be within selfRange tiles of self (Chebyshev distance)
+        if (dist > selfRange) return false;
+
+        // Must NOT be within otherRange of any other player
+        for (const player of otherPlayers) {
+          const pPos = player.getPosition?.() || player.__position;
+          if (!pPos) continue;
+          const dx = Math.abs(pPos.x - monsterPos.x);
+          const dy = Math.abs(pPos.y - monsterPos.y);
+          if (dx <= otherRange && dy <= otherRange) return false;
+        }
+      }
+      return true;
+    })
+    .sort((left, right) => {
+      const leftScore = getCreaturePriorityScore(left);
+      const rightScore = getCreaturePriorityScore(right);
+      if (leftScore !== rightScore) return leftScore - rightScore;
+      return Number(left?.id || 0) - Number(right?.id || 0);
+    });
+}
 
   // ---- GIVE UP / DISTANCE ----
   function shouldGiveUpTarget(target) {
