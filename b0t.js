@@ -301,7 +301,7 @@ window.__minibiaBotBundle.createBot = function createBot() {
       if (!channelManager || !text) return false;
       channelManager.sendMessageText(text);
       rememberSentChat(text);
-      this.log("sent chat:", text);
+      //this.log("sent chat:", text);
       return true;
     },
 
@@ -1110,28 +1110,35 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
     state.timerId = window.setTimeout(() => tick(), config.tickMs);
   }
 
-  function tick() {
-    if (!state.running) return;
-    const now = Date.now();
-    try {
-      const triggered = checkGameMasters() || checkUnknownPlayers() || checkHealthLoss();
-      if (!triggered) tryReturnToOrigin(now);
+	function tick() {
+	  if (!state.running) return;
+	  const now = Date.now();
+	  try {
+		const triggered = checkGameMasters() || checkUnknownPlayers() || checkHealthLoss();
+		if (!triggered) tryReturnToOrigin(now);
 
-      // Player on‑screen alert (sound only, does NOT stop any module)
-      if (config.playerAlertEnabled) {
-        const myId = window.gameClient?.player?.id;
-        const allPlayers = bot.xray?.getVisiblePlayers?.() || [];
-        const otherPlayers = allPlayers.filter(p => p.id !== myId);
-        if (otherPlayers.length > 0 && now - state.lastPlayerAlertAt >= config.playerAlertCooldownMs) {
-          state.lastPlayerAlertAt = now;
-          bot.playAlarm?.();
-          bot.log("player on-screen alert", { players: otherPlayers.map(p => p.name) });
-        }
-      }
-    } finally {
-      scheduleNextTick();
-    }
-  }
+		// ---- Player on‑screen alert (sound only, does NOT stop any module) ----
+		if (config.playerAlertEnabled) {
+		  const myId = window.gameClient?.player?.id;
+		  // Get visible players on the SAME floor only
+		  const allPlayers = bot.xray?.getVisiblePlayers?.({ sameFloorOnly: true }) || [];
+		  // Exclude self and trusted players
+		  const trustedNames = new Set(getTrustedNames()); // getTrustedNames returns normalized names
+		  const otherPlayers = allPlayers.filter(p => {
+			if (p.id === myId) return false;
+			const name = normalizeName(p.name);
+			return !trustedNames.has(name);
+		  });
+		  if (otherPlayers.length > 0 && now - state.lastPlayerAlertAt >= config.playerAlertCooldownMs) {
+			state.lastPlayerAlertAt = now;
+			bot.playAlarm?.();
+			bot.log("player on-screen alert", { players: otherPlayers.map(p => p.name) });
+		  }
+		}
+	  } finally {
+		scheduleNextTick();
+	  }
+	}
 
   function shouldRun() {
     return !!(getGameMasterNames().length || config.unknownPlayerEnabled || config.healthLossEnabled);
@@ -1520,10 +1527,10 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
       if (didSucceed(stats, a)) {
         state.lastHealAt[slotKey] = a.attemptedAt;
         state.pendingAttempt[slotKey] = null;
-        bot.log("confirmed heal", { slot: a.slot });
+        //bot.log("confirmed heal", { slot: a.slot });
       } else if (now - a.attemptedAt >= (config.healConfirmMs || 250)) {
         state.pendingAttempt[slotKey] = null;
-        bot.log("heal did not register", { slot: a.slot });
+        //bot.log("heal did not register", { slot: a.slot });
       }
     });
   }
@@ -1569,7 +1576,7 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
           hpBefore: stats.hp.current,
           manaBefore: stats.mana.current,
         };
-        bot.log("cast spell", { slot, words: rule.spellWords });
+        //bot.log("cast spell", { slot, words: rule.spellWords });
       }
       return sent;
     }
@@ -1990,6 +1997,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     lastFollowProgressAt: 0,
     lastFollowStallAt: 0,
     skippedTargetIds: new Map(),
+	kiteWaypointIndex: null, // index of the waypoint we're kiting toward
+	kiteTargetReached: false,
   };
 
   const storedConfig = bot.storage.get(configStorageKey, {}) || {};
@@ -2008,6 +2017,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
       antiKSEnabled: true,
       antiKSSelfRange: 2,
       antiKSOtherRange: 2,
+	  kiteMode: false,
+	  idealDistance: 3,
     },
     storedConfig
   );
@@ -2019,6 +2030,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     bot.storage.set(configStorageKey, { ...config });
   }
 
+  let kiteWaypointIndex = null;
+
   function normalizeHotbarSlot(slot) {
     const v = Number(slot);
     if (!Number.isFinite(v)) return null;
@@ -2026,7 +2039,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     if (n < 1 || n > 12) return null;
     return n;
   }
-
+  
   // ---- PREFERRED TARGETS ----
   function normalizeCreatureName(name) {
     return String(name || "").trim().toLowerCase();
@@ -2050,6 +2063,311 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
       return name === pnorm;
     });
   }
+
+
+// ---- Helper ----
+
+// ---- Tile safety helpers (copied from cave module) ----
+function getTileAtPosition(pos) {
+  if (!pos) return null;
+  return window.gameClient?.world?.getTileFromWorldPosition?.(new Position(pos.x, pos.y, pos.z)) || null;
+}
+
+function getThingDefinition(itemId) {
+  if (!itemId) return null;
+  return window.gameClient?.itemDefinitionsByCid?.[itemId] ||
+         window.gameClient?.itemDefinitionsBySid?.[itemId] ||
+         window.gameClient?.itemDefinitions?.[itemId] || null;
+}
+
+function getThingName(thing) {
+  const def = getThingDefinition(thing?.id);
+  return String(def?.properties?.name || thing?.name || "").trim().toLowerCase();
+}
+
+function isLadderThing(thing) {
+  if (!thing?.id) return false;
+  const ladderIds = new Set([1948, 1968]);
+  if (ladderIds.has(Number(thing.id))) return true;
+  return getThingName(thing).includes("ladder");
+}
+
+function isFloorChangeThing(thing) {
+  const def = getThingDefinition(thing?.id);
+  return !!def?.properties?.floorchange || isLadderThing(thing);
+}
+
+function isFloorChangeTile(tile) {
+  if (!tile) return false;
+  if (isFloorChangeThing(tile)) return true;
+  return Array.isArray(tile.items) && tile.items.some(item => isFloorChangeThing(item));
+}
+
+function tileHasNamedThing(tile, needle) {
+  const val = String(needle || "").trim().toLowerCase();
+  if (!val || !tile) return false;
+  const things = [tile, ...(tile.items || [])];
+  return things.some(t => getThingName(t).includes(val));
+}
+
+function isHoleTile(tile) {
+  return tileHasNamedThing(tile, "hole");
+}
+
+function isRopeTargetTile(tile) {
+  return tileHasNamedThing(tile, "rope spot") || isHoleTile(tile);
+}
+
+function isSafeTileForKite(pos) {
+  if (!pos) return false;
+  const tile = getTileAtPosition(pos);
+  if (!tile) return false;
+  // Must be walkable (allows ignoring creatures later)
+  if (!tile.isWalkable()) return false;
+  // Avoid floor-changing tiles (holes, ladders, stairs, rope spots, etc.)
+  if (isFloorChangeTile(tile)) return false;
+  return true;
+}
+
+function getDirection(dx, dy) {
+  if (dx === 0 && dy === -1) return CONST.DIRECTION.NORTH;
+  if (dx === 0 && dy === 1) return CONST.DIRECTION.SOUTH;
+  if (dx === -1 && dy === 0) return CONST.DIRECTION.WEST;
+  if (dx === 1 && dy === 0) return CONST.DIRECTION.EAST;
+  if (dx === -1 && dy === -1) return CONST.DIRECTION.NORTHWEST;
+  if (dx === 1 && dy === -1) return CONST.DIRECTION.NORTHEAST;
+  if (dx === -1 && dy === 1) return CONST.DIRECTION.SOUTHWEST;
+  if (dx === 1 && dy === 1) return CONST.DIRECTION.SOUTHEAST;
+  return null;
+}
+
+// ---- Simple walkability ----
+function isTileWalkable(x, y, z, ignoreCreatures = false) {
+  const pos = new Position(x, y, z);
+  const tile = window.gameClient?.world?.getTileFromWorldPosition?.(pos);
+  if (!tile) return false;
+  if (!tile.isWalkable()) return false;
+  if (tile.isItemBlocked()) return false;
+  if (!ignoreCreatures && tile.isOccupied()) return false;
+  return true;
+}
+
+// ---- Chase: move directly toward target ----
+function syncChase(now) {
+  if (!config.kiteMode) return false;
+  const target = getEngagedTarget();
+  if (!target) return false;
+
+  const playerPos = normalizePosition(bot.getPlayerPosition());
+  const targetPos = normalizePosition(target.getPosition?.() || target.__position);
+  if (!playerPos || !targetPos || playerPos.z !== targetPos.z) return false;
+
+  const dist = getTileDistance(playerPos, targetPos);
+  const ideal = Math.max(1, Number(config.idealDistance) || 3);
+  if (dist <= ideal + 1) return false;
+
+  let dx = targetPos.x - playerPos.x;
+  let dy = targetPos.y - playerPos.y;
+  let stepX = dx > 0 ? 1 : (dx < 0 ? -1 : 0);
+  let stepY = dy > 0 ? 1 : (dy < 0 ? -1 : 0);
+
+  // Try cardinal first, then diagonal
+  const attempts = [
+    { dx: stepX, dy: 0 },
+    { dx: 0, dy: stepY },
+    { dx: stepX, dy: stepY }
+  ];
+
+  for (const a of attempts) {
+    if (a.dx === 0 && a.dy === 0) continue;
+    const nx = playerPos.x + a.dx;
+    const ny = playerPos.y + a.dy;
+    if (isTileWalkable(nx, ny, playerPos.z, false)) {
+      const dir = getDirection(a.dx, a.dy);
+      if (dir !== null && window.gameClient?.keyboard) {
+        window.gameClient.keyboard.handleMoveKey(dir);
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function kiteAwayFallback(targetPos, playerPos, dist) {
+  const dx = playerPos.x - targetPos.x;
+  const dy = playerPos.y - targetPos.y;
+  let stepX = dx > 0 ? 1 : (dx < 0 ? -1 : 0);
+  let stepY = dy > 0 ? 1 : (dy < 0 ? -1 : 0);
+  const attempts = [
+    { dx: stepX, dy: 0 },
+    { dx: 0, dy: stepY },
+    { dx: stepX, dy: stepY }
+  ];
+  for (const a of attempts) {
+    if (a.dx === 0 && a.dy === 0) continue;
+    const nx = playerPos.x + a.dx;
+    const ny = playerPos.y + a.dy;
+    const candidatePos = { x: nx, y: ny, z: playerPos.z };
+    if (!isSafeTileForKite(candidatePos)) continue;
+    if (isTileWalkable(nx, ny, playerPos.z, false)) {
+      const dir = getDirection(a.dx, a.dy);
+      if (dir !== null && window.gameClient?.keyboard) {
+        window.gameClient.keyboard.handleMoveKey(dir);
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+
+// ---- Kite: move backward along cave route, or away from target ----
+function syncKite(now) {
+  if (!config.kiteMode) return false;
+  const target = getEngagedTarget();
+  if (!target) return false;
+
+  const playerPos = normalizePosition(bot.getPlayerPosition());
+  const targetPos = normalizePosition(target.getPosition?.() || target.__position);
+  if (!playerPos || !targetPos || playerPos.z !== targetPos.z) return false;
+
+  const dist = getTileDistance(playerPos, targetPos);
+  const ideal = Math.max(1, Number(config.idealDistance) || 3);
+  if (dist >= ideal) return false;
+
+  const caveStatus = bot.cave?.status?.();
+  const route = bot.cave?.getRoute?.() || [];
+  if (!caveStatus?.running || !caveStatus?.pausedForCombat || route.length === 0) {
+    return kiteAwayFallback(targetPos, playerPos, dist);
+  }
+
+  if (state.kiteWaypointIndex === null) {
+    state.kiteWaypointIndex = Math.max(0, caveStatus.currentIndex - 1);
+  }
+
+  let idx = Math.min(state.kiteWaypointIndex, route.length - 1);
+  if (idx < 0) idx = 0;
+
+  // Only target waypoints on the same floor
+  while (idx >= 0 && route[idx].z !== playerPos.z) {
+    idx--;
+  }
+  if (idx < 0) {
+    state.kiteWaypointIndex = null;
+    return false;
+  }
+
+  let targetWp = route[idx];
+  if (!targetWp) {
+    state.kiteWaypointIndex = null;
+    return false;
+  }
+
+  const distToWp = getTileDistance(playerPos, targetWp);
+  const tolerance = Math.max(0, Number(config.waypointTolerance) || 0);
+  if (distToWp <= tolerance) {
+    let nextIdx = idx - 1;
+    while (nextIdx >= 0 && route[nextIdx].z !== playerPos.z) {
+      nextIdx--;
+    }
+    if (nextIdx >= 0) {
+      state.kiteWaypointIndex = nextIdx;
+      bot.cave.setCurrentIndex(nextIdx);
+      targetWp = route[nextIdx];
+    } else {
+      state.kiteWaypointIndex = null;
+      return false;
+    }
+  }
+
+  const dx = targetWp.x - playerPos.x;
+  const dy = targetWp.y - playerPos.y;
+  let stepX = dx > 0 ? 1 : (dx < 0 ? -1 : 0);
+  let stepY = dy > 0 ? 1 : (dy < 0 ? -1 : 0);
+
+  const attempts = [
+    { dx: stepX, dy: 0 },
+    { dx: 0, dy: stepY },
+    { dx: stepX, dy: stepY },
+    { dx: -stepX, dy: 0 },
+    { dx: 0, dy: -stepY },
+  ];
+
+  for (const a of attempts) {
+    if (a.dx === 0 && a.dy === 0) continue;
+    const nx = playerPos.x + a.dx;
+    const ny = playerPos.y + a.dy;
+    const candidatePos = { x: nx, y: ny, z: playerPos.z };
+
+    if (!isSafeTileForKite(candidatePos)) continue;
+    if (!isTileWalkable(nx, ny, playerPos.z, false)) {
+      if (!isTileWalkable(nx, ny, playerPos.z, true)) continue;
+    }
+
+    const dir = getDirection(a.dx, a.dy);
+    if (dir !== null && window.gameClient?.keyboard) {
+      window.gameClient.keyboard.handleMoveKey(dir);
+      return true;
+    }
+  }
+  return false;
+}
+
+// ---- tryAttack ----
+function tryAttack() {
+  if (!config.enabled) return false;
+  const now = Date.now();
+  if (resetTargetIfTooFar()) return true;
+  syncCombatState(now);
+
+  if (config.kiteMode && getEngagedTarget()) {
+    if (syncChase(now)) return true;
+    if (syncKite(now)) return true;
+  }
+
+  // Melee mode (only if kite mode is OFF)
+  if (!config.kiteMode && config.meleeMode) {
+    const chased = syncMeleeChase(now);
+    if (getCurrentTarget()) return false;
+    if (chased) return triggerAttack(now) || true;
+  }
+
+  if (getCurrentTarget()) return triggerRune(now);
+  return triggerAttack(now);
+}
+
+
+function getCaveRetreatDirection() {
+  try {
+    if (!bot.cave?.status?.().running) return null;
+    const route = bot.cave.getRoute?.() || [];
+    const status = bot.cave.status?.();
+    if (!route.length || !status) return null;
+    const currentIdx = status.currentIndex;
+    // Find the previous waypoint (or stay at 0)
+    let targetIdx = Math.max(0, currentIdx - 1);
+    // If at start, go to current waypoint? But we want retreat, so if at start, we can't go back; maybe use current waypoint as fallback.
+    // We'll use the previous waypoint if exists, else current (or null)
+    if (targetIdx < 0) return null;
+    const prev = route[targetIdx];
+    if (!prev) return null;
+    const playerPos = normalizePosition(bot.getPlayerPosition());
+    if (!playerPos) return null;
+    const dx = prev.x - playerPos.x;
+    const dy = prev.y - playerPos.y;
+    // Only provide direction if it's the same floor
+    if (prev.z !== playerPos.z) return null;
+    // Convert to step direction (sign)
+    let stepX = dx > 0 ? 1 : (dx < 0 ? -1 : 0);
+    let stepY = dy > 0 ? 1 : (dy < 0 ? -1 : 0);
+    // If we're already on the previous waypoint, no retreat needed
+    if (stepX === 0 && stepY === 0) return null;
+    return { dx: stepX, dy: stepY };
+  } catch (e) {
+    return null;
+  }
+}
+
 
   function getCreatureDistanceFromPlayer(creature) {
     const player = window.gameClient?.player;
@@ -2108,6 +2426,11 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     return Math.max(Math.abs(from.x - to.x), Math.abs(from.y - to.y));
   }
 
+function getDistance(from, to) {
+  if (!from || !to || Number(from.z) !== Number(to.z)) return Number.POSITIVE_INFINITY;
+  return Math.max(Math.abs(from.x - to.x), Math.abs(from.y - to.y));
+}
+
   function isSameCreature(left, right) {
     return !!(left && right && (left === right || left.id === right.id));
   }
@@ -2145,12 +2468,13 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     state.lastFollowStallAt = 0;
   }
 
-  function clearEngagedTarget() {
-    state.engagedTargetId = null;
-    state.combatStartedAt = 0;
-    state.lastChaseDestinationKey = null;
-    resetFollowProgress();
-  }
+function clearEngagedTarget() {
+  state.engagedTargetId = null;
+  state.combatStartedAt = 0;
+  state.lastChaseDestinationKey = null;
+  state.kiteWaypointIndex = null;
+  resetFollowProgress();
+}
 
   function clearCurrentFollowTarget() {
     if (!window.gameClient?.player || typeof window.gameClient.send !== "function") return false;
@@ -2495,76 +2819,205 @@ function getMonsterCandidates(now = Date.now()) {
     return followed;
   }
 
-  // ---- ATTACK / RUNE ACTIONS ----
-  function canAttack(now = Date.now()) {
-    const slot = normalizeHotbarSlot(config.targetHotbarSlot);
-    if (!slot) return false;
-    if (now - state.lastTargetHotkeyAt < Math.max(0, Number(config.targetCooldownMs) || 0)) return false;
-    if (config.meleeMode) {
-      return getMonsterCandidates(now).length > 0 && !getCurrentTarget();
+
+
+// ---- Helper: standard away movement (fallback) ----
+function kiteAwayOnly(target, playerPos, targetPos, dist) {
+  const offsets = [
+    [0, -1], [1, 0], [0, 1], [-1, 0],
+    [-1, -1], [1, -1], [-1, 1], [1, 1]
+  ];
+  let best = null;
+  let bestScore = -Infinity;
+  const dxAway = playerPos.x - targetPos.x;
+  const dyAway = playerPos.y - targetPos.y;
+  const stepX = dxAway > 0 ? 1 : (dxAway < 0 ? -1 : 0);
+  const stepY = dyAway > 0 ? 1 : (dyAway < 0 ? -1 : 0);
+
+  for (const off of offsets) {
+    const nx = playerPos.x + off[0];
+    const ny = playerPos.y + off[1];
+    const pos = new Position(nx, ny, playerPos.z);
+    const tile = window.gameClient?.world?.getTileFromWorldPosition?.(pos);
+    if (!tile) continue;
+    if (!tile.isWalkable()) continue;
+    if (tile.isOccupied()) continue;
+
+    const newDist = Math.max(Math.abs(nx - targetPos.x), Math.abs(ny - targetPos.y));
+    const distIncrease = newDist - dist;
+    let score = distIncrease * 30;
+    if (off[0] === 0 || off[1] === 0) score += 15;
+    if (stepX !== 0 && off[0] === stepX) score += 10;
+    if (stepY !== 0 && off[1] === stepY) score += 10;
+    if (distIncrease === 0) score += 5;
+    score += (Math.random() - 0.5) * 0.1;
+
+    if (score > bestScore) {
+      bestScore = score;
+      best = { dx: off[0], dy: off[1] };
     }
-    return getNearbyMonsters().length > 0;
   }
 
-  function triggerAttack(now = Date.now()) {
-    if (!canAttack(now)) return false;
-    const engaged = getEngagedTarget();
-    const preferred = engaged && !isTargetSkipped(engaged, now)
-      ? engaged
-      : (getMonsterCandidates(now)[0] || null);
-    if (preferred && setCurrentTarget(preferred)) {
-      state.lastTargetHotkeyAt = now;
-      markCombatActive(now);
-      bot.log("selected auto attack target", {
-        id: preferred.id, name: preferred.name || "Mob",
-        reason: isSameCreature(preferred, engaged) ? "engaged target" : "nearest candidate",
-      });
-      return true;
-    }
-    if (config.meleeMode) return false;
-    const slot = normalizeHotbarSlot(config.targetHotbarSlot);
-    const clicked = bot.clickHotbar(slot - 1);
-    if (clicked) {
-      state.lastTargetHotkeyAt = now;
-      markCombatActive(now);
-      bot.log("used auto attack target hotkey", { slot, nearbyMonsters: getNearbyMonsters().map(c => c.name || "Mob") });
-    }
-    return clicked;
-  }
+  if (!best) return false;
+  const dir = getDirection(best.dx, best.dy);
+  if (!dir) return false;
 
-  function canUseRune(now = Date.now()) {
-    const slot = normalizeHotbarSlot(config.runeHotbarSlot);
-    if (!slot || !getCurrentTarget()) return false;
-    if (now - state.lastRuneHotkeyAt < Math.max(0, Number(config.runeCooldownMs) || 0)) return false;
+  if (window.gameClient?.keyboard && typeof window.gameClient.keyboard.handleMoveKey === 'function') {
+    window.gameClient.keyboard.handleMoveKey(dir);
     return true;
   }
 
-  function triggerRune(now = Date.now()) {
-    if (!canUseRune(now)) return false;
-    const slot = normalizeHotbarSlot(config.runeHotbarSlot);
-    const clicked = bot.clickHotbar(slot - 1);
-    if (clicked) {
-      state.lastRuneHotkeyAt = now;
-      markCombatActive(now);
-      bot.log("used auto attack rune hotkey", { slot, target: getCurrentTarget()?.name || "Mob" });
+  const packet = new MovementPacket(dir);
+  if (window.gameClient?.send) {
+    window.gameClient.send(packet);
+    if (window.gameClient?.player) {
+      window.gameClient.player.setTurnBuffer(dir);
+      const newPos = window.gameClient.player.getPosition().add(new Position(best.dx, best.dy, 0));
+      window.gameClient.networkManager.packetHandler.handlePlayerMove(newPos);
     }
-    return clicked;
+    return true;
   }
 
-  function tryAttack() {
-    if (!config.enabled) return false;
-    const now = Date.now();
-    if (resetTargetIfTooFar()) return true;
-    syncCombatState(now);
+  return false;
+}
 
-    if (config.meleeMode) {
-      const chased = syncMeleeChase(now);
-      if (getCurrentTarget()) return false;
-      if (chased) return triggerAttack(now) || true;
+// Fallback function to move away from enemy
+function syncKiteFallback(now) {
+  const target = getEngagedTarget();
+  if (!target) return false;
+  const playerPos = normalizePosition(bot.getPlayerPosition());
+  const targetPos = normalizePosition(target.getPosition?.() || target.__position);
+  if (!playerPos || !targetPos || playerPos.z !== targetPos.z) return false;
+  const dist = getTileDistance(playerPos, targetPos);
+  const ideal = Math.max(1, Number(config.idealDistance) || 3);
+  if (dist >= ideal) return false;
+
+  const offsets = [
+    [0, -1], [1, 0], [0, 1], [-1, 0],
+    [-1, -1], [1, -1], [-1, 1], [1, 1]
+  ];
+
+  let best = null;
+  let bestScore = -Infinity;
+
+  const dxAway = playerPos.x - targetPos.x;
+  const dyAway = playerPos.y - targetPos.y;
+  const stepX = dxAway > 0 ? 1 : (dxAway < 0 ? -1 : 0);
+  const stepY = dyAway > 0 ? 1 : (dyAway < 0 ? -1 : 0);
+
+  for (const off of offsets) {
+    const nx = playerPos.x + off[0];
+    const ny = playerPos.y + off[1];
+    const pos = new Position(nx, ny, playerPos.z);
+    const tile = window.gameClient?.world?.getTileFromWorldPosition?.(pos);
+    if (!tile) continue;
+    if (!tile.isWalkable()) continue;
+    if (tile.isOccupied()) continue;
+
+    const newDist = Math.max(Math.abs(nx - targetPos.x), Math.abs(ny - targetPos.y));
+    const distIncrease = newDist - dist;
+    let score = distIncrease * 30;
+    if (off[0] === 0 || off[1] === 0) score += 15;
+    if (stepX !== 0 && off[0] === stepX) score += 10;
+    if (stepY !== 0 && off[1] === stepY) score += 10;
+    if (distIncrease === 0) score += 5;
+    score += (Math.random() - 0.5) * 0.1;
+
+    if (score > bestScore) {
+      bestScore = score;
+      best = { dx: off[0], dy: off[1] };
     }
-    if (getCurrentTarget()) return triggerRune(now);
-    return triggerAttack(now);
   }
+
+  if (!best) return false;
+
+  const dir = getDirection(best.dx, best.dy);
+  if (!dir) return false;
+
+  if (window.gameClient?.keyboard && typeof window.gameClient.keyboard.handleMoveKey === 'function') {
+    window.gameClient.keyboard.handleMoveKey(dir);
+    return true;
+  }
+
+  const packet = new MovementPacket(dir);
+  if (window.gameClient?.send) {
+    window.gameClient.send(packet);
+    if (window.gameClient?.player) {
+      window.gameClient.player.setTurnBuffer(dir);
+      const newPos = window.gameClient.player.getPosition().add(new Position(best.dx, best.dy, 0));
+      window.gameClient.networkManager.packetHandler.handlePlayerMove(newPos);
+    }
+    return true;
+  }
+
+  return false;
+}
+
+
+  // ---- ATTACK / RUNE ACTIONS ----
+function canAttack(now = Date.now()) {
+  const slot = normalizeHotbarSlot(config.targetHotbarSlot);
+  if (!slot) return false;
+  if (now - state.lastTargetHotkeyAt < Math.max(0, Number(config.targetCooldownMs) || 0)) return false;
+  const candidates = getMonsterCandidates(now);
+  return candidates.length > 0 && !getCurrentTarget();
+}
+
+function triggerAttack(now = Date.now()) {
+  if (!canAttack(now)) return false;
+  const engaged = getEngagedTarget();
+  const preferred = engaged && !isTargetSkipped(engaged, now)
+    ? engaged
+    : (getMonsterCandidates(now)[0] || null);
+  if (preferred && setCurrentTarget(preferred)) {
+    state.lastTargetHotkeyAt = now;
+    markCombatActive(now);
+    bot.log("selected auto attack target", {
+      id: preferred.id, name: preferred.name || "Mob",
+      reason: isSameCreature(preferred, engaged) ? "engaged target" : "nearest candidate",
+    });
+    return true;
+  }
+  // NO LOG HERE – silently return false
+  return false;
+}
+
+function canUseRune(now = Date.now()) {
+  const slot = normalizeHotbarSlot(config.runeHotbarSlot);
+  if (!slot || !getCurrentTarget()) return false;
+
+  const playerPos = normalizePosition(bot.getPlayerPosition());
+  const targetPos = normalizePosition(getCurrentTarget().getPosition?.() || getCurrentTarget().__position);
+  if (!playerPos || !targetPos) return false;
+
+  const dist = getTileDistance(playerPos, targetPos);
+  const maxDist = Math.max(1, Number(config.maxTargetDistance) || 5);
+  if (dist > maxDist) return false;
+
+  if (now - state.lastRuneHotkeyAt < Math.max(0, Number(config.runeCooldownMs) || 0)) return false;
+  return true;
+}
+
+function triggerRune(now = Date.now()) {
+  if (!canUseRune(now)) return false;
+
+  // Optional debug log
+  const targetPos = normalizePosition(getCurrentTarget().getPosition?.() || getCurrentTarget().__position);
+  const playerPos = normalizePosition(bot.getPlayerPosition());
+  if (playerPos && targetPos) {
+    const dist = getTileDistance(playerPos, targetPos);
+    bot.log(`Using rune on target at distance ${dist}`);
+  }
+
+  const slot = normalizeHotbarSlot(config.runeHotbarSlot);
+  const clicked = bot.clickHotbar(slot - 1);
+  if (clicked) {
+    state.lastRuneHotkeyAt = now;
+    markCombatActive(now);
+    //bot.log("used auto attack rune hotkey", { slot, target: getCurrentTarget()?.name || "Mob" });
+  }
+  return clicked;
+}
 
   // ---- LOOP ----
   function scheduleNextTick() {
@@ -2596,6 +3049,7 @@ function getMonsterCandidates(now = Date.now()) {
     clearEngagedTarget();
     state.lastChaseAt = 0;
     clearCurrentFollowTarget();
+	state.kiteWaypointIndex = null;
     state.skippedTargetIds.clear();
     bot.log("auto attack stopped");
     return true;
@@ -2705,6 +3159,10 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     lastSkipCheckAt: 0,
     skipAttemptCount: 0,
     pathAttemptStart: 0,
+	stuckCount: 0,
+	lastDistanceToWaypoint: null,
+	positionHistory: [],
+	_stuckLogged: false,
   };
   const minimapOverlayState = { timerId: null };
 
@@ -2731,6 +3189,19 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     return value ? JSON.parse(JSON.stringify(value)) : null;
   }
 
+	function getDirection(dx, dy) {
+	  if (dx === 0 && dy === -1) return CONST.DIRECTION.NORTH;
+	  if (dx === 0 && dy === 1) return CONST.DIRECTION.SOUTH;
+	  if (dx === -1 && dy === 0) return CONST.DIRECTION.WEST;
+	  if (dx === 1 && dy === 0) return CONST.DIRECTION.EAST;
+	  if (dx === -1 && dy === -1) return CONST.DIRECTION.NORTHWEST;
+	  if (dx === 1 && dy === -1) return CONST.DIRECTION.NORTHEAST;
+	  if (dx === -1 && dy === 1) return CONST.DIRECTION.SOUTHWEST;
+	  if (dx === 1 && dy === 1) return CONST.DIRECTION.SOUTHEAST;
+	  return null;
+	}
+	
+	
   function normalizePreset(value) {
     if (!value) return null;
     const name = normalizePresetName(value.name);
@@ -3286,10 +3757,10 @@ function getContainerById(containerId) {
     try {
       window.gameClient?.world?.pathfinder?.findPath?.(from, to);
       state.lastPathAt = Date.now();
-      bot.log("cave pathing to waypoint", { ...waypoint, index: state.currentIndex + 1, total: route.length });
+      //bot.log("cave pathing to waypoint", { ...waypoint, index: state.currentIndex + 1, total: route.length });
       return true;
     } catch (error) {
-      bot.log("cave pathing failed", { ...waypoint, error: error?.message || error });
+      //bot.log("cave pathing failed", { ...waypoint, error: error?.message || error });
       return false;
     }
   }
@@ -3508,7 +3979,7 @@ function getContainerById(containerId) {
     state.currentIndex = Math.max(0, Math.min(route.length - 1, next));
     state.pathAttemptStart = 0;
     const wp = getCurrentWaypoint();
-    bot.log("cave advanced waypoint", { index: state.currentIndex + 1, total: route.length, direction: state.direction, waypoint: wp });
+    //bot.log("cave advanced waypoint", { index: state.currentIndex + 1, total: route.length, direction: state.direction, waypoint: wp });
     return wp;
   }
 
@@ -3524,135 +3995,241 @@ function getContainerById(containerId) {
    * logic that waits for pathfinder to give up (__finalDestination === null)
    * and for a time threshold before skipping.
    */
-  function tick() {
-    if (!state.running) return;
+function tick() {
+  if (!state.running) return;
 
-    try {
-      observePosition();
+  try {
+    observePosition();
 
-      if (!route.length) {
-        stop();
-        return;
-      }
+    if (!route.length) {
+      stop();
+      return;
+    }
 
-      const position = normalizePosition(bot.getPlayerPosition());
-      const positionKey = getPositionKey(position);
-      const now = Date.now();
-      const attackStatus = bot.attack?.status?.() || null;
-      const shouldPauseForCombat =
-        !!attackStatus?.combatActive &&
-        Number(attackStatus?.combatDurationMs || 0) < 60000;
+    const position = normalizePosition(bot.getPlayerPosition());
+    const positionKey = getPositionKey(position);
+    const now = Date.now();
 
-      if (shouldPauseForCombat) {
-        if (!state.pausedForCombat) {
-          state.pausedForCombat = true;
-          bot.log("cave paused for auto attack", {
-            combatDurationMs: Number(attackStatus?.combatDurationMs || 0),
-            targetCount: Number(attackStatus?.targetCount || 0),
-          });
-        }
-        return;
-      }
+    // ---- PAUSE FOR COMBAT ----
+const attackConfig = bot.attack?.config || {};
+const attackStatus = bot.attack?.status?.() || null;
+const isKiting = attackConfig.kiteMode && !!attackStatus?.engagedTargetId;
 
-      if (state.pausedForCombat) {
-        state.pausedForCombat = false;
-        bot.log("cave resumed after auto attack", {
+    const shouldPauseForCombat =
+      (!!attackStatus?.combatActive && Number(attackStatus?.combatDurationMs || 0) < 60000) ||
+      isKiting;
+
+    if (shouldPauseForCombat) {
+      if (!state.pausedForCombat) {
+        state.pausedForCombat = true;
+        bot.log("cave paused for auto attack", {
           combatDurationMs: Number(attackStatus?.combatDurationMs || 0),
           targetCount: Number(attackStatus?.targetCount || 0),
+          isKiting,
         });
       }
+      return;
+    }
 
-      if (positionKey && positionKey !== state.lastPositionKey) {
-        state.lastPositionKey = positionKey;
-        state.lastProgressAt = now;
+    if (state.pausedForCombat) {
+      state.pausedForCombat = false;
+      bot.log("cave resumed after auto attack");
+    }
+
+    // ---- POSITION HISTORY (detect stuck) ----
+    if (positionKey) {
+      if (!state.positionHistory) state.positionHistory = [];
+      state.positionHistory.push({ key: positionKey, time: now });
+      if (state.positionHistory.length > 5) state.positionHistory.shift();
+
+      // Check if we've been at the same tile for > 5 seconds
+      let stuck = false;
+      if (state.positionHistory.length >= 3) {
+        const first = state.positionHistory[0];
+        if (first.key === positionKey && now - first.time > 5000) {
+          stuck = true;
+        }
       }
+      if (stuck) {
+        if (!state._stuckLogged) {
+          state._stuckLogged = true;
+          bot.log("cave: stuck at tile for >5s, trying to move");
+        }
+      } else {
+        state._stuckLogged = false;
+      }
+    }
 
-      let waypoint = getCurrentWaypoint();
+    if (positionKey && positionKey !== state.lastPositionKey) {
+      state.lastPositionKey = positionKey;
+      state.lastProgressAt = now;
+    }
+
+    let waypoint = getCurrentWaypoint();
+    if (!waypoint) {
+      stop();
+      return;
+    }
+
+    // ---- AT WAYPOINT ----
+    if (isAtWaypoint(position, waypoint)) {
+      state.lastWaypointTarget = null;
+      state.pathAttemptStart = 0;
+      state.lastDistanceToWaypoint = null;
+      state.stuckCount = 0;
+      state.positionHistory = [];
+      waypoint = advanceWaypoint();
       if (!waypoint) {
         stop();
         return;
       }
+      state.lastWaypointTarget = waypoint;
+      state.pathAttemptStart = now;
+      state.lastDistanceToWaypoint = getDistanceToWaypoint(position, waypoint);
+      goToWaypoint(waypoint);
+      return;
+    }
 
-      // Check if we are at waypoint
-      if (isAtWaypoint(position, waypoint)) {
+    // ---- FLOOR CHANGE ----
+    if (position && waypoint.z !== position.z) {
+      state.lastWaypointTarget = null;
+      state.pathAttemptStart = 0;
+      state.lastDistanceToWaypoint = null;
+      state.stuckCount = 0;
+      state.positionHistory = [];
+      handleFloorChange(waypoint, now);
+      return;
+    }
+
+    // ---- PATHFINDING LOGIC ----
+    const pf = window.gameClient?.world?.pathfinder;
+    const currentDist = getDistanceToWaypoint(position, waypoint);
+
+    if (state.lastWaypointTarget === null || !isSameTile(state.lastWaypointTarget, waypoint)) {
+      state.lastWaypointTarget = waypoint;
+      state.pathAttemptStart = now;
+      state.lastDistanceToWaypoint = currentDist;
+      state.stuckCount = 0;
+      state.positionHistory = [];
+      goToWaypoint(waypoint);
+      return;
+    }
+
+    // ---- WE HAVE A WAYPOINT ----
+    if (state.lastWaypointTarget && position && pf) {
+      // If we are within tolerance, consider it reached
+      if (currentDist !== null && currentDist <= (config.waypointTolerance || 0)) {
         state.lastWaypointTarget = null;
         state.pathAttemptStart = 0;
-        waypoint = advanceWaypoint();
-        if (!waypoint) {
-          stop();
-          return;
-        }
-        state.lastWaypointTarget = waypoint;
+        state.lastDistanceToWaypoint = null;
+        state.stuckCount = 0;
+        state.positionHistory = [];
+        return;
+      }
+
+      // If we made progress, reset stuck counter
+      if (state.lastDistanceToWaypoint !== null && currentDist < state.lastDistanceToWaypoint) {
+        state.lastDistanceToWaypoint = currentDist;
         state.pathAttemptStart = now;
-        goToWaypoint(waypoint);
-        return;
+        state.stuckCount = 0;
+        state.positionHistory = [];
       }
 
-      // Handle floor change if needed (do NOT skip floor-change waypoints)
-      if (position && waypoint.z !== position.z) {
-        state.lastWaypointTarget = null;
-        state.pathAttemptStart = 0;
-        handleFloorChange(waypoint, now);
-        return;
-      }
-
-      // --- Pathfinder skip logic (only if on the same floor) ---
-      const pf = window.gameClient?.world?.pathfinder;
-
-      // If pathfinder is still searching, wait
-      if (pf && (pf.__isProcessing || pf.__isMinimapSearching)) {
-        return;
-      }
-
-      // If we haven't set a target waypoint yet, set it now
-      if (state.lastWaypointTarget === null || !isSameTile(state.lastWaypointTarget, waypoint)) {
-        state.lastWaypointTarget = waypoint;
-        state.pathAttemptStart = now;
-        goToWaypoint(waypoint);
-        return;
-      }
-
-      // Check if we should skip this waypoint
-      if (state.lastWaypointTarget && position && pf) {
-        const dist = getDistanceToWaypoint(position, state.lastWaypointTarget);
-        if (dist !== null && dist > (config.waypointTolerance || 0)) {
-          const timeSinceLastPath = now - state.lastPathAt;
-          const timeSinceAttemptStart = now - state.pathAttemptStart;
-          // Only skip if we haven't sent a path in 5 seconds,
-          // have been trying for 5 seconds, and pf has no destination.
-          if (timeSinceLastPath > 5000 && timeSinceAttemptStart > 5000 && pf.__finalDestination === null) {
-            bot.log("Pathfinder gave up, skipping to next waypoint", {
-              waypoint: state.lastWaypointTarget,
-              timeSinceLastPath,
-              timeSinceAttemptStart,
-            });
-            state.lastWaypointTarget = null;
-            state.pathAttemptStart = 0;
-            const nextWp = advanceWaypoint();
-            if (nextWp) goToWaypoint(nextWp);
-            else stop();
-            return;
-          }
-        } else {
-          // We reached the waypoint – clear target
-          state.lastWaypointTarget = null;
-          state.pathAttemptStart = 0;
-        }
-      }
-
-      // Repath if needed
+      // ---- REPATH ----
       const shouldRepath = now - state.lastPathAt >= config.repathMs ||
                            !state.lastProgressAt ||
                            now - state.lastProgressAt >= config.repathMs;
       if (shouldRepath) {
         goToWaypoint(waypoint);
       }
-    } catch (error) {
-      bot.log("cave tick failed", error?.message || error);
-    } finally {
-      scheduleNextTick();
+
+      // ---- STUCK DETECTION AND RECOVERY ----
+      const timeSinceAttemptStart = now - state.pathAttemptStart;
+      if (timeSinceAttemptStart > 5000 && pf.__finalDestination === null) {
+        // If we haven't moved in a while, try to nudge
+        let moved = false;
+
+        // Try moving toward waypoint if we can see it
+        const tile = window.gameClient?.world?.getTileFromWorldPosition?.(new Position(waypoint.x, waypoint.y, waypoint.z));
+        if (tile && tile.isWalkable && !tile.isOccupied()) {
+          // Try direct path to waypoint
+          const from = bot.getPlayerPosition();
+          if (from) {
+            const to = new Position(waypoint.x, waypoint.y, waypoint.z);
+            try {
+              window.gameClient?.world?.pathfinder?.findPath?.(from, to);
+              state.lastPathAt = now;
+              state.pathAttemptStart = now;
+              moved = true;
+            } catch (e) {}
+          }
+        }
+
+        // If direct failed, try moving one step in the general direction
+        if (!moved) {
+          let dx = waypoint.x - position.x;
+          let dy = waypoint.y - position.y;
+          let stepX = dx > 0 ? 1 : (dx < 0 ? -1 : 0);
+          let stepY = dy > 0 ? 1 : (dy < 0 ? -1 : 0);
+
+          // Check cardinal directions
+          let dir = null;
+          const candidates = [
+            { dx: stepX, dy: 0 },
+            { dx: 0, dy: stepY },
+            { dx: stepX, dy: stepY },
+            { dx: -stepX, dy: 0 },
+            { dx: 0, dy: -stepY },
+          ];
+          for (const c of candidates) {
+            const nx = position.x + c.dx;
+            const ny = position.y + c.dy;
+            const pos = new Position(nx, ny, position.z);
+            const t = window.gameClient?.world?.getTileFromWorldPosition?.(pos);
+            if (t && t.isWalkable && !t.isOccupied()) {
+              dir = getDirection(c.dx, c.dy);
+              if (dir !== null) {
+                if (window.gameClient?.keyboard) {
+                  window.gameClient.keyboard.handleMoveKey(dir);
+                  moved = true;
+                  break;
+                }
+              }
+            }
+          }
+          if (moved) {
+            state.pathAttemptStart = now;
+            state.stuckCount = 0;
+            bot.log("cave: nudged one step toward waypoint");
+          }
+        }
+
+        // If still stuck after a few attempts, skip the waypoint
+        if (!moved) {
+          state.stuckCount = (state.stuckCount || 0) + 1;
+          if (state.stuckCount > 3) {
+            bot.log("cave: stuck for too long, skipping waypoint", {
+              waypoint: state.lastWaypointTarget,
+              currentDist,
+            });
+            state.lastWaypointTarget = null;
+            state.pathAttemptStart = 0;
+            state.lastDistanceToWaypoint = null;
+            state.stuckCount = 0;
+            const nextWp = advanceWaypoint();
+            if (nextWp) goToWaypoint(nextWp);
+            else stop();
+            return;
+          }
+        }
+      }
     }
+  } catch (error) {
+    bot.log("cave tick failed", error?.message || error);
+  } finally {
+    scheduleNextTick();
   }
+}
 
   // ---- OBSERVER (learn transitions in background) ----
   function startObserver() {
@@ -5994,6 +6571,12 @@ function refreshPinkSkullStatus() {
       antiKSSelf: document.getElementById("minibia-bot-auto-attack-antiks-self"),
       antiKSOther: document.getElementById("minibia-bot-auto-attack-antiks-other"),
     };
+	const kiteToggle = document.getElementById("minibia-bot-auto-attack-kite");
+	const idealDistInput = document.getElementById("minibia-bot-auto-attack-ideal-dist");
+	if (kiteToggle) kiteToggle.checked = attackConfig.kiteMode !== false;
+	if (idealDistInput && document.activeElement !== idealDistInput) {
+	  idealDistInput.value = attackConfig.idealDistance ?? 3;
+	}
     if (inputs.enabled) inputs.enabled.checked = !!status?.running;
     if (inputs.melee) inputs.melee.checked = attackConfig.meleeMode !== false;
     if (inputs.hotkey && document.activeElement !== inputs.hotkey) {
@@ -6716,29 +7299,36 @@ function refreshPinkSkullStatus() {
       </div>
     </div>
 
-    <!-- Utility Tab -->
-    <div class="mb-tab-panel" data-tab-panel="utility">
-      <div class="mb-section"><div class="mb-label">Bot</div><button type="button" id="minibia-bot-reload">Reload Bot</button></div>
-      <div class="mb-section">
-        <div class="mb-label">Magic Level Trainer</div>
-        <label class="mb-toggle mb-toggle-main"><input type="checkbox" id="minibia-bot-rune-enabled" /><span>Enable Trainer</span></label>
-        <div class="mb-form-grid">
-          <label class="mb-field" for="minibia-bot-rune-spell"><span class="mb-field-label">Spell Words</span><input type="text" id="minibia-bot-rune-spell" placeholder="Spell words" /></label>
-          <label class="mb-field" for="minibia-bot-rune-mana"><span class="mb-field-label">Mana Cost</span><input type="number" id="minibia-bot-rune-mana" min="0" placeholder="Mana" /></label>
-        </div>
-      </div>
-      <div class="mb-section">
-        <div class="mb-label">Utility Modules</div>
-        <div class="mb-stack">
-          <div class="mb-utility-row"><label class="mb-toggle"><input type="checkbox" id="minibia-bot-auto-eat-enabled" /><span>Auto Eat</span></label><label class="mb-field mb-mini-field" for="minibia-bot-auto-eat-hotkey"><span class="mb-field-label">Hotkey</span><input type="number" id="minibia-bot-auto-eat-hotkey" min="1" max="12" placeholder="10" /></label></div>
-          <label class="mb-toggle"><input type="checkbox" id="minibia-bot-auto-invisible-enabled" /><span>Auto Invisible</span></label>
-          <label class="mb-toggle"><input type="checkbox" id="minibia-bot-auto-magic-shield-enabled" /><span>Auto Utamo Vita</span></label>
-          <label class="mb-toggle"><input type="checkbox" id="minibia-bot-equip-ring-enabled" /><span>Equip Ring</span></label>
-		  <label class="mb-toggle"><input type="checkbox" id="minibia-bot-light-hack-enabled" /><span>Disable Lighting (Light Hack)</span></label>
-		  <label class="mb-toggle"><input type="checkbox" id="minibia-bot-pink-skull-enabled" /><span>Pink Skull Disconnect</span></label>
-        </div>
-      </div>
+<!-- Utility Tab -->
+<div class="mb-tab-panel" data-tab-panel="utility">
+  <!-- Bot & Trainer -->
+  <div class="mb-section" style="padding:8px 10px;">
+    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+      <button type="button" id="minibia-bot-reload" style="width:auto; padding:4px 14px; font-size:11px;">Reload</button>
+      <div style="border-left:1px solid rgba(255,255,255,0.15); height:22px;"></div>
+      <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-rune-enabled" /><span>ML Trainer</span></label>
+      <label class="mb-field" style="flex:1; min-width:80px;"><span class="mb-field-label" style="font-size:10px;">Spell</span><input type="text" id="minibia-bot-rune-spell" placeholder="adori vita vis" style="padding:3px 6px;font-size:11px;" /></label>
+      <label class="mb-field" style="flex:0 0 70px;"><span class="mb-field-label" style="font-size:10px;">Mana</span><input type="number" id="minibia-bot-rune-mana" min="0" placeholder="600" style="padding:3px 6px;font-size:11px;" /></label>
     </div>
+  </div>
+
+  <!-- Utility Modules - 3 Column Grid -->
+  <div class="mb-section" style="padding:8px 10px;">
+    <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:6px 12px;">
+      <!-- Row 1 -->
+      <div style="display:flex; align-items:center; gap:6px;">
+        <label class="mb-toggle" style="margin:0; font-size:11px; white-space:nowrap;"><input type="checkbox" id="minibia-bot-auto-eat-enabled" /><span>Eat</span></label>
+        <input type="number" id="minibia-bot-auto-eat-hotkey" min="1" max="12" placeholder="10" style="width:38px;padding:2px 2px;font-size:11px;text-align:center;background:#080706;border:1px solid rgba(224,200,148,0.48);border-radius:4px;color:#fff2c7;" />
+      </div>
+      <label class="mb-toggle" style="margin:0; font-size:11px; white-space:nowrap;"><input type="checkbox" id="minibia-bot-auto-invisible-enabled" /><span>Invisible</span></label>
+      <label class="mb-toggle" style="margin:0; font-size:11px; white-space:nowrap;"><input type="checkbox" id="minibia-bot-auto-magic-shield-enabled" /><span>Utamo Vita</span></label>
+      <!-- Row 2 -->
+      <label class="mb-toggle" style="margin:0; font-size:11px; white-space:nowrap;"><input type="checkbox" id="minibia-bot-equip-ring-enabled" /><span>Equip Ring</span></label>
+      <label class="mb-toggle" style="margin:0; font-size:11px; white-space:nowrap;"><input type="checkbox" id="minibia-bot-light-hack-enabled" /><span>Light Hack</span></label>
+      <label class="mb-toggle" style="margin:0; font-size:11px; white-space:nowrap;"><input type="checkbox" id="minibia-bot-pink-skull-enabled" /><span>Pink Skull</span></label>
+    </div>
+  </div>
+</div>
 
     <!-- Cave Tab -->
     <div class="mb-tab-panel" data-tab-panel="cave">
@@ -6778,38 +7368,49 @@ function refreshPinkSkullStatus() {
       </div>
     </div>
 
-    <!-- Targeting Tab -->
-    <div class="mb-tab-panel" data-tab-panel="targeting">
-      <div class="mb-section">
-        <div class="mb-label">Auto Attack</div>
-        <div class="mb-stack">
-          <label class="mb-toggle mb-toggle-main"><input type="checkbox" id="minibia-bot-auto-attack-enabled" /><span>Enable Auto Attack</span></label>
-          <label class="mb-toggle"><input type="checkbox" id="minibia-bot-auto-attack-melee" /><span>Melee Mode</span></label>
-          <div class="mb-form-grid">
-            <label class="mb-field" for="minibia-bot-auto-attack-hotkey"><span class="mb-field-label">Target Hotkey</span><input type="number" id="minibia-bot-auto-attack-hotkey" min="1" max="12" placeholder="3" /></label>
-            <label class="mb-field" for="minibia-bot-auto-attack-rune-hotkey"><span class="mb-field-label">Rune Hotkey</span><input type="number" id="minibia-bot-auto-attack-rune-hotkey" min="1" max="12" placeholder="4" /></label>
-          </div>
-          <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:12px; align-items:end;">
-            <label class="mb-field" for="minibia-bot-auto-attack-maxdist"><span class="mb-field-label">Max Target Distance</span><input type="number" id="minibia-bot-auto-attack-maxdist" min="1" max="10" value="5" /></label>
-            <div style="display:flex; align-items:center;"><label class="mb-toggle" style="margin:0;"><input type="checkbox" id="minibia-bot-auto-attack-antiks" /><span>Anti-KS</span></label></div>
-            <div style="display:flex; gap:8px; align-items:center; justify-content:flex-end;">
-              <label class="mb-field" style="flex:1; min-width:0;"><span class="mb-field-label">Self Range</span><input type="number" id="minibia-bot-auto-attack-antiks-self" min="1" max="5" value="2" /></label>
-              <label class="mb-field" style="flex:1; min-width:0;"><span class="mb-field-label">Other Range</span><input type="number" id="minibia-bot-auto-attack-antiks-other" min="1" max="5" value="2" /></label>
-            </div>
-          </div>
-          <div class="mb-section" style="margin-top:8px;">
-            <div class="mb-label">Target Priority</div>
-            <div class="mb-stack">
-              <label class="mb-field" for="minibia-bot-auto-attack-preferred-names"><span class="mb-field-label">Preferred Mobs</span><textarea id="minibia-bot-auto-attack-preferred-names" placeholder="Orc Shaman, Amazon, Orc Spearman"></textarea></label>
-              <label class="mb-field" for="minibia-bot-auto-attack-preferred-match-mode"><span class="mb-field-label">Match Mode</span><select id="minibia-bot-auto-attack-preferred-match-mode"><option value="exact">Exact name</option><option value="includes">Contains text</option></select></label>
-              <button type="button" class="mb-small-button" id="minibia-bot-auto-attack-preferred-save">Save Target Priority</button>
-              <div class="mb-small-note" id="minibia-bot-auto-attack-preferred-status">Preferred mobs: none</div>
-              <div class="mb-small-note">Preferred mobs are ranked first, but other visible mobs are still allowed.</div>
-            </div>
-          </div>
-        </div>
-      </div>
+<!-- Targeting Tab -->
+<div class="mb-tab-panel" data-tab-panel="targeting">
+  <!-- Auto Attack -->
+  <div class="mb-section" style="padding:8px 10px;">
+    <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
+      <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-auto-attack-enabled" /><span>Enable</span></label>
+      <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-auto-attack-melee" /><span>Melee</span></label>
+      <label class="mb-field" style="flex:0 0 80px;"><span class="mb-field-label" style="font-size:10px;">Target</span><input type="number" id="minibia-bot-auto-attack-hotkey" min="1" max="12" placeholder="3" style="padding:3px 4px;font-size:11px;" /></label>
+      <label class="mb-field" style="flex:0 0 80px;"><span class="mb-field-label" style="font-size:10px;">Rune</span><input type="number" id="minibia-bot-auto-attack-rune-hotkey" min="1" max="12" placeholder="4" style="padding:3px 4px;font-size:11px;" /></label>
     </div>
+  </div>
+
+  <!-- Combat Settings -->
+  <div class="mb-section" style="padding:6px 10px;">
+    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+      <label class="mb-field" style="flex:0 0 90px;"><span class="mb-field-label" style="font-size:10px;">Max Dist</span><input type="number" id="minibia-bot-auto-attack-maxdist" min="1" max="10" value="5" style="padding:3px 4px;font-size:11px;" /></label>
+      <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-auto-attack-antiks" /><span>Anti-KS</span></label>
+      <label class="mb-field" style="flex:0 0 70px;"><span class="mb-field-label" style="font-size:10px;">Self</span><input type="number" id="minibia-bot-auto-attack-antiks-self" min="1" max="5" value="2" style="padding:3px 4px;font-size:11px;" /></label>
+      <label class="mb-field" style="flex:0 0 70px;"><span class="mb-field-label" style="font-size:10px;">Other</span><input type="number" id="minibia-bot-auto-attack-antiks-other" min="1" max="5" value="2" style="padding:3px 4px;font-size:11px;" /></label>
+    </div>
+  </div>
+
+  <!-- Kite Mode -->
+  <div class="mb-section" style="padding:6px 10px;">
+    <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
+      <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-auto-attack-kite" /><span>Kite</span></label>
+      <label class="mb-field" style="flex:0 0 80px;"><span class="mb-field-label" style="font-size:10px;">Ideal Dist</span><input type="number" id="minibia-bot-auto-attack-ideal-dist" min="1" max="10" value="3" style="padding:3px 4px;font-size:11px;" /></label>
+    </div>
+  </div>
+
+  <!-- Target Priority -->
+  <div class="mb-section" style="padding:6px 10px;">
+    <div style="display:flex; gap:6px; align-items:end; flex-wrap:wrap;">
+      <label class="mb-field" style="flex:1; min-width:100px;"><span class="mb-field-label" style="font-size:10px;">Preferred Mobs</span><textarea id="minibia-bot-auto-attack-preferred-names" placeholder="Orc Shaman, Amazon" style="min-height:28px;padding:3px 4px;font-size:11px;resize:vertical;"></textarea></label>
+      <label class="mb-field" style="flex:0 0 110px;"><span class="mb-field-label" style="font-size:10px;">Match Mode</span><select id="minibia-bot-auto-attack-preferred-match-mode" style="padding:3px 4px;font-size:11px;"><option value="exact">Exact</option><option value="includes">Contains</option></select></label>
+      <button type="button" class="mb-small-button" id="minibia-bot-auto-attack-preferred-save" style="padding:3px 10px;font-size:11px;width:auto;">Save</button>
+    </div>
+    <div style="display:flex; gap:8px; margin-top:4px; flex-wrap:wrap;">
+      <div class="mb-small-note" id="minibia-bot-auto-attack-preferred-status" style="font-size:10px;">Preferred: none</div>
+      <div class="mb-small-note" style="font-size:10px;">Ranked first, others allowed</div>
+    </div>
+  </div>
+</div>
 
     <!-- Talk Tab -->
     <div class="mb-tab-panel" data-tab-panel="talk">
@@ -7236,6 +7837,27 @@ function refreshPinkSkullStatus() {
       });
     }
 
+	// ---- Kite Mode ----
+	const kiteToggle = panel.querySelector("#minibia-bot-auto-attack-kite");
+	const idealDistInput = panel.querySelector("#minibia-bot-auto-attack-ideal-dist");
+
+	if (kiteToggle) {
+	  kiteToggle.checked = bot.attack?.config?.kiteMode || false;
+	  kiteToggle.addEventListener("change", function() {
+		bot.attack.updateConfig({ kiteMode: this.checked });
+	  });
+	}
+
+	if (idealDistInput) {
+	  idealDistInput.value = bot.attack?.config?.idealDistance ?? 3;
+	  idealDistInput.addEventListener("change", function() {
+		const val = Math.max(1, Math.min(10, Number(this.value) || 3));
+		this.value = val;
+		bot.attack.updateConfig({ idealDistance: val });
+	  });
+	}
+
+
     // Panic player alert
     const playerAlertToggle = panel.querySelector("#minibia-bot-panic-player-alert");
     const playerCooldownInput = panel.querySelector("#minibia-bot-panic-player-cooldown");
@@ -7409,6 +8031,53 @@ function refreshPinkSkullStatus() {
 	// ---- Trusted Name Add ----
 	const panicTrustedInput = panel.querySelector("#minibia-bot-panic-trusted-input");
 	const panicTrustedAddButton = panel.querySelector("#minibia-bot-panic-trusted-add");
+	
+		// ---- Game Master Name Add ----
+	const gmInput = panel.querySelector("#minibia-bot-panic-gm-input");
+	const gmAddButton = panel.querySelector("#minibia-bot-panic-gm-add");
+
+	function addGameMasterName() {
+	  const rawName = gmInput?.value?.trim() || "";
+	  if (!rawName) {
+		bot.log("No game master name entered.");
+		return;
+	  }
+
+	  if (!bot.panic) {
+		bot.log("Panic module not available.");
+		return;
+	  }
+
+	  const currentNames = bot.panic.config.gameMasterNames || [];
+	  const exists = currentNames.some(
+		(name) => String(name).trim().toLowerCase() === rawName.toLowerCase()
+	  );
+
+	  if (exists) {
+		bot.log(`"${rawName}" is already in the GM list.`);
+		gmInput.value = "";
+		return;
+	  }
+
+	  bot.panic.updateConfig({ gameMasterNames: [...currentNames, rawName] });
+	  gmInput.value = "";
+	  renderGameMasterNames();
+	  bot.log(`Added game master name: ${rawName}`);
+	}
+
+	if (gmAddButton) {
+	  gmAddButton.addEventListener("click", addGameMasterName);
+	}
+
+	if (gmInput) {
+	  gmInput.addEventListener("keydown", (event) => {
+		if (event.key === "Enter") {
+		  event.preventDefault();
+		  addGameMasterName();
+		}
+	  });
+	}
+
 
 	function addTrustedName() {
 	  const rawName = panicTrustedInput?.value?.trim() || "";
@@ -7454,6 +8123,7 @@ function refreshPinkSkullStatus() {
 		}
 	  });
 	}
+
 
     // ---- OLDER EXISTING LISTENERS (reload, trusted, GM, rune, eat, invisible, shield, equip, talk, panic, xray, home) ----
 
