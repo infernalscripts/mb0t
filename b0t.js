@@ -4633,6 +4633,289 @@ window.__minibiaBotBundle.installTalkModule = function installTalkModule(bot) {
   };
 };
 
+// Light hack
+
+window.__minibiaBotBundle.installLightHackModule = function installLightHackModule(bot) {
+  const configStorageKey = "minibiaBot.lightHack.config";
+  let patched = false;
+  let patchInterval = null;
+  let retryCount = 0;
+  const MAX_RETRIES = 60; // 60 seconds total
+
+  const config = Object.assign(
+    { enabled: false },
+    bot.storage.get(configStorageKey, {})
+  );
+
+  function persistConfig() {
+    bot.storage.set(configStorageKey, { ...config });
+  }
+
+  // ----- DIRECT PATCHING (we now know the class) -----
+  function getCanvasClass() {
+    // Try window.Canvas first, then global Canvas
+    if (typeof window !== 'undefined' && window.Canvas) return window.Canvas;
+    if (typeof Canvas !== 'undefined') return Canvas;
+    return null;
+  }
+
+  function shouldSkipDarkRect(r, g, b, a) {
+    const dark = r <= 0.08 && g <= 0.08 && b <= 0.08;
+    return dark && a >= 0.10;
+  }
+
+  // Force re‑render (same as before)
+  function forceRender() {
+    try {
+      const gc = window.gameClient;
+      if (gc && typeof gc.render === "function") gc.render();
+      if (gc && gc.renderer && typeof gc.renderer.render === "function") gc.renderer.render();
+      const canvas = document.querySelector("canvas#screen");
+      if (canvas) {
+        const w = canvas.width, h = canvas.height;
+        canvas.width = w + 1;
+        canvas.height = h + 1;
+        setTimeout(() => { canvas.width = w; canvas.height = h; }, 10);
+      }
+      const settings = gc?.interface?.settings;
+      if (settings && typeof settings.setLightingEnabled === "function") {
+        settings.setLightingEnabled(!config.enabled);
+        settings.setLightingEnabled(config.enabled);
+      }
+      // Also try toggling the WebGL setting to force a redraw
+      if (settings && typeof settings.setWebGLEnabled === "function") {
+        settings.setWebGLEnabled(false);
+        settings.setWebGLEnabled(true);
+      }
+    } catch (e) {
+      bot.log("LightHack: forceRender failed", e);
+    }
+  }
+
+  // Apply all patches directly to the Canvas class
+  function applyPatches() {
+    if (patched) return true;
+
+    const C = getCanvasClass();
+    if (!C) {
+      retryCount++;
+      if (retryCount % 10 === 0) {
+        bot.log(`LightHack: Canvas class not found (attempt ${retryCount}) – retrying`);
+      }
+      return false;
+    }
+
+    // Cancel retry loop if we just found it
+    if (patchInterval) {
+      clearInterval(patchInterval);
+      patchInterval = null;
+    }
+
+    // ---- PATCH isWebGLEnabled ----
+    if (!C.__minibiaLightHackOriginalIsWebGLEnabled) {
+      C.__minibiaLightHackOriginalIsWebGLEnabled = C.isWebGLEnabled;
+    }
+    C.isWebGLEnabled = function() {
+      if (config.enabled) return false;
+      return C.__minibiaLightHackOriginalIsWebGLEnabled
+        ? C.__minibiaLightHackOriginalIsWebGLEnabled.apply(this, arguments)
+        : true;
+    };
+
+    // ---- PATCH drawFilledRect ----
+    if (C.prototype && typeof C.prototype.drawFilledRect === "function") {
+      if (!C.prototype.__minibiaLightHackOriginalDrawFilledRect) {
+        C.prototype.__minibiaLightHackOriginalDrawFilledRect = C.prototype.drawFilledRect;
+      }
+      C.prototype.drawFilledRect = function(x, y, size, r, g, b, a) {
+        if (config.enabled && shouldSkipDarkRect(r, g, b, a)) {
+          // Skip drawing the dark rectangle entirely
+          return;
+        }
+        return C.prototype.__minibiaLightHackOriginalDrawFilledRect.apply(this, arguments);
+      };
+    }
+
+    // ---- PATCH setTint ----
+    if (C.prototype && typeof C.prototype.setTint === "function") {
+      if (!C.prototype.__minibiaLightHackOriginalSetTint) {
+        C.prototype.__minibiaLightHackOriginalSetTint = C.prototype.setTint;
+      }
+      C.prototype.setTint = function(r, g, b) {
+        if (config.enabled && r <= 0.25 && g <= 0.25 && b <= 0.25) {
+          // Override dark tint with bright white
+          return C.prototype.__minibiaLightHackOriginalSetTint.call(this, 1, 1, 1);
+        }
+        return C.prototype.__minibiaLightHackOriginalSetTint.apply(this, arguments);
+      };
+    }
+
+    // ---- PATCH applyFilter (skip greyscale/sepia/saturate) ----
+    if (C.prototype && typeof C.prototype.applyFilter === "function") {
+      if (!C.prototype.__minibiaLightHackOriginalApplyFilter) {
+        C.prototype.__minibiaLightHackOriginalApplyFilter = C.prototype.applyFilter;
+      }
+      C.prototype.applyFilter = function(filter) {
+        if (config.enabled && (filter === "greyscale" || filter === "saturate" || filter === "sepia")) {
+          return;
+        }
+        return C.prototype.__minibiaLightHackOriginalApplyFilter.apply(this, arguments);
+      };
+    }
+
+    // ---- PATCH gameClient.interface.settings.isLightingEnabled ----
+    try {
+      const gc = window.gameClient;
+      const settings = gc?.interface?.settings;
+      if (settings && typeof settings.isLightingEnabled === "function") {
+        if (!settings.__minibiaLightHackOriginalLighting) {
+          settings.__minibiaLightHackOriginalLighting = settings.isLightingEnabled.bind(settings);
+        }
+        settings.isLightingEnabled = function() {
+          if (config.enabled) return false;
+          return settings.__minibiaLightHackOriginalLighting();
+        };
+      }
+    } catch (e) {}
+
+    // ---- SET localStorage flags ----
+    try {
+      const raw = localStorage.getItem("settings");
+      const obj = raw ? JSON.parse(raw) : {};
+      obj["enable-webgl"] = false;
+      obj["enable-lighting"] = false;
+      obj["lighting"] = false;
+      obj["enableLights"] = false;
+      localStorage.setItem("settings", JSON.stringify(obj));
+    } catch (e) {}
+
+    patched = true;
+    bot.log("LightHack: patches applied successfully");
+
+    // Force re‑render after patching
+    forceRender();
+
+    return true;
+  }
+
+  function ensurePatched() {
+    if (patched) return;
+    if (patchInterval) {
+      clearInterval(patchInterval);
+      patchInterval = null;
+    }
+    retryCount = 0;
+    // Try immediately
+    if (applyPatches()) return;
+    // If not, retry
+    patchInterval = setInterval(() => {
+      if (retryCount > MAX_RETRIES) {
+        clearInterval(patchInterval);
+        patchInterval = null;
+        bot.log("LightHack: max retries reached, patches not applied");
+        return;
+      }
+      if (applyPatches()) {
+        clearInterval(patchInterval);
+        patchInterval = null;
+      }
+    }, 1000);
+  }
+
+  function removePatches() {
+    patched = false;
+    if (patchInterval) {
+      clearInterval(patchInterval);
+      patchInterval = null;
+    }
+
+    const C = getCanvasClass();
+    if (C) {
+      if (C.__minibiaLightHackOriginalIsWebGLEnabled) {
+        C.isWebGLEnabled = C.__minibiaLightHackOriginalIsWebGLEnabled;
+        delete C.__minibiaLightHackOriginalIsWebGLEnabled;
+      }
+      if (C.prototype) {
+        if (C.prototype.__minibiaLightHackOriginalDrawFilledRect) {
+          C.prototype.drawFilledRect = C.prototype.__minibiaLightHackOriginalDrawFilledRect;
+          delete C.prototype.__minibiaLightHackOriginalDrawFilledRect;
+        }
+        if (C.prototype.__minibiaLightHackOriginalSetTint) {
+          C.prototype.setTint = C.prototype.__minibiaLightHackOriginalSetTint;
+          delete C.prototype.__minibiaLightHackOriginalSetTint;
+        }
+        if (C.prototype.__minibiaLightHackOriginalApplyFilter) {
+          C.prototype.applyFilter = C.prototype.__minibiaLightHackOriginalApplyFilter;
+          delete C.prototype.__minibiaLightHackOriginalApplyFilter;
+        }
+      }
+    }
+
+    try {
+      const gc = window.gameClient;
+      const settings = gc?.interface?.settings;
+      if (settings && settings.__minibiaLightHackOriginalLighting) {
+        settings.isLightingEnabled = settings.__minibiaLightHackOriginalLighting;
+        delete settings.__minibiaLightHackOriginalLighting;
+      }
+    } catch (e) {}
+
+    bot.log("LightHack: patches removed");
+    forceRender();
+  }
+
+  // ---- PUBLIC API ----
+  function start() {
+    if (config.enabled) return false;
+    config.enabled = true;
+    persistConfig();
+    ensurePatched();
+    bot.log("LightHack enabled");
+    return true;
+  }
+
+  function stop() {
+    if (!config.enabled) return false;
+    config.enabled = false;
+    persistConfig();
+    removePatches();
+    bot.log("LightHack disabled");
+    return true;
+  }
+
+  function status() {
+    return {
+      running: config.enabled,
+      config: { ...config },
+    };
+  }
+
+  function updateConfig(next) {
+    if (next.enabled !== undefined) {
+      if (next.enabled) start();
+      else stop();
+    }
+    return { ...config };
+  }
+
+  // Auto‑apply on init if enabled
+  if (config.enabled) {
+    ensurePatched();
+    // Force a render after 200ms
+    setTimeout(forceRender, 200);
+  }
+
+  // Also expose a manual force‑render for debugging
+  bot.lightHack = {
+    start,
+    stop,
+    status,
+    updateConfig,
+    config,
+    forceRender,
+  };
+};
+
 // Paladin
 
 window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(bot) {
@@ -5769,7 +6052,7 @@ function refreshLooterStatus() {
 	  }
 	}
   }
-
+  
   function refreshTalkIgnoredPhrases() {
     const input = document.getElementById("minibia-bot-talk-ignored");
     if (!input) return;
@@ -5785,6 +6068,11 @@ function refreshLooterStatus() {
     bot.talk.updateConfig({ ignoredPhrases: phrases });
     refreshTalkIgnoredPhrases();
   }
+  
+  	function refreshLightHackStatus() {
+	  const toggle = document.getElementById("minibia-bot-light-hack-enabled");
+	  if (toggle) toggle.checked = !!bot.lightHack?.status?.().running;
+	}
 
   // ---- CAVE UI ----
   function refreshCavePresetControls() {
@@ -6317,6 +6605,7 @@ function refreshLooterStatus() {
           <label class="mb-toggle"><input type="checkbox" id="minibia-bot-auto-invisible-enabled" /><span>Auto Invisible</span></label>
           <label class="mb-toggle"><input type="checkbox" id="minibia-bot-auto-magic-shield-enabled" /><span>Auto Utamo Vita</span></label>
           <label class="mb-toggle"><input type="checkbox" id="minibia-bot-equip-ring-enabled" /><span>Equip Ring</span></label>
+		  <label class="mb-toggle"><input type="checkbox" id="minibia-bot-light-hack-enabled" /><span>Disable Lighting (Light Hack)</span></label>
         </div>
       </div>
     </div>
@@ -6545,6 +6834,31 @@ function refreshLooterStatus() {
     }
 
     // ---- EVENT LISTENERS ----
+	
+	// ---- Light Hack ----
+	const lightHackToggle = panel.querySelector("#minibia-bot-light-hack-enabled");
+	if (lightHackToggle) {
+	  // Sync initial state
+	  lightHackToggle.checked = !!(bot.lightHack?.status?.().running);
+
+	  lightHackToggle.addEventListener("change", function() {
+		// If the module isn't available, log error and uncheck
+		if (!bot.lightHack) {
+		  bot.log("LightHack module not installed – please reload the bot.");
+		  this.checked = false;
+		  return;
+		}
+
+		if (this.checked) {
+		  bot.lightHack.start();
+		} else {
+		  bot.lightHack.stop();
+		}
+
+		// Re-sync the checkbox with the actual state (in case start/stop failed)
+		this.checked = !!bot.lightHack.status().running;
+	  });
+	}
 	
 	// ---- Paladin listeners ----
 	const paladinToggle = panel.querySelector("#minibia-bot-paladin-enabled");
@@ -7092,6 +7406,7 @@ function refreshLooterStatus() {
     currentBundle.installTalkModule(bot);
 	currentBundle.installPaladinModule(bot);
 	currentBundle.installLooterModule(bot);
+	currentBundle.installLightHackModule(bot);
     currentBundle.installPanel(bot);
 
     bot.ui.inject();
