@@ -5583,6 +5583,130 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
   };
 };
 
+// -- PINK SKULL DISCONNECT
+
+window.__minibiaBotBundle.installPinkSkullDetectorModule = function installPinkSkullDetectorModule(bot) {
+  const configStorageKey = "minibiaBot.pinkSkull.config";
+  let checkInterval = null;
+
+  const config = Object.assign(
+    { enabled: false },
+    bot.storage.get(configStorageKey, {})
+  );
+
+  function persistConfig() {
+    bot.storage.set(configStorageKey, { ...config });
+  }
+
+  function getPinkSkullValue() {
+    // Attempt to get the pink skull constant from CONST.SKULL
+    if (typeof CONST !== 'undefined' && CONST.SKULL && typeof CONST.SKULL.PINK !== 'undefined') {
+      return CONST.SKULL.PINK;
+    }
+    // Fallback: numeric value from common OTC implementations (often 4)
+    return 4;
+  }
+
+  function checkSkull() {
+    if (!config.enabled) return;
+
+    const player = window.gameClient?.player;
+    if (!player) return;
+
+    const pink = getPinkSkullValue();
+    if (player.skull === pink) {
+      bot.log("PINK SKULL DETECTED! Disconnecting...");
+      bot.playAlarm?.();
+
+      // Stop all modules (like panic does)
+      if (bot.cave?.stop) bot.cave.stop({ persistEnabled: false });
+      if (bot.attack?.stop) bot.attack.stop({ persistEnabled: false });
+      if (bot.rune?.stop) bot.rune.stop({ persistEnabled: false });
+      if (bot.heal?.stop) bot.heal.stop({ persistEnabled: false });
+      if (bot.invisible?.stop) bot.invisible.stop({ persistEnabled: false });
+      if (bot.magicShield?.stop) bot.magicShield.stop({ persistEnabled: false });
+      if (bot.equipRing?.stop) bot.equipRing.stop({ persistEnabled: false });
+      if (bot.eat?.stop) bot.eat.stop({ persistEnabled: false });
+      if (bot.paladin?.stop) bot.paladin.stop({ persistEnabled: false });
+      if (bot.looter?.stop) bot.looter.stop({ persistEnabled: false });
+
+      // Disconnect
+      try {
+        if (window.gameClient && typeof window.gameClient.disconnect === 'function') {
+          window.gameClient.disconnect();
+          bot.log("Game client disconnected.");
+        } else {
+          bot.log("Could not disconnect: gameClient.disconnect not available.");
+        }
+      } catch (e) {
+        bot.log("Disconnect failed:", e);
+      }
+
+      // Disable the detector to prevent repeated triggers
+      config.enabled = false;
+      persistConfig();
+      if (checkInterval) {
+        clearInterval(checkInterval);
+        checkInterval = null;
+      }
+      // Update UI toggle
+      if (typeof bot.ui?.refreshPinkSkullStatus === 'function') {
+        bot.ui.refreshPinkSkullStatus();
+      }
+    }
+  }
+
+  function start() {
+    if (config.enabled) return false;
+    config.enabled = true;
+    persistConfig();
+    if (checkInterval) clearInterval(checkInterval);
+    checkInterval = setInterval(checkSkull, 1000);
+    bot.log("Pink Skull Detector enabled");
+    return true;
+  }
+
+  function stop() {
+    if (!config.enabled) return false;
+    config.enabled = false;
+    persistConfig();
+    if (checkInterval) {
+      clearInterval(checkInterval);
+      checkInterval = null;
+    }
+    bot.log("Pink Skull Detector disabled");
+    return true;
+  }
+
+  function status() {
+    return {
+      running: config.enabled,
+      config: { ...config },
+    };
+  }
+
+  function updateConfig(next) {
+    if (next.enabled !== undefined) {
+      if (next.enabled) start();
+      else stop();
+    }
+    return { ...config };
+  }
+
+  // Auto-start if enabled
+  if (config.enabled) {
+    start();
+  }
+
+  bot.pinkSkull = {
+    start,
+    stop,
+    status,
+    updateConfig,
+    config,
+  };
+};
+
 
 /**
  * ==================================================================================
@@ -5694,6 +5818,11 @@ function refreshLooterStatus() {
       }
     }
   }
+}
+
+function refreshPinkSkullStatus() {
+  const toggle = document.getElementById("minibia-bot-pink-skull-enabled");
+  if (toggle) toggle.checked = !!bot.pinkSkull?.status?.().running;
 }
 
   function saveAutoAttackPreferredConfig() {
@@ -6606,6 +6735,7 @@ function refreshLooterStatus() {
           <label class="mb-toggle"><input type="checkbox" id="minibia-bot-auto-magic-shield-enabled" /><span>Auto Utamo Vita</span></label>
           <label class="mb-toggle"><input type="checkbox" id="minibia-bot-equip-ring-enabled" /><span>Equip Ring</span></label>
 		  <label class="mb-toggle"><input type="checkbox" id="minibia-bot-light-hack-enabled" /><span>Disable Lighting (Light Hack)</span></label>
+		  <label class="mb-toggle"><input type="checkbox" id="minibia-bot-pink-skull-enabled" /><span>Pink Skull Disconnect</span></label>
         </div>
       </div>
     </div>
@@ -6859,6 +6989,26 @@ function refreshLooterStatus() {
 		this.checked = !!bot.lightHack.status().running;
 	  });
 	}
+	
+	// ---- Pink Skull ----
+	const pinkSkullToggle = panel.querySelector("#minibia-bot-pink-skull-enabled");
+	if (pinkSkullToggle) {
+	  pinkSkullToggle.checked = !!bot.pinkSkull?.status?.().running;
+	  pinkSkullToggle.addEventListener("change", function() {
+		if (!bot.pinkSkull) {
+		  bot.log("Pink Skull module not installed");
+		  this.checked = false;
+		  return;
+		}
+		if (this.checked) {
+		  bot.pinkSkull.start();
+		} else {
+		  bot.pinkSkull.stop();
+		}
+		this.checked = !!bot.pinkSkull.status().running;
+	  });
+	}
+	
 	
 	// ---- Paladin listeners ----
 	const paladinToggle = panel.querySelector("#minibia-bot-paladin-enabled");
@@ -7242,6 +7392,68 @@ function refreshLooterStatus() {
         bot.cave.setLoopMode(loopToggle.checked);
       });
     }
+	
+	// ---- Reload Bot ----
+	const reloadButton = panel.querySelector("#minibia-bot-reload");
+	if (reloadButton) {
+	  reloadButton.addEventListener("click", () => {
+		if (typeof window.minibiaBotReload === "function") {
+		  window.minibiaBotReload();
+		} else {
+		  console.warn("[minibia-bot] minibiaBotReload not defined – reloading page instead.");
+		  location.reload();
+		}
+	  });
+	}
+
+	// ---- Trusted Name Add ----
+	const panicTrustedInput = panel.querySelector("#minibia-bot-panic-trusted-input");
+	const panicTrustedAddButton = panel.querySelector("#minibia-bot-panic-trusted-add");
+
+	function addTrustedName() {
+	  const rawName = panicTrustedInput?.value?.trim() || "";
+	  if (!rawName) {
+		bot.log("No name entered.");
+		return;
+	  }
+
+	  if (!bot.panic) {
+		bot.log("Panic module not available.");
+		return;
+	  }
+
+	  const currentNames = bot.panic.config.trustedNames || [];
+	  const exists = currentNames.some(
+		(name) => String(name).trim().toLowerCase() === rawName.toLowerCase()
+	  );
+
+	  if (exists) {
+		bot.log(`"${rawName}" is already trusted.`);
+		panicTrustedInput.value = "";
+		return;
+	  }
+
+	  bot.panic.updateConfig({ trustedNames: [...currentNames, rawName] });
+	  panicTrustedInput.value = "";
+	  renderTrustedNames();
+	  bot.log(`Added trusted name: ${rawName}`);
+	}
+
+	if (panicTrustedAddButton) {
+	  panicTrustedAddButton.addEventListener("click", addTrustedName);
+	} else {
+	  console.warn("Trusted add button not found.");
+	}
+
+	// Also handle Enter key on input
+	if (panicTrustedInput) {
+	  panicTrustedInput.addEventListener("keydown", (event) => {
+		if (event.key === "Enter") {
+		  event.preventDefault();
+		  addTrustedName();
+		}
+	  });
+	}
 
     // ---- OLDER EXISTING LISTENERS (reload, trusted, GM, rune, eat, invisible, shield, equip, talk, panic, xray, home) ----
 
@@ -7407,6 +7619,7 @@ function refreshLooterStatus() {
 	currentBundle.installPaladinModule(bot);
 	currentBundle.installLooterModule(bot);
 	currentBundle.installLightHackModule(bot);
+	currentBundle.installPinkSkullDetectorModule(bot);
     currentBundle.installPanel(bot);
 
     bot.ui.inject();
@@ -7437,8 +7650,14 @@ function refreshLooterStatus() {
     return bot;
   }
 
-  window.__minibiaBotReloadBundle = bundle;
-  window.minibiaBotReload = () => boot(window.__minibiaBotReloadBundle || bundle);
+	window.minibiaBotReload = () => {
+	  try {
+		boot(window.__minibiaBotReloadBundle || bundle);
+	  } catch (e) {
+		console.error("[minibia-bot] reload failed", e);
+		location.reload();
+	  }
+	};
   delete window.__minibiaBotBundle;
   boot(bundle);
 })();
