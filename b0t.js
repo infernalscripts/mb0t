@@ -6534,27 +6534,31 @@ window.__minibiaBotBundle.installPinkSkullDetectorModule = function installPinkS
 window.__minibiaBotBundle.installProfileModule = function installProfileModule(bot) {
   const PROFILES_STORAGE_KEY = "minibiaBot.profiles";
 
-  const CONFIG_KEYS = [
-    "minibiaBot.rune.config",
-    "minibiaBot.heal.config",
-    "minibiaBot.invisible.config",
-    "minibiaBot.magicShield.config",
-    "minibiaBot.attack.config",
-    "minibiaBot.cave.config",
-    "minibiaBot.equipRing.config",
-    "minibiaBot.eat.config",
-    "minibiaBot.talk.config",
-    "minibiaBot.panic.config",
-    "minibiaBot.xray.config",
-    "minibiaBot.pz.home",
-    "minibiaBot.audio.alarmSrc",
-    "minibiaBot.lightHack.config",
-    "minibiaBot.pinkSkull.config",
-    "minibiaBot.paladin.config",
-    "minibiaBot.looter.config",
-    "minibiaBot.ui.panelPosition",
-    "minibiaBot.ui.panelCollapsed",
-  ];
+const CONFIG_KEYS = [
+  "minibiaBot.rune.config",
+  "minibiaBot.heal.config",
+  "minibiaBot.invisible.config",
+  "minibiaBot.magicShield.config",
+  "minibiaBot.attack.config",
+  "minibiaBot.cave.config",
+  "minibiaBot.cave.route",      
+  "minibiaBot.cave.transitions", 
+  "minibiaBot.cave.presets",     
+  "minibiaBot.equipRing.config",
+  "minibiaBot.eat.config",
+  "minibiaBot.talk.config",
+  "minibiaBot.panic.config",
+  "minibiaBot.xray.config",
+  "minibiaBot.pz.home",
+  "minibiaBot.audio.alarmSrc",
+  "minibiaBot.lightHack.config",
+  "minibiaBot.pinkSkull.config",
+  "minibiaBot.paladin.config",
+  "minibiaBot.looter.config",
+  "minibiaBot.blacklist.config", 
+  "minibiaBot.ui.panelPosition",
+  "minibiaBot.ui.panelCollapsed",
+];
 
   function getAllConfigs() {
     const snapshot = {};
@@ -6789,6 +6793,130 @@ window.__minibiaBotBundle.installBlacklistModule = function installBlacklistModu
     addCurrentPosition,
     persist,
   };
+};
+
+/**
+ * ANTI-AFK MODULE – Prevents logout by turning character when idle
+ */
+window.__minibiaBotBundle.installAntiAfkModule = function installAntiAfkModule(bot) {
+  const configStorageKey = "minibiaBot.antiafk.config";
+  const state = {
+    running: false,
+    timerId: null,
+    lastActionAt: 0,
+    turnIndex: 0,
+  };
+
+  const config = Object.assign(
+    { enabled: false, intervalMs: 60000 },
+    bot.storage.get(configStorageKey, {})
+  );
+
+  function persistConfig() {
+    bot.storage.set(configStorageKey, { ...config });
+  }
+
+  function isIdle() {
+    if (!!bot.cave?.status?.().running || !!bot.attack?.status?.().running) return false;
+    const pf = window.gameClient?.world?.pathfinder;
+    if (pf && pf.__isAutoWalking) return false;
+    return true;
+  }
+
+  function sendTurn(dir) {
+    try {
+      if (window.gameClient?.keyboard?.handleDirectionKey) {
+        window.gameClient.keyboard.handleDirectionKey(dir);
+        return true;
+      }
+      if (window.gameClient?.send && typeof TurnPacket === 'function') {
+        window.gameClient.send(new TurnPacket(dir));
+        return true;
+      }
+      if (window.gameClient?.keyboard?.handleMoveKey) {
+        window.gameClient.keyboard.handleMoveKey(dir);
+        return true;
+      }
+      return false;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function performTurn() {
+    if (!config.enabled || !state.running) return false;
+    if (!isIdle()) { state.lastActionAt = Date.now(); return false; }
+    if (Date.now() - state.lastActionAt < config.intervalMs) return false;
+
+    const dirs = [
+      CONST.DIRECTION.NORTH,
+      CONST.DIRECTION.EAST,
+      CONST.DIRECTION.SOUTH,
+      CONST.DIRECTION.WEST,
+    ];
+    const dir = dirs[state.turnIndex % dirs.length];
+    state.turnIndex++;
+
+    if (sendTurn(dir)) {
+      state.lastActionAt = Date.now();
+      bot.log("anti-afk: turned " + Object.keys(CONST.DIRECTION).find(k => CONST.DIRECTION[k] === dir) || dir);
+    } else {
+      state.turnIndex++; // skip failed direction
+    }
+    return true;
+  }
+
+  function scheduleNextTick() {
+    if (!state.running) return;
+    state.timerId = setTimeout(() => {
+      try { performTurn(); } catch (e) { bot.log("anti-afk tick failed", e); }
+      scheduleNextTick();
+    }, 5000);
+  }
+
+  function start(overrides = {}) {
+    Object.assign(config, overrides, { enabled: true });
+    persistConfig();
+    if (state.running) return false;
+    state.running = true;
+    state.lastActionAt = Date.now();
+    state.turnIndex = 0;
+    bot.log("anti-afk started", { intervalMs: config.intervalMs });
+    scheduleNextTick();
+    return true;
+  }
+
+  function stop(options = {}) {
+    const shouldPersist = options.persistEnabled !== false;
+    state.running = false;
+    if (state.timerId) { clearTimeout(state.timerId); state.timerId = null; }
+    if (shouldPersist) { config.enabled = false; persistConfig(); }
+    bot.log("anti-afk stopped");
+    return true;
+  }
+
+  function status() {
+    return {
+      running: state.running,
+      config: { ...config },
+      lastActionAt: state.lastActionAt,
+      turnIndex: state.turnIndex,
+      idle: isIdle(),
+    };
+  }
+
+  function updateConfig(next = {}) {
+    if (next.intervalMs !== undefined) {
+      next.intervalMs = Math.max(10000, Number(next.intervalMs) || 60000);
+    }
+    Object.assign(config, next);
+    persistConfig();
+    return { ...config };
+  }
+
+  if (config.enabled) start();
+
+  bot.antiAfk = { start, stop, status, updateConfig, config, performTurn };
 };
 
 
@@ -7458,6 +7586,23 @@ function refreshPinkSkullStatus() {
     }
   }
 
+	function refreshAntiAfkStatus() {
+	  const toggle = document.getElementById("minibia-bot-antiafk-enabled");
+	  const intervalInput = document.getElementById("minibia-bot-antiafk-interval");
+	  if (!bot.antiAfk) {
+		if (toggle) toggle.checked = false;
+		if (intervalInput) intervalInput.value = "60";
+		return;
+	  }
+	  const status = bot.antiAfk.status();
+	  if (toggle && document.activeElement !== toggle) {
+		toggle.checked = !!status.running;
+	  }
+	  if (intervalInput && document.activeElement !== intervalInput) {
+		intervalInput.value = Math.round((status.config?.intervalMs || 60000) / 1000);
+	  }
+	}
+
   // ---- VISIBLE CREATURES LIST ----
   function refreshVisibleCreatures() {
     const list = document.getElementById("minibia-bot-visible-creatures-list");
@@ -7835,6 +7980,16 @@ function refreshPinkSkullStatus() {
       <label class="mb-toggle" style="margin:0; font-size:11px; white-space:nowrap;"><input type="checkbox" id="minibia-bot-equip-ring-enabled" /><span>Equip Ring</span></label>
       <label class="mb-toggle" style="margin:0; font-size:11px; white-space:nowrap;"><input type="checkbox" id="minibia-bot-light-hack-enabled" /><span>Light Hack</span></label>
       <label class="mb-toggle" style="margin:0; font-size:11px; white-space:nowrap;"><input type="checkbox" id="minibia-bot-pink-skull-enabled" /><span>Pink Skull</span></label>
+	  <!-- Row 3 - Anti-AFK -->
+		<div style="display:flex; align-items:center; gap:6px;">
+		  <label class="mb-toggle" style="margin:0; font-size:11px; white-space:nowrap;">
+			<input type="checkbox" id="minibia-bot-antiafk-enabled" /><span>Anti-AFK</span>
+		  </label>
+		  <label class="mb-field" style="flex:0 0 70px;">
+			<span class="mb-field-label" style="font-size:10px;">Interval</span>
+			<input type="number" id="minibia-bot-antiafk-interval" min="10" max="300" value="60" style="padding:3px 4px;font-size:11px;" />
+		  </label>
+		</div>
     </div>
   </div>
 </div>
@@ -8131,6 +8286,36 @@ function refreshPinkSkullStatus() {
 
     // ---- EVENT LISTENERS ----
 	
+	// ---- Anti-AFK ----
+	const antiAfkToggle = panel.querySelector("#minibia-bot-antiafk-enabled");
+	const antiAfkInterval = panel.querySelector("#minibia-bot-antiafk-interval");
+
+	if (antiAfkToggle) {
+	  antiAfkToggle.checked = !!bot.antiAfk?.status?.().running;
+	  antiAfkToggle.addEventListener("change", function() {
+		if (!bot.antiAfk) {
+		  bot.log("Anti-AFK module not installed – please reload the bot.");
+		  this.checked = false;
+		  return;
+		}
+		if (this.checked) {
+		  bot.antiAfk.start();
+		} else {
+		  bot.antiAfk.stop();
+		}
+		refreshAntiAfkStatus();
+	  });
+	}
+
+	if (antiAfkInterval) {
+	  antiAfkInterval.value = Math.round((bot.antiAfk?.config?.intervalMs || 60000) / 1000);
+	  antiAfkInterval.addEventListener("change", function() {
+		const sec = Math.max(10, Number(this.value) || 60);
+		this.value = sec;
+		bot.antiAfk.updateConfig({ intervalMs: sec * 1000 });
+	  });
+	}
+	
 	// ---- Blacklist ----
 	const blacklistX = panel.querySelector("#minibia-bot-blacklist-x");
 	const blacklistY = panel.querySelector("#minibia-bot-blacklist-y");
@@ -8218,50 +8403,19 @@ function refreshPinkSkullStatus() {
 	
 	
 	// ---- Profile Manager ----
-	// Export
-	const exportBtn = panel.querySelector("#minibia-bot-profile-export");
-	if (exportBtn) {
-	  exportBtn.addEventListener("click", () => {
-		const name = profileSelect?.value;
-		if (!name) {
-		  if (profileStatus) profileStatus.textContent = "Select a profile to export.";
-		  return;
-		}
-		bot.profiles.export(name);
-	  });
-	}
-
-	// Import
-	const importInput = panel.querySelector("#minibia-bot-profile-import-input");
-	const importBtn = panel.querySelector("#minibia-bot-profile-import");
-	const importNameInput = panel.querySelector("#minibia-bot-profile-import-name");
-	if (importBtn && importInput) {
-	  importBtn.addEventListener("click", () => {
-		importInput.click();
-	  });
-	  importInput.addEventListener("change", async (e) => {
-		const file = e.target.files[0];
-		if (!file) return;
-		const name = importNameInput?.value?.trim() || undefined;
-		try {
-		  const importedName = await bot.profiles.import(file, name);
-		  if (profileStatus) profileStatus.textContent = `Profile "${importedName}" imported.`;
-		  refreshProfileList();
-		  // Optionally auto-select the imported profile
-		  if (profileSelect) profileSelect.value = importedName;
-		} catch (err) {
-		  if (profileStatus) profileStatus.textContent = `Import failed: ${err.message}`;
-		}
-		importInput.value = ''; // Reset file input
-	  });
-	}	
-	
 	const profileNameInput = panel.querySelector("#minibia-bot-profile-name");
 	const profileSaveBtn = panel.querySelector("#minibia-bot-profile-save");
 	const profileSelect = panel.querySelector("#minibia-bot-profile-select");
 	const profileLoadBtn = panel.querySelector("#minibia-bot-profile-load");
 	const profileDeleteBtn = panel.querySelector("#minibia-bot-profile-delete");
 	const profileStatus = panel.querySelector("#minibia-bot-profile-status");
+
+	// Export button
+	const exportBtn = panel.querySelector("#minibia-bot-profile-export");
+	// Import elements
+	const importInput = panel.querySelector("#minibia-bot-profile-import-input");
+	const importBtn = panel.querySelector("#minibia-bot-profile-import");
+	const importNameInput = panel.querySelector("#minibia-bot-profile-import-name");
 
 	function refreshProfileList() {
 	  if (!profileSelect) return;
@@ -8328,6 +8482,7 @@ function refreshPinkSkullStatus() {
 	  }
 	}
 
+	// ---- Now attach event listeners ----
 	if (profileSaveBtn) profileSaveBtn.addEventListener("click", saveProfile);
 	if (profileLoadBtn) profileLoadBtn.addEventListener("click", loadProfile);
 	if (profileDeleteBtn) profileDeleteBtn.addEventListener("click", deleteProfile);
@@ -8337,6 +8492,39 @@ function refreshPinkSkullStatus() {
 		  e.preventDefault();
 		  saveProfile();
 		}
+	  });
+	}
+
+	// Export
+	if (exportBtn) {
+	  exportBtn.addEventListener("click", () => {
+		const name = profileSelect?.value;
+		if (!name) {
+		  if (profileStatus) profileStatus.textContent = "Select a profile to export.";
+		  return;
+		}
+		bot.profiles.export(name);
+	  });
+	}
+
+	// Import
+	if (importBtn && importInput) {
+	  importBtn.addEventListener("click", () => {
+		importInput.click();
+	  });
+	  importInput.addEventListener("change", async (e) => {
+		const file = e.target.files[0];
+		if (!file) return;
+		const name = importNameInput?.value?.trim() || undefined;
+		try {
+		  const importedName = await bot.profiles.import(file, name);
+		  if (profileStatus) profileStatus.textContent = `Profile "${importedName}" imported.`;
+		  refreshProfileList();
+		  if (profileSelect) profileSelect.value = importedName;
+		} catch (err) {
+		  if (profileStatus) profileStatus.textContent = `Import failed: ${err.message}`;
+		}
+		importInput.value = ''; // Reset file input
 	  });
 	}
 	
@@ -8911,34 +9099,39 @@ function refreshPinkSkullStatus() {
 
     // ---- OLDER EXISTING LISTENERS (reload, trusted, GM, rune, eat, invisible, shield, equip, talk, panic, xray, home) ----
 
-    // ---- INITIAL REFRESHES ----
-    refreshHomeLabel();
-    refreshPanicStatus();
-    refreshXrayStatus();
-    renderTrustedNames();
-    renderGameMasterNames();
-    refreshRuneStatus();
-    refreshAutoHealStatus();
-    refreshHealRules();
-    refreshAutoInvisibleStatus();
-    refreshAutoMagicShieldStatus();
-    refreshAutoAttackStatus();
-    refreshAutoAttackPreferredStatus({ force: true });
-    refreshAutoEatStatus();
-    refreshCaveStatus();
-    refreshEquipRingStatus();
-    refreshTalkStatus();
-    refreshVisibleCreatures();
-    refreshCavePresetControls();
-    refreshCaveClosestStatus();
-    refreshCaveTransitionStatus();
-    refreshCaveWaypointList();
-    refreshTalkIgnoredPhrases();
-    refreshTitlebarRunIndicators();
-	refreshPaladinStatus();
-	refreshLooterStatus();
-	refreshProfileList();
-	refreshBlacklist();
+	// ---- INITIAL REFRESHES ----
+	try {
+	  refreshHomeLabel();
+	  refreshPanicStatus();
+	  refreshXrayStatus();
+	  renderTrustedNames();
+	  renderGameMasterNames();
+	  refreshRuneStatus();
+	  refreshAutoHealStatus();
+	  refreshHealRules();
+	  refreshAutoInvisibleStatus();
+	  refreshAutoMagicShieldStatus();
+	  refreshAutoAttackStatus();
+	  refreshAutoAttackPreferredStatus({ force: true });
+	  refreshAutoEatStatus();
+	  refreshCaveStatus();
+	  refreshEquipRingStatus();
+	  refreshTalkStatus();
+	  refreshVisibleCreatures();
+	  refreshCavePresetControls();
+	  refreshCaveClosestStatus();
+	  refreshCaveTransitionStatus();
+	  refreshCaveWaypointList();
+	  refreshTalkIgnoredPhrases();
+	  refreshTitlebarRunIndicators();
+	  refreshPaladinStatus();
+	  refreshLooterStatus();
+	  refreshProfileList();
+	  refreshBlacklist();
+	  refreshAntiAfkStatus();
+	} catch (e) {
+	  console.error("[minibia-bot] UI init error:", e);
+	}
 
     // Periodic refreshes
     const visibleTimer = window.setInterval(refreshVisibleCreatures, 1000);
@@ -9079,6 +9272,7 @@ function refreshPinkSkullStatus() {
 	currentBundle.installLightHackModule(bot);
 	currentBundle.installPinkSkullDetectorModule(bot);
 	currentBundle.installProfileModule(bot);
+	currentBundle.installAntiAfkModule(bot);
 	currentBundle.installPanel(bot);
 
     bot.ui.inject();
