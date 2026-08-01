@@ -207,6 +207,7 @@ window.__minibiaBotBundle.createBot = function createBot() {
     if (__imbResetInterval) return;
     __imbResetInterval = setInterval(() => {
       if (typeof __imB !== 'undefined') __imB = 0;
+	  if (typeof __provTicks !== 'undefined') __provTicks = 0; 
     }, intervalMs);
   }
   function stopImbReset() {
@@ -2344,18 +2345,36 @@ function tryAttack() {
     if (syncChase(now)) return true;
     if (syncKite(now)) return true;
   } else if (config.meleeMode && !config.kiteMode) {
-    if (config.useClientChase) {
-      // Client chase: ensure chase mode is on (done inside syncMeleeChase)
-      syncMeleeChase(now); 
-    } else {
-      // Custom step movement
-      syncMeleeChase(now);
+    syncMeleeChase(now);
+  }
+
+  // ----- TARGET SWITCHING: check if a better target exists -----
+  const current = getCurrentTarget();
+  if (current) {
+    const candidates = getMonsterCandidates(now);
+    if (candidates.length) {
+      const best = candidates[0];
+      // Only consider switching if we have valid info for both
+      const currentInfo = isTargetValidAndOnScreen(current, { returnDetails: true, maxDx: 7, maxDy: 5 });
+      const bestInfo = isTargetValidAndOnScreen(best, { returnDetails: true, maxDx: 7, maxDy: 5 });
+      if (bestInfo.valid && currentInfo.valid) {
+        const currentDist = currentInfo.distance;
+        const bestDist = bestInfo.distance;
+        // Switch if best is preferred and current is not, OR if best is at least 2 tiles closer
+        const switchPreferred = bestInfo.preferred && !currentInfo.preferred;
+        const switchCloser = bestDist !== undefined && currentDist !== undefined && (bestDist + 2) < currentDist;
+        if (switchPreferred || switchCloser) {
+          // Skip current target (clears it) with a very short cooldown
+          skipTarget(current, "switching to better target", now, 100);
+        }
+      }
     }
   }
 
   // ----- Attack -----
   if (getCurrentTarget()) {
     if (config.runeHotbarSlot && triggerRune(now)) return true;
+    // Even if we have a target, we may have just cleared it, so call triggerAttack anyway
     return triggerAttack(now);
   } else {
     return triggerAttack(now);
@@ -2902,6 +2921,10 @@ function syncMeleeChase(now = Date.now()) {
     const ny = playerPos.y + a.dy;
     const candidatePos = { x: nx, y: ny, z: playerPos.z };
 
+    // ---- BLACKLIST CHECK ----
+    if (bot.blacklist?.isBlacklisted(nx, ny, playerPos.z)) continue;
+    // ---- END ----
+
     if (!isSafeTileForKite(candidatePos)) continue;
     if (nx === targetPos.x && ny === targetPos.y) continue;
 
@@ -2917,6 +2940,7 @@ function syncMeleeChase(now = Date.now()) {
     }
   }
 
+  // Fallback: allow walking into occupied tiles (ignore creatures)
   for (const a of attempts) {
     if (a.dx === 0 && a.dy === 0) continue;
     const nx = playerPos.x + a.dx;
@@ -2924,6 +2948,11 @@ function syncMeleeChase(now = Date.now()) {
     if (nx === targetPos.x && ny === targetPos.y) continue;
     const candidatePos = { x: nx, y: ny, z: playerPos.z };
     if (!isSafeTileForKite(candidatePos)) continue;
+
+    // ---- BLACKLIST CHECK ----
+    if (bot.blacklist?.isBlacklisted(nx, ny, playerPos.z)) continue;
+    // ---- END ----
+
     if (isTileWalkable(nx, ny, playerPos.z, true)) {
       const dir = getDirection(a.dx, a.dy);
       if (dir !== null && window.gameClient?.keyboard) {
@@ -3030,6 +3059,11 @@ function syncKiteFallback(now) {
     const pos = new Position(nx, ny, playerPos.z);
     const tile = window.gameClient?.world?.getTileFromWorldPosition?.(pos);
     if (!tile) continue;
+
+    // ---- BLACKLIST CHECK ----
+    if (bot.blacklist?.isBlacklisted(nx, ny, playerPos.z)) continue;
+    // ---- END ----
+
     if (!tile.isWalkable()) continue;
     if (tile.isOccupied()) continue;
 
@@ -3295,8 +3329,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
   const config = Object.assign(
     {
-      tickMs: 500,
-      repathMs: 1500,
+      tickMs: 250,
+      repathMs: 500,
       waypointTolerance: 0,
       enabled: false,
       activePresetName: defaultPresetName,
@@ -3315,18 +3349,6 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
   function cloneValue(value) {
     return value ? JSON.parse(JSON.stringify(value)) : null;
   }
-
-	function getDirection(dx, dy) {
-	  if (dx === 0 && dy === -1) return CONST.DIRECTION.NORTH;
-	  if (dx === 0 && dy === 1) return CONST.DIRECTION.SOUTH;
-	  if (dx === -1 && dy === 0) return CONST.DIRECTION.WEST;
-	  if (dx === 1 && dy === 0) return CONST.DIRECTION.EAST;
-	  if (dx === -1 && dy === -1) return CONST.DIRECTION.NORTHWEST;
-	  if (dx === 1 && dy === -1) return CONST.DIRECTION.NORTHEAST;
-	  if (dx === -1 && dy === 1) return CONST.DIRECTION.SOUTHWEST;
-	  if (dx === 1 && dy === 1) return CONST.DIRECTION.SOUTHEAST;
-	  return null;
-	}
 	
 	
   function normalizePreset(value) {
@@ -3437,7 +3459,31 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
   function persistRoute() { persistActivePreset(); }
 
+	// ---- Simple walkability (copied from attack module) ----
+	function isTileWalkable(x, y, z, ignoreCreatures = false) {
+	  const pos = new Position(x, y, z);
+	  const tile = window.gameClient?.world?.getTileFromWorldPosition?.(pos);
+	  if (!tile) return false;
+	  if (!tile.isWalkable()) return false;
+	  if (tile.isItemBlocked()) return false;
+	  if (!ignoreCreatures && tile.isOccupied()) return false;
+	  return true;
+	}
+	
+	function getDirection(dx, dy) {
+	  if (dx === 0 && dy === -1) return CONST.DIRECTION.NORTH;
+	  if (dx === 0 && dy === 1) return CONST.DIRECTION.SOUTH;
+	  if (dx === -1 && dy === 0) return CONST.DIRECTION.WEST;
+	  if (dx === 1 && dy === 0) return CONST.DIRECTION.EAST;
+	  if (dx === -1 && dy === -1) return CONST.DIRECTION.NORTHWEST;
+	  if (dx === 1 && dy === -1) return CONST.DIRECTION.NORTHEAST;
+	  if (dx === -1 && dy === 1) return CONST.DIRECTION.SOUTHWEST;
+	  if (dx === 1 && dy === 1) return CONST.DIRECTION.SOUTHEAST;
+	  return null;
+	}
+
   // ---- POSITION HELPERS ----
+  
   function normalizePosition(value) {
     if (!value) return null;
     const x = Number(value.x), y = Number(value.y), z = Number(value.z);
@@ -3877,20 +3923,63 @@ function getContainerById(containerId) {
     return d <= Math.max(0, Number(config.waypointTolerance) || 0);
   }
 
-  function goToWaypoint(waypoint) {
-    const from = bot.getPlayerPosition();
-    if (!from || !waypoint) return false;
-    const to = new Position(waypoint.x, waypoint.y, waypoint.z);
-    try {
-      window.gameClient?.world?.pathfinder?.findPath?.(from, to);
-      state.lastPathAt = Date.now();
-      //bot.log("cave pathing to waypoint", { ...waypoint, index: state.currentIndex + 1, total: route.length });
-      return true;
-    } catch (error) {
-      //bot.log("cave pathing failed", { ...waypoint, error: error?.message || error });
-      return false;
-    }
+function goToWaypoint(waypoint) {
+  // ---- BLACKLIST CHECK ----
+  if (bot.blacklist?.isBlacklisted(waypoint.x, waypoint.y, waypoint.z)) {
+    bot.log("cave skipping blacklisted waypoint", waypoint);
+    state.lastWaypointTarget = null;
+    const nextWp = advanceWaypoint();
+    if (nextWp) return goToWaypoint(nextWp);
+    return false;
   }
+  // ---- END BLACKLIST CHECK ----
+
+  const from = bot.getPlayerPosition();
+  if (!from || !waypoint) return false;
+  const to = new Position(waypoint.x, waypoint.y, waypoint.z);
+  let success = false;
+  try {
+    window.gameClient?.world?.pathfinder?.findPath?.(from, to);
+    state.lastPathAt = Date.now();
+    success = true;
+  } catch (error) {
+    // pathfinder threw – we'll fallback
+  }
+
+  // If pathfinder didn't set a path (or failed), try to move one step manually
+  if (!success || !window.gameClient?.world?.pathfinder?.__finalDestination) {
+    const pf = window.gameClient?.world?.pathfinder;
+    // Wait a tiny moment for pathfinder to set its state, then check
+    setTimeout(() => {
+      if (pf && !pf.__finalDestination) {
+        // Move one step toward waypoint
+        const dx = waypoint.x - from.x;
+        const dy = waypoint.y - from.y;
+        let stepX = dx > 0 ? 1 : (dx < 0 ? -1 : 0);
+        let stepY = dy > 0 ? 1 : (dy < 0 ? -1 : 0);
+        const attempts = [
+          { dx: stepX, dy: 0 },
+          { dx: 0, dy: stepY },
+          { dx: stepX, dy: stepY }
+        ];
+        for (const a of attempts) {
+          const nx = from.x + a.dx;
+          const ny = from.y + a.dy;
+          if (bot.blacklist?.isBlacklisted(nx, ny, from.z)) continue;
+          if (isTileWalkable(nx, ny, from.z, true)) {
+            const dir = getDirection(a.dx, a.dy);
+            if (dir !== null && window.gameClient?.keyboard) {
+              window.gameClient.keyboard.handleMoveKey(dir);
+              state.lastPathAt = Date.now();
+              break;
+            }
+          }
+        }
+      }
+    }, 50);
+  }
+  return success;
+}
 
   function goToPosition(position) {
     if (!position) return false;
@@ -4138,6 +4227,22 @@ function tick() {
     const position = normalizePosition(bot.getPlayerPosition());
     const positionKey = getPositionKey(position);
     const now = Date.now();
+	if (position && bot.blacklist?.isBlacklisted(position.x, position.y, position.z)) {
+	  bot.log("cave: standing on blacklisted tile, moving away");
+	  // Try to move one step in any safe direction
+	  const offsets = [[0,-1],[1,0],[0,1],[-1,0],[-1,-1],[1,-1],[-1,1],[1,1]];
+	  for (const [dx, dy] of offsets) {
+		const nx = position.x + dx;
+		const ny = position.y + dy;
+		if (!bot.blacklist.isBlacklisted(nx, ny, position.z) && isTileWalkable(nx, ny, position.z, true)) {
+		  const dir = getDirection(dx, dy);
+		  if (dir !== null && window.gameClient?.keyboard) {
+			window.gameClient.keyboard.handleMoveKey(dir);
+			return;
+		  }
+		}
+	  }
+	}
 
     // ---- PAUSE FOR COMBAT ----
 const attackConfig = bot.attack?.config || {};
@@ -6616,6 +6721,76 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
   };
 };
 
+/**
+ * ==================================================================================
+ * BLACKLIST MODULE – Avoid walking on specific tiles
+ * ==================================================================================
+ */
+window.__minibiaBotBundle.installBlacklistModule = function installBlacklistModule(bot) {
+  const configStorageKey = "minibiaBot.blacklist.config";
+
+  let tiles = [];
+
+  function persist() {
+    bot.storage.set(configStorageKey, { tiles: tiles.map(t => ({ ...t })) });
+  }
+
+  function load() {
+    const data = bot.storage.get(configStorageKey, {});
+    tiles = Array.isArray(data.tiles) ? data.tiles.map(t => ({ x: Number(t.x), y: Number(t.y), z: Number(t.z) })).filter(t => Number.isFinite(t.x) && Number.isFinite(t.y) && Number.isFinite(t.z)) : [];
+  }
+
+  function isBlacklisted(x, y, z) {
+    return tiles.some(t => t.x === x && t.y === y && t.z === z);
+  }
+
+  function add(x, y, z) {
+    x = Math.trunc(x); y = Math.trunc(y); z = Math.trunc(z);
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return false;
+    if (isBlacklisted(x, y, z)) return false;
+    tiles.push({ x, y, z });
+    persist();
+    return true;
+  }
+
+  function remove(x, y, z) {
+    x = Math.trunc(x); y = Math.trunc(y); z = Math.trunc(z);
+    const before = tiles.length;
+    tiles = tiles.filter(t => !(t.x === x && t.y === y && t.z === z));
+    if (tiles.length !== before) { persist(); return true; }
+    return false;
+  }
+
+  function clear() {
+    tiles = [];
+    persist();
+  }
+
+  function getTiles() {
+    return tiles.map(t => ({ ...t }));
+  }
+
+  function addCurrentPosition() {
+    const pos = bot.getPlayerPosition();
+    if (!pos) { bot.log("Could not read current position."); return false; }
+    return add(pos.x, pos.y, pos.z);
+  }
+
+  // Load on init
+  load();
+
+  // Public API
+  bot.blacklist = {
+    isBlacklisted,
+    add,
+    remove,
+    clear,
+    getTiles,
+    addCurrentPosition,
+    persist,
+  };
+};
+
 
 /**
  * ==================================================================================
@@ -7568,6 +7743,7 @@ function refreshPinkSkullStatus() {
 	<button type="button" class="mb-tab-button" data-tab-button="paladin">Paladin</button>
 	<button type="button" class="mb-tab-button" data-tab-button="looter">Looter</button>
 	<button type="button" class="mb-tab-button" data-tab-button="profiles">Profiles</button>
+	<button type="button" class="mb-tab-button" data-tab-button="blacklist">Blacklist</button>
   </div>
   <div class="mb-tab-content">
     <!-- Healing Tab -->
@@ -7873,7 +8049,26 @@ function refreshPinkSkullStatus() {
   </div>
 </div>
 
-
+<!-- Blacklist Tab -->
+<div class="mb-tab-panel" data-tab-panel="blacklist">
+  <div class="mb-section">
+    <div class="mb-label">Tile Blacklist</div>
+    <div class="mb-stack">
+      <div style="display:flex; gap:6px; flex-wrap:wrap;">
+        <button type="button" class="mb-small-button" id="minibia-bot-blacklist-add-current">Add Current Tile</button>
+        <button type="button" class="mb-small-button" id="minibia-bot-blacklist-clear" style="background:#5a2020;border-color:#883030;">Clear All</button>
+      </div>
+      <div style="display:grid; grid-template-columns:70px 70px 70px auto; gap:6px; align-items:end;">
+        <label class="mb-field"><span class="mb-field-label">X</span><input type="number" id="minibia-bot-blacklist-x" step="1" /></label>
+        <label class="mb-field"><span class="mb-field-label">Y</span><input type="number" id="minibia-bot-blacklist-y" step="1" /></label>
+        <label class="mb-field"><span class="mb-field-label">Z</span><input type="number" id="minibia-bot-blacklist-z" step="1" /></label>
+        <button type="button" class="mb-small-button" id="minibia-bot-blacklist-add">Add Tile</button>
+      </div>
+      <div class="mb-small-note" id="minibia-bot-blacklist-count">0 tiles blocked</div>
+      <div id="minibia-bot-blacklist-list" style="max-height:200px; overflow-y:auto; border:1px solid rgba(224,200,148,0.2); border-radius:4px; padding:4px; font-size:11px;"></div>
+    </div>
+  </div>
+</div>
 
 
   </div> <!-- end mb-tab-content -->
@@ -7935,6 +8130,92 @@ function refreshPinkSkullStatus() {
     }
 
     // ---- EVENT LISTENERS ----
+	
+	// ---- Blacklist ----
+	const blacklistX = panel.querySelector("#minibia-bot-blacklist-x");
+	const blacklistY = panel.querySelector("#minibia-bot-blacklist-y");
+	const blacklistZ = panel.querySelector("#minibia-bot-blacklist-z");
+	const blacklistAddBtn = panel.querySelector("#minibia-bot-blacklist-add");
+	const blacklistAddCurrentBtn = panel.querySelector("#minibia-bot-blacklist-add-current");
+	const blacklistClearBtn = panel.querySelector("#minibia-bot-blacklist-clear");
+	const blacklistList = panel.querySelector("#minibia-bot-blacklist-list");
+	const blacklistCount = panel.querySelector("#minibia-bot-blacklist-count");
+
+	function refreshBlacklist() {
+	  if (!blacklistList) return;
+	  const tiles = bot.blacklist?.getTiles?.() || [];
+	  blacklistList.innerHTML = "";
+	  if (!tiles.length) {
+		const empty = document.createElement("div");
+		empty.className = "mb-small-note";
+		empty.textContent = "No tiles blacklisted.";
+		blacklistList.appendChild(empty);
+	  } else {
+		tiles.forEach((t, idx) => {
+		  const row = document.createElement("div");
+		  row.style.cssText = "display:flex;justify-content:space-between;align-items:center;padding:2px 0;border-bottom:1px solid rgba(255,255,255,0.05);";
+		  const label = document.createElement("span");
+		  label.textContent = `${t.x}, ${t.y}, ${t.z}`;
+		  const removeBtn = document.createElement("button");
+		  removeBtn.type = "button";
+		  removeBtn.className = "mb-small-button";
+		  removeBtn.textContent = "✕";
+		  removeBtn.style.cssText = "width:24px;padding:2px;background:#5a2020;color:#ff8888;border-color:#883030;";
+		  removeBtn.addEventListener("click", () => {
+			bot.blacklist.remove(t.x, t.y, t.z);
+			refreshBlacklist();
+		  });
+		  row.appendChild(label);
+		  row.appendChild(removeBtn);
+		  blacklistList.appendChild(row);
+		});
+	  }
+	  if (blacklistCount) {
+		blacklistCount.textContent = `${tiles.length} tile${tiles.length !== 1 ? 's' : ''} blocked`;
+	  }
+	}
+
+	// Add manually
+	if (blacklistAddBtn) {
+	  blacklistAddBtn.addEventListener("click", () => {
+		const x = parseInt(blacklistX?.value, 10);
+		const y = parseInt(blacklistY?.value, 10);
+		const z = parseInt(blacklistZ?.value, 10);
+		if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) {
+		  bot.log("Please enter valid X, Y, Z coordinates.");
+		  return;
+		}
+		bot.blacklist.add(x, y, z);
+		refreshBlacklist();
+		if (blacklistX) blacklistX.value = "";
+		if (blacklistY) blacklistY.value = "";
+		if (blacklistZ) blacklistZ.value = "";
+	  });
+	}
+
+	// Add current position
+	if (blacklistAddCurrentBtn) {
+	  blacklistAddCurrentBtn.addEventListener("click", () => {
+		const added = bot.blacklist.addCurrentPosition();
+		if (added) {
+		  refreshBlacklist();
+		  bot.log("Current tile added to blacklist.");
+		} else {
+		  bot.log("Could not add current position.");
+		}
+	  });
+	}
+
+	// Clear all
+	if (blacklistClearBtn) {
+	  blacklistClearBtn.addEventListener("click", () => {
+		if (!confirm("Remove ALL blacklisted tiles?")) return;
+		bot.blacklist.clear();
+		refreshBlacklist();
+		bot.log("Blacklist cleared.");
+	  });
+	}
+	
 	
 	// ---- Profile Manager ----
 	// Export
@@ -8657,6 +8938,7 @@ function refreshPinkSkullStatus() {
 	refreshPaladinStatus();
 	refreshLooterStatus();
 	refreshProfileList();
+	refreshBlacklist();
 
     // Periodic refreshes
     const visibleTimer = window.setInterval(refreshVisibleCreatures, 1000);
@@ -8676,6 +8958,7 @@ function refreshPinkSkullStatus() {
       const loopToggle = document.getElementById("minibia-bot-cave-loop");
       if (loopToggle) loopToggle.checked = bot.cave?.getLoopMode?.() ?? false;
     }, 1000);
+	setInterval(refreshBlacklist, 2000);
     bot.addCleanup(() => window.clearInterval(caveTimer));
     const titleTimer = window.setInterval(refreshTitlebarRunIndicators, 500);
     bot.addCleanup(() => window.clearInterval(titleTimer));
@@ -8778,24 +9061,25 @@ function refreshPinkSkullStatus() {
     restorePersistedEnabledSnapshot(prevSnapshot);
 
     const bot = currentBundle.createBot();
-    currentBundle.installPzModule(bot);
-    currentBundle.installXrayModule(bot);
-    currentBundle.installPanicModule(bot);
-    currentBundle.installRuneModule(bot);
-    currentBundle.installHealModule(bot);
-    currentBundle.installAutoInvisibleModule(bot);
-    currentBundle.installAutoMagicShieldModule(bot);
-    currentBundle.installAutoAttackModule(bot);
-    currentBundle.installCaveModule(bot);
-    currentBundle.installEquipRingModule(bot);
-    currentBundle.installAutoEatModule(bot);
-    currentBundle.installTalkModule(bot);
+	currentBundle.installPzModule(bot);
+	currentBundle.installXrayModule(bot);
+	currentBundle.installPanicModule(bot);
+	currentBundle.installRuneModule(bot);
+	currentBundle.installHealModule(bot);
+	currentBundle.installAutoInvisibleModule(bot);
+	currentBundle.installAutoMagicShieldModule(bot);
+	currentBundle.installBlacklistModule(bot);
+	currentBundle.installAutoAttackModule(bot);
+	currentBundle.installCaveModule(bot);
+	currentBundle.installEquipRingModule(bot);
+	currentBundle.installAutoEatModule(bot);
+	currentBundle.installTalkModule(bot);
 	currentBundle.installPaladinModule(bot);
 	currentBundle.installLooterModule(bot);
 	currentBundle.installLightHackModule(bot);
 	currentBundle.installPinkSkullDetectorModule(bot);
 	currentBundle.installProfileModule(bot);
-    currentBundle.installPanel(bot);
+	currentBundle.installPanel(bot);
 
     bot.ui.inject();
 
