@@ -1999,12 +1999,15 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     skippedTargetIds: new Map(),
 	kiteWaypointIndex: null, // index of the waypoint we're kiting toward
 	kiteTargetReached: false,
+	meleeLastDist: Infinity,
+    meleeProgressAt: 0,
+    meleeStuckAt: 0,
   };
 
   const storedConfig = bot.storage.get(configStorageKey, {}) || {};
   const config = Object.assign(
     {
-      tickMs: 500,
+      tickMs: 150,
       targetHotbarSlot: 3,
       runeHotbarSlot: null,
       targetCooldownMs: 1200,
@@ -2017,8 +2020,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
       antiKSEnabled: true,
       antiKSSelfRange: 2,
       antiKSOtherRange: 2,
-	  kiteMode: false,
-	  idealDistance: 3,
+      kiteMode: false,
+      idealDistance: 3,
+      useClientChase: true,
+	  
     },
     storedConfig
   );
@@ -2066,6 +2071,19 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
 
 // ---- Helper ----
+
+function setClientChaseMode(enabled) {
+  try {
+    const fms = window.gameClient?.interface?.fightModeSelector;
+    if (!fms) return false;
+    // 0 = Stand, 1 = Safe Chase, 2 = Aggressive Chase
+    const mode = enabled ? 2 : 0;
+    fms.setChaseMode(mode);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
 
 // ---- Tile safety helpers (copied from cave module) ----
 function getTileAtPosition(pos) {
@@ -2320,20 +2338,27 @@ function tryAttack() {
   if (resetTargetIfTooFar()) return true;
   syncCombatState(now);
 
+  // ----- Movement (if in melee mode & not kiting) -----
   if (config.kiteMode && getEngagedTarget()) {
     if (syncChase(now)) return true;
     if (syncKite(now)) return true;
+  } else if (config.meleeMode && !config.kiteMode) {
+    if (config.useClientChase) {
+      // Client chase: ensure chase mode is on (done inside syncMeleeChase)
+      syncMeleeChase(now); 
+    } else {
+      // Custom step movement
+      syncMeleeChase(now);
+    }
   }
 
-  // Melee mode (only if kite mode is OFF)
-  if (!config.kiteMode && config.meleeMode) {
-    const chased = syncMeleeChase(now);
-    if (getCurrentTarget()) return false;
-    if (chased) return triggerAttack(now) || true;
+  // ----- Attack -----
+  if (getCurrentTarget()) {
+    if (config.runeHotbarSlot && triggerRune(now)) return true;
+    return triggerAttack(now);
+  } else {
+    return triggerAttack(now);
   }
-
-  if (getCurrentTarget()) return triggerRune(now);
-  return triggerAttack(now);
 }
 
 
@@ -2474,6 +2499,8 @@ function clearEngagedTarget() {
   state.lastChaseDestinationKey = null;
   state.kiteWaypointIndex = null;
   resetFollowProgress();
+  clearCurrentFollowTarget();
+  if (config.useClientChase) setClientChaseMode(false);
 }
 
   function clearCurrentFollowTarget() {
@@ -2761,63 +2788,154 @@ function getMonsterCandidates(now = Date.now()) {
     return null;
   }
 
-  function syncMeleeChase(now = Date.now()) {
-    if (!config.meleeMode) return false;
-    const engaged = getValidatedEngagedTargetInfo();
-    if (!engaged.valid) {
-      if (engaged.target) skipTarget(engaged.target, engaged.reason || "invalid engaged target", now, 1000);
-      else clearEngagedTarget();
-      return false;
-    }
-    const target = engaged.target;
-    const playerPos = normalizePosition(bot.getPlayerPosition());
-    const targetPos = normalizePosition(target.getPosition?.() || target.__position);
-    if (!playerPos || !targetPos || playerPos.z !== targetPos.z) return false;
-    const giveUpDelay = Math.max(500, (Number(config.tickMs) || 0) * 10);
+function syncMeleeChase(now = Date.now()) {
+  if (!config.meleeMode) return false;
 
-    if (isAdjacentTile(playerPos, targetPos)) {
-      state.lastChaseDestinationKey = null;
-      clearCurrentFollowTarget();
-      resetFollowProgress();
-      return false;
-    }
+  const target = getEngagedTarget();
+  if (!target) return false;
 
-    const adjPos = findReachableAdjacentPosition(targetPos, playerPos);
-    if (!adjPos) {
-      if (!state.lastFollowStallAt) state.lastFollowStallAt = now;
-      else if (now - state.lastFollowStallAt > giveUpDelay) {
-        return skipTarget(target, "no reachable adjacent tile", now);
-      }
-      return false;
-    }
+  const playerPos = normalizePosition(bot.getPlayerPosition());
+  const targetPos = normalizePosition(target.getPosition?.() || target.__position);
+  if (!playerPos || !targetPos || playerPos.z !== targetPos.z) return false;
 
-    const currentDist = getTileDistance(playerPos, targetPos);
-    if (state.lastFollowTargetId !== target.id) {
-      state.lastFollowTargetId = target.id;
-      state.lastFollowDistance = currentDist;
-      state.lastFollowProgressAt = now;
-      state.lastFollowStallAt = 0;
-    } else if (currentDist < state.lastFollowDistance) {
-      state.lastFollowDistance = currentDist;
-      state.lastFollowProgressAt = now;
-      state.lastFollowStallAt = 0;
-    }
-
-    const followed = setCurrentFollowTarget(target);
-    if (followed) {
-      state.lastChaseAt = now;
-      state.lastChaseDestinationKey = getPositionKey(adjPos);
-      bot.log("following auto attack target", { id: target.id, name: target.name || "Mob", followTargetId: target.id });
-    }
-
-    if (state.lastFollowDistance <= currentDist) {
-      if (!state.lastFollowStallAt) state.lastFollowStallAt = now;
-      else if (now - state.lastFollowStallAt > giveUpDelay) {
-        return skipTarget(target, "follow made no progress", now);
-      }
-    }
-    return followed;
+  const info = isTargetValidAndOnScreen(target, { returnDetails: true, maxDx: 7, maxDy: 5 });
+  if (!info.valid) {
+    if (state.engagedTargetId === target.id) clearEngagedTarget();
+    return false;
   }
+
+  const dist = getTileDistance(playerPos, targetPos);
+  const maxDist = Math.max(1, Number(config.maxTargetDistance) || 5);
+  
+  // --- OUT OF RANGE: skip with 2s cooldown ---
+  if (dist > maxDist) {
+    skipTarget(target, "too far for melee", now, 2000);
+    return false;
+  }
+
+  if (dist <= 1) {
+    state.meleeLastDist = Infinity;
+    state.meleeProgressAt = 0;
+    state.meleeStuckAt = 0;
+    return false;
+  }
+
+  // ---- Anti‑KS ----
+  const visiblePlayers = bot.xray?.getVisiblePlayers?.({ sameFloorOnly: true }) || [];
+  const myId = window.gameClient?.player?.id;
+  const otherPlayers = visiblePlayers.filter(p => p.id !== myId);
+  const hasOtherPlayers = otherPlayers.length > 0 && config.antiKSEnabled;
+
+  if (hasOtherPlayers) {
+    const selfRange = config.antiKSSelfRange ?? 2;
+    const otherRange = config.antiKSOtherRange ?? 2;
+    if (dist > selfRange) {
+      skipTarget(target, "melee anti‑KS self range", now, 2000);
+      return false;
+    }
+    for (const player of otherPlayers) {
+      const pPos = player.getPosition?.() || player.__position;
+      if (!pPos) continue;
+      const dx = Math.abs(pPos.x - targetPos.x);
+      const dy = Math.abs(pPos.y - targetPos.y);
+      if (dx <= otherRange && dy <= otherRange) {
+        skipTarget(target, "melee anti‑KS other range", now, 2000);
+        return false;
+      }
+    }
+  }
+
+  // ---- Progress & Stuck (custom movement only) ----
+  if (!config.useClientChase) {
+    if (state.engagedTargetId !== target.id) {
+      state.meleeLastDist = dist;
+      state.meleeProgressAt = now;
+      state.meleeStuckAt = 0;
+    } else {
+      if (dist < state.meleeLastDist) {
+        state.meleeLastDist = dist;
+        state.meleeProgressAt = now;
+        state.meleeStuckAt = 0;
+      } else {
+        if (!state.meleeStuckAt) state.meleeStuckAt = now;
+        if (now - state.meleeStuckAt > 2000) {
+          skipTarget(target, "melee stuck (no progress)", now, 1500);
+          return false;
+        }
+      }
+    }
+  }
+
+  // ---- Client Chase Mode (if enabled) ----
+  if (config.useClientChase) {
+    try {
+      const fms = window.gameClient?.interface?.fightModeSelector;
+      if (fms && typeof fms.setChaseMode === 'function') {
+        fms.setChaseMode(2);
+      }
+    } catch (e) {}
+    state.lastChaseAt = now;
+    state.meleeLastDist = Infinity;
+    state.meleeProgressAt = 0;
+    state.meleeStuckAt = 0;
+    return true;
+  }
+
+  // ---- Custom Step‑by‑Step Movement ----
+  if (now - state.lastMoveAt < 250) return false;
+
+  const dx = targetPos.x - playerPos.x;
+  const dy = targetPos.y - playerPos.y;
+  let stepX = dx > 0 ? 1 : (dx < 0 ? -1 : 0);
+  let stepY = dy > 0 ? 1 : (dy < 0 ? -1 : 0);
+
+  const attempts = [
+    { dx: stepX, dy: 0 },
+    { dx: 0, dy: stepY },
+    { dx: stepX, dy: stepY }
+  ];
+
+  for (const a of attempts) {
+    if (a.dx === 0 && a.dy === 0) continue;
+    const nx = playerPos.x + a.dx;
+    const ny = playerPos.y + a.dy;
+    const candidatePos = { x: nx, y: ny, z: playerPos.z };
+
+    if (!isSafeTileForKite(candidatePos)) continue;
+    if (nx === targetPos.x && ny === targetPos.y) continue;
+
+    if (isTileWalkable(nx, ny, playerPos.z, false)) {
+      const dir = getDirection(a.dx, a.dy);
+      if (dir !== null && window.gameClient?.keyboard) {
+        window.gameClient.keyboard.handleMoveKey(dir);
+        state.lastChaseAt = now;
+        state.lastMoveAt = now;
+        state.meleeLastDist = dist;
+        return true;
+      }
+    }
+  }
+
+  for (const a of attempts) {
+    if (a.dx === 0 && a.dy === 0) continue;
+    const nx = playerPos.x + a.dx;
+    const ny = playerPos.y + a.dy;
+    if (nx === targetPos.x && ny === targetPos.y) continue;
+    const candidatePos = { x: nx, y: ny, z: playerPos.z };
+    if (!isSafeTileForKite(candidatePos)) continue;
+    if (isTileWalkable(nx, ny, playerPos.z, true)) {
+      const dir = getDirection(a.dx, a.dy);
+      if (dir !== null && window.gameClient?.keyboard) {
+        window.gameClient.keyboard.handleMoveKey(dir);
+        state.lastChaseAt = now;
+        state.lastMoveAt = now;
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
 
 
 
@@ -3046,6 +3164,14 @@ function triggerRune(now = Date.now()) {
     state.running = false;
     if (state.timerId != null) { window.clearTimeout(state.timerId); state.timerId = null; }
     if (shouldPersist) { config.enabled = false; persistConfig(); }
+	  if (config.useClientChase) {
+		try {
+		  const fms = window.gameClient?.interface?.fightModeSelector;
+		  if (fms && typeof fms.setChaseMode === 'function') {
+			fms.setChaseMode(0); // disable chase on stop
+		  }
+		} catch (e) {}
+	  }
     clearEngagedTarget();
     state.lastChaseAt = 0;
     clearCurrentFollowTarget();
@@ -7375,6 +7501,7 @@ function refreshPinkSkullStatus() {
     <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
       <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-auto-attack-enabled" /><span>Enable</span></label>
       <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-auto-attack-melee" /><span>Melee</span></label>
+	  <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-auto-attack-client-chase" /><span>Client Chase</span></label>
       <label class="mb-field" style="flex:0 0 80px;"><span class="mb-field-label" style="font-size:10px;">Target</span><input type="number" id="minibia-bot-auto-attack-hotkey" min="1" max="12" placeholder="3" style="padding:3px 4px;font-size:11px;" /></label>
       <label class="mb-field" style="flex:0 0 80px;"><span class="mb-field-label" style="font-size:10px;">Rune</span><input type="number" id="minibia-bot-auto-attack-rune-hotkey" min="1" max="12" placeholder="4" style="padding:3px 4px;font-size:11px;" /></label>
     </div>
@@ -7565,6 +7692,14 @@ function refreshPinkSkullStatus() {
     }
 
     // ---- EVENT LISTENERS ----
+	
+	const clientChaseToggle = panel.querySelector("#minibia-bot-auto-attack-client-chase");
+	if (clientChaseToggle) {
+	  clientChaseToggle.checked = bot.attack?.config?.useClientChase || false;
+	  clientChaseToggle.addEventListener("change", function() {
+		bot.attack.updateConfig({ useClientChase: this.checked });
+	  });
+	}
 	
 	// ---- Light Hack ----
 	const lightHackToggle = panel.querySelector("#minibia-bot-light-hack-enabled");
