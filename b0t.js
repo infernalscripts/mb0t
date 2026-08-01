@@ -2002,6 +2002,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 	meleeLastDist: Infinity,
     meleeProgressAt: 0,
     meleeStuckAt: 0,
+	lastMoveAt: 0,
   };
 
   const storedConfig = bot.storage.get(configStorageKey, {}) || {};
@@ -3299,7 +3300,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
       waypointTolerance: 0,
       enabled: false,
       activePresetName: defaultPresetName,
-      loopMode: false,
+      loopMode: true,
     },
     bot.storage.get(configStorageKey, {})
   );
@@ -4083,31 +4084,33 @@ function getContainerById(containerId) {
   }
 
   // ---- WAYPOINT NAVIGATION ----
-  function advanceWaypoint() {
-    if (!route.length) return null;
-    if (route.length === 1) return route[0];
+function advanceWaypoint() {
+  if (!route.length) return null;
+  if (route.length === 1) return route[0];
+
+  if (config.loopMode) {
+    // Always go forward, wrap around to 0 when at the end
+    let next = (state.currentIndex + 1) % route.length;
+    state.currentIndex = next;
+    state.direction = 1;   // ensure direction is forward
+    state.pathAttemptStart = 0;
+    return getCurrentWaypoint();
+  } else {
+    // Original non‑loop logic (go forward then backward)
     let next = state.currentIndex + state.direction;
     if (next >= route.length) {
-      if (config.loopMode) {
-        next = 0;
-      } else {
-        state.direction = -1;
-        next = route.length - 2;
-      }
+      state.direction = -1;
+      next = route.length - 2;
     } else if (next < 0) {
-      if (config.loopMode) {
-        next = route.length - 1;
-      } else {
-        state.direction = 1;
-        next = 1;
-      }
+      state.direction = 1;
+      next = 1;
     }
     state.currentIndex = Math.max(0, Math.min(route.length - 1, next));
     state.pathAttemptStart = 0;
-    const wp = getCurrentWaypoint();
-    //bot.log("cave advanced waypoint", { index: state.currentIndex + 1, total: route.length, direction: state.direction, waypoint: wp });
-    return wp;
+    return getCurrentWaypoint();
   }
+}
+
 
   // ---- MAIN LOOP ----
   function scheduleNextTick() {
@@ -4388,6 +4391,13 @@ const isKiting = attackConfig.kiteMode && !!attackStatus?.engagedTargetId;
     state.lastProgressAt = Date.now();
     state.pausedForCombat = false;
     state.pathAttemptStart = 0;
+	state.currentIndex = findClosestWaypointIndex(pos);
+	  if (config.loopMode) {
+		state.direction = 1;   // always forward when looping
+	  } else {
+		state.direction = state.currentIndex >= route.length - 1 ? -1 : 1;
+		if (route.length <= 1) state.direction = 1;
+	  }
     bot.log("cave bot started", {
       waypoints: route.length,
       currentIndex: state.currentIndex + 1,
@@ -6385,6 +6395,7 @@ window.__minibiaBotBundle.installPinkSkullDetectorModule = function installPinkS
     return {
       running: config.enabled,
       config: { ...config },
+	  profiles: bot.profiles?.list?.() || [],
     };
   }
 
@@ -6407,6 +6418,201 @@ window.__minibiaBotBundle.installPinkSkullDetectorModule = function installPinkS
     status,
     updateConfig,
     config,
+  };
+};
+
+/**
+ * ==================================================================================
+ * PROFILE MODULE – Full config save/load
+ * ==================================================================================
+ */
+window.__minibiaBotBundle.installProfileModule = function installProfileModule(bot) {
+  const PROFILES_STORAGE_KEY = "minibiaBot.profiles";
+
+  const CONFIG_KEYS = [
+    "minibiaBot.rune.config",
+    "minibiaBot.heal.config",
+    "minibiaBot.invisible.config",
+    "minibiaBot.magicShield.config",
+    "minibiaBot.attack.config",
+    "minibiaBot.cave.config",
+    "minibiaBot.equipRing.config",
+    "minibiaBot.eat.config",
+    "minibiaBot.talk.config",
+    "minibiaBot.panic.config",
+    "minibiaBot.xray.config",
+    "minibiaBot.pz.home",
+    "minibiaBot.audio.alarmSrc",
+    "minibiaBot.lightHack.config",
+    "minibiaBot.pinkSkull.config",
+    "minibiaBot.paladin.config",
+    "minibiaBot.looter.config",
+    "minibiaBot.ui.panelPosition",
+    "minibiaBot.ui.panelCollapsed",
+  ];
+
+  function getAllConfigs() {
+    const snapshot = {};
+    for (const key of CONFIG_KEYS) {
+      try {
+        const raw = localStorage.getItem(key);
+        snapshot[key] = raw !== null ? JSON.parse(raw) : undefined;
+      } catch { snapshot[key] = undefined; }
+    }
+    return snapshot;
+  }
+
+  function setAllConfigs(snapshot) {
+    for (const key of CONFIG_KEYS) {
+      const value = snapshot[key];
+      if (value === undefined) {
+        localStorage.removeItem(key);
+      } else {
+        localStorage.setItem(key, JSON.stringify(value));
+      }
+    }
+  }
+
+  function listProfiles() {
+    try {
+      const raw = localStorage.getItem(PROFILES_STORAGE_KEY);
+      return raw ? Object.keys(JSON.parse(raw)) : [];
+    } catch { return []; }
+  }
+
+  function getProfile(name) {
+    if (!name) return null;
+    try {
+      const raw = localStorage.getItem(PROFILES_STORAGE_KEY);
+      const profiles = raw ? JSON.parse(raw) : {};
+      return profiles[name] || null;
+    } catch { return null; }
+  }
+
+  function saveProfile(name) {
+    if (!name || typeof name !== "string") {
+      bot.log("Profile name required");
+      return false;
+    }
+    const nameTrim = name.trim();
+    if (!nameTrim) return false;
+
+    const snapshot = getAllConfigs();
+    let profiles = {};
+    try {
+      const raw = localStorage.getItem(PROFILES_STORAGE_KEY);
+      profiles = raw ? JSON.parse(raw) : {};
+    } catch { profiles = {}; }
+    profiles[nameTrim] = snapshot;
+    localStorage.setItem(PROFILES_STORAGE_KEY, JSON.stringify(profiles));
+    bot.log(`Profile "${nameTrim}" saved`);
+    return true;
+  }
+
+  function loadProfile(name) {
+    if (!name) return false;
+    const snapshot = getProfile(name);
+    if (!snapshot) {
+      bot.log(`Profile "${name}" not found`);
+      return false;
+    }
+    setAllConfigs(snapshot);
+    bot.log(`Profile "${name}" loaded – reloading bot...`);
+    if (typeof window.minibiaBotReload === "function") {
+      window.minibiaBotReload();
+    } else {
+      location.reload();
+    }
+    return true;
+  }
+
+  function deleteProfile(name) {
+    if (!name) return false;
+    let profiles = {};
+    try {
+      const raw = localStorage.getItem(PROFILES_STORAGE_KEY);
+      profiles = raw ? JSON.parse(raw) : {};
+    } catch { profiles = {}; }
+    if (!profiles[name]) return false;
+    delete profiles[name];
+    localStorage.setItem(PROFILES_STORAGE_KEY, JSON.stringify(profiles));
+    bot.log(`Profile "${name}" deleted`);
+    return true;
+  }
+
+  // ---- NEW: Export to file ----
+  function exportProfileToFile(name) {
+    if (!name) {
+      bot.log("Profile name required for export");
+      return false;
+    }
+    const snapshot = getProfile(name);
+    if (!snapshot) {
+      bot.log(`Profile "${name}" not found`);
+      return false;
+    }
+    const data = JSON.stringify(snapshot, null, 2);
+    const blob = new Blob([data], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${name}.profile.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    bot.log(`Profile "${name}" exported to file`);
+    return true;
+  }
+
+  // ---- NEW: Import from file ----
+  function importProfileFromFile(file, profileName) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        try {
+          const data = JSON.parse(e.target.result);
+          if (typeof data !== "object" || data === null) {
+            reject(new Error("Invalid profile data: not an object"));
+            return;
+          }
+          // Optional: check that it contains at least one known config key
+          const hasConfig = CONFIG_KEYS.some(key => key in data);
+          if (!hasConfig) {
+            reject(new Error("Invalid profile: no recognized config keys"));
+            return;
+          }
+          const name = profileName?.trim() || file.name.replace(/\.profile\.json$/i, "") || "imported";
+          // Load existing profiles
+          let profiles = {};
+          try {
+            const raw = localStorage.getItem(PROFILES_STORAGE_KEY);
+            profiles = raw ? JSON.parse(raw) : {};
+          } catch { profiles = {}; }
+          profiles[name] = data;
+          localStorage.setItem(PROFILES_STORAGE_KEY, JSON.stringify(profiles));
+          bot.log(`Profile "${name}" imported from file`);
+          resolve(name);
+        } catch (err) {
+          reject(new Error(`Import failed: ${err.message}`));
+        }
+      };
+      reader.onerror = () => reject(new Error("File read error"));
+      reader.readAsText(file);
+    });
+  }
+
+  // Public API
+  bot.profiles = {
+    list: listProfiles,
+    save: saveProfile,
+    load: loadProfile,
+    delete: deleteProfile,
+    get: getProfile,
+    getAllConfigs,
+    setAllConfigs,
+    export: exportProfileToFile,
+    import: importProfileFromFile,
   };
 };
 
@@ -7361,6 +7567,7 @@ function refreshPinkSkullStatus() {
     <button type="button" class="mb-tab-button" data-tab-button="talk">Talk</button>
 	<button type="button" class="mb-tab-button" data-tab-button="paladin">Paladin</button>
 	<button type="button" class="mb-tab-button" data-tab-button="looter">Looter</button>
+	<button type="button" class="mb-tab-button" data-tab-button="profiles">Profiles</button>
   </div>
   <div class="mb-tab-content">
     <!-- Healing Tab -->
@@ -7633,6 +7840,42 @@ function refreshPinkSkullStatus() {
       </div>
     </div>
 
+<!-- Profiles Tab -->
+<div class="mb-tab-panel" data-tab-panel="profiles">
+  <div class="mb-section">
+    <div class="mb-label">Profile Manager</div>
+    <div class="mb-stack">
+      <!-- Save -->
+      <div class="mb-inline">
+        <input type="text" id="minibia-bot-profile-name" placeholder="Profile name" />
+        <button type="button" class="mb-small-button" id="minibia-bot-profile-save">Save</button>
+      </div>
+      <!-- Load / Delete -->
+      <div class="mb-inline">
+        <select id="minibia-bot-profile-select" style="flex:1;">
+          <option value="">-- Select profile --</option>
+        </select>
+        <button type="button" class="mb-small-button" id="minibia-bot-profile-load">Load</button>
+        <button type="button" class="mb-small-button" id="minibia-bot-profile-delete" style="background:#5a2020;border-color:#883030;">Delete</button>
+      </div>
+      <!-- Export / Import -->
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px; align-items:center;">
+        <button type="button" class="mb-small-button" id="minibia-bot-profile-export">Export Selected</button>
+        <div style="display:flex; gap:6px; align-items:center;">
+          <input type="file" id="minibia-bot-profile-import-input" accept=".json" style="display:none;" />
+          <button type="button" class="mb-small-button" id="minibia-bot-profile-import">Import</button>
+          <input type="text" id="minibia-bot-profile-import-name" placeholder="Profile name (optional)" style="flex:1; padding:4px; font-size:11px;" />
+        </div>
+      </div>
+      <div class="mb-small-note" id="minibia-bot-profile-status">Ready</div>
+      <div class="mb-small-note">Saves ALL bot settings into a named profile. Export to file, import from file.</div>
+    </div>
+  </div>
+</div>
+
+
+
+
   </div> <!-- end mb-tab-content -->
 </div> <!-- end mb-body -->
 `;
@@ -7692,6 +7935,131 @@ function refreshPinkSkullStatus() {
     }
 
     // ---- EVENT LISTENERS ----
+	
+	// ---- Profile Manager ----
+	// Export
+	const exportBtn = panel.querySelector("#minibia-bot-profile-export");
+	if (exportBtn) {
+	  exportBtn.addEventListener("click", () => {
+		const name = profileSelect?.value;
+		if (!name) {
+		  if (profileStatus) profileStatus.textContent = "Select a profile to export.";
+		  return;
+		}
+		bot.profiles.export(name);
+	  });
+	}
+
+	// Import
+	const importInput = panel.querySelector("#minibia-bot-profile-import-input");
+	const importBtn = panel.querySelector("#minibia-bot-profile-import");
+	const importNameInput = panel.querySelector("#minibia-bot-profile-import-name");
+	if (importBtn && importInput) {
+	  importBtn.addEventListener("click", () => {
+		importInput.click();
+	  });
+	  importInput.addEventListener("change", async (e) => {
+		const file = e.target.files[0];
+		if (!file) return;
+		const name = importNameInput?.value?.trim() || undefined;
+		try {
+		  const importedName = await bot.profiles.import(file, name);
+		  if (profileStatus) profileStatus.textContent = `Profile "${importedName}" imported.`;
+		  refreshProfileList();
+		  // Optionally auto-select the imported profile
+		  if (profileSelect) profileSelect.value = importedName;
+		} catch (err) {
+		  if (profileStatus) profileStatus.textContent = `Import failed: ${err.message}`;
+		}
+		importInput.value = ''; // Reset file input
+	  });
+	}	
+	
+	const profileNameInput = panel.querySelector("#minibia-bot-profile-name");
+	const profileSaveBtn = panel.querySelector("#minibia-bot-profile-save");
+	const profileSelect = panel.querySelector("#minibia-bot-profile-select");
+	const profileLoadBtn = panel.querySelector("#minibia-bot-profile-load");
+	const profileDeleteBtn = panel.querySelector("#minibia-bot-profile-delete");
+	const profileStatus = panel.querySelector("#minibia-bot-profile-status");
+
+	function refreshProfileList() {
+	  if (!profileSelect) return;
+	  const currentVal = profileSelect.value;
+	  const names = bot.profiles?.list?.() || [];
+	  profileSelect.innerHTML = `<option value="">-- Select profile --</option>`;
+	  names.forEach(n => {
+		const opt = document.createElement("option");
+		opt.value = n;
+		opt.textContent = n;
+		profileSelect.appendChild(opt);
+	  });
+	  if (currentVal && names.includes(currentVal)) {
+		profileSelect.value = currentVal;
+	  }
+	  if (profileStatus) {
+		profileStatus.textContent = names.length ? `${names.length} profile(s) available` : "No profiles saved";
+	  }
+	}
+
+	function saveProfile() {
+	  const name = profileNameInput?.value?.trim();
+	  if (!name) {
+		if (profileStatus) profileStatus.textContent = "Please enter a profile name";
+		return;
+	  }
+	  const success = bot.profiles?.save(name);
+	  if (success) {
+		profileNameInput.value = "";
+		refreshProfileList();
+		if (profileStatus) profileStatus.textContent = `Profile "${name}" saved.`;
+	  } else {
+		if (profileStatus) profileStatus.textContent = `Failed to save "${name}".`;
+	  }
+	}
+
+	function loadProfile() {
+	  const name = profileSelect?.value;
+	  if (!name) {
+		if (profileStatus) profileStatus.textContent = "Select a profile to load.";
+		return;
+	  }
+	  if (!confirm(`Load profile "${name}"? This will restart the bot with the saved settings.`)) return;
+	  const success = bot.profiles?.load(name);
+	  if (!success && profileStatus) {
+		profileStatus.textContent = `Failed to load "${name}".`;
+	  }
+	  // reload will happen inside loadProfile
+	}
+
+	function deleteProfile() {
+	  const name = profileSelect?.value;
+	  if (!name) {
+		if (profileStatus) profileStatus.textContent = "Select a profile to delete.";
+		return;
+	  }
+	  if (!confirm(`Delete profile "${name}"?`)) return;
+	  const success = bot.profiles?.delete(name);
+	  if (success) {
+		refreshProfileList();
+		if (profileStatus) profileStatus.textContent = `Profile "${name}" deleted.`;
+	  } else {
+		if (profileStatus) profileStatus.textContent = `Failed to delete "${name}".`;
+	  }
+	}
+
+	if (profileSaveBtn) profileSaveBtn.addEventListener("click", saveProfile);
+	if (profileLoadBtn) profileLoadBtn.addEventListener("click", loadProfile);
+	if (profileDeleteBtn) profileDeleteBtn.addEventListener("click", deleteProfile);
+	if (profileNameInput) {
+	  profileNameInput.addEventListener("keydown", (e) => {
+		if (e.key === "Enter") {
+		  e.preventDefault();
+		  saveProfile();
+		}
+	  });
+	}
+	
+	
 	
 	const clientChaseToggle = panel.querySelector("#minibia-bot-auto-attack-client-chase");
 	if (clientChaseToggle) {
@@ -8288,6 +8656,7 @@ function refreshPinkSkullStatus() {
     refreshTitlebarRunIndicators();
 	refreshPaladinStatus();
 	refreshLooterStatus();
+	refreshProfileList();
 
     // Periodic refreshes
     const visibleTimer = window.setInterval(refreshVisibleCreatures, 1000);
@@ -8425,6 +8794,7 @@ function refreshPinkSkullStatus() {
 	currentBundle.installLooterModule(bot);
 	currentBundle.installLightHackModule(bot);
 	currentBundle.installPinkSkullDetectorModule(bot);
+	currentBundle.installProfileModule(bot);
     currentBundle.installPanel(bot);
 
     bot.ui.inject();
