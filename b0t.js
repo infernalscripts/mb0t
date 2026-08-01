@@ -217,7 +217,7 @@ window.__minibiaBotBundle.createBot = function createBot() {
 
   // ---- PUBLIC API ----
   return {
-    version: "0.5.0",
+    version: "0.5.8",
     addCleanup,
 
     /** Destroy the bot and all its modules (call before reload) */
@@ -2004,6 +2004,9 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     meleeProgressAt: 0,
     meleeStuckAt: 0,
 	lastMoveAt: 0,
+	lastProgressAt: 0,
+	lastTargetHealth: null,
+	stuckStartAt: 0,
   };
 
   const storedConfig = bot.storage.get(configStorageKey, {}) || {};
@@ -2257,12 +2260,23 @@ function syncKite(now) {
 
   const caveStatus = bot.cave?.status?.();
   const route = bot.cave?.getRoute?.() || [];
+  const loopMode = bot.cave?.getLoopMode?.() ?? false;
+
   if (!caveStatus?.running || !caveStatus?.pausedForCombat || route.length === 0) {
     return kiteAwayFallback(targetPos, playerPos, dist);
   }
 
+  // ---- INITIAL RETREAT WAYPOINT ----
   if (state.kiteWaypointIndex === null) {
-    state.kiteWaypointIndex = Math.max(0, caveStatus.currentIndex - 1);
+    let startIdx = caveStatus.currentIndex - 1;
+    // If at the first waypoint and loop mode is on, wrap to the last waypoint
+    if (loopMode && caveStatus.currentIndex === 0) {
+      startIdx = route.length - 1;
+    }
+    // Clamp to valid range
+    if (startIdx < 0) startIdx = 0;
+    if (startIdx >= route.length) startIdx = route.length - 1;
+    state.kiteWaypointIndex = startIdx;
   }
 
   let idx = Math.min(state.kiteWaypointIndex, route.length - 1);
@@ -2272,9 +2286,10 @@ function syncKite(now) {
   while (idx >= 0 && route[idx].z !== playerPos.z) {
     idx--;
   }
+  // If no same‑floor waypoint found, fallback to away movement
   if (idx < 0) {
     state.kiteWaypointIndex = null;
-    return false;
+    return kiteAwayFallback(targetPos, playerPos, dist);
   }
 
   let targetWp = route[idx];
@@ -2285,21 +2300,33 @@ function syncKite(now) {
 
   const distToWp = getTileDistance(playerPos, targetWp);
   const tolerance = Math.max(0, Number(config.waypointTolerance) || 0);
+
+  // ---- REACHED RETREAT WAYPOINT – MOVE TO NEXT (BACKWARDS) ----
   if (distToWp <= tolerance) {
     let nextIdx = idx - 1;
+    // If loopMode is on and we go below 0, wrap to the last waypoint
+    if (loopMode && nextIdx < 0) {
+      nextIdx = route.length - 1;
+    }
+    // Skip floors that don't match
     while (nextIdx >= 0 && route[nextIdx].z !== playerPos.z) {
       nextIdx--;
+      if (loopMode && nextIdx < 0) {
+        nextIdx = route.length - 1; // wrap again if needed (avoid infinite loop)
+      }
     }
     if (nextIdx >= 0) {
       state.kiteWaypointIndex = nextIdx;
       bot.cave.setCurrentIndex(nextIdx);
       targetWp = route[nextIdx];
     } else {
+      // No valid retreat waypoint – fallback
       state.kiteWaypointIndex = null;
-      return false;
+      return kiteAwayFallback(targetPos, playerPos, dist);
     }
   }
 
+  // ---- MOVE TOWARD THE RETREAT WAYPOINT ----
   const dx = targetWp.x - playerPos.x;
   const dy = targetWp.y - playerPos.y;
   let stepX = dx > 0 ? 1 : (dx < 0 ? -1 : 0);
@@ -2319,28 +2346,32 @@ function syncKite(now) {
     const ny = playerPos.y + a.dy;
     const candidatePos = { x: nx, y: ny, z: playerPos.z };
 
+    // Blacklist check
+    if (bot.blacklist?.isBlacklisted(nx, ny, playerPos.z)) continue;
+    // Safety: avoid floor-change tiles
     if (!isSafeTileForKite(candidatePos)) continue;
-    if (!isTileWalkable(nx, ny, playerPos.z, false)) {
-      if (!isTileWalkable(nx, ny, playerPos.z, true)) continue;
-    }
-
-    const dir = getDirection(a.dx, a.dy);
-    if (dir !== null && window.gameClient?.keyboard) {
-      window.gameClient.keyboard.handleMoveKey(dir);
-      return true;
+    // Walkability (ignore creatures for kiting)
+    if (isTileWalkable(nx, ny, playerPos.z, true)) {
+      const dir = getDirection(a.dx, a.dy);
+      if (dir !== null && window.gameClient?.keyboard) {
+        window.gameClient.keyboard.handleMoveKey(dir);
+        return true;
+      }
     }
   }
+
   return false;
 }
-
-// ---- tryAttack ----
 function tryAttack() {
   if (!config.enabled) return false;
   const now = Date.now();
-  if (resetTargetIfTooFar()) return true;
+
+  // 1) Clear target if too far (give up after being far for a while)
+  if (resetTargetIfTooFar(now)) return true;
+
   syncCombatState(now);
 
-  // ----- Movement (if in melee mode & not kiting) -----
+  // 2) Movement
   if (config.kiteMode && getEngagedTarget()) {
     if (syncChase(now)) return true;
     if (syncKite(now)) return true;
@@ -2348,33 +2379,85 @@ function tryAttack() {
     syncMeleeChase(now);
   }
 
-  // ----- TARGET SWITCHING: check if a better target exists -----
+  // 3) Validate current target
   const current = getCurrentTarget();
-  if (current) {
-    const candidates = getMonsterCandidates(now);
-    if (candidates.length) {
-      const best = candidates[0];
-      // Only consider switching if we have valid info for both
-      const currentInfo = isTargetValidAndOnScreen(current, { returnDetails: true, maxDx: 7, maxDy: 5 });
-      const bestInfo = isTargetValidAndOnScreen(best, { returnDetails: true, maxDx: 7, maxDy: 5 });
-      if (bestInfo.valid && currentInfo.valid) {
-        const currentDist = currentInfo.distance;
-        const bestDist = bestInfo.distance;
-        // Switch if best is preferred and current is not, OR if best is at least 2 tiles closer
-        const switchPreferred = bestInfo.preferred && !currentInfo.preferred;
-        const switchCloser = bestDist !== undefined && currentDist !== undefined && (bestDist + 2) < currentDist;
-        if (switchPreferred || switchCloser) {
-          // Skip current target (clears it) with a very short cooldown
-          skipTarget(current, "switching to better target", now, 100);
-        }
+  if (!current) {
+    state.lastProgressAt = 0;
+    state.lastDistance = undefined;
+    state.lastTargetHealth = null;
+    return triggerAttack(now);
+  }
+
+  const playerPos = normalizePosition(bot.getPlayerPosition());
+  const targetPos = normalizePosition(current.getPosition?.() || current.__position);
+  if (!playerPos || !targetPos) {
+    skipTarget(current, "missing position", now, 10000);
+    return false;
+  }
+
+  const dist = getTileDistance(playerPos, targetPos);
+  const maxDist = Math.max(1, Number(config.maxTargetDistance) || 5);
+
+  // Only skip if target is clearly out of range (maxDist + 2)
+  if (dist > maxDist + 2) {
+    skipTarget(current, "target too far (distance check)", now, 10000);
+    return false;
+  }
+
+  // 4) Stuck detection: only if we are within range (maxDist+2), and have been trying for a while
+  const health = current.state?.health ?? current.health ?? null;
+  let progress = false;
+
+  // Initialize tracking for new target
+  if (state.lastDistance === undefined || state.engagedTargetId !== current.id) {
+    state.lastDistance = dist;
+    state.lastProgressAt = now;
+    state.lastTargetHealth = health;
+    state.engagedTargetId = current.id;
+    state.stuckStartAt = now; // track when we started trying this target
+  } else {
+    // Check progress: distance decreased significantly (>=1 tile) OR health dropped
+    if (dist < state.lastDistance - 0.5) progress = true; // small threshold for distance decrease
+    if (health !== null && state.lastTargetHealth !== null && health < state.lastTargetHealth - 1) progress = true; // health drop >=1
+
+    if (progress) {
+      state.lastProgressAt = now;
+    }
+
+    // Update stored values
+    state.lastDistance = dist;
+    state.lastTargetHealth = health;
+
+    // Only trigger stuck after 8 seconds of no progress, and only if we've been trying this target for at least 3 seconds
+    // to avoid false positives at the start of a fight.
+    const timeTrying = now - (state.stuckStartAt || now);
+    if (timeTrying > 3000 && now - state.lastProgressAt > 8000) {
+      skipTarget(current, "no progress for 8s", now, 10000);
+      return false;
+    }
+  }
+
+  // 5) Optional: switch to a better target (only if current is not preferred and best is preferred, or best is at least 3 tiles closer)
+  const candidates = getMonsterCandidates(now);
+  if (candidates.length) {
+    const best = candidates[0];
+    const currentInfo = isTargetValidAndOnScreen(current, { returnDetails: true, maxDx: 7, maxDy: 5 });
+    const bestInfo = isTargetValidAndOnScreen(best, { returnDetails: true, maxDx: 7, maxDy: 5 });
+    if (bestInfo.valid && currentInfo.valid) {
+      const currentDist = currentInfo.distance;
+      const bestDist = bestInfo.distance;
+      // Only switch if best is preferred AND current is not, OR best is at least 3 tiles closer
+      if ((bestInfo.preferred && !currentInfo.preferred) ||
+          (bestDist !== undefined && currentDist !== undefined && (bestDist + 3) < currentDist)) {
+        skipTarget(current, "switching to better target", now, 500);
+        return false;
       }
     }
   }
 
-  // ----- Attack -----
+  // 6) Attack
   if (getCurrentTarget()) {
     if (config.runeHotbarSlot && triggerRune(now)) return true;
-    // Even if we have a target, we may have just cleared it, so call triggerAttack anyway
     return triggerAttack(now);
   } else {
     return triggerAttack(now);
@@ -2518,6 +2601,9 @@ function clearEngagedTarget() {
   state.combatStartedAt = 0;
   state.lastChaseDestinationKey = null;
   state.kiteWaypointIndex = null;
+  state.lastProgressAt = 0;
+  state.lastDistance = undefined;
+  state.lastTargetHealth = null;
   resetFollowProgress();
   clearCurrentFollowTarget();
   if (config.useClientChase) setClientChaseMode(false);
@@ -2750,27 +2836,34 @@ function getMonsterCandidates(now = Date.now()) {
 }
 
   // ---- GIVE UP / DISTANCE ----
-  function shouldGiveUpTarget(target) {
-    const maxDist = Math.max(1, Number(config.maxTargetDistance) || 5);
-    const playerPos = normalizePosition(bot.getPlayerPosition());
-    const targetPos = normalizePosition(target?.getPosition?.() || target?.__position);
-    if (!playerPos || !targetPos) return false;
-    return getTileDistance(playerPos, targetPos) > maxDist;
+function resetTargetIfTooFar(now = Date.now()) {
+  const current = getCurrentTarget();
+  if (current && shouldGiveUpTarget(current)) {
+    skipTarget(current, "target too far", now, 10000);
+    return true;
   }
+  const engaged = getEngagedTarget();
+  if (engaged && shouldGiveUpTarget(engaged)) {
+    skipTarget(engaged, "engaged target too far", now, 10000);
+    return true;
+  }
+  return false;
+}
 
-  function resetTargetIfTooFar() {
-    const current = getCurrentTarget();
-    if (current && shouldGiveUpTarget(current)) {
-      skipTarget(current, "target too far", Date.now(), 500);
-      return true;
-    }
-    const engaged = getEngagedTarget();
-    if (engaged && shouldGiveUpTarget(engaged)) {
-      skipTarget(engaged, "engaged target too far", Date.now(), 500);
-      return true;
-    }
-    return false;
-  }
+function shouldGiveUpTarget(target) {
+  const maxDist = Math.max(1, Number(config.maxTargetDistance) || 5);
+  const playerPos = normalizePosition(bot.getPlayerPosition());
+  const targetPos = normalizePosition(target?.getPosition?.() || target?.__position);
+  if (!playerPos || !targetPos) return true;
+  if (playerPos.z !== targetPos.z) return true;
+  // Only give up if target is more than maxDist + 3 away (lenient)
+  const dist = getTileDistance(playerPos, targetPos);
+  if (dist > maxDist + 3) return true;
+  // Also check if target is off-screen (but don't give up immediately – maybe it's just around a corner)
+  // We'll only give up if target is off-screen AND we haven't made progress for a while (handled in tryAttack)
+  // So here we only use distance.
+  return false;
+}
 
   // ---- MELEE CHASE ----
   function getTileFromPosition(position) {
@@ -2827,9 +2920,9 @@ function syncMeleeChase(now = Date.now()) {
   const dist = getTileDistance(playerPos, targetPos);
   const maxDist = Math.max(1, Number(config.maxTargetDistance) || 5);
   
-  // --- OUT OF RANGE: skip with 2s cooldown ---
+  // --- OUT OF RANGE: skip with 5s cooldown ---
   if (dist > maxDist) {
-    skipTarget(target, "too far for melee", now, 2000);
+    skipTarget(target, "too far for melee", now, 5000);
     return false;
   }
 
@@ -2850,7 +2943,7 @@ function syncMeleeChase(now = Date.now()) {
     const selfRange = config.antiKSSelfRange ?? 2;
     const otherRange = config.antiKSOtherRange ?? 2;
     if (dist > selfRange) {
-      skipTarget(target, "melee anti‑KS self range", now, 2000);
+      skipTarget(target, "melee anti‑KS self range", now, 5000);
       return false;
     }
     for (const player of otherPlayers) {
@@ -2859,34 +2952,34 @@ function syncMeleeChase(now = Date.now()) {
       const dx = Math.abs(pPos.x - targetPos.x);
       const dy = Math.abs(pPos.y - targetPos.y);
       if (dx <= otherRange && dy <= otherRange) {
-        skipTarget(target, "melee anti‑KS other range", now, 2000);
+        skipTarget(target, "melee anti‑KS other range", now, 5000);
         return false;
       }
     }
   }
 
-  // ---- Progress & Stuck (custom movement only) ----
-  if (!config.useClientChase) {
-    if (state.engagedTargetId !== target.id) {
+  // ---- Progress & Stuck (for both custom and client chase) ----
+  // We'll track progress regardless of movement method
+  if (state.engagedTargetId !== target.id) {
+    state.meleeLastDist = dist;
+    state.meleeProgressAt = now;
+    state.meleeStuckAt = 0;
+  } else {
+    if (dist < state.meleeLastDist) {
       state.meleeLastDist = dist;
       state.meleeProgressAt = now;
       state.meleeStuckAt = 0;
     } else {
-      if (dist < state.meleeLastDist) {
-        state.meleeLastDist = dist;
-        state.meleeProgressAt = now;
-        state.meleeStuckAt = 0;
-      } else {
-        if (!state.meleeStuckAt) state.meleeStuckAt = now;
-        if (now - state.meleeStuckAt > 2000) {
-          skipTarget(target, "melee stuck (no progress)", now, 1500);
-          return false;
-        }
+      if (!state.meleeStuckAt) state.meleeStuckAt = now;
+      // If we haven't made progress for 5 seconds, skip
+      if (now - state.meleeStuckAt > 5000) {
+        skipTarget(target, "melee stuck (no progress)", now, 5000);
+        return false;
       }
     }
   }
 
-  // ---- Client Chase Mode (if enabled) ----
+  // ---- Client Chase Mode ----
   if (config.useClientChase) {
     try {
       const fms = window.gameClient?.interface?.fightModeSelector;
@@ -2895,9 +2988,6 @@ function syncMeleeChase(now = Date.now()) {
       }
     } catch (e) {}
     state.lastChaseAt = now;
-    state.meleeLastDist = Infinity;
-    state.meleeProgressAt = 0;
-    state.meleeStuckAt = 0;
     return true;
   }
 
@@ -2921,10 +3011,6 @@ function syncMeleeChase(now = Date.now()) {
     const ny = playerPos.y + a.dy;
     const candidatePos = { x: nx, y: ny, z: playerPos.z };
 
-    // ---- BLACKLIST CHECK ----
-    if (bot.blacklist?.isBlacklisted(nx, ny, playerPos.z)) continue;
-    // ---- END ----
-
     if (!isSafeTileForKite(candidatePos)) continue;
     if (nx === targetPos.x && ny === targetPos.y) continue;
 
@@ -2940,7 +3026,6 @@ function syncMeleeChase(now = Date.now()) {
     }
   }
 
-  // Fallback: allow walking into occupied tiles (ignore creatures)
   for (const a of attempts) {
     if (a.dx === 0 && a.dy === 0) continue;
     const nx = playerPos.x + a.dx;
@@ -2948,11 +3033,6 @@ function syncMeleeChase(now = Date.now()) {
     if (nx === targetPos.x && ny === targetPos.y) continue;
     const candidatePos = { x: nx, y: ny, z: playerPos.z };
     if (!isSafeTileForKite(candidatePos)) continue;
-
-    // ---- BLACKLIST CHECK ----
-    if (bot.blacklist?.isBlacklisted(nx, ny, playerPos.z)) continue;
-    // ---- END ----
-
     if (isTileWalkable(nx, ny, playerPos.z, true)) {
       const dir = getDirection(a.dx, a.dy);
       if (dir !== null && window.gameClient?.keyboard) {
@@ -3218,6 +3298,9 @@ function triggerRune(now = Date.now()) {
 
   function status() {
     const combatActive = syncCombatState(Date.now());
+	state.lastProgressAt = 0;
+	state.lastDistance = undefined;
+	state.lastTargetHealth = null;
     return {
       running: state.running,
       config: { ...config },
@@ -4907,32 +4990,100 @@ window.__minibiaBotBundle.installAutoEatModule = function installAutoEatModule(b
     return n;
   }
 
+  // ---- Improved food timer reader ----
   function readFoodTimer() {
-    const text = document.querySelector('#skill-window div[skill="food"] .skill')?.textContent?.trim() || null;
-    if (!text) return null;
-    const match = text.match(/^(\d{1,2}):(\d{2})$/);
-    return match ? { text, seconds: Number(match[1]) * 60 + Number(match[2]) } : { text, seconds: null };
+    // 1) Try internal skill-window property (updated by FOOD_TIMER packet)
+    try {
+      const skillWin = window.gameClient?.interface?.windowManager?.getWindow?.("skill-window");
+      if (skillWin) {
+        // Method
+        if (typeof skillWin.getFoodTimer === 'function') {
+          const val = skillWin.getFoodTimer();
+          if (typeof val === 'number' && val >= 0) {
+            return { source: 'skillWin.getFoodTimer()', seconds: val };
+          }
+        }
+        // Property
+        if (typeof skillWin.foodTimer === 'number' && skillWin.foodTimer >= 0) {
+          return { source: 'skillWin.foodTimer', seconds: skillWin.foodTimer };
+        }
+      }
+    } catch (e) { /* ignore */ }
+
+    // 2) Try DOM selector
+    const el = document.querySelector('#skill-window div[skill="food"] .skill');
+    if (el) {
+      const text = el.textContent?.trim() || null;
+      if (text) {
+        const match = text.match(/^(\d{1,2}):(\d{2})$/);
+        if (match) {
+          const seconds = Number(match[1]) * 60 + Number(match[2]);
+          return { source: 'DOM', seconds };
+        }
+        return { source: 'DOM', seconds: null };
+      }
+    }
+
+    // 3) If all fails, return null
+    return null;
   }
 
   function isSated() {
-    const player = window.gameClient?.player;
-    const conditions = player?.conditions;
-    if (conditions?.has && conditions.SATED != null) return conditions.has(conditions.SATED);
+    // ---- 1) Read food timer ----
     const food = readFoodTimer();
-    if (food?.seconds != null) return food.seconds > 0;
-    return true;
+    if (food && food.seconds !== undefined && food.seconds !== null) {
+      const sated = food.seconds > 0;
+      // Log once per minute if we are using a non‑zero timer to see what's happening
+      if (sated && food.seconds < 30) {
+        // If timer says we have less than 30 seconds, we should be considered hungry,
+        // but the bot may not eat because it thinks we are sated. We'll force hunger
+        // if the timer is < 30 seconds to trigger eating earlier.
+        // Actually, we want to eat when timer is 0, not before. So keep as is.
+      }
+      return sated;
+    }
+
+    // ---- 2) Fallback to condition check ----
+    const player = window.gameClient?.player;
+    if (player?.conditions) {
+      const satedId = window.ConditionManager?.prototype?.SATED;
+      if (satedId !== undefined && player.conditions.has) {
+        return player.conditions.has(satedId);
+      }
+    }
+
+    // ---- 3) If we can't determine, assume hungry ----
+    return false;
   }
 
   function tryEat() {
-    if (!config.enabled) return false;
-    if (isSated()) return false;
-    if (Date.now() - state.lastFoodAt < config.eatCooldownMs) return false;
+    if (!config.enabled) {
+      bot.log("Eat: disabled");
+      return false;
+    }
+    if (isSated()) {
+      // Log only once in a while to avoid spam
+      if (!tryEat._lastLoggedSated || Date.now() - tryEat._lastLoggedSated > 30000) {
+        tryEat._lastLoggedSated = Date.now();
+        const food = readFoodTimer();
+        bot.log("Eat: isSated() true, not eating. Food timer:", food);
+      }
+      return false;
+    }
+    if (Date.now() - state.lastFoodAt < config.eatCooldownMs) {
+      return false;
+    }
     const slot = normalizeHotbarSlot(config.eatHotbarSlot);
-    if (!slot) return false;
+    if (!slot) {
+      bot.log("Eat: invalid hotbar slot", config.eatHotbarSlot);
+      return false;
+    }
     const clicked = bot.clickHotbar(slot - 1);
     if (clicked) {
       state.lastFoodAt = Date.now();
       bot.log("used eat hotkey", { slot });
+    } else {
+      bot.log("Eat: clickHotbar failed for slot", slot);
     }
     return clicked;
   }
@@ -4969,11 +5120,13 @@ window.__minibiaBotBundle.installAutoEatModule = function installAutoEatModule(b
   }
 
   function status() {
+    const food = readFoodTimer();
     return {
       running: state.running,
       config: { ...config },
       lastFoodAt: state.lastFoodAt,
       isSated: isSated(),
+      foodTimer: food,
     };
   }
 
@@ -4996,6 +5149,7 @@ window.__minibiaBotBundle.installAutoEatModule = function installAutoEatModule(b
   bot.eat = {
     start, stop, status, updateConfig,
     isSated, tryEat, normalizeHotbarSlot,
+    readFoodTimer,
     config,
   };
   bot.startAutoEat = start;
@@ -5980,7 +6134,7 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
     if (manaPercent > config.highManaThreshold && config.highManaSpellWords) {
       const sent = bot.sendChat(config.highManaSpellWords.trim());
       if (sent) {
-        bot.log("Paladin: cast high mana spell", { spell: config.highManaSpellWords });
+        //bot.log("Paladin: cast high mana spell", { spell: config.highManaSpellWords });
         return true;
       }
     }
@@ -7357,10 +7511,16 @@ function refreshPinkSkullStatus() {
     if (toggle) toggle.checked = !!bot.rune?.status?.().running;
   }
 
-  function refreshAutoEatStatus() {
-    const toggle = document.getElementById("minibia-bot-auto-eat-enabled");
-    if (toggle) toggle.checked = !!bot.eat?.status?.().running;
-  }
+	function refreshAutoEatStatus() {
+	  const toggle = document.getElementById("minibia-bot-auto-eat-enabled");
+	  if (toggle) toggle.checked = !!bot.eat?.status?.().running;
+	  
+	  // Also update the hotkey input if it exists and isn't focused
+	  const hotkeyInput = document.getElementById("minibia-bot-auto-eat-hotkey");
+	  if (hotkeyInput && document.activeElement !== hotkeyInput) {
+		hotkeyInput.value = bot.eat?.config?.eatHotbarSlot ?? 10;
+	  }
+	}
 
   function refreshAutoInvisibleStatus() {
     const toggle = document.getElementById("minibia-bot-auto-invisible-enabled");
@@ -8563,6 +8723,33 @@ function refreshPinkSkullStatus() {
 	  });
 	}
 	
+	// ---- Auto Eat ----
+	const autoEatToggle = panel.querySelector("#minibia-bot-auto-eat-enabled");
+	const autoEatHotkeyInput = panel.querySelector("#minibia-bot-auto-eat-hotkey");
+
+	if (autoEatToggle) {
+	  autoEatToggle.checked = !!bot.eat?.status?.().running;
+	  autoEatToggle.addEventListener("change", function() {
+		if (this.checked) {
+		  bot.eat.start();
+		} else {
+		  bot.eat.stop();
+		}
+		refreshAutoEatStatus();
+	  });
+	}
+
+	if (autoEatHotkeyInput) {
+	  // Load initial value from config
+	  autoEatHotkeyInput.value = bot.eat?.config?.eatHotbarSlot ?? 10;
+	  autoEatHotkeyInput.addEventListener("change", function() {
+		const val = Math.min(12, Math.max(1, Number(this.value) || 1));
+		this.value = String(val);
+		bot.eat.updateConfig({ eatHotbarSlot: val });
+		bot.log("Auto eat hotkey updated", { slot: val });
+	  });
+	}
+	
 	// ---- Pink Skull ----
 	const pinkSkullToggle = panel.querySelector("#minibia-bot-pink-skull-enabled");
 	if (pinkSkullToggle) {
@@ -9210,6 +9397,7 @@ function refreshPinkSkullStatus() {
  *     Also implements hot‑reload.
  * ==================================================================================
  */
+ 
 (() => {
   const bundle = window.__minibiaBotBundle || window.__minibiaBotReloadBundle || {};
   const persistedEnabledModules = [
@@ -9317,16 +9505,16 @@ function refreshPinkSkullStatus() {
 
 /**
  * ==================================================================================
- * 16. INFERNAL SCRIPT – MOVEMENT PATCH
- *     Hooks into the game client to force‑stop auto‑walking when the player has
- *     a target. Prevents cave bot and pathfinder from moving while in combat.
+ * 16. INFERNAL SCRIPT – MOVEMENT PATCH (Light)
+ *     Prevents cavebot / auto‑walk from moving while you have a target,
+ *     but leaves manual walking (keyboard + click‑to‑move) untouched.
  * ==================================================================================
  */
 (() => {
   const TAG = "[InfernalScript]";
-  const state = { installed: false, stopping: false, lastStopPacketAt: 0, forceStopUntil: 0 };
+  const state = { installed: false, stopping: false, lastStopPacketAt: 0 };
 
-  console.log(`${TAG} page hook loaded`);
+  console.log(`${TAG} page hook loaded (light version)`);
 
   function waitForClient() {
     const client = window.gameClient || window.GameClient?.instance || window.client;
@@ -9340,16 +9528,22 @@ function refreshPinkSkullStatus() {
   function install(client) {
     if (state.installed) return;
     state.installed = true;
-    console.log(`${TAG} gameClient found`);
+    console.log(`${TAG} gameClient found – light mode`);
 
+    // Only patch the player.__target setter (to force-clear autowalk on target change)
     guardPlayerTarget(client);
-    guardPathfinderProperties(client);
-    patchGameClientSend(client);
-    patchPathfinder(client);
-    patchPacketHandler(client);
-    patchPlayerUnlockMovement(client);
+    // Block outgoing autowalk packets ONLY when they come from the bot's modules,
+    // but allow manual map-clicks. We'll use a simple heuristic: if the player
+    // is idle (no keyboard input) and not in a fight, it's probably the bot.
+    // For simplicity, we just don't block any packets.
+    // Instead, we rely on the periodic stop loop.
+    // No patchGameClientSend blocking.
+
+    // No pathfinder property guards – they were too strict.
+
+    // Keep the periodic stop loop, but with a gentler interval and manual-input grace.
     startStopLoop(client);
-    console.log(`${TAG} FULL CONTROL ACTIVE - balanced smooth mode`);
+    console.log(`${TAG} light control active – manual walking untouched`);
   }
 
   function hasTarget(client) {
@@ -9358,30 +9552,7 @@ function refreshPinkSkullStatus() {
     let target = null;
     try { if (typeof p.getTarget === "function") target = p.getTarget(); } catch {}
     if (!target && p.__target !== null && p.__target !== undefined) target = p.__target;
-    if (!target) return false;
-    if (!isTargetOnScreen(client, target)) {
-      state.pausedForCombat = false;
-      return false;
-    }
-    state.pausedForCombat = true;
-    return true;
-  }
-
-  function isTargetOnScreen(client, target) {
-    const p = client.player;
-    if (!p || !target) return false;
-    try {
-      if (typeof p.canSeeSmall === "function") return p.canSeeSmall(target);
-      if (typeof p.canSee === "function") return p.canSee(target);
-    } catch {}
-    try {
-      const pp = p.getPosition().projected();
-      const tp = target.getPosition().projected();
-      const dx = Math.abs(pp.x - tp.x);
-      const dy = Math.abs(pp.y - tp.y);
-      return dx < 8 && dy < 6;
-    } catch {}
-    return false;
+    return !!target;
   }
 
   function sendStopWalk(client, force = false) {
@@ -9396,6 +9567,22 @@ function refreshPinkSkullStatus() {
   }
 
   function hardStop(client, forcePacket = false) {
+    // ---- GRACE: if the player has manually pressed a movement key recently,
+    // skip the stop so manual walking isn't interrupted.
+    try {
+      const kb = client.keyboard;
+      if (kb && typeof kb.__lastInputAt !== 'undefined') {
+        const now = performance.now();
+        const msSinceInput = now - kb.__lastInputAt;
+        if (msSinceInput < 500) {
+          // Manual input detected – let the player move freely.
+          return;
+        }
+      }
+    } catch (e) {
+      // If we can't read the keyboard state, fall through and stop anyway.
+    }
+
     if (state.stopping) return;
     state.stopping = true;
     try {
@@ -9403,7 +9590,7 @@ function refreshPinkSkullStatus() {
       const pf = client.world?.pathfinder;
       if (!p || !pf) return;
       sendStopWalk(client, forcePacket);
-      // Clear all pathfinding state
+      // Clear pathfinding state (but don't wipe everything – just the active walk)
       pf.__isAutoWalking = false;
       pf.__autoWalkStepsRemaining = 0;
       pf.__autowalkStartPosition = null;
@@ -9412,11 +9599,7 @@ function refreshPinkSkullStatus() {
       pf.__pathfindCache = [];
       pf.__minimapWaypoints = null;
       pf.__recentMinimapStarts = [];
-      pf.__lastCancelPosition = null;
-      pf.__lastRetryDest = null;
-      pf.__lastRetryTime = 0;
       pf.__hybridPath = null;
-      pf.__hybridNeedsAlign = false;
       p.__movementBuffer = null;
       p.__lookDirectionBuffer = null;
       if (client.mouse) {
@@ -9440,8 +9623,9 @@ function refreshPinkSkullStatus() {
       set(value) {
         targetValue = value;
         if (value !== null && value !== undefined) {
-          state.forceStopUntil = performance.now() + 1200;
-          queueMicrotask(() => hardStop(client, true));
+          // Force‑stop autowalk the moment a target is set.
+          // This catches both manual and bot targeting.
+          hardStop(client, true);
         }
       }
     });
@@ -9449,172 +9633,29 @@ function refreshPinkSkullStatus() {
     console.log(`${TAG} guarded player.__target`);
   }
 
-  function guardPathfinderProperties(client) {
-    const pf = client.world?.pathfinder;
-    if (!pf || pf.__stopOnTargetPropertyGuarded) return;
-    let finalDest = pf.__finalDestination ?? null;
-    let isAutoWalking = pf.__isAutoWalking ?? false;
-    let pathCache = Array.isArray(pf.__pathfindCache) ? pf.__pathfindCache : [];
-    let hybridPath = pf.__hybridPath ?? null;
-
-    Object.defineProperty(pf, "__finalDestination", {
-      configurable: true,
-      get() { return hasTarget(client) ? null : finalDest; },
-      set(v) {
-        if (hasTarget(client)) {
-          finalDest = null;
-          state.forceStopUntil = performance.now() + 800;
-          hardStop(client, true);
-          return;
-        }
-        finalDest = v;
-      }
-    });
-    Object.defineProperty(pf, "__isAutoWalking", {
-      configurable: true,
-      get() { return hasTarget(client) ? false : isAutoWalking; },
-      set(v) {
-        if (hasTarget(client)) {
-          isAutoWalking = false;
-          state.forceStopUntil = performance.now() + 800;
-          hardStop(client, true);
-          return;
-        }
-        isAutoWalking = v;
-      }
-    });
-    Object.defineProperty(pf, "__pathfindCache", {
-      configurable: true,
-      get() {
-        if (hasTarget(client)) pathCache.length = 0;
-        return pathCache;
-      },
-      set(v) {
-        if (hasTarget(client)) {
-          pathCache = [];
-          state.forceStopUntil = performance.now() + 800;
-          hardStop(client, true);
-          return;
-        }
-        pathCache = Array.isArray(v) ? v : [];
-      }
-    });
-    Object.defineProperty(pf, "__hybridPath", {
-      configurable: true,
-      get() { return hasTarget(client) ? null : hybridPath; },
-      set(v) {
-        if (hasTarget(client)) {
-          hybridPath = null;
-          state.forceStopUntil = performance.now() + 800;
-          hardStop(client, true);
-          return;
-        }
-        hybridPath = v;
-      }
-    });
-    pf.__stopOnTargetPropertyGuarded = true;
-    console.log(`${TAG} guarded pathfinder properties`);
-  }
-
-  function patchGameClientSend(client) {
-    if (!client || typeof client.send !== "function" || client.__stopOnTargetSendPatched) return;
-    const orig = client.send;
-    client.send = function(packet) {
-      const name = packet?.constructor?.name || "";
-      if (name === "StopWalkPacket") return orig.call(this, packet);
-      if (hasTarget(client) && (name === "AutoWalkPacket" || name === "WalkToDestinationPacket")) {
-        console.log(`${TAG} blocked outgoing ${name}`);
-        state.forceStopUntil = performance.now() + 1000;
-        hardStop(client, true);
-        return false;
-      }
-      return orig.call(this, packet);
-    };
-    client.__stopOnTargetSendPatched = true;
-    console.log(`${TAG} patched gameClient.send`);
-  }
-
-  function patchPathfinder(client) {
-    const pf = client.world?.pathfinder;
-    if (!pf || pf.__stopOnTargetFunctionsPatched) return;
-    const methods = ["findPath","handlePathfind","__predictHybridStep","__findPathViaMinimap","__continueAlongWaypoints","getNextMove"];
-    methods.forEach(key => {
-      if (typeof pf[key] !== "function") return;
-      const orig = pf[key];
-      pf[key] = function(...args) {
-        if (hasTarget(client)) {
-          state.forceStopUntil = performance.now() + 800;
-          hardStop(client, true);
-          return false;
-        }
-        return orig.apply(this, args);
-      };
-    });
-    if (typeof pf.setPathfindCache === "function") {
-      const orig = pf.setPathfindCache;
-      pf.setPathfindCache = function(path) {
-        if (hasTarget(client) && path !== null) {
-          state.forceStopUntil = performance.now() + 800;
-          hardStop(client, true);
-          return false;
-        }
-        return orig.call(this, path);
-      };
-    }
-    pf.__stopOnTargetFunctionsPatched = true;
-    console.log(`${TAG} patched pathfinder functions`);
-  }
-
-  function patchPacketHandler(client) {
-    const handler = client.networkManager?.packetHandler || client.packetHandler;
-    if (!handler || handler.__stopOnTargetPacketHandlerPatched) return;
-    const methods = ["handleAutoWalkPath"];
-    methods.forEach(key => {
-      if (typeof handler[key] !== "function") return;
-      const orig = handler[key];
-      handler[key] = function(...args) {
-        if (hasTarget(client)) {
-          console.log(`${TAG} blocked incoming ${key}`);
-          state.forceStopUntil = performance.now() + 1000;
-          hardStop(client, true);
-          return false;
-        }
-        return orig.apply(this, args);
-      };
-    });
-    handler.__stopOnTargetPacketHandlerPatched = true;
-    console.log(`${TAG} patched packetHandler`);
-  }
-
-  function patchPlayerUnlockMovement(client) {
-    const p = client.player;
-    if (!p || typeof p.unlockMovement !== "function" || p.__stopOnTargetUnlockPatched) return;
-    const orig = p.unlockMovement;
-    p.unlockMovement = function(...args) {
-      if (hasTarget(client)) {
-        hardStop(client, false);
-        this.__movementBuffer = null;
-        this.__lookDirectionBuffer = null;
-        return orig.apply(this, args);
-      }
-      return orig.apply(this, args);
-    };
-    p.__stopOnTargetUnlockPatched = true;
-    console.log(`${TAG} patched player.unlockMovement - smooth cleanup mode`);
-  }
-
   function startStopLoop(client) {
     let lastHad = false;
     setInterval(() => {
       const active = hasTarget(client);
-      const now = performance.now();
       if (active) {
-        const force = !lastHad || now < state.forceStopUntil;
-        hardStop(client, force);
+        // Only hardStop if the player is actually moving (avoids spamming stop packets).
+        const moving = client.player && client.player.isMoving && client.player.isMoving();
+        if (moving) {
+          hardStop(client, false);
+        }
+        // If not moving, just ensure any autowalk flags are cleared (lighter).
+        else {
+          const pf = client.world?.pathfinder;
+          if (pf && pf.__isAutoWalking) {
+            pf.__isAutoWalking = false;
+            pf.__finalDestination = null;
+            pf.__pathfindCache = [];
+          }
+        }
       }
       lastHad = active;
-    }, 100);
-    console.log(`${TAG} target stop loop running - balanced interval mode`);
+    }, 300); // check every 300ms instead of 100ms
+    console.log(`${TAG} target stop loop running – 300ms interval`);
   }
 
   waitForClient();
