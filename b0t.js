@@ -183,17 +183,27 @@ window.__minibiaBotBundle.createBot = function createBot() {
     return true;
   }
 
-  function startReconnectWatcher() {
-    if (reconnectObserver || reconnectPollTimerId) return;
-    const runCheck = () => { try { tryClickReconnect(); } catch (e) { console.error("[minibia-bot] reconnect watcher failed", e); } };
-    reconnectObserver = new MutationObserver(runCheck);
-    reconnectObserver.observe(document.documentElement || document.body, {
-      childList: true, subtree: true, attributes: true,
-      attributeFilter: ["class", "style", "hidden", "aria-hidden", "value"]
-    });
-    reconnectPollTimerId = window.setInterval(runCheck, 2000);
-    runCheck();
-  }
+function startReconnectWatcher() {
+  if (reconnectObserver || reconnectPollTimerId) return;
+  const runCheck = () => {
+    try {
+      // Only try to reconnect if we're actually disconnected
+      const isConnected = window.gameClient?.networkManager?.isConnected?.();
+      if (isConnected === false) {
+        tryClickReconnect();
+      }
+    } catch (e) {
+      console.error("[minibia-bot] reconnect watcher failed", e);
+    }
+  };
+  reconnectObserver = new MutationObserver(runCheck);
+  reconnectObserver.observe(document.documentElement || document.body, {
+    childList: true, subtree: true, attributes: true,
+    attributeFilter: ["class", "style", "hidden", "aria-hidden", "value"]
+  });
+  reconnectPollTimerId = window.setInterval(runCheck, 2000);
+  runCheck();
+}
 
   function stopReconnectWatcher() {
     if (reconnectObserver) { reconnectObserver.disconnect(); reconnectObserver = null; }
@@ -2080,12 +2090,16 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 function setClientChaseMode(enabled) {
   try {
     const fms = window.gameClient?.interface?.fightModeSelector;
-    if (!fms) return false;
-    // 0 = Stand, 1 = Safe Chase, 2 = Aggressive Chase
+    if (!fms) {
+      console.warn("setClientChaseMode: fightModeSelector not found");
+      return false;
+    }
     const mode = enabled ? 2 : 0;
+ //   console.log(`setClientChaseMode: setting chase mode to ${mode}`);
     fms.setChaseMode(mode);
     return true;
   } catch (e) {
+    console.error("setClientChaseMode error:", e);
     return false;
   }
 }
@@ -2391,20 +2405,20 @@ function tryAttack() {
   const playerPos = normalizePosition(bot.getPlayerPosition());
   const targetPos = normalizePosition(current.getPosition?.() || current.__position);
   if (!playerPos || !targetPos) {
-    skipTarget(current, "missing position", now, 10000);
+    skipTarget(current, "missing position", now, 3000);
     return false;
   }
 
   const dist = getTileDistance(playerPos, targetPos);
   const maxDist = Math.max(1, Number(config.maxTargetDistance) || 5);
 
-  // Only skip if target is clearly out of range (maxDist + 2)
+  // Skip only if clearly out of range (maxDist + 2)
   if (dist > maxDist + 2) {
-    skipTarget(current, "target too far (distance check)", now, 10000);
+    skipTarget(current, "target too far (distance check)", now, 3000);
     return false;
   }
 
-  // 4) Stuck detection: only if we are within range (maxDist+2), and have been trying for a while
+  // 4) Stuck detection – but only if there is another monster to switch to
   const health = current.state?.health ?? current.health ?? null;
   let progress = false;
 
@@ -2414,11 +2428,14 @@ function tryAttack() {
     state.lastProgressAt = now;
     state.lastTargetHealth = health;
     state.engagedTargetId = current.id;
-    state.stuckStartAt = now; // track when we started trying this target
+    state.lastPlayerPos = playerPos;
   } else {
-    // Check progress: distance decreased significantly (>=1 tile) OR health dropped
-    if (dist < state.lastDistance - 0.5) progress = true; // small threshold for distance decrease
-    if (health !== null && state.lastTargetHealth !== null && health < state.lastTargetHealth - 1) progress = true; // health drop >=1
+    // Progress: distance decreased, health dropped, or player moved
+    if (dist < state.lastDistance - 0.5) progress = true;
+    if (health !== null && state.lastTargetHealth !== null && health < state.lastTargetHealth - 1) progress = true;
+    if (playerPos.x !== state.lastPlayerPos.x || playerPos.y !== state.lastPlayerPos.y) {
+      progress = true;
+    }
 
     if (progress) {
       state.lastProgressAt = now;
@@ -2427,17 +2444,30 @@ function tryAttack() {
     // Update stored values
     state.lastDistance = dist;
     state.lastTargetHealth = health;
+    state.lastPlayerPos = playerPos;
 
-    // Only trigger stuck after 8 seconds of no progress, and only if we've been trying this target for at least 3 seconds
-    // to avoid false positives at the start of a fight.
-    const timeTrying = now - (state.stuckStartAt || now);
-    if (timeTrying > 3000 && now - state.lastProgressAt > 8000) {
-      skipTarget(current, "no progress for 8s", now, 10000);
-      return false;
+    // Stuck timeout: 4 seconds
+    const timeStuck = now - state.lastProgressAt;
+
+    // Only skip if we've been stuck for >4s AND there is another visible monster
+    if (timeStuck > 4000) {
+      // Count visible monsters (not skipped) to see if we have alternatives
+      const candidates = getMonsterCandidates(now);
+      // If there is another monster (at least 1) AND it's not the current one, we can switch
+      const hasAlternative = candidates.some(m => m.id !== current.id);
+      if (hasAlternative) {
+        skipTarget(current, "no progress for 4s, alternative exists", now, 3000);
+        return false;
+      } else {
+        // No alternative – keep trying this one (don't skip)
+        // Reset the progress timer so we don't keep logging
+        state.lastProgressAt = now;
+        bot.log("No alternative target – sticking to", current.name);
+      }
     }
   }
 
-  // 5) Optional: switch to a better target (only if current is not preferred and best is preferred, or best is at least 3 tiles closer)
+  // 5) Optional: switch to a better target (only if new target is preferred, or at least 3 tiles closer)
   const candidates = getMonsterCandidates(now);
   if (candidates.length) {
     const best = candidates[0];
@@ -2446,7 +2476,7 @@ function tryAttack() {
     if (bestInfo.valid && currentInfo.valid) {
       const currentDist = currentInfo.distance;
       const bestDist = bestInfo.distance;
-      // Only switch if best is preferred AND current is not, OR best is at least 3 tiles closer
+      // Switch if: best is preferred and current is not, OR best is at least 3 tiles closer
       if ((bestInfo.preferred && !currentInfo.preferred) ||
           (bestDist !== undefined && currentDist !== undefined && (bestDist + 3) < currentDist)) {
         skipTarget(current, "switching to better target", now, 500);
@@ -2606,7 +2636,6 @@ function clearEngagedTarget() {
   state.lastTargetHealth = null;
   resetFollowProgress();
   clearCurrentFollowTarget();
-  if (config.useClientChase) setClientChaseMode(false);
 }
 
   function clearCurrentFollowTarget() {
@@ -2922,7 +2951,7 @@ function syncMeleeChase(now = Date.now()) {
   
   // --- OUT OF RANGE: skip with 5s cooldown ---
   if (dist > maxDist) {
-    skipTarget(target, "too far for melee", now, 5000);
+    skipTarget(target, "too far for melee", now, 3000);
     return false;
   }
 
@@ -2972,8 +3001,8 @@ function syncMeleeChase(now = Date.now()) {
     } else {
       if (!state.meleeStuckAt) state.meleeStuckAt = now;
       // If we haven't made progress for 5 seconds, skip
-      if (now - state.meleeStuckAt > 5000) {
-        skipTarget(target, "melee stuck (no progress)", now, 5000);
+      if (now - state.meleeStuckAt > 4000) {
+        skipTarget(target, "melee stuck (no progress)", now, 3000);
         return false;
       }
     }
@@ -3264,20 +3293,25 @@ function triggerRune(now = Date.now()) {
     finally { scheduleNextTick(); }
   }
 
-  function start(overrides = {}) {
-    Object.assign(config, overrides, { enabled: true });
-    persistConfig();
-    if (state.running) { bot.log("auto attack already running"); return false; }
-    state.running = true;
-    bot.log("auto attack started", { ...config });
-    tick();
-    return true;
+function start(overrides = {}) {
+  Object.assign(config, overrides, { enabled: true });
+  persistConfig();
+  if (state.running) { bot.log("auto attack already running"); return false; }
+  state.running = true;
+  // Apply chase mode if enabled
+  if (config.useClientChase) {
+    setClientChaseMode(2);
   }
+  bot.log("auto attack started", { ...config });
+  tick();
+  return true;
+}
 
   function stop(options = {}) {
     const shouldPersist = options.persistEnabled !== false;
     state.running = false;
     if (state.timerId != null) { window.clearTimeout(state.timerId); state.timerId = null; }
+	  setClientChaseMode(0);
     if (shouldPersist) { config.enabled = false; persistConfig(); }
 	  if (config.useClientChase) {
 		try {
@@ -8690,13 +8724,22 @@ function refreshPinkSkullStatus() {
 	
 	
 	
-	const clientChaseToggle = panel.querySelector("#minibia-bot-auto-attack-client-chase");
-	if (clientChaseToggle) {
-	  clientChaseToggle.checked = bot.attack?.config?.useClientChase || false;
-	  clientChaseToggle.addEventListener("change", function() {
-		bot.attack.updateConfig({ useClientChase: this.checked });
-	  });
-	}
+const clientChaseToggle = panel.querySelector("#minibia-bot-auto-attack-client-chase");
+if (clientChaseToggle) {
+  clientChaseToggle.checked = bot.attack?.config?.useClientChase || false;
+  clientChaseToggle.addEventListener("change", function() {
+    const enabled = this.checked;
+    // Update config
+    bot.attack.updateConfig({ useClientChase: enabled });
+    // Actually set the chase mode in the client
+    if (enabled) {
+      setClientChaseMode(2); // aggressive chase
+    } else {
+      setClientChaseMode(0); // stand
+    }
+    bot.log("Client chase toggled to", enabled ? "ON" : "OFF");
+  });
+}
 	
 	// ---- Light Hack ----
 	const lightHackToggle = panel.querySelector("#minibia-bot-light-hack-enabled");
