@@ -2093,7 +2093,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
       kiteMode: false,
       idealDistance: 3,
       useClientChase: true,
-	  
+	  kiteStuckCount: 0,         
+	  unreachableStart: 0,      
     },
     storedConfig
   );
@@ -2312,6 +2313,47 @@ function kiteAwayFallback(targetPos, playerPos, dist) {
   return false;
 }
 
+// ---- REACHABILITY CACHE ----
+const reachCache = new Map();
+function isTargetReachable(target) {
+  if (!target) return false;
+  const key = target.id;
+  const now = Date.now();
+  if (reachCache.has(key) && reachCache.get(key).expires > now) {
+    return reachCache.get(key).reachable;
+  }
+  const playerPos = normalizePosition(bot.getPlayerPosition());
+  const targetPos = normalizePosition(target.getPosition?.() || target.__position);
+  if (!playerPos || !targetPos || playerPos.z !== targetPos.z) return false;
+  // Quick distance check – if too far, don't bother
+  const dist = getTileDistance(playerPos, targetPos);
+  const maxDist = Math.max(1, Number(config.maxTargetDistance) || 5);
+  if (dist > maxDist + 2) {
+    reachCache.set(key, { reachable: false, expires: now + 5000 });
+    return false;
+  }
+  let reachable = false;
+  try {
+    const from = new Position(playerPos.x, playerPos.y, playerPos.z);
+    const to = new Position(targetPos.x, targetPos.y, targetPos.z);
+    const pf = window.gameClient?.world?.pathfinder;
+    if (pf && typeof pf.search === 'function') {
+      const startTile = pf.getTileFromWorldPosition(from);
+      const endTile = pf.getTileFromWorldPosition(to);
+      if (startTile && endTile) {
+        const path = pf.search(startTile, endTile);
+        reachable = Array.isArray(path) && path.length > 0;
+      }
+    }
+  } catch (e) {
+    // On error, assume reachable to avoid false skips
+    reachable = true;
+  }
+  // Cache for 3 seconds (adjustable)
+  reachCache.set(key, { reachable, expires: now + 3000 });
+  return reachable;
+}
+
 
 // ---- Kite: move backward along cave route, or away from target ----
 function syncKite(now) {
@@ -2332,17 +2374,16 @@ function syncKite(now) {
   const loopMode = bot.cave?.getLoopMode?.() ?? false;
 
   if (!caveStatus?.running || !caveStatus?.pausedForCombat || route.length === 0) {
+    // Fallback: move away from target (this already uses ignoreCreatures=false in its own checks)
     return kiteAwayFallback(targetPos, playerPos, dist);
   }
 
   // ---- INITIAL RETREAT WAYPOINT ----
   if (state.kiteWaypointIndex === null) {
     let startIdx = caveStatus.currentIndex - 1;
-    // If at the first waypoint and loop mode is on, wrap to the last waypoint
     if (loopMode && caveStatus.currentIndex === 0) {
       startIdx = route.length - 1;
     }
-    // Clamp to valid range
     if (startIdx < 0) startIdx = 0;
     if (startIdx >= route.length) startIdx = route.length - 1;
     state.kiteWaypointIndex = startIdx;
@@ -2355,7 +2396,6 @@ function syncKite(now) {
   while (idx >= 0 && route[idx].z !== playerPos.z) {
     idx--;
   }
-  // If no same‑floor waypoint found, fallback to away movement
   if (idx < 0) {
     state.kiteWaypointIndex = null;
     return kiteAwayFallback(targetPos, playerPos, dist);
@@ -2373,15 +2413,13 @@ function syncKite(now) {
   // ---- REACHED RETREAT WAYPOINT – MOVE TO NEXT (BACKWARDS) ----
   if (distToWp <= tolerance) {
     let nextIdx = idx - 1;
-    // If loopMode is on and we go below 0, wrap to the last waypoint
     if (loopMode && nextIdx < 0) {
       nextIdx = route.length - 1;
     }
-    // Skip floors that don't match
     while (nextIdx >= 0 && route[nextIdx].z !== playerPos.z) {
       nextIdx--;
       if (loopMode && nextIdx < 0) {
-        nextIdx = route.length - 1; // wrap again if needed (avoid infinite loop)
+        nextIdx = route.length - 1;
       }
     }
     if (nextIdx >= 0) {
@@ -2389,48 +2427,111 @@ function syncKite(now) {
       bot.cave.setCurrentIndex(nextIdx);
       targetWp = route[nextIdx];
     } else {
-      // No valid retreat waypoint – fallback
       state.kiteWaypointIndex = null;
       return kiteAwayFallback(targetPos, playerPos, dist);
     }
   }
 
-  // ---- MOVE TOWARD THE RETREAT WAYPOINT ----
+  // ---- MOVE TOWARD THE RETREAT WAYPOINT (CARDINAL-FIRST) ----
   const dx = targetWp.x - playerPos.x;
   const dy = targetWp.y - playerPos.y;
-  let stepX = dx > 0 ? 1 : (dx < 0 ? -1 : 0);
-  let stepY = dy > 0 ? 1 : (dy < 0 ? -1 : 0);
+  const stepX = dx > 0 ? 1 : (dx < 0 ? -1 : 0);
+  const stepY = dy > 0 ? 1 : (dy < 0 ? -1 : 0);
 
-  const attempts = [
+  // Helper: validate a candidate tile for kiting – NOW respects creatures!
+  function isValidKiteTile(nx, ny) {
+    if (bot.blacklist?.isBlacklisted(nx, ny, playerPos.z)) return false;
+    const candidatePos = { x: nx, y: ny, z: playerPos.z };
+    if (!isSafeTileForKite(candidatePos)) return false;
+    // CRITICAL: ignoreCreatures = false => creatures block movement
+    return isTileWalkable(nx, ny, playerPos.z, false);
+  }
+
+  let moved = false;
+
+  // ----- 1. TRY CARDINAL DIRECTIONS (toward the waypoint) -----
+  const cardinalAttempts = [
     { dx: stepX, dy: 0 },
-    { dx: 0, dy: stepY },
-    { dx: stepX, dy: stepY },
-    { dx: -stepX, dy: 0 },
-    { dx: 0, dy: -stepY },
+    { dx: 0, dy: stepY }
   ];
-
-  for (const a of attempts) {
+  for (const a of cardinalAttempts) {
     if (a.dx === 0 && a.dy === 0) continue;
     const nx = playerPos.x + a.dx;
     const ny = playerPos.y + a.dy;
-    const candidatePos = { x: nx, y: ny, z: playerPos.z };
-
-    // Blacklist check
-    if (bot.blacklist?.isBlacklisted(nx, ny, playerPos.z)) continue;
-    // Safety: avoid floor-change tiles
-    if (!isSafeTileForKite(candidatePos)) continue;
-    // Walkability (ignore creatures for kiting)
-    if (isTileWalkable(nx, ny, playerPos.z, true)) {
+    if (isValidKiteTile(nx, ny)) {
       const dir = getDirection(a.dx, a.dy);
       if (dir !== null && window.gameClient?.keyboard) {
         window.gameClient.keyboard.handleMoveKey(dir);
-        return true;
+        moved = true;
+        break;
       }
     }
   }
 
-  return false;
+  // ----- 2. IF BOTH CARDINALS FAIL, TRY DIAGONAL (last resort) -----
+  if (!moved && stepX !== 0 && stepY !== 0) {
+    const diagAttempts = [
+      { dx: stepX, dy: stepY },
+      { dx: stepX, dy: -stepY },
+      { dx: -stepX, dy: stepY },
+      { dx: -stepX, dy: -stepY }
+    ];
+    diagAttempts.sort((a, b) => {
+      const da = Math.abs(targetWp.x - (playerPos.x + a.dx)) + Math.abs(targetWp.y - (playerPos.y + a.dy));
+      const db = Math.abs(targetWp.x - (playerPos.x + b.dx)) + Math.abs(targetWp.y - (playerPos.y + b.dy));
+      return da - db;
+    });
+    for (const a of diagAttempts) {
+      const nx = playerPos.x + a.dx;
+      const ny = playerPos.y + a.dy;
+      if (isValidKiteTile(nx, ny)) {
+        const dir = getDirection(a.dx, a.dy);
+        if (dir !== null && window.gameClient?.keyboard) {
+          window.gameClient.keyboard.handleMoveKey(dir);
+          moved = true;
+          break;
+        }
+      }
+    }
+  }
+
+  // ----- 3. ABSOLUTE FALLBACK: try all 8 directions (extreme case) -----
+  if (!moved) {
+    const fallbackOffsets = [
+      [0, -1], [1, 0], [0, 1], [-1, 0],
+      [-1, -1], [1, -1], [-1, 1], [1, 1]
+    ];
+    for (const off of fallbackOffsets) {
+      const nx = playerPos.x + off[0];
+      const ny = playerPos.y + off[1];
+      if (isValidKiteTile(nx, ny)) {
+        const dir = getDirection(off[0], off[1]);
+        if (dir !== null && window.gameClient?.keyboard) {
+          window.gameClient.keyboard.handleMoveKey(dir);
+          moved = true;
+          break;
+        }
+      }
+    }
+  }
+
+  // ---- STUCK DETECTION: skip blocked waypoint after too many failures ----
+  if (!moved) {
+    if (!state.kiteStuckCount) state.kiteStuckCount = 0;
+    state.kiteStuckCount++;
+    if (state.kiteStuckCount > 5) {
+      bot.log("Kite: retreat waypoint blocked, skipping to previous waypoint");
+      state.kiteWaypointIndex = (state.kiteWaypointIndex - 1 + route.length) % route.length;
+      state.kiteStuckCount = 0;
+    }
+  } else {
+    state.kiteStuckCount = 0;
+  }
+
+  return moved;
 }
+
+
 function tryAttack() {
   if (!config.enabled) return false;
   const now = Date.now();
@@ -2454,6 +2555,7 @@ function tryAttack() {
     state.lastProgressAt = 0;
     state.lastDistance = undefined;
     state.lastTargetHealth = null;
+    state.unreachableStart = 0;
     return triggerAttack(now);
   }
 
@@ -2461,6 +2563,7 @@ function tryAttack() {
   const targetPos = normalizePosition(current.getPosition?.() || current.__position);
   if (!playerPos || !targetPos) {
     skipTarget(current, "missing position", now, 3000);
+    state.unreachableStart = 0;
     return false;
   }
 
@@ -2470,7 +2573,22 @@ function tryAttack() {
   // Skip only if clearly out of range (maxDist + 2)
   if (dist > maxDist + 2) {
     skipTarget(current, "target too far (distance check)", now, 3000);
+    state.unreachableStart = 0;
     return false;
+  }
+
+  // ---- REACHABILITY CHECK (new) ----
+  if (dist <= maxDist + 2 && !isTargetReachable(current)) {
+    if (!state.unreachableStart) state.unreachableStart = now;
+    if (now - state.unreachableStart > 3000) {
+      skipTarget(current, "unreachable (wall)", now, 5000);
+      state.unreachableStart = 0;
+      return false;
+    }
+    // Still unreachable but not timed out – don't attack, but keep target
+    return false;
+  } else {
+    state.unreachableStart = 0;
   }
 
   // 4) Stuck detection – but only if there is another monster to switch to
@@ -2506,35 +2624,32 @@ function tryAttack() {
 
     // Only skip if we've been stuck for >4s AND there is another visible monster
     if (timeStuck > 4000) {
-      // Count visible monsters (not skipped) to see if we have alternatives
       const candidates = getMonsterCandidates(now);
-      // If there is another monster (at least 1) AND it's not the current one, we can switch
       const hasAlternative = candidates.some(m => m.id !== current.id);
       if (hasAlternative) {
         skipTarget(current, "no progress for 4s, alternative exists", now, 3000);
+        state.unreachableStart = 0;
         return false;
       } else {
-        // No alternative – keep trying this one (don't skip)
-        // Reset the progress timer so we don't keep logging
         state.lastProgressAt = now;
         bot.log("No alternative target – sticking to", current.name);
       }
     }
   }
 
-  // 5) Optional: switch to a better target (only if new target is preferred, or at least 3 tiles closer)
+  // 5) Optional: switch to a better target
   const candidates = getMonsterCandidates(now);
   if (candidates.length) {
     const best = candidates[0];
-    const currentInfo = isTargetValidAndOnScreen(current, { returnDetails: true, maxDx: 7, maxDy: 5 });
-    const bestInfo = isTargetValidAndOnScreen(best, { returnDetails: true, maxDx: 7, maxDy: 5 });
+    const currentInfo = isTargetValidAndOnScreen(current, { returnDetails: true, maxDx: 7, maxDy: 5, skipReachability: true });
+    const bestInfo = isTargetValidAndOnScreen(best, { returnDetails: true, maxDx: 7, maxDy: 5, skipReachability: true });
     if (bestInfo.valid && currentInfo.valid) {
       const currentDist = currentInfo.distance;
       const bestDist = bestInfo.distance;
-      // Switch if: best is preferred and current is not, OR best is at least 3 tiles closer
       if ((bestInfo.preferred && !currentInfo.preferred) ||
           (bestDist !== undefined && currentDist !== undefined && (bestDist + 3) < currentDist)) {
         skipTarget(current, "switching to better target", now, 500);
+        state.unreachableStart = 0;
         return false;
       }
     }
@@ -2622,6 +2737,8 @@ function getCaveRetreatDirection() {
     if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return null;
     return { x: Math.trunc(x), y: Math.trunc(y), z: Math.trunc(z) };
   }
+  
+
 
   function getPositionKey(position) {
     return position ? `${position.x},${position.y},${position.z}` : null;
@@ -2796,6 +2913,11 @@ function clearEngagedTarget() {
     if (!visible) {
       return result(false, { reason: `off screen dx=${dx} dy=${dy}`, dx, dy, distance });
     }
+	// ---- REACHABILITY CHECK ----
+	if (!options.skipReachability && !isTargetReachable(target)) {
+	  return result(false, { reason: "not reachable", dx, dy, distance });
+	}
+	
     const preferred = isPreferredCreature(target);
     const score = getCreaturePriorityScore(target);
     return result(true, { reason: preferred ? "valid preferred" : "valid normal", dx, dy, distance, preferred, score });
@@ -6305,14 +6427,35 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
     return false;
   }
 
+  // ---- scheduleNextTick MUST be defined before tick ----
+  function scheduleNextTick() {
+    if (!state.running) return;
+    state.timerId = window.setTimeout(tick, config.tickMs);
+  }
+
   // ---- Loop ----
   function tick() {
     if (!state.running) return;
     try {
       if (config.equipWeapon && config.weaponId) {
-        const now = Date.now();
-        if (now - state.lastEquipAt > (config.equipCooldownMs || 5000)) {
-          equipWeapon(config.weaponId);
+        const eq = window.gameClient?.player?.equipment;
+        let leftHandCount = 0;
+        let leftHandHasWeapon = false;
+
+        if (eq) {
+          const leftItem = eq.getSlotItem(LEFT_HAND_SLOT);
+          if (leftItem && leftItem.id === config.weaponId) {
+            leftHandCount = leftItem.count || 1;
+            leftHandHasWeapon = true;
+          }
+        }
+
+        // Equip only if left hand is empty OR count is below threshold
+        if (!leftHandHasWeapon || leftHandCount <= config.ammoThreshold) {
+          const now = Date.now();
+          if (now - state.lastEquipAt > (config.equipCooldownMs || 5000)) {
+            equipWeapon(config.weaponId);
+          }
         }
       }
       tryCraft();
@@ -6321,11 +6464,6 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
     } finally {
       scheduleNextTick();
     }
-  }
-
-  function scheduleNextTick() {
-    if (!state.running) return;
-    state.timerId = window.setTimeout(tick, config.tickMs);
   }
 
   // ---- Public API ----
@@ -9921,96 +10059,101 @@ if (clientChaseToggle) {
 	}
 	
 	
-	// ---- Paladin listeners ----
-	const paladinToggle = panel.querySelector("#minibia-bot-paladin-enabled");
-	const paladinAmmoThreshold = panel.querySelector("#minibia-bot-paladin-ammo-threshold");
-	const paladinCraftMana = panel.querySelector("#minibia-bot-paladin-craft-mana");
-	const paladinCraftSpell = panel.querySelector("#minibia-bot-paladin-craft-spell");
-	const paladinHighManaSpell = panel.querySelector("#minibia-bot-paladin-high-mana-spell");
-	const paladinHighManaThreshold = panel.querySelector("#minibia-bot-paladin-high-mana-threshold");
-	const paladinEquipCooldown = panel.querySelector("#minibia-bot-paladin-equip-cooldown");
-	const paladinEquipWeapon = panel.querySelector("#minibia-bot-paladin-equip-weapon");
-	const paladinWeaponId = panel.querySelector("#minibia-bot-paladin-weapon-id");
-	const paladinCaptureBtn = panel.querySelector("#minibia-bot-paladin-capture-weapon");
+  // ---- Paladin listeners ----
+  const paladinToggle = panel.querySelector("#minibia-bot-paladin-enabled");
+  const paladinAmmoThreshold = panel.querySelector("#minibia-bot-paladin-ammo-threshold");
+  const paladinCraftMana = panel.querySelector("#minibia-bot-paladin-craft-mana");
+  const paladinCraftSpell = panel.querySelector("#minibia-bot-paladin-craft-spell");
+  const paladinHighManaSpell = panel.querySelector("#minibia-bot-paladin-high-mana-spell");
+  const paladinHighManaThreshold = panel.querySelector("#minibia-bot-paladin-high-mana-threshold");
+  const paladinEquipCooldown = panel.querySelector("#minibia-bot-paladin-equip-cooldown");
+  const paladinEquipWeapon = panel.querySelector("#minibia-bot-paladin-equip-weapon");
+  const paladinWeaponId = panel.querySelector("#minibia-bot-paladin-weapon-id");
+  const paladinCaptureBtn = panel.querySelector("#minibia-bot-paladin-capture-weapon");
+  const equipNowBtn = panel.querySelector("#minibia-bot-paladin-equip-now");
 
-	function getPaladinConfigFromUI() {
-	  return {
-		ammoThreshold: parseInt(document.getElementById("minibia-bot-paladin-ammo-threshold")?.value, 10) || 20,
-		craftManaCost: parseInt(document.getElementById("minibia-bot-paladin-craft-mana")?.value, 10) || 100,
-		craftSpellWords: document.getElementById("minibia-bot-paladin-craft-spell")?.value?.trim() || "",
-		highManaSpellWords: document.getElementById("minibia-bot-paladin-high-mana-spell")?.value?.trim() || "",
-		highManaThreshold: parseInt(document.getElementById("minibia-bot-paladin-high-mana-threshold")?.value, 10) || 98,
-		equipCooldownMs: parseInt(document.getElementById("minibia-bot-paladin-equip-cooldown")?.value, 10) || 5000,
-		equipWeapon: document.getElementById("minibia-bot-paladin-equip-weapon")?.checked || false,
-		weaponId: parseInt(document.getElementById("minibia-bot-paladin-weapon-id")?.value, 10) || null,
-	  };
-	}
+  function getPaladinConfigFromUI() {
+    return {
+      ammoThreshold: parseInt(document.getElementById("minibia-bot-paladin-ammo-threshold")?.value, 10) || 20,
+      craftManaCost: parseInt(document.getElementById("minibia-bot-paladin-craft-mana")?.value, 10) || 100,
+      craftSpellWords: document.getElementById("minibia-bot-paladin-craft-spell")?.value?.trim() || "",
+      highManaSpellWords: document.getElementById("minibia-bot-paladin-high-mana-spell")?.value?.trim() || "",
+      highManaThreshold: parseInt(document.getElementById("minibia-bot-paladin-high-mana-threshold")?.value, 10) || 98,
+      equipCooldownMs: parseInt(document.getElementById("minibia-bot-paladin-equip-cooldown")?.value, 10) || 5000,
+      equipWeapon: document.getElementById("minibia-bot-paladin-equip-weapon")?.checked || false,
+      weaponId: parseInt(document.getElementById("minibia-bot-paladin-weapon-id")?.value, 10) || null,
+    };
+  }
 
-	// Load initial values
-	if (paladinAmmoThreshold) paladinAmmoThreshold.value = bot.paladin?.config?.ammoThreshold ?? 20;
-	if (paladinCraftMana) paladinCraftMana.value = bot.paladin?.config?.craftManaCost ?? 100;
-	if (paladinCraftSpell) paladinCraftSpell.value = bot.paladin?.config?.craftSpellWords || "";
-	if (paladinHighManaSpell) paladinHighManaSpell.value = bot.paladin?.config?.highManaSpellWords || "";
-	if (paladinHighManaThreshold) paladinHighManaThreshold.value = bot.paladin?.config?.highManaThreshold ?? 98;
-	if (paladinEquipCooldown) paladinEquipCooldown.value = bot.paladin?.config?.equipCooldownMs ?? 5000;
-	// ---- Paladin UI  ----
-	if (paladinEquipWeapon) {
-	  paladinEquipWeapon.checked = bot.paladin?.config?.equipWeapon || false;
-	  paladinEquipWeapon.addEventListener("change", function() {
-		const config = getPaladinConfigFromUI();
-		config.equipWeapon = this.checked;
-		bot.paladin.updateConfig(config);
-		// ✅ If the box is checked AND the module is running, equip immediately
-		if (this.checked && bot.paladin?.status?.().running) {
-		  bot.paladin.equipWeapon(bot.paladin.config.weaponId);
-		}
-	  });
-	}
-	if (paladinWeaponId) paladinWeaponId.value = bot.paladin?.config?.weaponId ?? "";
+  // Load initial values
+  if (paladinAmmoThreshold) paladinAmmoThreshold.value = bot.paladin?.config?.ammoThreshold ?? 20;
+  if (paladinCraftMana) paladinCraftMana.value = bot.paladin?.config?.craftManaCost ?? 100;
+  if (paladinCraftSpell) paladinCraftSpell.value = bot.paladin?.config?.craftSpellWords || "";
+  if (paladinHighManaSpell) paladinHighManaSpell.value = bot.paladin?.config?.highManaSpellWords || "";
+  if (paladinHighManaThreshold) paladinHighManaThreshold.value = bot.paladin?.config?.highManaThreshold ?? 98;
+  if (paladinEquipCooldown) paladinEquipCooldown.value = bot.paladin?.config?.equipCooldownMs ?? 5000;
 
-	if (paladinToggle) {
-	  paladinToggle.checked = !!bot.paladin?.status?.().running;
-	  paladinToggle.addEventListener("change", () => {
-		if (paladinToggle.checked) {
-		  const config = getPaladinConfigFromUI();
-		  bot.paladin.updateConfig(config);
-		  bot.paladin.start();
-		} else {
-		  bot.paladin.stop();
-		}
-		refreshPaladinStatus();
-	  });
-	}
+  // ---- Paladin UI ----
+  if (paladinEquipWeapon) {
+    paladinEquipWeapon.checked = bot.paladin?.config?.equipWeapon || false;
+    paladinEquipWeapon.addEventListener("change", function() {
+      const config = getPaladinConfigFromUI();
+      config.equipWeapon = this.checked;
+      bot.paladin.updateConfig(config);
+      // ❌ REMOVED: immediate equip – the tick loop handles it with threshold check
+    });
+  }
 
-	// Capture weapon ID from left hand
-	if (paladinCaptureBtn) {
-	  paladinCaptureBtn.addEventListener("click", () => {
-		bot.paladin.startCaptureWeapon();
-	  });
-	}
-	
-	// ---- Ammo threshold: update config on change ----
-	if (paladinAmmoThreshold) {
-	  paladinAmmoThreshold.addEventListener("change", function() {
-		const val = Math.max(0, parseInt(this.value, 10) || 0);
-		this.value = val;
-		bot.paladin.updateConfig({ ammoThreshold: val });
-	  });
-	}
+  if (paladinWeaponId) paladinWeaponId.value = bot.paladin?.config?.weaponId ?? "";
 
-	// ---- Equip Now button ----
-	const equipNowBtn = panel.querySelector("#minibia-bot-paladin-equip-now");
-	if (equipNowBtn) {
-	  equipNowBtn.addEventListener("click", function() {
-		const weaponId = bot.paladin?.config?.weaponId;
-		if (!weaponId) {
-		  bot.log("Paladin: No weapon ID set. Capture or enter one first.");
-		  return;
-		}
-		const success = bot.paladin.equipWeapon(weaponId);
-		bot.log(success ? "Paladin: Weapon equipped manually." : "Paladin: Could not equip weapon. Check containers/equipment.");
-	  });
-}
+  if (paladinToggle) {
+    paladinToggle.checked = !!bot.paladin?.status?.().running;
+    paladinToggle.addEventListener("change", () => {
+      if (paladinToggle.checked) {
+        const config = getPaladinConfigFromUI();
+        bot.paladin.updateConfig(config);
+        bot.paladin.start();
+      } else {
+        bot.paladin.stop();
+      }
+      refreshPaladinStatus();
+    });
+  }
+
+  // Capture weapon ID from left hand
+  if (paladinCaptureBtn) {
+    paladinCaptureBtn.addEventListener("click", () => {
+      bot.paladin.startCaptureWeapon();
+    });
+  }
+
+  // ---- Ammo threshold: update config on change ----
+  if (paladinAmmoThreshold) {
+    paladinAmmoThreshold.addEventListener("change", function() {
+      const val = Math.max(0, parseInt(this.value, 10) || 0);
+      this.value = val;
+      bot.paladin.updateConfig({ ammoThreshold: val });
+    });
+  }
+
+  // ---- Equip Now button (manual override, optionally threshold-aware) ----
+  if (equipNowBtn) {
+    equipNowBtn.addEventListener("click", function() {
+      const weaponId = bot.paladin?.config?.weaponId;
+      if (!weaponId) {
+        bot.log("Paladin: No weapon ID set. Capture or enter one first.");
+        return;
+      }
+      // Optional: respect threshold on manual click? Uncomment the next lines if you want.
+      // const ammo = bot.paladin.getAmmoCount();
+      // if (ammo > bot.paladin.config.ammoThreshold) {
+      //   bot.log(`Paladin: Ammo count ${ammo} is above threshold ${bot.paladin.config.ammoThreshold}, not equipping.`);
+      //   return;
+      // }
+      const success = bot.paladin.equipWeapon(weaponId);
+      bot.log(success ? "Paladin: Weapon equipped manually." : "Paladin: Could not equip weapon. Check containers/equipment.");
+    });
+  }
 
 	// ---- Looter listeners ----
 	const looterToggle = panel.querySelector("#minibia-bot-looter-enabled");
