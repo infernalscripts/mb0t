@@ -7107,6 +7107,344 @@ window.__minibiaBotBundle.installAntiAfkModule = function installAntiAfkModule(b
   bot.antiAfk = { start, stop, status, updateConfig, config, performTurn };
 };
 
+/**
+ * ==================================================================================
+ * FISHER MODULE – Automatically fishes on a selected tile
+ * ==================================================================================
+ */
+window.__minibiaBotBundle.installFisherModule = function installFisherModule(bot) {
+  const configStorageKey = "minibiaBot.fisher.config";
+  const FISHING_ROD_ID = 3483;
+  const FISH_ITEM_ID = 3578;
+
+  const state = {
+    running: false,
+    timerId: null,
+    captureMode: false,
+    lastFishAt: 0,
+  };
+
+  const config = Object.assign(
+    {
+      enabled: false,
+      tile: null,          // {x, y, z}
+      delayMs: 2000,
+      fishThreshold: 10,
+    },
+    bot.storage.get(configStorageKey, {})
+  );
+
+  function persistConfig() {
+    bot.storage.set(configStorageKey, { ...config });
+  }
+
+  // ---- Helpers ----
+  function getContainerById(containerId) {
+    const containers = window.gameClient?.player?.__openedContainers;
+    if (!containers) return null;
+    const arr = Array.isArray(containers) ? containers : Array.from(containers);
+    return arr.find(c => c.__containerId === containerId) || null;
+  }
+
+  function getContainersArray() {
+    const containers = window.gameClient?.player?.__openedContainers;
+    if (!containers) return [];
+    if (Array.isArray(containers)) return containers;
+    if (containers instanceof Set) return Array.from(containers);
+    if (containers instanceof Map) return Array.from(containers.values());
+    if (typeof containers === 'object') return Object.values(containers);
+    return [];
+  }
+
+  function getEquipment() {
+    return window.gameClient?.player?.equipment || null;
+  }
+
+  function getItemDefinition(item) {
+    if (!item) return null;
+    return window.gameClient?.itemDefinitionsBySid?.[item.sid] ||
+           window.gameClient?.itemDefinitions?.[item.id] || null;
+  }
+
+  function getItemName(item) {
+    const def = getItemDefinition(item);
+    return def?.properties?.name || item?.name || "";
+  }
+
+  // ---- Find fishing rod in equipment or containers ----
+  function findFishingRod() {
+    const eq = getEquipment();
+    if (eq) {
+      for (let i = 0; i < eq.slots.length; i++) {
+        const item = eq.getSlotItem(i);
+        if (item && item.id === FISHING_ROD_ID) {
+          return { container: eq, slotIndex: i, item };
+        }
+      }
+    }
+    for (const container of getContainersArray()) {
+      if (!container || typeof container.size !== 'number') continue;
+      for (let i = 0; i < container.size; i++) {
+        const item = container.getSlotItem(i);
+        if (item && item.id === FISHING_ROD_ID) {
+          return { container, slotIndex: i, item };
+        }
+      }
+    }
+    return null;
+  }
+
+  // ---- Count fish (item 3578) in all containers and equipment ----
+  function getFishCount() {
+    let count = 0;
+    const eq = getEquipment();
+    if (eq) {
+      for (let i = 0; i < eq.slots.length; i++) {
+        const item = eq.getSlotItem(i);
+        if (item && item.id === FISH_ITEM_ID) {
+          count += item.count || 1;
+        }
+      }
+    }
+    for (const container of getContainersArray()) {
+      if (!container || typeof container.size !== 'number') continue;
+      for (let i = 0; i < container.size; i++) {
+        const item = container.getSlotItem(i);
+        if (item && item.id === FISH_ITEM_ID) {
+          count += item.count || 1;
+        }
+      }
+    }
+    return count;
+  }
+
+  // ---- Use fishing rod on the selected tile ----
+  function useFishingRod() {
+    const rod = findFishingRod();
+    if (!rod) {
+      bot.log("Fisher: No fishing rod found (ID 3483)");
+      return false;
+    }
+
+    const tile = config.tile;
+    if (!tile || typeof tile.x !== 'number' || typeof tile.y !== 'number' || typeof tile.z !== 'number') {
+      bot.log("Fisher: No tile selected");
+      return false;
+    }
+
+    // Get the tile object at the position
+    const pos = new Position(tile.x, tile.y, tile.z);
+    const worldTile = window.gameClient?.world?.getTileFromWorldPosition?.(pos);
+    if (!worldTile) {
+      bot.log("Fisher: Tile not loaded or invalid");
+      return false;
+    }
+
+    // Use rod on tile
+    try {
+      // Method 1: use mouse.__handleItemUseWith if available
+      if (window.gameClient?.mouse?.__handleItemUseWith) {
+        const source = { which: rod.container, index: rod.slotIndex };
+        const target = { which: worldTile, index: 0xFF }; // 0xFF means use on tile
+        window.gameClient.mouse.__handleItemUseWith(source, target);
+        return true;
+      }
+
+      // Method 2: send packet directly
+      if (window.gameClient?.send && typeof ThingUseWithPacket === 'function') {
+        const source = { which: rod.container, index: rod.slotIndex };
+        const target = { position: pos };
+        const packet = new ThingUseWithPacket(source, target);
+        window.gameClient.send(packet);
+        return true;
+      }
+
+      bot.log("Fisher: Cannot use item – no method available");
+      return false;
+    } catch (e) {
+      bot.log("Fisher: Error using rod", e);
+      return false;
+    }
+  }
+
+  // ---- Fisher tick ----
+  function tick() {
+    if (!state.running || !config.enabled) return;
+
+    const now = Date.now();
+    if (now - state.lastFishAt < config.delayMs) {
+      scheduleNextTick();
+      return;
+    }
+
+    const fishCount = getFishCount();
+    if (fishCount >= config.fishThreshold) {
+      scheduleNextTick();
+      return;
+    }
+
+    // Attempt to fish
+    const success = useFishingRod();
+    if (success) {
+      state.lastFishAt = now;
+    }
+
+    scheduleNextTick();
+  }
+
+  function scheduleNextTick() {
+    if (!state.running) return;
+    state.timerId = setTimeout(tick, 500); // check every 500ms
+  }
+
+  // ---- Public API ----
+  function start(overrides = {}) {
+    Object.assign(config, overrides, { enabled: true });
+    persistConfig();
+    if (state.running) {
+      bot.log("Fisher already running");
+      return false;
+    }
+    if (!config.tile) {
+      bot.log("Fisher: No tile selected – cannot start");
+      return false;
+    }
+    if (!findFishingRod()) {
+      bot.log("Fisher: No fishing rod found – cannot start");
+      return false;
+    }
+    state.running = true;
+    state.lastFishAt = 0;
+    bot.log("Fisher started", { tile: config.tile, delayMs: config.delayMs, threshold: config.fishThreshold });
+    tick();
+    return true;
+  }
+
+  function stop(options = {}) {
+    const shouldPersist = options.persistEnabled !== false;
+    state.running = false;
+    if (state.timerId) {
+      clearTimeout(state.timerId);
+      state.timerId = null;
+    }
+    if (shouldPersist) {
+      config.enabled = false;
+      persistConfig();
+    }
+    bot.log("Fisher stopped");
+    return true;
+  }
+
+  function status() {
+    return {
+      running: state.running,
+      config: { ...config },
+      fishCount: getFishCount(),
+      hasRod: !!findFishingRod(),
+    };
+  }
+
+  function updateConfig(next = {}) {
+    if (next.tile !== undefined) {
+      // Ensure tile has x, y, z
+      const t = next.tile;
+      if (t && typeof t.x === 'number' && typeof t.y === 'number' && typeof t.z === 'number') {
+        config.tile = { x: t.x, y: t.y, z: t.z };
+      } else {
+        config.tile = null;
+      }
+    }
+    if (next.delayMs !== undefined) {
+      config.delayMs = Math.max(500, Number(next.delayMs) || 2000);
+    }
+    if (next.fishThreshold !== undefined) {
+      config.fishThreshold = Math.max(1, Number(next.fishThreshold) || 10);
+    }
+    persistConfig();
+    return { ...config };
+  }
+
+  // ---- Tile capture ----
+function startTileCapture() {
+  if (state.captureMode) return;
+  state.captureMode = true;
+  bot.log("Fisher: Click on a tile in the game world to select it");
+
+  const handler = (event) => {
+    // Only handle clicks on the screen canvas
+    if (event.target.id !== "screen") {
+      bot.log("Fisher: Please click on the game screen, not the UI.");
+      return;
+    }
+
+    let tilePos = null;
+
+    // Method 1: Use the game's own mouse.getWorldObject (most reliable)
+    try {
+      const worldObject = gameClient.mouse.getWorldObject(event);
+      if (worldObject && worldObject.which && worldObject.which.constructor.name === "Tile") {
+        tilePos = worldObject.which.getPosition();
+        bot.log("Fisher: Got tile via gameClient.mouse.getWorldObject");
+      }
+    } catch (e) {}
+
+    // Fallback: renderer.screen.getWorldCoordinates
+    if (!tilePos) {
+      try {
+        const worldPos = gameClient.renderer.screen.getWorldCoordinates(event);
+        if (worldPos && worldPos.__position) {
+          tilePos = worldPos.__position;
+          bot.log("Fisher: Got tile via renderer.screen.getWorldCoordinates");
+        }
+      } catch (e) {}
+    }
+
+    if (tilePos) {
+      config.tile = { x: tilePos.x, y: tilePos.y, z: tilePos.z };
+      persistConfig();
+      bot.log("Fisher: Tile selected", config.tile);
+      updateFisherUI(tilePos);
+      state.captureMode = false;
+      document.removeEventListener("click", handler, true);
+    } else {
+      bot.log("Fisher: Could not determine tile. Try again or enter coordinates manually.");
+    }
+  };
+
+  document.addEventListener("click", handler, true);
+}
+
+// Helper to update the UI elements
+function updateFisherUI(tilePos) {
+  const tileDisplay = document.getElementById("minibia-bot-fisher-tile-display");
+  if (tileDisplay) tileDisplay.textContent = `${tilePos.x}, ${tilePos.y}, ${tilePos.z}`;
+  const xInput = document.getElementById("minibia-bot-fisher-tile-x");
+  const yInput = document.getElementById("minibia-bot-fisher-tile-y");
+  const zInput = document.getElementById("minibia-bot-fisher-tile-z");
+  if (xInput) xInput.value = tilePos.x;
+  if (yInput) yInput.value = tilePos.y;
+  if (zInput) zInput.value = tilePos.z;
+}
+
+  // Load saved config and auto-start if enabled
+  if (config.enabled) {
+    start();
+  }
+
+  // Public API
+  bot.fisher = {
+    start,
+    stop,
+    status,
+    updateConfig,
+    startTileCapture,
+    getTile: () => config.tile ? { ...config.tile } : null,
+    getFishCount,
+    findFishingRod,
+    config,
+  };
+};
+
 
 /**
  * ==================================================================================
@@ -7976,81 +8314,626 @@ function refreshPinkSkullStatus() {
     const style = document.createElement("style");
     style.id = "minibia-bot-style";
     style.textContent = `
+      /* ── Base Panel ── */
       #minibia-bot-panel {
-        position: fixed; z-index: 999999; top: 16px; right: 16px;
-        width: 500px; max-width: calc(100vw - 32px); padding: 8px;
-        border: 1px solid rgba(224,200,148,0.45); border-radius: 10px;
-        background: rgba(18,13,8,0.96); box-shadow: 0 8px 24px rgba(0,0,0,0.45);
-        color: #f8e6b8; font: 12px/1.35 Verdana, sans-serif; user-select: none;
+        position: fixed;
+        z-index: 999999;
+        top: 16px;
+        right: 16px;
+        width: 560px;
+        max-width: calc(100vw - 32px);
+        max-height: calc(100vh - 32px);
+        border: 1px solid #000;
+        border-radius: 0;
+        box-shadow: 0px 0px 10px 0px #000;
+        background-image: url("/png/bg.png");
+        background-color: #1a1612;
+        color: #dcdcdc;
+        font: 12px/1.35 Verdana, "Sans-Serif", sans-serif;
+        user-select: none;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
       }
-      #minibia-bot-panel .mb-run-indicator { cursor: pointer; transition: background 0.15s, border-color 0.15s; }
-      #minibia-bot-panel .mb-run-indicator:hover { background: rgba(255,255,255,0.08); border-color: rgba(224,200,148,0.6); }
-      #minibia-bot-panel[data-collapsed="true"] { width: 240px; }
-      #minibia-bot-panel .mb-titlebar { display: grid; grid-template-columns: auto minmax(0,1fr) auto; align-items: center; gap: 8px; margin: 0 0 8px; }
-      #minibia-bot-panel[data-collapsed="true"] .mb-titlebar { margin-bottom: 0; }
-      #minibia-bot-panel .mb-title-status { display: flex; align-items: center; justify-content: flex-end; gap: 6px; min-width: 0; }
-      #minibia-bot-panel .mb-run-indicator { display: inline-flex; align-items: center; gap: 4px; padding: 2px 6px; border: 1px solid rgba(224,200,148,0.22); border-radius: 999px; background: rgba(8,7,6,0.55); color: #b7a67d; font-size: 10px; line-height: 1.2; white-space: nowrap; }
-      #minibia-bot-panel .mb-run-dot { width: 7px; height: 7px; border-radius: 50%; background: #5b5547; box-shadow: 0 0 0 1px rgba(0,0,0,0.45); }
-      #minibia-bot-panel .mb-run-indicator[data-running="true"] { color: #d7ffd7; border-color: rgba(90,220,120,0.42); background: rgba(20,70,28,0.35); }
-      #minibia-bot-panel .mb-run-indicator[data-running="true"] .mb-run-dot { background: #39e86f; box-shadow: 0 0 0 1px rgba(0,0,0,0.45), 0 0 7px rgba(57,232,111,0.8); }
-      #minibia-bot-panel .mb-title-actions { display: flex; gap: 6px; align-items: center; }
-      #minibia-bot-panel .mb-title { margin: 0; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; cursor: move; color: #ffe7ad; }
-      #minibia-bot-panel .mb-icon-button { width: 24px; min-width: 24px; padding: 2px 0; border-radius: 6px; font-weight: 700; line-height: 1; }
-      #minibia-bot-panel .mb-body { display: grid; grid-template-columns: 112px minmax(0,1fr); gap: 10px; align-items: start; }
-      #minibia-bot-panel .mb-body[hidden] { display: none !important; }
-      #minibia-bot-panel .mb-tab-menu { display: grid; gap: 6px; }
-      #minibia-bot-panel .mb-tab-button { width: 100%; padding: 8px 9px; border-radius: 7px; text-align: left; font-size: 11px; line-height: 1.15; background: rgba(255,244,212,0.07); }
-      #minibia-bot-panel .mb-tab-button[data-active="true"] { background: linear-gradient(180deg,#8a7044,#554329); border-color: rgba(224,200,148,0.75); color: #fff3cf; }
-      #minibia-bot-panel .mb-tab-content { min-width: 0; max-height: min(72vh,560px); overflow-y: auto; padding-right: 4px; }
-      #minibia-bot-panel .mb-tab-panel { display: none; }
-      #minibia-bot-panel .mb-tab-panel[data-active="true"] { display: grid; gap: 10px; }
-      #minibia-bot-panel .mb-section { padding: 12px; border: 1px solid rgba(224,200,148,0.18); border-radius: 8px; background: rgba(8,7,6,0.86); }
-      #minibia-bot-panel .mb-label { margin: 0 0 10px; color: #ffe5a8; font-weight: 700; font-size: 13px; }
-      #minibia-bot-panel .mb-stack { display: grid; gap: 10px; }
-      #minibia-bot-panel .mb-form-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 10px; }
-      #minibia-bot-panel .mb-button-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 8px; }
-      #minibia-bot-panel .mb-utility-row { display: grid; grid-template-columns: minmax(0,1fr) 86px; gap: 10px; align-items: end; }
-      #minibia-bot-panel .mb-field { display: grid; gap: 4px; min-width: 0; }
-      #minibia-bot-panel .mb-mini-field { width: 86px; }
-      #minibia-bot-panel .mb-field-label { color: #e9d39b; font-size: 11px; line-height: 1.2; }
-      #minibia-bot-panel input, #minibia-bot-panel textarea, #minibia-bot-panel select {
-        width: 100%; box-sizing: border-box; padding: 8px 10px;
-        border: 1px solid rgba(224,200,148,0.48); border-radius: 8px;
-        background: #080706; color: #fff2c7; font: inherit;
-        box-shadow: inset 0 1px 2px rgba(0,0,0,0.65); caret-color: #fff2c7;
+
+      /* ── Header ── */
+      #minibia-bot-panel .mb-titlebar {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 4px 8px;
+        background-image: url("/png/bg2.png");
+        background-color: #2a241e;
+        border-bottom: 1px solid #000;
+        flex-shrink: 0;
+        cursor: grab;
+        min-height: 28px;
       }
-      #minibia-bot-panel input::placeholder, #minibia-bot-panel textarea::placeholder { color: rgba(255,226,176,0.48); }
-      #minibia-bot-panel input:focus, #minibia-bot-panel textarea:focus, #minibia-bot-panel select:focus {
-        outline: none; border-color: rgba(255,220,140,0.9);
-        box-shadow: inset 0 1px 2px rgba(0,0,0,0.65), 0 0 0 2px rgba(255,200,90,0.18);
+
+      #minibia-bot-panel .mb-title {
+        margin: 0;
+        font-weight: bold;
+        font-size: 13px;
+        color: #ffcc00;
+        text-shadow: 0 0 2px #000, 0 0 2px #000;
+        letter-spacing: 1px;
+        flex: 0 0 auto;
       }
-      #minibia-bot-panel textarea { min-height: 90px; resize: vertical; }
-      #minibia-bot-panel .mb-toggle { display: flex; align-items: center; gap: 8px; color: #f3dfad; white-space: normal; }
-      #minibia-bot-panel .mb-toggle-main { margin-bottom: 2px; }
-      #minibia-bot-panel input[type="checkbox"] { width: 14px; height: 14px; margin: 0; accent-color: #18c99a; }
-      #minibia-bot-panel button { width: 100%; padding: 8px 10px; border: 1px solid rgba(224,200,148,0.35); border-radius: 8px; background: linear-gradient(180deg,#635133,#3f321f); color: #fff0ca; font: inherit; cursor: pointer; }
-      #minibia-bot-panel button:hover { background: linear-gradient(180deg,#755f3d,#4f4028); }
-      #minibia-bot-panel .mb-small-button { width: auto; padding: 6px 8px; border-radius: 6px; }
-      #minibia-bot-panel .mb-inline { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 8px; align-items: center; }
-      #minibia-bot-panel .mb-list { display: grid; gap: 6px; }
-      #minibia-bot-panel .mb-list-row { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 6px; align-items: center; color: #d3c49d; }
-      #minibia-bot-panel .mb-creature-row { padding: 6px 8px; border: 1px solid rgba(224,200,148,0.14); border-radius: 8px; background: rgba(255,244,212,0.04); }
-      #minibia-bot-panel .mb-creature-name { color: #f7eccf; word-break: break-word; }
-      #minibia-bot-panel .mb-floor-label { margin-top: 4px; color: #e2cf9c; font-size: 11px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; }
-      #minibia-bot-panel #minibia-bot-visible-creatures-list,
-      #minibia-bot-panel #minibia-bot-panic-trusted-list,
-      #minibia-bot-panel #minibia-bot-panic-gm-list { max-height: 150px; overflow-y: auto; padding-right: 2px; }
-      #minibia-bot-panel .mb-small-note, #minibia-bot-panel .mb-note { color: #cdbb8b; font-size: 11px; line-height: 1.35; }
-      #minibia-bot-panel .mb-collapsed-stop-button { background: linear-gradient(180deg,#7a2f2f,#4e1f1f); border-color: rgba(255,120,120,0.55); color: #ffd6d6; }
-      #minibia-bot-panel .mb-collapsed-stop-button:hover { background: linear-gradient(180deg,#963b3b,#642727); }
-      #minibia-bot-panel[data-collapsed="false"] .mb-collapsed-stop-button { display: none; }
-      @media (max-width:760px) {
-        #minibia-bot-panel { width: min(560px,calc(100vw - 32px)); }
-        #minibia-bot-panel .mb-body { grid-template-columns: 1fr; }
-        #minibia-bot-panel .mb-tab-menu { grid-template-columns: repeat(3,minmax(0,1fr)); }
-        #minibia-bot-panel .mb-tab-button { text-align: center; }
-        #minibia-bot-panel .mb-form-grid, #minibia-bot-panel .mb-button-grid, #minibia-bot-panel .mb-utility-row { grid-template-columns: 1fr; }
-        #minibia-bot-panel .mb-mini-field { width: 100%; }
+
+      #minibia-bot-panel .mb-title-status {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        flex: 1 1 auto;
+        justify-content: flex-end;
+        min-width: 0;
+      }
+
+      #minibia-bot-panel .mb-run-indicator {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        padding: 2px 8px;
+        border: 1px solid #444;
+        border-radius: 12px;
+        background: rgba(0, 0, 0, 0.5);
+        color: #999;
+        font-size: 10px;
+        cursor: pointer;
+        transition: border-color 0.15s, background 0.15s, color 0.15s;
+      }
+
+      #minibia-bot-panel .mb-run-indicator:hover {
+        border-color: #888;
+        background: rgba(255, 255, 255, 0.06);
+      }
+
+      #minibia-bot-panel .mb-run-dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: #555;
+        box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.6);
+        transition: background 0.2s, box-shadow 0.2s;
+      }
+
+      #minibia-bot-panel .mb-run-indicator[data-running="true"] {
+        color: #c8ffc8;
+        border-color: rgba(90, 220, 120, 0.5);
+        background: rgba(20, 70, 28, 0.3);
+      }
+
+      #minibia-bot-panel .mb-run-indicator[data-running="true"] .mb-run-dot {
+        background: #39e86f;
+        box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.6), 0 0 8px rgba(57, 232, 111, 0.7);
+      }
+
+      #minibia-bot-panel .mb-title-actions {
+        display: flex;
+        gap: 4px;
+        flex: 0 0 auto;
+      }
+
+      #minibia-bot-panel .mb-title-actions button {
+        width: 24px;
+        min-width: 24px;
+        height: 24px;
+        padding: 0;
+        margin: 0;
+        border: 1px solid #444;
+        border-radius: 4px;
+        background: rgba(0, 0, 0, 0.4);
+        color: #ccc;
+        font-size: 14px;
+        font-weight: bold;
+        line-height: 1;
+        cursor: pointer;
+        transition: border-color 0.15s, background 0.15s, color 0.15s;
+      }
+
+      #minibia-bot-panel .mb-title-actions button:hover {
+        border-color: #888;
+        background: rgba(255, 255, 255, 0.08);
+        color: #fff;
+      }
+
+      #minibia-bot-panel .mb-collapsed-stop-button {
+        color: #ff8888;
+        border-color: #663333;
+      }
+
+      #minibia-bot-panel .mb-collapsed-stop-button:hover {
+        border-color: #ff6666;
+        background: rgba(255, 0, 0, 0.12);
+        color: #ffaaaa;
+      }
+
+      /* ── Collapsed state ── */
+      #minibia-bot-panel[data-collapsed="true"] {
+        width: 260px;
+      }
+
+      #minibia-bot-panel[data-collapsed="true"] .mb-body {
+        display: none !important;
+      }
+
+      #minibia-bot-panel[data-collapsed="true"] .mb-titlebar {
+        border-bottom: none;
+      }
+
+      /* ── Body (tabs + content) ── */
+      #minibia-bot-panel .mb-body {
+        display: grid;
+        grid-template-columns: 110px 1fr;
+        gap: 0;
+        flex: 1 1 auto;
+        min-height: 0;
+        overflow: hidden;
+      }
+
+      /* ── Tab Menu ── */
+      #minibia-bot-panel .mb-tab-menu {
+        display: flex;
+        flex-direction: column;
+        gap: 0;
+        background-image: url("/png/bg2.png");
+        background-color: #1e1a16;
+        border-right: 1px solid #000;
+        padding: 4px 0;
+        overflow-y: auto;
+        flex-shrink: 0;
+      }
+
+      #minibia-bot-panel .mb-tab-button {
+        display: block;
+        width: 100%;
+        padding: 6px 8px;
+        border: none;
+        border-bottom: 1px solid rgba(0, 0, 0, 0.3);
+        background: transparent;
+        color: #aaa;
+        font-size: 10px;
+        font-weight: bold;
+        text-align: left;
+        font-family: inherit;
+        cursor: pointer;
+        transition: background 0.1s, color 0.1s;
+        border-radius: 0;
+        margin: 0;
+      }
+
+      #minibia-bot-panel .mb-tab-button:hover {
+        background: rgba(255, 255, 255, 0.06);
+        color: #ddd;
+      }
+
+      #minibia-bot-panel .mb-tab-button[data-active="true"] {
+        background-image: url("/png/bg.png");
+        background-color: #2a241e;
+        color: #ffcc00;
+        border-right: 2px solid #ffcc00;
+        box-shadow: inset 0 0 6px rgba(0, 0, 0, 0.5);
+      }
+
+      /* ── Tab Content ── */
+      #minibia-bot-panel .mb-tab-content {
+        padding: 8px 10px;
+        overflow-y: auto;
+        background-image: url("/png/bg.png");
+        background-color: #1a1612;
+        flex: 1 1 auto;
+        min-height: 0;
+      }
+
+      #minibia-bot-panel .mb-tab-panel {
+        display: none;
+        gap: 8px;
+      }
+
+      #minibia-bot-panel .mb-tab-panel[data-active="true"] {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+
+      /* ── Sections ── */
+      #minibia-bot-panel .mb-section {
+        padding: 10px 12px;
+        border: 1px solid rgba(0, 0, 0, 0.6);
+        background-image: url("/png/bg2.png");
+        background-color: #1e1a16;
+        box-shadow: inset 0 0 4px rgba(0, 0, 0, 0.4);
+        border-radius: 0;
+      }
+
+      #minibia-bot-panel .mb-label {
+        margin: 0 0 8px 0;
+        color: #ffcc00;
+        font-weight: bold;
+        font-size: 12px;
+        text-shadow: 0 0 2px #000;
+        letter-spacing: 0.5px;
+      }
+
+      #minibia-bot-panel .mb-small-note {
+        color: #999;
+        font-size: 10px;
+        line-height: 1.4;
+        margin: 2px 0;
+      }
+
+      #minibia-bot-panel .mb-note {
+        color: #bbb;
+        font-size: 11px;
+        line-height: 1.4;
+      }
+
+      /* ── Form Elements ── */
+      #minibia-bot-panel .mb-field {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        min-width: 0;
+      }
+
+      #minibia-bot-panel .mb-field-label {
+        color: #c8b88a;
+        font-size: 10px;
+        font-weight: bold;
+        text-transform: uppercase;
+        letter-spacing: 0.3px;
+      }
+
+      #minibia-bot-panel input,
+      #minibia-bot-panel textarea,
+      #minibia-bot-panel select {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 5px 8px;
+        border: 1px solid #222;
+        border-radius: 0;
+        background-image: url("/png/bg3.png");
+        background-color: #0d0b0a;
+        color: #eee;
+        font: inherit;
+        font-size: 11px;
+        box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.6);
+        outline: none;
+        transition: border-color 0.15s;
+      }
+
+      #minibia-bot-panel input:focus,
+      #minibia-bot-panel textarea:focus,
+      #minibia-bot-panel select:focus {
+        border-color: #c8a84e;
+        box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.6), 0 0 4px rgba(200, 168, 78, 0.3);
+      }
+
+      #minibia-bot-panel input::placeholder,
+      #minibia-bot-panel textarea::placeholder {
+        color: #666;
+      }
+
+      #minibia-bot-panel textarea {
+        min-height: 50px;
+        resize: vertical;
+        font-size: 11px;
+      }
+
+      #minibia-bot-panel select {
+        appearance: none;
+        -webkit-appearance: none;
+        background-image: url("/png/bg3.png"), url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='6'%3E%3Cpath d='M0 0l4 6 4-6z' fill='%23999'/%3E%3C/svg%3E");
+        background-repeat: repeat, no-repeat;
+        background-position: 0 0, right 8px center;
+        padding-right: 24px;
+        cursor: pointer;
+      }
+
+      /* ── Checkboxes (Toggle style) ── */
+      #minibia-bot-panel .mb-toggle {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        color: #dcdcdc;
+        font-size: 11px;
+        cursor: pointer;
+        user-select: none;
+        padding: 2px 0;
+      }
+
+      #minibia-bot-panel .mb-toggle input[type="checkbox"] {
+        width: 14px;
+        height: 14px;
+        margin: 0;
+        flex: 0 0 14px;
+        accent-color: #c8a84e;
+        cursor: pointer;
+        background: transparent;
+        border: 1px solid #555;
+        box-shadow: none;
+        padding: 0;
+      }
+
+      #minibia-bot-panel .mb-toggle-main {
+        font-weight: bold;
+        font-size: 12px;
+        color: #eee;
+      }
+
+      /* ── Buttons ── */
+      #minibia-bot-panel button {
+        padding: 6px 12px;
+        border: 1px solid #222;
+        border-radius: 0;
+        background-image: url("/png/bg3.png");
+        background-color: #2a241e;
+        color: #eee;
+        font-size: 10px;
+        font-weight: bold;
+        font-family: inherit;
+        cursor: pointer;
+        margin: 0;
+        transition: border-color 0.15s, background 0.15s, color 0.15s;
+        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+      }
+
+      #minibia-bot-panel button:hover {
+        border-color: #888;
+        background-image: url("/png/bg2.png");
+        background-color: #3a322a;
+        color: #fff;
+      }
+
+      #minibia-bot-panel button:active {
+        transform: scale(0.98);
+      }
+
+      #minibia-bot-panel .mb-small-button {
+        padding: 4px 10px;
+        font-size: 10px;
+        width: auto;
+        flex: 0 0 auto;
+      }
+
+      #minibia-bot-panel .mb-button-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 6px;
+      }
+
+      #minibia-bot-panel .mb-form-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 6px;
+      }
+
+      #minibia-bot-panel .mb-inline {
+        display: flex;
+        gap: 6px;
+        align-items: center;
+      }
+
+      #minibia-bot-panel .mb-inline > * {
+        flex: 1 1 auto;
+        min-width: 0;
+      }
+
+      #minibia-bot-panel .mb-inline > button {
+        flex: 0 0 auto;
+      }
+
+      #minibia-bot-panel .mb-utility-row {
+        display: grid;
+        grid-template-columns: 1fr auto;
+        gap: 6px;
+        align-items: end;
+      }
+
+      /* ── Lists ── */
+      #minibia-bot-panel .mb-list {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        max-height: 140px;
+        overflow-y: auto;
+        padding-right: 4px;
+        margin: 4px 0;
+      }
+
+      #minibia-bot-panel .mb-list-row {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 3px 6px;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+        font-size: 11px;
+        color: #ccc;
+        gap: 6px;
+      }
+
+      #minibia-bot-panel .mb-list-row > span {
+        flex: 1 1 auto;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      #minibia-bot-panel .mb-list-row > button {
+        flex: 0 0 auto;
+        padding: 2px 6px;
+        font-size: 10px;
+      }
+
+      /* ── Creature rows ── */
+      #minibia-bot-panel .mb-creature-row {
+        padding: 4px 8px;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 8px;
+      }
+
+      #minibia-bot-panel .mb-creature-name {
+        color: #e8e0d0;
+        font-weight: bold;
+        font-size: 11px;
+      }
+
+      #minibia-bot-panel .mb-floor-label {
+        color: #c8a84e;
+        font-size: 10px;
+        font-weight: bold;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        padding: 4px 0 2px 4px;
+        border-bottom: 1px solid rgba(200, 168, 78, 0.2);
+      }
+
+      /* ── Scrollbars ── */
+      #minibia-bot-panel ::-webkit-scrollbar {
+        width: 12px;
+        background: #1a1a1a;
+      }
+
+      #minibia-bot-panel ::-webkit-scrollbar-thumb {
+        background: #666;
+        border: 2px solid #1a1a1a;
+        border-radius: 0;
+      }
+
+      #minibia-bot-panel ::-webkit-scrollbar-thumb:hover {
+        background: #888;
+      }
+
+      #minibia-bot-panel ::-webkit-scrollbar-corner {
+        background: #1a1a1a;
+      }
+
+      #minibia-bot-panel .mb-list::-webkit-scrollbar,
+      #minibia-bot-panel .mb-tab-content::-webkit-scrollbar,
+      #minibia-bot-panel .mb-tab-menu::-webkit-scrollbar {
+        width: 8px;
+      }
+
+      #minibia-bot-panel .mb-list::-webkit-scrollbar-thumb,
+      #minibia-bot-panel .mb-tab-content::-webkit-scrollbar-thumb,
+      #minibia-bot-panel .mb-tab-menu::-webkit-scrollbar-thumb {
+        background: #555;
+        border: 1px solid #222;
+      }
+
+      /* Firefox scrollbar */
+      #minibia-bot-panel {
+        scrollbar-color: #666 #1a1a1a;
+        scrollbar-width: thin;
+      }
+
+      /* ── Misc ── */
+      #minibia-bot-panel .mb-stack {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+
+      #minibia-bot-panel .mb-mini-field {
+        width: 80px;
+      }
+
+      #minibia-bot-panel hr {
+        border: 0;
+        height: 1px;
+        background: linear-gradient(to right, transparent, #444, transparent);
+        margin: 6px 0;
+      }
+
+      /* ── Mobile responsive ── */
+      @media (max-width: 700px) {
+        #minibia-bot-panel {
+          width: min(540px, calc(100vw - 16px));
+          max-height: calc(100vh - 16px);
+          top: 8px;
+          right: 8px;
+        }
+
+        #minibia-bot-panel .mb-body {
+          grid-template-columns: 1fr;
+          grid-template-rows: auto 1fr;
+        }
+
+        #minibia-bot-panel .mb-tab-menu {
+          flex-direction: row;
+          flex-wrap: wrap;
+          padding: 2px 4px;
+          border-right: none;
+          border-bottom: 1px solid #000;
+          overflow-x: auto;
+          gap: 2px;
+          background-image: url("/png/bg2.png");
+        }
+
+        #minibia-bot-panel .mb-tab-button {
+          padding: 4px 8px;
+          font-size: 9px;
+          border-bottom: none;
+          border-right: 1px solid rgba(0, 0, 0, 0.3);
+          flex: 0 0 auto;
+          width: auto;
+          text-align: center;
+        }
+
+        #minibia-bot-panel .mb-tab-button[data-active="true"] {
+          border-right: 2px solid #ffcc00;
+          border-bottom: none;
+        }
+
+        #minibia-bot-panel .mb-tab-content {
+          padding: 6px 8px;
+        }
+
+        #minibia-bot-panel .mb-form-grid,
+        #minibia-bot-panel .mb-button-grid {
+          grid-template-columns: 1fr;
+        }
+
+        #minibia-bot-panel .mb-utility-row {
+          grid-template-columns: 1fr;
+        }
+
+        #minibia-bot-panel .mb-inline {
+          flex-wrap: wrap;
+        }
+
+        #minibia-bot-panel .mb-title-status .mb-run-label {
+          display: none;
+        }
+
+        #minibia-bot-panel[data-collapsed="true"] {
+          width: 200px;
+        }
+      }
+
+      @media (max-width: 420px) {
+        #minibia-bot-panel {
+          width: calc(100vw - 8px);
+          top: 4px;
+          right: 4px;
+          max-height: calc(100vh - 8px);
+        }
+
+        #minibia-bot-panel .mb-title {
+          font-size: 11px;
+        }
+
+        #minibia-bot-panel .mb-tab-button {
+          font-size: 8px;
+          padding: 3px 6px;
+        }
+
+        #minibia-bot-panel .mb-section {
+          padding: 6px 8px;
+        }
       }
     `;
     document.head.appendChild(style);
@@ -8149,41 +9032,67 @@ function refreshPinkSkullStatus() {
 
 <!-- Utility Tab -->
 <div class="mb-tab-panel" data-tab-panel="utility">
-  <!-- Bot & Trainer -->
-  <div class="mb-section" style="padding:8px 10px;">
-    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
-      <button type="button" id="minibia-bot-reload" style="width:auto; padding:4px 14px; font-size:11px;">Reload</button>
-      <div style="border-left:1px solid rgba(255,255,255,0.15); height:22px;"></div>
-      <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-rune-enabled" /><span>ML Trainer</span></label>
-      <label class="mb-field" style="flex:1; min-width:80px;"><span class="mb-field-label" style="font-size:10px;">Spell</span><input type="text" id="minibia-bot-rune-spell" placeholder="adori vita vis" style="padding:3px 6px;font-size:11px;" /></label>
-      <label class="mb-field" style="flex:0 0 70px;"><span class="mb-field-label" style="font-size:10px;">Mana</span><input type="number" id="minibia-bot-rune-mana" min="0" placeholder="600" style="padding:3px 6px;font-size:11px;" /></label>
+  <!-- ML Trainer -->
+  <div class="mb-section" style="padding:12px 16px;">
+    <div style="display:flex; gap:16px; align-items:center; flex-wrap:wrap;">
+      <label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-rune-enabled" /><span>ML Trainer</span></label>
+      <label class="mb-field" style="flex:2; min-width:140px;">
+        <span class="mb-field-label" style="font-size:10px;">Spell</span>
+        <input type="text" id="minibia-bot-rune-spell" placeholder="adori vita vis" style="padding:6px 10px;font-size:12px;" />
+      </label>
+      <label class="mb-field" style="flex:0 0 100px;">
+        <span class="mb-field-label" style="font-size:10px;">Mana Cost</span>
+        <input type="number" id="minibia-bot-rune-mana" min="0" placeholder="600" style="padding:6px 10px;font-size:12px;" />
+      </label>
     </div>
   </div>
 
-  <!-- Utility Modules - 3 Column Grid -->
-  <div class="mb-section" style="padding:8px 10px;">
-    <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:6px 12px;">
-      <!-- Row 1 -->
-      <div style="display:flex; align-items:center; gap:6px;">
-        <label class="mb-toggle" style="margin:0; font-size:11px; white-space:nowrap;"><input type="checkbox" id="minibia-bot-auto-eat-enabled" /><span>Eat</span></label>
-        <input type="number" id="minibia-bot-auto-eat-hotkey" min="1" max="12" placeholder="10" style="width:38px;padding:2px 2px;font-size:11px;text-align:center;background:#080706;border:1px solid rgba(224,200,148,0.48);border-radius:4px;color:#fff2c7;" />
+  <!-- Utility Modules -->
+  <div class="mb-section" style="padding:12px 16px;">
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px 32px;">
+      <!-- Left Column -->
+      <div style="display:flex; flex-direction:column; gap:10px;">
+        <div style="display:flex; align-items:center; gap:12px;">
+          <label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-auto-eat-enabled" /><span>Eat</span></label>
+          <label class="mb-field" style="flex:0 0 60px;">
+            <span class="mb-field-label" style="font-size:9px;">Key</span>
+            <input type="number" id="minibia-bot-auto-eat-hotkey" min="1" max="12" placeholder="10" style="padding:4px 4px;font-size:12px;text-align:center;" />
+          </label>
+        </div>
+        <label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-auto-invisible-enabled" /><span>Invisible</span></label>
+        <label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-light-hack-enabled" /><span>Light Hack</span></label>
       </div>
-      <label class="mb-toggle" style="margin:0; font-size:11px; white-space:nowrap;"><input type="checkbox" id="minibia-bot-auto-invisible-enabled" /><span>Invisible</span></label>
-      <label class="mb-toggle" style="margin:0; font-size:11px; white-space:nowrap;"><input type="checkbox" id="minibia-bot-auto-magic-shield-enabled" /><span>Utamo Vita</span></label>
-      <!-- Row 2 -->
-      <label class="mb-toggle" style="margin:0; font-size:11px; white-space:nowrap;"><input type="checkbox" id="minibia-bot-equip-ring-enabled" /><span>Equip Ring</span></label>
-      <label class="mb-toggle" style="margin:0; font-size:11px; white-space:nowrap;"><input type="checkbox" id="minibia-bot-light-hack-enabled" /><span>Light Hack</span></label>
-      <label class="mb-toggle" style="margin:0; font-size:11px; white-space:nowrap;"><input type="checkbox" id="minibia-bot-pink-skull-enabled" /><span>Pink Skull</span></label>
-	  <!-- Row 3 - Anti-AFK -->
-		<div style="display:flex; align-items:center; gap:6px;">
-		  <label class="mb-toggle" style="margin:0; font-size:11px; white-space:nowrap;">
-			<input type="checkbox" id="minibia-bot-antiafk-enabled" /><span>Anti-AFK</span>
-		  </label>
-		  <label class="mb-field" style="flex:0 0 70px;">
-			<span class="mb-field-label" style="font-size:10px;">Interval</span>
-			<input type="number" id="minibia-bot-antiafk-interval" min="10" max="300" value="60" style="padding:3px 4px;font-size:11px;" />
-		  </label>
-		</div>
+      <!-- Right Column -->
+      <div style="display:flex; flex-direction:column; gap:10px;">
+        <label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-auto-magic-shield-enabled" /><span>Utamo Vita</span></label>
+        <label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-equip-ring-enabled" /><span>Equip Ring</span></label>
+        <label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-pink-skull-enabled" /><span>Pink Skull</span></label>
+      </div>
+    </div>
+
+    <!-- Anti-AFK (Full Width) -->
+    <div style="display:flex; align-items:center; gap:16px; margin-top:12px; padding-top:12px; border-top:1px solid rgba(255,255,255,0.08); flex-wrap:wrap;">
+      <label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-antiafk-enabled" /><span>Anti-AFK</span></label>
+      <label class="mb-field" style="flex:0 0 80px;">
+        <span class="mb-field-label" style="font-size:10px;">Interval (s)</span>
+        <input type="number" id="minibia-bot-antiafk-interval" min="10" max="300" value="60" style="padding:4px 6px;font-size:12px;text-align:center;" />
+      </label>
+    </div>
+
+    <!-- Fisher (Full Width) -->
+    <div style="display:flex; align-items:center; gap:14px; margin-top:12px; padding-top:12px; border-top:1px solid rgba(255,255,255,0.08); flex-wrap:wrap;">
+      <label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-fisher-enabled" /><span>Fisher</span></label>
+      <button type="button" class="mb-small-button" id="minibia-bot-fisher-select-tile" style="padding:4px 14px;font-size:11px;">Set Tile</button>
+      <span style="font-size:12px; color:#cdbb8b; min-width:80px;" id="minibia-bot-fisher-tile-display">none</span>
+      <label class="mb-field" style="flex:0 0 72px;">
+        <span class="mb-field-label" style="font-size:10px;">Delay (s)</span>
+        <input type="number" id="minibia-bot-fisher-delay" min="0.5" step="0.5" value="2" style="padding:4px 4px;font-size:12px;text-align:center;" />
+      </label>
+      <label class="mb-field" style="flex:0 0 64px;">
+        <span class="mb-field-label" style="font-size:10px;">Fish Cap</span>
+        <input type="number" id="minibia-bot-fisher-threshold" min="1" value="10" style="padding:4px 4px;font-size:12px;text-align:center;" />
+      </label>
+      <span style="font-size:12px; color:#cdbb8b;">Fish: <span id="minibia-bot-fisher-count" style="font-weight:bold; color:#fff;">0</span></span>
     </div>
   </div>
 </div>
@@ -8479,6 +9388,85 @@ function refreshPinkSkullStatus() {
     }
 
     // ---- EVENT LISTENERS ----
+	
+	// ---- Fisher ----
+	const fisherToggle = panel.querySelector("#minibia-bot-fisher-enabled");
+	const fisherSelectTile = panel.querySelector("#minibia-bot-fisher-select-tile");
+	const fisherDelay = panel.querySelector("#minibia-bot-fisher-delay");
+	const fisherThreshold = panel.querySelector("#minibia-bot-fisher-threshold");
+	const fisherStatus = panel.querySelector("#minibia-bot-fisher-status");
+	const fisherCountDisplay = panel.querySelector("#minibia-bot-fisher-count");
+
+	function refreshFisherStatus() {
+	  if (!bot.fisher) return;
+	  const status = bot.fisher.status();
+	  if (fisherToggle && document.activeElement !== fisherToggle) {
+		fisherToggle.checked = status.running;
+	  }
+	  if (fisherDelay && document.activeElement !== fisherDelay) {
+		fisherDelay.value = (status.config.delayMs / 1000).toFixed(1);
+	  }
+	  if (fisherThreshold && document.activeElement !== fisherThreshold) {
+		fisherThreshold.value = status.config.fishThreshold;
+	  }
+	  if (fisherStatus) {
+		fisherStatus.textContent = status.running ? "Status: running" : "Status: idle";
+	  }
+	  if (fisherCountDisplay) {
+		fisherCountDisplay.textContent = status.fishCount;
+	  }
+	  const tile = bot.fisher.getTile();
+	  const tileDisplay = document.getElementById("minibia-bot-fisher-tile-display");
+	  if (tileDisplay) {
+		tileDisplay.textContent = tile ? `${tile.x}, ${tile.y}, ${tile.z}` : "No tile selected";
+	  }
+	}
+
+	if (fisherToggle) {
+	  fisherToggle.checked = !!bot.fisher?.status?.().running;
+	  fisherToggle.addEventListener("change", function() {
+		if (this.checked) {
+		  // Read values from UI
+		  const delay = parseFloat(fisherDelay?.value) || 2;
+		  const threshold = parseInt(fisherThreshold?.value) || 10;
+		  bot.fisher.updateConfig({ delayMs: delay * 1000, fishThreshold: threshold });
+		  bot.fisher.start();
+		} else {
+		  bot.fisher.stop();
+		}
+		refreshFisherStatus();
+	  });
+	}
+
+	if (fisherSelectTile) {
+	  fisherSelectTile.addEventListener("click", function() {
+		if (bot.fisher && typeof bot.fisher.startTileCapture === 'function') {
+		  bot.fisher.startTileCapture();
+		} else {
+		  bot.log("Fisher module not available. Please reload the bot.");
+		}
+	  });
+	}
+
+	if (fisherDelay) {
+	  fisherDelay.addEventListener("change", function() {
+		const val = Math.max(0.5, parseFloat(this.value) || 2);
+		this.value = val.toFixed(1);
+		bot.fisher.updateConfig({ delayMs: val * 1000 });
+	  });
+	}
+
+	if (fisherThreshold) {
+	  fisherThreshold.addEventListener("change", function() {
+		const val = Math.max(1, parseInt(this.value) || 10);
+		this.value = val;
+		bot.fisher.updateConfig({ fishThreshold: val });
+	  });
+	}
+
+	// Periodic refresh
+	const fisherTimer = window.setInterval(refreshFisherStatus, 1000);
+	bot.addCleanup(() => window.clearInterval(fisherTimer));
 	
 	// ---- Anti-AFK ----
 	const antiAfkToggle = panel.querySelector("#minibia-bot-antiafk-enabled");
@@ -9504,6 +10492,7 @@ if (clientChaseToggle) {
 	currentBundle.installPinkSkullDetectorModule(bot);
 	currentBundle.installProfileModule(bot);
 	currentBundle.installAntiAfkModule(bot);
+	currentBundle.installFisherModule(bot);
 	currentBundle.installPanel(bot);
 
     bot.ui.inject();
