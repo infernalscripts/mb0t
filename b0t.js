@@ -213,7 +213,7 @@ function startReconnectWatcher() {
 
   // ---- __imB COUNTER RESET (prevents input spam detection) ----
   let __imbResetInterval = null;
-  function startImbReset(intervalMs = 1000) {
+  function startImbReset(intervalMs = 5000) {
     if (__imbResetInterval) return;
     __imbResetInterval = setInterval(() => {
       if (typeof __imB !== 'undefined') __imB = 0;
@@ -224,6 +224,61 @@ function startReconnectWatcher() {
     if (__imbResetInterval) { clearInterval(__imbResetInterval); __imbResetInterval = null; }
   }
   startImbReset(1000);
+  
+  // ---- PATCH gameClient.send to manipulate __imA/__imB ----
+  let originalSend = null;
+  if (window.gameClient && typeof window.gameClient.send === 'function') {
+    originalSend = window.gameClient.send;
+    window.gameClient.send = function(packet) {
+      // Call the original send
+      originalSend.call(this, packet);
+
+      // ---- Extract opcode safely ----
+      let opcode = -1;
+      if (packet && typeof packet.getBuffer === 'function') {
+        const buf = packet.getBuffer();
+        if (buf && buf.length > 0) opcode = buf[0];
+      } else if (packet && packet.opcode !== undefined) {
+        opcode = packet.opcode;
+      } else if (packet && packet.length > 0) {
+        opcode = packet[0];
+      }
+
+      // ---- Classify direct-intent opcodes ----
+      // Use window.CONST if available, otherwise fallback to numeric values
+      const CLIENT = (typeof CONST !== 'undefined' && CONST.PROTOCOL?.CLIENT)
+        ? CONST.PROTOCOL.CLIENT
+        : {
+            TARGET: 0x01,
+            CAST_SPELL: 0x02,
+            THING_USE_WITH: 0x03,
+            THING_USE_ON_CREATURE: 0x04,
+            CHANNEL_MESSAGE: 0x05
+          };
+
+      const classified = [
+        CLIENT.TARGET,
+        CLIENT.CAST_SPELL,
+        CLIENT.THING_USE_WITH,
+        CLIENT.THING_USE_ON_CREATURE,
+        CLIENT.CHANNEL_MESSAGE
+      ];
+
+      if (classified.includes(opcode)) {
+        if (typeof __imA !== 'undefined') __imA++;
+        if (typeof __imB !== 'undefined') __imB = 0;
+      }
+    };
+
+    // Add cleanup to restore original send when bot is destroyed
+    addCleanup(() => {
+      if (window.gameClient && originalSend) {
+        window.gameClient.send = originalSend;
+      }
+    });
+  } else {
+    console.warn('[minibia-bot] gameClient.send not available – counter patch skipped');
+  }
 
   // ---- PUBLIC API ----
   return {
@@ -5204,6 +5259,14 @@ window.__minibiaBotBundle.installAutoEatModule = function installAutoEatModule(b
  *     short, casual reply. Supports ignoring specific phrases.
  * ==================================================================================
  */
+/**
+ * ==================================================================================   
+ * FIXES:
+ * 1. Greetings bypass Gemini entirely – uses canned replies.
+ * 2. SanitizeReply now detects and cleans up multiple greetings.
+ * 3. Fallback is more aggressive for low-quality responses.
+ * ==================================================================================
+ */
 window.__minibiaBotBundle.installTalkModule = function installTalkModule(bot) {
   const configStorageKey = "minibiaBot.talk.config";
   const legacyDefaultModels = ["gemini-3-pro-preview", "gemini-2.0-flash"];
@@ -5408,7 +5471,6 @@ window.__minibiaBotBundle.installTalkModule = function installTalkModule(bot) {
       if (!message?.body || !message?.key) return false;
       if (hasSeenMessage(message)) return false;
 
-      // Skip ignored phrases
       const ignored = config.ignoredPhrases || [];
       const bodyLower = message.body.toLowerCase();
       if (ignored.some(p => bodyLower.includes(p))) {
@@ -5491,16 +5553,41 @@ window.__minibiaBotBundle.installTalkModule = function installTalkModule(bot) {
     return "statement";
   }
 
+  /**
+   * FIX: Improved sanitizer – detects multiple greetings and reduces to one.
+   * Also strips any text that looks like a bot disclaimer.
+   */
   function sanitizeReply(text) {
     const single = String(text || "")
       .replace(/\s+/g, " ")
       .replace(/^["'`]+|["'`]+$/g, "")
       .trim();
     if (!single) return "";
+
+    // Take the first sentence (split by . ! ?)
     const first = single.split(/(?<=[.!?])\s+/)[0] || single;
-    const trimmed = first.slice(0, 90).trim();
+    let trimmed = first.slice(0, 90).trim();
     if (!trimmed) return "";
-    if (trimmed === "?") return bot.isRecentSentChat?.("?", 20000) ? "" : "?";
+
+    // ---- FIX: detect multiple greetings ----
+    const greetingWords = ["yo", "hey", "hi", "sup", "hiya", "hello", "howdy", "heya"];
+    const words = trimmed.split(/\s+/);
+    const greetings = words.filter(w => greetingWords.includes(w.toLowerCase().replace(/[^a-z]/g, "")));
+    if (greetings.length > 1) {
+      // Keep only the first greeting word + maybe a single following word if it's "lol"
+      let firstGreeting = greetings[0];
+      // Check if the reply starts with a greeting, but has extra words
+      // We'll just return the first greeting word, or "yo" as fallback.
+      return firstGreeting || "yo";
+    }
+
+    // If the entire reply is just a single greeting word, keep it.
+    const cleanLower = trimmed.toLowerCase().replace(/[^a-z]/g, "");
+    if (greetingWords.includes(cleanLower)) {
+      return trimmed; // keep as-is (e.g., "yo", "hey")
+    }
+
+    // ---- General cleanup ----
     const styled = trimmed
       .toLowerCase()
       .replace(/[“”]/g, '"').replace(/[‘’]/g, "'")
@@ -5509,6 +5596,7 @@ window.__minibiaBotBundle.installTalkModule = function installTalkModule(bot) {
       .replace(/\bgoing to\b/g, "gonna").replace(/\bwant to\b/g, "wanna")
       .replace(/\s+([,.!?])/g, "$1").replace(/([!?.,]){2,}/g, "$1")
       .trim();
+
     if (!styled || /^[^a-z0-9]+$/i.test(styled)) return "";
     if (/\b(bot|ai|assistant|language model|automation|script)\b/i.test(styled)) return "";
     if (bot.isRecentSentChat?.(styled, 20000)) return "";
@@ -5560,20 +5648,51 @@ window.__minibiaBotBundle.installTalkModule = function installTalkModule(bot) {
         });
         return false;
       }
+
+      // ---- Classify ----
       const type = await classifyMessageType(pending.targetMessage, context);
-      const rawReply = isBotQuestion(pending.targetMessage.body)
-        ? "no"
-        : await generateText(buildReplyPrompt(pending.targetMessage, context, type));
-      const reply = sanitizeReply(rawReply) || pickFallbackReply(pending.targetMessage, type);
+      let reply;
+
+      // ---- FIX: skip Gemini for greetings and bot questions ----
+      if (isBotQuestion(pending.targetMessage.body)) {
+        reply = "no";
+      } else if (type === "greeting" || isGreeting(pending.targetMessage.body)) {
+        // Use canned greeting only – no AI
+        reply = pickFallbackReply(pending.targetMessage, "greeting");
+      } else {
+        const rawReply = await generateText(buildReplyPrompt(pending.targetMessage, context, type));
+        reply = sanitizeReply(rawReply) || pickFallbackReply(pending.targetMessage, type);
+      }
+
       rememberSeenMessages(pending.pendingMessages);
+
+      // ---- Extra safety: if reply is still a mashup, fallback ----
+      if (reply) {
+        const words = reply.split(/\s+/);
+        const greetings = words.filter(w => ["yo","hey","hi","sup","hiya","hello","howdy"].includes(w.toLowerCase().replace(/[^a-z]/g,"")));
+        if (greetings.length > 1) {
+          reply = greetings[0];
+        }
+      }
+
       if (!reply) {
-        bot.log("talk skipped reply", { sender: pending.targetMessage.sender, message: pending.targetMessage.body, messageType: type, rawReply });
+        bot.log("talk skipped reply (empty after sanitize)", {
+          sender: pending.targetMessage.sender,
+          message: pending.targetMessage.body,
+          messageType: type,
+        });
         return false;
       }
+
       const sent = bot.sendChat(reply);
       if (sent) {
         state.lastReplyAt = Date.now();
-        bot.log("talk replied", { sender: pending.targetMessage.sender, message: pending.targetMessage.body, messageType: type, reply });
+        bot.log("talk replied", {
+          sender: pending.targetMessage.sender,
+          message: pending.targetMessage.body,
+          messageType: type,
+          reply,
+        });
       }
       return sent;
     } finally {
@@ -9242,6 +9361,7 @@ function refreshPinkSkullStatus() {
               <input type="number" id="minibia-bot-paladin-weapon-id" placeholder="e.g., 1234" />
             </label>
             <button type="button" class="mb-small-button" id="minibia-bot-paladin-capture-weapon" style="width:auto;">Click to Capture</button>
+			<button type="button" class="mb-small-button" id="minibia-bot-paladin-equip-now" style="width:auto;background:#2a4a2a;border-color:#3a7a3a;">Equip Now</button>
           </div>
           <div class="mb-small-note" id="minibia-bot-paladin-status">Status: idle</div>
           <div class="mb-small-note">Ammo count: <span id="minibia-bot-paladin-ammo">0</span></div>
@@ -9868,6 +9988,29 @@ if (clientChaseToggle) {
 		bot.paladin.startCaptureWeapon();
 	  });
 	}
+	
+	// ---- Ammo threshold: update config on change ----
+	if (paladinAmmoThreshold) {
+	  paladinAmmoThreshold.addEventListener("change", function() {
+		const val = Math.max(0, parseInt(this.value, 10) || 0);
+		this.value = val;
+		bot.paladin.updateConfig({ ammoThreshold: val });
+	  });
+	}
+
+	// ---- Equip Now button ----
+	const equipNowBtn = panel.querySelector("#minibia-bot-paladin-equip-now");
+	if (equipNowBtn) {
+	  equipNowBtn.addEventListener("click", function() {
+		const weaponId = bot.paladin?.config?.weaponId;
+		if (!weaponId) {
+		  bot.log("Paladin: No weapon ID set. Capture or enter one first.");
+		  return;
+		}
+		const success = bot.paladin.equipWeapon(weaponId);
+		bot.log(success ? "Paladin: Weapon equipped manually." : "Paladin: Could not equip weapon. Check containers/equipment.");
+	  });
+}
 
 	// ---- Looter listeners ----
 	const looterToggle = panel.querySelector("#minibia-bot-looter-enabled");
