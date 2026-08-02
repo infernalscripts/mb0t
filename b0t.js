@@ -6182,7 +6182,7 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
     {
       enabled: false,
       tickMs: 2000,
-      ammoThreshold: 15,
+      ammoThreshold: 4,
       craftManaCost: 140,
       craftSpellWords: "exeta con",
       highManaSpellWords: "utani hur",
@@ -6190,6 +6190,7 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
       weaponId: null,
       equipWeapon: false,
       equipCooldownMs: 5000,
+	  equipThreshold: 7,
     },
     bot.storage.get(configStorageKey, {})
   );
@@ -6451,7 +6452,7 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
         }
 
         // Equip only if left hand is empty OR count is below threshold
-        if (!leftHandHasWeapon || leftHandCount <= config.ammoThreshold) {
+        if (!leftHandHasWeapon || leftHandCount <= config.equipThreshold) {
           const now = Date.now();
           if (now - state.lastEquipAt > (config.equipCooldownMs || 5000)) {
             equipWeapon(config.weaponId);
@@ -6509,6 +6510,7 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
     config.craftManaCost = Math.max(0, Number(config.craftManaCost) || 0);
     config.highManaThreshold = Math.min(100, Math.max(0, Number(config.highManaThreshold) || 0));
     config.equipCooldownMs = Math.max(1000, Number(config.equipCooldownMs) || 5000);
+	config.equipThreshold = Math.max(0, Number(config.equipThreshold) || 0);
     if (config.weaponId !== null && config.weaponId !== undefined) {
       config.weaponId = Number(config.weaponId) || null;
     }
@@ -7751,7 +7753,9 @@ function refreshPaladinStatus() {
   const toggle = document.getElementById("minibia-bot-paladin-enabled");
   const statusLabel = document.getElementById("minibia-bot-paladin-status");
   const ammoLabel = document.getElementById("minibia-bot-paladin-ammo");
+  const handCountLabel = document.getElementById("minibia-bot-paladin-hand-count");
   const status = bot.paladin?.status?.();
+
   if (toggle && document.activeElement !== toggle) {
     toggle.checked = !!status?.running;
   }
@@ -7760,6 +7764,19 @@ function refreshPaladinStatus() {
   }
   if (ammoLabel) {
     ammoLabel.textContent = status?.ammoCount ?? 0;
+  }
+  if (handCountLabel) {
+    // Get left hand count
+    const eq = window.gameClient?.player?.equipment;
+    let leftHandCount = 0;
+    if (eq) {
+      const leftItem = eq.getSlotItem(5); // LEFT_HAND_SLOT
+      const weaponId = bot.paladin?.config?.weaponId;
+      if (leftItem && leftItem.id === weaponId) {
+        leftHandCount = leftItem.count || 1;
+      }
+    }
+    handCountLabel.textContent = leftHandCount;
   }
 }
 
@@ -9452,60 +9469,84 @@ function refreshPinkSkullStatus() {
       </div>
     </div>
 
-    <!-- Paladin Tab -->
-    <div class="mb-tab-panel" data-tab-panel="paladin">
-      <div class="mb-section">
-        <div class="mb-label">Paladin Utilities</div>
-        <div class="mb-stack">
-          <label class="mb-toggle mb-toggle-main">
-            <input type="checkbox" id="minibia-bot-paladin-enabled" />
-            <span>Enable</span>
-          </label>
-          <div class="mb-form-grid">
-            <label class="mb-field" for="minibia-bot-paladin-ammo-threshold">
-              <span class="mb-field-label">Ammo Threshold</span>
-              <input type="number" id="minibia-bot-paladin-ammo-threshold" min="0" value="15" />
-            </label>
-            <label class="mb-field" for="minibia-bot-paladin-craft-mana">
-              <span class="mb-field-label">Craft Mana Cost</span>
-              <input type="number" id="minibia-bot-paladin-craft-mana" min="0" value="140" />
-            </label>
-          </div>
-          <label class="mb-field" for="minibia-bot-paladin-craft-spell">
-            <span class="mb-field-label">Craft Spell Words</span>
-            <input type="text" id="minibia-bot-paladin-craft-spell" placeholder="exeta con" />
-          </label>
-          <label class="mb-field" for="minibia-bot-paladin-high-mana-spell">
-            <span class="mb-field-label">High Mana Spell</span>
-            <input type="text" id="minibia-bot-paladin-high-mana-spell" placeholder="utani hur" />
-          </label>
-          <div class="mb-form-grid">
-            <label class="mb-field" for="minibia-bot-paladin-high-mana-threshold">
-              <span class="mb-field-label">High Mana %</span>
-              <input type="number" id="minibia-bot-paladin-high-mana-threshold" min="0" max="100" value="98" />
-            </label>
-            <label class="mb-field" for="minibia-bot-paladin-equip-cooldown">
-              <span class="mb-field-label">Equip Cooldown (ms)</span>
-              <input type="number" id="minibia-bot-paladin-equip-cooldown" min="1000" value="5000" />
-            </label>
-          </div>
-          <div style="display:flex; gap:6px; align-items:center;">
-            <label class="mb-toggle" style="margin:0;">
-              <input type="checkbox" id="minibia-bot-paladin-equip-weapon" />
-              <span>Equip Weapon</span>
-            </label>
-            <label class="mb-field" style="flex:1;">
-              <span class="mb-field-label">Weapon ID</span>
-              <input type="number" id="minibia-bot-paladin-weapon-id" placeholder="e.g., 1234" />
-            </label>
-            <button type="button" class="mb-small-button" id="minibia-bot-paladin-capture-weapon" style="width:auto;">Click to Capture</button>
-			<button type="button" class="mb-small-button" id="minibia-bot-paladin-equip-now" style="width:auto;background:#2a4a2a;border-color:#3a7a3a;">Equip Now</button>
-          </div>
-          <div class="mb-small-note" id="minibia-bot-paladin-status">Status: idle</div>
-          <div class="mb-small-note">Ammo count: <span id="minibia-bot-paladin-ammo">0</span></div>
-        </div>
+<!-- Paladin Tab -->
+<div class="mb-tab-panel" data-tab-panel="paladin">
+  <div class="mb-section">
+    <div class="mb-label">Paladin Utilities</div>
+    <div class="mb-stack">
+      <!-- Enable toggle -->
+      <label class="mb-toggle mb-toggle-main">
+        <input type="checkbox" id="minibia-bot-paladin-enabled" />
+        <span>Enable</span>
+      </label>
+
+      <!-- Row 1: Ammo Threshold + Equip Threshold -->
+      <div class="mb-form-grid">
+        <label class="mb-field" for="minibia-bot-paladin-ammo-threshold">
+          <span class="mb-field-label">Ammo Threshold</span>
+          <input type="number" id="minibia-bot-paladin-ammo-threshold" min="0" value="15" />
+        </label>
+        <label class="mb-field" for="minibia-bot-paladin-equip-threshold">
+          <span class="mb-field-label">Equip Threshold</span>
+          <input type="number" id="minibia-bot-paladin-equip-threshold" min="0" value="10" />
+        </label>
+      </div>
+
+      <!-- Row 2: Craft Spell Words + Craft Mana Cost -->
+      <div class="mb-form-grid">
+        <label class="mb-field" for="minibia-bot-paladin-craft-spell">
+          <span class="mb-field-label">Craft Spell Words</span>
+          <input type="text" id="minibia-bot-paladin-craft-spell" placeholder="exeta con" />
+        </label>
+        <label class="mb-field" for="minibia-bot-paladin-craft-mana">
+          <span class="mb-field-label">Craft Mana Cost</span>
+          <input type="number" id="minibia-bot-paladin-craft-mana" min="0" value="140" />
+        </label>
+      </div>
+
+      <!-- Row 3: High Mana Spell + High Mana % -->
+      <div class="mb-form-grid">
+        <label class="mb-field" for="minibia-bot-paladin-high-mana-spell">
+          <span class="mb-field-label">High Mana Spell</span>
+          <input type="text" id="minibia-bot-paladin-high-mana-spell" placeholder="utani hur" />
+        </label>
+        <label class="mb-field" for="minibia-bot-paladin-high-mana-threshold">
+          <span class="mb-field-label">High Mana %</span>
+          <input type="number" id="minibia-bot-paladin-high-mana-threshold" min="0" max="100" value="98" />
+        </label>
+      </div>
+
+      <!-- Row 4: Equip Weapon + Weapon ID + Equip Cooldown -->
+      <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
+        <label class="mb-toggle" style="margin:0; flex:0 0 auto;">
+          <input type="checkbox" id="minibia-bot-paladin-equip-weapon" />
+          <span>Equip Weapon</span>
+        </label>
+        <label class="mb-field" style="flex:1; min-width:80px;">
+          <span class="mb-field-label">Weapon ID</span>
+          <input type="number" id="minibia-bot-paladin-weapon-id" placeholder="e.g., 3277" />
+        </label>
+        <label class="mb-field" style="flex:0 0 120px;">
+          <span class="mb-field-label">Equip Cooldown (ms)</span>
+          <input type="number" id="minibia-bot-paladin-equip-cooldown" min="1000" value="5000" />
+        </label>
+      </div>
+
+      <!-- Row 5: Buttons -->
+      <div style="display:flex; gap:6px;">
+        <button type="button" class="mb-small-button" id="minibia-bot-paladin-capture-weapon" style="flex:1;">Click to Capture</button>
+        <button type="button" class="mb-small-button" id="minibia-bot-paladin-equip-now" style="flex:1;background:#2a4a2a;border-color:#3a7a3a;">Equip Now</button>
+      </div>
+
+      <!-- Status line -->
+      <div style="display:flex; gap:16px; flex-wrap:wrap; font-size:11px; color:#cdbb8b; margin-top:4px;">
+        <span id="minibia-bot-paladin-status">Status: idle</span>
+        <span>Ammo count: <span id="minibia-bot-paladin-ammo">0</span></span>
+        <span>Hand count: <span id="minibia-bot-paladin-hand-count">0</span></span>
       </div>
     </div>
+  </div>
+</div>
 
     <!-- Looter Tab -->
     <div class="mb-tab-panel" data-tab-panel="looter">
@@ -10071,6 +10112,16 @@ if (clientChaseToggle) {
   const paladinWeaponId = panel.querySelector("#minibia-bot-paladin-weapon-id");
   const paladinCaptureBtn = panel.querySelector("#minibia-bot-paladin-capture-weapon");
   const equipNowBtn = panel.querySelector("#minibia-bot-paladin-equip-now");
+  
+  const paladinEquipThreshold = panel.querySelector("#minibia-bot-paladin-equip-threshold");
+	if (paladinEquipThreshold) {
+	  paladinEquipThreshold.value = bot.paladin?.config?.equipThreshold ?? 15;
+	  paladinEquipThreshold.addEventListener("change", function() {
+		const val = Math.max(0, parseInt(this.value, 10) || 0);
+		this.value = val;
+		bot.paladin.updateConfig({ equipThreshold: val });
+	  });
+	}
 
   function getPaladinConfigFromUI() {
     return {
