@@ -2208,7 +2208,7 @@ function isHoleTile(tile) {
 }
 
 function isRopeTargetTile(tile) {
-  return tileHasNamedThing(tile, "rope spot") || isHoleTile(tile);
+  return isHoleTile(tile) || tileHasNamedThing(tile, "rope spot");
 }
 
 function isSafeTileForKite(pos) {
@@ -3404,20 +3404,26 @@ function canAttack(now = Date.now()) {
 
 function triggerAttack(now = Date.now()) {
   if (!canAttack(now)) return false;
-  const engaged = getEngagedTarget();
-  const preferred = engaged && !isTargetSkipped(engaged, now)
-    ? engaged
-    : (getMonsterCandidates(now)[0] || null);
-  if (preferred && setCurrentTarget(preferred)) {
+  const candidates = getMonsterCandidates(now);
+  if (!candidates.length) return false;
+  const best = candidates[0];
+
+  // If we already have a target and it's the best, we're done.
+  const current = getCurrentTarget();
+  if (current && isSameCreature(current, best)) {
+    return true;
+  }
+
+  // Target the best candidate
+  if (setCurrentTarget(best)) {
     state.lastTargetHotkeyAt = now;
     markCombatActive(now);
     bot.log("selected auto attack target", {
-      id: preferred.id, name: preferred.name || "Mob",
-      reason: isSameCreature(preferred, engaged) ? "engaged target" : "nearest candidate",
+      id: best.id, name: best.name || "Mob",
+      reason: "best candidate"
     });
     return true;
   }
-  // NO LOG HERE – silently return false
   return false;
 }
 
@@ -3570,6 +3576,7 @@ function start(overrides = {}) {
     canUseRune, triggerRune,
     getNearbyMonsters, getCurrentTarget, getCurrentFollowTarget,
     isCombatActive, syncMeleeChase, normalizeHotbarSlot,
+	setClientChaseMode,
     config,
   };
 };
@@ -3591,6 +3598,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
   const minimapOverlayRootId = "minibia-bot-cave-minimap-overlay";
   const minimapOverlayStyleId = "minibia-bot-cave-minimap-overlay-style";
   const ladderItemIds = new Set([1948, 1968]);
+  const holeItemIds = new Set([12396]);
   const ropeNamePattern = /\brope\b/i;
   const shovelNamePattern = /\bshovel\b/i;
   const shovelTargetNamePatterns = [
@@ -3972,7 +3980,12 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
   function isLadderTile(tile) { return getTileThings(tile).some(t => isLadderThing(t)); }
   function isStairsTile(tile) { return tileHasNamedThing(tile, "stairs"); }
-  function isHoleTile(tile) { return tileHasNamedThing(tile, "hole"); }
+	function isHoleTile(tile) {
+	  if (tileHasNamedThing(tile, "hole")) return true;
+	  // fallback: check if the tile itself or any item has a known hole ID
+	  const things = [tile, ...(tile.items || [])];
+	  return things.some(t => t?.id !== undefined && holeItemIds.has(t.id));
+	}
   function isRopeSpotTile(tile) { return tileHasNamedThing(tile, "rope spot"); }
   function isRopeTargetTile(tile) { return isHoleTile(tile) || isRopeSpotTile(tile); }
 
@@ -9527,7 +9540,7 @@ function refreshPinkSkullStatus() {
           <input type="number" id="minibia-bot-paladin-weapon-id" placeholder="e.g., 3277" />
         </label>
         <label class="mb-field" style="flex:0 0 120px;">
-          <span class="mb-field-label">Equip Cooldown (ms)</span>
+          <span class="mb-field-label">Equip CD (MS)</span>
           <input type="number" id="minibia-bot-paladin-equip-cooldown" min="1000" value="5000" />
         </label>
       </div>
@@ -10016,13 +10029,11 @@ if (clientChaseToggle) {
   clientChaseToggle.checked = bot.attack?.config?.useClientChase || false;
   clientChaseToggle.addEventListener("change", function() {
     const enabled = this.checked;
-    // Update config
     bot.attack.updateConfig({ useClientChase: enabled });
-    // Actually set the chase mode in the client
     if (enabled) {
-      setClientChaseMode(2); // aggressive chase
+      bot.attack.setClientChaseMode(2);   // aggressive chase
     } else {
-      setClientChaseMode(0); // stand
+      bot.attack.setClientChaseMode(0);   // stand
     }
     bot.log("Client chase toggled to", enabled ? "ON" : "OFF");
   });
