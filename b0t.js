@@ -2993,7 +2993,18 @@ function getMonsterCandidates(now = Date.now()) {
 
   const visiblePlayers = bot.xray?.getVisiblePlayers?.({ sameFloorOnly: true }) || [];
   const myId = window.gameClient?.player?.id;
-  const otherPlayers = visiblePlayers.filter(p => p.id !== myId);
+
+  // Get trusted names (already normalized) from Panic module
+  const trustedNames = bot.panic?.getTrustedNames?.() || [];
+  const trustedSet = new Set(trustedNames);
+
+  // Filter out trusted players from the "other players" list
+  const otherPlayers = visiblePlayers.filter(p => {
+    if (p.id === myId) return false;
+    const name = normalizeCreatureName(p.name);   // use existing normalizer
+    return !trustedSet.has(name);
+  });
+
   const hasOtherPlayers = otherPlayers.length > 0 && config.antiKSEnabled;
   const maxDist = Math.max(1, Number(config.maxTargetDistance) || 5);
 
@@ -3007,22 +3018,17 @@ function getMonsterCandidates(now = Date.now()) {
       });
       if (!info.valid) return false;
 
-      // --- Apply max target distance filter ---
       const monsterPos = monster.getPosition?.() || monster.__position;
       if (!monsterPos) return false;
       const dist = Math.max(Math.abs(me.x - monsterPos.x), Math.abs(me.y - monsterPos.y));
       if (dist > maxDist) return false;
 
-      // Anti‑KS: if other players are present, only attack monsters within self range,
-      // and not within other range of any other player.
       if (hasOtherPlayers) {
         const selfRange = config.antiKSSelfRange ?? 2;
         const otherRange = config.antiKSOtherRange ?? 2;
 
-        // Must be within selfRange tiles of self (Chebyshev distance)
         if (dist > selfRange) return false;
 
-        // Must NOT be within otherRange of any other player
         for (const player of otherPlayers) {
           const pPos = player.getPosition?.() || player.__position;
           if (!pPos) continue;
@@ -3178,7 +3184,7 @@ function syncMeleeChase(now = Date.now()) {
     } else {
       if (!state.meleeStuckAt) state.meleeStuckAt = now;
       // If we haven't made progress for 5 seconds, skip
-      if (now - state.meleeStuckAt > 4000) {
+      if (now - state.meleeStuckAt > 7000) {
         skipTarget(target, "melee stuck (no progress)", now, 3000);
         return false;
       }
@@ -3597,7 +3603,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
   const defaultPresetName = "Default";
   const minimapOverlayRootId = "minibia-bot-cave-minimap-overlay";
   const minimapOverlayStyleId = "minibia-bot-cave-minimap-overlay-style";
-  const ladderItemIds = new Set([1948, 1968]);
+  const ladderItemIds = new Set([1948, 1968, 435]);
   const holeItemIds = new Set([12396]);
   const ropeNamePattern = /\brope\b/i;
   const shovelNamePattern = /\bshovel\b/i;
