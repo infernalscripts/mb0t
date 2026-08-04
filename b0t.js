@@ -2087,6 +2087,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
       enabled: false,
       preferredTargetNames: [],
       preferredMatchMode: "exact",
+      ignoredTargetNames: [],
       antiKSEnabled: true,
       antiKSSelfRange: 2,
       antiKSOtherRange: 2,
@@ -2139,6 +2140,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
       return name === pnorm;
     });
   }
+
 
 
 // ---- Helper ----
@@ -2991,17 +2993,24 @@ function getMonsterCandidates(now = Date.now()) {
   const me = bot.getPlayerPosition();
   if (!me) return [];
 
+  // --- BUILD IGNORED SET (Normalized) ---
+  const ignoredNames = new Set(
+    (config.ignoredTargetNames || [])
+      .map(n => normalizeCreatureName(n))
+      .filter(Boolean)
+  );
+
   const visiblePlayers = bot.xray?.getVisiblePlayers?.({ sameFloorOnly: true }) || [];
   const myId = window.gameClient?.player?.id;
 
-  // Get trusted names (already normalized) from Panic module
+  // Trusted players (from Panic)
   const trustedNames = bot.panic?.getTrustedNames?.() || [];
   const trustedSet = new Set(trustedNames);
 
-  // Filter out trusted players from the "other players" list
+  // Filter out trusted players
   const otherPlayers = visiblePlayers.filter(p => {
     if (p.id === myId) return false;
-    const name = normalizeCreatureName(p.name);   // use existing normalizer
+    const name = normalizeCreatureName(p.name);
     return !trustedSet.has(name);
   });
 
@@ -3011,6 +3020,10 @@ function getMonsterCandidates(now = Date.now()) {
   return getNearbyMonsters()
     .filter((monster) => !isTargetSkipped(monster, now))
     .filter((monster) => {
+      // --- IGNORED CHECK: Skip blacklisted monsters ---
+      const monsterName = normalizeCreatureName(monster.name);
+      if (ignoredNames.has(monsterName)) return false;
+
       const info = isTargetValidAndOnScreen(monster, {
         returnDetails: true,
         maxDx: 7,
@@ -3565,6 +3578,16 @@ function start(overrides = {}) {
     }
     if (nextConfig.antiKSOtherRange !== undefined) {
       nextConfig.antiKSOtherRange = Math.max(1, Math.trunc(Number(nextConfig.antiKSOtherRange) || 2));
+    }
+    if (nextConfig.preferredTargetNames !== undefined) {
+      nextConfig.preferredTargetNames = Array.isArray(nextConfig.preferredTargetNames)
+        ? nextConfig.preferredTargetNames.map(n => String(n).trim()).filter(Boolean)
+        : [];
+    }
+    if (nextConfig.ignoredTargetNames !== undefined) {
+      nextConfig.ignoredTargetNames = Array.isArray(nextConfig.ignoredTargetNames)
+        ? nextConfig.ignoredTargetNames.map(n => String(n).trim()).filter(Boolean)
+        : [];
     }
     Object.assign(config, nextConfig);
     persistConfig();
@@ -7767,6 +7790,20 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
     }
   }
 
+  function refreshAutoAttackIgnoredStatus(options = {}) {
+    const force = options.force === true;
+    const input = document.getElementById("minibia-bot-auto-attack-ignored-names");
+    const statusLabel = document.getElementById("minibia-bot-auto-attack-ignored-status");
+    const attackConfig = bot.attack?.status?.().config || bot.attack?.config || {};
+    const ignored = Array.isArray(attackConfig.ignoredTargetNames) ? attackConfig.ignoredTargetNames : [];
+    if (input && (force || document.activeElement !== input)) {
+      input.value = ignored.join(", ");
+    }
+    if (statusLabel) {
+      statusLabel.textContent = ignored.length ? `Ignored: ${ignored.join(", ")}` : "Ignored: none";
+    }
+  }
+
 // ---- Paladin UI ----
 function refreshPaladinStatus() {
   const toggle = document.getElementById("minibia-bot-paladin-enabled");
@@ -7864,6 +7901,14 @@ function refreshPinkSkullStatus() {
     bot.attack?.updateConfig?.({ preferredTargetNames: preferred, preferredMatchMode: mode });
     refreshAutoAttackPreferredStatus({ force: true });
     bot.log?.("auto attack preferred targets updated", { preferredTargetNames: preferred, preferredMatchMode: mode });
+  }
+  
+  function saveAutoAttackIgnoredConfig() {
+    const input = document.getElementById("minibia-bot-auto-attack-ignored-names");
+    const ignored = parsePreferredTargetNames(input?.value || ""); // Reuse the existing parser
+    bot.attack?.updateConfig?.({ ignoredTargetNames: ignored });
+    refreshAutoAttackIgnoredStatus({ force: true });
+    bot.log?.("auto attack ignored targets updated", { ignoredTargetNames: ignored });
   }
 
   // ---- HEAL UI ----
@@ -9471,7 +9516,23 @@ function refreshPinkSkullStatus() {
       <div class="mb-small-note" style="font-size:10px;">Ranked first, others allowed</div>
     </div>
   </div>
+  
+    <!-- Ignored Mobs (Blacklist) -->
+  <div class="mb-section" style="padding:6px 10px;">
+    <div style="display:flex; gap:6px; align-items:end; flex-wrap:wrap;">
+      <label class="mb-field" style="flex:1; min-width:100px;">
+        <span class="mb-field-label">Ignored Mobs (never attack)</span>
+        <textarea id="minibia-bot-auto-attack-ignored-names" placeholder="Dragon, Demon, Orc Berserker" style="min-height:28px;padding:3px 4px;font-size:11px;resize:vertical;"></textarea>
+      </label>
+      <button type="button" class="mb-small-button" id="minibia-bot-auto-attack-ignored-save" style="padding:3px 10px;font-size:11px;width:auto;">Save</button>
+    </div>
+    <div class="mb-small-note" id="minibia-bot-auto-attack-ignored-status" style="font-size:10px;">Ignored: none</div>
+  </div>
+  
+  
 </div>
+
+
 
     <!-- Talk Tab -->
     <div class="mb-tab-panel" data-tab-panel="talk">
@@ -10044,6 +10105,17 @@ if (clientChaseToggle) {
     bot.log("Client chase toggled to", enabled ? "ON" : "OFF");
   });
 }
+	
+	  // Ignored monster save button
+	 const ignoredSaveBtn = panel.querySelector("#minibia-bot-auto-attack-ignored-save");
+	 const ignoredInput = panel.querySelector("#minibia-bot-auto-attack-ignored-names");
+	 if (ignoredSaveBtn) {
+		ignoredSaveBtn.addEventListener("click", saveAutoAttackIgnoredConfig);
+	 }
+	 if (ignoredInput) {
+		ignoredInput.addEventListener("change", saveAutoAttackIgnoredConfig);
+		ignoredInput.addEventListener("blur", saveAutoAttackIgnoredConfig);
+	 }
 	
 	// ---- Light Hack ----
 	const lightHackToggle = panel.querySelector("#minibia-bot-light-hack-enabled");
@@ -10685,6 +10757,7 @@ if (clientChaseToggle) {
 	  refreshAutoMagicShieldStatus();
 	  refreshAutoAttackStatus();
 	  refreshAutoAttackPreferredStatus({ force: true });
+	  refreshAutoAttackIgnoredStatus({ force: true });
 	  refreshAutoEatStatus();
 	  refreshCaveStatus();
 	  refreshEquipRingStatus();
