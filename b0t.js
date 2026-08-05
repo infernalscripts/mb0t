@@ -27,8 +27,15 @@ window.__minibiaBotBundle = window.__minibiaBotBundle || {};
 window.__minibiaBotBundle.createBot = function createBot() {
   // ---- PRIVATE STATE ----
   const cleanups = [];                                      // Functions to run on destroy
+  // ---- ALARM AUDIO (Multiple Sounds) ----
   const defaultAlarmAudioSrc = "https://upload.wikimedia.org/wikipedia/commons/5/5c/En-us-red_alert.oga";
+  const playerAlarmSrc = "https://upload.wikimedia.org/wikipedia/commons/f/fc/Female_voice_saying_Player_on_screen.wav";
+  const gmAlarmSrc = "https://upload.wikimedia.org/wikipedia/commons/2/2d/Female_Voice_saying_Gamemaster_Detected.wav";
+  const antiBotAlarmSrc = "http://upload.wikimedia.org/wikipedia/commons/e/e3/Female_voice_saying_Anti-Bot_check.wav";
   const alarmAudioSrcStorageKey = "minibiaBot.audio.alarmSrc";
+  const playerAlarmStorageKey = "minibiaBot.audio.playerAlarmSrc";
+  const gmAlarmStorageKey = "minibiaBot.audio.gmAlarmSrc";
+  const antiBotAlarmStorageKey = "minibiaBot.audio.antiBotAlarmSrc";
   const recentSentChats = [];                               // Tracks recently sent messages (avoid duplicates)
   const reconnectButtonSelectors = [                        // CSS selectors to find a reconnect button
     "button", "[role=\"button\"]", "input[type=\"button\"]",
@@ -433,6 +440,36 @@ function startReconnectWatcher() {
         return true;
       } catch (error) {
         console.error("[minibia-bot] alarm failed", error);
+        return false;
+      }
+    },
+	
+	    /** Play the player-on-screen alarm */
+    playPlayerAlarm() {
+      return this._playSpecificAlarm(playerAlarmSrc, "playerAlarm");
+    },
+
+    /** Play the gamemaster-detected alarm */
+    playGMAlarm() {
+      return this._playSpecificAlarm(gmAlarmSrc, "gmAlarm");
+    },
+
+    /** Play the anti-bot-check alarm */
+    playAntiBotAlarm() {
+      return this._playSpecificAlarm(antiBotAlarmSrc, "antiBotAlarm");
+    },
+
+    /** Internal helper for specific alarms */
+    _playSpecificAlarm(src, label) {
+      try {
+        const audio = new Audio(src);
+        audio.preload = "auto";
+        audio.play().catch((error) => {
+          this.log(`${label} playback failed`, error?.message || error);
+        });
+        return true;
+      } catch (error) {
+        console.error(`[minibia-bot] ${label} failed`, error);
         return false;
       }
     },
@@ -1090,7 +1127,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
 
   function triggerGameMasterKillSwitch(players) {
     const detectedPlayers = (players || []).map(p => p?.name).filter(Boolean);
-    bot.playAlarm?.();
+    bot.playGMAlarm?.();
     bot.log("game master kill switch triggered", { players: detectedPlayers });
     // Stop all modules
     if (bot.rune?.stop) bot.rune.stop();
@@ -1197,7 +1234,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
 		  });
 		  if (otherPlayers.length > 0 && now - state.lastPlayerAlertAt >= config.playerAlertCooldownMs) {
 			state.lastPlayerAlertAt = now;
-			bot.playAlarm?.();
+			bot.playPlayerAlarm?.();
 			bot.log("player on-screen alert", { players: otherPlayers.map(p => p.name) });
 		  }
 		}
@@ -2107,6 +2144,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     config.targetHotbarSlot = storedConfig.hotbarSlot;
   }
 
+  // ---- Constants for floor-change detection (copied from cave module) ----
+  const ladderItemIds = new Set([1948, 1968, 435]);
+  const teleporterItemIds = new Set([5756]); // turtle teleport – add more IDs as needed
+
   function persistConfig() {
     bot.storage.set(configStorageKey, { ...config });
   }
@@ -2582,7 +2623,7 @@ function tryAttack() {
 
   // Skip only if clearly out of range (maxDist + 2)
   if (dist > maxDist + 2) {
-    skipTarget(current, "target too far (distance check)", now, 3000);
+    skipTarget(current, "target too far (distance check)", now, 2000);
     state.unreachableStart = 0;
     return false;
   }
@@ -2591,7 +2632,7 @@ function tryAttack() {
   if (dist <= maxDist + 2 && !isTargetReachable(current)) {
     if (!state.unreachableStart) state.unreachableStart = now;
     if (now - state.unreachableStart > 3000) {
-      skipTarget(current, "unreachable (wall)", now, 5000);
+      skipTarget(current, "unreachable (wall)", now, 2000);
       state.unreachableStart = 0;
       return false;
     }
@@ -2633,11 +2674,11 @@ function tryAttack() {
     const timeStuck = now - state.lastProgressAt;
 
     // Only skip if we've been stuck for >4s AND there is another visible monster
-    if (timeStuck > 4000) {
+    if (timeStuck > 6000) {
       const candidates = getMonsterCandidates(now);
       const hasAlternative = candidates.some(m => m.id !== current.id);
       if (hasAlternative) {
-        skipTarget(current, "no progress for 4s, alternative exists", now, 3000);
+        skipTarget(current, "no progress for 4s, alternative exists", now, 2000);
         state.unreachableStart = 0;
         return false;
       } else {
@@ -3072,12 +3113,12 @@ function getMonsterCandidates(now = Date.now()) {
 function resetTargetIfTooFar(now = Date.now()) {
   const current = getCurrentTarget();
   if (current && shouldGiveUpTarget(current)) {
-    skipTarget(current, "target too far", now, 10000);
+    skipTarget(current, "target too far", now, 5000);
     return true;
   }
   const engaged = getEngagedTarget();
   if (engaged && shouldGiveUpTarget(engaged)) {
-    skipTarget(engaged, "engaged target too far", now, 10000);
+    skipTarget(engaged, "engaged target too far", now, 5000);
     return true;
   }
   return false;
@@ -5950,6 +5991,81 @@ window.__minibiaBotBundle.installTalkModule = function installTalkModule(bot) {
     getChatMessages, config,
   };
 };
+
+window.__minibiaBotBundle.installAntiBotMonitorModule = function installAntiBotMonitorModule(bot) {
+  const state = {
+    running: false,
+    timerId: null,
+    lastTriggerAt: 0,
+    cooldownMs: 30000, // prevent spam
+  };
+
+  function start() {
+    if (state.running) return;
+    state.running = true;
+    bot.log("Anti-Bot monitor started");
+    checkChat();
+  }
+
+  function stop() {
+    state.running = false;
+    if (state.timerId) {
+      clearTimeout(state.timerId);
+      state.timerId = null;
+    }
+    bot.log("Anti-Bot monitor stopped");
+  }
+
+  function checkChat() {
+    if (!state.running) return;
+
+    try {
+      // Get messages from the console channel
+      const channels = window.gameClient?.interface?.channelManager?.channels || [];
+      const consoleChannel = channels.find(ch => ch?.name === "Console");
+      if (!consoleChannel) {
+        scheduleNext();
+        return;
+      }
+
+      const contents = consoleChannel.__contents || [];
+      const now = Date.now();
+
+      for (const entry of contents) {
+        const message = String(entry?.message || "").toLowerCase();
+        // Look for the word "bot" (case-insensitive)
+        if (message.includes("bot")) {
+          // Avoid triggering on our own messages or old ones
+          const time = entry?.__time ? new Date(entry.__time).getTime() : 0;
+          if (time && now - time > 5000) continue; // ignore old messages
+
+          if (now - state.lastTriggerAt > state.cooldownMs) {
+            state.lastTriggerAt = now;
+            bot.playAntiBotAlarm?.();
+            bot.log("Anti-Bot check triggered", { message });
+            break;
+          }
+        }
+      }
+    } catch (e) {
+      bot.log("Anti-Bot monitor error", e);
+    }
+
+    scheduleNext();
+  }
+
+  function scheduleNext() {
+    if (!state.running) return;
+    state.timerId = setTimeout(checkChat, 2000); // check every 2 seconds
+  }
+
+  // Public API
+  bot.antiBotMonitor = { start, stop };
+
+  // Auto-start if you want, or let the user enable it via UI
+  // start();
+};
+
 
 // Light hack
 
@@ -9370,6 +9486,7 @@ function refreshPinkSkullStatus() {
           <label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-health" /><span>Lose Health</span></label>
           <label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-return" /><span>Auto Return</span></label>
           <label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-player-alert" /><span>Player On‑Screen Alert (sound only)</span></label>
+		  <label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-antibot-enabled" /><span>Anti-Bot Monitor</span></label>
           <div style="display:flex;gap:6px;align-items:center;"><label style="font-size:11px;color:#e9d39b;">Cooldown (seconds)</label><input type="number" id="minibia-bot-panic-player-cooldown" min="10" value="60" style="width:60px;padding:2px 4px;font-size:11px;" /></div>
           <div class="mb-inline"><input type="text" id="minibia-bot-panic-trusted-input" placeholder="Trusted name" /><button type="button" class="mb-small-button" id="minibia-bot-panic-trusted-add">Add</button></div>
           <div class="mb-list" id="minibia-bot-panic-trusted-list"></div>
@@ -9484,16 +9601,18 @@ function refreshPinkSkullStatus() {
           <input type="number" id="minibia-bot-cave-tolerance" min="0" max="5" step="1" value="0" style="width:50px;padding:2px 4px;font-size:11px;" />
           <span style="font-size:11px;color:#cdbb8b;">tiles</span>
         </div>
-        <div style="margin:6px 0;">
-          <div class="mb-label" style="font-size:11px;margin:0 0 4px;">Waypoints</div>
-          <div id="minibia-bot-cave-waypoint-list" style="max-height:120px;overflow-y:auto;border:1px solid rgba(224,200,148,0.2);border-radius:4px;padding:2px;font-size:11px;"></div>
-        </div>
-        <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:4px;margin:4px 0;">
+		<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:4px;margin:4px 0;">
           <button type="button" class="mb-small-button" id="minibia-bot-cave-add" style="padding:4px;">+ Add</button>
           <button type="button" class="mb-small-button" id="minibia-bot-cave-move-up" style="padding:4px;">▲</button>
           <button type="button" class="mb-small-button" id="minibia-bot-cave-move-down" style="padding:4px;">▼</button>
           <button type="button" class="mb-small-button" id="minibia-bot-cave-delete-selected" style="padding:4px;background:#5a2020;border-color:#883030;">✕</button>
         </div>
+		
+        <div style="margin:6px 0;">
+          <div class="mb-label" style="font-size:11px;margin:0 0 4px;">Waypoints</div>
+          <div id="minibia-bot-cave-waypoint-list" style="max-height:120px;overflow-y:auto;border:1px solid rgba(224,200,148,0.2);border-radius:4px;padding:2px;font-size:11px;"></div>
+        </div>
+
         <div style="font-size:10px;color:#cdbb8b;margin-top:4px;display:grid;gap:2px;">
           <div id="minibia-bot-cave-status">Status: no waypoints</div>
           <div id="minibia-bot-cave-closest">Closest start: none</div>
@@ -9796,6 +9915,18 @@ function refreshPinkSkullStatus() {
     }
 
     // ---- EVENT LISTENERS ----
+	
+	const antiBotToggle = panel.querySelector("#minibia-bot-antibot-enabled");
+	if (antiBotToggle) {
+	  antiBotToggle.checked = !!bot.antiBotMonitor?.status?.().running;
+	  antiBotToggle.addEventListener("change", function() {
+		if (this.checked) {
+		  bot.antiBotMonitor.start();
+		} else {
+		  bot.antiBotMonitor.stop();
+		}
+	  });
+	}
 	
 	// ---- Fisher ----
 	const fisherToggle = panel.querySelector("#minibia-bot-fisher-enabled");
@@ -10942,6 +11073,7 @@ if (clientChaseToggle) {
 	currentBundle.installEquipRingModule(bot);
 	currentBundle.installAutoEatModule(bot);
 	currentBundle.installTalkModule(bot);
+	currentBundle.installAntiBotMonitorModule(bot);
 	currentBundle.installPaladinModule(bot);
 	currentBundle.installLooterModule(bot);
 	currentBundle.installLightHackModule(bot);
