@@ -1206,9 +1206,13 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
 	  }
 	}
 
-  function shouldRun() {
-    return !!(getGameMasterNames().length || config.unknownPlayerEnabled || config.healthLossEnabled);
-  }
+	function shouldRun() {
+	  // Run if any panic trigger is enabled OR if playerAlert is enabled
+	  return !!(getGameMasterNames().length || 
+				config.unknownPlayerEnabled || 
+				config.healthLossEnabled || 
+				config.playerAlertEnabled);
+	}
 
   function start() {
     if (state.running) return false;
@@ -2188,8 +2192,12 @@ function isLadderThing(thing) {
 }
 
 function isFloorChangeThing(thing) {
+  if (!thing?.id) return false;
   const def = getThingDefinition(thing?.id);
-  return !!def?.properties?.floorchange || isLadderThing(thing);
+  if (def?.properties?.floorchange) return true;
+  if (ladderItemIds.has(Number(thing.id))) return true;
+  if (teleporterItemIds.has(Number(thing.id))) return true;
+  return false;
 }
 
 function isFloorChangeTile(tile) {
@@ -3144,13 +3152,14 @@ function syncMeleeChase(now = Date.now()) {
 
   const dist = getTileDistance(playerPos, targetPos);
   const maxDist = Math.max(1, Number(config.maxTargetDistance) || 5);
-  
-  // --- OUT OF RANGE: skip with 5s cooldown ---
+
+  // If too far, skip (will be handled elsewhere)
   if (dist > maxDist) {
     skipTarget(target, "too far for melee", now, 3000);
     return false;
   }
 
+  // If already adjacent, no need to move
   if (dist <= 1) {
     state.meleeLastDist = Infinity;
     state.meleeProgressAt = 0;
@@ -3158,10 +3167,16 @@ function syncMeleeChase(now = Date.now()) {
     return false;
   }
 
-  // ---- Anti‑KS ----
+  // Anti‑KS (only if other non‑trusted players are nearby)
   const visiblePlayers = bot.xray?.getVisiblePlayers?.({ sameFloorOnly: true }) || [];
   const myId = window.gameClient?.player?.id;
-  const otherPlayers = visiblePlayers.filter(p => p.id !== myId);
+  const trustedNames = bot.panic?.getTrustedNames?.() || [];
+  const trustedSet = new Set(trustedNames);
+  const otherPlayers = visiblePlayers.filter(p => {
+    if (p.id === myId) return false;
+    const name = normalizeCreatureName(p.name);
+    return !trustedSet.has(name);
+  });
   const hasOtherPlayers = otherPlayers.length > 0 && config.antiKSEnabled;
 
   if (hasOtherPlayers) {
@@ -3183,8 +3198,7 @@ function syncMeleeChase(now = Date.now()) {
     }
   }
 
-  // ---- Progress & Stuck (for both custom and client chase) ----
-  // We'll track progress regardless of movement method
+  // ---- Stuck detection ----
   if (state.engagedTargetId !== target.id) {
     state.meleeLastDist = dist;
     state.meleeProgressAt = now;
@@ -3196,28 +3210,15 @@ function syncMeleeChase(now = Date.now()) {
       state.meleeStuckAt = 0;
     } else {
       if (!state.meleeStuckAt) state.meleeStuckAt = now;
-      // If we haven't made progress for 5 seconds, skip
-      if (now - state.meleeStuckAt > 7000) {
+      if (now - state.meleeStuckAt > 4000) {
         skipTarget(target, "melee stuck (no progress)", now, 3000);
         return false;
       }
     }
   }
 
-  // ---- Client Chase Mode ----
-  if (config.useClientChase) {
-    try {
-      const fms = window.gameClient?.interface?.fightModeSelector;
-      if (fms && typeof fms.setChaseMode === 'function') {
-        fms.setChaseMode(2);
-      }
-    } catch (e) {}
-    state.lastChaseAt = now;
-    return true;
-  }
-
-  // ---- Custom Step‑by‑Step Movement ----
-  if (now - state.lastMoveAt < 250) return false;
+  // ---- Move one step toward target ----
+  if (now - state.lastMoveAt < 250) return false; // throttle
 
   const dx = targetPos.x - playerPos.x;
   const dy = targetPos.y - playerPos.y;
@@ -3234,11 +3235,10 @@ function syncMeleeChase(now = Date.now()) {
     if (a.dx === 0 && a.dy === 0) continue;
     const nx = playerPos.x + a.dx;
     const ny = playerPos.y + a.dy;
-    const candidatePos = { x: nx, y: ny, z: playerPos.z };
-
-    if (!isSafeTileForKite(candidatePos)) continue;
+    // Don't try to walk onto the target's tile (it's occupied)
     if (nx === targetPos.x && ny === targetPos.y) continue;
 
+    // Check walkable, do NOT ignore creatures (so we can't walk into other creatures)
     if (isTileWalkable(nx, ny, playerPos.z, false)) {
       const dir = getDirection(a.dx, a.dy);
       if (dir !== null && window.gameClient?.keyboard) {
@@ -3251,24 +3251,7 @@ function syncMeleeChase(now = Date.now()) {
     }
   }
 
-  for (const a of attempts) {
-    if (a.dx === 0 && a.dy === 0) continue;
-    const nx = playerPos.x + a.dx;
-    const ny = playerPos.y + a.dy;
-    if (nx === targetPos.x && ny === targetPos.y) continue;
-    const candidatePos = { x: nx, y: ny, z: playerPos.z };
-    if (!isSafeTileForKite(candidatePos)) continue;
-    if (isTileWalkable(nx, ny, playerPos.z, true)) {
-      const dir = getDirection(a.dx, a.dy);
-      if (dir !== null && window.gameClient?.keyboard) {
-        window.gameClient.keyboard.handleMoveKey(dir);
-        state.lastChaseAt = now;
-        state.lastMoveAt = now;
-        return true;
-      }
-    }
-  }
-
+  // If cardinal and diagonal failed, try moving away? (fallback – not needed)
   return false;
 }
 
@@ -3628,6 +3611,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
   const minimapOverlayStyleId = "minibia-bot-cave-minimap-overlay-style";
   const ladderItemIds = new Set([1948, 1968, 435]);
   const holeItemIds = new Set([12396]);
+  const teleporterItemIds = new Set([5756]); // turtle teleport – add more IDs as needed
   const ropeNamePattern = /\brope\b/i;
   const shovelNamePattern = /\bshovel\b/i;
   const shovelTargetNamePatterns = [
@@ -3980,8 +3964,15 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
   }
 
   function isFloorChangeThing(thing) {
+    if (!thing?.id) return false;
+    // Check known floor‑change properties
     const def = getThingDefinition(thing?.id);
-    return !!def?.properties?.floorchange || isLadderThing(thing);
+    if (def?.properties?.floorchange) return true;
+    // Check ladders
+    if (ladderItemIds.has(Number(thing.id))) return true;
+    // Check teleporters
+    if (teleporterItemIds.has(Number(thing.id))) return true;
+    return false;
   }
 
   function isFloorChangeTile(tile) {
@@ -4481,32 +4472,70 @@ function goToWaypoint(waypoint) {
     return true;
   }
 
-  function handleFloorChange(waypoint, now = Date.now()) {
-    const position = normalizePosition(bot.getPlayerPosition());
-    if (!position || !waypoint || position.z === waypoint.z) return false;
-    const visible = findNearbyTransitionTile(position, waypoint);
-    if (visible) {
-      const moved = useFloorChangeTile(visible, waypoint, now);
+function handleFloorChange(waypoint, now = Date.now()) {
+  const position = normalizePosition(bot.getPlayerPosition());
+  if (!position || !waypoint || position.z === waypoint.z) return false;
+
+  // Try to find a visible transition tile
+  const visible = findNearbyTransitionTile(position, waypoint);
+  if (visible) {
+    const tile = visible.tile;
+    const tilePos = visible.position;
+    const isTeleporter = tile && teleporterItemIds.has(Number(tile.id));
+
+    if (isTeleporter) {
+      // Walk onto the teleporter tile
+      const moved = goToPosition(tilePos);
       if (moved) {
-        bot.log("cave probing visible floor-change tile", {
-          tileX: visible.position.x, tileY: visible.position.y, tileZ: visible.position.z,
-          targetZ: waypoint.z,
+        bot.log("cave walking onto teleporter tile", {
+          x: tilePos.x, y: tilePos.y, z: tilePos.z,
+          targetZ: waypoint.z
+        });
+        return true;
+      }
+      // Fallback: if walk fails, try using it anyway (just in case)
+    }
+
+    // For non‑teleporter tiles (stairs, ladders, holes), use them
+    const moved = useFloorChangeTile(visible, waypoint, now);
+    if (moved) {
+      bot.log("cave probing visible floor-change tile", {
+        tileX: visible.position.x, tileY: visible.position.y, tileZ: visible.position.z,
+        targetZ: waypoint.z,
+      });
+      return true;
+    }
+  }
+
+  // Fallback to learned transition
+  const known = findBestKnownTransition(position, waypoint);
+  if (known) {
+    const target = { tile: getTileAt(known.from), position: known.from };
+    const tile = target.tile;
+    const isTeleporter = tile && teleporterItemIds.has(Number(tile.id));
+
+    if (isTeleporter) {
+      const moved = goToPosition(known.from);
+      if (moved) {
+        bot.log("cave walking onto known teleporter tile", {
+          from: known.from, to: known.to, waypoint
         });
         return true;
       }
     }
-    const known = findBestKnownTransition(position, waypoint);
-    if (known) {
-      const target = { tile: getTileAt(known.from), position: known.from };
-      const moved = useFloorChangeTile(target, waypoint, now);
-      if (moved) {
-        bot.log("cave using learned floor transition", { from: known.from, to: known.to, waypoint });
-        return true;
-      }
-      bot.log("cave learned transition unavailable, falling back to live scan", { from: known.from, to: known.to, waypoint });
+
+    const moved = useFloorChangeTile(target, waypoint, now);
+    if (moved) {
+      bot.log("cave using learned floor transition", { from: known.from, to: known.to, waypoint });
+      return true;
     }
-    return false;
+    bot.log("cave learned transition unavailable, falling back to live scan", {
+      from: known.from, to: known.to, waypoint
+    });
   }
+
+  return false;
+}
 
   // ---- WAYPOINT NAVIGATION ----
 function advanceWaypoint() {
