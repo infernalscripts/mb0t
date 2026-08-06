@@ -6352,10 +6352,11 @@ window.__minibiaBotBundle.installSlimeTrainerModule = function installSlimeTrain
 
 window.__minibiaBotBundle.installLightHackModule = function installLightHackModule(bot) {
   const configStorageKey = "minibiaBot.lightHack.config";
-  let patched = false;
-  let patchInterval = null;
-  let retryCount = 0;
-  const MAX_RETRIES = 60; // 60 seconds total
+  const state = {
+    enabled: false,
+    originalIsLightingEnabled: null,
+    patched: false,
+  };
 
   const config = Object.assign(
     { enabled: false },
@@ -6366,20 +6367,61 @@ window.__minibiaBotBundle.installLightHackModule = function installLightHackModu
     bot.storage.set(configStorageKey, { ...config });
   }
 
-  // ----- DIRECT PATCHING (we now know the class) -----
-  function getCanvasClass() {
-    // Try window.Canvas first, then global Canvas
-    if (typeof window !== 'undefined' && window.Canvas) return window.Canvas;
-    if (typeof Canvas !== 'undefined') return Canvas;
-    return null;
+  function getSettings() {
+    return window.gameClient?.interface?.settings || null;
   }
 
-  function shouldSkipDarkRect(r, g, b, a) {
-    const dark = r <= 0.08 && g <= 0.08 && b <= 0.08;
-    return dark && a >= 0.10;
+  function patch() {
+    if (state.patched) return true;
+    const settings = getSettings();
+    if (!settings || typeof settings.isLightingEnabled !== "function") {
+      return false;
+    }
+
+    // Save original if not already saved
+    if (state.originalIsLightingEnabled === null) {
+      state.originalIsLightingEnabled = settings.isLightingEnabled.bind(settings);
+    }
+
+    // Override the instance method
+    settings.isLightingEnabled = function() {
+      return false;
+    };
+
+    // Also patch the prototype for any new instances (e.g., after a reload)
+    const proto = Object.getPrototypeOf(settings);
+    if (proto && typeof proto.isLightingEnabled === "function" && !proto.__minibia_light_hack_patched) {
+      proto.__minibia_light_hack_original = proto.isLightingEnabled;
+      proto.isLightingEnabled = function() {
+        return false;
+      };
+      proto.__minibia_light_hack_patched = true;
+    }
+
+    state.patched = true;
+    bot.log("LightHack: patched settings.isLightingEnabled");
+    forceRender();
+    return true;
   }
 
-  // Force re‑render (same as before)
+  function restore() {
+    if (!state.patched) return;
+    const settings = getSettings();
+    if (settings && state.originalIsLightingEnabled !== null) {
+      settings.isLightingEnabled = state.originalIsLightingEnabled;
+    }
+    // Restore prototype if we patched it
+    const proto = Object.getPrototypeOf(settings);
+    if (proto && proto.__minibia_light_hack_original) {
+      proto.isLightingEnabled = proto.__minibia_light_hack_original;
+      delete proto.__minibia_light_hack_original;
+      delete proto.__minibia_light_hack_patched;
+    }
+    state.patched = false;
+    bot.log("LightHack: restored original isLightingEnabled");
+    forceRender();
+  }
+
   function forceRender() {
     try {
       const gc = window.gameClient;
@@ -6392,194 +6434,19 @@ window.__minibiaBotBundle.installLightHackModule = function installLightHackModu
         canvas.height = h + 1;
         setTimeout(() => { canvas.width = w; canvas.height = h; }, 10);
       }
-      const settings = gc?.interface?.settings;
-      if (settings && typeof settings.setLightingEnabled === "function") {
-        settings.setLightingEnabled(!config.enabled);
-        settings.setLightingEnabled(config.enabled);
-      }
-      // Also try toggling the WebGL setting to force a redraw
-      if (settings && typeof settings.setWebGLEnabled === "function") {
-        settings.setWebGLEnabled(false);
-        settings.setWebGLEnabled(true);
-      }
     } catch (e) {
       bot.log("LightHack: forceRender failed", e);
     }
   }
 
-  // Apply all patches directly to the Canvas class
-  function applyPatches() {
-    if (patched) return true;
-
-    const C = getCanvasClass();
-    if (!C) {
-      retryCount++;
-      if (retryCount % 10 === 0) {
-        bot.log(`LightHack: Canvas class not found (attempt ${retryCount}) – retrying`);
-      }
-      return false;
-    }
-
-    // Cancel retry loop if we just found it
-    if (patchInterval) {
-      clearInterval(patchInterval);
-      patchInterval = null;
-    }
-
-    // ---- PATCH isWebGLEnabled ----
-    if (!C.__minibiaLightHackOriginalIsWebGLEnabled) {
-      C.__minibiaLightHackOriginalIsWebGLEnabled = C.isWebGLEnabled;
-    }
-    C.isWebGLEnabled = function() {
-      if (config.enabled) return false;
-      return C.__minibiaLightHackOriginalIsWebGLEnabled
-        ? C.__minibiaLightHackOriginalIsWebGLEnabled.apply(this, arguments)
-        : true;
-    };
-
-    // ---- PATCH drawFilledRect ----
-    if (C.prototype && typeof C.prototype.drawFilledRect === "function") {
-      if (!C.prototype.__minibiaLightHackOriginalDrawFilledRect) {
-        C.prototype.__minibiaLightHackOriginalDrawFilledRect = C.prototype.drawFilledRect;
-      }
-      C.prototype.drawFilledRect = function(x, y, size, r, g, b, a) {
-        if (config.enabled && shouldSkipDarkRect(r, g, b, a)) {
-          // Skip drawing the dark rectangle entirely
-          return;
-        }
-        return C.prototype.__minibiaLightHackOriginalDrawFilledRect.apply(this, arguments);
-      };
-    }
-
-    // ---- PATCH setTint ----
-    if (C.prototype && typeof C.prototype.setTint === "function") {
-      if (!C.prototype.__minibiaLightHackOriginalSetTint) {
-        C.prototype.__minibiaLightHackOriginalSetTint = C.prototype.setTint;
-      }
-      C.prototype.setTint = function(r, g, b) {
-        if (config.enabled && r <= 0.25 && g <= 0.25 && b <= 0.25) {
-          // Override dark tint with bright white
-          return C.prototype.__minibiaLightHackOriginalSetTint.call(this, 1, 1, 1);
-        }
-        return C.prototype.__minibiaLightHackOriginalSetTint.apply(this, arguments);
-      };
-    }
-
-    // ---- PATCH applyFilter (skip greyscale/sepia/saturate) ----
-    if (C.prototype && typeof C.prototype.applyFilter === "function") {
-      if (!C.prototype.__minibiaLightHackOriginalApplyFilter) {
-        C.prototype.__minibiaLightHackOriginalApplyFilter = C.prototype.applyFilter;
-      }
-      C.prototype.applyFilter = function(filter) {
-        if (config.enabled && (filter === "greyscale" || filter === "saturate" || filter === "sepia")) {
-          return;
-        }
-        return C.prototype.__minibiaLightHackOriginalApplyFilter.apply(this, arguments);
-      };
-    }
-
-    // ---- PATCH gameClient.interface.settings.isLightingEnabled ----
-    try {
-      const gc = window.gameClient;
-      const settings = gc?.interface?.settings;
-      if (settings && typeof settings.isLightingEnabled === "function") {
-        if (!settings.__minibiaLightHackOriginalLighting) {
-          settings.__minibiaLightHackOriginalLighting = settings.isLightingEnabled.bind(settings);
-        }
-        settings.isLightingEnabled = function() {
-          if (config.enabled) return false;
-          return settings.__minibiaLightHackOriginalLighting();
-        };
-      }
-    } catch (e) {}
-
-    // ---- SET localStorage flags ----
-    try {
-      const raw = localStorage.getItem("settings");
-      const obj = raw ? JSON.parse(raw) : {};
-      obj["enable-webgl"] = false;
-      obj["enable-lighting"] = false;
-      obj["lighting"] = false;
-      obj["enableLights"] = false;
-      localStorage.setItem("settings", JSON.stringify(obj));
-    } catch (e) {}
-
-    patched = true;
-    bot.log("LightHack: patches applied successfully");
-
-    // Force re‑render after patching
-    forceRender();
-
-    return true;
-  }
-
   function ensurePatched() {
-    if (patched) return;
-    if (patchInterval) {
-      clearInterval(patchInterval);
-      patchInterval = null;
+    if (state.patched) return;
+    if (!patch()) {
+      // Retry if settings not ready yet
+      setTimeout(ensurePatched, 500);
     }
-    retryCount = 0;
-    // Try immediately
-    if (applyPatches()) return;
-    // If not, retry
-    patchInterval = setInterval(() => {
-      if (retryCount > MAX_RETRIES) {
-        clearInterval(patchInterval);
-        patchInterval = null;
-        bot.log("LightHack: max retries reached, patches not applied");
-        return;
-      }
-      if (applyPatches()) {
-        clearInterval(patchInterval);
-        patchInterval = null;
-      }
-    }, 1000);
   }
 
-  function removePatches() {
-    patched = false;
-    if (patchInterval) {
-      clearInterval(patchInterval);
-      patchInterval = null;
-    }
-
-    const C = getCanvasClass();
-    if (C) {
-      if (C.__minibiaLightHackOriginalIsWebGLEnabled) {
-        C.isWebGLEnabled = C.__minibiaLightHackOriginalIsWebGLEnabled;
-        delete C.__minibiaLightHackOriginalIsWebGLEnabled;
-      }
-      if (C.prototype) {
-        if (C.prototype.__minibiaLightHackOriginalDrawFilledRect) {
-          C.prototype.drawFilledRect = C.prototype.__minibiaLightHackOriginalDrawFilledRect;
-          delete C.prototype.__minibiaLightHackOriginalDrawFilledRect;
-        }
-        if (C.prototype.__minibiaLightHackOriginalSetTint) {
-          C.prototype.setTint = C.prototype.__minibiaLightHackOriginalSetTint;
-          delete C.prototype.__minibiaLightHackOriginalSetTint;
-        }
-        if (C.prototype.__minibiaLightHackOriginalApplyFilter) {
-          C.prototype.applyFilter = C.prototype.__minibiaLightHackOriginalApplyFilter;
-          delete C.prototype.__minibiaLightHackOriginalApplyFilter;
-        }
-      }
-    }
-
-    try {
-      const gc = window.gameClient;
-      const settings = gc?.interface?.settings;
-      if (settings && settings.__minibiaLightHackOriginalLighting) {
-        settings.isLightingEnabled = settings.__minibiaLightHackOriginalLighting;
-        delete settings.__minibiaLightHackOriginalLighting;
-      }
-    } catch (e) {}
-
-    bot.log("LightHack: patches removed");
-    forceRender();
-  }
-
-  // ---- PUBLIC API ----
   function start() {
     if (config.enabled) return false;
     config.enabled = true;
@@ -6593,7 +6460,7 @@ window.__minibiaBotBundle.installLightHackModule = function installLightHackModu
     if (!config.enabled) return false;
     config.enabled = false;
     persistConfig();
-    removePatches();
+    restore();
     bot.log("LightHack disabled");
     return true;
   }
@@ -6616,11 +6483,9 @@ window.__minibiaBotBundle.installLightHackModule = function installLightHackModu
   // Auto‑apply on init if enabled
   if (config.enabled) {
     ensurePatched();
-    // Force a render after 200ms
     setTimeout(forceRender, 200);
   }
 
-  // Also expose a manual force‑render for debugging
   bot.lightHack = {
     start,
     stop,
