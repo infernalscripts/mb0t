@@ -1165,6 +1165,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
     if (bot.cave?.stop) bot.cave.stop();
     if (bot.attack?.stop) bot.attack.stop();
     if (bot.equipRing?.stop) bot.equipRing.stop();
+	if (bot.slimeTrainer?.stop) bot.slimeTrainer.stop();
     clearPendingReturn();
     config.unknownPlayerEnabled = false;
     config.healthLossEnabled = false;
@@ -6094,6 +6095,258 @@ window.__minibiaBotBundle.installAntiBotMonitorModule = function installAntiBotM
   // start();
 };
 
+window.__minibiaBotBundle.installSlimeTrainerModule = function installSlimeTrainerModule(bot) {
+  const configStorageKey = "minibiaBot.slimeTrainer.config";
+  const state = {
+    running: false,
+    timerId: null,
+    lastAttackAt: 0,
+    captureMode: false,
+  };
+
+  const config = Object.assign(
+    {
+      enabled: false,
+      motherSlimeId: null,
+      motherSlimeName: null,
+      tickMs: 300,
+    },
+    bot.storage.get(configStorageKey, {})
+  );
+
+  function persistConfig() {
+    bot.storage.set(configStorageKey, { ...config });
+  }
+
+  function getPlayerPosition() {
+    return bot.getPlayerPosition();
+  }
+
+  function getVisibleMonsters() {
+    let allCreatures = bot.xray?.getVisibleCreatures?.() || [];
+    if (!allCreatures.length) {
+      const active = window.gameClient?.world?.activeCreatures || {};
+      allCreatures = Object.values(active);
+    }
+    const me = bot.getPlayerPosition();
+    if (!me) return [];
+
+    return allCreatures.filter(c => {
+      const pos = c.__position || c.getPosition?.();
+      if (!pos || pos.z !== me.z) return false;
+      if (c.id === window.gameClient?.player?.id) return false;
+      return true;
+    });
+  }
+
+  function isAdjacentTile(pos1, pos2) {
+    if (!pos1 || !pos2 || pos1.z !== pos2.z) return false;
+    return Math.abs(pos1.x - pos2.x) <= 1 && Math.abs(pos1.y - pos2.y) <= 1;
+  }
+
+  function isSlimeCreature(creature) {
+    if (!creature?.name) return false;
+    const name = creature.name.toLowerCase();
+    return name.includes("slime") || name.includes("ooze") || name.includes("jelly");
+  }
+
+  function attackCreature(creature) {
+    if (!creature) return false;
+    try {
+      window.gameClient.player.setTarget(creature);
+      window.gameClient.send(new TargetPacket(creature.id));
+      state.lastAttackAt = Date.now();
+      return true;
+    } catch (e) {
+      // fallback to hotbar target if available
+      try {
+        const slot = bot.attack?.config?.targetHotbarSlot || 3;
+        const clicked = bot.clickHotbar(slot - 1);
+        if (clicked) {
+          state.lastAttackAt = Date.now();
+          return true;
+        }
+      } catch (e2) {
+        bot.log("Slime trainer: attack failed", e2);
+      }
+      return false;
+    }
+  }
+
+  function startCaptureMotherSlime() {
+    if (state.captureMode) return;
+    state.captureMode = true;
+    bot.log("Slime trainer: click on the Mother Slime to select it, or target it first.");
+
+    const handler = (event) => {
+      let creature = null;
+
+      try {
+        const worldObject = window.gameClient.mouse.getWorldObject(event);
+        if (worldObject && worldObject.which) {
+          if (worldObject.which.constructor.name === "Creature") {
+            creature = worldObject.which;
+          } else if (worldObject.which.constructor.name === "Tile") {
+            const tile = worldObject.which;
+            const pos = tile.getPosition();
+            const creatures = Object.values(window.gameClient.world.activeCreatures || {});
+            for (const c of creatures) {
+              const cPos = c.getPosition?.() || c.__position;
+              if (cPos && cPos.x === pos.x && cPos.y === pos.y && cPos.z === pos.z) {
+                creature = c;
+                break;
+              }
+            }
+          }
+        }
+      } catch (e) {}
+
+      if (!creature) {
+        try {
+          const worldPos = window.gameClient.renderer.screen.getWorldCoordinates(event);
+          if (worldPos && worldPos.__position) {
+            const pos = worldPos.__position;
+            const creatures = Object.values(window.gameClient.world.activeCreatures || {});
+            for (const c of creatures) {
+              const cPos = c.getPosition?.() || c.__position;
+              if (cPos && cPos.x === pos.x && cPos.y === pos.y && cPos.z === pos.z) {
+                creature = c;
+                break;
+              }
+            }
+          }
+        } catch (e) {}
+      }
+
+      if (!creature) {
+        try {
+          const currentTarget = window.gameClient.player.getTarget();
+          if (currentTarget && currentTarget.constructor.name === "Creature") {
+            creature = currentTarget;
+          }
+        } catch (e) {}
+      }
+
+      if (!creature) {
+        bot.log("No creature found. Try clicking directly on the creature or target it first.");
+        return;
+      }
+
+      config.motherSlimeId = creature.id;
+      config.motherSlimeName = creature.name || "Mother Slime";
+      persistConfig();
+      bot.log(`Mother Slime set: ${config.motherSlimeName} (ID: ${config.motherSlimeId})`);
+      state.captureMode = false;
+      document.removeEventListener("click", handler, true);
+      if (typeof bot.ui?.refreshSlimeTrainerStatus === "function") {
+        bot.ui.refreshSlimeTrainerStatus();
+      }
+    };
+
+    document.addEventListener("click", handler, true);
+  }
+
+  function tick() {
+    if (!state.running || !config.enabled) {
+      scheduleNextTick();
+      return;
+    }
+
+    const playerPos = getPlayerPosition();
+    if (!playerPos) {
+      scheduleNextTick();
+      return;
+    }
+
+    const monsters = getVisibleMonsters();
+    const motherId = config.motherSlimeId;
+
+    const slimeCandidates = monsters.filter(c => {
+      if (c.id === motherId) return false;
+      return isSlimeCreature(c);
+    });
+
+    if (!slimeCandidates.length) {
+      scheduleNextTick();
+      return;
+    }
+
+    const adjacentSlimes = slimeCandidates.filter(c => {
+      const pos = c.__position || c.getPosition?.();
+      if (!pos) return false;
+      return isAdjacentTile(playerPos, pos);
+    });
+
+    if (!adjacentSlimes.length) {
+      scheduleNextTick();
+      return;
+    }
+
+    const target = adjacentSlimes[0];
+    attackCreature(target);
+
+    scheduleNextTick();
+  }
+
+  function scheduleNextTick() {
+    if (!state.running) return;
+    state.timerId = window.setTimeout(tick, config.tickMs);
+  }
+
+  function start() {
+    if (state.running) return false;
+    config.enabled = true;
+    persistConfig();
+    state.running = true;
+    bot.log("Slime trainer started");
+    tick();
+    return true;
+  }
+
+  function stop(options = {}) {
+    const shouldPersist = options.persistEnabled !== false;
+    state.running = false;
+    if (state.timerId) {
+      clearTimeout(state.timerId);
+      state.timerId = null;
+    }
+    if (shouldPersist) {
+      config.enabled = false;
+      persistConfig();
+    }
+    bot.log("Slime trainer stopped");
+    return true;
+  }
+
+  function status() {
+    return {
+      running: state.running,
+      config: { ...config },
+      motherSlimeId: config.motherSlimeId,
+      motherSlimeName: config.motherSlimeName,
+    };
+  }
+
+  function updateConfig(next) {
+    Object.assign(config, next);
+    persistConfig();
+    if (config.enabled && !state.running) start();
+    if (!config.enabled && state.running) stop();
+    return { ...config };
+  }
+
+  if (config.enabled) start();
+
+  bot.slimeTrainer = {
+    start,
+    stop,
+    status,
+    updateConfig,
+    startCaptureMotherSlime,
+    config,
+  };
+};
+
 
 // Light hack
 
@@ -9473,6 +9726,7 @@ function refreshPinkSkullStatus() {
     <button type="button" class="mb-tab-button" data-tab-button="targeting">Targeting</button>
 	<button type="button" class="mb-tab-button" data-tab-button="paladin">Paladin Utility</button>
 	<button type="button" class="mb-tab-button" data-tab-button="looter">Looter</button>
+	<button type="button" class="mb-tab-button" data-tab-button="training">Training</button>
 	<button type="button" class="mb-tab-button" data-tab-button="profiles">Profiles</button>
     <button type="button" class="mb-tab-button" data-tab-button="talk">Talk</button>
     <button type="button" class="mb-tab-button" data-tab-button="xray">Xray</button>
@@ -9564,20 +9818,6 @@ function refreshPinkSkullStatus() {
 
 <!-- Utility Tab -->
 <div class="mb-tab-panel" data-tab-panel="utility">
-  <!-- ML Trainer -->
-  <div class="mb-section" style="padding:12px 16px;">
-    <div style="display:flex; gap:16px; align-items:center; flex-wrap:wrap;">
-      <label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-rune-enabled" /><span>ML Trainer</span></label>
-      <label class="mb-field" style="flex:2; min-width:140px;">
-        <span class="mb-field-label" style="font-size:10px;">Spell</span>
-        <input type="text" id="minibia-bot-rune-spell" placeholder="adori vita vis" style="padding:6px 10px;font-size:12px;" />
-      </label>
-      <label class="mb-field" style="flex:0 0 100px;">
-        <span class="mb-field-label" style="font-size:10px;">Mana Cost</span>
-        <input type="number" id="minibia-bot-rune-mana" min="0" placeholder="600" style="padding:6px 10px;font-size:12px;" />
-      </label>
-    </div>
-  </div>
 
   <!-- Utility Modules -->
   <div class="mb-section" style="padding:12px 16px;">
@@ -9902,6 +10142,41 @@ function refreshPinkSkullStatus() {
 </div>
 
 
+<!-- Training Tab -->
+<div class="mb-tab-panel" data-tab-panel="training">
+  <!-- ML Trainer -->
+  <div class="mb-section" style="padding:12px 16px;">
+    <div style="display:flex; gap:16px; align-items:center; flex-wrap:wrap;">
+      <label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-rune-enabled" /><span>ML Trainer</span></label>
+      <label class="mb-field" style="flex:2; min-width:140px;">
+        <span class="mb-field-label" style="font-size:10px;">Spell</span>
+        <input type="text" id="minibia-bot-rune-spell" placeholder="adori vita vis" style="padding:6px 10px;font-size:12px;" />
+      </label>
+      <label class="mb-field" style="flex:0 0 100px;">
+        <span class="mb-field-label" style="font-size:10px;">Mana Cost</span>
+        <input type="number" id="minibia-bot-rune-mana" min="0" placeholder="600" style="padding:6px 10px;font-size:12px;" />
+      </label>
+    </div>
+  </div>
+  
+  <div class="mb-section">
+    <div class="mb-label">Slime Trainer</div>
+    <div class="mb-stack">
+      <label class="mb-toggle mb-toggle-main">
+        <input type="checkbox" id="minibia-bot-slime-trainer-enabled" />
+        <span>Enable Slime Trainer</span>
+      </label>
+      <div style="display:flex; gap:6px; align-items:center;">
+        <button type="button" class="mb-small-button" id="minibia-bot-slime-trainer-capture">Select Mother Slime</button>
+        <span style="font-size:11px; color:#cdbb8b;" id="minibia-bot-slime-trainer-mother-status">None selected</span>
+      </div>
+      <div class="mb-small-note" id="minibia-bot-slime-trainer-status">Status: idle</div>
+      <div class="mb-small-note">Attacks adjacent slimes (except the mother slime). Stops when a GM is detected.</div>
+    </div>
+  </div>
+</div>
+
+
   </div> <!-- end mb-tab-content -->
 </div> <!-- end mb-body -->
 `;
@@ -9989,6 +10264,48 @@ function refreshPinkSkullStatus() {
 		} else {
 		  bot.antiBotMonitor.stop();
 		}
+	  });
+	}
+	
+	// ---- Slime Trainer UI ----
+	function refreshSlimeTrainerStatus() {
+	  const toggle = document.getElementById("minibia-bot-slime-trainer-enabled");
+	  const statusLabel = document.getElementById("minibia-bot-slime-trainer-status");
+	  const motherStatus = document.getElementById("minibia-bot-slime-trainer-mother-status");
+	  const status = bot.slimeTrainer?.status?.();
+
+	  if (toggle && document.activeElement !== toggle) {
+		toggle.checked = !!status?.running;
+	  }
+	  if (statusLabel) {
+		statusLabel.textContent = status?.running ? "Status: running" : "Status: idle";
+	  }
+	  if (motherStatus) {
+		const name = status?.motherSlimeName || "None";
+		const id = status?.motherSlimeId ? `(ID: ${status.motherSlimeId})` : "";
+		motherStatus.textContent = name !== "None" ? `${name} ${id}` : "None selected";
+	  }
+	}
+
+	// ---- Event listeners ----
+	const slimeToggle = panel.querySelector("#minibia-bot-slime-trainer-enabled");
+	const captureBtn = panel.querySelector("#minibia-bot-slime-trainer-capture");
+
+	if (slimeToggle) {
+	  slimeToggle.checked = !!bot.slimeTrainer?.status?.().running;
+	  slimeToggle.addEventListener("change", function() {
+		if (this.checked) {
+		  bot.slimeTrainer.start();
+		} else {
+		  bot.slimeTrainer.stop();
+		}
+		refreshSlimeTrainerStatus();
+	  });
+	}
+
+	if (captureBtn) {
+	  captureBtn.addEventListener("click", () => {
+		bot.slimeTrainer.startCaptureMotherSlime();
 	  });
 	}
 	
@@ -11027,6 +11344,7 @@ if (clientChaseToggle) {
 	  refreshProfileList();
 	  refreshBlacklist();
 	  refreshAntiAfkStatus();
+	  refreshSlimeTrainerStatus();
 	} catch (e) {
 	  console.error("[minibia-bot] UI init error:", e);
 	}
@@ -11167,6 +11485,7 @@ if (clientChaseToggle) {
 	currentBundle.installAutoEatModule(bot);
 	currentBundle.installTalkModule(bot);
 	currentBundle.installAntiBotMonitorModule(bot);
+	currentBundle.installSlimeTrainerModule(bot);
 	currentBundle.installPaladinModule(bot);
 	currentBundle.installLooterModule(bot);
 	currentBundle.installLightHackModule(bot);
