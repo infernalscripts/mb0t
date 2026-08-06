@@ -36,11 +36,22 @@ window.__minibiaBotBundle.createBot = function createBot() {
   const playerAlarmStorageKey = "minibiaBot.audio.playerAlarmSrc";
   const gmAlarmStorageKey = "minibiaBot.audio.gmAlarmSrc";
   const antiBotAlarmStorageKey = "minibiaBot.audio.antiBotAlarmSrc";
+  const reconnectEnabledStorageKey = "minibiaBot.reconnect.enabled";
   const recentSentChats = [];                               // Tracks recently sent messages (avoid duplicates)
   const reconnectButtonSelectors = [                        // CSS selectors to find a reconnect button
     "button", "[role=\"button\"]", "input[type=\"button\"]",
     "input[type=\"submit\"]", "a", ".button", ".btn",
   ];
+	function getReconnectEnabled() {
+	  try {
+		const value = window.localStorage.getItem(reconnectEnabledStorageKey);
+		return value === "true"; // default false
+	  } catch { return false; }
+	}
+
+	function setReconnectEnabled(enabled) {
+	  window.localStorage.setItem(reconnectEnabledStorageKey, JSON.stringify(!!enabled));
+	}
   let alarmAudio = null;                                    // Audio element for alarm sounds
   let reconnectObserver = null;                             // MutationObserver for reconnect detection
   let reconnectPollTimerId = null;                          // Interval timer for reconnect polling
@@ -216,7 +227,10 @@ function startReconnectWatcher() {
     if (reconnectObserver) { reconnectObserver.disconnect(); reconnectObserver = null; }
     if (reconnectPollTimerId) { window.clearInterval(reconnectPollTimerId); reconnectPollTimerId = null; }
   }
-  startReconnectWatcher();
+  
+	if (getReconnectEnabled()) {
+	  startReconnectWatcher();
+	}
 
   // ---- __imB COUNTER RESET (prevents input spam detection) ----
   let __imbResetInterval = null;
@@ -289,7 +303,7 @@ function startReconnectWatcher() {
 
   // ---- PUBLIC API ----
   return {
-    version: "0.5.8",
+    version: "0.6.5",
     addCleanup,
 
     /** Destroy the bot and all its modules (call before reload) */
@@ -330,6 +344,20 @@ function startReconnectWatcher() {
         window.localStorage.removeItem(key);
       }
     },
+
+	reconnect: {
+	  enable: () => {
+		setReconnectEnabled(true);
+		startReconnectWatcher();
+	  },
+	  disable: () => {
+		setReconnectEnabled(false);
+		stopReconnectWatcher();
+	  },
+	  isEnabled: getReconnectEnabled,
+	  start: startReconnectWatcher,
+	  stop: stopReconnectWatcher,
+	},
 
     /** Game client accessors */
     getPlayerPosition() {
@@ -9439,16 +9467,16 @@ function refreshPinkSkullStatus() {
 <div class="mb-body">
   <div class="mb-tab-menu">
     <button type="button" class="mb-tab-button" data-tab-button="healing">Healing</button>
-    <button type="button" class="mb-tab-button" data-tab-button="panic">Panic</button>
-    <button type="button" class="mb-tab-button" data-tab-button="xray">Xray</button>
+    <button type="button" class="mb-tab-button" data-tab-button="panic">Alerts</button>
     <button type="button" class="mb-tab-button" data-tab-button="utility">Utility</button>
     <button type="button" class="mb-tab-button" data-tab-button="cave">Cavebot</button>
     <button type="button" class="mb-tab-button" data-tab-button="targeting">Targeting</button>
-    <button type="button" class="mb-tab-button" data-tab-button="talk">Talk</button>
-	<button type="button" class="mb-tab-button" data-tab-button="paladin">Paladin</button>
+	<button type="button" class="mb-tab-button" data-tab-button="paladin">Paladin Utility</button>
 	<button type="button" class="mb-tab-button" data-tab-button="looter">Looter</button>
 	<button type="button" class="mb-tab-button" data-tab-button="profiles">Profiles</button>
-	<button type="button" class="mb-tab-button" data-tab-button="blacklist">Blacklist</button>
+    <button type="button" class="mb-tab-button" data-tab-button="talk">Talk</button>
+    <button type="button" class="mb-tab-button" data-tab-button="xray">Xray</button>
+	<button type="button" class="mb-tab-button" data-tab-button="blacklist">Blacklisted Tiles</button>
   </div>
   <div class="mb-tab-content">
     <!-- Healing Tab -->
@@ -9478,16 +9506,25 @@ function refreshPinkSkullStatus() {
 
     <!-- Panic Tab -->
     <div class="mb-tab-panel" data-tab-panel="panic">
+	
       <div class="mb-section">
-        <div class="mb-label" id="minibia-bot-home">Panic Runner Home: not set</div>
         <div class="mb-stack">
-          <button type="button" id="minibia-bot-set-home">Set Home</button>
-          <label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-unknown" /><span>Unknown Player</span></label>
-          <label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-health" /><span>Lose Health</span></label>
-          <label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-return" /><span>Auto Return</span></label>
-          <label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-player-alert" /><span>Player On‑Screen Alert (sound only)</span></label>
-		  <label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-antibot-enabled" /><span>Anti-Bot Monitor</span></label>
-          <div style="display:flex;gap:6px;align-items:center;"><label style="font-size:11px;color:#e9d39b;">Cooldown (seconds)</label><input type="number" id="minibia-bot-panic-player-cooldown" min="10" value="60" style="width:60px;padding:2px 4px;font-size:11px;" /></div>
+		<div style="display:grid; grid-template-columns:1fr 1fr; gap:12px 32px;">
+		  <!-- Left Column -->
+		  <div style="display:flex; flex-direction:column; gap:10px;">
+		
+			<label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-player-alert" /><span>Player On Screen</span></label>
+		  
+		  </div>
+		  <!-- Right Column -->
+		  <div style="display:flex; flex-direction:column; gap:10px;">
+
+			<label class="mb-toggle"><input type="checkbox" id="minibia-bot-antibot-enabled" /><span>Anti-Bot Monitor</span></label>
+
+		  </div>
+		</div>
+
+          <div style="display:flex;gap:6px;align-items:center;"><label style="font-size:11px;color:#e9d39b;">Alert Cooldown (s)</label><input type="number" id="minibia-bot-panic-player-cooldown" min="10" value="10" style="width:60px;padding:2px 4px" /></div>
           <div class="mb-inline"><input type="text" id="minibia-bot-panic-trusted-input" placeholder="Trusted name" /><button type="button" class="mb-small-button" id="minibia-bot-panic-trusted-add">Add</button></div>
           <div class="mb-list" id="minibia-bot-panic-trusted-list"></div>
         </div>
@@ -9499,6 +9536,17 @@ function refreshPinkSkullStatus() {
           <div class="mb-list" id="minibia-bot-panic-gm-list"></div>
         </div>
       </div>
+	  
+	  <div class="mb-section">
+        <div class="mb-label" id="minibia-bot-home">Panic Runner Home: not set</div>
+        <div class="mb-stack">
+          <button type="button" id="minibia-bot-set-home">Set Home</button>
+          <label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-unknown" /><span>Unknown Player</span></label>
+          <label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-health" /><span>Healthloss</span></label>
+          <label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-return" /><span>Auto Return to Position</span></label>
+        </div>
+      </div>
+	  
     </div>
 
     <!-- Xray Tab -->
@@ -9537,31 +9585,29 @@ function refreshPinkSkullStatus() {
       <!-- Left Column -->
       <div style="display:flex; flex-direction:column; gap:10px;">
         <div style="display:flex; align-items:center; gap:12px;">
-          <label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-auto-eat-enabled" /><span>Eat</span></label>
+          <label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-auto-eat-enabled" /><span>Eat Food</span></label>
           <label class="mb-field" style="flex:0 0 60px;">
-            <span class="mb-field-label" style="font-size:9px;">Key</span>
             <input type="number" id="minibia-bot-auto-eat-hotkey" min="1" max="12" placeholder="10" style="padding:4px 4px;font-size:12px;text-align:center;" />
           </label>
         </div>
         <label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-auto-invisible-enabled" /><span>Invisible</span></label>
         <label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-light-hack-enabled" /><span>Light Hack</span></label>
+		<!-- Anti-AFK (Full Width) -->
+		<label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-antiafk-enabled" /><span>Anti-AFK</span></label>
+	  
       </div>
       <!-- Right Column -->
       <div style="display:flex; flex-direction:column; gap:10px;">
         <label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-auto-magic-shield-enabled" /><span>Utamo Vita</span></label>
         <label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-equip-ring-enabled" /><span>Equip Ring</span></label>
         <label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-pink-skull-enabled" /><span>Pink Skull</span></label>
+		<label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-reconnect-enabled" /><span>Auto‑Reconnect</span></label>
       </div>
     </div>
 
-    <!-- Anti-AFK (Full Width) -->
-    <div style="display:flex; align-items:center; gap:16px; margin-top:12px; padding-top:12px; border-top:1px solid rgba(255,255,255,0.08); flex-wrap:wrap;">
-      <label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-antiafk-enabled" /><span>Anti-AFK</span></label>
-      <label class="mb-field" style="flex:0 0 80px;">
-        <span class="mb-field-label" style="font-size:10px;">Interval (s)</span>
-        <input type="number" id="minibia-bot-antiafk-interval" min="10" max="300" value="60" style="padding:4px 6px;font-size:12px;text-align:center;" />
-      </label>
-    </div>
+
+
+
 
     <!-- Fisher (Full Width) -->
     <div style="display:flex; align-items:center; gap:14px; margin-top:12px; padding-top:12px; border-top:1px solid rgba(255,255,255,0.08); flex-wrap:wrap;">
@@ -9915,6 +9961,24 @@ function refreshPinkSkullStatus() {
     }
 
     // ---- EVENT LISTENERS ----
+	
+	// ---- Set Home button ----
+	const setHomeBtn = panel.querySelector("#minibia-bot-set-home");
+	if (setHomeBtn) {
+	  setHomeBtn.addEventListener("click", () => {
+		bot.setHomePzCurrentSpot?.();
+		refreshHomeLabel();   // updates the label right away
+	  });
+	}
+	
+	const reconnectToggle = panel.querySelector("#minibia-bot-reconnect-enabled");
+	if (reconnectToggle) {
+	  reconnectToggle.checked = bot.reconnect.isEnabled();
+	  reconnectToggle.addEventListener("change", function() {
+		if (this.checked) bot.reconnect.enable();
+		else bot.reconnect.disable();
+	  });
+	}
 	
 	const antiBotToggle = panel.querySelector("#minibia-bot-antibot-enabled");
 	if (antiBotToggle) {
@@ -10897,6 +10961,35 @@ if (clientChaseToggle) {
 		  event.preventDefault();
 		  addTrustedName();
 		}
+	  });
+	}
+	
+	// ---- Panic toggles: Unknown Player, Healthloss, Auto Return ----
+	const unknownToggle = panel.querySelector("#minibia-bot-panic-unknown");
+	const healthToggle = panel.querySelector("#minibia-bot-panic-health");
+	const returnToggle = panel.querySelector("#minibia-bot-panic-return");
+
+	if (unknownToggle) {
+	  unknownToggle.checked = !!bot.panic?.config?.unknownPlayerEnabled;
+	  unknownToggle.addEventListener("change", () => {
+		bot.panic.updateConfig({ unknownPlayerEnabled: unknownToggle.checked });
+		refreshPanicStatus();
+	  });
+	}
+
+	if (healthToggle) {
+	  healthToggle.checked = !!bot.panic?.config?.healthLossEnabled;
+	  healthToggle.addEventListener("change", () => {
+		bot.panic.updateConfig({ healthLossEnabled: healthToggle.checked });
+		refreshPanicStatus();
+	  });
+	}
+
+	if (returnToggle) {
+	  returnToggle.checked = !!bot.panic?.config?.returnToOriginEnabled;
+	  returnToggle.addEventListener("change", () => {
+		bot.panic.updateConfig({ returnToOriginEnabled: returnToggle.checked });
+		refreshPanicStatus();
 	  });
 	}
 
