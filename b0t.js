@@ -6144,12 +6144,6 @@ window.__minibiaBotBundle.installSlimeTrainerModule = function installSlimeTrain
     return Math.abs(pos1.x - pos2.x) <= 1 && Math.abs(pos1.y - pos2.y) <= 1;
   }
 
-  function isSlimeCreature(creature) {
-    if (!creature?.name) return false;
-    const name = creature.name.toLowerCase();
-    return name.includes("slime") || name.includes("ooze") || name.includes("jelly");
-  }
-
   function attackCreature(creature) {
     if (!creature) return false;
     try {
@@ -6261,28 +6255,26 @@ window.__minibiaBotBundle.installSlimeTrainerModule = function installSlimeTrain
     const monsters = getVisibleMonsters();
     const motherId = config.motherSlimeId;
 
-    const slimeCandidates = monsters.filter(c => {
-      if (c.id === motherId) return false;
-      return isSlimeCreature(c);
-    });
+    // Exclude ONLY the mother slime – attack ANY other monster that is adjacent
+    const candidates = monsters.filter(c => c.id !== motherId);
 
-    if (!slimeCandidates.length) {
+    if (!candidates.length) {
       scheduleNextTick();
       return;
     }
 
-    const adjacentSlimes = slimeCandidates.filter(c => {
+    const adjacent = candidates.filter(c => {
       const pos = c.__position || c.getPosition?.();
       if (!pos) return false;
       return isAdjacentTile(playerPos, pos);
     });
 
-    if (!adjacentSlimes.length) {
+    if (!adjacent.length) {
       scheduleNextTick();
       return;
     }
 
-    const target = adjacentSlimes[0];
+    const target = adjacent[0];
     attackCreature(target);
 
     scheduleNextTick();
@@ -8040,6 +8032,194 @@ function updateFisherUI(tilePos) {
 
 /**
  * ==================================================================================
+ * STACKER MODULE
+ * ==================================================================================
+ */
+
+window.__minibiaBotBundle.installAutoStackerModule = function installAutoStackerModule(bot) {
+  const configStorageKey = "minibiaBot.autostacker.config";
+  const state = {
+    running: false,
+    timerId: null,
+  };
+
+  const config = Object.assign(
+    {
+      enabled: false,
+      tickMs: 5000,
+    },
+    bot.storage.get(configStorageKey, {})
+  );
+
+  function persistConfig() {
+    bot.storage.set(configStorageKey, { ...config });
+  }
+
+  function getContainers() {
+    const containers = window.gameClient?.player?.__openedContainers;
+    if (!containers) return [];
+    if (Array.isArray(containers)) return containers;
+    if (containers instanceof Set) return Array.from(containers);
+    if (containers instanceof Map) return Array.from(containers.values());
+    if (typeof containers === "object") return Object.values(containers);
+    return [];
+  }
+
+  function moveItemsInContainer(container, fromSlot, toSlot, count) {
+    if (!container || fromSlot === toSlot || count <= 0) return false;
+    try {
+      const from = { which: container, index: fromSlot };
+      const to = { which: container, index: toSlot };
+
+      if (window.gameClient?.mouse?.sendItemMove) {
+        window.gameClient.mouse.sendItemMove(from, to, count);
+        return true;
+      }
+      if (window.gameClient?.send && typeof ItemMovePacket === "function") {
+        window.gameClient.send(new ItemMovePacket(from, to, count));
+        return true;
+      }
+      if (window.gameClient?.mouse?.__handleItemMove) {
+        window.gameClient.mouse.__handleItemMove(from, to, count);
+        return true;
+      }
+      return false;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function stackItems() {
+    if (!config.enabled || !state.running) return false;
+
+    const containers = getContainers();
+    if (!containers.length) return false;
+
+    let movedAny = false;
+
+    for (const container of containers) {
+      const itemMap = new Map();
+      const size = container.size || container.slots?.length || 0;
+      for (let slot = 0; slot < size; slot++) {
+        const item = container.getSlotItem(slot);
+        if (!item) continue;
+        const id = item.id;
+        const count = item.count || 1;
+        if (!itemMap.has(id)) itemMap.set(id, []);
+        itemMap.get(id).push({ slot, count });
+      }
+
+      for (const [itemId, stacks] of itemMap) {
+        if (stacks.length <= 1) continue;
+
+        stacks.sort((a, b) => a.slot - b.slot);
+        const maxStack = 100;
+
+        let moved = true;
+        while (moved) {
+          moved = false;
+          for (let srcIdx = stacks.length - 1; srcIdx >= 1; srcIdx--) {
+            const source = stacks[srcIdx];
+            if (source.count === 0) continue;
+
+            for (let tgtIdx = 0; tgtIdx < srcIdx; tgtIdx++) {
+              const target = stacks[tgtIdx];
+              const room = maxStack - target.count;
+              if (room <= 0) continue;
+
+              const moveCount = Math.min(source.count, room);
+              if (moveCount <= 0) continue;
+
+              const success = moveItemsInContainer(container, source.slot, target.slot, moveCount);
+              if (success) {
+                source.count -= moveCount;
+                target.count += moveCount;
+                moved = true;
+                movedAny = true;
+                break;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if (movedAny) {
+      // Only log once per tick if we moved something
+      bot.log("AutoStacker: combined some stacks");
+    }
+    return movedAny;
+  }
+
+  function scheduleNextTick() {
+    if (!state.running) return;
+    state.timerId = window.setTimeout(() => {
+      try {
+        stackItems();
+      } catch (e) {
+        bot.log("AutoStacker tick failed", e);
+      } finally {
+        scheduleNextTick();
+      }
+    }, config.tickMs);
+  }
+
+  function start() {
+    if (state.running) return false;
+    config.enabled = true;
+    persistConfig();
+    state.running = true;
+    bot.log("AutoStacker started");
+    stackItems();
+    scheduleNextTick();
+    return true;
+  }
+
+  function stop(options = {}) {
+    const shouldPersist = options.persistEnabled !== false;
+    state.running = false;
+    if (state.timerId) {
+      clearTimeout(state.timerId);
+      state.timerId = null;
+    }
+    if (shouldPersist) {
+      config.enabled = false;
+      persistConfig();
+    }
+    bot.log("AutoStacker stopped");
+    return true;
+  }
+
+  function status() {
+    return {
+      running: state.running,
+      config: { ...config },
+    };
+  }
+
+  function updateConfig(next) {
+    Object.assign(config, next);
+    persistConfig();
+    if (config.enabled && !state.running) start();
+    if (!config.enabled && state.running) stop();
+    return { ...config };
+  }
+
+  if (config.enabled) start();
+
+  bot.autoStacker = {
+    start,
+    stop,
+    status,
+    updateConfig,
+    config,
+    stackItems,
+  };
+};
+
+
+/**
+ * ==================================================================================
  * 14. UI PANEL
  *     Injects a draggable, collapsible panel with tabs for each module.
  *     Provides real‑time controls, status indicators, and refresh functions.
@@ -9699,6 +9879,7 @@ function refreshPinkSkullStatus() {
         <label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-light-hack-enabled" /><span>Light Hack</span></label>
 		<!-- Anti-AFK (Full Width) -->
 		<label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-antiafk-enabled" /><span>Anti-AFK</span></label>
+		<label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-autostacker-enabled" /><span>Auto Stacker</span></label>
 	  
       </div>
       <!-- Right Column -->
@@ -10101,6 +10282,62 @@ function refreshPinkSkullStatus() {
     }
 
     // ---- EVENT LISTENERS ----
+	
+	// ---- AutoStacker ----
+	function refreshAutoStackerStatus() {
+	  const toggle = document.getElementById("minibia-bot-autostacker-enabled");
+	  if (!toggle) return;
+	  const status = bot.autoStacker?.status?.();
+	  toggle.checked = !!status?.running;
+	}
+
+	const autoStackerToggle = panel.querySelector("#minibia-bot-autostacker-enabled");
+	if (autoStackerToggle) {
+	  autoStackerToggle.checked = !!bot.autoStacker?.status?.().running;
+	  autoStackerToggle.addEventListener("change", function() {
+		if (this.checked) {
+		  bot.autoStacker.start();
+		} else {
+		  bot.autoStacker.stop();
+		}
+		refreshAutoStackerStatus();
+	  });
+	}
+	
+	// ---- Rune trainer ----
+	const runeEnabledInput = panel.querySelector("#minibia-bot-rune-enabled");
+	const runeSpellInput = panel.querySelector("#minibia-bot-rune-spell");
+	const runeManaInput = panel.querySelector("#minibia-bot-rune-mana");
+
+	if (runeSpellInput) {
+	  runeSpellInput.value = bot.rune?.config?.runeSpellWords || "";
+	  runeSpellInput.addEventListener("change", () => {
+		bot.rune.updateConfig({ runeSpellWords: runeSpellInput.value.trim() });
+	  });
+	}
+
+	if (runeManaInput) {
+	  runeManaInput.value = String(bot.rune?.config?.runeManaCost ?? 0);
+	  runeManaInput.addEventListener("change", () => {
+		const mana = Math.max(0, Number(runeManaInput.value) || 0);
+		runeManaInput.value = String(mana);
+		bot.rune.updateConfig({ runeManaCost: mana });
+	  });
+	}
+
+	if (runeEnabledInput) {
+	  runeEnabledInput.checked = !!bot.rune?.status?.().running;
+	  runeEnabledInput.addEventListener("change", function() {
+		const spell = runeSpellInput?.value?.trim() || bot.rune.config.runeSpellWords;
+		const mana = Math.max(0, Number(runeManaInput?.value) || bot.rune.config.runeManaCost || 0);
+		if (this.checked) {
+		  bot.rune.start({ runeSpellWords: spell, runeManaCost: mana });
+		} else {
+		  bot.rune.stop();
+		}
+		refreshRuneStatus();
+	  });
+	}
 	
 	// ---- Set Home button ----
 	const setHomeBtn = panel.querySelector("#minibia-bot-set-home");
@@ -11210,6 +11447,7 @@ if (clientChaseToggle) {
 	  refreshBlacklist();
 	  refreshAntiAfkStatus();
 	  refreshSlimeTrainerStatus();
+	  refreshAutoStackerStatus();
 	} catch (e) {
 	  console.error("[minibia-bot] UI init error:", e);
 	}
@@ -11358,6 +11596,7 @@ if (clientChaseToggle) {
 	currentBundle.installProfileModule(bot);
 	currentBundle.installAntiAfkModule(bot);
 	currentBundle.installFisherModule(bot);
+	currentBundle.installAutoStackerModule(bot);
 	currentBundle.installPanel(bot);
 
     bot.ui.inject();
