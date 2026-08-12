@@ -300,10 +300,106 @@ function startReconnectWatcher() {
   } else {
     console.warn('[minibia-bot] gameClient.send not available – counter patch skipped');
   }
+  
+  // ---- ITEM FINDER ----
+  function findItemById(itemId) {
+    const eq = window.gameClient?.player?.equipment;
+    const containers = window.gameClient?.player?.__openedContainers || [];
+    if (eq) {
+      for (let i = 0; i < eq.slots.length; i++) {
+        const item = eq.getSlotItem(i);
+        if (item && item.id === itemId) return { container: eq, slot: i, item };
+      }
+    }
+    const arr = Array.isArray(containers) ? containers : Array.from(containers);
+    for (const container of arr) {
+      if (!container || typeof container.size !== 'number') continue;
+      for (let i = 0; i < container.size; i++) {
+        const item = container.getSlotItem(i);
+        if (item && item.id === itemId) return { container, slot: i, item };
+      }
+    }
+    return null;
+  }
+
+  function useItemFromSource(source) {
+    if (!source) return false;
+    try {
+      if (window.gameClient?.mouse?.use) {
+        window.gameClient.mouse.use({ which: source.container, index: source.slot });
+        return true;
+      }
+      if (window.gameClient?.send && typeof UsePacket === 'function') {
+        window.gameClient.send(new UsePacket(source.container, source.slot));
+        return true;
+      }
+      return false;
+    } catch (e) {
+      this.log('useItem failed', e);
+      return false;
+    }
+  }
+
+  // ---- TILE HELPERS ----
+  function getTileAtPosition(pos) {
+    if (!pos) return null;
+    return window.gameClient?.world?.getTileFromWorldPosition?.(new Position(pos.x, pos.y, pos.z)) || null;
+  }
+
+  function getTopItemOnTile(tile) {
+    if (!tile) return null;
+    if (tile.id) return tile;
+    if (Array.isArray(tile.items) && tile.items.length > 0) {
+      return tile.items[0];
+    }
+    return null;
+  }
+
+  function getItemId(thing) {
+    return thing?.id ?? null;
+  }
+
+  function useItemOnTile(source, tile) {
+    if (!source || !tile) return false;
+    try {
+      const from = { which: source.container, index: source.slot };
+      const to = { which: tile, index: 0xFF };
+      if (window.gameClient?.mouse?.__handleItemUseWith) {
+        window.gameClient.mouse.__handleItemUseWith(from, to);
+        return true;
+      }
+      if (window.gameClient?.send && typeof ThingUseWithPacket === 'function') {
+        window.gameClient.send(new ThingUseWithPacket(from, to));
+        return true;
+      }
+      return false;
+    } catch (e) {
+      this.log('useItemOnTile failed', e);
+      return false;
+    }
+  }
+
+  function useTile(tile) {
+    if (!tile) return false;
+    try {
+      if (window.gameClient?.mouse?.use) {
+        window.gameClient.mouse.use({ which: tile, index: 0xFF });
+        return true;
+      }
+      if (window.gameClient?.send && typeof UsePacket === 'function') {
+        window.gameClient.send(new UsePacket(tile, 0xFF));
+        return true;
+      }
+      return false;
+    } catch (e) {
+      this.log('useTile failed', e);
+      return false;
+    }
+  }
 
   // ---- PUBLIC API ----
   return {
-    version: "0.6.5",
+    version: "0.7.0",
     addCleanup,
 
     /** Destroy the bot and all its modules (call before reload) */
@@ -507,8 +603,181 @@ function startReconnectWatcher() {
       start: () => startImbReset(1000),
       stop: stopImbReset,
       reset: () => { if (typeof __imB !== 'undefined') __imB = 0; }
-    }
-  };
+    },
+	
+    // ---- GLOBAL ALIASES ----
+    level() {
+      const snap = this.getPlayerSnapshot();
+      return snap?.level ?? null;
+    },
+    experience() {
+      const snap = this.getPlayerSnapshot();
+      return snap?.experience ?? null;
+    },
+    health() {
+      const snap = this.getPlayerSnapshot();
+      return snap?.health ?? null;
+    },
+    healthPercent() {
+      const snap = this.getPlayerSnapshot();
+      if (snap?.maxHealth && snap.maxHealth > 0) return (snap.health / snap.maxHealth) * 100;
+      return null;
+    },
+    healthMax() {
+      const snap = this.getPlayerSnapshot();
+      return snap?.maxHealth ?? null;
+    },
+    mana() {
+      const snap = this.getPlayerSnapshot();
+      return snap?.mana ?? null;
+    },
+    manaPercent() {
+      const snap = this.getPlayerSnapshot();
+      if (snap?.maxMana && snap.maxMana > 0) return (snap.mana / snap.maxMana) * 100;
+      return null;
+    },
+    manaMax() {
+      const snap = this.getPlayerSnapshot();
+      return snap?.maxMana ?? null;
+    },
+    cap() {
+      const snap = this.getPlayerSnapshot();
+      return snap?.capacity ?? null;
+    },
+    position() {
+      return this.getPlayerPosition();
+    },
+    say(text) {
+      return this.sendChat(text);
+    },
+    print(...args) {
+      console.log(...args);
+    },
+
+    // ---- USE ITEM (right-click from inventory) ----
+    use(itemId) {
+      const source = findItemById(itemId);
+      if (!source) {
+        this.log(`Item ${itemId} not found in equipment or open containers.`);
+        return false;
+      }
+      return useItemFromSource(source);
+    },
+
+    // ---- USE ITEM ON TILE ----
+    useItemOnPosition(itemId, x, y, z) {
+      const pos = { x, y, z };
+      const tile = getTileAtPosition(pos);
+      if (!tile) {
+        this.log(`Tile at ${x},${y},${z} is not loaded.`);
+        return false;
+      }
+      const source = findItemById(itemId);
+      if (!source) {
+        this.log(`Item ${itemId} not found.`);
+        return false;
+      }
+      return useItemOnTile(source, tile);
+    },
+
+    // ---- USE POSITION (right-click on tile) ----
+    usePosition(x, y, z) {
+      const pos = { x, y, z };
+      const tile = getTileAtPosition(pos);
+      if (!tile) {
+        this.log(`Tile at ${x},${y},${z} is not loaded.`);
+        return false;
+      }
+      return useTile(tile);
+    },
+
+    // ---- GET ITEM ID AT POSITION ----
+    getItemAtPosition(x, y, z) {
+      const pos = { x, y, z };
+      const tile = getTileAtPosition(pos);
+      if (!tile) return null;
+      const top = getTopItemOnTile(tile);
+      return top ? getItemId(top) : null;
+    },
+
+    // ---- WAIT (pause cavebot) ----
+    wait(ms) {
+      if (typeof ms !== 'number' || ms < 0) {
+        this.log('wait() requires a positive number of milliseconds.');
+        return false;
+      }
+      this._waitUntil = Date.now() + ms;
+      this.log(`Cavebot paused for ${ms}ms until ${new Date(this._waitUntil).toLocaleTimeString()}`);
+      setTimeout(() => {
+        this._waitUntil = 0;
+        this.log('Cavebot wait expired, resuming.');
+      }, ms);
+      return true;
+    },
+	// ---- COUNT ITEMS IN OPEN CONTAINERS ----
+    itemCount(itemId) {
+      let total = 0;
+      const containers = window.gameClient?.player?.__openedContainers;
+      if (!containers) return 0;
+      const containerArr = Array.isArray(containers) ? containers : Array.from(containers);
+      for (const container of containerArr) {
+        if (!container || typeof container.size !== 'number') continue;
+        for (let i = 0; i < container.size; i++) {
+          const item = container.getSlotItem(i);
+          if (item && item.id === itemId) {
+            // Use getCount() if available, otherwise fallback to count property or 1
+            const count = (typeof item.getCount === 'function') ? item.getCount() : (item.count || 1);
+            total += count;
+          }
+        }
+      }
+      return total;
+    },
+    // ---- GO TO WAYPOINT BY LABEL ----
+    goToLabel(labelname) {
+      if (!labelname) {
+        this.log("goToLabel: label name required.");
+        return false;
+      }
+      const route = this.cave?.getRoute?.();
+      if (!route || !route.length) {
+        this.log("goToLabel: no route loaded.");
+        return false;
+      }
+      const normalized = String(labelname).trim().toLowerCase();
+      const index = route.findIndex(wp => {
+        const wpLabel = wp.label ? String(wp.label).trim().toLowerCase() : "";
+        return wpLabel === normalized;
+      });
+      if (index === -1) {
+        this.log(`goToLabel: label "${labelname}" not found in route.`);
+        return false;
+      }
+      const wp = route[index];
+      this.cave.setCurrentIndex(index);
+      this.log(`goToLabel: jumping to "${labelname}" (index ${index})`);
+      // If the cavebot is running, start pathing to that waypoint
+      if (this.cave?.status?.().running) {
+        this.cave.goToWaypoint(wp);
+      } else {
+        // If cavebot is stopped, just set the index – user can start later
+        this.log("goToLabel: cavebot not running, only index updated.");
+      }
+      return true;
+    },
+    
+    // ---- GET INDEX BY LABEL (helper) ----
+    getWaypointIndexByLabel(labelname) {
+      if (!labelname) return -1;
+      const route = this.cave?.getRoute?.();
+      if (!route || !route.length) return -1;
+      const normalized = String(labelname).trim().toLowerCase();
+      return route.findIndex(wp => {
+        const wpLabel = wp.label ? String(wp.label).trim().toLowerCase() : "";
+        return wpLabel === normalized;
+      });
+    },
+  }
 };
 
 /**
@@ -2717,23 +2986,40 @@ function tryAttack() {
     }
   }
 
-  // 5) Optional: switch to a better target
-  const candidates = getMonsterCandidates(now);
-  if (candidates.length) {
-    const best = candidates[0];
-    const currentInfo = isTargetValidAndOnScreen(current, { returnDetails: true, maxDx: 7, maxDy: 5, skipReachability: true });
-    const bestInfo = isTargetValidAndOnScreen(best, { returnDetails: true, maxDx: 7, maxDy: 5, skipReachability: true });
-    if (bestInfo.valid && currentInfo.valid) {
-      const currentDist = currentInfo.distance;
-      const bestDist = bestInfo.distance;
-      if ((bestInfo.preferred && !currentInfo.preferred) ||
-          (bestDist !== undefined && currentDist !== undefined && (bestDist + 3) < currentDist)) {
-        skipTarget(current, "switching to better target", now, 500);
-        state.unreachableStart = 0;
-        return false;
-      }
-    }
-  }
+	// 5) Optional: switch to a better target
+	const candidates = getMonsterCandidates(now);
+	if (candidates.length) {
+		const best = candidates[0];
+		const currentInfo = isTargetValidAndOnScreen(current, {
+			returnDetails: true,
+			maxDx: 7,
+			maxDy: 5,
+			skipReachability: true
+		});
+		const bestInfo = isTargetValidAndOnScreen(best, {
+			returnDetails: true,
+			maxDx: 7,
+			maxDy: 5,
+			skipReachability: true
+		});
+
+		if (bestInfo.valid && currentInfo.valid) {
+			const currentDist = currentInfo.distance;
+			const bestDist = bestInfo.distance;
+
+			// Switch if:
+			// 1) best is preferred and current isn't, OR
+			// 2) best is at least 1 tile closer (was +3), OR
+			// 3) best is adjacent (<=1) and current is not adjacent (>1)
+			if ((bestInfo.preferred && !currentInfo.preferred) ||
+				(bestDist !== undefined && currentDist !== undefined && (bestDist + 1) < currentDist) ||
+				(bestDist !== undefined && bestDist <= 1 && currentDist > 1)) {
+				skipTarget(current, "switching to better target", now, 500);
+				state.unreachableStart = 0;
+				return false;
+			}
+		}
+	}
 
   // 6) Attack
   if (getCurrentTarget()) {
@@ -3223,7 +3509,6 @@ function syncMeleeChase(now = Date.now()) {
   const dist = getTileDistance(playerPos, targetPos);
   const maxDist = Math.max(1, Number(config.maxTargetDistance) || 5);
 
-  // If too far, skip (will be handled elsewhere)
   if (dist > maxDist) {
     skipTarget(target, "too far for melee", now, 3000);
     return false;
@@ -3237,7 +3522,7 @@ function syncMeleeChase(now = Date.now()) {
     return false;
   }
 
-  // Anti‑KS (only if other non‑trusted players are nearby)
+  // ---- Anti‑KS (same as before) ----
   const visiblePlayers = bot.xray?.getVisiblePlayers?.({ sameFloorOnly: true }) || [];
   const myId = window.gameClient?.player?.id;
   const trustedNames = bot.panic?.getTrustedNames?.() || [];
@@ -3268,19 +3553,22 @@ function syncMeleeChase(now = Date.now()) {
     }
   }
 
-  // ---- Stuck detection ----
+  // ---- Stuck detection (UPDATED) ----
   if (state.engagedTargetId !== target.id) {
     state.meleeLastDist = dist;
     state.meleeProgressAt = now;
     state.meleeStuckAt = 0;
   } else {
+    // If distance decreased, we're making progress
     if (dist < state.meleeLastDist) {
       state.meleeLastDist = dist;
       state.meleeProgressAt = now;
       state.meleeStuckAt = 0;
     } else {
+      // No progress: start or increment stuck timer
       if (!state.meleeStuckAt) state.meleeStuckAt = now;
-      if (now - state.meleeStuckAt > 4000) {
+      // ⬇️ Increased from 4000 to 6000ms
+      if (now - state.meleeStuckAt > 6000) {
         skipTarget(target, "melee stuck (no progress)", now, 3000);
         return false;
       }
@@ -3288,7 +3576,7 @@ function syncMeleeChase(now = Date.now()) {
   }
 
   // ---- Move one step toward target ----
-  if (now - state.lastMoveAt < 250) return false; // throttle
+  if (now - state.lastMoveAt < 250) return false;
 
   const dx = targetPos.x - playerPos.x;
   const dy = targetPos.y - playerPos.y;
@@ -3305,10 +3593,8 @@ function syncMeleeChase(now = Date.now()) {
     if (a.dx === 0 && a.dy === 0) continue;
     const nx = playerPos.x + a.dx;
     const ny = playerPos.y + a.dy;
-    // Don't try to walk onto the target's tile (it's occupied)
     if (nx === targetPos.x && ny === targetPos.y) continue;
 
-    // Check walkable, do NOT ignore creatures (so we can't walk into other creatures)
     if (isTileWalkable(nx, ny, playerPos.z, false)) {
       const dir = getDirection(a.dx, a.dy);
       if (dir !== null && window.gameClient?.keyboard) {
@@ -3316,12 +3602,13 @@ function syncMeleeChase(now = Date.now()) {
         state.lastChaseAt = now;
         state.lastMoveAt = now;
         state.meleeLastDist = dist;
+        // ✅ Reset stuck timer because we successfully moved
+        state.meleeStuckAt = 0;
         return true;
       }
     }
   }
 
-  // If cardinal and diagonal failed, try moving away? (fallback – not needed)
   return false;
 }
 
@@ -3709,6 +3996,13 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 	lastDistanceToWaypoint: null,
 	positionHistory: [],
 	_stuckLogged: false,
+	standReached: {},
+	_standAttempt: null, // { index: number, adjacentAt: number }
+	_ropeUsed: null, // index -> true
+	_shovelUsed: null, // index -> true
+	_shovelState: null,
+	_shovelOpened: null,
+	_shovelRetry: null, // { index, count, lastTry }
   };
   const minimapOverlayState = { timerId: null };
 
@@ -3720,6 +4014,10 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
       enabled: false,
       activePresetName: defaultPresetName,
       loopMode: true,
+      autoTransitions: true,
+      stuckTimeoutMs: 5000,   
+      maxSkipAttempts: 10,
+	  stuckTimeoutMs: 30000,	  
     },
     bot.storage.get(configStorageKey, {})
   );
@@ -3876,11 +4174,43 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     return { x: Math.trunc(x), y: Math.trunc(y), z: Math.trunc(z) };
   }
 
-  function normalizeWaypoint(waypoint) { return normalizePosition(waypoint); }
-  function normalizeRoute(value) {
-    if (!Array.isArray(value)) return [];
-    return value.map(normalizeWaypoint).filter(Boolean);
+function normalizeWaypoint(waypoint) {
+  if (!waypoint) return null;
+  let x, y, z, label, script, stand, rope, shovel;
+  if (Array.isArray(waypoint)) {
+    [x, y, z] = waypoint;
+    stand = false;
+    rope = false;
+    shovel = false;
+  } else {
+    x = Number(waypoint.x);
+    y = Number(waypoint.y);
+    z = Number(waypoint.z);
+    label = waypoint.label ? String(waypoint.label).trim() : undefined;
+    script = waypoint.script !== undefined && waypoint.script !== null ? String(waypoint.script) : undefined;
+    stand = waypoint.stand === true;
+    rope = waypoint.rope === true;
+    shovel = waypoint.shovel === true;
   }
+  const hasCoords = Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z);
+  const hasScript = script !== undefined && script.length > 0;
+  if (!hasCoords && !hasScript) return null;
+  return {
+    x: hasCoords ? Math.trunc(x) : undefined,
+    y: hasCoords ? Math.trunc(y) : undefined,
+    z: hasCoords ? Math.trunc(z) : undefined,
+    label: label || (hasScript ? "Script" : undefined),
+    script: script,
+    stand: !!stand,
+    rope: !!rope,
+    shovel: !!shovel,
+  };
+}
+
+function normalizeRoute(value) {
+  if (!Array.isArray(value)) return [];
+  return value.map(normalizeWaypoint).filter(Boolean);
+}
 
   function normalizeTransition(transition) {
     if (!transition) return null;
@@ -3962,6 +4292,14 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
   }
 
   // ---- WAYPOINT HELPERS ----
+  
+	function isOrthogonallyAdjacent(from, to) {
+	  if (!from || !to || from.z !== to.z) return false;
+	  const dx = Math.abs(from.x - to.x);
+	  const dy = Math.abs(from.y - to.y);
+	  return (dx === 1 && dy === 0) || (dx === 0 && dy === 1);
+	}
+	
   function getCurrentWaypoint() {
     if (!route.length) return null;
     if (state.currentIndex < 0 || state.currentIndex >= route.length) state.currentIndex = 0;
@@ -4321,6 +4659,10 @@ function getContainerById(containerId) {
   }
 
 function goToWaypoint(waypoint) {
+  // If this is a script-only waypoint, nothing to move
+  if (!waypoint || waypoint.x === undefined || waypoint.x === null) {
+    return true;
+  }
   // ---- BLACKLIST CHECK ----
   if (bot.blacklist?.isBlacklisted(waypoint.x, waypoint.y, waypoint.z)) {
     bot.log("cave skipping blacklisted waypoint", waypoint);
@@ -4481,24 +4823,25 @@ function goToWaypoint(waypoint) {
   function findRopeSource() { return findToolSource(isRopeItem); }
   function findShovelSource() { return findToolSource(isShovelItem); }
 
-  function useToolOnTile(tool, targetTile, targetPosition, actionLabel, now = Date.now()) {
-    if (!tool || !targetTile || !targetPosition) return false;
-    const playerPos = normalizePosition(bot.getPlayerPosition());
-    if (!playerPos) return false;
-    if (!isAdjacentTile(playerPos, targetPosition)) {
-      const adj = findAdjacentWalkablePosition(targetPosition, playerPos);
-      if (adj) return goToPosition(adj);
-    }
-    window.gameClient?.mouse?.__handleItemUseWith?.(
-      { which: tool.which, index: tool.index },
-      { which: targetTile, index: 0xFF }
-    );
-    state.lastStairsUseAt = now;
-    state.lastPathAt = now;
-    markPendingTransitionSource(targetPosition);
-    bot.log(actionLabel, { source: targetPosition, toolLocation: tool.location, toolSlot: tool.index, toolName: getThingName(tool.item) });
-    return true;
+function useToolOnTile(tool, targetTile, targetPosition, actionLabel, now = Date.now()) {
+  if (!tool || !targetTile || !targetPosition) return false;
+  const playerPos = normalizePosition(bot.getPlayerPosition());
+  if (!playerPos) return false;
+  // Allow use if on the same tile OR adjacent
+  if (!isSameTile(playerPos, targetPosition) && !isAdjacentTile(playerPos, targetPosition)) {
+    const adj = findAdjacentWalkablePosition(targetPosition, playerPos);
+    if (adj) return goToPosition(adj);
   }
+  window.gameClient?.mouse?.__handleItemUseWith?.(
+    { which: tool.which, index: tool.index },
+    { which: targetTile, index: 0xFF }
+  );
+  state.lastStairsUseAt = now;
+  state.lastPathAt = now;
+  markPendingTransitionSource(targetPosition);
+  bot.log(actionLabel, { source: targetPosition, toolLocation: tool.location, toolSlot: tool.index, toolName: getThingName(tool.item) });
+  return true;
+}
 
   function useRopeOnTile(targetTile, targetPosition, now) {
     return useToolOnTile(findRopeSource(), targetTile, targetPosition, "cave roped transition tile", now);
@@ -4609,6 +4952,15 @@ function handleFloorChange(waypoint, now = Date.now()) {
 
   // ---- WAYPOINT NAVIGATION ----
 function advanceWaypoint() {
+	state._standAttempt = null;
+	state._ropeUsed = undefined;
+	state._shovelUsed = undefined;
+	state._shovelOpened = undefined;
+	state._shovelRetry = null;
+  // Clear reached flag for old index
+  if (state.standReached) {
+    delete state.standReached[state.currentIndex];
+  }
   if (!route.length) return null;
   if (route.length === 1) return route[0];
 
@@ -4635,6 +4987,105 @@ function advanceWaypoint() {
   }
 }
 
+/**
+ * Skips to the waypoint closest to the player's current position.
+ * Returns the new waypoint, or null if no route exists.
+ */
+function skipToClosestWaypoint() {
+  const pos = bot.getPlayerPosition();
+  if (!pos || !route.length) return null;
+
+  // Find the closest waypoint by distance (Manhattan)
+  let bestIdx = 0;
+  let bestDist = Infinity;
+  for (let i = 0; i < route.length; i++) {
+    const wp = route[i];
+    const dist = Math.abs(wp.x - pos.x) + Math.abs(wp.y - pos.y) + Math.abs(wp.z - pos.z) * 10;
+    if (dist < bestDist) {
+      bestDist = dist;
+      bestIdx = i;
+    }
+  }
+
+  state.currentIndex = bestIdx;
+  state.direction = 1; // reset direction to forward
+
+  const wp = route[bestIdx];
+  bot.log(`Cave: skipping to closest waypoint #${bestIdx+1} (${wp.x}, ${wp.y}, ${wp.z})`);
+  goToWaypoint(wp);
+  return wp;
+}
+
+/**
+ * Advances to the next waypoint, skipping any that are on a different floor
+ * and cannot be reached via a known or visible transition.
+ * Returns the new waypoint (or null if none found).
+ */
+function advanceToReachableWaypoint(startIndex, direction) {
+  let attempts = 0;
+  const maxAttempts = config.maxSkipAttempts || 10;
+  let idx = startIndex;
+  let dir = direction || state.direction || 1;
+
+  while (attempts < maxAttempts) {
+    // Move to next waypoint according to direction/loop
+    let next = idx + dir;
+    if (config.loopMode) {
+      if (next >= route.length) next = 0;
+      else if (next < 0) next = route.length - 1;
+    } else {
+      if (next >= route.length || next < 0) {
+        // End of route in non‑loop mode – stop
+        return null;
+      }
+    }
+    // Clamp
+    next = Math.max(0, Math.min(route.length - 1, next));
+
+    const candidate = route[next];
+    if (!candidate) break;
+
+    // If same floor, we can go to it directly
+    const pos = bot.getPlayerPosition();
+    if (pos && candidate.z === pos.z) {
+      state.currentIndex = next;
+      state.direction = dir;
+      return candidate;
+    }
+
+    // If different floor, check if we have a transition
+    if (pos) {
+      // Try to find a known transition from current floor to candidate floor
+      const transition = findBestKnownTransition(pos, candidate);
+      if (transition) {
+        // We have a known transition – we can try to use it
+        state.currentIndex = next;
+        state.direction = dir;
+        return candidate;
+      }
+
+      // Also check if there is a visible transition tile nearby
+      const visible = findNearbyTransitionTile(pos, candidate);
+      if (visible) {
+        state.currentIndex = next;
+        state.direction = dir;
+        return candidate;
+      }
+    }
+
+    // No transition found – skip this waypoint
+    bot.log(`Cave: skipping waypoint ${next+1} (floor ${candidate.z}) – no transition available`);
+    attempts++;
+    idx = next;
+    // Continue looping to the next
+  }
+
+  // No reachable waypoint found – stop cavebot
+  bot.log("Cave: no reachable waypoint found within max skip attempts – stopping");
+  stop();
+  return null;
+}
+
 
   // ---- MAIN LOOP ----
   function scheduleNextTick() {
@@ -4650,6 +5101,11 @@ function advanceWaypoint() {
    */
 function tick() {
   if (!state.running) return;
+  // ---- PAUSE CHECK ----
+  if (bot._waitUntil && Date.now() < bot._waitUntil) {
+    scheduleNextTick();
+    return;
+  }
 
   try {
     observePosition();
@@ -4662,28 +5118,420 @@ function tick() {
     const position = normalizePosition(bot.getPlayerPosition());
     const positionKey = getPositionKey(position);
     const now = Date.now();
-	if (position && bot.blacklist?.isBlacklisted(position.x, position.y, position.z)) {
-	  bot.log("cave: standing on blacklisted tile, moving away");
-	  // Try to move one step in any safe direction
-	  const offsets = [[0,-1],[1,0],[0,1],[-1,0],[-1,-1],[1,-1],[-1,1],[1,1]];
-	  for (const [dx, dy] of offsets) {
-		const nx = position.x + dx;
-		const ny = position.y + dy;
-		if (!bot.blacklist.isBlacklisted(nx, ny, position.z) && isTileWalkable(nx, ny, position.z, true)) {
-		  const dir = getDirection(dx, dy);
-		  if (dir !== null && window.gameClient?.keyboard) {
-			window.gameClient.keyboard.handleMoveKey(dir);
-			return;
-		  }
-		}
+
+    // ---- DECLARE WAYPOINT HERE ----
+    let waypoint = getCurrentWaypoint();
+
+// ---- STAND WAYPOINT ----
+if (waypoint && waypoint.stand) {
+  const index = state.currentIndex;
+
+  // If position is unavailable, wait for next tick
+  if (!position) {
+    scheduleNextTick();
+    return;
+  }
+
+  // Already reached?
+  if (state.standReached && state.standReached[index]) {
+    bot.log("Stand waypoint already reached, advancing");
+    waypoint = advanceWaypoint();
+    if (!waypoint) { stop(); return; }
+    state._standAttempt = null;
+    state.lastWaypointTarget = null;
+    state.pathAttemptStart = 0;
+    state.lastDistanceToWaypoint = null;
+    state.stuckCount = 0;
+    state.positionHistory = [];
+    state.skipAttemptCount = 0;
+    if (waypoint.x !== undefined) {
+      state.lastWaypointTarget = waypoint;
+      state.pathAttemptStart = Date.now();
+      state.lastDistanceToWaypoint = getDistanceToWaypoint(position, waypoint);
+      goToWaypoint(waypoint);
+    }
+    return;
+  }
+  
+    // --- NEW: floor change detection ---
+  if (position && waypoint && position.z !== waypoint.z) {
+    if (!state.standReached) state.standReached = {};
+    state.standReached[index] = true;
+    bot.log("Stand waypoint reached (floor changed)");
+    waypoint = advanceWaypoint();
+    if (!waypoint) { stop(); return; }
+    state.lastWaypointTarget = null;
+    state.pathAttemptStart = 0;
+    state.lastDistanceToWaypoint = null;
+    state.stuckCount = 0;
+    state.positionHistory = [];
+    state.skipAttemptCount = 0;
+    if (waypoint.x !== undefined) {
+      state.lastWaypointTarget = waypoint;
+      state.pathAttemptStart = Date.now();
+      state.lastDistanceToWaypoint = getDistanceToWaypoint(position, waypoint);
+      goToWaypoint(waypoint);
+    }
+    return;
+  }
+
+  const dx = Math.abs(position.x - waypoint.x);
+  const dy = Math.abs(position.y - waypoint.y);
+  const dz = position.z === waypoint.z;
+  const dist = Math.max(dx, dy); // tile distance
+
+  // Exact arrival (on the tile)
+  if (dx === 0 && dy === 0 && dz) {
+    if (!state.standReached) state.standReached = {};
+    state.standReached[index] = true;
+    state._standAttempt = null;
+    bot.log("Stand waypoint reached (exact tile)");
+    waypoint = advanceWaypoint();
+    if (!waypoint) { stop(); return; }
+    state.lastWaypointTarget = null;
+    state.pathAttemptStart = 0;
+    state.lastDistanceToWaypoint = null;
+    state.stuckCount = 0;
+    state.positionHistory = [];
+    state.skipAttemptCount = 0;
+    if (waypoint.x !== undefined) {
+      state.lastWaypointTarget = waypoint;
+      state.pathAttemptStart = Date.now();
+      state.lastDistanceToWaypoint = getDistanceToWaypoint(position, waypoint);
+      goToWaypoint(waypoint);
+    }
+    return;
+  }
+
+  // Adjacent – start trying to step onto it
+  if (dist <= 1) {
+    state._standAttempt = { index, adjacentAt: Date.now() };
+    goToWaypoint(waypoint);
+    return; // wait for next tick
+  }
+
+  // Teleport detection: we were adjacent before, now we are > 1 tile away
+  if (state._standAttempt && state._standAttempt.index === index && dist > 1) {
+    state._standAttempt = null;
+    if (!state.standReached) state.standReached = {};
+    state.standReached[index] = true;
+    bot.log("Stand waypoint teleported, advancing");
+    waypoint = advanceWaypoint();
+    if (!waypoint) { stop(); return; }
+    state.lastWaypointTarget = null;
+    state.pathAttemptStart = 0;
+    state.lastDistanceToWaypoint = null;
+    state.stuckCount = 0;
+    state.positionHistory = [];
+    state.skipAttemptCount = 0;
+    if (waypoint.x !== undefined) {
+      state.lastWaypointTarget = waypoint;
+      state.pathAttemptStart = Date.now();
+      state.lastDistanceToWaypoint = getDistanceToWaypoint(position, waypoint);
+      goToWaypoint(waypoint);
+    }
+    return;
+  }
+
+  // If we are not adjacent and not on the tile, path to it
+  if (dist > 1) {
+    goToWaypoint(waypoint);
+    return;
+  }
+
+  // Fallback: wait for next tick
+  return;
+}
+
+// ---- ROPE WAYPOINT ----
+if (waypoint && waypoint.rope) {
+  const index = state.currentIndex;
+  if (state._ropeUsed && state._ropeUsed[index]) {
+    // Already used rope, advance
+    bot.log("Rope waypoint already used, advancing");
+    waypoint = advanceWaypoint();
+    if (!waypoint) { stop(); return; }
+    state._ropeUsed = undefined;
+    state.lastWaypointTarget = null;
+    state.pathAttemptStart = 0;
+    state.lastDistanceToWaypoint = null;
+    state.stuckCount = 0;
+    state.positionHistory = [];
+    state.skipAttemptCount = 0;
+    if (waypoint.x !== undefined) {
+      state.lastWaypointTarget = waypoint;
+      state.pathAttemptStart = Date.now();
+      state.lastDistanceToWaypoint = getDistanceToWaypoint(position, waypoint);
+      goToWaypoint(waypoint);
+    }
+    return;
+  }
+
+  if (!position) {
+    return;
+  }
+
+	// If the waypoint is on a different floor, skip it
+	if (waypoint.z !== position.z) {
+	  bot.log("Rope/Shovel waypoint on different floor, skipping");
+	  waypoint = advanceWaypoint();
+	  if (!waypoint) { stop(); return; }
+	  state.lastWaypointTarget = null;
+	  state.pathAttemptStart = 0;
+	  state.lastDistanceToWaypoint = null;
+	  state.stuckCount = 0;
+	  state.positionHistory = [];
+	  state.skipAttemptCount = 0;
+	  if (waypoint.x !== undefined) {
+		state.lastWaypointTarget = waypoint;
+		state.pathAttemptStart = Date.now();
+		state.lastDistanceToWaypoint = getDistanceToWaypoint(position, waypoint);
+		goToWaypoint(waypoint);
 	  }
+	  return;
 	}
 
-    // ---- PAUSE FOR COMBAT ----
-const attackConfig = bot.attack?.config || {};
-const attackStatus = bot.attack?.status?.() || null;
-const isKiting = attackConfig.kiteMode && !!attackStatus?.engagedTargetId;
+  const dist = getDistance(position, waypoint);
+  // If not exactly on the tile, walk to it (ignore tolerance)
+  if (dist > 0) {
+    // If we are adjacent but not on tile, try to step onto it
+    if (dist === 1) {
+      const dx = waypoint.x - position.x;
+      const dy = waypoint.y - position.y;
+      const dir = getDirection(dx, dy);
+      if (dir !== null) {
+        // Check if the tile is walkable (ignore creatures)
+        if (isTileWalkable(waypoint.x, waypoint.y, waypoint.z, false)) {
+          window.gameClient?.keyboard?.handleMoveKey(dir);
+          return;
+        }
+      }
+    }
+    // Otherwise, use pathfinding
+    goToWaypoint(waypoint);
+    return;
+  }
 
+  // We are on the tile: use rope
+  const tile = getTileAt(waypoint);
+  if (!tile) {
+    bot.log("Rope waypoint: tile not loaded");
+    return;
+  }
+
+  // Find rope in equipment or containers
+  const ropeSource = findRopeSource();
+  if (!ropeSource) {
+    bot.log("Rope waypoint: no rope found, marking as used to proceed");
+    if (!state._ropeUsed) state._ropeUsed = {};
+    state._ropeUsed[index] = true;
+    return;
+  }
+
+  // Use rope on tile
+  try {
+    const source = { which: ropeSource.which, index: ropeSource.index };
+    const target = { which: tile, index: 0xFF };
+    if (window.gameClient?.mouse?.__handleItemUseWith) {
+      window.gameClient.mouse.__handleItemUseWith(source, target);
+      bot.log("Rope waypoint: used rope via mouse.__handleItemUseWith");
+    } else if (window.gameClient?.send && typeof ThingUseWithPacket === 'function') {
+      window.gameClient.send(new ThingUseWithPacket(source, target));
+      bot.log("Rope waypoint: used rope via ThingUseWithPacket");
+    } else {
+      bot.log("Rope waypoint: cannot use rope – no method available");
+    }
+    // Mark as used and advance
+    if (!state._ropeUsed) state._ropeUsed = {};
+    state._ropeUsed[index] = true;
+    bot.log("Rope waypoint: rope used, advancing");
+    waypoint = advanceWaypoint();
+    if (!waypoint) { stop(); return; }
+    state.lastWaypointTarget = null;
+    state.pathAttemptStart = 0;
+    state.lastDistanceToWaypoint = null;
+    state.stuckCount = 0;
+    state.positionHistory = [];
+    state.skipAttemptCount = 0;
+    if (waypoint.x !== undefined) {
+      state.lastWaypointTarget = waypoint;
+      state.pathAttemptStart = Date.now();
+      state.lastDistanceToWaypoint = getDistanceToWaypoint(position, waypoint);
+      goToWaypoint(waypoint);
+    }
+    return;
+  } catch (e) {
+    bot.log("Rope waypoint: error using rope", e.message);
+    // Mark as used to avoid getting stuck
+    if (!state._ropeUsed) state._ropeUsed = {};
+    state._ropeUsed[index] = true;
+    return;
+  }
+}
+
+// ---- SHOVEL WAYPOINT ----
+if (waypoint && waypoint.shovel) {
+  const index = state.currentIndex;
+  const tileDist = Math.max(Math.abs(position.x - waypoint.x), Math.abs(position.y - waypoint.y));
+
+  // ---- CHECK IF ALREADY ENTERED HOLE (z changed) ----
+  if (position.z > waypoint.z) {
+    // Fallen into the hole!
+    if (!state._shovelUsed) state._shovelUsed = {};
+    state._shovelUsed[index] = true;
+    state._shovelOpened = undefined;
+    bot.log("Shovel waypoint: entered hole (z changed), advancing");
+    waypoint = advanceWaypoint();
+    if (!waypoint) { stop(); return; }
+    state.lastWaypointTarget = null;
+    state.pathAttemptStart = 0;
+    state.lastDistanceToWaypoint = null;
+    state.stuckCount = 0;
+    state.positionHistory = [];
+    state.skipAttemptCount = 0;
+    if (waypoint.x !== undefined) {
+      state.lastWaypointTarget = waypoint;
+      state.pathAttemptStart = Date.now();
+      state.lastDistanceToWaypoint = getDistanceToWaypoint(position, waypoint);
+      goToWaypoint(waypoint);
+    }
+    return;
+  }
+
+  // ---- STEP 2: HOLE IS OPEN, WALK INTO IT ----
+  if (state._shovelOpened && state._shovelOpened[index]) {
+    // If we are already on the hole tile (same z) or z changed (fallen), advance
+    if ((position.z === waypoint.z && tileDist === 0) || position.z < waypoint.z) {
+      bot.log("Shovel waypoint: walked into hole, advancing");
+      state._shovelOpened = undefined;
+      if (!state._shovelUsed) state._shovelUsed = {};
+      state._shovelUsed[index] = true;
+      waypoint = advanceWaypoint();
+      if (!waypoint) { stop(); return; }
+      state.lastWaypointTarget = null;
+      state.pathAttemptStart = 0;
+      state.lastDistanceToWaypoint = null;
+      state.stuckCount = 0;
+      state.positionHistory = [];
+      state.skipAttemptCount = 0;
+      if (waypoint.x !== undefined) {
+        state.lastWaypointTarget = waypoint;
+        state.pathAttemptStart = Date.now();
+        state.lastDistanceToWaypoint = getDistanceToWaypoint(position, waypoint);
+        goToWaypoint(waypoint);
+      }
+      return;
+    } else {
+      // Hole is open but we are not on it – walk onto it
+      bot.log("Shovel waypoint: walking into opened hole");
+      goToWaypoint(waypoint);
+      return;
+    }
+  }
+
+  // ---- STEP 1: OPEN THE HOLE ----
+  if (!position) {
+    return;
+  }
+
+  // Floor change check – skip if different floor
+  if (position.z !== waypoint.z) {
+    bot.log("Shovel waypoint on different floor, skipping");
+    waypoint = advanceWaypoint();
+    if (!waypoint) { stop(); return; }
+    state.lastWaypointTarget = null;
+    state.pathAttemptStart = 0;
+    state.lastDistanceToWaypoint = null;
+    state.stuckCount = 0;
+    state.positionHistory = [];
+    state.skipAttemptCount = 0;
+    if (waypoint.x !== undefined) {
+      state.lastWaypointTarget = waypoint;
+      state.pathAttemptStart = Date.now();
+      state.lastDistanceToWaypoint = getDistanceToWaypoint(position, waypoint);
+      goToWaypoint(waypoint);
+    }
+    return;
+  }
+
+  // ---- We are ON the target tile – move to adjacent walkable tile ----
+  if (tileDist === 0) {
+    const adjPos = findAdjacentWalkablePosition(waypoint, position);
+    if (adjPos) {
+      goToPosition(adjPos);
+      return;
+    } else {
+      bot.log("Shovel waypoint: on target but no adjacent walkable tile, marking as used");
+      if (!state._shovelUsed) state._shovelUsed = {};
+      state._shovelUsed[index] = true;
+      return;
+    }
+  }
+
+  // ---- We are ADJACENT (including diagonal) – use shovel ----
+  if (tileDist === 1) {
+    const tile = getTileAt(waypoint);
+    if (!tile) {
+      bot.log("Shovel waypoint: target tile not loaded");
+      return;
+    }
+
+    const shovelSource = findShovelSource();
+    if (!shovelSource) {
+      bot.log("Shovel waypoint: no shovel found, marking as used");
+      if (!state._shovelUsed) state._shovelUsed = {};
+      state._shovelUsed[index] = true;
+      return;
+    }
+
+    const used = useToolOnTile(shovelSource, tile, waypoint, "Shovel waypoint used", now);
+    if (used) {
+      if (!state._shovelOpened) state._shovelOpened = {};
+      state._shovelOpened[index] = true;
+      bot.log("Shovel waypoint: hole opened, walking into it");
+      goToWaypoint(waypoint);
+      return;
+    } else {
+      bot.log("Shovel waypoint: shovel use failed, marking as used");
+      if (!state._shovelUsed) state._shovelUsed = {};
+      state._shovelUsed[index] = true;
+      return;
+    }
+  }
+
+  // ---- We are FAR (>1) – move to adjacent walkable tile ----
+  if (tileDist > 1) {
+    const adjPos = findAdjacentWalkablePosition(waypoint, position);
+    if (adjPos) {
+      goToPosition(adjPos);
+      return;
+    } else {
+      goToWaypoint(waypoint);
+      return;
+    }
+  }
+}
+
+    // ---- BLACKLIST CHECK ----
+    if (position && bot.blacklist?.isBlacklisted(position.x, position.y, position.z)) {
+      bot.log("cave: standing on blacklisted tile, moving away");
+      const offsets = [[0,-1],[1,0],[0,1],[-1,0],[-1,-1],[1,-1],[-1,1],[1,1]];
+      for (const [dx, dy] of offsets) {
+        const nx = position.x + dx;
+        const ny = position.y + dy;
+        if (!bot.blacklist.isBlacklisted(nx, ny, position.z) && isTileWalkable(nx, ny, position.z, true)) {
+          const dir = getDirection(dx, dy);
+          if (dir !== null && window.gameClient?.keyboard) {
+            window.gameClient.keyboard.handleMoveKey(dir);
+            return;
+          }
+        }
+      }
+    }
+
+    // ---- PAUSE FOR COMBAT ----
+    const attackStatus = bot.attack?.status?.() || null;
+    const isKiting = bot.attack?.config?.kiteMode && !!attackStatus?.engagedTargetId;
     const shouldPauseForCombat =
       (!!attackStatus?.combatActive && Number(attackStatus?.combatDurationMs || 0) < 60000) ||
       isKiting;
@@ -4691,11 +5539,7 @@ const isKiting = attackConfig.kiteMode && !!attackStatus?.engagedTargetId;
     if (shouldPauseForCombat) {
       if (!state.pausedForCombat) {
         state.pausedForCombat = true;
-        bot.log("cave paused for auto attack", {
-          combatDurationMs: Number(attackStatus?.combatDurationMs || 0),
-          targetCount: Number(attackStatus?.targetCount || 0),
-          isKiting,
-        });
+        bot.log("cave paused for auto attack");
       }
       return;
     }
@@ -4705,36 +5549,84 @@ const isKiting = attackConfig.kiteMode && !!attackStatus?.engagedTargetId;
       bot.log("cave resumed after auto attack");
     }
 
-    // ---- POSITION HISTORY (detect stuck) ----
+    // ---- PROGRESS TRACKING ----
     if (positionKey) {
       if (!state.positionHistory) state.positionHistory = [];
       state.positionHistory.push({ key: positionKey, time: now });
       if (state.positionHistory.length > 5) state.positionHistory.shift();
-
-      // Check if we've been at the same tile for > 5 seconds
-      let stuck = false;
-      if (state.positionHistory.length >= 3) {
-        const first = state.positionHistory[0];
-        if (first.key === positionKey && now - first.time > 5000) {
-          stuck = true;
-        }
-      }
-      if (stuck) {
-        if (!state._stuckLogged) {
-          state._stuckLogged = true;
-          bot.log("cave: stuck at tile for >5s, trying to move");
-        }
-      } else {
-        state._stuckLogged = false;
-      }
     }
 
+    // Check if we've moved (new tile) or used a floor change
+    let madeProgress = false;
     if (positionKey && positionKey !== state.lastPositionKey) {
+      madeProgress = true;
       state.lastPositionKey = positionKey;
+      state.lastProgressAt = now;
+      state.stuckCount = 0;
+      state.positionHistory = [];
+    }
+    if (now - state.lastStairsUseAt < 2000) {
+      madeProgress = true;
       state.lastProgressAt = now;
     }
 
-    let waypoint = getCurrentWaypoint();
+    // ---- STUCK DETECTION ----
+    const stuckTimeout = config.stuckTimeoutMs || 30000;
+    if (!madeProgress && (now - state.lastProgressAt) > stuckTimeout) {
+      // Only skip if we actually have a waypoint and are not in combat
+      const currentWp = getCurrentWaypoint();
+      if (currentWp) {
+        bot.log(`Cave: stuck on tile for ${(now - state.lastProgressAt)/1000}s – skipping to closest waypoint`);
+        const nextWp = skipToClosestWaypoint();
+        if (nextWp) {
+          state.lastProgressAt = now;
+          state._stuckLogged = false;
+          return; // tick will continue on next interval
+        } else {
+          stop();
+          return;
+        }
+      }
+    }
+
+    // ---- NORMAL NAVIGATION ----
+    // waypoint is already defined from above, but it might have been changed by stand block.
+    // Ensure it's current.
+    waypoint = getCurrentWaypoint();
+    // ---- SCRIPT-ONLY WAYPOINT ----
+    if (waypoint && waypoint.x === undefined) {
+      // Execute script if present
+      if (waypoint.script) {
+        try {
+          bot.log(`Executing script for script waypoint ${waypoint.label || 'unnamed'}`);
+          const scriptFn = new Function('bot', 'state', waypoint.script);
+          scriptFn(bot, state);
+        } catch (e) {
+          bot.log(`Script error at script waypoint: ${e.message}`);
+        }
+      }
+      // Advance to next waypoint immediately
+      waypoint = advanceWaypoint();
+      if (!waypoint) {
+        stop();
+        return;
+      }
+      state.lastWaypointTarget = null;
+      state.pathAttemptStart = 0;
+      state.lastDistanceToWaypoint = null;
+      state.stuckCount = 0;
+      state.positionHistory = [];
+      state.skipAttemptCount = 0;
+      // If next waypoint has coordinates, start moving to it
+      if (waypoint.x !== undefined) {
+        state.lastWaypointTarget = waypoint;
+        state.pathAttemptStart = Date.now();
+        state.lastDistanceToWaypoint = getDistanceToWaypoint(position, waypoint);
+        goToWaypoint(waypoint);
+      }
+      // If it's another script-only, the next tick will handle it
+      return;
+    }
     if (!waypoint) {
       stop();
       return;
@@ -4747,6 +5639,20 @@ const isKiting = attackConfig.kiteMode && !!attackStatus?.engagedTargetId;
       state.lastDistanceToWaypoint = null;
       state.stuckCount = 0;
       state.positionHistory = [];
+      state.skipAttemptCount = 0;
+
+      // ---- EXECUTE SCRIPT IF PRESENT ----
+      if (waypoint.script) {
+        try {
+          bot.log(`Executing script for waypoint ${waypoint.label || waypoint.x+','+waypoint.y+','+waypoint.z}`);
+          const scriptFn = new Function('bot', 'state', waypoint.script);
+          scriptFn(bot, state);
+        } catch (e) {
+          bot.log(`Script error at waypoint: ${e.message}`);
+        }
+      }
+
+      // Advance to next waypoint (normal progression)
       waypoint = advanceWaypoint();
       if (!waypoint) {
         stop();
@@ -4761,16 +5667,40 @@ const isKiting = attackConfig.kiteMode && !!attackStatus?.engagedTargetId;
 
     // ---- FLOOR CHANGE ----
     if (position && waypoint.z !== position.z) {
+      if (!config.autoTransitions) {
+        // Auto transitions disabled: skip this waypoint and advance
+        bot.log("Auto transitions disabled, skipping waypoint on different floor", { waypoint });
+        waypoint = advanceWaypoint();
+        if (!waypoint) {
+          stop();
+          return;
+        }
+        state.lastWaypointTarget = null;
+        state.pathAttemptStart = 0;
+        state.lastDistanceToWaypoint = null;
+        state.stuckCount = 0;
+        state.positionHistory = [];
+        state.skipAttemptCount = 0;
+        if (waypoint.x !== undefined) {
+          state.lastWaypointTarget = waypoint;
+          state.pathAttemptStart = now;
+          state.lastDistanceToWaypoint = getDistanceToWaypoint(position, waypoint);
+          goToWaypoint(waypoint);
+        }
+        return;
+      }
+      // Original floor-change handling
       state.lastWaypointTarget = null;
       state.pathAttemptStart = 0;
       state.lastDistanceToWaypoint = null;
       state.stuckCount = 0;
       state.positionHistory = [];
+      state.skipAttemptCount = 0;
       handleFloorChange(waypoint, now);
       return;
     }
 
-    // ---- PATHFINDING LOGIC ----
+    // ---- PATHFINDING / REPATH ----
     const pf = window.gameClient?.world?.pathfinder;
     const currentDist = getDistanceToWaypoint(position, waypoint);
 
@@ -4784,115 +5714,13 @@ const isKiting = attackConfig.kiteMode && !!attackStatus?.engagedTargetId;
       return;
     }
 
-    // ---- WE HAVE A WAYPOINT ----
-    if (state.lastWaypointTarget && position && pf) {
-      // If we are within tolerance, consider it reached
-      if (currentDist !== null && currentDist <= (config.waypointTolerance || 0)) {
-        state.lastWaypointTarget = null;
-        state.pathAttemptStart = 0;
-        state.lastDistanceToWaypoint = null;
-        state.stuckCount = 0;
-        state.positionHistory = [];
-        return;
-      }
-
-      // If we made progress, reset stuck counter
-      if (state.lastDistanceToWaypoint !== null && currentDist < state.lastDistanceToWaypoint) {
-        state.lastDistanceToWaypoint = currentDist;
-        state.pathAttemptStart = now;
-        state.stuckCount = 0;
-        state.positionHistory = [];
-      }
-
-      // ---- REPATH ----
-      const shouldRepath = now - state.lastPathAt >= config.repathMs ||
-                           !state.lastProgressAt ||
-                           now - state.lastProgressAt >= config.repathMs;
-      if (shouldRepath) {
-        goToWaypoint(waypoint);
-      }
-
-      // ---- STUCK DETECTION AND RECOVERY ----
-      const timeSinceAttemptStart = now - state.pathAttemptStart;
-      if (timeSinceAttemptStart > 5000 && pf.__finalDestination === null) {
-        // If we haven't moved in a while, try to nudge
-        let moved = false;
-
-        // Try moving toward waypoint if we can see it
-        const tile = window.gameClient?.world?.getTileFromWorldPosition?.(new Position(waypoint.x, waypoint.y, waypoint.z));
-        if (tile && tile.isWalkable && !tile.isOccupied()) {
-          // Try direct path to waypoint
-          const from = bot.getPlayerPosition();
-          if (from) {
-            const to = new Position(waypoint.x, waypoint.y, waypoint.z);
-            try {
-              window.gameClient?.world?.pathfinder?.findPath?.(from, to);
-              state.lastPathAt = now;
-              state.pathAttemptStart = now;
-              moved = true;
-            } catch (e) {}
-          }
-        }
-
-        // If direct failed, try moving one step in the general direction
-        if (!moved) {
-          let dx = waypoint.x - position.x;
-          let dy = waypoint.y - position.y;
-          let stepX = dx > 0 ? 1 : (dx < 0 ? -1 : 0);
-          let stepY = dy > 0 ? 1 : (dy < 0 ? -1 : 0);
-
-          // Check cardinal directions
-          let dir = null;
-          const candidates = [
-            { dx: stepX, dy: 0 },
-            { dx: 0, dy: stepY },
-            { dx: stepX, dy: stepY },
-            { dx: -stepX, dy: 0 },
-            { dx: 0, dy: -stepY },
-          ];
-          for (const c of candidates) {
-            const nx = position.x + c.dx;
-            const ny = position.y + c.dy;
-            const pos = new Position(nx, ny, position.z);
-            const t = window.gameClient?.world?.getTileFromWorldPosition?.(pos);
-            if (t && t.isWalkable && !t.isOccupied()) {
-              dir = getDirection(c.dx, c.dy);
-              if (dir !== null) {
-                if (window.gameClient?.keyboard) {
-                  window.gameClient.keyboard.handleMoveKey(dir);
-                  moved = true;
-                  break;
-                }
-              }
-            }
-          }
-          if (moved) {
-            state.pathAttemptStart = now;
-            state.stuckCount = 0;
-            bot.log("cave: nudged one step toward waypoint");
-          }
-        }
-
-        // If still stuck after a few attempts, skip the waypoint
-        if (!moved) {
-          state.stuckCount = (state.stuckCount || 0) + 1;
-          if (state.stuckCount > 3) {
-            bot.log("cave: stuck for too long, skipping waypoint", {
-              waypoint: state.lastWaypointTarget,
-              currentDist,
-            });
-            state.lastWaypointTarget = null;
-            state.pathAttemptStart = 0;
-            state.lastDistanceToWaypoint = null;
-            state.stuckCount = 0;
-            const nextWp = advanceWaypoint();
-            if (nextWp) goToWaypoint(nextWp);
-            else stop();
-            return;
-          }
-        }
-      }
+    const shouldRepath = now - state.lastPathAt >= config.repathMs ||
+                         !state.lastProgressAt ||
+                         now - state.lastProgressAt >= config.repathMs;
+    if (shouldRepath) {
+      goToWaypoint(waypoint);
     }
+
   } catch (error) {
     bot.log("cave tick failed", error?.message || error);
   } finally {
@@ -4958,14 +5786,14 @@ const isKiting = attackConfig.kiteMode && !!attackStatus?.engagedTargetId;
     return true;
   }
 
-  function addWaypoint(waypoint) {
-    const norm = normalizeWaypoint(waypoint);
-    if (!norm) return null;
-    route.push(norm);
-    persistRoute();
-    bot.log("cave waypoint added", { ...norm, total: route.length });
-    return cloneValue(norm);
-  }
+function addWaypoint(waypoint) {
+  const norm = normalizeWaypoint(waypoint);
+  if (!norm) return null;
+  route.push(norm);
+  persistRoute();
+  bot.log("cave waypoint added", { ...norm, total: route.length });
+  return cloneValue(norm);
+}
 
   function addWaypointCurrentSpot() {
     const pos = normalizePosition(bot.getPlayerPosition());
@@ -5102,6 +5930,23 @@ const isKiting = attackConfig.kiteMode && !!attackStatus?.engagedTargetId;
         names: getTileThings(e.tile).map(t => getThingName(t)).filter(Boolean),
       }));
   }
+  
+  function updateWaypoint(index, updates) {
+  if (!route.length || index < 0 || index >= route.length) {
+    bot.log("Invalid waypoint index.");
+    return null;
+  }
+  const wp = route[index];
+  if (updates.label !== undefined) {
+    wp.label = updates.label ? String(updates.label).trim() : undefined;
+  }
+  if (updates.script !== undefined) {
+    wp.script = updates.script ? String(updates.script).trim() : undefined;
+  }
+  persistRoute();
+  bot.log("Waypoint updated", { index, label: wp.label, script: wp.script });
+  return cloneValue(wp);
+}
 
   // ---- STARTUP ----
   startObserver();
@@ -5122,6 +5967,7 @@ const isKiting = attackConfig.kiteMode && !!attackStatus?.engagedTargetId;
     setLoopMode, getLoopMode,
     inspectNearbyTiles,
     isAtWaypoint,
+	updateWaypoint,
   };
 };
 
@@ -6021,35 +6867,60 @@ window.__minibiaBotBundle.installTalkModule = function installTalkModule(bot) {
   };
 };
 
+//*********************
+// -- ANTI-BOT ALARM
+//*********************
+
 window.__minibiaBotBundle.installAntiBotMonitorModule = function installAntiBotMonitorModule(bot) {
+  const configStorageKey = "minibiaBot.antibot.config";
   const state = {
     running: false,
     timerId: null,
     lastTriggerAt: 0,
-    cooldownMs: 30000, // prevent spam
+    cooldownMs: 30000,
   };
+
+  // Load persisted config
+  const config = Object.assign(
+    { enabled: false },
+    bot.storage.get(configStorageKey, {})
+  );
+
+  function persistConfig() {
+    bot.storage.set(configStorageKey, { enabled: config.enabled });
+  }
 
   function start() {
     if (state.running) return;
+    config.enabled = true;
+    persistConfig();
     state.running = true;
     bot.log("Anti-Bot monitor started");
     checkChat();
+    // Update UI checkbox if exists
+    const toggle = document.getElementById("minibia-bot-antibot-enabled");
+    if (toggle) toggle.checked = true;
   }
 
   function stop() {
+    if (!state.running) return;
+    config.enabled = false;
+    persistConfig();
     state.running = false;
     if (state.timerId) {
       clearTimeout(state.timerId);
       state.timerId = null;
     }
     bot.log("Anti-Bot monitor stopped");
+    // Update UI checkbox if exists
+    const toggle = document.getElementById("minibia-bot-antibot-enabled");
+    if (toggle) toggle.checked = false;
   }
 
   function checkChat() {
     if (!state.running) return;
 
     try {
-      // Get messages from the console channel
       const channels = window.gameClient?.interface?.channelManager?.channels || [];
       const consoleChannel = channels.find(ch => ch?.name === "Console");
       if (!consoleChannel) {
@@ -6062,12 +6933,9 @@ window.__minibiaBotBundle.installAntiBotMonitorModule = function installAntiBotM
 
       for (const entry of contents) {
         const message = String(entry?.message || "").toLowerCase();
-        // Look for the word "bot" (case-insensitive)
         if (message.includes("bot")) {
-          // Avoid triggering on our own messages or old ones
           const time = entry?.__time ? new Date(entry.__time).getTime() : 0;
-          if (time && now - time > 5000) continue; // ignore old messages
-
+          if (time && now - time > 5000) continue;
           if (now - state.lastTriggerAt > state.cooldownMs) {
             state.lastTriggerAt = now;
             bot.playAntiBotAlarm?.();
@@ -6085,14 +6953,25 @@ window.__minibiaBotBundle.installAntiBotMonitorModule = function installAntiBotM
 
   function scheduleNext() {
     if (!state.running) return;
-    state.timerId = setTimeout(checkChat, 2000); // check every 2 seconds
+    state.timerId = setTimeout(checkChat, 2000);
   }
 
-  // Public API
-  bot.antiBotMonitor = { start, stop };
+  function status() {
+    return { running: state.running, config: { ...config } };
+  }
 
-  // Auto-start if you want, or let the user enable it via UI
-  // start();
+  // ---- Auto-start if enabled ----
+  if (config.enabled) {
+    start();
+  }
+
+  // ---- Public API ----
+  bot.antiBotMonitor = {
+    start,
+    stop,
+    status,
+    config,
+  };
 };
 
 window.__minibiaBotBundle.installSlimeTrainerModule = function installSlimeTrainerModule(bot) {
@@ -8041,12 +8920,14 @@ window.__minibiaBotBundle.installAutoStackerModule = function installAutoStacker
   const state = {
     running: false,
     timerId: null,
+    convertTimerId: null,
   };
 
   const config = Object.assign(
     {
       enabled: false,
       tickMs: 5000,
+      convertCurrency: false,
     },
     bot.storage.get(configStorageKey, {})
   );
@@ -8070,7 +8951,6 @@ window.__minibiaBotBundle.installAutoStackerModule = function installAutoStacker
     try {
       const from = { which: container, index: fromSlot };
       const to = { which: container, index: toSlot };
-
       if (window.gameClient?.mouse?.sendItemMove) {
         window.gameClient.mouse.sendItemMove(from, to, count);
         return true;
@@ -8089,9 +8969,63 @@ window.__minibiaBotBundle.installAutoStackerModule = function installAutoStacker
     }
   }
 
-  function stackItems() {
-    if (!config.enabled || !state.running) return false;
+  function useItem(container, slot) {
+    if (!container || slot == null) return false;
+    try {
+      if (window.gameClient?.mouse?.use) {
+        window.gameClient.mouse.use({ which: container, index: slot });
+        return true;
+      }
+      if (window.gameClient?.send && typeof UsePacket === "function") {
+        try {
+          window.gameClient.send(new UsePacket(container, slot));
+        } catch (e) {
+          window.gameClient.send(new UsePacket({ which: container, index: slot }));
+        }
+        return true;
+      }
+      if (window.gameClient?.mouse?.__handleUse) {
+        window.gameClient.mouse.__handleUse({ which: container, index: slot });
+        return true;
+      }
+      return false;
+    } catch (e) {
+      return false;
+    }
+  }
 
+  function convertCurrencyNow() {
+    const containers = getContainers();
+    if (!containers.length) return false;
+
+    const GOLD_ID = 3031;
+    const PLATINUM_ID = 3035;
+    const FULL_STACK = 100;
+    let usedAny = false;
+
+    for (const container of containers) {
+      const size = container.size || container.slots?.length || 0;
+      for (let slot = 0; slot < size; slot++) {
+        const item = container.getSlotItem(slot);
+        if (!item) continue;
+        const id = item.id;
+        const count = item.count || 1;
+
+        let shouldConvert = false;
+        if (id === GOLD_ID && count === FULL_STACK) shouldConvert = true;
+        if (id === PLATINUM_ID && count === FULL_STACK) shouldConvert = true;
+
+        if (shouldConvert) {
+          const used = useItem(container, slot);
+          if (used) usedAny = true;
+        }
+      }
+    }
+    return usedAny;
+  }
+
+  function stackItems() {
+    if (!config.enabled) return false;
     const containers = getContainers();
     if (!containers.length) return false;
 
@@ -8100,6 +9034,7 @@ window.__minibiaBotBundle.installAutoStackerModule = function installAutoStacker
     for (const container of containers) {
       const itemMap = new Map();
       const size = container.size || container.slots?.length || 0;
+
       for (let slot = 0; slot < size; slot++) {
         const item = container.getSlotItem(slot);
         if (!item) continue;
@@ -8111,56 +9046,68 @@ window.__minibiaBotBundle.installAutoStackerModule = function installAutoStacker
 
       for (const [itemId, stacks] of itemMap) {
         if (stacks.length <= 1) continue;
-
-        stacks.sort((a, b) => a.slot - b.slot);
+        stacks.sort((a, b) => b.count - a.count);
         const maxStack = 100;
 
-        let moved = true;
-        while (moved) {
-          moved = false;
-          for (let srcIdx = stacks.length - 1; srcIdx >= 1; srcIdx--) {
-            const source = stacks[srcIdx];
+        for (let i = 0; i < stacks.length; i++) {
+          const target = stacks[i];
+          if (target.count >= maxStack) continue;
+          let room = maxStack - target.count;
+
+          for (let j = i + 1; j < stacks.length; j++) {
+            const source = stacks[j];
             if (source.count === 0) continue;
+            const moveCount = Math.min(source.count, room);
+            if (moveCount <= 0) continue;
 
-            for (let tgtIdx = 0; tgtIdx < srcIdx; tgtIdx++) {
-              const target = stacks[tgtIdx];
-              const room = maxStack - target.count;
-              if (room <= 0) continue;
-
-              const moveCount = Math.min(source.count, room);
-              if (moveCount <= 0) continue;
-
-              const success = moveItemsInContainer(container, source.slot, target.slot, moveCount);
-              if (success) {
-                source.count -= moveCount;
-                target.count += moveCount;
-                moved = true;
-                movedAny = true;
-                break;
-              }
+            const moved = moveItemsInContainer(container, source.slot, target.slot, moveCount);
+            if (moved) {
+              movedAny = true;
+              source.count -= moveCount;
+              target.count += moveCount;
+              room -= moveCount;
+              if (room <= 0) break;
             }
           }
         }
       }
     }
 
-    if (movedAny) {
-      // Only log once per tick if we moved something
-      bot.log("AutoStacker: combined some stacks");
-    }
+    if (movedAny) bot.log("AutoStacker: stacking completed");
     return movedAny;
   }
 
-  function scheduleNextTick() {
+  function scheduleConvertTick() {
+    if (!config.convertCurrency) return;
+    state.convertTimerId = window.setTimeout(() => {
+      try { convertCurrencyNow(); } catch (e) { /* ignore */ }
+      finally { scheduleConvertTick(); }
+    }, config.tickMs);
+  }
+
+  function startConvertLoop() {
+    if (state.convertTimerId) return;
+    config.convertCurrency = true;
+    persistConfig();
+    bot.log("ConvertCurrency loop started");
+    scheduleConvertTick();
+  }
+
+  function stopConvertLoop() {
+    if (state.convertTimerId) {
+      clearTimeout(state.convertTimerId);
+      state.convertTimerId = null;
+    }
+    config.convertCurrency = false;
+    persistConfig();
+    bot.log("ConvertCurrency loop stopped");
+  }
+
+  function scheduleStackTick() {
     if (!state.running) return;
     state.timerId = window.setTimeout(() => {
-      try {
-        stackItems();
-      } catch (e) {
-        bot.log("AutoStacker tick failed", e);
-      } finally {
-        scheduleNextTick();
-      }
+      try { stackItems(); } catch (e) { /* ignore */ }
+      finally { scheduleStackTick(); }
     }, config.tickMs);
   }
 
@@ -8171,21 +9118,15 @@ window.__minibiaBotBundle.installAutoStackerModule = function installAutoStacker
     state.running = true;
     bot.log("AutoStacker started");
     stackItems();
-    scheduleNextTick();
+    scheduleStackTick();
     return true;
   }
 
   function stop(options = {}) {
     const shouldPersist = options.persistEnabled !== false;
     state.running = false;
-    if (state.timerId) {
-      clearTimeout(state.timerId);
-      state.timerId = null;
-    }
-    if (shouldPersist) {
-      config.enabled = false;
-      persistConfig();
-    }
+    if (state.timerId) { clearTimeout(state.timerId); state.timerId = null; }
+    if (shouldPersist) { config.enabled = false; persistConfig(); }
     bot.log("AutoStacker stopped");
     return true;
   }
@@ -8194,17 +9135,25 @@ window.__minibiaBotBundle.installAutoStackerModule = function installAutoStacker
     return {
       running: state.running,
       config: { ...config },
+      convertLoopRunning: !!state.convertTimerId,
     };
   }
 
   function updateConfig(next) {
+    if (next.convertCurrency !== undefined && next.convertCurrency !== config.convertCurrency) {
+      if (next.convertCurrency) startConvertLoop();
+      else stopConvertLoop();
+    }
     Object.assign(config, next);
     persistConfig();
+
     if (config.enabled && !state.running) start();
     if (!config.enabled && state.running) stop();
+
     return { ...config };
   }
 
+  if (config.convertCurrency) startConvertLoop();
   if (config.enabled) start();
 
   bot.autoStacker = {
@@ -8214,6 +9163,7 @@ window.__minibiaBotBundle.installAutoStackerModule = function installAutoStacker
     updateConfig,
     config,
     stackItems,
+    convertCurrencyNow,
   };
 };
 
@@ -8235,45 +9185,66 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
     document.getElementById("minibia-bot-style")?.remove();
   }
 
-  function parsePreferredTargetNames(value) {
-    return String(value || "")
-      .split(/[\n,]/)
-      .map(s => s.trim())
-      .filter(Boolean)
-      .filter((name, idx, arr) => arr.findIndex(o => o.toLowerCase() === name.toLowerCase()) === idx);
-  }
+function parsePreferredTargetNames(value) {
+  return String(value || "")
+    .split(/\n/)                     // split by newline
+    .map(s => s.trim())              // trim whitespace
+    .filter(Boolean)                 // remove empty lines
+    .filter((name, idx, arr) => 
+      arr.findIndex(o => o.toLowerCase() === name.toLowerCase()) === idx
+    );                               // deduplicate (case-insensitive)
+}
 
   // ---- REFRESH FUNCTIONS (tie UI to bot state) ----
-  function refreshAutoAttackPreferredStatus(options = {}) {
-    const force = options.force === true;
-    const input = document.getElementById("minibia-bot-auto-attack-preferred-names");
-    const modeSelect = document.getElementById("minibia-bot-auto-attack-preferred-match-mode");
-    const statusLabel = document.getElementById("minibia-bot-auto-attack-preferred-status");
-    const attackConfig = bot.attack?.status?.().config || bot.attack?.config || {};
-    const preferred = Array.isArray(attackConfig.preferredTargetNames) ? attackConfig.preferredTargetNames : [];
-    const mode = attackConfig.preferredMatchMode === "includes" ? "includes" : "exact";
-    if (input && (force || document.activeElement !== input)) input.value = preferred.join(", ");
-    if (modeSelect) modeSelect.value = mode;
-    if (statusLabel) {
-      const names = preferred.length ? preferred.join(", ") : "none";
-      const modeText = mode === "includes" ? "contains text" : "exact name";
-      statusLabel.textContent = `Preferred mobs: ${names} | Mode: ${modeText}`;
-    }
+function refreshAutoAttackPreferredStatus(options = {}) {
+  const force = options.force === true;
+  const input = document.getElementById("minibia-bot-auto-attack-preferred-names");
+  const modeSelect = document.getElementById("minibia-bot-auto-attack-preferred-match-mode");
+  const statusLabel = document.getElementById("minibia-bot-auto-attack-preferred-status");
+  const attackConfig = bot.attack?.status?.().config || bot.attack?.config || {};
+  const preferred = Array.isArray(attackConfig.preferredTargetNames) ? attackConfig.preferredTargetNames : [];
+  const mode = attackConfig.preferredMatchMode === "includes" ? "includes" : "exact";
+
+  // --- CHANGE: join with newline instead of comma ---
+  if (input && (force || document.activeElement !== input)) {
+    input.value = preferred.join("\n");
   }
 
-  function refreshAutoAttackIgnoredStatus(options = {}) {
-    const force = options.force === true;
-    const input = document.getElementById("minibia-bot-auto-attack-ignored-names");
-    const statusLabel = document.getElementById("minibia-bot-auto-attack-ignored-status");
-    const attackConfig = bot.attack?.status?.().config || bot.attack?.config || {};
-    const ignored = Array.isArray(attackConfig.ignoredTargetNames) ? attackConfig.ignoredTargetNames : [];
-    if (input && (force || document.activeElement !== input)) {
-      input.value = ignored.join(", ");
-    }
-    if (statusLabel) {
-      statusLabel.textContent = ignored.length ? `Ignored: ${ignored.join(", ")}` : "Ignored: none";
-    }
+  if (modeSelect) modeSelect.value = mode;
+  if (statusLabel) {
+    const names = preferred.length ? preferred.join(", ") : "none";
+    const modeText = mode === "includes" ? "contains text" : "exact name";
+    statusLabel.textContent = `Preferred mobs: ${names} | Mode: ${modeText}`;
   }
+}
+
+function refreshAutoAttackIgnoredStatus(options = {}) {
+  const force = options.force === true;
+  const input = document.getElementById("minibia-bot-auto-attack-ignored-names");
+  const statusLabel = document.getElementById("minibia-bot-auto-attack-ignored-status");
+  const attackConfig = bot.attack?.status?.().config || bot.attack?.config || {};
+  const ignored = Array.isArray(attackConfig.ignoredTargetNames) ? attackConfig.ignoredTargetNames : [];
+
+  // --- CHANGE: join with newline instead of comma ---
+  if (input && (force || document.activeElement !== input)) {
+    input.value = ignored.join("\n");
+  }
+
+  if (statusLabel) {
+    statusLabel.textContent = ignored.length ? `Ignored: ${ignored.join(", ")}` : "Ignored: none";
+  }
+}
+
+function refreshAntiBotStatus() {
+  const toggle = document.getElementById("minibia-bot-antibot-enabled");
+  if (!toggle) return;
+  const status = bot.antiBotMonitor?.status?.();
+  if (status) {
+    toggle.checked = status.running;
+  } else {
+    toggle.checked = false;
+  }
+}
 
 // ---- Paladin UI ----
 function refreshPaladinStatus() {
@@ -8763,6 +9734,22 @@ function refreshPinkSkullStatus() {
 	}
 
   // ---- CAVE UI ----
+  
+function getDirectionOffset(dir) {
+  const offsets = {
+    NW: { dx: -1, dy: -1 },
+    N:  { dx: 0,  dy: -1 },
+    NE: { dx: 1,  dy: -1 },
+    W:  { dx: -1, dy: 0 },
+    C:  { dx: 0,  dy: 0 },
+    E:  { dx: 1,  dy: 0 },
+    SW: { dx: -1, dy: 1 },
+    S:  { dx: 0,  dy: 1 },
+    SE: { dx: 1,  dy: 1 }
+  };
+  return offsets[dir] || { dx: 0, dy: 0 };
+}
+  
   function refreshCavePresetControls() {
     const select = document.getElementById("minibia-bot-cave-preset-select");
     const label = document.getElementById("minibia-bot-cave-preset-status");
@@ -8791,7 +9778,7 @@ function refreshPinkSkullStatus() {
     if (label) label.textContent = names.length ? `Preset: ${active} (${names.length} saved)` : `Preset: ${active}`;
     if (delBtn) delBtn.disabled = !names.length || !select?.value;
   }
-
+  
   function refreshCaveClosestStatus() {
     const label = document.getElementById("minibia-bot-cave-closest");
     if (!label) return;
@@ -8841,8 +9828,37 @@ function refreshPinkSkullStatus() {
       const num = document.createElement("span");
       num.textContent = `${idx+1}.`;
       num.style.cssText = "font-weight:bold;min-width:20px;";
-      const coords = document.createElement("span");
-      coords.textContent = `${wp.x}, ${wp.y}, ${wp.z}`;
+		const coords = document.createElement("span");
+		let displayText = "";
+		// For normal waypoints with coordinates
+		if (wp.x !== undefined && wp.x !== null) {
+		  displayText = `${wp.x}, ${wp.y}, ${wp.z}`;
+		}
+		// If it has a label, use it as title
+		if (wp.label) {
+		  if (displayText) {
+			displayText = wp.label + ' (' + displayText + ')';
+		  } else {
+			displayText = wp.label;
+		  }
+		}
+		// If no coords and no label, it's a script-only without label – show as "Script"
+		if (!displayText) {
+		  displayText = "Script";
+		}
+		if (wp.stand) {
+		  displayText = "📍 " + displayText;
+		}
+		if (wp.rope) {
+		  displayText = "🪢 " + displayText;
+		}
+		if (wp.shovel) {
+		  displayText = "⛏️ " + displayText;
+		}
+		if (wp.script) {
+		  displayText += ' 📜';
+		}
+		coords.textContent = displayText;
       if (idx === current) coords.style.cssText = "color:#ffcf5a;font-weight:bold;";
       const distSpan = document.createElement("span");
       distSpan.style.cssText = "margin-left:auto;font-size:10px;opacity:0.6;";
@@ -8852,16 +9868,22 @@ function refreshPinkSkullStatus() {
         distSpan.textContent = `dist ${dx+dy}`;
       }
       row.appendChild(num); row.appendChild(coords); row.appendChild(distSpan);
-      row.addEventListener("click", () => {
-        container.querySelectorAll("[data-selected]").forEach(el => el.dataset.selected = "false");
-        row.dataset.selected = "true";
-        selectedWaypointIndex = idx;
-        bot.cave.setCurrentIndex(idx);
-        if (bot.cave?.status?.().running) bot.cave.goToWaypoint(route[idx]);
-        refreshCaveStatus();
-        refreshCaveWaypointList();
-        refreshTitlebarRunIndicators();
-      });
+		row.addEventListener("click", () => {
+		  container.querySelectorAll("[data-selected]").forEach(el => el.dataset.selected = "false");
+		  row.dataset.selected = "true";
+		  selectedWaypointIndex = idx;
+		  const wp = route[idx];
+		  const labelInput = document.getElementById("minibia-bot-cave-waypoint-label");
+		  const scriptInput = document.getElementById("minibia-bot-cave-waypoint-script");
+		  if (labelInput) labelInput.value = wp.label || "";
+		  if (scriptInput) scriptInput.value = wp.script || "";
+		  bot.cave.setCurrentIndex(idx);
+		  if (bot.cave?.status?.().running) bot.cave.goToWaypoint(route[idx]);
+		  refreshCaveStatus();
+		  refreshCaveWaypointList();
+		  refreshTitlebarRunIndicators();
+		  scrollToSelectedWaypoint();   // <-- added
+		});
       if (idx === current && selectedWaypointIndex === null) {
         row.dataset.selected = "true";
         selectedWaypointIndex = idx;
@@ -8872,6 +9894,19 @@ function refreshPinkSkullStatus() {
       selectedWaypointIndex = null;
     }
   }
+  
+	function scrollToSelectedWaypoint() {
+	  const container = document.getElementById("minibia-bot-cave-waypoint-list");
+	  if (!container) return;
+	  if (selectedWaypointIndex === null || selectedWaypointIndex < 0) return;
+	  const rows = container.querySelectorAll("[data-index]");
+	  if (selectedWaypointIndex < rows.length) {
+		const row = rows[selectedWaypointIndex];
+		if (row) {
+		  row.scrollIntoView({ block: "nearest", behavior: "smooth" });
+		}
+	  }
+	}
 
   function moveSelectedWaypoint(direction) {
     if (selectedWaypointIndex === null) { bot.log("No waypoint selected. Click a waypoint first."); return; }
@@ -9888,6 +10923,7 @@ function refreshPinkSkullStatus() {
         <label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-equip-ring-enabled" /><span>Equip Ring</span></label>
         <label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-pink-skull-enabled" /><span>Pink Skull</span></label>
 		<label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-reconnect-enabled" /><span>Auto‑Reconnect</span></label>
+		<label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-autostacker-convert-currency" /><span>Convert Currency</span></label>
       </div>
     </div>
 
@@ -9913,45 +10949,95 @@ function refreshPinkSkullStatus() {
   </div>
 </div>
 
-    <!-- Cave Tab -->
-    <div class="mb-tab-panel" data-tab-panel="cave">
-      <div class="mb-section">
-        <div style="display:flex;justify-content:space-between;align-items:center;">
-          <div class="mb-label" style="margin:0;">Cave Bot</div>
-          <div style="display:flex;gap:12px;align-items:center;">
-            <label class="mb-toggle" style="margin:0;font-size:11px;"><input type="checkbox" id="minibia-bot-cave-loop" /><span>Loop</span></label>
-            <label class="mb-toggle" style="margin:0;font-size:11px;"><input type="checkbox" id="minibia-bot-cave-toggle" /><span>Enable</span></label>
-          </div>
-        </div>
-        <div style="display:flex;gap:6px;align-items:center;margin:6px 0;">
-          <select id="minibia-bot-cave-preset-select" style="flex:1;padding:4px 6px;font-size:11px;"></select>
-          <button type="button" class="mb-small-button" id="minibia-bot-cave-preset-new" style="padding:2px 8px;font-size:10px;">New</button>
-          <button type="button" class="mb-small-button" id="minibia-bot-cave-preset-delete" style="padding:2px 8px;font-size:10px;">Del</button>
-        </div>
-        <div style="display:flex;gap:6px;align-items:center;margin:4px 0;">
-          <label style="font-size:11px;color:#e9d39b;">Skip if within</label>
-          <input type="number" id="minibia-bot-cave-tolerance" min="0" max="5" step="1" value="0" style="width:50px;padding:2px 4px;font-size:11px;" />
-          <span style="font-size:11px;color:#cdbb8b;">tiles</span>
-        </div>
-		<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:4px;margin:4px 0;">
-          <button type="button" class="mb-small-button" id="minibia-bot-cave-add" style="padding:4px;">+ Add</button>
-          <button type="button" class="mb-small-button" id="minibia-bot-cave-move-up" style="padding:4px;">▲</button>
-          <button type="button" class="mb-small-button" id="minibia-bot-cave-move-down" style="padding:4px;">▼</button>
-          <button type="button" class="mb-small-button" id="minibia-bot-cave-delete-selected" style="padding:4px;background:#5a2020;border-color:#883030;">✕</button>
-        </div>
-		
-        <div style="margin:6px 0;">
-          <div class="mb-label" style="font-size:11px;margin:0 0 4px;">Waypoints</div>
-          <div id="minibia-bot-cave-waypoint-list" style="max-height:120px;overflow-y:auto;border:1px solid rgba(224,200,148,0.2);border-radius:4px;padding:2px;font-size:11px;"></div>
-        </div>
+<!-- Cave Tab -->
+<div class="mb-tab-panel" data-tab-panel="cave">
+  <div class="mb-section">
 
-        <div style="font-size:10px;color:#cdbb8b;margin-top:4px;display:grid;gap:2px;">
-          <div id="minibia-bot-cave-status">Status: no waypoints</div>
-          <div id="minibia-bot-cave-closest">Closest start: none</div>
-          <div id="minibia-bot-cave-transition-status">Transitions learned: none</div>
-        </div>
+    <!-- Header -->
+    <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:8px;">
+      <div class="mb-label" style="margin:0;">Cave Bot</div>
+      <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
+        <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-cave-loop" /> Loop</label>
+        <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-cave-auto-transitions" /> Auto Transitions</label>
+        <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-cave-toggle" /> Enable</label>
       </div>
     </div>
+
+    <!-- Presets -->
+    <div style="display:flex; gap:6px; align-items:center; margin-bottom:6px;">
+      <select id="minibia-bot-cave-preset-select" style="flex:1; padding:4px 6px; font-size:11px;"></select>
+      <button type="button" class="mb-small-button" id="minibia-bot-cave-preset-new" style="padding:2px 8px; font-size:10px;">New</button>
+      <button type="button" class="mb-small-button" id="minibia-bot-cave-preset-delete" style="padding:2px 8px; font-size:10px;">Del</button>
+    </div>
+
+    <!-- Controls -->
+    <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:6px;">
+      <div style="display:flex; align-items:center; gap:4px;">
+        <label style="font-size:11px; color:#e9d39b;">Direction</label>
+        <select id="minibia-bot-cave-direction" style="padding:2px; font-size:11px;">
+          <option value="NW">NW</option><option value="N">N</option><option value="NE">NE</option>
+          <option value="W">W</option><option value="C" selected>C</option><option value="E">E</option>
+          <option value="SW">SW</option><option value="S">S</option><option value="SE">SE</option>
+        </select>
+      </div>
+	  
+      <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-cave-stand" /> Stand</label>
+	  
+	  <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-cave-rope" /> Rope</label>
+	  
+	  <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-cave-shovel" /> Shovel</label>
+	  
+    </div>
+	
+	
+
+    <!-- Buttons -->
+    <div style="display:grid; grid-template-columns:repeat(5, 1fr); gap:4px; margin-bottom:6px;">
+      <button type="button" class="mb-small-button" id="minibia-bot-cave-add" style="padding:4px;">+ Add</button>
+      <button type="button" class="mb-small-button" id="minibia-bot-cave-add-script" style="padding:4px;">+ Script</button>
+      <button type="button" class="mb-small-button" id="minibia-bot-cave-move-up" style="padding:4px;">▲</button>
+      <button type="button" class="mb-small-button" id="minibia-bot-cave-move-down" style="padding:4px;">▼</button>
+      <button type="button" class="mb-small-button" id="minibia-bot-cave-delete-selected" style="padding:4px; background:#5a2020; border-color:#883030;">✕</button>
+    </div>
+
+    <!-- Waypoint list -->
+    <div style="margin-bottom:6px;">
+      <!-- Row 1: WPT | SKIP + input -->
+      <div style="display:flex; align-items:center; gap:8px; margin-bottom:4px;">
+        <div class="mb-label" style="font-size:11px; margin:0 0 4px;">Waypoints</div>
+        <span style="color:#666;">|</span>
+        <label style="font-size:11px; color:#e9d39b; white-space:nowrap;">Skip sqm</label>
+        <input type="number" id="minibia-bot-cave-tolerance" min="0" max="5" step="1" value="0" style="width:50px; padding:2px 4px; font-size:11px;" />
+      </div>
+      <div id="minibia-bot-cave-waypoint-list" style="max-height:120px; overflow-y:auto; border:1px solid rgba(224,200,148,0.2); border-radius:4px; padding:2px; font-size:11px;"></div>
+    </div>
+
+    <!-- Waypoint properties – exact match -->
+    <div style="border-top:1px solid rgba(255,255,255,0.1); padding-top:6px; margin-top:4px;">
+      <div class="mb-label" style="font-size:11px;">Waypoint Properties</div>
+      <!-- Row 1: Script | Label + input -->
+      <div style="display:flex; align-items:center; gap:8px; margin-bottom:4px;">
+        <span style="font-size:11px; color:#e9d39b; font-weight:bold;">Script</span>
+        <span style="color:#666;">|</span>
+        <label style="font-size:11px; color:#e9d39b; white-space:nowrap;">Label</label>
+        <input type="text" id="minibia-bot-cave-waypoint-label" placeholder="Optional label" style="flex:1; padding:4px 6px; font-size:11px;" />
+      </div>
+      <!-- Row 2: Script textarea -->
+      <div>
+        <textarea id="minibia-bot-cave-waypoint-script" placeholder="Code to run when reached" rows="2" style="width:100%; resize:vertical; padding:4px 6px; font-size:11px; box-sizing:border-box;"></textarea>
+      </div>
+      <button type="button" class="mb-small-button" id="minibia-bot-cave-waypoint-save" style="margin-top:4px;">Save</button>
+    </div>
+
+    <!-- Status -->
+    <div style="font-size:10px; color:#cdbb8b; margin-top:6px; display:grid; gap:2px;">
+      <div id="minibia-bot-cave-status">Status: no waypoints</div>
+      <div id="minibia-bot-cave-closest">Closest start: none</div>
+      <div id="minibia-bot-cave-transition-status">Transitions learned: none</div>
+    </div>
+
+  </div>
+</div>
 
 <!-- Targeting Tab -->
 <div class="mb-tab-panel" data-tab-panel="targeting">
@@ -10283,6 +11369,57 @@ function refreshPinkSkullStatus() {
 
     // ---- EVENT LISTENERS ----
 	
+	const addScriptBtn = panel.querySelector("#minibia-bot-cave-add-script");
+	if (addScriptBtn) {
+	  addScriptBtn.addEventListener("click", () => {
+		const wp = {
+		  label: "Script",
+		  script: "// Enter script code here\nbot.log('Hello from script!');"
+		};
+		const added = bot.cave.addWaypoint(wp);
+		if (added) {
+		  const route = bot.cave.getRoute();
+		  selectedWaypointIndex = route.length - 1;
+		  const wpData = route[selectedWaypointIndex];
+		  const labelInput = document.getElementById("minibia-bot-cave-waypoint-label");
+		  const scriptInput = document.getElementById("minibia-bot-cave-waypoint-script");
+		  if (labelInput) labelInput.value = wpData.label || "";
+		  if (scriptInput) scriptInput.value = wpData.script || "";
+		  refreshCaveWaypointList();
+		  refreshCaveStatus();
+		  refreshCaveClosestStatus();
+		  refreshCaveTransitionStatus();
+		  refreshCavePresetControls();
+		  scrollToSelectedWaypoint();
+		  bot.log("Script waypoint added.");
+		} else {
+		  bot.log("Failed to add script waypoint.");
+		}
+	  });
+	}
+	
+	const saveWpBtn = panel.querySelector("#minibia-bot-cave-waypoint-save");
+	if (saveWpBtn) {
+	  saveWpBtn.addEventListener("click", () => {
+		const route = bot.cave.getRoute();
+		if (selectedWaypointIndex === null || selectedWaypointIndex >= route.length) {
+		  bot.log("No waypoint selected.");
+		  return;
+		}
+		const labelInput = document.getElementById("minibia-bot-cave-waypoint-label");
+		const scriptInput = document.getElementById("minibia-bot-cave-waypoint-script");
+		const label = labelInput.value.trim() || undefined;
+		const script = scriptInput.value.trim() || undefined;
+		// Update the actual route via the new method
+		bot.cave.updateWaypoint(selectedWaypointIndex, { label, script });
+		// Refresh the list and status
+		refreshCaveWaypointList();
+		refreshCaveStatus();
+		bot.log("Waypoint properties saved.");
+	  });
+	}
+	
+	
 	// ---- AutoStacker ----
 	function refreshAutoStackerStatus() {
 	  const toggle = document.getElementById("minibia-bot-autostacker-enabled");
@@ -10301,6 +11438,15 @@ function refreshPinkSkullStatus() {
 		  bot.autoStacker.stop();
 		}
 		refreshAutoStackerStatus();
+	  });
+	}
+	
+	// ---- AutoStacker currency conversion ----
+	const convertCurrencyToggle = panel.querySelector("#minibia-bot-autostacker-convert-currency");
+	if (convertCurrencyToggle) {
+	  convertCurrencyToggle.checked = bot.autoStacker?.config?.convertCurrency !== false;
+	  convertCurrencyToggle.addEventListener("change", function() {
+		bot.autoStacker.updateConfig({ convertCurrency: this.checked });
 	  });
 	}
 	
@@ -11188,14 +12334,45 @@ if (clientChaseToggle) {
     const moveUpBtn = panel.querySelector("#minibia-bot-cave-move-up");
     const moveDownBtn = panel.querySelector("#minibia-bot-cave-move-down");
     const delBtn = panel.querySelector("#minibia-bot-cave-delete-selected");
-    if (addBtn) addBtn.addEventListener("click", () => {
-      bot.cave.addWaypointCurrentSpot();
-      refreshCaveWaypointList();
-      refreshCaveStatus();
-      refreshCaveClosestStatus();
-      refreshCaveTransitionStatus();
-      refreshCavePresetControls();
-    });
+	if (addBtn) {
+	  addBtn.addEventListener("click", () => {
+		const pos = bot.getPlayerPosition();
+		if (!pos) { bot.log("Cannot get player position."); return; }
+		const dirSelect = document.getElementById("minibia-bot-cave-direction");
+		const standCheck = document.getElementById("minibia-bot-cave-stand");
+		const ropeCheck = document.getElementById("minibia-bot-cave-rope");
+		const shovelCheck = document.getElementById("minibia-bot-cave-shovel");
+		const dir = dirSelect ? dirSelect.value : "C";
+		const offset = getDirectionOffset(dir);
+		const x = pos.x + offset.dx;
+		const y = pos.y + offset.dy;
+		const z = pos.z;
+		const stand = !!(standCheck && standCheck.checked);
+		const rope = !!(ropeCheck && ropeCheck.checked);
+		const shovel = !!(shovelCheck && shovelCheck.checked);
+		const label = stand ? "Stand" : (rope ? "Rope" : (shovel ? "Shovel" : ""));
+		const waypoint = { x, y, z, label: label || undefined, stand: stand, rope: rope, shovel: shovel };
+		const added = bot.cave.addWaypoint(waypoint);
+		if (added) {
+		  const route = bot.cave.getRoute();
+		  selectedWaypointIndex = route.length - 1;
+		  const wp = route[selectedWaypointIndex];
+		  const labelInput = document.getElementById("minibia-bot-cave-waypoint-label");
+		  const scriptInput = document.getElementById("minibia-bot-cave-waypoint-script");
+		  if (labelInput) labelInput.value = wp.label || "";
+		  if (scriptInput) scriptInput.value = wp.script || "";
+		  refreshCaveWaypointList();
+		  refreshCaveStatus();
+		  refreshCaveClosestStatus();
+		  refreshCaveTransitionStatus();
+		  refreshCavePresetControls();
+		  scrollToSelectedWaypoint();
+		  bot.log("Waypoint added.");
+		} else {
+		  bot.log("Failed to add waypoint.");
+		}
+	  });
+	}
     if (moveUpBtn) moveUpBtn.addEventListener("click", () => moveSelectedWaypoint("up"));
     if (moveDownBtn) moveDownBtn.addEventListener("click", () => moveSelectedWaypoint("down"));
     if (delBtn) delBtn.addEventListener("click", deleteSelectedWaypoint);
@@ -11273,6 +12450,14 @@ if (clientChaseToggle) {
         bot.cave.setLoopMode(loopToggle.checked);
       });
     }
+	
+	const autoTransToggle = panel.querySelector("#minibia-bot-cave-auto-transitions");
+	if (autoTransToggle) {
+	  autoTransToggle.checked = bot.cave?.config?.autoTransitions ?? true;
+	  autoTransToggle.addEventListener("change", () => {
+		bot.cave.updateConfig({ autoTransitions: autoTransToggle.checked });
+	  });
+	}
 	
 	// ---- Reload Bot ----
 	const reloadButton = panel.querySelector("#minibia-bot-reload");
@@ -11448,6 +12633,11 @@ if (clientChaseToggle) {
 	  refreshAntiAfkStatus();
 	  refreshSlimeTrainerStatus();
 	  refreshAutoStackerStatus();
+	  refreshAntiBotStatus();
+	  if (convertCurrencyToggle) {
+		convertCurrencyToggle.checked = bot.autoStacker?.config?.convertCurrency !== false;
+	  }
+	  
 	} catch (e) {
 	  console.error("[minibia-bot] UI init error:", e);
 	}
@@ -11461,6 +12651,8 @@ if (clientChaseToggle) {
 	bot.addCleanup(() => window.clearInterval(paladinTimer));
 	const looterTimer = window.setInterval(refreshLooterStatus, 1000);
 	bot.addCleanup(() => window.clearInterval(looterTimer));
+	const antibotTimer = window.setInterval(refreshAntiBotStatus, 1000);
+	bot.addCleanup(() => window.clearInterval(antibotTimer));
     const caveTimer = window.setInterval(() => {
       refreshCaveStatus();
       refreshCavePresetControls();
