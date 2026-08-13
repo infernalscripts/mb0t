@@ -438,7 +438,7 @@ function startReconnectWatcher() {
     },
 
     log(...args) {
-      console.log("[minibia-bot]", ...args);
+      console.log("[mbot]", ...args);
     },
 
     /** Simple localStorage wrapper with JSON serialisation */
@@ -2620,7 +2620,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
   }
 
   // ---- Constants for floor-change detection (copied from cave module) ----
-  const ladderItemIds = new Set([1948, 1968, 435]);
+  const ladderItemIds = new Set([1948, 1968, 435, 5542]);
   const teleporterItemIds = new Set([5756]); // turtle teleport – add more IDs as needed
 
   function persistConfig() {
