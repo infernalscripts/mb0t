@@ -31,7 +31,9 @@ window.__minibiaBotBundle.createBot = function createBot() {
   const defaultAlarmAudioSrc = "https://upload.wikimedia.org/wikipedia/commons/5/5c/En-us-red_alert.oga";
   const playerAlarmSrc = "https://upload.wikimedia.org/wikipedia/commons/f/fc/Female_voice_saying_Player_on_screen.wav";
   const gmAlarmSrc = "https://upload.wikimedia.org/wikipedia/commons/2/2d/Female_Voice_saying_Gamemaster_Detected.wav";
-  const antiBotAlarmSrc = "http://upload.wikimedia.org/wikipedia/commons/e/e3/Female_voice_saying_Anti-Bot_check.wav";
+  const antiBotAlarmSrc = "https://upload.wikimedia.org/wikipedia/commons/e/e3/Female_voice_saying_Anti-Bot_check.wav";
+  const playerAttackAlarmSrc = "https://upload.wikimedia.org/wikipedia/commons/d/d6/Female_voice_saying_%22Player_Attack%22.wav";
+  const messageAlarmSrc = "https://upload.wikimedia.org/wikipedia/commons/7/7d/Female_Voice_saying_%22Message%22.wav";
   const alarmAudioSrcStorageKey = "minibiaBot.audio.alarmSrc";
   const playerAlarmStorageKey = "minibiaBot.audio.playerAlarmSrc";
   const gmAlarmStorageKey = "minibiaBot.audio.gmAlarmSrc";
@@ -106,6 +108,20 @@ window.__minibiaBotBundle.createBot = function createBot() {
     }
     return alarmAudio;
   }
+  
+  
+	function setupGlobalAudioUnlock() {
+	  const unlock = () => {
+		this.unlockAudio();
+		// Remove listeners after first unlock to avoid spamming
+		document.removeEventListener("click", unlock);
+		document.removeEventListener("touchstart", unlock);
+		document.removeEventListener("keydown", unlock);
+	  };
+	  document.addEventListener("click", unlock);
+	  document.addEventListener("touchstart", unlock);
+	  document.addEventListener("keydown", unlock);
+	}
 
   // ---- CHAT HELPERS (deduplication) ----
   function normalizeChatText(text) {
@@ -177,6 +193,7 @@ window.__minibiaBotBundle.createBot = function createBot() {
       ""
     );
   }
+
 
   // ---- RECONNECT WATCHER ----
   function findReconnectElement() {
@@ -530,24 +547,33 @@ function startReconnectWatcher() {
     },
 
     /** Unlock audio autoplay by playing a muted sound */
-    unlockAudio() {
-      try {
-        const audio = getAlarmAudio();
-        if (!audio) return false;
-        audio.muted = true;
-        const playResult = audio.play();
-        if (playResult && typeof playResult.then === "function") {
-          playResult.then(() => { audio.pause(); audio.currentTime = 0; audio.muted = false; })
-                   .catch(() => { audio.muted = false; });
-        } else {
-          audio.pause(); audio.currentTime = 0; audio.muted = false;
-        }
-        return true;
-      } catch (error) {
-        console.error("[minibia-bot] audio unlock failed", error);
-        return false;
-      }
-    },
+unlockAudio() {
+  try {
+    if (!this.__unlockAudio) {
+      this.__unlockAudio = new Audio();
+    }
+    const audio = this.__unlockAudio;
+    audio.muted = true;
+    const playResult = audio.play();
+    if (playResult && typeof playResult.then === "function") {
+      playResult.then(() => {
+        audio.pause();
+        audio.currentTime = 0;
+        audio.muted = false;
+      }).catch(() => {
+        audio.muted = false;
+      });
+    } else {
+      audio.pause();
+      audio.currentTime = 0;
+      audio.muted = false;
+    }
+    return true;
+  } catch (error) {
+    console.error("[minibia-bot] audio unlock failed", error);
+    return false;
+  }
+},
 
     /** Play the alarm sound */
     playAlarm() {
@@ -582,21 +608,52 @@ function startReconnectWatcher() {
     playAntiBotAlarm() {
       return this._playSpecificAlarm(antiBotAlarmSrc, "antiBotAlarm");
     },
+	
+	/** Play the player-attack alarm */
+	playPlayerAttackAlarm() {
+	  return this._playSpecificAlarm(playerAttackAlarmSrc, "playerAttackAlarm");
+	},
+
+	/** Play the message alert alarm */
+	playMessageAlarm() {
+	  return this._playSpecificAlarm(messageAlarmSrc, "messageAlarm");
+	},
 
     /** Internal helper for specific alarms */
-    _playSpecificAlarm(src, label) {
-      try {
-        const audio = new Audio(src);
-        audio.preload = "auto";
-        audio.play().catch((error) => {
-          this.log(`${label} playback failed`, error?.message || error);
-        });
-        return true;
-      } catch (error) {
-        console.error(`[minibia-bot] ${label} failed`, error);
-        return false;
-      }
-    },
+_playSpecificAlarm(src, label) {
+  try {
+    // Create a shared audio element if it doesn't exist
+    if (!this.__specificAlarmAudio) {
+      this.__specificAlarmAudio = new Audio();
+      this.__specificAlarmAudio.preload = "auto";
+    }
+    const audio = this.__specificAlarmAudio;
+
+    // Unlock the audio context (uses a standalone method below)
+    this.unlockAudio();
+
+    // Update source if changed
+    if (audio.src !== src) {
+      audio.src = src;
+      audio.load();
+    }
+
+    audio.currentTime = 0;
+    audio.volume = 1;
+    const playPromise = audio.play();
+    if (playPromise && typeof playPromise.catch === "function") {
+      playPromise.catch((error) => {
+        console.error(`[minibia-bot] ${label} playback failed:`, error);
+        this.log(`${label} playback failed`, error?.message || error);
+      });
+    }
+    return true;
+  } catch (error) {
+    console.error(`[minibia-bot] ${label} creation failed:`, error);
+    this.log(`${label} creation failed`, error?.message || error);
+    return false;
+  }
+},
 
     /** Control the __imB reset interval */
     imbReset: {
@@ -777,6 +834,8 @@ function startReconnectWatcher() {
         return wpLabel === normalized;
       });
     },
+	
+	getAlarmAudio,   // expose the internal function
   }
 };
 
@@ -1650,6 +1709,124 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
   };
 };
 
+window.__minibiaBotBundle.installPlayerAttackMonitorModule = function installPlayerAttackMonitorModule(bot) {
+  const configStorageKey = "minibiaBot.playerAttack.config";
+  const state = {
+    running: false,
+    timerId: null,
+    lastDamageKey: null,
+  };
+
+  // Load config
+  const config = Object.assign(
+    { enabled: false },
+    bot.storage.get(configStorageKey, {})
+  );
+
+  function persistConfig() {
+    bot.storage.set(configStorageKey, { enabled: config.enabled });
+  }
+
+  // ---- Helpers (same as before) ----
+  function normalizeName(name) {
+    return String(name || "").trim().toLowerCase();
+  }
+
+  function parseDamageEvent(entry) {
+    const match = entry.message.match(/^You lose\s+(\d+)\s+hitpoints\s+due to an attack by\s+(.+?)\.$/i);
+    if (!match) return null;
+    return {
+      amount: Number(match[1]),
+      attackerName: match[2].trim(),
+      time: entry.time,
+      channelName: entry.channelName,
+      key: `${entry.time || "no-time"}|${entry.message}`,
+      message: entry.message,
+    };
+  }
+
+  function getLatestDamageEvent() {
+    const channels = window.gameClient?.interface?.channelManager?.channels || [];
+    const messages = channels
+      .flatMap(channel => (channel?.__contents || []).map(entry => ({
+        channelName: channel?.name || null,
+        message: String(entry?.message || ""),
+        time: entry?.__time || null,
+      })))
+      .map(parseDamageEvent)
+      .filter(Boolean)
+      .sort((a, b) => {
+        const aTime = a.time ? Date.parse(a.time) : 0;
+        const bTime = b.time ? Date.parse(b.time) : 0;
+        return bTime - aTime;
+      });
+    return messages[0] || null;
+  }
+
+  function isAttackerPlayer(attackerName) {
+    if (!attackerName) return false;
+    const creatures = Object.values(window.gameClient?.world?.activeCreatures || {});
+    const normalized = normalizeName(attackerName);
+    for (const creature of creatures) {
+      if (creature?.name && normalizeName(creature.name) === normalized) {
+        return creature.type === 0;
+      }
+    }
+    return false;
+  }
+
+  function checkForPlayerAttack() {
+    if (!config.enabled || !state.running) return;
+    const event = getLatestDamageEvent();
+    if (!event) return;
+    if (event.key === state.lastDamageKey) return;
+    state.lastDamageKey = event.key;
+
+    const trustedNames = bot.panic?.getTrustedNames?.() || [];
+    const isTrusted = trustedNames.some(t => normalizeName(t) === normalizeName(event.attackerName));
+    if (isTrusted) return;
+
+    if (isAttackerPlayer(event.attackerName)) {
+      bot.playPlayerAttackAlarm();
+      bot.log("PLAYER ATTACK!", { attacker: event.attackerName, amount: event.amount });
+    }
+  }
+
+  function tick() {
+    if (!state.running) return;
+    try { checkForPlayerAttack(); } catch (e) { bot.log("Player attack monitor error", e); }
+    state.timerId = setTimeout(tick, 2000);
+  }
+
+  function start() {
+    if (state.running) return false;
+    config.enabled = true;
+    persistConfig();
+    state.running = true;
+    bot.log("Player attack monitor started");
+    tick();
+    return true;
+  }
+
+  function stop() {
+    state.running = false;
+    if (state.timerId) { clearTimeout(state.timerId); state.timerId = null; }
+    config.enabled = false;
+    persistConfig();
+    bot.log("Player attack monitor stopped");
+    return true;
+  }
+
+  function status() {
+    return { running: state.running, config: { ...config } };
+  }
+
+  // Auto-start if enabled
+  if (config.enabled) start();
+
+  bot.playerAttackMonitor = { start, stop, status, config };
+};
+
 /**
  * ==================================================================================
  * 5. RUNE MODULE (Magic Level Trainer)
@@ -1668,7 +1845,7 @@ window.__minibiaBotBundle.installRuneModule = function installRuneModule(bot) {
       minHpPercent: 50,
       minFoodSeconds: 30,
       runeSpellWords: "adori vita vis",
-      runeManaCost: 600,
+      runeManaCost: 98,
       runeCooldownMs: 3500,
       enabled: false,
     },
@@ -1708,7 +1885,7 @@ window.__minibiaBotBundle.installRuneModule = function installRuneModule(bot) {
     }
     const hpPercent = hp.max > 0 ? (hp.current / hp.max) * 100 : 0;
     const enoughHp = hpPercent >= config.minHpPercent;
-    const enoughMana = mana.current >= config.runeManaCost;
+    const enoughMana = bot.manaPercent() >= config.runeManaCost;
     const enoughFood = food?.seconds == null || food.seconds >= config.minFoodSeconds;
     const cooldownElapsed = now - state.lastRuneAt;
     const cooldownRemaining = Math.max(0, config.runeCooldownMs - cooldownElapsed);
@@ -4003,6 +4180,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 	_shovelState: null,
 	_shovelOpened: null,
 	_shovelRetry: null, // { index, count, lastTry }
+	_ladderUsed: null, // index -> true
   };
   const minimapOverlayState = { timerId: null };
 
@@ -4176,12 +4354,10 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
 function normalizeWaypoint(waypoint) {
   if (!waypoint) return null;
-  let x, y, z, label, script, stand, rope, shovel;
+  let x, y, z, label, script, stand, rope, shovel, ladder;
   if (Array.isArray(waypoint)) {
     [x, y, z] = waypoint;
-    stand = false;
-    rope = false;
-    shovel = false;
+    stand = rope = shovel = ladder = false;
   } else {
     x = Number(waypoint.x);
     y = Number(waypoint.y);
@@ -4191,6 +4367,7 @@ function normalizeWaypoint(waypoint) {
     stand = waypoint.stand === true;
     rope = waypoint.rope === true;
     shovel = waypoint.shovel === true;
+    ladder = waypoint.ladder === true;
   }
   const hasCoords = Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z);
   const hasScript = script !== undefined && script.length > 0;
@@ -4204,6 +4381,7 @@ function normalizeWaypoint(waypoint) {
     stand: !!stand,
     rope: !!rope,
     shovel: !!shovel,
+    ladder: !!ladder,
   };
 }
 
@@ -5125,16 +5303,42 @@ function tick() {
 // ---- STAND WAYPOINT ----
 if (waypoint && waypoint.stand) {
   const index = state.currentIndex;
+  const now = Date.now();
 
-  // If position is unavailable, wait for next tick
+  // ---- Already reached? Advance ----
+  if (state.standReached && state.standReached[index]) {
+    bot.log("Stand waypoint already reached, advancing");
+    waypoint = advanceWaypoint();
+    if (!waypoint) { stop(); return; }
+    state._standAttempt = null;
+    state.lastWaypointTarget = null;
+    state.pathAttemptStart = 0;
+    state.lastDistanceToWaypoint = null;
+    state.stuckCount = 0;
+    state.positionHistory = [];
+    state.skipAttemptCount = 0;
+    delete state.standStartAt?.[index];
+    if (waypoint.x !== undefined) {
+      state.lastWaypointTarget = waypoint;
+      state.pathAttemptStart = Date.now();
+      state.lastDistanceToWaypoint = getDistanceToWaypoint(position, waypoint);
+      goToWaypoint(waypoint);
+    }
+    return;
+  }
+
+  // ---- If position is unavailable, wait for next tick ----
   if (!position) {
     scheduleNextTick();
     return;
   }
 
-  // Already reached?
-  if (state.standReached && state.standReached[index]) {
-    bot.log("Stand waypoint already reached, advancing");
+  // ---- FLOOR CHECK: if waypoint is on different floor, mark reached ----
+  if (waypoint.z !== undefined && waypoint.z !== position.z) {
+    bot.log(`Stand waypoint ${index+1} is on different floor (${waypoint.z} vs ${position.z}), marking reached`);
+    if (!state.standReached) state.standReached = {};
+    state.standReached[index] = true;
+    delete state.standStartAt?.[index];
     waypoint = advanceWaypoint();
     if (!waypoint) { stop(); return; }
     state._standAttempt = null;
@@ -5152,14 +5356,50 @@ if (waypoint && waypoint.stand) {
     }
     return;
   }
-  
-    // --- NEW: floor change detection ---
-  if (position && waypoint && position.z !== waypoint.z) {
+
+  // ---- WALKABILITY CHECK: if tile is not walkable, mark reached ----
+  if (waypoint.x !== undefined && waypoint.y !== undefined && waypoint.z !== undefined) {
+    if (!isTileWalkable(waypoint.x, waypoint.y, waypoint.z, true)) {
+      bot.log(`Stand waypoint ${index+1} is on non-walkable tile, marking reached`);
+      if (!state.standReached) state.standReached = {};
+      state.standReached[index] = true;
+      delete state.standStartAt?.[index];
+      waypoint = advanceWaypoint();
+      if (!waypoint) { stop(); return; }
+      state._standAttempt = null;
+      state.lastWaypointTarget = null;
+      state.pathAttemptStart = 0;
+      state.lastDistanceToWaypoint = null;
+      state.stuckCount = 0;
+      state.positionHistory = [];
+      state.skipAttemptCount = 0;
+      if (waypoint.x !== undefined) {
+        state.lastWaypointTarget = waypoint;
+        state.pathAttemptStart = Date.now();
+        state.lastDistanceToWaypoint = getDistanceToWaypoint(position, waypoint);
+        goToWaypoint(waypoint);
+      }
+      return;
+    }
+  }
+
+  // ---- Record start time for this waypoint ----
+  if (!state.standStartAt) state.standStartAt = {};
+  if (!state.standStartAt[index]) {
+    state.standStartAt[index] = now;
+    bot.log(`Stand waypoint ${index+1} start timer`);
+  }
+
+  // ---- Stuck timeout check ----
+  const stuckTimeout = config.stuckTimeoutMs || 30000;
+  if (now - state.standStartAt[index] > stuckTimeout) {
     if (!state.standReached) state.standReached = {};
     state.standReached[index] = true;
-    bot.log("Stand waypoint reached (floor changed)");
+    delete state.standStartAt[index];
+    bot.log(`Stand waypoint timed out after ${stuckTimeout/1000}s, advancing`);
     waypoint = advanceWaypoint();
     if (!waypoint) { stop(); return; }
+    state._standAttempt = null;
     state.lastWaypointTarget = null;
     state.pathAttemptStart = 0;
     state.lastDistanceToWaypoint = null;
@@ -5178,12 +5418,13 @@ if (waypoint && waypoint.stand) {
   const dx = Math.abs(position.x - waypoint.x);
   const dy = Math.abs(position.y - waypoint.y);
   const dz = position.z === waypoint.z;
-  const dist = Math.max(dx, dy); // tile distance
+  const dist = Math.max(dx, dy);
 
-  // Exact arrival (on the tile)
+  // ---- Exact arrival (on the tile) ----
   if (dx === 0 && dy === 0 && dz) {
     if (!state.standReached) state.standReached = {};
     state.standReached[index] = true;
+    delete state.standStartAt[index];
     state._standAttempt = null;
     bot.log("Stand waypoint reached (exact tile)");
     waypoint = advanceWaypoint();
@@ -5203,19 +5444,20 @@ if (waypoint && waypoint.stand) {
     return;
   }
 
-  // Adjacent – start trying to step onto it
+  // ---- Adjacent – try to step onto it ----
   if (dist <= 1) {
     state._standAttempt = { index, adjacentAt: Date.now() };
     goToWaypoint(waypoint);
-    return; // wait for next tick
+    return;
   }
 
-  // Teleport detection: we were adjacent before, now we are > 1 tile away
+  // ---- Teleport detection: we were adjacent before, now far away ----
   if (state._standAttempt && state._standAttempt.index === index && dist > 1) {
-    state._standAttempt = null;
     if (!state.standReached) state.standReached = {};
     state.standReached[index] = true;
-    bot.log("Stand waypoint teleported, advancing");
+    delete state.standStartAt[index];
+    state._standAttempt = null;
+    bot.log("Stand waypoint reached via teleport");
     waypoint = advanceWaypoint();
     if (!waypoint) { stop(); return; }
     state.lastWaypointTarget = null;
@@ -5233,7 +5475,7 @@ if (waypoint && waypoint.stand) {
     return;
   }
 
-  // If we are not adjacent and not on the tile, path to it
+  // ---- If not adjacent and not on tile, path to it ----
   if (dist > 1) {
     goToWaypoint(waypoint);
     return;
@@ -5509,6 +5751,109 @@ if (waypoint && waypoint.shovel) {
       goToWaypoint(waypoint);
       return;
     }
+  }
+}
+
+// ---- LADDER WAYPOINT ----
+if (waypoint && waypoint.ladder) {
+  const index = state.currentIndex;
+  const now = Date.now();
+
+  // Already used? Advance
+  if (state._ladderUsed && state._ladderUsed[index]) {
+    bot.log("Ladder waypoint already used, advancing");
+    waypoint = advanceWaypoint();
+    if (!waypoint) { stop(); return; }
+    state._ladderUsed = undefined;
+    state.lastWaypointTarget = null;
+    state.pathAttemptStart = 0;
+    state.lastDistanceToWaypoint = null;
+    state.stuckCount = 0;
+    state.positionHistory = [];
+    state.skipAttemptCount = 0;
+    if (waypoint.x !== undefined) {
+      state.lastWaypointTarget = waypoint;
+      state.pathAttemptStart = Date.now();
+      state.lastDistanceToWaypoint = getDistanceToWaypoint(position, waypoint);
+      goToWaypoint(waypoint);
+    }
+    return;
+  }
+
+  if (!position) {
+    return;
+  }
+
+  // If the waypoint is on a different floor, skip it (can't climb from here)
+  if (waypoint.z !== position.z) {
+    bot.log("Ladder waypoint on different floor, skipping");
+    waypoint = advanceWaypoint();
+    if (!waypoint) { stop(); return; }
+    state.lastWaypointTarget = null;
+    state.pathAttemptStart = 0;
+    state.lastDistanceToWaypoint = null;
+    state.stuckCount = 0;
+    state.positionHistory = [];
+    state.skipAttemptCount = 0;
+    if (waypoint.x !== undefined) {
+      state.lastWaypointTarget = waypoint;
+      state.pathAttemptStart = Date.now();
+      state.lastDistanceToWaypoint = getDistanceToWaypoint(position, waypoint);
+      goToWaypoint(waypoint);
+    }
+    return;
+  }
+
+  const tileDist = getDistance(position, waypoint);
+
+  // Not on the ladder tile – walk to it
+  if (tileDist > 0) {
+    goToWaypoint(waypoint);
+    return;
+  }
+
+  // We are on the ladder tile – use it
+  const tile = getTileAt(waypoint);
+  if (!tile) {
+    bot.log("Ladder waypoint: tile not loaded");
+    return;
+  }
+
+  // Use the tile (right‑click)
+  try {
+    if (window.gameClient?.mouse?.use) {
+      window.gameClient.mouse.use({ which: tile, index: 0xFF });
+    } else if (window.gameClient?.send && typeof UsePacket === 'function') {
+      window.gameClient.send(new UsePacket(tile, 0xFF));
+    } else {
+      bot.log("Ladder waypoint: cannot use tile – no method available");
+    }
+    // Mark as used and advance immediately (the floor change will happen)
+    if (!state._ladderUsed) state._ladderUsed = {};
+    state._ladderUsed[index] = true;
+    bot.log("Ladder waypoint: used ladder, advancing");
+    // Advance now; the bot will either change floor or the next tick will skip if floor changed
+    waypoint = advanceWaypoint();
+    if (!waypoint) { stop(); return; }
+    state.lastWaypointTarget = null;
+    state.pathAttemptStart = 0;
+    state.lastDistanceToWaypoint = null;
+    state.stuckCount = 0;
+    state.positionHistory = [];
+    state.skipAttemptCount = 0;
+    if (waypoint.x !== undefined) {
+      state.lastWaypointTarget = waypoint;
+      state.pathAttemptStart = Date.now();
+      state.lastDistanceToWaypoint = getDistanceToWaypoint(position, waypoint);
+      goToWaypoint(waypoint);
+    }
+    return;
+  } catch (e) {
+    bot.log("Ladder waypoint: error using ladder", e.message);
+    // Mark as used to avoid getting stuck
+    if (!state._ladderUsed) state._ladderUsed = {};
+    state._ladderUsed[index] = true;
+    return;
   }
 }
 
@@ -6866,6 +7211,157 @@ window.__minibiaBotBundle.installTalkModule = function installTalkModule(bot) {
     getChatMessages, config,
   };
 };
+
+window.__minibiaBotBundle.installMessageAlertModule = function installMessageAlertModule(bot) {
+  const configStorageKey = "minibiaBot.messageAlert.config";
+  const state = {
+    running: false,
+    timerId: null,
+    seenKeys: new Set(),
+  };
+
+  const config = Object.assign(
+    { enabled: false },
+    bot.storage.get(configStorageKey, {})
+  );
+
+  function persistConfig() {
+    bot.storage.set(configStorageKey, { enabled: config.enabled });
+  }
+
+  function normalizeText(text) {
+    return String(text || "").trim().toLowerCase().replace(/\s+/g, " ");
+  }
+
+  function getSelfNames() {
+    return new Set([
+      "you",
+      bot.getPlayerName?.(),
+      window.gameClient?.player?.name,
+      window.gameClient?.player?.state?.name,
+    ].map(n => normalizeText(n)).filter(Boolean));
+  }
+
+function getChatMessages() {
+  const channels = gameClient.interface.channelManager.channels || [];
+  const targetNames = ["Default"];
+  const all = [];
+  for (const ch of channels) {
+    if (!ch?.__contents) continue;
+    const name = ch.name || ch.__name || "";
+    if (!targetNames.includes(name)) continue;
+    for (const entry of ch.__contents) {
+      const raw = String(entry?.message || entry?.text || "").trim();
+      if (!raw) continue;
+
+      // Try multiple properties to find the sender
+      let sender = entry?.author || entry?.sender || entry?.name || entry?.from || entry?.character || null;
+
+      // If still null, attempt to extract from raw using regex (some messages include sender)
+      if (!sender) {
+        const match = raw.match(/^([^:\n]{2,40}):\s+(.+)$/);
+        if (match) {
+          sender = match[1].trim();
+          // body already is raw, but we can update body to the stripped version
+          // but we keep raw as full message; we'll set body to the part after colon
+        }
+      }
+
+      // If still null, skip (can't identify who sent it)
+      if (!sender) continue;
+
+      const body = raw; // keep full raw for now, but we could strip sender if extracted
+      const key = [name, sender, body, entry?.__time || ""].join("|");
+      all.push({ key, channelName: name, sender, body, rawMessage: raw, time: entry?.__time });
+    }
+  }
+  return all;
+}
+
+  function isSelfMessage(message) {
+    return getSelfNames().has(normalizeText(message?.sender)) ||
+           bot.isRecentSentChat?.(message?.body, 20000) ||
+           bot.isRecentSentChat?.(message?.rawMessage, 20000);
+  }
+
+  function getNewMessages() {
+    const all = getChatMessages();
+    const newMessages = [];
+    const ignoreWords = ["Munch.", "Chomp.", "Gulp.", "Slurp."];
+    for (const msg of all) {
+      if (state.seenKeys.has(msg.key)) continue;
+      state.seenKeys.add(msg.key);
+      if (isSelfMessage(msg)) continue;
+	  // Skip trade spam
+	  const upper = msg.body.toUpperCase();
+	  if (ignoreWords.some(word => upper.includes(word))) continue;
+	  newMessages.push(msg);
+    }
+    if (state.seenKeys.size > 500) {
+      const arr = Array.from(state.seenKeys);
+      state.seenKeys = new Set(arr.slice(-300));
+    }
+    return newMessages;
+  }
+
+  function checkForNewMessages() {
+    if (!config.enabled || !state.running) return;
+    const newMsgs = getNewMessages();
+    if (!newMsgs.length) return;
+
+    //console.log("[MessageAlert] New messages:", newMsgs.map(m => `${m.sender}: ${m.body}`));
+    if (typeof bot.playMessageAlarm === 'function') {
+      bot.playMessageAlarm();
+      //bot.log("New message alert", { count: newMsgs.length, sample: newMsgs[0].sender + ": " + newMsgs[0].body });
+    } else {
+      console.error("[MessageAlert] bot.playMessageAlarm is not defined!");
+    }
+  }
+
+  function tick() {
+    if (!state.running) return;
+    try { checkForNewMessages(); } catch (e) { bot.log("Message alert error", e); }
+    state.timerId = setTimeout(tick, 2000);
+  }
+
+  function start() {
+    if (state.running) return false;
+    config.enabled = true;
+    persistConfig();
+    state.running = true;
+    // Pre-seed seen messages
+    const existing = getChatMessages();
+    existing.forEach(m => state.seenKeys.add(m.key));
+    bot.log("Message alert monitor started");
+    tick();
+    return true;
+  }
+
+  function stop() {
+    state.running = false;
+    if (state.timerId) { clearTimeout(state.timerId); state.timerId = null; }
+    config.enabled = false;
+    persistConfig();
+    bot.log("Message alert monitor stopped");
+    return true;
+  }
+
+  function status() {
+    return { running: state.running, config: { ...config } };
+  }
+
+  // Public API — expose checkForNewMessages for manual testing
+  if (config.enabled) start();
+
+  bot.messageAlert = {
+    start,
+    stop,
+    status,
+    checkForNewMessages, // <-- now exposed
+    config,
+  };
+};
+
 
 //*********************
 // -- ANTI-BOT ALARM
@@ -9855,6 +10351,9 @@ function getDirectionOffset(dir) {
 		if (wp.shovel) {
 		  displayText = "⛏️ " + displayText;
 		}
+		if (wp.ladder) {
+		  displayText = "🪜 " + displayText;
+		}
 		if (wp.script) {
 		  displayText += ' 📜';
 		}
@@ -9978,6 +10477,20 @@ function getDirectionOffset(dir) {
 		intervalInput.value = Math.round((status.config?.intervalMs || 60000) / 1000);
 	  }
 	}
+
+function refreshPlayerAttackStatus() {
+  const toggle = document.getElementById("minibia-bot-player-attack-alert");
+  if (toggle && document.activeElement !== toggle) {
+    toggle.checked = !!bot.playerAttackMonitor?.status?.().running;
+  }
+}
+
+function refreshMessageAlertStatus() {
+  const toggle = document.getElementById("minibia-bot-message-alert");
+  if (toggle && document.activeElement !== toggle) {
+    toggle.checked = !!bot.messageAlert?.status?.().running;
+  }
+}
 
   // ---- VISIBLE CREATURES LIST ----
   function refreshVisibleCreatures() {
@@ -10847,13 +11360,15 @@ function getDirectionOffset(dir) {
 		  <!-- Left Column -->
 		  <div style="display:flex; flex-direction:column; gap:10px;">
 		
-			<label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-player-alert" /><span>Player On Screen</span></label>
-		  
+			<label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-player-alert" /><span>Player On Screen Alert</span></label>
+			<label class="mb-toggle"><input type="checkbox" id="minibia-bot-player-attack-alert" /><span>Player Attack Alert</span></label>
+			
 		  </div>
 		  <!-- Right Column -->
 		  <div style="display:flex; flex-direction:column; gap:10px;">
 
-			<label class="mb-toggle"><input type="checkbox" id="minibia-bot-antibot-enabled" /><span>Anti-Bot Monitor</span></label>
+			<label class="mb-toggle"><input type="checkbox" id="minibia-bot-antibot-enabled" /><span>Anti-Bot Alert</span></label>
+			<label class="mb-toggle"><input type="checkbox" id="minibia-bot-message-alert" /><span>Message Alert</span></label>
 
 		  </div>
 		</div>
@@ -10986,6 +11501,8 @@ function getDirectionOffset(dir) {
 	  <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-cave-rope" /> Rope</label>
 	  
 	  <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-cave-shovel" /> Shovel</label>
+	  
+	  <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-cave-ladder" /> Ladder</label>
 	  
     </div>
 	
@@ -11285,7 +11802,7 @@ function getDirectionOffset(dir) {
         <input type="text" id="minibia-bot-rune-spell" placeholder="adori vita vis" style="padding:6px 10px;font-size:12px;" />
       </label>
       <label class="mb-field" style="flex:0 0 100px;">
-        <span class="mb-field-label" style="font-size:10px;">Mana Cost</span>
+        <span class="mb-field-label" style="font-size:10px;">Mana Percent</span>
         <input type="number" id="minibia-bot-rune-mana" min="0" placeholder="600" style="padding:6px 10px;font-size:12px;" />
       </label>
     </div>
@@ -11368,6 +11885,33 @@ function getDirectionOffset(dir) {
     }
 
     // ---- EVENT LISTENERS ----
+	
+	
+	const playerAttackToggle = panel.querySelector("#minibia-bot-player-attack-alert");
+	if (playerAttackToggle) {
+	  playerAttackToggle.checked = !!bot.playerAttackMonitor?.status?.().running;
+	  playerAttackToggle.addEventListener("change", function() {
+		if (this.checked) {
+		  bot.playerAttackMonitor.start();
+		} else {
+		  bot.playerAttackMonitor.stop();
+		}
+		refreshPlayerAttackStatus();
+	  });
+	}
+
+	const messageAlertToggle = panel.querySelector("#minibia-bot-message-alert");
+	if (messageAlertToggle) {
+	  messageAlertToggle.checked = !!bot.messageAlert?.status?.().running;
+	  messageAlertToggle.addEventListener("change", function() {
+		if (this.checked) {
+		  bot.messageAlert.start();
+		} else {
+		  bot.messageAlert.stop();
+		}
+		refreshMessageAlertStatus();
+	  });
+	}
 	
 	const addScriptBtn = panel.querySelector("#minibia-bot-cave-add-script");
 	if (addScriptBtn) {
@@ -12272,6 +12816,7 @@ if (clientChaseToggle) {
         bot.panic.updateConfig({ playerAlertEnabled: playerAlertToggle.checked });
       });
     }
+	
     if (playerCooldownInput) {
       playerCooldownInput.value = (bot.panic?.config?.playerAlertCooldownMs ?? 60000) / 1000;
       playerCooldownInput.addEventListener("change", () => {
@@ -12342,6 +12887,7 @@ if (clientChaseToggle) {
 		const standCheck = document.getElementById("minibia-bot-cave-stand");
 		const ropeCheck = document.getElementById("minibia-bot-cave-rope");
 		const shovelCheck = document.getElementById("minibia-bot-cave-shovel");
+		const ladderCheck = document.getElementById("minibia-bot-cave-ladder");
 		const dir = dirSelect ? dirSelect.value : "C";
 		const offset = getDirectionOffset(dir);
 		const x = pos.x + offset.dx;
@@ -12350,8 +12896,9 @@ if (clientChaseToggle) {
 		const stand = !!(standCheck && standCheck.checked);
 		const rope = !!(ropeCheck && ropeCheck.checked);
 		const shovel = !!(shovelCheck && shovelCheck.checked);
+		const ladder = !!(ladderCheck && ladderCheck.checked);
 		const label = stand ? "Stand" : (rope ? "Rope" : (shovel ? "Shovel" : ""));
-		const waypoint = { x, y, z, label: label || undefined, stand: stand, rope: rope, shovel: shovel };
+		const waypoint = { x, y, z, label: label || undefined, stand: stand, rope: rope, shovel: shovel, ladder: ladder};
 		const added = bot.cave.addWaypoint(waypoint);
 		if (added) {
 		  const route = bot.cave.getRoute();
@@ -12634,6 +13181,8 @@ if (clientChaseToggle) {
 	  refreshSlimeTrainerStatus();
 	  refreshAutoStackerStatus();
 	  refreshAntiBotStatus();
+	  refreshPlayerAttackStatus();
+	  refreshMessageAlertStatus();
 	  if (convertCurrencyToggle) {
 		convertCurrencyToggle.checked = bot.autoStacker?.config?.convertCurrency !== false;
 	  }
@@ -12789,6 +13338,8 @@ if (clientChaseToggle) {
 	currentBundle.installAntiAfkModule(bot);
 	currentBundle.installFisherModule(bot);
 	currentBundle.installAutoStackerModule(bot);
+	currentBundle.installPlayerAttackMonitorModule(bot);
+	currentBundle.installMessageAlertModule(bot);
 	currentBundle.installPanel(bot);
 
     bot.ui.inject();
@@ -12813,6 +13364,18 @@ if (clientChaseToggle) {
     });
 
     window.minibiaBot = bot;
+	
+	// Unlock audio on first user interaction
+	const unlock = () => {
+	  if (window.minibiaBot) {
+		window.minibiaBot.unlockAudio();
+	  }
+	  document.removeEventListener("click", unlock);
+	  document.removeEventListener("touchstart", unlock);
+	};
+	document.addEventListener("click", unlock, { once: true });
+	document.addEventListener("touchstart", unlock, { once: true });
+	
     window.pzBot = bot.pz;
     console.log("[minibia-bot] ready", { version: bot.version, modules: ["pz","xray","panic","rune","heal","invisible","magicShield","attack","cave","equipRing","eat","talk","ui"] });
     console.log("minibiaBot.reload()");
