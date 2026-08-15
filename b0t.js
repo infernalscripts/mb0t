@@ -458,7 +458,7 @@ function startReconnectWatcher() {
 
   // ---- PUBLIC API ----
   return {
-    version: "0.7.2",
+    version: "0.7.3",
     addCleanup,
 
     /** Destroy the bot and all its modules (call before reload) */
@@ -882,7 +882,7 @@ _playSpecificAlarm(src, label) {
 };
 
 /**
- * ==================================================================================
+ * =============================================== ===================================
  * 2. PZ MODULE (Protection Zone)
  *    Finds, paths to, and remembers PZ tiles. Also allows setting a "home" PZ.
  * ==================================================================================
@@ -5952,9 +5952,11 @@ if (waypoint && waypoint.ladder) {
     // ---- PAUSE FOR COMBAT ----
     const attackStatus = bot.attack?.status?.() || null;
     const isKiting = bot.attack?.config?.kiteMode && !!attackStatus?.engagedTargetId;
+    const hasTarget = !!window.gameClient?.player?.__target || !!bot.attack?.getCurrentTarget?.();
     const shouldPauseForCombat =
       (!!attackStatus?.combatActive && Number(attackStatus?.combatDurationMs || 0) < 60000) ||
-      isKiting;
+      isKiting ||
+      hasTarget;
 
     if (shouldPauseForCombat) {
       if (!state.pausedForCombat) {
@@ -7362,16 +7364,26 @@ function getChatMessages() {
   function getNewMessages() {
     const all = getChatMessages();
     const newMessages = [];
-    const ignoreWords = ["Munch.", "Chomp.", "Gulp.", "Slurp."];
+    
+    // ---- Get ignored phrases from talk module, or fallback to hardcoded ----
+    let ignoreWords = ["Munch.", "Chomp.", "Gulp.", "Slurp."];
+    try {
+      const talkIgnored = bot.talk?.config?.ignoredPhrases;
+      if (Array.isArray(talkIgnored) && talkIgnored.length) {
+        ignoreWords = talkIgnored.map(w => String(w).trim()).filter(Boolean);
+      }
+    } catch (e) { /* ignore */ }
+
     for (const msg of all) {
       if (state.seenKeys.has(msg.key)) continue;
       state.seenKeys.add(msg.key);
       if (isSelfMessage(msg)) continue;
-	  // Skip trade spam
-	  const upper = msg.body.toUpperCase();
-	  if (ignoreWords.some(word => upper.includes(word))) continue;
-	  newMessages.push(msg);
+      const upper = msg.body.toUpperCase();
+      // Skip if body contains any ignored phrase (case‑insensitive)
+      if (ignoreWords.some(word => upper.includes(word.toUpperCase()))) continue;
+      newMessages.push(msg);
     }
+
     if (state.seenKeys.size > 500) {
       const arr = Array.from(state.seenKeys);
       state.seenKeys = new Set(arr.slice(-300));
