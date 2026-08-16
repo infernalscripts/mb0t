@@ -863,7 +863,7 @@ window.__minibiaBotBundle.createBot = function createBot() {
         print(...args) {
             console.log(...args);
         },
-
+        
         // ---- USE ITEM (right-click from inventory) ----
         use(itemId) {
             const source = findItemById(itemId);
@@ -958,6 +958,63 @@ window.__minibiaBotBundle.createBot = function createBot() {
             }
             return total;
         },
+        
+        
+        follow: function(name) {
+            const targetName = String(name || "").trim();
+            if (!targetName) {
+                this.log("follow: name required.");
+                return false;
+            }
+            const creatures = window.gameClient?.world?.activeCreatures || {};
+            const player = window.gameClient?.player;
+            if (!player) {
+                this.log("follow: player not found.");
+                return false;
+            }
+            // Find creature by name (case-insensitive)
+            let target = null;
+            for (const id in creatures) {
+                const c = creatures[id];
+                if (c.name && c.name.toLowerCase() === targetName.toLowerCase()) {
+                    target = c;
+                    break;
+                }
+            }
+            if (!target) {
+                this.log(`follow: player "${targetName}" not found on screen.`);
+                return false;
+            }
+            if (target.id === player.id) {
+                this.log("follow: cannot follow yourself.");
+                return false;
+            }
+            // Set follow target and send packet
+            try {
+                player.setFollowTarget(target);
+                window.gameClient.send(new FollowPacket(target.id));
+                this.log(`Following ${targetName}.`);
+                return true;
+            } catch (e) {
+                this.log("follow: failed to send FollowPacket", e);
+                return false;
+            }
+        },
+
+        stopFollow: function() {
+            const player = window.gameClient?.player;
+            if (!player) return false;
+            try {
+                player.setFollowTarget(null);
+                window.gameClient.send(new FollowPacket(0));
+                this.log("Stopped following.");
+                return true;
+            } catch (e) {
+                this.log("stopFollow: failed", e);
+                return false;
+            }
+        },
+        
         // ---- GO TO WAYPOINT BY LABEL ----
         goToLabel(labelname) {
             if (!labelname) {
@@ -10067,165 +10124,62 @@ window.__minibiaBotBundle.installNotificationModule = function installNotificati
 
 /**
  * ==================================================================================
- * MOVEMENT PATCH – Stops cavebot/autowalk when a target is present,
- * but leaves manual keyboard/click movement untouched.
+ * MOVEMENT PATCH – Light, non‑aggressive
+ * Prevents cavebot / autowalk from moving while you have a target,
+ * but leaves manual keyboard + click‑to‑move (non‑autowalk) untouched.
  * ==================================================================================
  */
 window.__minibiaBotBundle.installMovementPatch = function installMovementPatch(bot) {
-  // The original IIFE code, adapted to run as a module.
-  // It will wait for gameClient and install the patches.
+  // Run once, wait for gameClient
   (function install() {
-    const TAG = "[InfernalScript]";
+    const TAG = "[MovementPatch]";
 
-    const state = {
-      installed: false,
-      stopping: false,
-      lastStopPacketAt: 0,
-      forceStopUntil: 0,
-      pauseInterval: null,
-    };
+    let installed = false;
+    let client = null;
 
     function waitForClient() {
-      const client =
-        window.gameClient ||
-        window.GameClient?.instance ||
-        window.client;
-
-      if (!client || !client.player || !client.world?.pathfinder) {
-        // Retry after a short delay
+      const c = window.gameClient || window.GameClient?.instance || window.client;
+      if (!c || !c.player || !c.world?.pathfinder) {
         setTimeout(waitForClient, 200);
         return;
       }
-
-      // If already installed, skip
-      if (state.installed) return;
-      state.installed = true;
-
-      bot.log(`${TAG} gameClient found, installing patches`);
-
+      if (installed) return;
+      installed = true;
+      client = c;
+      bot.log(`${TAG} installed (light mode)`);
       installPatches(client);
     }
 
     function installPatches(client) {
+      // 1) When a target is SET, cancel any ongoing autowalk immediately
       guardPlayerTarget(client);
-      guardPathfinderProperties(client);
-      patchGameClientSend(client);
-      patchPathfinder(client);
-      patchPacketHandler(client);
-      patchPlayerUnlockMovement(client);
-      startStopLoop(client);
 
-      bot.log(`${TAG} MOVEMENT PATCH active – stops autowalk while targeting`);
+      // 2) Block outgoing autowalk packets while target is present
+      patchGameClientSend(client);
+
+      // 3) Optionally, block pathfinder's findPath if target is present (extra safety)
+      patchPathfinder(client);
+
+      // No interval loop – we only react to events.
     }
 
+    // ---- Helper: does the player have a target on screen? ----
     function hasTarget(client) {
       const p = client.player;
       if (!p) return false;
-
       let target = null;
-      try {
-        if (typeof p.getTarget === "function") {
-          target = p.getTarget();
-        }
-      } catch {}
-
-      if (!target && p.__target !== null && p.__target !== undefined) {
-        target = p.__target;
-      }
-
+      try { if (typeof p.getTarget === "function") target = p.getTarget(); } catch {}
+      if (!target && p.__target !== null && p.__target !== undefined) target = p.__target;
       if (!target) return false;
-
-      if (!isTargetOnScreen(client, target)) {
-        state.pausedForCombat = false;
-        return false;
-      }
-      state.pausedForCombat = true;
-      return true;
-    }
-
-    function isTargetOnScreen(client, target) {
-      const p = client.player;
-      if (!p || !target) return false;
-
-      try {
-        if (typeof p.canSeeSmall === "function") {
-          return p.canSeeSmall(target);
-        }
-        if (typeof p.canSee === "function") {
-          return p.canSee(target);
-        }
-      } catch {}
-
+      // Check if target is on screen (same floor, within view)
       try {
         const pp = p.getPosition().projected();
         const tp = target.getPosition().projected();
-        const dx = Math.abs(pp.x - tp.x);
-        const dy = Math.abs(pp.y - tp.y);
-        return dx < 8 && dy < 6;
-      } catch {}
-
-      return false;
+        return Math.abs(pp.x - tp.x) < 8 && Math.abs(pp.y - tp.y) < 6;
+      } catch { return false; }
     }
 
-    function sendStopWalk(client, force = false) {
-      const now = performance.now();
-      if (!force && now - state.lastStopPacketAt < 250) return;
-      state.lastStopPacketAt = now;
-
-      try {
-        if (typeof StopWalkPacket === "function") {
-          client.send(new StopWalkPacket());
-        }
-      } catch (e) {
-        bot.log(`${TAG} failed to send StopWalkPacket`, e);
-      }
-    }
-
-    function hardStop(client, forcePacket = false) {
-      if (state.stopping) return;
-      state.stopping = true;
-
-      try {
-        const p = client.player;
-        const pf = client.world?.pathfinder;
-        if (!p || !pf) return;
-
-        sendStopWalk(client, forcePacket);
-
-        // Clear autowalk state
-        try { pf.__isAutoWalking = false; } catch {}
-        try { pf.__autoWalkStepsRemaining = 0; } catch {}
-        try { pf.__autowalkStartPosition = null; } catch {}
-        try { pf.__autowalkStartedAt = 0; } catch {}
-        try { pf.__finalDestination = null; } catch {}
-        try { if (Array.isArray(pf.__pathfindCache)) pf.__pathfindCache.length = 0; else pf.__pathfindCache = []; } catch {}
-        try { pf.__minimapWaypoints = null; } catch {}
-        try { pf.__recentMinimapStarts = []; } catch {}
-        try { pf.__lastCancelPosition = null; } catch {}
-        try { pf.__lastRetryDest = null; } catch {}
-        try { pf.__lastRetryTime = 0; } catch {}
-        try { pf.__hybridPath = null; } catch {}
-        try { pf.__hybridNeedsAlign = false; } catch {}
-
-        // Clear buffered movement (but not actual position)
-        try { p.__movementBuffer = null; } catch {}
-        try { p.__lookDirectionBuffer = null; } catch {}
-
-        // Clear mouse pending actions
-        try {
-          if (client.mouse) {
-            client.mouse.__pendingUseObject = null;
-            client.mouse.__pendingUsePosition = null;
-            client.mouse.__pendingUseWithSource = null;
-            client.mouse.__pendingMoveFrom = null;
-          }
-        } catch {}
-
-      } finally {
-        state.stopping = false;
-      }
-    }
-
+    // ---- 1) Guard player.__target ----
     function guardPlayerTarget(client) {
       const p = client.player;
       if (!p || p.__stopOnTargetTargetGuarded) return;
@@ -10237,89 +10191,28 @@ window.__minibiaBotBundle.installMovementPatch = function installMovementPatch(b
         get() { return targetValue; },
         set(value) {
           targetValue = value;
+          // If a target is set (non‑null), cancel any autowalk once
           if (value !== null && value !== undefined) {
-            state.forceStopUntil = performance.now() + 1200;
-            queueMicrotask(() => hardStop(client, true));
+            // Clear pathfinder cache and send StopWalk
+            const pf = client.world?.pathfinder;
+            if (pf) {
+              pf.setPathfindCache(null);
+              pf.__isAutoWalking = false;
+              pf.__finalDestination = null;
+              pf.__hybridPath = null;
+            }
+            // Send StopWalkPacket if autowalk was active
+            if (pf && pf.__isAutoWalking !== false) {
+              try { client.send(new StopWalkPacket()); } catch {}
+            }
+            bot.log(`${TAG} target acquired – autowalk cancelled`);
           }
         }
       });
-
       p.__stopOnTargetTargetGuarded = true;
     }
 
-    function guardPathfinderProperties(client) {
-      const pf = client.world?.pathfinder;
-      if (!pf || pf.__stopOnTargetPropertyGuarded) return;
-
-      let finalDestinationValue = pf.__finalDestination ?? null;
-      let isAutoWalkingValue = pf.__isAutoWalking ?? false;
-      let pathfindCacheValue = Array.isArray(pf.__pathfindCache) ? pf.__pathfindCache : [];
-      let hybridPathValue = pf.__hybridPath ?? null;
-
-      Object.defineProperty(pf, "__finalDestination", {
-        configurable: true,
-        get() { return hasTarget(client) ? null : finalDestinationValue; },
-        set(value) {
-          if (hasTarget(client)) {
-            finalDestinationValue = null;
-            state.forceStopUntil = performance.now() + 800;
-            hardStop(client, true);
-            return;
-          }
-          finalDestinationValue = value;
-        }
-      });
-
-      Object.defineProperty(pf, "__isAutoWalking", {
-        configurable: true,
-        get() { return hasTarget(client) ? false : isAutoWalkingValue; },
-        set(value) {
-          if (hasTarget(client)) {
-            isAutoWalkingValue = false;
-            state.forceStopUntil = performance.now() + 800;
-            hardStop(client, true);
-            return;
-          }
-          isAutoWalkingValue = value;
-        }
-      });
-
-      Object.defineProperty(pf, "__pathfindCache", {
-        configurable: true,
-        get() {
-          if (hasTarget(client)) {
-            pathfindCacheValue.length = 0;
-          }
-          return pathfindCacheValue;
-        },
-        set(value) {
-          if (hasTarget(client)) {
-            pathfindCacheValue = [];
-            state.forceStopUntil = performance.now() + 800;
-            hardStop(client, true);
-            return;
-          }
-          pathfindCacheValue = Array.isArray(value) ? value : [];
-        }
-      });
-
-      Object.defineProperty(pf, "__hybridPath", {
-        configurable: true,
-        get() { return hasTarget(client) ? null : hybridPathValue; },
-        set(value) {
-          if (hasTarget(client)) {
-            hybridPathValue = null;
-            state.forceStopUntil = performance.now() + 800;
-            hardStop(client, true);
-            return;
-          }
-          hybridPathValue = value;
-        }
-      });
-
-      pf.__stopOnTargetPropertyGuarded = true;
-    }
-
+    // ---- 2) Block AutoWalkPacket / WalkToDestinationPacket if target exists ----
     function patchGameClientSend(client) {
       if (!client || typeof client.send !== "function" || client.__stopOnTargetSendPatched) return;
 
@@ -10328,14 +10221,16 @@ window.__minibiaBotBundle.installMovementPatch = function installMovementPatch(b
       client.send = function (packet) {
         const packetName = packet?.constructor?.name || "";
 
+        // Always let StopWalkPacket through (we may send it ourselves)
         if (packetName === "StopWalkPacket") {
           return originalSend.call(this, packet);
         }
 
-        if (hasTarget(client) && (packetName === "AutoWalkPacket" || packetName === "WalkToDestinationPacket")) {
-          state.forceStopUntil = performance.now() + 1000;
-          hardStop(client, true);
-          return false;
+        // Block autowalk packets if target is present
+        if (hasTarget(client) &&
+            (packetName === "AutoWalkPacket" || packetName === "WalkToDestinationPacket")) {
+          bot.log(`${TAG} blocked ${packetName} (target active)`);
+          return false; // drop the packet
         }
 
         return originalSend.call(this, packet);
@@ -10344,126 +10239,575 @@ window.__minibiaBotBundle.installMovementPatch = function installMovementPatch(b
       client.__stopOnTargetSendPatched = true;
     }
 
+    // ---- 3) Patch pathfinder findPath to bail if target is present ----
     function patchPathfinder(client) {
       const pf = client.world?.pathfinder;
       if (!pf || pf.__stopOnTargetFunctionsPatched) return;
 
-      const methodsToBlock = [
-        "findPath",
-        "handlePathfind",
-        "__predictHybridStep",
-        "__findPathViaMinimap",
-        "__continueAlongWaypoints",
-        "getNextMove"
-      ];
-
-      for (const key of methodsToBlock) {
-        if (typeof pf[key] !== "function") continue;
-        const original = pf[key];
-        pf[key] = function (...args) {
-          if (hasTarget(client)) {
-            state.forceStopUntil = performance.now() + 800;
-            hardStop(client, true);
-            return false;
-          }
-          return original.apply(this, args);
-        };
-      }
-
-      if (typeof pf.setPathfindCache === "function") {
-        const originalSetPathfindCache = pf.setPathfindCache;
-        pf.setPathfindCache = function (path) {
-          if (hasTarget(client)) {
-            if (path === null) {
-              return originalSetPathfindCache.call(this, path);
-            }
-            state.forceStopUntil = performance.now() + 800;
-            hardStop(client, true);
-            return false;
-          }
-          return originalSetPathfindCache.call(this, path);
-        };
-      }
+      const originalFindPath = pf.findPath;
+      pf.findPath = function (begin, stop, isFinalDestination = true) {
+        if (hasTarget(client)) {
+          bot.log(`${TAG} findPath blocked (target active)`);
+          return false;
+        }
+        return originalFindPath.call(this, begin, stop, isFinalDestination);
+      };
 
       pf.__stopOnTargetFunctionsPatched = true;
     }
 
-    function patchPacketHandler(client) {
-      const handler = client.networkManager?.packetHandler || client.packetHandler;
-      if (!handler || handler.__stopOnTargetPacketHandlerPatched) return;
-
-      const methodsToBlock = ["handleAutoWalkPath"];
-
-      for (const key of methodsToBlock) {
-        if (typeof handler[key] !== "function") continue;
-        const original = handler[key];
-        handler[key] = function (...args) {
-          if (hasTarget(client)) {
-            bot.log(`${TAG} blocked incoming ${key}`);
-            state.forceStopUntil = performance.now() + 1000;
-            hardStop(client, true);
-            return false;
-          }
-          return original.apply(this, args);
-        };
-      }
-
-      handler.__stopOnTargetPacketHandlerPatched = true;
-    }
-
-    function patchPlayerUnlockMovement(client) {
-      const p = client.player;
-      if (!p || typeof p.unlockMovement !== "function" || p.__stopOnTargetUnlockPatched) return;
-
-      const originalUnlockMovement = p.unlockMovement;
-
-      p.unlockMovement = function (...args) {
-        if (hasTarget(client)) {
-          hardStop(client, false);
-          try {
-            this.__movementBuffer = null;
-            this.__lookDirectionBuffer = null;
-          } catch {}
-          return originalUnlockMovement.apply(this, args);
-        }
-        return originalUnlockMovement.apply(this, args);
-      };
-
-      p.__stopOnTargetUnlockPatched = true;
-    }
-
-    function startStopLoop(client) {
-      let lastHadTarget = false;
-
-      state.pauseInterval = setInterval(() => {
-        const active = hasTarget(client);
-        const now = performance.now();
-
-        if (active) {
-          const shouldForce = !lastHadTarget || now < state.forceStopUntil;
-          hardStop(client, shouldForce);
-        }
-
-        lastHadTarget = active;
-      }, 100);
-
-      bot.log(`${TAG} MOVEMENT PATCH loop running`);
-    }
-
-    // Start waiting for the client
+    // Start the installer
     waitForClient();
 
-    // Cleanup on bot destroy
-    bot.addCleanup(() => {
-      if (state.pauseInterval) {
-        clearInterval(state.pauseInterval);
-        state.pauseInterval = null;
-      }
-      // Optionally restore original methods? Not strictly necessary.
-      bot.log(`${TAG} movement patch cleaned up`);
-    });
+  })(); 
+};
 
-  })(); // IIFE ends – it runs immediately when the module is installed
+/**
+ * ==================================================================================
+ * OUTFIT RANDOMIZER – Changes your outfit periodically
+ * ==================================================================================
+ */
+window.__minibiaBotBundle.installOutfitRandomizerModule = function installOutfitRandomizerModule(bot) {
+    const configStorageKey = "minibiaBot.outfitRandomizer.config";
+    const state = {
+        running: false,
+        timerId: null,
+    };
+
+    const config = Object.assign({
+        enabled: false,
+        intervalMinutes: 5,
+        randomizeMount: true,
+        randomizeAddons: true,
+    }, bot.storage.get(configStorageKey, {}));
+
+    function persistConfig() {
+        bot.storage.set(configStorageKey, {
+            ...config
+        });
+    }
+
+    function getOutfits() {
+        return gameClient.player?.outfits || [];
+    }
+
+    function getMounts() {
+        return gameClient.player?.mounts || [];
+    }
+
+    function randomizeOutfit() {
+        if (!gameClient.player) return false;
+
+        const outfits = getOutfits();
+        if (!outfits.length) {
+            bot.log("Outfit randomizer: no outfits available.");
+            return false;
+        }
+
+        // 1) Pick random outfit
+        const outfitIdx = Math.floor(Math.random() * outfits.length);
+        const chosen = outfits[outfitIdx];
+        const outfitId = chosen.id;
+        const ownedAddons = chosen.addons || 0;
+
+        // 2) Build new outfit object
+        const newOutfit = {
+            id: outfitId,
+            lookTypeEx: 0,
+            details: {
+                head: Math.floor(Math.random() * 72),
+                body: Math.floor(Math.random() * 72),
+                legs: Math.floor(Math.random() * 72),
+                feet: Math.floor(Math.random() * 72),
+            },
+            mount: 0,
+            mounted: false,
+            addonOne: false,
+            addonTwo: false,
+            verifiedGhost: false,
+        };
+
+        // 3) Randomize mount (if any and enabled)
+        const mounts = getMounts();
+        if (config.randomizeMount && mounts.length) {
+            const mountIdx = Math.floor(Math.random() * mounts.length);
+            newOutfit.mount = mounts[mountIdx].id;
+            newOutfit.mounted = Math.random() < 0.5; // 50% chance to be mounted
+        }
+
+        // 4) Randomize addons (only if owned)
+        if (config.randomizeAddons) {
+            if (ownedAddons & 1) newOutfit.addonOne = Math.random() < 0.5;
+            if (ownedAddons & 2) newOutfit.addonTwo = Math.random() < 0.5;
+        }
+
+        // 5) Send the outfit change packet
+        try {
+            gameClient.send(new OutfitChangePacket(newOutfit));
+            bot.log(`Outfit randomizer: changed to outfit ${outfitId} (addons: ${newOutfit.addonOne ? 1 : 0}${newOutfit.addonTwo ? 2 : 0})`);
+            return true;
+        } catch (e) {
+            bot.log("Outfit randomizer: failed to send packet", e);
+            return false;
+        }
+    }
+
+    function scheduleNext() {
+        if (!state.running) return;
+        const ms = Math.max(60000, config.intervalMinutes * 60 * 1000);
+        state.timerId = setTimeout(() => {
+            try {
+                randomizeOutfit();
+            } catch (e) {
+                bot.log("Outfit randomizer tick error", e);
+            }
+            scheduleNext();
+        }, ms);
+    }
+
+    function start() {
+        if (state.running) return false;
+        config.enabled = true;
+        persistConfig();
+        state.running = true;
+        bot.log(`Outfit randomizer started (every ${config.intervalMinutes} min)`);
+        // Randomize once immediately on start
+        randomizeOutfit();
+        scheduleNext();
+        return true;
+    }
+
+    function stop() {
+        if (!state.running) return false;
+        state.running = false;
+        if (state.timerId) {
+            clearTimeout(state.timerId);
+            state.timerId = null;
+        }
+        config.enabled = false;
+        persistConfig();
+        bot.log("Outfit randomizer stopped");
+        return true;
+    }
+
+    function status() {
+        return {
+            running: state.running,
+            config: { ...config },
+        };
+    }
+
+    function updateConfig(next) {
+        Object.assign(config, next);
+        // Clamp interval
+        if (config.intervalMinutes < 1) config.intervalMinutes = 1;
+        persistConfig();
+
+        if (config.enabled && !state.running) start();
+        if (!config.enabled && state.running) stop();
+
+        return { ...config };
+    }
+
+    // Auto‑start if enabled
+    if (config.enabled) start();
+
+    // Public API
+    bot.outfitRandomizer = {
+        start,
+        stop,
+        status,
+        updateConfig,
+        randomizeNow: randomizeOutfit,
+        config,
+    };
+};
+
+// ---- ComboBot Module ----
+if (typeof window.__minibiaBotBundle === 'undefined') {
+    window.__minibiaBotBundle = {};
+}
+
+window.__minibiaBotBundle.installComboBotModule = function installComboBotModule(bot) {
+    const configStorageKey = "minibiaBot.combo.config";
+    const state = {
+        running: false,
+        channel: null,
+        originalSend: null,
+        lastTriggerAt: 0,
+        retryTimer: null,
+        retryCount: 0,
+    };
+
+    const config = Object.assign({
+        mode: 'follower',
+        hotkeySlot: 11,
+        minMana: 0,
+        cooldownMs: 1500,
+        broadcastClear: true,
+        channelName: 'minibia-combo-bot',
+        autoFollowLeader: false,
+        leaderName: '',
+    }, bot.storage.get(configStorageKey, {}));
+
+    function persistConfig() {
+        bot.storage.set(configStorageKey, { ...config });
+    }
+
+    function log(...args) {
+        console.log('%c[ComboBot]', 'color:#4fc3f7', ...args);
+    }
+
+    function isLeader() {
+        return config.mode === 'leader';
+    }
+
+    function getPlayer() {
+        return window.gameClient && window.gameClient.player;
+    }
+
+    function getWorld() {
+        return window.gameClient && window.gameClient.world;
+    }
+
+    function sendMessage(msg) {
+        if (state.channel) state.channel.postMessage(msg);
+    }
+
+    // ---- Follower logic ----
+    function handleTarget(msg) {
+        const player = getPlayer();
+        const world = getWorld();
+        if (!player || !world) return;
+
+        const targetId = msg.id;
+        const leaderId = msg.leaderId;
+
+        if (targetId === 0) {
+            if (player.__target) {
+                player.setTarget(null);
+                sendPacket('TargetPacket', 0);
+            }
+            return;
+        }
+
+        const creature = world.getCreature(targetId);
+        if (!creature) {
+            log('Target creature not found:', targetId);
+            return;
+        }
+
+        if (player.__target !== creature) {
+            player.setTarget(creature);
+            sendPacket('TargetPacket', targetId);
+            log('Targeting', creature.name, '(', targetId, ')');
+        }
+
+        // ---- Auto Follow Leader ----
+        if (config.autoFollowLeader && leaderId) {
+            log('Auto-follow enabled, leaderId:', leaderId);
+            followLeaderById(leaderId);
+        } else if (config.autoFollowLeader && config.leaderName) {
+            log('Auto-follow via name fallback:', config.leaderName);
+            followLeaderByName();
+        } else {
+            log('Auto-follow not enabled or missing leader info.');
+        }
+
+        triggerHotkey();
+    }
+
+    function followLeaderById(leaderId) {
+        // Try to follow by ID first, but if not found fallback to name
+        const world = getWorld();
+        if (!world) return;
+        const player = getPlayer();
+        if (!player) return;
+
+        const leader = world.getCreature(leaderId);
+        if (leader) {
+            // Use bot.follow by name (we know the leader's name from config)
+            if (config.leaderName) {
+                bot.follow(config.leaderName);
+            }
+            return;
+        }
+        // Fallback: try by name
+        if (config.leaderName) {
+            bot.follow(config.leaderName);
+        }
+    }
+
+    function followLeaderByName() {
+        if (config.leaderName) {
+            bot.follow(config.leaderName);
+        }
+    }
+
+    function followLeaderByName() {
+        const world = getWorld();
+        if (!world) {
+            log('World not available.');
+            return;
+        }
+
+        const leaderName = config.leaderName.trim();
+        if (!leaderName) {
+            log('Leader name is empty.');
+            return;
+        }
+
+        const creatures = Object.values(world.activeCreatures || {});
+        const leader = creatures.find(c => {
+            if (!c.name) return false;
+            return c.name.toLowerCase() === leaderName.toLowerCase();
+        });
+
+        if (!leader) {
+            log('Leader not found by name:', leaderName);
+            return;
+        }
+
+        const player = getPlayer();
+        if (!player) return;
+
+        if (player.id === leader.id) {
+            log('Leader is self – ignoring.');
+            return;
+        }
+
+        if (player.__followTarget && player.__followTarget.id === leader.id) {
+            return;
+        }
+
+        player.setFollowTarget(leader);
+        sendPacket('FollowPacket', leader.id);
+        log('Following leader by name:', leader.name, '(', leader.id, ')');
+    }
+
+    function triggerHotkey() {
+        const gc = window.gameClient;
+        if (!gc || !gc.interface || !gc.interface.hotbarManager) return;
+
+        const player = getPlayer();
+        if (!player) return;
+
+        const now = performance.now();
+        if (now - state.lastTriggerAt < config.cooldownMs) return;
+
+        if (config.minMana > 0 && player.state.mana < config.minMana) {
+            return;
+        }
+
+        state.lastTriggerAt = now;
+        gc.interface.hotbarManager.__handleClick(config.hotkeySlot);
+        log('Triggered hotkey slot', config.hotkeySlot);
+    }
+
+    function sendPacket(packetName, ...args) {
+        const gc = window.gameClient;
+        if (!gc || !gc.send) return;
+        const packetClass = window[packetName];
+        if (!packetClass) {
+            log('Packet class not found:', packetName);
+            return;
+        }
+        gc.send(new packetClass(...args));
+    }
+
+    // ---- Leader hook ----
+    function hookLeader() {
+        const gc = window.gameClient;
+        if (!gc || typeof gc.send !== 'function') {
+            log('gameClient.send not found – will retry.');
+            return false;
+        }
+
+        if (state.originalSend) {
+            gc.send = state.originalSend;
+        }
+
+        state.originalSend = gc.send;
+        gc.send = function(packet) {
+            const buffer = packet.getBuffer();
+            if (buffer && buffer[0] === (window.CONST && CONST.PROTOCOL.CLIENT.TARGET)) {
+                const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+                const targetId = view.getUint32(1, true);
+                if (targetId !== 0 || config.broadcastClear) {
+                    const leaderId = gc.player ? gc.player.id : 0;
+                    sendMessage({ type: 'target', id: targetId, leaderId: leaderId });
+                }
+            }
+            state.originalSend.call(this, packet);
+        };
+        log('Leader hook installed – broadcasting targets with leader ID.');
+        return true;
+    }
+
+    function hookFollower() {
+        log('Follower mode – listening for targets.');
+        return true;
+    }
+
+    // ---- Communication channel ----
+    function setupChannel() {
+        if (state.channel) {
+            state.channel.close();
+            state.channel = null;
+        }
+
+        if ('BroadcastChannel' in window) {
+            state.channel = new BroadcastChannel(config.channelName);
+        } else {
+            state.channel = {
+                postMessage: (msg) => localStorage.setItem('__comboBot', JSON.stringify(msg)),
+                onmessage: null,
+                close: () => {}
+            };
+            window.addEventListener('storage', (e) => {
+                if (e.key === '__comboBot' && e.newValue) {
+                    const msg = JSON.parse(e.newValue);
+                    if (state.channel.onmessage) state.channel.onmessage({ data: msg });
+                }
+            });
+        }
+
+        state.channel.onmessage = (event) => {
+            const msg = event.data;
+            if (!msg || !msg.type) return;
+            if (msg.type === 'target') {
+                if (!isLeader()) handleTarget(msg);
+            }
+        };
+        return true;
+    }
+
+    // ---- Start / Stop ----
+    function start() {
+        if (state.running) {
+            log('Already running.');
+            return false;
+        }
+
+        if (state.retryTimer) {
+            clearTimeout(state.retryTimer);
+            state.retryTimer = null;
+            state.retryCount = 0;
+        }
+
+        if (!setupChannel()) {
+            log('Failed to set up communication channel.');
+            return false;
+        }
+
+        if (isLeader()) {
+            const hooked = hookLeader();
+            if (!hooked) {
+                state.retryCount++;
+                if (state.retryCount > 10) {
+                    log('Giving up – gameClient.send not found after 10 retries.');
+                    state.channel.close();
+                    state.channel = null;
+                    return false;
+                }
+                state.retryTimer = setTimeout(() => {
+                    state.retryTimer = null;
+                    start();
+                }, 2000);
+                return false;
+            }
+        } else {
+            if (!hookFollower()) {
+                state.channel.close();
+                state.channel = null;
+                return false;
+            }
+        }
+
+        state.running = true;
+        config.enabled = true;
+        persistConfig();
+        log(`Started as ${config.mode}.`);
+        return true;
+    }
+
+    function stop() {
+        if (!state.running) return false;
+
+        if (state.retryTimer) {
+            clearTimeout(state.retryTimer);
+            state.retryTimer = null;
+            state.retryCount = 0;
+        }
+
+        if (state.originalSend && window.gameClient) {
+            window.gameClient.send = state.originalSend;
+            state.originalSend = null;
+        }
+
+        if (state.channel) {
+            state.channel.close();
+            state.channel = null;
+        }
+
+        state.running = false;
+        config.enabled = false;
+        persistConfig();
+        log('Stopped.');
+        return true;
+    }
+
+    function status() {
+        return {
+            running: state.running,
+            config: { ...config },
+        };
+    }
+
+    function updateConfig(next) {
+        Object.assign(config, next);
+        if (config.cooldownMs < 100) config.cooldownMs = 100;
+        if (config.hotkeySlot < 0) config.hotkeySlot = 0;
+        if (config.hotkeySlot > 11) config.hotkeySlot = 11;
+        if (config.leaderName) config.leaderName = config.leaderName.trim();
+        persistConfig();
+
+        if (state.running) {
+            stop();
+            start();
+        }
+        return { ...config };
+    }
+
+    // ---- Manual follow function for testing ----
+    function followLeaderNow() {
+        const player = getPlayer();
+        if (!player) {
+            log('Player not found.');
+            return;
+        }
+        // If we have a leader name, try by name
+        if (config.leaderName) {
+            followLeaderByName();
+        } else {
+            log('No leader name set. Use the leader name field.');
+        }
+    }
+
+    if (config.enabled) {
+        setTimeout(() => {
+            if (!state.running) start();
+        }, 1000);
+    }
+
+    bot.comboBot = {
+        start,
+        stop,
+        status,
+        updateConfig,
+        config,
+        followLeaderNow, // manual follow
+    };
 };
 
 
@@ -14527,6 +14871,7 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
     <button type="button" class="mb-tab-button" data-tab-button="talk">Talk</button>
     <button type="button" class="mb-tab-button" data-tab-button="xray">Xray</button>
 	<button type="button" class="mb-tab-button" data-tab-button="blacklist">Blacklisted Tiles</button>
+  <button type="button" class="mb-tab-button" data-tab-button="combo">PVP</button>
   </div>
   <div class="mb-tab-content">
   
@@ -14665,6 +15010,18 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
       </label>
       <span style="font-size:12px; color:#cdbb8b;">Fish: <span id="minibia-bot-fisher-count" style="font-weight:bold; color:#fff;">0</span></span>
     </div>
+    
+    <!-- Outfit Randomizer -->
+    <div style="display:flex; align-items:center; gap:14px; margin-top:10px; padding-top:10px; border-top:1px solid rgba(255,255,255,0.08); flex-wrap:wrap;">
+      <label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-outfit-randomizer-enabled" /><span>Random Outfit</span></label>
+      <label class="mb-field" style="flex:0 0 80px;">
+        <span class="mb-field-label" style="font-size:10px;">Interval(m)</span>
+        <input type="number" id="minibia-bot-outfit-randomizer-interval" min="1" value="5" style="padding:4px 4px;font-size:12px;text-align:center;" />
+      </label>
+      <button type="button" class="mb-small-button" id="minibia-bot-outfit-randomizer-now" style="padding:4px 14px;font-size:11px;">Randomize Now</button>
+      <span style="font-size:11px; color:#cdbb8b;" id="minibia-bot-outfit-randomizer-status">Idle</span>
+    </div>
+    
   </div>
 </div>
 
@@ -15027,7 +15384,7 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
     <div class="mb-stack">
       <label class="mb-toggle mb-toggle-main">
         <input type="checkbox" id="minibia-bot-slime-trainer-enabled" />
-        <span>Enable Slime Trainer<s/span>
+        <span>Enable Slime Trainer</span>
       </label>
       <div style="display:flex; gap:6px; align-items:center;">
         <button type="button" class="mb-small-button" id="minibia-bot-slime-trainer-capture">Select Mother Slime</button>
@@ -15035,6 +15392,66 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
       </div>
       <div class="mb-small-note" id="minibia-bot-slime-trainer-status">Status: idle</div>
       <div class="mb-small-note">Attacks adjacent slimes (except the mother slime). Stops when a GM is detected.</div>
+    </div>
+  </div>
+</div>
+
+<!-- Combo Tab -->
+<div class="mb-tab-panel" data-tab-panel="combo">
+  <div class="mb-section">
+    <div class="mb-label">ComboBot</div>
+    <div class="mb-stack">
+      <!-- Mode selector -->
+      <div class="mb-field">
+        <span class="mb-field-label">Mode</span>
+        <select id="minibia-bot-combo-mode">
+          <option value="leader">Leader</option>
+          <option value="follower">Follower</option>
+        </select>
+      </div>
+
+      <!-- Enable toggle -->
+      <label class="mb-toggle mb-toggle-main">
+        <input type="checkbox" id="minibia-bot-combo-enabled" />
+        <span>Enable ComboBot</span>
+      </label>
+
+      <!-- Hotkey slot -->
+      <div class="mb-field">
+        <span class="mb-field-label">Hotkey Slot (0=F1 – 11=F12)</span>
+        <input type="number" id="minibia-bot-combo-slot" min="0" max="11" value="11" />
+      </div>
+
+      <!-- Minimum mana -->
+      <div class="mb-field">
+        <span class="mb-field-label">Minimum Mana</span>
+        <input type="number" id="minibia-bot-combo-minmana" min="0" value="0" />
+      </div>
+
+      <!-- Cooldown -->
+      <div class="mb-field">
+        <span class="mb-field-label">Cooldown (ms)</span>
+        <input type="number" id="minibia-bot-combo-cooldown" min="100" value="1500" />
+      </div>
+
+      <!-- Status -->
+      <div class="mb-small-note" id="minibia-bot-combo-status">Status: idle</div>
+    </div>
+  </div>
+      
+  <!-- ★ NEW: Standalone Follow section -->
+  <div class="mb-section" style="margin-top:8px;">
+    <div class="mb-label">Auto Follow</div>
+    <div class="mb-stack">
+      <div class="mb-field">
+        <span class="mb-field-label">Player Name</span>
+        <input type="text" id="minibia-bot-follow-name" placeholder="Enter player name" />
+      </div>
+      <label class="mb-toggle mb-toggle-main">
+        <input type="checkbox" id="minibia-bot-follow-enabled" />
+        <span>Enable Auto Follow</span>
+      </label>
+      <div class="mb-small-note" id="minibia-bot-follow-status">Status: idle</div>
     </div>
   </div>
 </div>
@@ -15107,6 +15524,288 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
         }
 
         // ---- EVENT LISTENERS ----
+        
+        // ---- Standalone Follow (separate from ComboBot) ----
+        const followNameInput = panel.querySelector("#minibia-bot-follow-name");
+        const followToggle = panel.querySelector("#minibia-bot-follow-enabled");
+        const followStatus = panel.querySelector("#minibia-bot-follow-status");
+
+        let followInterval = null;
+        let followEnabled = false;
+
+        function refreshFollowStatus() {
+            if (followToggle && document.activeElement !== followToggle) {
+                followToggle.checked = followEnabled;
+            }
+            if (followStatus) {
+                followStatus.textContent = followEnabled ? "Following..." : "Idle";
+            }
+        }
+
+        function stopFollow() {
+            if (followInterval) {
+                clearInterval(followInterval);
+                followInterval = null;
+            }
+            followEnabled = false;
+            bot.stopFollow();
+            refreshFollowStatus();
+            // Persist state
+            localStorage.setItem("minibiaBot.follow.enabled", JSON.stringify(false));
+        }
+
+        function startFollow() {
+            const name = followNameInput?.value?.trim();
+            if (!name) {
+                bot.log("Follow: Please enter a player name.");
+                if (followToggle) followToggle.checked = false;
+                return;
+            }
+            // Stop any existing follow
+            if (followInterval) {
+                clearInterval(followInterval);
+                followInterval = null;
+            }
+            followEnabled = true;
+            // Persist state
+            localStorage.setItem("minibiaBot.follow.enabled", JSON.stringify(true));
+            localStorage.setItem("minibiaBot.follow.name", name);
+            // First attempt immediately
+            bot.follow(name);
+            // Then retry every 5 seconds
+            followInterval = setInterval(() => {
+                if (followEnabled) {
+                    bot.follow(name);
+                }
+            }, 5000);
+            refreshFollowStatus();
+        }
+
+        if (followToggle) {
+            // Load saved state
+            try {
+                const saved = localStorage.getItem("minibiaBot.follow.enabled");
+                const savedName = localStorage.getItem("minibiaBot.follow.name") || "";
+                if (saved === "true") {
+                    followToggle.checked = true;
+                    if (followNameInput) followNameInput.value = savedName;
+                    startFollow();
+                }
+            } catch (e) {}
+
+            followToggle.addEventListener("change", function () {
+                if (this.checked) {
+                    startFollow();
+                } else {
+                    stopFollow();
+                }
+            });
+        }
+
+        if (followNameInput) {
+            followNameInput.addEventListener("keydown", function (e) {
+                if (e.key === "Enter") {
+                    e.preventDefault();
+                    if (followToggle) followToggle.click();
+                }
+            });
+            // Save name on change
+            followNameInput.addEventListener("change", function () {
+                if (followEnabled) {
+                    // Restart follow with new name
+                    startFollow();
+                }
+                localStorage.setItem("minibiaBot.follow.name", this.value.trim());
+            });
+        }
+
+        // Clean up when bot reloads
+        bot.addCleanup(() => {
+            if (followInterval) {
+                clearInterval(followInterval);
+                followInterval = null;
+            }
+            followEnabled = false;
+        });
+        
+        // ---- ComboBot: Leader Name & Auto Follow ----
+        const comboLeaderName = panel.querySelector("#minibia-bot-combo-leader-name");
+        const comboAutoFollow = panel.querySelector("#minibia-bot-combo-auto-follow");
+
+        if (comboLeaderName) {
+            comboLeaderName.addEventListener("change", function () {
+                bot.comboBot.updateConfig({ leaderName: this.value });
+                refreshComboStatus();
+            });
+        }
+
+        if (comboAutoFollow) {
+            comboAutoFollow.addEventListener("change", function () {
+                bot.comboBot.updateConfig({ autoFollowLeader: this.checked });
+                refreshComboStatus();
+            });
+        }
+        
+        // ---- ComboBot ----
+        const comboMode = panel.querySelector("#minibia-bot-combo-mode");
+        const comboToggle = panel.querySelector("#minibia-bot-combo-enabled");
+        const comboSlot = panel.querySelector("#minibia-bot-combo-slot");
+        const comboMinMana = panel.querySelector("#minibia-bot-combo-minmana");
+        const comboCooldown = panel.querySelector("#minibia-bot-combo-cooldown");
+        const comboStatus = panel.querySelector("#minibia-bot-combo-status");
+
+        function refreshComboStatus() {
+            const status = bot.comboBot?.status?.();
+            if (!status) return;
+
+            if (comboToggle && document.activeElement !== comboToggle) {
+                comboToggle.checked = status.running;
+            }
+            if (comboMode && document.activeElement !== comboMode) {
+                comboMode.value = status.config.mode || 'follower';
+            }
+            if (comboSlot && document.activeElement !== comboSlot) {
+                comboSlot.value = status.config.hotkeySlot ?? 11;
+            }
+            if (comboMinMana && document.activeElement !== comboMinMana) {
+                comboMinMana.value = status.config.minMana || 0;
+            }
+            if (comboCooldown && document.activeElement !== comboCooldown) {
+                comboCooldown.value = status.config.cooldownMs || 1500;
+            }
+            if (comboStatus) {
+                comboStatus.textContent = status.running ? `Running (${status.config.mode})` : "Idle";
+            }
+        }
+
+        // Toggle
+        if (comboToggle) {
+            comboToggle.checked = !!bot.comboBot?.status?.().running;
+            comboToggle.addEventListener("change", function () {
+                if (this.checked) {
+                    // Gather current settings
+                    const mode = comboMode?.value || 'follower';
+                    const slot = parseInt(comboSlot?.value) || 11;
+                    const minMana = parseInt(comboMinMana?.value) || 0;
+                    const cooldown = parseInt(comboCooldown?.value) || 1500;
+                    bot.comboBot.updateConfig({
+                        mode,
+                        hotkeySlot: slot,
+                        minMana,
+                        cooldownMs: cooldown,
+                    });
+                    bot.comboBot.start();
+                } else {
+                    bot.comboBot.stop();
+                }
+                refreshComboStatus();
+            });
+        }
+
+        // Mode change
+        if (comboMode) {
+            comboMode.addEventListener("change", function () {
+                const mode = this.value;
+                bot.comboBot.updateConfig({ mode });
+                // If running, restart to apply mode
+                if (bot.comboBot.status().running) {
+                    bot.comboBot.stop();
+                    bot.comboBot.start();
+                }
+                refreshComboStatus();
+            });
+        }
+
+        // Slot change
+        if (comboSlot) {
+            comboSlot.addEventListener("change", function () {
+                const val = Math.min(11, Math.max(0, parseInt(this.value) || 0));
+                this.value = val;
+                bot.comboBot.updateConfig({ hotkeySlot: val });
+                refreshComboStatus();
+            });
+        }
+
+        // Min mana change
+        if (comboMinMana) {
+            comboMinMana.addEventListener("change", function () {
+                const val = Math.max(0, parseInt(this.value) || 0);
+                this.value = val;
+                bot.comboBot.updateConfig({ minMana: val });
+                refreshComboStatus();
+            });
+        }
+
+        // Cooldown change
+        if (comboCooldown) {
+            comboCooldown.addEventListener("change", function () {
+                const val = Math.max(100, parseInt(this.value) || 100);
+                this.value = val;
+                bot.comboBot.updateConfig({ cooldownMs: val });
+                refreshComboStatus();
+            });
+        }
+
+        // Periodic refresh (every 2s)
+        setInterval(refreshComboStatus, 2000);
+        
+        // ---- Outfit Randomizer ----
+        const outfitToggle = panel.querySelector("#minibia-bot-outfit-randomizer-enabled");
+        const outfitInterval = panel.querySelector("#minibia-bot-outfit-randomizer-interval");
+        const outfitNow = panel.querySelector("#minibia-bot-outfit-randomizer-now");
+        const outfitStatus = panel.querySelector("#minibia-bot-outfit-randomizer-status");
+
+        function refreshOutfitRandomizerStatus() {
+            const status = bot.outfitRandomizer?.status?.();
+            if (!status) return;
+            if (outfitToggle && document.activeElement !== outfitToggle) {
+                outfitToggle.checked = status.running;
+            }
+            if (outfitInterval && document.activeElement !== outfitInterval) {
+                outfitInterval.value = status.config.intervalMinutes || 5;
+            }
+            if (outfitStatus) {
+                outfitStatus.textContent = status.running ? `Running (every ${status.config.intervalMinutes} min)` : "Idle";
+            }
+        }
+
+        if (outfitToggle) {
+            outfitToggle.checked = !!bot.outfitRandomizer?.status?.().running;
+            outfitToggle.addEventListener("change", function () {
+                if (this.checked) {
+                    const interval = parseInt(outfitInterval?.value) || 5;
+                    bot.outfitRandomizer.updateConfig({
+                        enabled: true,
+                        intervalMinutes: interval,
+                    });
+                } else {
+                    bot.outfitRandomizer.stop();
+                }
+                refreshOutfitRandomizerStatus();
+            });
+        }
+
+        if (outfitInterval) {
+            outfitInterval.value = bot.outfitRandomizer?.config?.intervalMinutes || 5;
+            outfitInterval.addEventListener("change", function () {
+                const val = Math.max(1, parseInt(this.value) || 5);
+                this.value = val;
+                bot.outfitRandomizer.updateConfig({
+                    intervalMinutes: val,
+                });
+                refreshOutfitRandomizerStatus();
+            });
+        }
+
+        if (outfitNow) {
+            outfitNow.addEventListener("click", function () {
+                bot.outfitRandomizer.randomizeNow();
+                refreshOutfitRandomizerStatus();
+            });
+        }
+
+        // Refresh periodically (like other utility modules)
+        setInterval(refreshOutfitRandomizerStatus, 5000);
 
 
         const playerAttackToggle = panel.querySelector("#minibia-bot-player-attack-alert");
@@ -16815,6 +17514,8 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
         currentBundle.installMessageAlertModule(bot);
         currentBundle.installNotificationModule(bot);
         currentBundle.installMovementPatch(bot);
+        currentBundle.installOutfitRandomizerModule(bot);
+        currentBundle.installComboBotModule(bot);
         currentBundle.installPanel(bot);
 
         bot.ui.inject();
