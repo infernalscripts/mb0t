@@ -5675,6 +5675,46 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         return true;
     }
 
+    function renamePreset(oldName, newName) {
+        const old = normalizePresetName(oldName);
+        const newN = normalizePresetName(newName);
+        if (!old || !newN) {
+            bot.log("renamePreset: invalid names");
+            return false;
+        }
+        if (old === newN) {
+            bot.log("renamePreset: new name is the same");
+            return false;
+        }
+        const existing = getPresetByName(newN);
+        if (existing) {
+            bot.log("renamePreset: preset with new name already exists");
+            return false;
+        }
+        const preset = getPresetByName(old);
+        if (!preset) {
+            bot.log("renamePreset: preset not found");
+            return false;
+        }
+        // Create new preset with new name and same route/transitions
+        const newPreset = {
+            name: newN,
+            route: preset.route.map(w => cloneValue(w)),
+            transitions: preset.transitions.map(t => cloneValue(t)),
+        };
+        // Remove old and add new
+        presets = presets.filter(p => p.name.toLowerCase() !== old.toLowerCase());
+        presets.push(newPreset);
+        persistPresets();
+        // If active preset was the old one, update active name
+        if (config.activePresetName && config.activePresetName.toLowerCase() === old.toLowerCase()) {
+            config.activePresetName = newN;
+            persistConfig();
+        }
+        bot.log(`renamePreset: renamed "${old}" to "${newN}"`);
+        return true;
+    }
+
     /**
      * Merge new presets into the existing ones.
      * @param {Array} newPresets – Array of preset objects { name, route, transitions }
@@ -8003,6 +8043,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         isAtWaypoint,
         updateWaypoint,
         mergePresets: mergePresets,
+        renamePreset: renamePreset,
     };
 };
 
@@ -13313,8 +13354,11 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
         const label = document.getElementById("minibia-bot-cave-preset-status");
         const delBtn = document.getElementById("minibia-bot-cave-preset-delete");
         const status = bot.cave?.status?.();
-        const names = status?.presetNames || bot.cave?.getPresetNames?.() || [];
+        // ★ Get the list and sort it alphabetically (case-insensitive)
+        let names = status?.presetNames || bot.cave?.getPresetNames?.() || [];
+        names = [...names].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
         const active = status?.activePresetName || bot.cave?.getActivePresetName?.() || "Default";
+
         if (select) {
             const prev = select.value;
             select.innerHTML = "";
@@ -13332,7 +13376,8 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
                     select.appendChild(opt);
                 });
                 select.disabled = false;
-                select.value = names.includes(active) ? active : (prev || names[0]);
+                // Set value: prefer active, fallback to prev selection or first in list
+                select.value = names.includes(active) ? active : (prev && names.includes(prev) ? prev : names[0]);
             }
         }
         if (label)
@@ -14642,6 +14687,7 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
       <select id="minibia-bot-cave-preset-select" style="flex:1; padding:4px 6px; font-size:11px;"></select>
       <button type="button" class="mb-small-button" id="minibia-bot-cave-preset-new" style="padding:2px 8px; font-size:10px;">New</button>
       <button type="button" class="mb-small-button" id="minibia-bot-cave-preset-delete" style="padding:2px 8px; font-size:10px;">Del</button>
+      <button type="button" class="mb-small-button" id="minibia-bot-cave-preset-rename" style="padding:2px 8px; font-size:10px;">Rename</button>
     </div>
 
     <!-- Controls -->
@@ -16328,6 +16374,42 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
                 refreshCaveClosestStatus();
                 refreshCaveTransitionStatus();
                 refreshCaveWaypointList();
+            });
+        }
+        
+        const renamePresetBtn = panel.querySelector("#minibia-bot-cave-preset-rename");
+        if (renamePresetBtn) {
+            renamePresetBtn.addEventListener("click", () => {
+                const select = document.getElementById("minibia-bot-cave-preset-select");
+                if (!select) return;
+                const oldName = select.value;
+                if (!oldName) {
+                    bot.log("No preset selected to rename.");
+                    return;
+                }
+                const newName = window.prompt("Enter new name for preset:", oldName);
+                if (newName === null) return; // cancelled
+                const trimmed = newName.trim();
+                if (!trimmed) {
+                    bot.log("Invalid preset name.");
+                    return;
+                }
+                const success = bot.cave.renamePreset(oldName, trimmed);
+                if (success) {
+                    refreshCavePresetControls();
+                    refreshCaveStatus();
+                    refreshCaveWaypointList();
+                    // Select the new name in dropdown
+                    const updatedSelect = document.getElementById("minibia-bot-cave-preset-select");
+                    if (updatedSelect) {
+                        const options = Array.from(updatedSelect.options);
+                        const match = options.find(opt => opt.value === trimmed);
+                        if (match) updatedSelect.value = trimmed;
+                    }
+                    bot.log(`Preset renamed to "${trimmed}"`);
+                } else {
+                    bot.log("Rename failed. Check for duplicate names.");
+                }
             });
         }
 
