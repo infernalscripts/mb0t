@@ -5342,7 +5342,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         activePresetName: defaultPresetName,
         loopMode: true,
         autoTransitions: true,
-        stuckTimeoutMs: 5000,
+        stuckTimeoutMs: 2000,
         maxSkipAttempts: 10,
     },
             bot.storage.get(configStorageKey, {}));
@@ -6867,6 +6867,11 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             const position = normalizePosition(bot.getPlayerPosition());
             const positionKey = getPositionKey(position);
             const now = Date.now();
+            
+            // ---- Helper: is the player currently targeting something? ----
+            function _hasTarget() {
+                return !!window.gameClient?.player?.__target || !!bot.attack?.getCurrentTarget?.();
+            }
 
             // ---- DECLARE WAYPOINT HERE ----
             let waypoint = getCurrentWaypoint();
@@ -7150,6 +7155,12 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 if (!position) {
                     return;
                 }
+                
+                // ---- TARGET CHECK: pause if we have a target ----
+                if (_hasTarget()) {
+                    bot.log("Rope waypoint paused – target active");
+                    return; // will retry on next tick
+                }
 
                 // If the waypoint is on a different floor, skip it
                 if (waypoint.z !== position.z) {
@@ -7382,6 +7393,11 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
                 // ---- We are ADJACENT (including diagonal) – use shovel ----
                 if (tileDist === 1) {
+                    // ---- TARGET CHECK: pause if we have a target ----
+                    if (_hasTarget()) {
+                        bot.log("Shovel waypoint paused – target active");
+                        return;
+                    }
                     const tile = getTileAt(waypoint);
                     if (!tile) {
                         bot.log("Shovel waypoint: target tile not loaded");
@@ -7457,6 +7473,12 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 }
 
                 if (!position) {
+                    return;
+                }
+                
+                // ---- TARGET CHECK: pause if we have a target ----
+                if (_hasTarget()) {
+                    bot.log("Ladder waypoint paused – target active");
                     return;
                 }
 
@@ -10205,7 +10227,7 @@ window.__minibiaBotBundle.installMovementPatch = function installMovementPatch(b
             if (pf && pf.__isAutoWalking !== false) {
               try { client.send(new StopWalkPacket()); } catch {}
             }
-            bot.log(`${TAG} target acquired – autowalk cancelled`);
+            //bot.log(`${TAG} target acquired – autowalk cancelled`);
           }
         }
       });
