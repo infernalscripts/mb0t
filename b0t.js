@@ -17739,6 +17739,493 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
 
 /**
  * ==================================================================================
+ * UI TWEAKS MODULE – with name spoofer (fixed), popup hider, hotbar banks & wide columns
+ * ==================================================================================
+ */
+window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule(bot) {
+    const configStorageKey = "minibiaBot.uiTweaks.config";
+
+    const config = Object.assign({
+        wideColumns: false,
+        showBothHotbarBanks: false,
+        nameSpooferEnabled: false,
+        spoofedName: "",
+        hideFloatingPopups: false,
+    }, bot.storage.get(configStorageKey, {}));
+
+    function persistConfig() {
+        bot.storage.set(configStorageKey, config);
+    }
+
+    // ---- Name spoofer state ----
+    let __originalNameDescriptor = null;
+    let __originalChannelAddMessage = null;
+    let __realName = null;
+
+    // ---- Popup hider & floating text spoof ----
+    let __originalCreateTextElement = null;
+    let __originalCreateTextElementMethod = null;
+
+    // ---- Food consumption messages ----
+    const CONSUMPTION_MSGS = new Set([
+        "yum.", "yummy.", "chomp.", "munch.", "burp.",
+        "gulp..", "ugh!", "aaaah...", "ahhh..", "slurp.",
+        "glug.", "nom.", "nom nom.", "tasty.", "crunch.",
+        "gulp", "yum", "burp", "munch", "crunch"
+    ]);
+
+    function isConsumptionMessage(msg) {
+        return CONSUMPTION_MSGS.has(String(msg).toLowerCase().trim());
+    }
+
+    // ---- Name spoofer for nameplate & chat ----
+    function applyNameSpoof() {
+        const player = window.gameClient?.player;
+        if (!player) {
+            bot.log("[UI] Name spoofer: player not ready, will retry");
+            setTimeout(applyNameSpoof, 500);
+            return;
+        }
+
+        const enabled = config.nameSpooferEnabled;
+        const name = config.spoofedName.trim();
+
+        if (!enabled || !name) {
+            // Restore Creature.prototype.name
+            if (__originalNameDescriptor) {
+                Object.defineProperty(Creature.prototype, 'name', __originalNameDescriptor);
+                __originalNameDescriptor = null;
+                bot.log("[UI] Name spoofer: restored original name getter");
+            }
+            // Restore Channel.addMessage
+            if (__originalChannelAddMessage) {
+                Channel.prototype.addMessage = __originalChannelAddMessage;
+                __originalChannelAddMessage = null;
+                bot.log("[UI] Name spoofer: restored chat handler");
+            }
+            forceRefreshNameplates(); // will use real name
+            return;
+        }
+
+        const realName = player.name;
+        if (!realName) {
+            bot.log("[UI] Name spoofer: real name not found");
+            return;
+        }
+        __realName = realName;
+
+        // ---- Patch Creature.prototype.name ----
+        if (!__originalNameDescriptor) {
+            const desc = Object.getOwnPropertyDescriptor(Creature.prototype, 'name');
+            __originalNameDescriptor = desc;
+            Object.defineProperty(Creature.prototype, 'name', {
+                get: function() {
+                    if (this === gameClient.player) {
+                        return config.spoofedName.trim();
+                    }
+                    return __originalNameDescriptor ? __originalNameDescriptor.get.call(this) : this.__name;
+                },
+                set: function(value) {
+                    if (this === gameClient.player) {
+                        this.__realName = value;
+                        return;
+                    }
+                    if (__originalNameDescriptor) {
+                        __originalNameDescriptor.set.call(this, value);
+                    } else {
+                        this.__name = value;
+                    }
+                },
+                configurable: true
+            });
+            bot.log("[UI] Name spoofer: patched Creature.prototype.name");
+        }
+
+        // ---- Patch Channel.addMessage ----
+        if (!__originalChannelAddMessage) {
+            __originalChannelAddMessage = Channel.prototype.addMessage;
+            Channel.prototype.addMessage = function(message, level, name, color, timestamp, levelNumber) {
+                if (name && name === __realName) {
+                    name = config.spoofedName.trim();
+                }
+                return __originalChannelAddMessage.call(this, message, level, name, color, timestamp, levelNumber);
+            };
+            bot.log("[UI] Name spoofer: patched Channel.addMessage");
+        }
+
+        forceRefreshNameplates(); // will use spoofed name
+        bot.log(`[UI] Name spoofer: applied "${name}"`);
+    }
+
+    // ★ FIXED: forceRefreshNameplates now checks the enabled state
+    function forceRefreshNameplates() {
+        const player = window.gameClient?.player;
+        if (!player) return;
+        // Use spoofed name only if enabled and non-empty, else real name
+        const displayName = (config.nameSpooferEnabled && config.spoofedName.trim())
+            ? config.spoofedName.trim()
+            : player.name;
+
+        if (player.characterElement) {
+            const ce = player.characterElement;
+            if (typeof ce.name !== 'undefined') ce.name = displayName;
+            if (typeof ce._name !== 'undefined') ce._name = displayName;
+
+            const el = ce.element;
+            if (el) {
+                const nameRow = el.querySelector('.skull-name-row');
+                if (nameRow) {
+                    const nameSpan = nameRow.querySelector('span');
+                    if (nameSpan) {
+                        nameSpan.textContent = displayName;
+                    }
+                }
+            }
+            if (typeof ce.render === 'function') ce.render();
+            if (typeof ce.update === 'function') ce.update();
+            if (typeof ce.updateNameplate === 'function') ce.updateNameplate();
+            if (typeof ce.setName === 'function') ce.setName(displayName);
+        }
+
+        const battleWindow = gameClient.interface?.windowManager?.getWindow?.("battle-window");
+        if (battleWindow && typeof battleWindow.updateCreature === 'function') {
+            battleWindow.updateCreature(player);
+        }
+
+        if (window.gameClient?.renderer) {
+            window.gameClient.renderer.updateTileCache();
+            window.gameClient.renderer.render();
+        }
+    }
+
+    // ---- Combined patch for floating text: spoof name + hide popups ----
+    function applyFloatingTextPatch() {
+        const mgr = gameClient?.interface?.screenElementManager;
+        if (!mgr) {
+            bot.log("[UI] Floating text patch: ScreenElementManager not ready, will retry");
+            setTimeout(applyFloatingTextPatch, 500);
+            return;
+        }
+
+        const proto = Object.getPrototypeOf(mgr);
+
+        if (!__originalCreateTextElement) {
+            __originalCreateTextElement = proto.__createTextElement;
+        }
+        if (!__originalCreateTextElementMethod) {
+            __originalCreateTextElementMethod = proto.createTextElement;
+        }
+
+        proto.createTextElement = function(entity, message, color, loudness) {
+            // ---- 1) Check if we should hide this floating bubble ----
+            let hide = false;
+            if (config.hideFloatingPopups) {
+                let isSpell = false;
+                if (typeof mgr.isSpellCastMessage === 'function') {
+                    isSpell = mgr.isSpellCastMessage(message);
+                } else {
+                    const lower = String(message).toLowerCase().trim();
+                    isSpell = /^[a-z ]+$/.test(lower) && lower.length < 30;
+                }
+                const isFood = isConsumptionMessage(message);
+                hide = isSpell || isFood;
+            }
+
+            // ---- 2) Log to Default channel (original behavior) ----
+            if (!hide && entity && entity.type !== 1) {
+                let shouldHideLog = false;
+                try {
+                    shouldHideLog = gameClient.interface.settings
+                        && gameClient.interface.settings.isHideSpellCastsEnabled()
+                        && mgr.isSpellCastMessage && mgr.isSpellCastMessage(message);
+                } catch (e) {}
+                if (!shouldHideLog) {
+                    gameClient.interface.channelManager.getChannel("Default").addMessage(
+                        message, entity.type, entity.name, color, loudness, entity.level
+                    );
+                }
+            }
+
+            if (hide) {
+                return null;
+            }
+
+            // ---- 3) Spoof name for floating bubble (if enabled) ----
+            if (config.nameSpooferEnabled && config.spoofedName.trim() && entity === gameClient.player) {
+                const realName = entity.name;
+                entity.name = config.spoofedName.trim();
+                const result = this.__createTextElement(
+                    new MessageElement(entity, message, color, loudness)
+                );
+                entity.name = realName;
+                return result;
+            }
+
+            // ---- 4) Default ----
+            return this.__createTextElement(
+                new MessageElement(entity, message, color, loudness)
+            );
+        };
+
+        bot.log("[UI] Floating text patch: installed (name spoof + popup hider)");
+    }
+
+    // ---- CSS for hotbar banks ----
+    function ensureBothBanksCSS() {
+        if (document.getElementById("mb-ui-tweaks-style")) return;
+        const style = document.createElement("style");
+        style.id = "mb-ui-tweaks-style";
+        style.textContent = `
+            .hotbar.show-both-banks {
+                display: flex !important;
+                flex-direction: row !important;
+                flex-wrap: wrap !important;
+                gap: 2px !important;
+            }
+            .hotbar.show-both-banks .hotbar-bank1,
+            .hotbar.show-both-banks .hotbar-bank2 {
+                display: flex !important;
+                flex-direction: row !important;
+                gap: 2px !important;
+            }
+            .hotbar.show-both-banks .hotbar-item {
+                flex: 0 0 36px !important;
+                width: 36px !important;
+                height: 36px !important;
+            }
+            .hotbar.show-both-banks .hotbar-spacer {
+                display: none !important;
+            }
+            #hotbar-bank-toggle.hidden {
+                opacity: 0;
+                pointer-events: none;
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    function applyStyles() {
+        ensureBothBanksCSS();
+
+        // Wide Columns
+        const columns = document.querySelectorAll("#game-wrapper .column");
+        const newWidth = config.wideColumns ? "224px" : "180px";
+        columns.forEach(col => { col.style.width = newWidth; });
+
+        // Hotbar banks
+        const hotbar = document.querySelector(".hotbar");
+        if (hotbar) {
+            const bank1 = hotbar.querySelector(".hotbar-bank1");
+            const bank2 = hotbar.querySelector(".hotbar-bank2");
+            const toggleBtn = document.getElementById("hotbar-bank-toggle");
+
+            if (config.showBothHotbarBanks) {
+                hotbar.classList.add("show-both-banks");
+                if (bank1) bank1.style.display = "";
+                if (bank2) bank2.style.display = "";
+                if (toggleBtn) toggleBtn.classList.add("hidden");
+            } else {
+                hotbar.classList.remove("show-both-banks");
+                if (bank1) bank1.style.display = "";
+                if (bank2) bank2.style.display = hotbar.classList.contains("show-bank2") ? "" : "none";
+                if (toggleBtn) toggleBtn.classList.remove("hidden");
+            }
+        }
+
+        applyNameSpoof();
+        applyFloatingTextPatch();
+    }
+
+    function applyAll() {
+        persistConfig();
+        applyStyles();
+        setTimeout(forceRefreshNameplates, 100);
+    }
+
+    // ---- Inject the UI tab ----
+    function injectUiTab() {
+        const panel = document.getElementById("minibia-bot-panel");
+        if (!panel) {
+            setTimeout(injectUiTab, 100);
+            return;
+        }
+
+        const tabMenu = panel.querySelector(".mb-tab-menu");
+        if (!tabMenu) return;
+        if (tabMenu.querySelector('[data-tab-button="ui"]')) return;
+        const tabBtn = document.createElement("button");
+        tabBtn.type = "button";
+        tabBtn.className = "mb-tab-button";
+        tabBtn.dataset.tabButton = "ui";
+        tabBtn.textContent = "UI";
+        tabMenu.appendChild(tabBtn);
+
+        const tabContent = panel.querySelector(".mb-tab-content");
+        if (!tabContent) return;
+        if (tabContent.querySelector('[data-tab-panel="ui"]')) return;
+
+        const uiPanel = document.createElement("div");
+        uiPanel.className = "mb-tab-panel";
+        uiPanel.dataset.tabPanel = "ui";
+        uiPanel.innerHTML = `
+            <div class="mb-section">
+                <div class="mb-label">Interface Tweaks</div>
+                <div class="mb-stack">
+                    <label class="mb-toggle mb-toggle-main">
+                        <input type="checkbox" id="minibia-bot-ui-wide-columns" />
+                        <span>Wide Columns (224px)</span>
+                    </label>
+                    <div class="mb-small-note">Expands the container widths from 180px to 224px.</div>
+
+                    <label class="mb-toggle mb-toggle-main" style="margin-top:8px;">
+                        <input type="checkbox" id="minibia-bot-ui-show-both-hotbar" />
+                        <span>Show Both Hotbar Banks</span>
+                    </label>
+                    <div class="mb-small-note">Show all 24 hotbar slots (F1-F12 and Shift+F1-F12) at once.</div>
+
+                    <hr style="margin:12px 0;border-color:#444;">
+
+                    <div class="mb-label" style="font-size:12px;">Name Spoofer</div>
+                    <label class="mb-toggle mb-toggle-main">
+                        <input type="checkbox" id="minibia-bot-ui-name-spoofer-enabled" />
+                        <span>Enable Name Spoof</span>
+                    </label>
+                    <div style="display:flex; gap:6px; margin-top:4px;">
+                        <input type="text" id="minibia-bot-ui-spoofed-name" placeholder="Enter custom name" style="flex:1;" />
+                        <button type="button" class="mb-small-button" id="minibia-bot-ui-apply-spoofer">Apply</button>
+                    </div>
+                    <div class="mb-small-note">Changes your display name locally (nameplate, chat, and floating speech).</div>
+
+                    <hr style="margin:12px 0;border-color:#444;">
+
+                    <div class="mb-label" style="font-size:12px;">Floating Popups</div>
+                    <label class="mb-toggle mb-toggle-main">
+                        <input type="checkbox" id="minibia-bot-ui-hide-popups" />
+                        <span>Hide Spell Casts &amp; Food Popups</span>
+                    </label>
+                    <div class="mb-small-note">Removes floating bubbles above your character when casting spells or eating food.</div>
+                </div>
+            </div>
+        `;
+        tabContent.appendChild(uiPanel);
+
+        // ---- Tab click handler ----
+        tabBtn.addEventListener("click", function() {
+            const tabId = this.dataset.tabButton;
+            panel.querySelectorAll(".mb-tab-button").forEach(btn => btn.dataset.active = btn === this ? "true" : "false");
+            panel.querySelectorAll(".mb-tab-panel").forEach(tp => tp.dataset.active = tp.dataset.tabPanel === tabId ? "true" : "false");
+            try { localStorage.setItem("minibia-bot-active-tab", tabId); } catch {}
+        });
+
+        // ---- Restore active tab ----
+        const savedTab = (() => {
+            try { return localStorage.getItem("minibia-bot-active-tab") || "healing"; } catch { return "healing"; }
+        })();
+        if (savedTab === "ui") {
+            tabBtn.dataset.active = "true";
+            uiPanel.dataset.active = "true";
+        }
+
+        // ---- Wire up controls ----
+        const wideCheck = document.getElementById("minibia-bot-ui-wide-columns");
+        const bothCheck = document.getElementById("minibia-bot-ui-show-both-hotbar");
+        const nameSpoofCheck = document.getElementById("minibia-bot-ui-name-spoofer-enabled");
+        const spoofNameInput = document.getElementById("minibia-bot-ui-spoofed-name");
+        const applySpooferBtn = document.getElementById("minibia-bot-ui-apply-spoofer");
+        const hidePopupsCheck = document.getElementById("minibia-bot-ui-hide-popups");
+
+        function refreshUI() {
+            if (wideCheck) wideCheck.checked = config.wideColumns;
+            if (bothCheck) bothCheck.checked = config.showBothHotbarBanks;
+            if (nameSpoofCheck) nameSpoofCheck.checked = config.nameSpooferEnabled;
+            if (spoofNameInput) spoofNameInput.value = config.spoofedName || "";
+            if (hidePopupsCheck) hidePopupsCheck.checked = config.hideFloatingPopups;
+        }
+
+        function applyAll() {
+            persistConfig();
+            applyStyles();
+            setTimeout(forceRefreshNameplates, 100);
+        }
+
+        if (wideCheck) {
+            wideCheck.addEventListener("change", function () {
+                config.wideColumns = this.checked;
+                applyAll();
+            });
+        }
+        if (bothCheck) {
+            bothCheck.addEventListener("change", function () {
+                config.showBothHotbarBanks = this.checked;
+                applyAll();
+            });
+        }
+        if (nameSpoofCheck) {
+            nameSpoofCheck.addEventListener("change", function () {
+                config.nameSpooferEnabled = this.checked;
+                applyAll();
+            });
+        }
+        if (applySpooferBtn) {
+            applySpooferBtn.addEventListener("click", function () {
+                const name = spoofNameInput?.value?.trim() || "";
+                config.spoofedName = name;
+                if (name && !config.nameSpooferEnabled) {
+                    config.nameSpooferEnabled = true;
+                    if (nameSpoofCheck) nameSpoofCheck.checked = true;
+                }
+                applyAll();
+            });
+        }
+        if (spoofNameInput) {
+            spoofNameInput.addEventListener("keydown", function (e) {
+                if (e.key === "Enter") {
+                    e.preventDefault();
+                    if (applySpooferBtn) applySpooferBtn.click();
+                }
+            });
+        }
+        if (hidePopupsCheck) {
+            hidePopupsCheck.addEventListener("change", function () {
+                config.hideFloatingPopups = this.checked;
+                applyAll();
+            });
+        }
+
+        refreshUI();
+        applyAll();
+    }
+
+    // ---- Injection ----
+    if (document.getElementById("minibia-bot-panel")) {
+        injectUiTab();
+    } else {
+        const observer = new MutationObserver(() => {
+            if (document.getElementById("minibia-bot-panel")) {
+                observer.disconnect();
+                injectUiTab();
+            }
+        });
+        observer.observe(document.body, { childList: true, subtree: true });
+        setTimeout(() => {
+            observer.disconnect();
+            injectUiTab();
+        }, 3000);
+    }
+
+    // ---- Public API ----
+    bot.uiTweaks = {
+        config,
+        applyStyles,
+        persistConfig,
+        forceRefreshNameplates,
+        applyNameSpoof,
+        applyFloatingTextPatch,
+    };
+};
+
+/**
+ * ==================================================================================
  * 15. BOOTSTRAP
  *     Creates the bot, installs all modules, and exposes it globally.
  *     Also implements hot‑reload.
@@ -17825,6 +18312,7 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
         currentBundle.installOutfitRandomizerModule(bot);
         currentBundle.installComboBotModule(bot);
         currentBundle.installPanel(bot);
+        currentBundle.installUiTweaksModule(bot);
 
         bot.ui.inject();
 
