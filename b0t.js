@@ -364,15 +364,22 @@ window.__minibiaBotBundle.createBot = function createBot() {
     function applyDeadmanBypass() {
         try {
             if (typeof Keyboard !== 'undefined' && Keyboard.prototype) {
-                // Disable recovery entirely
                 Keyboard.prototype.MOVEMENT_RECOVERY_ENABLED = false;
-                // Set timeouts to effectively infinite (24 hours)
                 Keyboard.prototype.MOVEMENT_DEADMAN_SILENCE_MS = 99999999;
                 Keyboard.prototype.MOVEMENT_DEADMAN_ARM_MS = 99999999;
                 console.log('[minibia-bot] Deadman switch disabled via prototype');
             }
+            // Also apply to the current instance if it exists
+            const kb = window.gameClient?.keyboard;
+            if (kb) {
+                kb.MOVEMENT_RECOVERY_ENABLED = false;
+                kb.MOVEMENT_DEADMAN_SILENCE_MS = 99999999;
+                kb.MOVEMENT_DEADMAN_ARM_MS = 99999999;
+                kb.__checkMovementDeadman = function () {};
+                console.log('[minibia-bot] Deadman switch disabled on instance');
+            }
         } catch (e) {
-            // Prototype may not be ready – ignore
+            // Ignore
         }
     }
     applyDeadmanBypass();
@@ -3356,6 +3363,9 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         lastProgressAt: 0,
         lastTargetHealth: null,
         stuckStartAt: 0,
+        lastKiteWaypoint: null,
+        kiteTargetKey: null,
+        kiteOriginalIndex: null,
     };
 
     const storedConfig = bot.storage.get(configStorageKey, {}) || {};
@@ -3386,13 +3396,45 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     // ---- Constants for floor-change detection (copied from cave module) ----
-    const ladderItemIds = new Set([1948, 1968, 435, 5542]);
-    const teleporterItemIds = new Set([5756]); // turtle teleport – add more IDs as needed
 
     function persistConfig() {
         bot.storage.set(configStorageKey, {
             ...config
         });
+    }
+    // ---- FLOOR CHANGE DETECTION (copied from cave module) ----
+    const ladderItemIds = new Set([1948, 1968, 435, 5542]);
+    const teleporterItemIds = new Set([5756]);
+
+    function isFloorChangeTile(tile) {
+        if (!tile)
+            return false;
+        if (ladderItemIds.has(tile.id) || teleporterItemIds.has(tile.id))
+            return true;
+        if (Array.isArray(tile.items)) {
+            for (const item of tile.items) {
+                if (ladderItemIds.has(item.id) || teleporterItemIds.has(item.id))
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    // Safe walkable check: walkable AND not a floor-change tile
+    function isSafeToWalkTile(x, y, z, ignoreCreatures = false) {
+        const pos = new Position(x, y, z);
+        const tile = window.gameClient?.world?.getTileFromWorldPosition?.(pos);
+        if (!tile)
+            return false;
+        if (!tile.isWalkable())
+            return false;
+        if (tile.isItemBlocked())
+            return false;
+        if (!ignoreCreatures && tile.isOccupied())
+            return false;
+        if (isFloorChangeTile(tile))
+            return false; // ★ skip holes/ladders/teleporters
+        return true;
     }
 
     let kiteWaypointIndex = null;
@@ -3495,14 +3537,6 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         return false;
     }
 
-    function isFloorChangeTile(tile) {
-        if (!tile)
-            return false;
-        if (isFloorChangeThing(tile))
-            return true;
-        return Array.isArray(tile.items) && tile.items.some(item => isFloorChangeThing(item));
-    }
-
     function tileHasNamedThing(tile, needle) {
         const val = String(needle || "").trim().toLowerCase();
         if (!val || !tile)
@@ -3592,7 +3626,6 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         let stepX = dx > 0 ? 1 : (dx < 0 ? -1 : 0);
         let stepY = dy > 0 ? 1 : (dy < 0 ? -1 : 0);
 
-        // Try cardinal first, then diagonal
         const attempts = [{
                 dx: stepX,
                 dy: 0
@@ -3610,7 +3643,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 continue;
             const nx = playerPos.x + a.dx;
             const ny = playerPos.y + a.dy;
-            if (isTileWalkable(nx, ny, playerPos.z, false)) {
+            // ★ Safe check
+            if (isSafeToWalkTile(nx, ny, playerPos.z, false)) {
                 const dir = getDirection(a.dx, a.dy);
                 if (dir !== null && window.gameClient?.keyboard) {
                     window.gameClient.keyboard.handleMoveKey(dir);
@@ -3732,28 +3766,29 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         const loopMode = bot.cave?.getLoopMode?.() ?? false;
 
         if (!caveStatus?.running || !caveStatus?.pausedForCombat || route.length === 0) {
-            // Fallback: move away from target (this already uses ignoreCreatures=false in its own checks)
             return kiteAwayFallback(targetPos, playerPos, dist);
         }
 
-        // ---- INITIAL RETREAT WAYPOINT ----
-        if (state.kiteWaypointIndex === null) {
-            let startIdx = caveStatus.currentIndex - 1;
-            if (loopMode && caveStatus.currentIndex === 0) {
-                startIdx = route.length - 1;
-            }
-            if (startIdx < 0)
-                startIdx = 0;
-            if (startIdx >= route.length)
-                startIdx = route.length - 1;
-            state.kiteWaypointIndex = startIdx;
+        // ---- Store original index when we first start kiting ----
+        if (state.kiteOriginalIndex === null && caveStatus?.running) {
+            state.kiteOriginalIndex = caveStatus.currentIndex;
+            bot.log(`[Kite] original index saved: ${state.kiteOriginalIndex + 1}`);
         }
+
+        let retreatIdx = caveStatus.currentIndex - 1;
+        if (loopMode) {
+            if (retreatIdx < 0)
+                retreatIdx = route.length + retreatIdx; // wrap around
+        } else {
+            retreatIdx = Math.max(0, Math.min(route.length - 1, retreatIdx));
+        }
+
+        state.kiteWaypointIndex = retreatIdx;
 
         let idx = Math.min(state.kiteWaypointIndex, route.length - 1);
         if (idx < 0)
             idx = 0;
 
-        // Only target waypoints on the same floor
         while (idx >= 0 && route[idx].z !== playerPos.z) {
             idx--;
         }
@@ -3769,21 +3804,19 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         }
 
         const distToWp = getTileDistance(playerPos, targetWp);
-        const tolerance = Math.max(0, Number(config.waypointTolerance) || 0);
+        // ★ Tolerance = 3 (switch sooner)
+        const tolerance = Math.max(6, Number(config.waypointTolerance) || 6);
 
-        // ---- REACHED RETREAT WAYPOINT – MOVE TO NEXT (BACKWARDS) ----
         if (distToWp <= tolerance) {
-            let nextIdx = idx - 1;
-            if (loopMode && nextIdx < 0) {
-                nextIdx = route.length - 1;
+            // ★ Move to the next retreat waypoint (another -2)
+            let nextIdx = idx - 2;
+            if (loopMode) {
+                if (nextIdx < 0)
+                    nextIdx = route.length + nextIdx;
+            } else {
+                nextIdx = Math.max(0, Math.min(route.length - 1, nextIdx));
             }
-            while (nextIdx >= 0 && route[nextIdx].z !== playerPos.z) {
-                nextIdx--;
-                if (loopMode && nextIdx < 0) {
-                    nextIdx = route.length - 1;
-                }
-            }
-            if (nextIdx >= 0) {
+            if (nextIdx >= 0 && nextIdx < route.length) {
                 state.kiteWaypointIndex = nextIdx;
                 bot.cave.setCurrentIndex(nextIdx);
                 targetWp = route[nextIdx];
@@ -3799,7 +3832,6 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         const stepX = dx > 0 ? 1 : (dx < 0 ? -1 : 0);
         const stepY = dy > 0 ? 1 : (dy < 0 ? -1 : 0);
 
-        // Helper: validate a candidate tile for kiting – NOW respects creatures!
         function isValidKiteTile(nx, ny) {
             if (bot.blacklist?.isBlacklisted(nx, ny, playerPos.z))
                 return false;
@@ -3810,13 +3842,12 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             };
             if (!isSafeTileForKite(candidatePos))
                 return false;
-            // CRITICAL: ignoreCreatures = false => creatures block movement
             return isTileWalkable(nx, ny, playerPos.z, false);
         }
 
         let moved = false;
 
-        // ----- 1. TRY CARDINAL DIRECTIONS (toward the waypoint) -----
+        // Cardinal attempts
         const cardinalAttempts = [{
                 dx: stepX,
                 dy: 0
@@ -3840,7 +3871,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             }
         }
 
-        // ----- 2. IF BOTH CARDINALS FAIL, TRY DIAGONAL (last resort) -----
+        // Diagonal attempts
         if (!moved && stepX !== 0 && stepY !== 0) {
             const diagAttempts = [{
                     dx: stepX,
@@ -3875,7 +3906,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             }
         }
 
-        // ----- 3. ABSOLUTE FALLBACK: try all 8 directions (extreme case) -----
+        // Fallback: all 8 directions
         if (!moved) {
             const fallbackOffsets = [
                 [0, -1], [1, 0], [0, 1], [-1, 0],
@@ -3895,14 +3926,14 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             }
         }
 
-        // ---- STUCK DETECTION: skip blocked waypoint after too many failures ----
+        // Stuck detection
         if (!moved) {
             if (!state.kiteStuckCount)
                 state.kiteStuckCount = 0;
             state.kiteStuckCount++;
             if (state.kiteStuckCount > 5) {
                 bot.log("Kite: retreat waypoint blocked, skipping to previous waypoint");
-                state.kiteWaypointIndex = (state.kiteWaypointIndex - 1 + route.length) % route.length;
+                state.kiteWaypointIndex = (state.kiteWaypointIndex - 2 + route.length) % route.length;
                 state.kiteStuckCount = 0;
             }
         } else {
@@ -3917,7 +3948,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             return false;
         const now = Date.now();
 
-        // 1) Clear target if too far (give up after being far for a while)
+        // 1) Clear target if too far
         if (resetTargetIfTooFar(now))
             return true;
 
@@ -3934,15 +3965,18 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         }
 
         // 3) Validate current target
-        const current = getCurrentTarget();
+        let current = getCurrentTarget(); // use 'let' so we can reassign later if needed
         if (!current) {
+            // ---- NEW: Restore original index if no target ----
+            if (state.kiteOriginalIndex !== null) {
+                restoreKiteIndex();
+            }
             state.lastProgressAt = 0;
             state.lastDistance = undefined;
             state.lastTargetHealth = null;
             state.unreachableStart = 0;
             return triggerAttack(now);
         }
-
         const playerPos = normalizePosition(bot.getPlayerPosition());
         const targetPos = normalizePosition(current.getPosition?.() || current.__position);
         if (!playerPos || !targetPos) {
@@ -3954,8 +3988,15 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         const dist = getTileDistance(playerPos, targetPos);
         const maxDist = Math.max(1, Number(config.maxTargetDistance) || 5);
 
-        // Skip only if clearly out of range (maxDist + 2)
-        if (dist > maxDist + 2) {
+        // ★ NEW: For melee mode without client chase, skip target as soon as it's out of melee range
+        if (config.meleeMode && !config.useClientChase && dist > maxDist) {
+            skipTarget(current, "melee target out of range (no chase)", now, 500);
+            state.unreachableStart = 0;
+            return false;
+        }
+
+        // Skip only if clearly out of range (maxDist + 1)
+        if (dist > maxDist + 1) {
             skipTarget(current, "target too far (distance check)", now, 2000);
             state.unreachableStart = 0;
             return false;
@@ -4237,6 +4278,15 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         state.lastTargetHealth = null;
         resetFollowProgress();
         clearCurrentFollowTarget();
+    }
+
+    function restoreKiteIndex() {
+        if (state.kiteOriginalIndex !== null) {
+            bot.cave.setCurrentIndex(state.kiteOriginalIndex);
+            bot.log(`[Kite] restored original index ${state.kiteOriginalIndex + 1}`);
+            state.kiteOriginalIndex = null;
+            state.kiteWaypointIndex = null;
+        }
     }
 
     function clearCurrentFollowTarget() {
@@ -4692,7 +4742,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             }, {
                 x: 1,
                 y: 1
-            },
+            }
         ];
         offsets.sort((a, b) => {
             const da = Math.abs(targetPos.x + a.x - playerPos.x) + Math.abs(targetPos.y + a.y - playerPos.y);
@@ -4712,18 +4762,15 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             const tile = getTileFromPosition(candidate);
             if (!tile?.isWalkable?.())
                 continue;
+            if (isFloorChangeTile(tile))
+                continue; // ★ skip floor-change tiles
             if (candidate.x === playerPos.x && candidate.y === playerPos.y)
                 return candidate;
             try {
                 const path = pf.search(startTile, tile);
                 if (Array.isArray(path) && path.length > 0)
                     return candidate;
-            } catch (e) {
-                bot.log("auto attack reachability check failed", {
-                    ...candidate,
-                    error: e?.message || e
-                });
-                return null;
+            } catch (e) { /* ignore */
             }
         }
         return null;
@@ -4761,7 +4808,6 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             return false;
         }
 
-        // If already adjacent, no need to move
         if (dist <= 1) {
             state.meleeLastDist = Infinity;
             state.meleeProgressAt = 0;
@@ -4769,7 +4815,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             return false;
         }
 
-        // ---- Anti‑KS (same as before) ----
+        // Anti‑KS (same as before)
         const visiblePlayers = bot.xray?.getVisiblePlayers?.({
             sameFloorOnly: true
         }) || [];
@@ -4804,22 +4850,19 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             }
         }
 
-        // ---- Stuck detection (UPDATED) ----
+        // Stuck detection
         if (state.engagedTargetId !== target.id) {
             state.meleeLastDist = dist;
             state.meleeProgressAt = now;
             state.meleeStuckAt = 0;
         } else {
-            // If distance decreased, we're making progress
             if (dist < state.meleeLastDist) {
                 state.meleeLastDist = dist;
                 state.meleeProgressAt = now;
                 state.meleeStuckAt = 0;
             } else {
-                // No progress: start or increment stuck timer
                 if (!state.meleeStuckAt)
                     state.meleeStuckAt = now;
-                // ⬇️ Increased from 4000 to 6000ms
                 if (now - state.meleeStuckAt > 6000) {
                     skipTarget(target, "melee stuck (no progress)", now, 3000);
                     return false;
@@ -4827,7 +4870,6 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             }
         }
 
-        // ---- Move one step toward target ----
         if (now - state.lastMoveAt < 250)
             return false;
 
@@ -4856,14 +4898,14 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             if (nx === targetPos.x && ny === targetPos.y)
                 continue;
 
-            if (isTileWalkable(nx, ny, playerPos.z, false)) {
+            // ★ Use safe check: walkable + not a hole/ladder/teleporter
+            if (isSafeToWalkTile(nx, ny, playerPos.z, false)) {
                 const dir = getDirection(a.dx, a.dy);
                 if (dir !== null && window.gameClient?.keyboard) {
                     window.gameClient.keyboard.handleMoveKey(dir);
                     state.lastChaseAt = now;
                     state.lastMoveAt = now;
                     state.meleeLastDist = dist;
-                    // ✅ Reset stuck timer because we successfully moved
                     state.meleeStuckAt = 0;
                     return true;
                 }
@@ -5343,6 +5385,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         _shovelOpened: null,
         _shovelRetry: null, // { index, count, lastTry }
         _ladderUsed: null, // index -> true
+        combatCooldownUntil: 0,
     };
     const minimapOverlayState = {
         timerId: null
@@ -6870,64 +6913,100 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         if (!state.running)
             return;
 
-        // ---- PAUSE CHECK (wait) ----
         if (bot._waitUntil && Date.now() < bot._waitUntil) {
             scheduleNextTick();
             return;
         }
 
-        // ---- COMBAT PAUSE (MOVED TO TOP) ----
-        // Helper: is there a valid, alive, on‑screen target?
+        if (state.combatCooldownUntil && Date.now() < state.combatCooldownUntil) {
+            scheduleNextTick();
+            return;
+        }
+
+        // ---- stopMovement helper ----
+        function stopMovement() {
+            const pf = window.gameClient?.world?.pathfinder;
+            if (pf) {
+                pf.setPathfindCache(null);
+                pf.__isAutoWalking = false;
+                pf.__finalDestination = null;
+                pf.__hybridPath = null;
+            }
+            const player = window.gameClient?.player;
+            if (player && player.__preWalks) {
+                player.__preWalks.length = 0;
+            }
+            try {
+                if (window.gameClient && window.gameClient.send) {
+                    window.gameClient.send(new StopWalkPacket());
+                }
+            } catch (e) {}
+            state.lastWaypointTarget = null;
+            state.pathAttemptStart = 0;
+            state.lastDistanceToWaypoint = null;
+            state.lastPathAt = 0;
+        }
+
+        // ---- Combat pause ----
         function hasValidTarget() {
             const player = window.gameClient?.player;
             if (!player)
                 return false;
-            const target = player.__target; // direct client target
+            const target = player.__target;
             if (!target) {
-                // No target – clear pause state immediately
                 if (state.pausedForCombat) {
                     state.pausedForCombat = false;
-                    bot.log("cave resumed (no target)");
+                    // Clear prediction queue to avoid extra step
+                    if (player.__preWalks)
+                        player.__preWalks.length = 0;
+                    state.combatCooldownUntil = Date.now() + 200; // 200ms cooldown
+                    bot.log("cave resumed (no target) – cooldown 200ms");
                 }
                 return false;
             }
-            // Check health (alive)
             const health = target.state?.health ?? target.health;
             if (health !== undefined && health <= 0) {
                 if (state.pausedForCombat) {
                     state.pausedForCombat = false;
-                    bot.log("cave resumed (target dead)");
+                    if (player.__preWalks)
+                        player.__preWalks.length = 0;
+                    state.combatCooldownUntil = Date.now() + 200;
+                    bot.log("cave resumed (target dead) – cooldown 200ms");
                 }
                 return false;
             }
-            // Check if target is on screen (same floor, within viewport)
             try {
                 const pp = player.getPosition().projected();
                 const tp = target.getPosition().projected();
                 const onScreen = Math.abs(pp.x - tp.x) < 8 && Math.abs(pp.y - tp.y) < 6;
                 if (!onScreen && state.pausedForCombat) {
                     state.pausedForCombat = false;
-                    bot.log("cave resumed (target off‑screen)");
+                    if (player.__preWalks)
+                        player.__preWalks.length = 0;
+                    state.combatCooldownUntil = Date.now() + 200;
+                    bot.log("cave resumed (target off‑screen) – cooldown 200ms");
                 }
                 return onScreen;
             } catch {
-                // Position unavailable – treat as not on screen
                 if (state.pausedForCombat) {
                     state.pausedForCombat = false;
-                    bot.log("cave resumed (position error)");
+                    if (player.__preWalks)
+                        player.__preWalks.length = 0;
+                    state.combatCooldownUntil = Date.now() + 200;
+                    bot.log("cave resumed (error) – cooldown 200ms");
                 }
                 return false;
             }
         }
 
-        // Evaluate pause condition
         const shouldPause = hasValidTarget();
         if (shouldPause) {
             if (!state.pausedForCombat) {
                 state.pausedForCombat = true;
-                bot.log("cave paused for auto attack");
+                stopMovement();
+                bot.log("cave paused");
             }
-            scheduleNextTick(); // check again next tick
+            scheduleNextTick();
             return;
         }
 
@@ -10230,18 +10309,15 @@ window.__minibiaBotBundle.installNotificationModule = function installNotificati
 
 /**
  * ==================================================================================
- * MOVEMENT PATCH – Light, non‑aggressive
- * Prevents cavebot / autowalk from moving while you have a target,
- * but leaves manual keyboard + click‑to‑move (non‑autowalk) untouched.
+ * MOVEMENT PATCH – Balanced
+ * Cancels autowalk on target acquisition and blocks autowalk packets while a valid target exists.
+ * Does NOT patch findPath – cavebot handles pause.
  * ==================================================================================
  */
 window.__minibiaBotBundle.installMovementPatch = function installMovementPatch(bot) {
-    // Run once, wait for gameClient
     (function install() {
         const TAG = "[MovementPatch]";
-
         let installed = false;
-        let client = null;
 
         function waitForClient() {
             const c = window.gameClient || window.GameClient?.instance || window.client;
@@ -10252,39 +10328,29 @@ window.__minibiaBotBundle.installMovementPatch = function installMovementPatch(b
             if (installed)
                 return;
             installed = true;
-            client = c;
-            bot.log(`${TAG} installed (light mode)`);
-            installPatches(client);
+            bot.log(`${TAG} installed (balanced)`);
+            installPatches(c);
         }
 
         function installPatches(client) {
-            // 1) When a target is SET, cancel any ongoing autowalk immediately
             guardPlayerTarget(client);
-
-            // 2) Block outgoing autowalk packets while target is present
             patchGameClientSend(client);
-
-            // 3) Optionally, block pathfinder's findPath if target is present (extra safety)
-            patchPathfinder(client);
-
-            // No interval loop – we only react to events.
+            // No findPath patch.
         }
 
-        // ---- Helper: does the player have a target on screen? ----
-        function hasTarget(client) {
+        // Helper: does the player have a valid target (alive, on screen)?
+        function hasValidTarget(client) {
             const p = client.player;
             if (!p)
                 return false;
-            let target = null;
-            try {
-                if (typeof p.getTarget === "function")
-                    target = p.getTarget();
-            } catch {}
-            if (!target && p.__target !== null && p.__target !== undefined)
-                target = p.__target;
+            const target = p.__target;
             if (!target)
                 return false;
-            // Check if target is on screen (same floor, within view)
+            // Check health
+            const health = target.state?.health ?? target.health;
+            if (health !== undefined && health <= 0)
+                return false;
+            // Check on screen
             try {
                 const pp = p.getPosition().projected();
                 const tp = target.getPosition().projected();
@@ -10294,7 +10360,25 @@ window.__minibiaBotBundle.installMovementPatch = function installMovementPatch(b
             }
         }
 
-        // ---- 1) Guard player.__target ----
+        // Stop movement: clear pathfinder, send StopWalkPacket, clear prediction queue
+        function stopMovement(client) {
+            const pf = client.world?.pathfinder;
+            if (pf) {
+                pf.setPathfindCache(null);
+                pf.__isAutoWalking = false;
+                pf.__finalDestination = null;
+                pf.__hybridPath = null;
+            }
+            const p = client.player;
+            if (p && p.__preWalks) {
+                p.__preWalks.length = 0;
+            }
+            try {
+                client.send(new StopWalkPacket());
+            } catch (e) {}
+        }
+
+        // 1) Guard __target: when a target is set, stop movement immediately
         function guardPlayerTarget(client) {
             const p = client.player;
             if (!p || p.__stopOnTargetTargetGuarded)
@@ -10309,30 +10393,17 @@ window.__minibiaBotBundle.installMovementPatch = function installMovementPatch(b
                 },
                 set(value) {
                     targetValue = value;
-                    // If a target is set (non‑null), cancel any autowalk once
                     if (value !== null && value !== undefined) {
-                        // Clear pathfinder cache and send StopWalk
-                        const pf = client.world?.pathfinder;
-                        if (pf) {
-                            pf.setPathfindCache(null);
-                            pf.__isAutoWalking = false;
-                            pf.__finalDestination = null;
-                            pf.__hybridPath = null;
-                        }
-                        // Send StopWalkPacket if autowalk was active
-                        if (pf && pf.__isAutoWalking !== false) {
-                            try {
-                                client.send(new StopWalkPacket());
-                            } catch {}
-                        }
-                        //bot.log(`${TAG} target acquired – autowalk cancelled`);
+                        // Target acquired – cancel autowalk immediately
+                        stopMovement(client);
+                        // bot.log(`${TAG} target acquired – autowalk cancelled`);
                     }
                 }
             });
             p.__stopOnTargetTargetGuarded = true;
         }
 
-        // ---- 2) Block AutoWalkPacket / WalkToDestinationPacket if target exists ----
+        // 2) Block AutoWalkPacket / WalkToDestinationPacket only while a valid target exists
         function patchGameClientSend(client) {
             if (!client || typeof client.send !== "function" || client.__stopOnTargetSendPatched)
                 return;
@@ -10342,16 +10413,17 @@ window.__minibiaBotBundle.installMovementPatch = function installMovementPatch(b
             client.send = function (packet) {
                 const packetName = packet?.constructor?.name || "";
 
-                // Always let StopWalkPacket through (we may send it ourselves)
+                // Always allow StopWalkPacket
                 if (packetName === "StopWalkPacket") {
                     return originalSend.call(this, packet);
                 }
 
-                // Block autowalk packets if target is present
-                if (hasTarget(client) &&
-                    (packetName === "AutoWalkPacket" || packetName === "WalkToDestinationPacket")) {
-                    bot.log(`${TAG} blocked ${packetName} (target active)`);
-                    return false; // drop the packet
+                // Block autowalk packets only if a valid target exists (alive, on screen)
+                if (packetName === "AutoWalkPacket" || packetName === "WalkToDestinationPacket") {
+                    if (hasValidTarget(client)) {
+                        //bot.log(`${TAG} blocked ${packetName} (valid target active)`);
+                        return false; // drop the packet
+                    }
                 }
 
                 return originalSend.call(this, packet);
@@ -10360,27 +10432,7 @@ window.__minibiaBotBundle.installMovementPatch = function installMovementPatch(b
             client.__stopOnTargetSendPatched = true;
         }
 
-        // ---- 3) Patch pathfinder findPath to bail if target is present ----
-        function patchPathfinder(client) {
-            const pf = client.world?.pathfinder;
-            if (!pf || pf.__stopOnTargetFunctionsPatched)
-                return;
-
-            const originalFindPath = pf.findPath;
-            pf.findPath = function (begin, stop, isFinalDestination = true) {
-                if (hasTarget(client)) {
-                    //bot.log(`${TAG} findPath blocked (target active)`);
-                    return false;
-                }
-                return originalFindPath.call(this, begin, stop, isFinalDestination);
-            };
-
-            pf.__stopOnTargetFunctionsPatched = true;
-        }
-
-        // Start the installer
         waitForClient();
-
     })();
 };
 
