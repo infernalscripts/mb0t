@@ -15137,19 +15137,19 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
 </div>
 <div class="mb-body">
   <div class="mb-tab-menu">
-    <button type="button" class="mb-tab-button" data-tab-button="healing">💚 Healing</button>
-    <button type="button" class="mb-tab-button" data-tab-button="panic">⚠️ Alerts</button>
     <button type="button" class="mb-tab-button" data-tab-button="cave">🚶 Cavebot</button>
     <button type="button" class="mb-tab-button" data-tab-button="targeting">️⚔️ Targeting</button>
-    <button type="button" class="mb-tab-button" data-tab-button="utility">🛠️ Tools</button>
-	<button type="button" class="mb-tab-button" data-tab-button="paladin">🏹 Paladin Tools</button>
+    <button type="button" class="mb-tab-button" data-tab-button="healing">💚 Healing</button>
 	<button type="button" class="mb-tab-button" data-tab-button="looter">💰 Looter</button>
+    <button type="button" class="mb-tab-button" data-tab-button="panic">⚠️ Alerts</button>
+    <button type="button" class="mb-tab-button" data-tab-button="utility">🛠️ Tools</button>
 	<button type="button" class="mb-tab-button" data-tab-button="training">✨ Training</button>
-	<button type="button" class="mb-tab-button" data-tab-button="profiles">💾 Profiles</button>
-    <button type="button" class="mb-tab-button" data-tab-button="talk">💬 Responder</button>
-    <button type="button" class="mb-tab-button" data-tab-button="xray">🩻 X-Ray</button>
-	<button type="button" class="mb-tab-button" data-tab-button="blacklist">🗺️ Special Area</button>
+	<button type="button" class="mb-tab-button" data-tab-button="paladin">🏹 Distance</button>
   <button type="button" class="mb-tab-button" data-tab-button="combo">💀 PVP</button>
+    <button type="button" class="mb-tab-button" data-tab-button="xray">🩻 X-Ray</button>
+    <button type="button" class="mb-tab-button" data-tab-button="talk">💬 Responder</button>
+	<button type="button" class="mb-tab-button" data-tab-button="blacklist">🗺️ Special Area</button>
+	<button type="button" class="mb-tab-button" data-tab-button="profiles">💾 Profiles</button>
   </div>
   <div class="mb-tab-content">
   
@@ -15460,7 +15460,7 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
 <!-- Talk Tab -->
 <div class="mb-tab-panel" data-tab-panel="talk">
   <div class="mb-section">
-    <div class="mb-label">Talk</div>
+    <div class="mb-label">Auto Responder</div>
     <div class="mb-stack">
       <label class="mb-toggle mb-toggle-main"><input type="checkbox" id="minibia-bot-talk-enabled" /><span>Enable Auto Reply</span></label>
       <label class="mb-field" for="minibia-bot-talk-api-key"><span class="mb-field-label">Gemini API Key</span><input type="password" id="minibia-bot-talk-api-key" placeholder="Gemini API key" /></label>
