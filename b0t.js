@@ -10247,7 +10247,7 @@ window.__minibiaBotBundle.installNotificationModule = function installNotificati
         document.body.appendChild(container);
     }
 
-    function showNotification(title, message, type = 'alarm', duration = 15000) {
+    function showNotification(title, message, type = 'alarm', duration = 5000) {
         const item = document.createElement('div');
         item.className = `mb-notification type-${type}`;
         item.innerHTML = `<div class="mb-notif-title">${title}</div><div class="mb-notif-msg">${message}</div>`;
@@ -14632,7 +14632,7 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
 
       /* ── Collapsed state ── */
       #minibia-bot-panel[data-collapsed="true"] {
-        width: 260px;
+        width: 200px;
       }
 
       #minibia-bot-panel[data-collapsed="true"] .mb-body {
@@ -15092,7 +15092,7 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
         }
 
         #minibia-bot-panel[data-collapsed="true"] {
-          width: 200px;
+          width: 222x;
         }
       }
 
@@ -15127,8 +15127,8 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
 <div class="mb-titlebar">
   <div class="mb-title">MBot</div>
   <div class="mb-title-status">
-    <span class="mb-run-indicator" id="minibia-bot-title-cave-status" data-running="false"><span class="mb-run-dot"></span><span class="mb-run-label">Cave</span></span>
-    <span class="mb-run-indicator" id="minibia-bot-title-attack-status" data-running="false"><span class="mb-run-dot"></span><span class="mb-run-label">Target</span></span>
+    <span class="mb-run-indicator" id="minibia-bot-title-cave-status" data-running="false"><span class="mb-run-dot"></span><span class="mb-run-label">C</span></span>
+    <span class="mb-run-indicator" id="minibia-bot-title-attack-status" data-running="false"><span class="mb-run-dot"></span><span class="mb-run-label">T</span></span>
   </div>
   <div class="mb-title-actions">
     <button type="button" class="mb-icon-button mb-collapsed-stop-button" id="minibia-bot-collapsed-stop" title="Stop Cave + Attack">■</button>
