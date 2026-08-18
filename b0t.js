@@ -14632,7 +14632,7 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
 
       /* ── Collapsed state ── */
       #minibia-bot-panel[data-collapsed="true"] {
-        width: 200px;
+        width: 222px;
       }
 
       #minibia-bot-panel[data-collapsed="true"] .mb-body {
@@ -15127,8 +15127,8 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
 <div class="mb-titlebar">
   <div class="mb-title">MBot</div>
   <div class="mb-title-status">
-    <span class="mb-run-indicator" id="minibia-bot-title-cave-status" data-running="false"><span class="mb-run-dot"></span><span class="mb-run-label">C</span></span>
-    <span class="mb-run-indicator" id="minibia-bot-title-attack-status" data-running="false"><span class="mb-run-dot"></span><span class="mb-run-label">T</span></span>
+    <span class="mb-run-indicator" id="minibia-bot-title-cave-status" data-running="false"><span class="mb-run-dot"></span><span class="mb-run-label">🚶</span></span>
+    <span class="mb-run-indicator" id="minibia-bot-title-attack-status" data-running="false"><span class="mb-run-dot"></span><span class="mb-run-label">⚔️</span></span>
   </div>
   <div class="mb-title-actions">
     <button type="button" class="mb-icon-button mb-collapsed-stop-button" id="minibia-bot-collapsed-stop" title="Stop Cave + Attack">■</button>
@@ -15137,19 +15137,19 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
 </div>
 <div class="mb-body">
   <div class="mb-tab-menu">
-    <button type="button" class="mb-tab-button" data-tab-button="healing">Healing</button>
-    <button type="button" class="mb-tab-button" data-tab-button="panic">Alerts</button>
-    <button type="button" class="mb-tab-button" data-tab-button="utility">Utility</button>
-    <button type="button" class="mb-tab-button" data-tab-button="cave">Cavebot</button>
-    <button type="button" class="mb-tab-button" data-tab-button="targeting">Targeting</button>
-	<button type="button" class="mb-tab-button" data-tab-button="paladin">Paladin Utility</button>
-	<button type="button" class="mb-tab-button" data-tab-button="looter">Looter</button>
-	<button type="button" class="mb-tab-button" data-tab-button="training">Training</button>
-	<button type="button" class="mb-tab-button" data-tab-button="profiles">Profiles</button>
-    <button type="button" class="mb-tab-button" data-tab-button="talk">Talk</button>
-    <button type="button" class="mb-tab-button" data-tab-button="xray">Xray</button>
-	<button type="button" class="mb-tab-button" data-tab-button="blacklist">Blacklisted Tiles</button>
-  <button type="button" class="mb-tab-button" data-tab-button="combo">PVP</button>
+    <button type="button" class="mb-tab-button" data-tab-button="healing">💚 Healing</button>
+    <button type="button" class="mb-tab-button" data-tab-button="panic">⚠️ Alerts</button>
+    <button type="button" class="mb-tab-button" data-tab-button="cave">🚶 Cavebot</button>
+    <button type="button" class="mb-tab-button" data-tab-button="targeting">️⚔️ Targeting</button>
+    <button type="button" class="mb-tab-button" data-tab-button="utility">🛠️ Tools</button>
+	<button type="button" class="mb-tab-button" data-tab-button="paladin">🏹 Paladin Tools</button>
+	<button type="button" class="mb-tab-button" data-tab-button="looter">💰 Looter</button>
+	<button type="button" class="mb-tab-button" data-tab-button="training">✨ Training</button>
+	<button type="button" class="mb-tab-button" data-tab-button="profiles">💾 Profiles</button>
+    <button type="button" class="mb-tab-button" data-tab-button="talk">💬 Responder</button>
+    <button type="button" class="mb-tab-button" data-tab-button="xray">🩻 X-Ray</button>
+	<button type="button" class="mb-tab-button" data-tab-button="blacklist">🗺️ Special Area</button>
+  <button type="button" class="mb-tab-button" data-tab-button="combo">💀 PVP</button>
   </div>
   <div class="mb-tab-content">
   
@@ -15618,10 +15618,10 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
   </div>
 </div>
 
-<!-- Blacklist Tab -->
+<!-- Special Area -->
 <div class="mb-tab-panel" data-tab-panel="blacklist">
   <div class="mb-section">
-    <div class="mb-label">Tile Blacklist</div>
+    <div class="mb-label">Special Area (Avoid SQM)</div>
     <div class="mb-stack">
       <div style="display:flex; gap:6px; flex-wrap:wrap;">
         <button type="button" class="mb-small-button" id="minibia-bot-blacklist-add-current">Add Current Tile</button>
@@ -17782,7 +17782,7 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
     function applyNameSpoof() {
         const player = window.gameClient?.player;
         if (!player) {
-            bot.log("[UI] Name spoofer: player not ready, will retry");
+            //bot.log("[UI] Name spoofer: player not ready, will retry");
             setTimeout(applyNameSpoof, 500);
             return;
         }
@@ -18057,7 +18057,7 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
         tabBtn.type = "button";
         tabBtn.className = "mb-tab-button";
         tabBtn.dataset.tabButton = "ui";
-        tabBtn.textContent = "UI";
+        tabBtn.textContent = "🖥️ UI Tweaks";
         tabMenu.appendChild(tabBtn);
 
         const tabContent = panel.querySelector(".mb-tab-content");
