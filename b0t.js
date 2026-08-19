@@ -7133,7 +7133,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 }
 
                 // ---- Stuck timeout check ----
-                const stuckTimeout = config.stuckTimeoutMs || 5000;
+                const stuckTimeout = config.stuckTimeoutMs || 2000;
                 if (now - state.standStartAt[index] > stuckTimeout) {
                     if (!state.standReached)
                         state.standReached = {};
@@ -7252,7 +7252,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                     state._ropeStartAt = {};
                 if (!state._ropeStartAt[index])
                     state._ropeStartAt[index] = now;
-                const stuckTimeout = config.stuckTimeoutMs || 5000;
+                const stuckTimeout = config.stuckTimeoutMs || 2000;
                 if (now - state._ropeStartAt[index] > stuckTimeout) {
                     bot.log(`Rope waypoint ${index + 1} timed out after ${stuckTimeout / 1000}s – skipping`);
                     if (!state._ropeUsed)
@@ -7601,7 +7601,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                     state._ladderStartAt = {};
                 if (!state._ladderStartAt[index])
                     state._ladderStartAt[index] = now;
-                const stuckTimeout = config.stuckTimeoutMs || 5000;
+                const stuckTimeout = config.stuckTimeoutMs || 2000;
                 if (now - state._ladderStartAt[index] > stuckTimeout) {
                     bot.log(`Ladder waypoint ${index + 1} timed out after ${stuckTimeout / 1000}s – skipping`);
                     if (!state._ladderUsed)
@@ -7793,7 +7793,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             }
 
             // ---- STUCK DETECTION ----
-            const stuckTimeout = config.stuckTimeoutMs || 5000;
+            const stuckTimeout = config.stuckTimeoutMs || 2000;
             if (!madeProgress && (now - state.lastProgressAt) > stuckTimeout) {
                 // Only skip if we actually have a waypoint and are not in combat
                 const currentWp = getCurrentWaypoint();
@@ -17737,11 +17737,6 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
     };
 };
 
-/**
- * ==================================================================================
- * UI TWEAKS MODULE – with name spoofer (fixed), popup hider, hotbar banks & wide columns
- * ==================================================================================
- */
 window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule(bot) {
     const configStorageKey = "minibiaBot.uiTweaks.config";
 
@@ -17751,10 +17746,189 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
         nameSpooferEnabled: false,
         spoofedName: "",
         hideFloatingPopups: false,
+        ttlEnabled: false, // NEW
     }, bot.storage.get(configStorageKey, {}));
 
     function persistConfig() {
         bot.storage.set(configStorageKey, config);
+    }
+
+    // ---- TTL state ----
+    const ttlState = {
+        installed: false,
+        originalRenderStatistics: null,
+        debuggerInstance: null,
+        intervalId: null,
+    };
+
+    // ---- TTL helper functions ----
+    function getExpForLevel(level) {
+        return Math.floor((50/3) * Math.pow(level, 3) - 100 * Math.pow(level, 2) + (850/3) * level - 200);
+    }
+
+    function calculateTTL() {
+        try {
+            let expEl = document.querySelector('div[skill="experience"] .skill');
+            let lvlEl = document.querySelector('div[skill="level"] .skill');
+            let currentExp = expEl ? parseInt(expEl.textContent.replace(/,/g, ''), 10) : null;
+            let level = lvlEl ? parseInt(lvlEl.textContent.replace(/,/g, ''), 10) : null;
+
+            if (currentExp == null || isNaN(currentExp) || level == null || isNaN(level)) {
+                let player = gameClient?.player?.state;
+                if (player) {
+                    currentExp = player.experience;
+                    level = player.level;
+                }
+            }
+
+            if (currentExp == null || level == null || isNaN(currentExp) || isNaN(level)) {
+                return "Open Skills";
+            }
+
+            let neededExp = getExpForLevel(level + 1);
+            let remaining = neededExp - currentExp;
+            if (remaining <= 0) {
+                return "LEVEL UP!";
+            }
+
+            let xphEl = document.querySelector('div[skill="xph"] .skill');
+            let xph = 0;
+            if (xphEl) {
+                let raw = xphEl.textContent.replace(/,/g, '').trim();
+                if (raw.includes('/h')) raw = raw.replace('/h', '').trim();
+                xph = parseFloat(raw);
+            }
+            if (!xph || xph <= 0) {
+                let win = gameClient?.interface?.windows?.skill;
+                if (win && win.__xphStartExp != null) {
+                    let elapsed = (Date.now() - win.__xphStartTime) / 3600000;
+                    if (elapsed > 0.005) {
+                        xph = (win.__xphLastExp - win.__xphStartExp) / elapsed;
+                    }
+                }
+            }
+            if (!xph || xph <= 0 || !isFinite(xph)) {
+                return "Gain XP";
+            }
+
+            let hours = remaining / xph;
+            let seconds = Math.round(hours * 3600);
+            if (seconds < 0) seconds = 0;
+            if (seconds > 31536000) {
+                return "> 1y";
+            }
+
+            let h = Math.floor(seconds / 3600);
+            let m = Math.floor((seconds % 3600) / 60);
+            let s = seconds % 60;
+            let formatted = "";
+            if (h > 0) formatted += h + "h ";
+            if (m > 0 || h > 0) formatted += m + "m ";
+            formatted += s + "s";
+            return formatted;
+        } catch (e) {
+            return "?";
+        }
+    }
+
+    function findBuildLine(container) {
+        const children = container.querySelectorAll("*");
+        for (const child of children) {
+            if (child.textContent && child.textContent.trim().toLowerCase().startsWith("build:")) {
+                return child;
+            }
+        }
+        return null;
+    }
+
+    function updateTTLRow() {
+        const overlay = document.getElementById("debug-statistics")
+            || document.getElementById("debugger-statistics")
+            || document.getElementById("debug-overlay")
+            || document.getElementById("performance-overlay");
+
+        let buildLine = null;
+        if (overlay) {
+            buildLine = findBuildLine(overlay);
+        } else {
+            const all = document.querySelectorAll("div, span, p, pre");
+            for (const el of all) {
+                if (el.textContent && el.textContent.trim().toLowerCase().startsWith("build:")) {
+                    buildLine = el;
+                    break;
+                }
+            }
+            if (!buildLine) return;
+        }
+
+        let ttlRow = document.getElementById("ttl-inline-row");
+        if (!ttlRow) {
+            ttlRow = document.createElement("div");
+            ttlRow.id = "ttl-inline-row";
+            ttlRow.style.color = "#9f9";
+            ttlRow.style.fontWeight = "bold";
+            ttlRow.style.marginTop = "2px";
+            ttlRow.style.pointerEvents = "none";
+            if (buildLine && buildLine.parentElement) {
+                buildLine.insertAdjacentElement("afterend", ttlRow);
+            } else if (overlay) {
+                overlay.appendChild(ttlRow);
+            }
+        }
+        ttlRow.textContent = "⏳ TTL: " + calculateTTL();
+    }
+
+    // ---- TTL install / uninstall ----
+    function installTTL() {
+        if (ttlState.installed) return;
+        const debuggerInstance = gameClient?.renderer?.debugger;
+        if (!debuggerInstance) {
+            setTimeout(installTTL, 500);
+            return;
+        }
+        ttlState.debuggerInstance = debuggerInstance;
+        const proto = Object.getPrototypeOf(debuggerInstance);
+        if (!proto.renderStatistics) return;
+        ttlState.originalRenderStatistics = proto.renderStatistics;
+        proto.renderStatistics = function() {
+            ttlState.originalRenderStatistics.call(this);
+            updateTTLRow();
+        };
+        debuggerInstance.renderStatistics = proto.renderStatistics;
+        ttlState.installed = true;
+        if (!ttlState.intervalId) {
+            ttlState.intervalId = setInterval(() => {
+                if (document.getElementById("ttl-inline-row")) {
+                    updateTTLRow();
+                }
+            }, 2000);
+        }
+        bot.log("[TTL] Hook installed.");
+    }
+
+    function uninstallTTL() {
+        if (ttlState.intervalId) {
+            clearInterval(ttlState.intervalId);
+            ttlState.intervalId = null;
+        }
+        if (ttlState.debuggerInstance && ttlState.originalRenderStatistics) {
+            const proto = Object.getPrototypeOf(ttlState.debuggerInstance);
+            proto.renderStatistics = ttlState.originalRenderStatistics;
+            ttlState.debuggerInstance.renderStatistics = ttlState.originalRenderStatistics;
+            ttlState.originalRenderStatistics = null;
+            ttlState.debuggerInstance = null;
+        }
+        document.getElementById("ttl-inline-row")?.remove();
+        ttlState.installed = false;
+        bot.log("[TTL] Hook uninstalled.");
+    }
+
+    function applyTTL() {
+        if (config.ttlEnabled) {
+            installTTL();
+        } else {
+            uninstallTTL();
+        }
     }
 
     // ---- Name spoofer state ----
@@ -17782,7 +17956,6 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
     function applyNameSpoof() {
         const player = window.gameClient?.player;
         if (!player) {
-            //bot.log("[UI] Name spoofer: player not ready, will retry");
             setTimeout(applyNameSpoof, 500);
             return;
         }
@@ -17791,19 +17964,17 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
         const name = config.spoofedName.trim();
 
         if (!enabled || !name) {
-            // Restore Creature.prototype.name
             if (__originalNameDescriptor) {
                 Object.defineProperty(Creature.prototype, 'name', __originalNameDescriptor);
                 __originalNameDescriptor = null;
                 bot.log("[UI] Name spoofer: restored original name getter");
             }
-            // Restore Channel.addMessage
             if (__originalChannelAddMessage) {
                 Channel.prototype.addMessage = __originalChannelAddMessage;
                 __originalChannelAddMessage = null;
                 bot.log("[UI] Name spoofer: restored chat handler");
             }
-            forceRefreshNameplates(); // will use real name
+            forceRefreshNameplates();
             return;
         }
 
@@ -17814,7 +17985,6 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
         }
         __realName = realName;
 
-        // ---- Patch Creature.prototype.name ----
         if (!__originalNameDescriptor) {
             const desc = Object.getOwnPropertyDescriptor(Creature.prototype, 'name');
             __originalNameDescriptor = desc;
@@ -17841,7 +18011,6 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
             bot.log("[UI] Name spoofer: patched Creature.prototype.name");
         }
 
-        // ---- Patch Channel.addMessage ----
         if (!__originalChannelAddMessage) {
             __originalChannelAddMessage = Channel.prototype.addMessage;
             Channel.prototype.addMessage = function(message, level, name, color, timestamp, levelNumber) {
@@ -17853,15 +18022,13 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
             bot.log("[UI] Name spoofer: patched Channel.addMessage");
         }
 
-        forceRefreshNameplates(); // will use spoofed name
+        forceRefreshNameplates();
         bot.log(`[UI] Name spoofer: applied "${name}"`);
     }
 
-    // ★ FIXED: forceRefreshNameplates now checks the enabled state
     function forceRefreshNameplates() {
         const player = window.gameClient?.player;
         if (!player) return;
-        // Use spoofed name only if enabled and non-empty, else real name
         const displayName = (config.nameSpooferEnabled && config.spoofedName.trim())
             ? config.spoofedName.trim()
             : player.name;
@@ -17917,7 +18084,6 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
         }
 
         proto.createTextElement = function(entity, message, color, loudness) {
-            // ---- 1) Check if we should hide this floating bubble ----
             let hide = false;
             if (config.hideFloatingPopups) {
                 let isSpell = false;
@@ -17931,7 +18097,6 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
                 hide = isSpell || isFood;
             }
 
-            // ---- 2) Log to Default channel (original behavior) ----
             if (!hide && entity && entity.type !== 1) {
                 let shouldHideLog = false;
                 try {
@@ -17950,7 +18115,6 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
                 return null;
             }
 
-            // ---- 3) Spoof name for floating bubble (if enabled) ----
             if (config.nameSpooferEnabled && config.spoofedName.trim() && entity === gameClient.player) {
                 const realName = entity.name;
                 entity.name = config.spoofedName.trim();
@@ -17961,7 +18125,6 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
                 return result;
             }
 
-            // ---- 4) Default ----
             return this.__createTextElement(
                 new MessageElement(entity, message, color, loudness)
             );
@@ -18007,12 +18170,10 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
     function applyStyles() {
         ensureBothBanksCSS();
 
-        // Wide Columns
         const columns = document.querySelectorAll("#game-wrapper .column");
-        const newWidth = config.wideColumns ? "224px" : "180px";
+        const newWidth = config.wideColumns ? "224px" : "216px";
         columns.forEach(col => { col.style.width = newWidth; });
 
-        // Hotbar banks
         const hotbar = document.querySelector(".hotbar");
         if (hotbar) {
             const bank1 = hotbar.querySelector(".hotbar-bank1");
@@ -18034,6 +18195,7 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
 
         applyNameSpoof();
         applyFloatingTextPatch();
+        applyTTL();
     }
 
     function applyAll() {
@@ -18104,6 +18266,16 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
                         <span>Hide Spell Casts &amp; Food Popups</span>
                     </label>
                     <div class="mb-small-note">Removes floating bubbles above your character when casting spells or eating food.</div>
+
+                    <hr style="margin:12px 0;border-color:#444;">
+
+                    <!-- NEW TTL SECTION -->
+                    <div class="mb-label" style="font-size:12px;">Time‑To‑Level</div>
+                    <label class="mb-toggle mb-toggle-main">
+                        <input type="checkbox" id="minibia-bot-ui-ttl-enabled" />
+                        <span>Show Time‑To‑Level (TTL) in Performance Overlay</span>
+                    </label>
+                    <div class="mb-small-note">Displays remaining time until next level (requires Debugger overlay).</div>
                 </div>
             </div>
         `;
@@ -18133,6 +18305,7 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
         const spoofNameInput = document.getElementById("minibia-bot-ui-spoofed-name");
         const applySpooferBtn = document.getElementById("minibia-bot-ui-apply-spoofer");
         const hidePopupsCheck = document.getElementById("minibia-bot-ui-hide-popups");
+        const ttlCheck = document.getElementById("minibia-bot-ui-ttl-enabled");
 
         function refreshUI() {
             if (wideCheck) wideCheck.checked = config.wideColumns;
@@ -18140,12 +18313,11 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
             if (nameSpoofCheck) nameSpoofCheck.checked = config.nameSpooferEnabled;
             if (spoofNameInput) spoofNameInput.value = config.spoofedName || "";
             if (hidePopupsCheck) hidePopupsCheck.checked = config.hideFloatingPopups;
+            if (ttlCheck) ttlCheck.checked = config.ttlEnabled;
         }
 
-        function applyAll() {
-            persistConfig();
-            applyStyles();
-            setTimeout(forceRefreshNameplates, 100);
+        function applyAllWithTTL() {
+            applyAll();
         }
 
         if (wideCheck) {
@@ -18191,6 +18363,13 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
                 applyAll();
             });
         }
+        if (ttlCheck) {
+            ttlCheck.addEventListener("change", function () {
+                config.ttlEnabled = this.checked;
+                persistConfig();
+                applyTTL(); // apply toggle immediately
+            });
+        }
 
         refreshUI();
         applyAll();
@@ -18213,6 +18392,12 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
         }, 3000);
     }
 
+    // ---- Cleanup on bot destroy ----
+    bot.addCleanup(() => {
+        uninstallTTL();
+        // Restore other patches if needed (handled individually)
+    });
+
     // ---- Public API ----
     bot.uiTweaks = {
         config,
@@ -18221,6 +18406,8 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
         forceRefreshNameplates,
         applyNameSpoof,
         applyFloatingTextPatch,
+        applyTTL,
+        uninstallTTL,
     };
 };
 
