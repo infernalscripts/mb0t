@@ -10174,6 +10174,199 @@ window.__minibiaBotBundle.installLightHackModule = function installLightHackModu
     };
 };
 
+window.__minibiaBotBundle.installLightHackLegitModule = function installLightHackLegitModule(bot) {
+    const configStorageKey = "minibiaBot.lightHackLegit.config";
+    const state = {
+        running: false,
+        originalRenderFBOLighting: null,
+        renderer: null,
+    };
+
+    const config = Object.assign({
+        enabled: false,
+        playerLightSize: 11,
+        playerLightColor: 215,
+    }, bot.storage.get(configStorageKey, {}));
+
+    function persistConfig() {
+        bot.storage.set(configStorageKey, {
+            enabled: config.enabled,
+            playerLightSize: config.playerLightSize,
+            playerLightColor: config.playerLightColor,
+        });
+    }
+
+    function installHook(renderer) {
+        if (state.running) return;
+        const proto = Object.getPrototypeOf(renderer);
+        state.originalRenderFBOLighting = proto.__renderFBOLighting;
+        state.renderer = renderer;
+
+        proto.__renderFBOLighting = function(playerLightSize, playerLightColor) {
+            if (window.LightHack && window.LightHack.enabled) {
+                const hack = window.LightHack;
+                if (hack.playerLight.enabled) {
+                    playerLightSize = hack.playerLight.size;
+                    playerLightColor = hack.playerLight.color;
+                }
+            }
+            state.originalRenderFBOLighting.call(this, playerLightSize, playerLightColor);
+            if (window.LightHack && window.LightHack.enabled) {
+                this.__injectExtraLights();
+            }
+        };
+        renderer.__renderFBOLighting = proto.__renderFBOLighting;
+
+        // Add helper methods if not present
+        if (!proto.__injectExtraLights) {
+            proto.__injectExtraLights = function() {
+                const hack = window.LightHack;
+                if (!hack || !hack.extraLights || hack.extraLights.length === 0) return;
+                const playerZ = gameClient.player.getPosition().z;
+                for (const light of hack.extraLights) {
+                    if (light.z !== playerZ) continue;
+                    const pos = this.getStaticScreenPosition(new Position(light.x, light.y, light.z));
+                    this.__pushLight(pos.x, pos.y, light.size, light.color);
+                }
+            };
+        }
+        if (!proto.__pushLight) {
+            proto.__pushLight = function(x, y, size, colorByte) {
+                if (this.__lightQueueSize >= this.__lightQueueCapacity) return;
+                const idx = this.__lightQueueSize * 4;
+                this.__lightQueueData[idx] = x;
+                this.__lightQueueData[idx + 1] = y;
+                this.__lightQueueData[idx + 2] = size;
+                this.__lightQueueData[idx + 3] = colorByte;
+                this.__lightQueueSize++;
+            };
+        }
+
+        // Set up global LightHack configuration
+        if (!window.LightHack) {
+            window.LightHack = {
+                enabled: true,
+                playerLight: {
+                    enabled: true,
+                    size: config.playerLightSize || 11,
+                    color: config.playerLightColor || 215,
+                },
+                extraLights: [],
+                addLight: function(x, y, z, size, color) {
+                    this.extraLights.push({ x, y, z, size, color });
+                    return this.extraLights.length - 1;
+                },
+                removeLight: function(id) {
+                    if (id >= 0 && id < this.extraLights.length) {
+                        this.extraLights.splice(id, 1);
+                        return true;
+                    }
+                    return false;
+                },
+                clearLights: function() {
+                    this.extraLights = [];
+                },
+                setPlayerLight: function(enabled, size, color) {
+                    this.playerLight.enabled = enabled;
+                    if (size !== undefined) this.playerLight.size = size;
+                    if (color !== undefined) this.playerLight.color = color;
+                }
+            };
+        } else {
+            window.LightHack.enabled = true;
+            window.LightHack.playerLight.size = config.playerLightSize || 11;
+            window.LightHack.playerLight.color = config.playerLightColor || 215;
+        }
+
+        state.running = true;
+        bot.log("LightHackLegit enabled");
+        if (renderer && typeof renderer.render === 'function') renderer.render();
+    }
+
+    function uninstallHook() {
+        if (!state.running) return;
+        const renderer = state.renderer;
+        if (renderer && state.originalRenderFBOLighting) {
+            const proto = Object.getPrototypeOf(renderer);
+            proto.__renderFBOLighting = state.originalRenderFBOLighting;
+            renderer.__renderFBOLighting = state.originalRenderFBOLighting;
+        }
+        state.running = false;
+        state.originalRenderFBOLighting = null;
+        state.renderer = null;
+        if (window.LightHack) {
+            window.LightHack.enabled = false;
+        }
+        bot.log("LightHackLegit disabled");
+        if (gameClient?.renderer && typeof gameClient.renderer.render === 'function') gameClient.renderer.render();
+    }
+
+    function start() {
+        if (state.running) return false;
+        config.enabled = true;
+        persistConfig();
+
+        const waitForRenderer = (callback) => {
+            if (gameClient?.renderer?.screen?.__spriteBatch) {
+                callback(gameClient.renderer);
+            } else {
+                setTimeout(() => waitForRenderer(callback), 200);
+            }
+        };
+
+        waitForRenderer((renderer) => {
+            installHook(renderer);
+        });
+
+        return true;
+    }
+
+    function stop() {
+        if (!state.running) return false;
+        config.enabled = false;
+        persistConfig();
+        uninstallHook();
+        return true;
+    }
+
+    function status() {
+        return {
+            running: state.running,
+            config: { ...config }
+        };
+    }
+
+    function updateConfig(next) {
+        if (next.enabled !== undefined) {
+            if (next.enabled) start();
+            else stop();
+        }
+        if (next.playerLightSize !== undefined) {
+            config.playerLightSize = Math.max(1, Number(next.playerLightSize) || 11);
+            if (window.LightHack) window.LightHack.playerLight.size = config.playerLightSize;
+        }
+        if (next.playerLightColor !== undefined) {
+            config.playerLightColor = Math.min(255, Math.max(0, Number(next.playerLightColor) || 215));
+            if (window.LightHack) window.LightHack.playerLight.color = config.playerLightColor;
+        }
+        persistConfig();
+        return { ...config };
+    }
+
+    // Auto‑start if enabled
+    if (config.enabled) {
+        start();
+    }
+
+    bot.lightHackLegit = {
+        start,
+        stop,
+        status,
+        updateConfig,
+        config,
+    };
+};
+
 /**
  * ==================================================================================
  * NOTIFICATION MODULE – Shows toast alerts for alarms
@@ -10189,21 +10382,20 @@ window.__minibiaBotBundle.installNotificationModule = function installNotificati
         style.textContent = `
       #mb-notification-container {
         position: fixed;
-        top: 16px;
-        left: 50%;
-        transform: translateX(-50%);
+        top: 0px;
+        left: 224px;
         z-index: 9999999;
         display: flex;
         flex-direction: column;
-        align-items: center;
+        align-items: flex-start;
         gap: 8px;
         pointer-events: none;
-        max-width: 420px;
+        max-width: 220px;
         width: 90%;
       }
       .mb-notification {
         background: rgba(20, 18, 16, 0.92);
-        border-left: 4px solid #ffcc00;
+        border-right: 4px solid #ffcc00;
         padding: 12px 16px;
         border-radius: 6px;
         box-shadow: 0 4px 16px rgba(0,0,0,0.6);
@@ -10218,7 +10410,7 @@ window.__minibiaBotBundle.installNotificationModule = function installNotificati
       }
       .mb-notification.hiding {
         opacity: 0;
-        transform: translateX(40px);
+        transform: translateX(-40px);
       }
       .mb-notification .mb-notif-title {
         font-weight: bold;
@@ -10230,12 +10422,12 @@ window.__minibiaBotBundle.installNotificationModule = function installNotificati
         opacity: 0.8;
         margin-top: 4px;
       }
-      .mb-notification.type-alarm { border-left-color: #ff4444; }
-      .mb-notification.type-player { border-left-color: #ffaa44; }
-      .mb-notification.type-gm { border-left-color: #cc88ff; }
-      .mb-notification.type-antibot { border-left-color: #ffdd44; }
-      .mb-notification.type-playerattack { border-left-color: #ff2222; }
-      .mb-notification.type-message { border-left-color: #44aaff; }
+      .mb-notification.type-alarm { border-right-color: #ff4444; }
+      .mb-notification.type-player { border-right-color: #ffaa44; }
+      .mb-notification.type-gm { border-right-color: #cc88ff; }
+      .mb-notification.type-antibot { border-right-color: #ffdd44; }
+      .mb-notification.type-playerattack { border-right-color: #ff2222; }
+      .mb-notification.type-message { border-right-color: #44aaff; }
     `;
         document.head.appendChild(style);
         bot.log('Notification styles injected.');
@@ -10247,22 +10439,41 @@ window.__minibiaBotBundle.installNotificationModule = function installNotificati
         document.body.appendChild(container);
     }
 
+    // Track active notifications by type
+    const activeNotifications = new Map(); // type -> { element, timer }
+
     function showNotification(title, message, type = 'alarm', duration = 5000) {
+        // Remove existing notification of the same type (if any)
+        if (activeNotifications.has(type)) {
+            const old = activeNotifications.get(type);
+            clearTimeout(old.timer);
+            // Remove instantly without animation to avoid double display
+            if (old.element.parentNode) {
+                old.element.remove();
+            }
+            activeNotifications.delete(type);
+        }
+
         const item = document.createElement('div');
         item.className = `mb-notification type-${type}`;
         item.innerHTML = `<div class="mb-notif-title">${title}</div><div class="mb-notif-msg">${message}</div>`;
         container.appendChild(item);
 
         const remove = () => {
-            if (!item.parentNode)
-                return;
+            if (!item.parentNode) return;
             item.classList.add('hiding');
             setTimeout(() => {
-                if (item.parentNode)
-                    item.remove();
+                if (item.parentNode) item.remove();
             }, 300);
+            // Clean up from map after removal
+            if (activeNotifications.get(type)?.element === item) {
+                activeNotifications.delete(type);
+            }
         };
+
         const timer = setTimeout(remove, duration);
+        activeNotifications.set(type, { element: item, timer });
+
         item.addEventListener('click', () => {
             clearTimeout(timer);
             remove();
@@ -10304,7 +10515,7 @@ window.__minibiaBotBundle.installNotificationModule = function installNotificati
         return orig.playMessageAlarm.call(this);
     };
 
-    bot.log('Notification system is now active');
+    bot.log('Notification system updated – top‑left, one per type.');
 };
 
 /**
@@ -15253,7 +15464,8 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
           </label>
         </div>
         <label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-auto-invisible-enabled" /><span>Invisible</span></label>
-        <label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-light-hack-enabled" /><span>Light Hack</span></label>
+        <label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-light-hack-enabled" /><span>Light Hack (Full)</span></label>
+        <label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-light-hack-legit-enabled" /><span>Light Hack (Utevo)</span></label>
 		<!-- Anti-AFK (Full Width) -->
 		<label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-antiafk-enabled" /><span>Anti-AFK</span></label>
 		<label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-autostacker-enabled" /><span>Auto Stacker</span></label>
@@ -15802,6 +16014,8 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
         }
 
         // ---- EVENT LISTENERS ----
+        
+        
 
         // ---- Standalone Follow (separate from ComboBot) ----
         const followNameInput = panel.querySelector("#minibia-bot-follow-name");
@@ -16817,6 +17031,63 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
                 this.checked = !!bot.lightHack.status().running;
             });
         }
+        
+            // Wire up events
+    const toggle = document.getElementById('minibia-bot-light-hack-legit-enabled');
+    const sizeInput = document.getElementById('minibia-bot-light-hack-legit-size');
+    const colorInput = document.getElementById('minibia-bot-light-hack-legit-color');
+    const statusLabel = document.getElementById('minibia-bot-light-hack-legit-status');
+
+    function refreshLightHackLegitStatus() {
+        const status = bot.lightHackLegit?.status?.();
+        if (toggle && document.activeElement !== toggle) {
+            toggle.checked = !!status?.running;
+        }
+        if (statusLabel) {
+            statusLabel.textContent = status?.running ? 'Status: running' : 'Status: idle';
+        }
+        if (sizeInput && document.activeElement !== sizeInput) {
+            sizeInput.value = status?.config?.playerLightSize ?? 11;
+        }
+        if (colorInput && document.activeElement !== colorInput) {
+            colorInput.value = status?.config?.playerLightColor ?? 215;
+        }
+    }
+
+    if (toggle) {
+        toggle.addEventListener('change', function() {
+            if (this.checked) {
+                const size = parseInt(sizeInput?.value) || 11;
+                const color = parseInt(colorInput?.value) || 215;
+                bot.lightHackLegit.updateConfig({
+                    enabled: true,
+                    playerLightSize: size,
+                    playerLightColor: color,
+                });
+            } else {
+                bot.lightHackLegit.stop();
+            }
+            refreshLightHackLegitStatus();
+        });
+    }
+
+    if (sizeInput) {
+        sizeInput.addEventListener('change', function() {
+            const val = Math.max(1, parseInt(this.value) || 11);
+            this.value = val;
+            bot.lightHackLegit.updateConfig({ playerLightSize: val });
+            refreshLightHackLegitStatus();
+        });
+    }
+
+    if (colorInput) {
+        colorInput.addEventListener('change', function() {
+            const val = Math.min(255, Math.max(0, parseInt(this.value) || 215));
+            this.value = val;
+            bot.lightHackLegit.updateConfig({ playerLightColor: val });
+            refreshLightHackLegitStatus();
+        });
+    }
 
         // ---- Auto Eat ----
         const autoEatToggle = panel.querySelector("#minibia-bot-auto-eat-enabled");
@@ -17654,6 +17925,7 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
             refreshAntiBotStatus();
             refreshPlayerAttackStatus();
             refreshMessageAlertStatus();
+            refreshLightHackLegitStatus();
             if (convertCurrencyToggle) {
                 convertCurrencyToggle.checked = bot.autoStacker?.config?.convertCurrency !== false;
             }
@@ -17687,6 +17959,8 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
         bot.addCleanup(() => window.clearInterval(caveTimer));
         const titleTimer = window.setInterval(refreshTitlebarRunIndicators, 500);
         bot.addCleanup(() => window.clearInterval(titleTimer));
+        const lightHackLegitTimer = setInterval(refreshLightHackLegitStatus, 2000);
+        bot.addCleanup(() => clearInterval(lightHackLegitTimer));
 
         // Position, drag, collapse
         applySavedPanelPosition(panel);
@@ -18487,6 +18761,7 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
         currentBundle.installPaladinModule(bot);
         currentBundle.installLooterModule(bot);
         currentBundle.installLightHackModule(bot);
+        currentBundle.installLightHackLegitModule(bot);
         currentBundle.installPinkSkullDetectorModule(bot);
         currentBundle.installProfileModule(bot);
         currentBundle.installAntiAfkModule(bot);
