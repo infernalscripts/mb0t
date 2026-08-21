@@ -8220,26 +8220,31 @@ function isTileWalkable(x, y, z, ignoreCreatures = false) {
         return true;
     }
 
-    function addWaypoint(waypoint) {
+    function addWaypoint(waypoint, insertIndex) {
         const norm = normalizeWaypoint(waypoint);
-        if (!norm)
-            return null;
-        route.push(norm);
+        if (!norm) return null;
+        // If insertIndex is a valid number, insert at that position; otherwise append
+        if (typeof insertIndex === 'number' && insertIndex >= 0 && insertIndex <= route.length) {
+            route.splice(insertIndex, 0, norm);
+        } else {
+            route.push(norm);
+        }
         persistRoute();
         bot.log("cave waypoint added", {
             ...norm,
-            total: route.length
+            total: route.length,
+            insertedAt: typeof insertIndex === 'number' ? insertIndex : 'end'
         });
         return cloneValue(norm);
     }
 
-    function addWaypointCurrentSpot() {
+    function addWaypointCurrentSpot(insertIndex) {
         const pos = normalizePosition(bot.getPlayerPosition());
         if (!pos) {
             bot.log("could not read current position for cave waypoint");
             return null;
         }
-        return addWaypoint(pos);
+        return addWaypoint(pos, insertIndex);
     }
 
     function clearWaypoints() {
@@ -10748,6 +10753,12 @@ window.__minibiaBotBundle.installNotificationModule = function installNotificati
       .mb-notification.type-antibot { border-right-color: #ffdd44; }
       .mb-notification.type-playerattack { border-right-color: #ff2222; }
       .mb-notification.type-message { border-right-color: #44aaff; }
+      
+      /* Highlight for selected waypoint */
+      .mb-cave-waypoint-row[data-selected="true"] {
+          background: rgba(200, 168, 78, 0.2) !important;
+          border-left: 3px solid #ffcc00 !important;
+      }
     `;
         document.head.appendChild(style);
         bot.log('Notification styles injected.');
@@ -14583,122 +14594,137 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
     // ---- CAVE WAYPOINT LIST ----
     let selectedWaypointIndex = null;
 
-    function refreshCaveWaypointList() {
-        const container = document.getElementById("minibia-bot-cave-waypoint-list");
-        if (!container)
-            return;
-        const route = bot.cave?.getRoute?.() || [];
-        const status = bot.cave?.status?.();
-        const current = status?.currentIndex ?? 0;
-        container.innerHTML = "";
-        if (!route.length) {
-            const empty = document.createElement("div");
-            empty.className = "mb-small-note";
-            empty.textContent = "No waypoints recorded.";
-            container.appendChild(empty);
-            selectedWaypointIndex = null;
-            return;
+function refreshCaveWaypointList() {
+    const container = document.getElementById("minibia-bot-cave-waypoint-list");
+    if (!container) return;
+    const route = bot.cave?.getRoute?.() || [];
+    const status = bot.cave?.status?.();
+    const current = status?.currentIndex ?? 0;
+    container.innerHTML = "";
+    if (!route.length) {
+        const empty = document.createElement("div");
+        empty.className = "mb-small-note";
+        empty.textContent = "No waypoints recorded.";
+        container.appendChild(empty);
+        selectedWaypointIndex = null;
+        return;
+    }
+    route.forEach((wp, idx) => {
+        const row = document.createElement("div");
+        row.className = "mb-cave-waypoint-row"; // added class for CSS
+        row.style.cssText = `display:flex;align-items:center;gap:6px;padding:2px 4px;border-radius:4px;cursor:pointer;${idx === current ? 'background:rgba(255,200,80,0.2);border:1px solid #ffcf5a;' : ''}`;
+        row.dataset.index = idx;
+        const num = document.createElement("span");
+        num.textContent = `${idx + 1}.`;
+        num.style.cssText = "font-weight:bold;min-width:20px;";
+        const coords = document.createElement("span");
+        let displayText = "";
+        if (wp.x !== undefined && wp.x !== null) {
+            displayText = `${wp.x}, ${wp.y}, ${wp.z}`;
         }
-        route.forEach((wp, idx) => {
-            const row = document.createElement("div");
-            row.style.cssText = `display:flex;align-items:center;gap:6px;padding:2px 4px;border-radius:4px;cursor:pointer;${idx === current ? 'background:rgba(255,200,80,0.2);border:1px solid #ffcf5a;' : ''}`;
-            row.dataset.index = idx;
-            const num = document.createElement("span");
-            num.textContent = `${idx + 1}.`;
-            num.style.cssText = "font-weight:bold;min-width:20px;";
-            const coords = document.createElement("span");
-            let displayText = "";
-            // For normal waypoints with coordinates
-            if (wp.x !== undefined && wp.x !== null) {
-                displayText = `${wp.x}, ${wp.y}, ${wp.z}`;
+        if (wp.label) {
+            if (displayText) {
+                displayText = wp.label + ' (' + displayText + ')';
+            } else {
+                displayText = wp.label;
             }
-            // If it has a label, use it as title
-            if (wp.label) {
-                if (displayText) {
-                    displayText = wp.label + ' (' + displayText + ')';
+        }
+        if (!displayText) {
+            displayText = "Script";
+        }
+        if (wp.stand) {
+            displayText = "📍 " + displayText;
+        }
+        if (wp.rope) {
+            displayText = "🪢 " + displayText;
+        }
+        if (wp.shovel) {
+            displayText = "⛏️ " + displayText;
+        }
+        if (wp.ladder) {
+            displayText = "🪜 " + displayText;
+        }
+        if (wp.script) {
+            displayText += ' 📜';
+        }
+        coords.textContent = displayText;
+        if (idx === current)
+            coords.style.cssText = "color:#ffcf5a;font-weight:bold;";
+        const distSpan = document.createElement("span");
+        distSpan.style.cssText = "margin-left:auto;font-size:10px;opacity:0.6;";
+        const pos = bot.getPlayerPosition?.();
+        if (pos && wp.z === pos.z) {
+            const dx = Math.abs(pos.x - wp.x),
+            dy = Math.abs(pos.y - wp.y);
+            distSpan.textContent = `dist ${dx + dy}`;
+        }
+        row.appendChild(num);
+        row.appendChild(coords);
+        row.appendChild(distSpan);
+        row.addEventListener("click", () => {
+            container.querySelectorAll("[data-selected]").forEach(el => el.dataset.selected = "false");
+            row.dataset.selected = "true";
+            selectedWaypointIndex = idx;
+            const wp = route[idx];
+            const labelInput = document.getElementById("minibia-bot-cave-waypoint-label");
+            const scriptInput = document.getElementById("minibia-bot-cave-waypoint-script");
+            if (labelInput)
+                labelInput.value = wp.label || "";
+            if (scriptInput)
+                scriptInput.value = wp.script || "";
+            bot.cave.setCurrentIndex(idx);
+            if (bot.cave?.status?.().running)
+                bot.cave.goToWaypoint(route[idx]);
+            refreshCaveStatus();
+            refreshCaveWaypointList();
+            refreshTitlebarRunIndicators();
+            scrollToSelectedWaypoint();
+        });
+        // ★ NEW: Always set data-selected based on selectedWaypointIndex
+        if (selectedWaypointIndex !== null && idx === selectedWaypointIndex) {
+            row.dataset.selected = "true";
+        } else {
+            row.dataset.selected = "false";
+        }
+        // Keep the old fallback for when selectedWaypointIndex is null and we want to highlight current
+        if (selectedWaypointIndex === null && idx === current) {
+            row.dataset.selected = "true";
+        }
+        container.appendChild(row);
+    });
+    if (selectedWaypointIndex !== null && (selectedWaypointIndex < 0 || selectedWaypointIndex >= route.length)) {
+        selectedWaypointIndex = null;
+    }
+    // Scroll only if cavebot is running (force = false)
+    scrollToWaypointIndex();
+}
+
+    function scrollToWaypointIndex(index, force = false) {
+        const container = document.getElementById("minibia-bot-cave-waypoint-list");
+        if (!container) return;
+        if (!force && !bot.cave?.status?.().running) return;
+        if (index === undefined || index === null) {
+            // fallback to selected or current
+            if (selectedWaypointIndex !== null && selectedWaypointIndex >= 0) {
+                index = selectedWaypointIndex;
+            } else {
+                const status = bot.cave?.status?.();
+                if (status && typeof status.currentIndex === 'number') {
+                    index = status.currentIndex;
                 } else {
-                    displayText = wp.label;
+                    return;
                 }
             }
-            // If no coords and no label, it's a script-only without label – show as "Script"
-            if (!displayText) {
-                displayText = "Script";
-            }
-            if (wp.stand) {
-                displayText = "📍 " + displayText;
-            }
-            if (wp.rope) {
-                displayText = "🪢 " + displayText;
-            }
-            if (wp.shovel) {
-                displayText = "⛏️ " + displayText;
-            }
-            if (wp.ladder) {
-                displayText = "🪜 " + displayText;
-            }
-            if (wp.script) {
-                displayText += ' 📜';
-            }
-            coords.textContent = displayText;
-            if (idx === current)
-                coords.style.cssText = "color:#ffcf5a;font-weight:bold;";
-            const distSpan = document.createElement("span");
-            distSpan.style.cssText = "margin-left:auto;font-size:10px;opacity:0.6;";
-            const pos = bot.getPlayerPosition?.();
-            if (pos && wp.z === pos.z) {
-                const dx = Math.abs(pos.x - wp.x),
-                dy = Math.abs(pos.y - wp.y);
-                distSpan.textContent = `dist ${dx + dy}`;
-            }
-            row.appendChild(num);
-            row.appendChild(coords);
-            row.appendChild(distSpan);
-            row.addEventListener("click", () => {
-                container.querySelectorAll("[data-selected]").forEach(el => el.dataset.selected = "false");
-                row.dataset.selected = "true";
-                selectedWaypointIndex = idx;
-                const wp = route[idx];
-                const labelInput = document.getElementById("minibia-bot-cave-waypoint-label");
-                const scriptInput = document.getElementById("minibia-bot-cave-waypoint-script");
-                if (labelInput)
-                    labelInput.value = wp.label || "";
-                if (scriptInput)
-                    scriptInput.value = wp.script || "";
-                bot.cave.setCurrentIndex(idx);
-                if (bot.cave?.status?.().running)
-                    bot.cave.goToWaypoint(route[idx]);
-                refreshCaveStatus();
-                refreshCaveWaypointList();
-                refreshTitlebarRunIndicators();
-                scrollToSelectedWaypoint(); // <-- added
-            });
-            if (idx === current && selectedWaypointIndex === null) {
-                row.dataset.selected = "true";
-                selectedWaypointIndex = idx;
-            }
-            container.appendChild(row);
-        });
-        if (selectedWaypointIndex !== null && (selectedWaypointIndex < 0 || selectedWaypointIndex >= route.length)) {
-            selectedWaypointIndex = null;
+        }
+        const rows = container.querySelectorAll("[data-index]");
+        if (index >= 0 && index < rows.length) {
+            rows[index].scrollIntoView({ block: "nearest", behavior: "smooth" });
         }
     }
 
+    // Keep an alias for backward compatibility (if any other code calls it)
     function scrollToSelectedWaypoint() {
-        const container = document.getElementById("minibia-bot-cave-waypoint-list");
-        if (!container)
-            return;
-        if (selectedWaypointIndex === null || selectedWaypointIndex < 0)
-            return;
-        const rows = container.querySelectorAll("[data-index]");
-        if (selectedWaypointIndex < rows.length) {
-            const row = rows[selectedWaypointIndex];
-            if (row) {
-                row.scrollIntoView({
-                    block: "nearest",
-                    behavior: "smooth"
-                });
-            }
-        }
+        scrollToWaypointIndex(selectedWaypointIndex, false);
     }
 
     function moveSelectedWaypoint(direction) {
@@ -14716,18 +14742,18 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
         let moved = false;
         if (direction === "up") {
             moved = bot.cave.moveWaypointUp(selectedWaypointIndex);
-            if (moved)
-                selectedWaypointIndex--;
+            if (moved) selectedWaypointIndex--;
         } else {
             moved = bot.cave.moveWaypointDown(selectedWaypointIndex);
-            if (moved)
-                selectedWaypointIndex++;
+            if (moved) selectedWaypointIndex++;
         }
         if (moved) {
             refreshCaveWaypointList();
             refreshCaveStatus();
             refreshCaveClosestStatus();
             refreshCaveTransitionStatus();
+            // Force‑scroll to the new position of the selected waypoint
+            scrollToWaypointIndex(selectedWaypointIndex, true);
         }
     }
 
@@ -14737,15 +14763,25 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
             return;
         }
         const route = bot.cave?.getRoute?.() || [];
-        if (selectedWaypointIndex < 0 || selectedWaypointIndex >= route.length)
-            return;
+        if (selectedWaypointIndex < 0 || selectedWaypointIndex >= route.length) return;
         const deleted = bot.cave.deleteWaypoint(selectedWaypointIndex);
         if (deleted) {
-            selectedWaypointIndex = null;
+            // After deletion, set selectedWaypointIndex to the cavebot's current index
+            const status = bot.cave?.status?.();
+            if (status && typeof status.currentIndex === 'number') {
+                selectedWaypointIndex = status.currentIndex;
+            } else {
+                // fallback: if no cavebot running, select the first waypoint if any
+                const newRoute = bot.cave?.getRoute?.() || [];
+                selectedWaypointIndex = newRoute.length > 0 ? 0 : null;
+            }
             refreshCaveWaypointList();
             refreshCaveStatus();
             refreshCaveClosestStatus();
             refreshCaveTransitionStatus();
+            // Force scroll to the new selection
+            scrollToWaypointIndex(selectedWaypointIndex, true);
+            bot.log("Waypoint deleted. Now selected index " + selectedWaypointIndex);
         }
     }
 
@@ -16686,28 +16722,33 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
         const addScriptBtn = panel.querySelector("#minibia-bot-cave-add-script");
         if (addScriptBtn) {
             addScriptBtn.addEventListener("click", () => {
+                const route = bot.cave.getRoute();
+                let insertIndex = route.length; // default append
+                if (selectedWaypointIndex !== null && selectedWaypointIndex >= 0 && selectedWaypointIndex < route.length) {
+                    insertIndex = selectedWaypointIndex + 1;
+                }
                 const wp = {
                     label: "Script",
                     script: "// Enter script code here\nbot.log('Hello from script!');"
                 };
-                const added = bot.cave.addWaypoint(wp);
+                const added = bot.cave.addWaypoint(wp, insertIndex);
                 if (added) {
+                    bot.cave.setCurrentIndex(insertIndex);
+                    selectedWaypointIndex = insertIndex;
+                    // Update property inputs
                     const route = bot.cave.getRoute();
-                    selectedWaypointIndex = route.length - 1;
-                    const wpData = route[selectedWaypointIndex];
+                    const wpData = route[insertIndex];
                     const labelInput = document.getElementById("minibia-bot-cave-waypoint-label");
                     const scriptInput = document.getElementById("minibia-bot-cave-waypoint-script");
-                    if (labelInput)
-                        labelInput.value = wpData.label || "";
-                    if (scriptInput)
-                        scriptInput.value = wpData.script || "";
+                    if (labelInput) labelInput.value = wpData?.label || "";
+                    if (scriptInput) scriptInput.value = wpData?.script || "";
                     refreshCaveWaypointList();
                     refreshCaveStatus();
                     refreshCaveClosestStatus();
                     refreshCaveTransitionStatus();
                     refreshCavePresetControls();
-                    scrollToSelectedWaypoint();
-                    bot.log("Script waypoint added.");
+                    scrollToWaypointIndex(insertIndex, true); // force scroll
+                    bot.log("Script waypoint added after selected index " + (insertIndex - 1) + " and set as current.");
                 } else {
                     bot.log("Failed to add script waypoint.");
                 }
@@ -17910,35 +17951,31 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
                 const ladder = !!(ladderCheck && ladderCheck.checked);
                 const label = stand ? "Stand" : (rope ? "Rope" : (shovel ? "Shovel" : ""));
                 const waypoint = {
-                    x,
-                    y,
-                    z,
+                    x, y, z,
                     label: label || undefined,
                     stand: stand,
                     rope: rope,
                     shovel: shovel,
                     ladder: ladder
                 };
-                const added = bot.cave.addWaypoint(waypoint);
+                const route = bot.cave.getRoute();
+                let insertIndex = route.length; // append
+                if (selectedWaypointIndex !== null && selectedWaypointIndex >= 0 && selectedWaypointIndex < route.length) {
+                    insertIndex = selectedWaypointIndex + 1;
+                }
+                const added = bot.cave.addWaypoint(waypoint, insertIndex);
                 if (added) {
-                    const route = bot.cave.getRoute();
-                    selectedWaypointIndex = route.length - 1;
-                    const wp = route[selectedWaypointIndex];
-                    const labelInput = document.getElementById("minibia-bot-cave-waypoint-label");
-                    const scriptInput = document.getElementById("minibia-bot-cave-waypoint-script");
-                    if (labelInput)
-                        labelInput.value = wp.label || "";
-                    if (scriptInput)
-                        scriptInput.value = wp.script || "";
+                    bot.cave.setCurrentIndex(insertIndex);
+                    selectedWaypointIndex = insertIndex;
+                    // ... update label/script inputs ...
                     refreshCaveWaypointList();
                     refreshCaveStatus();
                     refreshCaveClosestStatus();
                     refreshCaveTransitionStatus();
                     refreshCavePresetControls();
-                    scrollToSelectedWaypoint();
-                    bot.log("Waypoint added.");
-                } else {
-                    bot.log("Failed to add waypoint.");
+                    // Force‑scroll to the new waypoint (even if cavebot is not running)
+                    scrollToWaypointIndex(insertIndex, true);
+                    bot.log("Waypoint added after selected index " + (insertIndex - 1) + " and set as current.");
                 }
             });
         }
