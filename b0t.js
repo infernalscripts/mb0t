@@ -15086,6 +15086,21 @@ function refreshCaveWaypointList() {
         const style = document.createElement("style");
         style.id = "minibia-bot-style";
         style.textContent = `
+
+      /* Hide number input spinners (Chrome, Edge, Safari) */
+      #minibia-bot-panel input[type="number"]::-webkit-inner-spin-button,
+      #minibia-bot-panel input[type="number"]::-webkit-outer-spin-button {
+          -webkit-appearance: none !important;
+          appearance: none !important;
+          margin: 0 !important;
+          display: none !important;
+      }
+
+      /* Hide number input spinners (Firefox) */
+      #minibia-bot-panel input[type="number"] {
+          -moz-appearance: textfield !important;
+          appearance: textfield !important; /* modern browsers */
+      }
       /* ── Base Panel ── */
       #minibia-bot-panel {
         position: fixed;
@@ -15709,6 +15724,7 @@ function refreshCaveWaypointList() {
       }
     `;
         document.head.appendChild(style);
+
 
         // ---- PANEL HTML (full) ----
         const panel = document.createElement("div");
