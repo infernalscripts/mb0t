@@ -881,9 +881,6 @@ window.__minibiaBotBundle.createBot = function createBot() {
         say(text) {
             return this.sendChat(text);
         },
-        print(...args) {
-            console.log(...args);
-        },
 
         // ---- USE ITEM (right-click from inventory) ----
         use(itemId) {
@@ -9958,9 +9955,7 @@ window.__minibiaBotBundle.installExoriModule = function installExoriModule(bot) 
         manaCost: 150,
         cooldownMs: 6000,
         monsterCount: 3,
-        range: 1, // Chebyshev distance
-        playerProximityCheck: true,   // default enabled
-        playerProximityDistance: 3,   // default 3 tiles
+        range: 1,
     }, bot.storage.get(configStorageKey, {}));
 
     function persistConfig() {
@@ -9971,21 +9966,6 @@ window.__minibiaBotBundle.installExoriModule = function installExoriModule(bot) 
             cooldownMs: config.cooldownMs,
             monsterCount: config.monsterCount,
             range: config.range,
-        });
-    }
-
-    function getPlayersInRange() {
-        const me = bot.getPlayerPosition();
-        if (!me) return [];
-        const players = bot.xray?.getVisiblePlayers?.({ sameFloorOnly: true }) || [];
-        const myId = window.gameClient?.player?.id;
-        return players.filter(p => {
-            if (p.id === myId) return false;
-            const pos = p.__position || p.getPosition?.();
-            if (!pos) return false;
-            const dx = Math.abs(pos.x - me.x);
-            const dy = Math.abs(pos.y - me.y);
-            return dx <= config.playerProximityDistance && dy <= config.playerProximityDistance;
         });
     }
 
@@ -10002,25 +9982,21 @@ window.__minibiaBotBundle.installExoriModule = function installExoriModule(bot) 
         });
     }
 
-    function tryCast(now) {
-        if (!config.enabled || !state.running) return false;
+    function canCast(now) {
         if (now - state.lastCastAt < config.cooldownMs) return false;
         const mana = bot.mana();
         if (mana == null || mana < config.manaCost) return false;
         const nearby = getMonstersInRange();
-        if (nearby.length < config.monsterCount) return false;
-        // Player proximity check
-        if (config.playerProximityCheck) {
-            const nearbyPlayers = getPlayersInRange();
-            if (nearbyPlayers.length > 0) {
-                // Optional: log only occasionally to avoid spam
-                return false;
-            }
-        }
+        return nearby.length >= config.monsterCount;
+    }
+
+    function tryCast(now) {
+        if (!config.enabled || !state.running) return false;
+        if (!canCast(now)) return false;
         const sent = bot.sendChat(config.spellWords);
         if (sent) {
             state.lastCastAt = now;
-            bot.log(`Exori cast (${nearby.length} monsters nearby, mana ${mana})`);
+            bot.log(`Exori cast (${getMonstersInRange().length} monsters nearby, mana ${bot.mana()})`);
         }
         return sent;
     }
@@ -10066,10 +10042,18 @@ window.__minibiaBotBundle.installExoriModule = function installExoriModule(bot) 
     }
 
     function status() {
+        const now = Date.now();
+        const nearby = getMonstersInRange();
+        const mana = bot.mana();
+        const ready = canCast(now);
+        const cooldownRemaining = Math.max(0, config.cooldownMs - (now - state.lastCastAt));
         return {
             running: state.running,
             config: { ...config },
-            monstersInRange: getMonstersInRange().length,
+            monstersInRange: nearby.length,
+            mana: mana,
+            ready: ready,
+            cooldownRemaining: cooldownRemaining,
             lastCastAt: state.lastCastAt,
         };
     }
@@ -16019,9 +16003,9 @@ function refreshCaveWaypointList() {
   
     <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
       <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-auto-attack-kite" /><span>Kite</span></label>
-      <label class="mb-field" style="flex:0 0 65px;"><span class="mb-field-label" style="font-size:10px;">Kite Dist</span><input type="number" id="minibia-bot-auto-attack-ideal-dist" min="1" max="10" value="3" style="padding:3px 4px;font-size:11px;" /></label>
+      <label class="mb-field" style="flex:0 0 60px;"><span class="mb-field-label" style="font-size:10px;">Kite Dist</span><input type="number" id="minibia-bot-auto-attack-ideal-dist" min="1" max="10" value="3" style="padding:3px 4px;font-size:11px;" /></label>
         <span style="color:#666;">|</span>
-      <label class="mb-field" style="flex:0 0 65px;"><span class="mb-field-label" style="font-size:10px;">Use Rune</span><input type="number" id="minibia-bot-auto-attack-rune-hotkey" min="1" max="12" placeholder="4" style="padding:3px 4px;font-size:11px;" /></label>
+      <label class="mb-field" style="flex:0 0 60px;"><span class="mb-field-label" style="font-size:10px;">Use Rune</span><input type="number" id="minibia-bot-auto-attack-rune-hotkey" min="1" max="12" placeholder="4" style="padding:3px 4px;font-size:11px;" /></label>
         <span style="color:#666;">|</span>
       <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-auto-attack-antiks" /><span>Anti-KS</span></label>
       <label class="mb-field" style="flex:0 0 40px;"><span class="mb-field-label" style="font-size:10px;">Self</span><input type="number" id="minibia-bot-auto-attack-antiks-self" min="1" max="5" value="2" style="padding:3px 4px;font-size:11px;" /></label>
@@ -16035,6 +16019,7 @@ function refreshCaveWaypointList() {
   <!-- Exori Settings -->
     <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
       <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-exori-enabled" /><span>Cast Exori</span></label>
+      <label class="mb-field" style="flex:0 0 90px;"><span class="mb-field-label" style="font-size:10px;">On X mobs</span><input type="number" id="minibia-bot-exori-monsters" min="1" max="10" value="3" style="padding:3px 4px;font-size:11px;" /></label>
       <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-exori-player-check" /><span>Avoid Players</span></label>
       <label class="mb-field" style="flex:0 0 80px;"><span class="mb-field-label" style="font-size:10px;">Avoid Dist</span><input type="number" id="minibia-bot-exori-player-dist" min="1" max="10" value="3" style="padding:3px 4px;font-size:11px;" /></label>
     </div>
@@ -16442,6 +16427,29 @@ function refreshCaveWaypointList() {
             // Periodic refresh (optional)
             setInterval(refreshExoriStatus, 2000);
         }
+        
+        // ---- Exori monster count ----
+        const exoriMonstersInput = document.getElementById('minibia-bot-exori-monsters');
+        if (exoriMonstersInput) {
+            // Set initial value from current config
+            const status = bot.exori?.status?.();
+            exoriMonstersInput.value = status?.config?.monsterCount ?? 3;
+
+            exoriMonstersInput.addEventListener('change', function() {
+                const val = Math.max(1, Math.min(10, Number(this.value) || 3));
+                this.value = val;
+                bot.exori.updateConfig({ monsterCount: val });
+            });
+        }
+        
+        function refreshExoriMonsters() {
+            const status = bot.exori?.status?.();
+            if (exoriMonstersInput && document.activeElement !== exoriMonstersInput) {
+                exoriMonstersInput.value = status?.config?.monsterCount ?? 3;
+            }
+        }
+        setInterval(refreshExoriMonsters, 2000);
+        setTimeout(refreshExoriMonsters, 100);
         
         // Exori player check
         const exoriPlayerCheck = document.getElementById("minibia-bot-exori-player-check");
@@ -19203,6 +19211,60 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
     };
 };
 
+window.__minibiaBotBundle.installCustomNotificationModule = function installCustomNotificationModule(bot) {
+    function sanitize(text) {
+        const el = document.createElement('div');
+        el.textContent = String(text);
+        return el.innerHTML;
+    }
+
+    function sendCancelMessage(message) {
+        const nm = gameClient?.interface?.notificationManager;
+        if (!nm) return false;
+        nm.setCancelMessage(sanitize(message));
+        return true;
+    }
+
+    function sendServerMessage(message, color = 'white', priority = 0) {
+        const nm = gameClient?.interface?.notificationManager;
+        if (!nm) return false;
+        nm.setServerMessage(sanitize(message), color, priority);
+        return true;
+    }
+
+    function sendZoneMessage(message, title) {
+        const nm = gameClient?.interface?.notificationManager;
+        if (!nm) return false;
+        nm.setZoneMessage(sanitize(message), sanitize(title));
+        return true;
+    }
+
+    // Expose the new notification methods
+    bot.notify = {
+        cancel: sendCancelMessage,
+        server: sendServerMessage,
+        zone: sendZoneMessage,
+        message: sendCancelMessage,
+    };
+    bot.sendCancelMessage = sendCancelMessage;
+    bot.sendServerMessage = sendServerMessage;
+    bot.sendZoneMessage = sendZoneMessage;
+
+    // ---- PATCH: Replace bot.print with a server‑notification + console wrapper ----
+    // Keep a reference to the original console logger (if you ever need it)
+
+    bot.print = function(...args) {
+        // Build the message string from all arguments
+        const msg = args.map(a => String(a)).join(' ');
+        // Show it as a server notification (white text, normal priority)
+        bot.sendServerMessage(msg, 255);
+        // Also log it to the console for debugging (optional)
+        console.log('[mbot]', ...args);
+    };
+
+    bot.log('Custom notification module installed. bot.print now sends in‑game notifications.');
+};
+
 /**
  * ==================================================================================
  * 15. BOOTSTRAP
@@ -19294,6 +19356,7 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
         currentBundle.installExoriModule(bot);
         currentBundle.installPanel(bot);
         currentBundle.installUiTweaksModule(bot);
+        currentBundle.installCustomNotificationModule(bot);
 
         bot.ui.inject();
 
