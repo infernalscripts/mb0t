@@ -943,6 +943,176 @@ window.__minibiaBotBundle.createBot = function createBot() {
             const top = getTopItemOnTile(tile);
             return top ? getItemId(top) : null;
         },
+        
+        // ---- MOVE ITEM TO POSITION (Drop/Place on ground) ----
+        moveItemToPosition(itemId, x, y, z) {
+            // 1. Find the item in your equipment or open containers
+            const source = findItemById(itemId);
+            if (!source) {
+                this.log(`Item ${itemId} not found in equipment or open containers.`);
+                return false;
+            }
+
+            // 2. Get the target ground tile
+            const pos = { x, y, z };
+            const tile = getTileAtPosition(pos);
+            if (!tile) {
+                this.log(`Ground tile at ${x},${y},${z} is not loaded.`);
+                return false;
+            }
+
+            // 3. MOVE (drop) the item to the ground tile
+            const from = { which: source.container, index: source.slot };
+            const to = { which: tile, index: 0xFF }; // 0xFF = ground slot
+            const count = source.item.count || 1;
+
+            try {
+                if (window.gameClient?.send && typeof ItemMovePacket === 'function') {
+                    window.gameClient.send(new ItemMovePacket(from, to, count));
+                    this.log(`Dropped ${count}x item ${itemId} at ${x},${y},${z}`);
+                    return true;
+                }
+                // Fallback to mouse method if available
+                if (window.gameClient?.mouse?.sendItemMove) {
+                    window.gameClient.mouse.sendItemMove(from, to, count);
+                    this.log(`Dropped ${count}x item ${itemId} at ${x},${y},${z} (via mouse)`);
+                    return true;
+                }
+                this.log(`Cannot drop item: no ItemMovePacket or mouse.sendItemMove available.`);
+                return false;
+            } catch (e) {
+                this.log('moveItemToPosition failed', e);
+                return false;
+            }
+        },
+        
+        // ---- MOVE ITEM FROM ONE GROUND TILE TO ANOTHER ----
+        moveItemOnGround(fromX, fromY, fromZ, toX, toY, toZ) {
+            const fromPos = { x: fromX, y: fromY, z: fromZ };
+            const toPos = { x: toX, y: toY, z: toZ };
+
+            const fromTile = getTileAtPosition(fromPos);
+            if (!fromTile) {
+                this.log(`Source ground tile at ${fromX},${fromY},${fromZ} is not loaded.`);
+                return false;
+            }
+
+            const toTile = getTileAtPosition(toPos);
+            if (!toTile) {
+                this.log(`Destination ground tile at ${toX},${toY},${toZ} is not loaded.`);
+                return false;
+            }
+
+            const topItem = getTopItemOnTile(fromTile);
+            if (!topItem) {
+                this.log(`No item found on source tile at ${fromX},${fromY},${fromZ}.`);
+                return false;
+            }
+
+            // Get the stack count (if stackable)
+            const count = topItem.count || topItem.getCount?.() || 1;
+
+            try {
+                if (window.gameClient?.send && typeof ItemMovePacket === 'function') {
+                    const from = { which: fromTile, index: 0xFF };
+                    const to = { which: toTile, index: 0xFF };
+                    window.gameClient.send(new ItemMovePacket(from, to, count));
+                    this.log(`Moved item ${topItem.id} (${count}x) from ground ${fromX},${fromY},${fromZ} to ${toX},${toY},${toZ}`);
+                    return true;
+                }
+                // Fallback to mouse method if available
+                if (window.gameClient?.mouse?.sendItemMove) {
+                    const from = { which: fromTile, index: 0xFF };
+                    const to = { which: toTile, index: 0xFF };
+                    window.gameClient.mouse.sendItemMove(from, to, count);
+                    this.log(`Moved item ${topItem.id} (${count}x) from ground to ground (via mouse)`);
+                    return true;
+                }
+                this.log('Cannot move ground item: no ItemMovePacket or mouse.sendItemMove available.');
+                return false;
+            } catch (e) {
+                this.log('moveItemOnGround failed', e);
+                return false;
+            }
+        },
+        
+        // ---- PICK UP ITEM FROM GROUND TO BACKPACK ----
+        pickUpItem(x, y, z) {
+            const pos = { x, y, z };
+            
+            // 1. Get the ground tile
+            const tile = getTileAtPosition(pos);
+            if (!tile) {
+                this.log(`Ground tile at ${x},${y},${z} is not loaded.`);
+                return false;
+            }
+
+            // 2. Get the top item on that tile
+            const item = getTopItemOnTile(tile);
+            if (!item) {
+                this.log(`No item found on ground at ${x},${y},${z}.`);
+                return false;
+            }
+
+            // 3. Find an open container with an empty slot
+            const containers = window.gameClient?.player?.__openedContainers;
+            if (!containers) {
+                this.log('No open containers found.');
+                return false;
+            }
+
+            // Convert to array (works with Set, Map, Array, or plain object)
+            let containerArr;
+            if (Array.isArray(containers)) containerArr = containers;
+            else if (containers instanceof Set) containerArr = Array.from(containers);
+            else if (containers instanceof Map) containerArr = Array.from(containers.values());
+            else if (typeof containers === 'object') containerArr = Object.values(containers);
+            else containerArr = [];
+
+            let targetContainer = null;
+            let targetSlot = -1;
+
+            for (const container of containerArr) {
+                if (!container || typeof container.size !== 'number') continue;
+                for (let i = 0; i < container.size; i++) {
+                    if (!container.getSlotItem(i)) {
+                        targetContainer = container;
+                        targetSlot = i;
+                        break;
+                    }
+                }
+                if (targetContainer) break;
+            }
+
+            if (!targetContainer) {
+                this.log('No empty slots found in any open container.');
+                return false;
+            }
+
+            // 4. Move the item from ground to the empty slot
+            const count = item.count || item.getCount?.() || 1;
+            const from = { which: tile, index: 0xFF };
+            const to = { which: targetContainer, index: targetSlot };
+
+            try {
+                if (window.gameClient?.send && typeof ItemMovePacket === 'function') {
+                    window.gameClient.send(new ItemMovePacket(from, to, count));
+                    this.log(`Picked up item ${item.id} (${count}x) from ground ${x},${y},${z} to container slot ${targetSlot}`);
+                    return true;
+                }
+                // Fallback to mouse method if available
+                if (window.gameClient?.mouse?.sendItemMove) {
+                    window.gameClient.mouse.sendItemMove(from, to, count);
+                    this.log(`Picked up item ${item.id} (${count}x) from ground to container (via mouse)`);
+                    return true;
+                }
+                this.log('Cannot pick up item: no ItemMovePacket or mouse.sendItemMove available.');
+                return false;
+            } catch (e) {
+                this.log('pickUpItem failed', e);
+                return false;
+            }
+        },
 
         // ---- WAIT (pause cavebot) ----
         wait(ms) {
@@ -1082,7 +1252,8 @@ window.__minibiaBotBundle.createBot = function createBot() {
                 return wpLabel === normalized;
             });
         },
-
+        
+        
         getAlarmAudio, // expose the internal function
     }
 };
@@ -3421,21 +3592,17 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     // Safe walkable check: walkable AND not a floor-change tile
-    function isSafeToWalkTile(x, y, z, ignoreCreatures = false) {
-        const pos = new Position(x, y, z);
-        const tile = window.gameClient?.world?.getTileFromWorldPosition?.(pos);
-        if (!tile)
-            return false;
-        if (!tile.isWalkable())
-            return false;
-        if (tile.isItemBlocked())
-            return false;
-        if (!ignoreCreatures && tile.isOccupied())
-            return false;
-        if (isFloorChangeTile(tile))
-            return false; // ★ skip holes/ladders/teleporters
-        return true;
-    }
+function isSafeToWalkTile(x, y, z, ignoreCreatures = false) {
+    const pos = new Position(x, y, z);
+    const tile = window.gameClient?.world?.getTileFromWorldPosition?.(pos);
+    if (!tile) return false;
+    if (!tile.isWalkable()) return false;
+    if (tile.isItemBlocked()) return false;
+    // Enhanced check: fallback to manual creature detection
+    if (!ignoreCreatures && (tile.isOccupied() || isTileOccupiedByCreature(x, y, z))) return false;
+    if (isFloorChangeTile(tile)) return false;
+    return true;
+}
 
     let kiteWaypointIndex = null;
 
@@ -3589,19 +3756,27 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     // ---- Simple walkability ----
-    function isTileWalkable(x, y, z, ignoreCreatures = false) {
-        const pos = new Position(x, y, z);
-        const tile = window.gameClient?.world?.getTileFromWorldPosition?.(pos);
-        if (!tile)
-            return false;
-        if (!tile.isWalkable())
-            return false;
-        if (tile.isItemBlocked())
-            return false;
-        if (!ignoreCreatures && tile.isOccupied())
-            return false;
-        return true;
+function isTileOccupiedByCreature(x, y, z) {
+    const creatures = window.gameClient?.world?.activeCreatures || {};
+    for (const id in creatures) {
+        const c = creatures[id];
+        const pos = c.getPosition?.() || c.__position;
+        if (pos && pos.x === x && pos.y === y && pos.z === z) {
+            return true;
+        }
     }
+    return false;
+}
+
+function isTileWalkable(x, y, z, ignoreCreatures = false) {
+    const pos = new Position(x, y, z);
+    const tile = window.gameClient?.world?.getTileFromWorldPosition?.(pos);
+    if (!tile) return false;
+    if (!tile.isWalkable()) return false;
+    if (tile.isItemBlocked()) return false;
+    if (!ignoreCreatures && (tile.isOccupied() || isTileOccupiedByCreature(x, y, z))) return false;
+    return true;
+}
 
     // ---- Chase: move directly toward target ----
     function syncChase(now) {
@@ -4700,7 +4875,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             return true;
         // Only give up if target is more than maxDist + 3 away (lenient)
         const dist = getTileDistance(playerPos, targetPos);
-        if (dist > maxDist + 3)
+        if (dist > maxDist + 1)
             return true;
         // Also check if target is off-screen (but don't give up immediately – maybe it's just around a corner)
         // We'll only give up if target is off-screen AND we haven't made progress for a while (handled in tryAttack)
@@ -5544,19 +5719,32 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     }
 
     // ---- Simple walkability (copied from attack module) ----
-    function isTileWalkable(x, y, z, ignoreCreatures = false) {
-        const pos = new Position(x, y, z);
-        const tile = window.gameClient?.world?.getTileFromWorldPosition?.(pos);
-        if (!tile)
-            return false;
-        if (!tile.isWalkable())
-            return false;
-        if (tile.isItemBlocked())
-            return false;
-        if (!ignoreCreatures && tile.isOccupied())
-            return false;
-        return true;
+// Custom helper: checks if any creature (player or monster) is standing on the tile
+function isTileOccupiedByCreature(x, y, z) {
+    const creatures = window.gameClient?.world?.activeCreatures || {};
+    const player = window.gameClient?.player;
+    for (const id in creatures) {
+        const c = creatures[id];
+        // Skip self
+        if (c.id === player?.id) continue;
+        const pos = c.getPosition?.() || c.__position;
+        if (pos && Math.trunc(pos.x) === Math.trunc(x) && Math.trunc(pos.y) === Math.trunc(y) && Math.trunc(pos.z) === Math.trunc(z)) {
+            return true;
+        }
     }
+    return false;
+}
+
+function isTileWalkable(x, y, z, ignoreCreatures = false) {
+    const pos = new Position(x, y, z);
+    const tile = window.gameClient?.world?.getTileFromWorldPosition?.(pos);
+    if (!tile) return false;
+    if (!tile.isWalkable()) return false;
+    if (tile.isItemBlocked()) return false;
+    // Enhanced check: fallback to manual creature detection if tile.isOccupied() fails
+    if (!ignoreCreatures && (tile.isOccupied() || isTileOccupiedByCreature(x, y, z))) return false;
+    return true;
+}
 
     function getDirection(dx, dy) {
         if (dx === 0 && dy === -1)
@@ -9746,6 +9934,138 @@ window.__minibiaBotBundle.installAntiBotMonitorModule = function installAntiBotM
         config,
     };
 };
+
+//***************
+// EXORI NODULE
+//***************
+
+window.__minibiaBotBundle.installExoriModule = function installExoriModule(bot) {
+    const configStorageKey = "minibiaBot.exori.config";
+    const state = {
+        running: false,
+        timerId: null,
+        lastCastAt: 0,
+    };
+
+    const config = Object.assign({
+        enabled: false,
+        spellWords: "exori",
+        manaCost: 150,
+        cooldownMs: 6000,
+        monsterCount: 3,
+        range: 1, // Chebyshev distance
+    }, bot.storage.get(configStorageKey, {}));
+
+    function persistConfig() {
+        bot.storage.set(configStorageKey, {
+            enabled: config.enabled,
+            spellWords: config.spellWords,
+            manaCost: config.manaCost,
+            cooldownMs: config.cooldownMs,
+            monsterCount: config.monsterCount,
+            range: config.range,
+        });
+    }
+
+    function getMonstersInRange() {
+        const me = bot.getPlayerPosition();
+        if (!me) return [];
+        const monsters = bot.xray?.getVisibleMonsters?.({ sameFloorOnly: true }) || [];
+        return monsters.filter(m => {
+            const pos = m.__position || m.getPosition?.();
+            if (!pos) return false;
+            const dx = Math.abs(pos.x - me.x);
+            const dy = Math.abs(pos.y - me.y);
+            return dx <= config.range && dy <= config.range;
+        });
+    }
+
+    function tryCast(now) {
+        if (!config.enabled || !state.running) return false;
+        if (now - state.lastCastAt < config.cooldownMs) return false;
+
+        const mana = bot.mana();
+        if (mana == null || mana < config.manaCost) return false;
+
+        const nearby = getMonstersInRange();
+        if (nearby.length < config.monsterCount) return false;
+
+        const sent = bot.sendChat(config.spellWords);
+        if (sent) {
+            state.lastCastAt = now;
+            bot.log(`Exori cast (${nearby.length} monsters nearby, mana ${mana})`);
+        }
+        return sent;
+    }
+
+    function tick() {
+        if (!state.running) return;
+        try {
+            tryCast(Date.now());
+        } catch (e) {
+            bot.log("Exori tick error", e);
+        } finally {
+            scheduleNextTick();
+        }
+    }
+
+    function scheduleNextTick() {
+        if (!state.running) return;
+        state.timerId = setTimeout(tick, 500);
+    }
+
+    function start() {
+        if (state.running) return false;
+        config.enabled = true;
+        persistConfig();
+        state.running = true;
+        state.lastCastAt = 0;
+        bot.log("Exori enabled");
+        tick();
+        return true;
+    }
+
+    function stop() {
+        if (!state.running) return false;
+        state.running = false;
+        if (state.timerId) {
+            clearTimeout(state.timerId);
+            state.timerId = null;
+        }
+        config.enabled = false;
+        persistConfig();
+        bot.log("Exori disabled");
+        return true;
+    }
+
+    function status() {
+        return {
+            running: state.running,
+            config: { ...config },
+            monstersInRange: getMonstersInRange().length,
+            lastCastAt: state.lastCastAt,
+        };
+    }
+
+    function updateConfig(next) {
+        Object.assign(config, next);
+        persistConfig();
+        return { ...config };
+    }
+
+    if (config.enabled) start();
+
+    bot.exori = {
+        start,
+        stop,
+        status,
+        updateConfig,
+        config,
+    };
+};
+
+
+
 
 window.__minibiaBotBundle.installSlimeTrainerModule = function installSlimeTrainerModule(bot) {
     const configStorageKey = "minibiaBot.slimeTrainer.config";
@@ -15338,7 +15658,7 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
 <div class="mb-titlebar">
   <div class="mb-title">MBot</div>
   <div class="mb-title-status">
-    <span class="mb-run-indicator" id="minibia-bot-title-cave-status" data-running="false"><span class="mb-run-dot"></span><span class="mb-run-label">🚶</span></span>
+    <span class="mb-run-indicator" id="minibia-bot-title-cave-status" data-running="false"><span class="mb-run-dot"></span><span class="mb-run-label">🏃‍♂️‍➡️</span></span>
     <span class="mb-run-indicator" id="minibia-bot-title-attack-status" data-running="false"><span class="mb-run-dot"></span><span class="mb-run-label">⚔️</span></span>
   </div>
   <div class="mb-title-actions">
@@ -15348,7 +15668,7 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
 </div>
 <div class="mb-body">
   <div class="mb-tab-menu">
-    <button type="button" class="mb-tab-button" data-tab-button="cave">🚶 Cavebot</button>
+    <button type="button" class="mb-tab-button" data-tab-button="cave">🏃‍♂️‍➡️ Cavebot</button>
     <button type="button" class="mb-tab-button" data-tab-button="targeting">️⚔️ Targeting</button>
     <button type="button" class="mb-tab-button" data-tab-button="healing">💚 Healing</button>
 	<button type="button" class="mb-tab-button" data-tab-button="looter">💰 Looter</button>
@@ -15636,6 +15956,7 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
     <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
       <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-auto-attack-kite" /><span>Kite</span></label>
       <label class="mb-field" style="flex:0 0 80px;"><span class="mb-field-label" style="font-size:10px;">Ideal Dist</span><input type="number" id="minibia-bot-auto-attack-ideal-dist" min="1" max="10" value="3" style="padding:3px 4px;font-size:11px;" /></label>
+      <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-exori-enabled" /><span>Exori</span></label>
     </div>
   </div>
 
@@ -16015,7 +16336,27 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
 
         // ---- EVENT LISTENERS ----
         
-        
+        // ---- Exori toggle ----
+        const exoriToggle = document.getElementById('minibia-bot-exori-enabled');
+        if (exoriToggle) {
+            function refreshExoriStatus() {
+                if (exoriToggle && document.activeElement !== exoriToggle) {
+                    exoriToggle.checked = !!bot.exori?.status?.().running;
+                }
+            }
+            exoriToggle.addEventListener('change', function() {
+                if (this.checked) {
+                    bot.exori.start();
+                } else {
+                    bot.exori.stop();
+                }
+                refreshExoriStatus();
+            });
+            // Initial refresh
+            setTimeout(refreshExoriStatus, 100);
+            // Periodic refresh (optional)
+            setInterval(refreshExoriStatus, 2000);
+        }
 
         // ---- Standalone Follow (separate from ComboBot) ----
         const followNameInput = panel.querySelector("#minibia-bot-follow-name");
@@ -18773,6 +19114,7 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
         currentBundle.installMovementPatch(bot);
         currentBundle.installOutfitRandomizerModule(bot);
         currentBundle.installComboBotModule(bot);
+        currentBundle.installExoriModule(bot);
         currentBundle.installPanel(bot);
         currentBundle.installUiTweaksModule(bot);
 
