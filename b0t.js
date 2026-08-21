@@ -9959,6 +9959,8 @@ window.__minibiaBotBundle.installExoriModule = function installExoriModule(bot) 
         cooldownMs: 6000,
         monsterCount: 3,
         range: 1, // Chebyshev distance
+        playerProximityCheck: true,   // default enabled
+        playerProximityDistance: 3,   // default 3 tiles
     }, bot.storage.get(configStorageKey, {}));
 
     function persistConfig() {
@@ -9969,6 +9971,21 @@ window.__minibiaBotBundle.installExoriModule = function installExoriModule(bot) 
             cooldownMs: config.cooldownMs,
             monsterCount: config.monsterCount,
             range: config.range,
+        });
+    }
+
+    function getPlayersInRange() {
+        const me = bot.getPlayerPosition();
+        if (!me) return [];
+        const players = bot.xray?.getVisiblePlayers?.({ sameFloorOnly: true }) || [];
+        const myId = window.gameClient?.player?.id;
+        return players.filter(p => {
+            if (p.id === myId) return false;
+            const pos = p.__position || p.getPosition?.();
+            if (!pos) return false;
+            const dx = Math.abs(pos.x - me.x);
+            const dy = Math.abs(pos.y - me.y);
+            return dx <= config.playerProximityDistance && dy <= config.playerProximityDistance;
         });
     }
 
@@ -9988,13 +10005,18 @@ window.__minibiaBotBundle.installExoriModule = function installExoriModule(bot) 
     function tryCast(now) {
         if (!config.enabled || !state.running) return false;
         if (now - state.lastCastAt < config.cooldownMs) return false;
-
         const mana = bot.mana();
         if (mana == null || mana < config.manaCost) return false;
-
         const nearby = getMonstersInRange();
         if (nearby.length < config.monsterCount) return false;
-
+        // Player proximity check
+        if (config.playerProximityCheck) {
+            const nearbyPlayers = getPlayersInRange();
+            if (nearbyPlayers.length > 0) {
+                // Optional: log only occasionally to avoid spam
+                return false;
+            }
+        }
         const sent = bot.sendChat(config.spellWords);
         if (sent) {
             state.lastCastAt = now;
@@ -11579,168 +11601,144 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
     const RIGHT_HAND_SLOT = 4;
 
     const state = {
-        running: false,
+        running: false,        // crafter running
+        equipRunning: false,   // equipper running
         timerId: null,
+        equipTimerId: null,
         lastCraftAt: 0,
         lastEquipAt: 0,
         captureMode: false,
     };
 
+    // Load config – separate flags for craft and equip
+    const stored = bot.storage.get(configStorageKey, {});
     const config = Object.assign({
-        enabled: false,
-        tickMs: 2000,
+        // Crafter settings
+        craftEnabled: false,
+        craftTickMs: 2000,
         ammoThreshold: 4,
         craftManaCost: 140,
         craftSpellWords: "exeta con",
         highManaSpellWords: "utani hur",
         highManaThreshold: 98,
+        // Equipper settings
+        equipEnabled: false,
+        equipTickMs: 2000,
         weaponId: null,
-        equipWeapon: false,
         equipCooldownMs: 5000,
         equipThreshold: 7,
-    },
-            bot.storage.get(configStorageKey, {}));
+    }, stored);
+
+    // Backward compatibility: if old `enabled` was true, set craftEnabled
+    if (stored.enabled === true && config.craftEnabled === false) {
+        config.craftEnabled = true;
+    }
 
     function persistConfig() {
         bot.storage.set(configStorageKey, {
-            ...config
+            craftEnabled: config.craftEnabled,
+            equipEnabled: config.equipEnabled,
+            ammoThreshold: config.ammoThreshold,
+            craftManaCost: config.craftManaCost,
+            craftSpellWords: config.craftSpellWords,
+            highManaSpellWords: config.highManaSpellWords,
+            highManaThreshold: config.highManaThreshold,
+            weaponId: config.weaponId,
+            equipCooldownMs: config.equipCooldownMs,
+            equipThreshold: config.equipThreshold,
         });
     }
 
+    // ---- Helpers (unchanged) ----
     function getContainerById(containerId) {
         const containers = window.gameClient?.player?.__openedContainers;
-        if (!containers)
-            return null;
+        if (!containers) return null;
         let arr;
-        if (Array.isArray(containers))
-            arr = containers;
-        else if (containers instanceof Set)
-            arr = Array.from(containers);
-        else if (containers instanceof Map)
-            arr = Array.from(containers.values());
-        else if (typeof containers === 'object')
-            arr = Object.values(containers);
-        else
-            return null;
+        if (Array.isArray(containers)) arr = containers;
+        else if (containers instanceof Set) arr = Array.from(containers);
+        else if (containers instanceof Map) arr = Array.from(containers.values());
+        else if (typeof containers === 'object') arr = Object.values(containers);
+        else return null;
         return arr.find(c => c.__containerId === containerId) || null;
     }
 
     function getContainersArray() {
         const containers = window.gameClient?.player?.__openedContainers;
-        if (!containers)
-            return [];
-        if (Array.isArray(containers))
-            return containers;
-        if (containers instanceof Set)
-            return Array.from(containers);
-        if (containers instanceof Map)
-            return Array.from(containers.values());
-        if (typeof containers === 'object')
-            return Object.values(containers);
+        if (!containers) return [];
+        if (Array.isArray(containers)) return containers;
+        if (containers instanceof Set) return Array.from(containers);
+        if (containers instanceof Map) return Array.from(containers.values());
+        if (typeof containers === 'object') return Object.values(containers);
         return [];
     }
 
     function readStats() {
         const ps = bot.getPlayerState();
-        if (!ps)
-            return null;
+        if (!ps) return null;
         return {
-            hp: {
-                current: ps.health ?? 0,
-                max: ps.maxHealth ?? 0
-            },
-            mana: {
-                current: ps.mana ?? 0,
-                max: ps.maxMana ?? 0
-            },
+            hp: { current: ps.health ?? 0, max: ps.maxHealth ?? 0 },
+            mana: { current: ps.mana ?? 0, max: ps.maxMana ?? 0 },
         };
     }
 
     function getManaPercent(stats) {
-        if (!stats || stats.mana.max <= 0)
-            return 0;
+        if (!stats || stats.mana.max <= 0) return 0;
         return (stats.mana.current / stats.mana.max) * 100;
     }
 
     function getAmmoCount() {
         const eq = window.gameClient?.player?.equipment;
-        if (!eq)
-            return 0;
-
+        if (!eq) return 0;
         const leftItem = eq.getSlotItem(LEFT_HAND_SLOT);
         const rightItem = eq.getSlotItem(RIGHT_HAND_SLOT);
         const weaponId = config.weaponId;
-
         let targetId = weaponId;
         if (!targetId) {
             targetId = leftItem ? leftItem.id : (rightItem ? rightItem.id : null);
         }
-        if (!targetId)
-            return 0;
+        if (!targetId) return 0;
 
         let total = 0;
-        if (leftItem && leftItem.id === targetId)
-            total += leftItem.count || 1;
-        if (rightItem && rightItem.id === targetId)
-            total += rightItem.count || 1;
+        if (leftItem && leftItem.id === targetId) total += leftItem.count || 1;
+        if (rightItem && rightItem.id === targetId) total += rightItem.count || 1;
 
         for (const container of getContainersArray()) {
-            if (!container || typeof container.size !== 'number')
-                continue;
+            if (!container || typeof container.size !== 'number') continue;
             for (let i = 0; i < container.size; i++) {
                 const item = container.getSlotItem(i);
-                if (item && item.id === targetId)
-                    total += item.count || 1;
+                if (item && item.id === targetId) total += item.count || 1;
             }
         }
         return total;
     }
 
     function findWeaponInContainers(weaponId, includeRightHand = false) {
-        if (!weaponId)
-            return null;
-
+        if (!weaponId) return null;
         if (includeRightHand) {
             const eq = window.gameClient?.player?.equipment;
             if (eq) {
                 const rightItem = eq.getSlotItem(RIGHT_HAND_SLOT);
                 if (rightItem && rightItem.id === weaponId) {
-                    return {
-                        container: eq,
-                        slot: RIGHT_HAND_SLOT,
-                        item: rightItem
-                    };
+                    return { container: eq, slot: RIGHT_HAND_SLOT, item: rightItem };
                 }
             }
         }
-
         for (const container of getContainersArray()) {
-            if (!container || typeof container.size !== 'number')
-                continue;
+            if (!container || typeof container.size !== 'number') continue;
             for (let i = 0; i < container.size; i++) {
                 const item = container.getSlotItem(i);
                 if (item && item.id === weaponId) {
-                    return {
-                        container,
-                        slot: i,
-                        item
-                    };
+                    return { container, slot: i, item };
                 }
             }
         }
-
         const eq = window.gameClient?.player?.equipment;
         if (eq) {
             for (let i = 0; i < eq.slots.length; i++) {
-                if (i === LEFT_HAND_SLOT || i === RIGHT_HAND_SLOT)
-                    continue;
+                if (i === LEFT_HAND_SLOT || i === RIGHT_HAND_SLOT) continue;
                 const item = eq.getSlotItem(i);
                 if (item && item.id === weaponId) {
-                    return {
-                        container: eq,
-                        slot: i,
-                        item
-                    };
+                    return { container: eq, slot: i, item };
                 }
             }
         }
@@ -11748,34 +11746,19 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
     }
 
     function equipWeapon(weaponId) {
-        if (!weaponId)
-            return false;
-
+        if (!weaponId) return false;
         const eq = window.gameClient?.player?.equipment;
-        if (!eq)
-            return false;
-
+        if (!eq) return false;
         const source = findWeaponInContainers(weaponId, true);
-        if (!source)
-            return false;
-
-        const from = {
-            which: source.container,
-            index: source.slot
-        };
-        const to = {
-            which: eq,
-            index: LEFT_HAND_SLOT
-        };
+        if (!source) return false;
+        const from = { which: source.container, index: source.slot };
+        const to = { which: eq, index: LEFT_HAND_SLOT };
         const count = source.item.count || 1;
-
         try {
             if (window.gameClient?.send) {
                 window.gameClient.send(new ItemMovePacket(from, to, count));
                 state.lastEquipAt = Date.now();
-                bot.log("Paladin: equipped weapon (moved from slot " + source.slot + " to left hand)", {
-                    weaponId
-                });
+                bot.log("Paladin: equipped weapon (moved from slot " + source.slot + " to left hand)", { weaponId });
                 return true;
             }
         } catch (e) {
@@ -11785,21 +11768,18 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
     }
 
     function startCaptureWeapon() {
-        if (state.captureMode)
-            return;
+        if (state.captureMode) return;
         state.captureMode = true;
         bot.log("Paladin: click a weapon slot (any container or equipment) to capture its ID");
 
         const handler = (event) => {
             const slot = event.target.closest(".slot[slotindex]");
-            if (!slot)
-                return;
+            if (!slot) return;
             event.preventDefault();
             event.stopPropagation();
 
             let containerEl = slot.closest("[containerindex]");
-            if (!containerEl)
-                containerEl = slot.closest("[containerIndex]");
+            if (!containerEl) containerEl = slot.closest("[containerIndex]");
             if (!containerEl) {
                 const eq = window.gameClient?.player?.equipment;
                 if (eq) {
@@ -11810,14 +11790,10 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
                             if (item) {
                                 config.weaponId = item.id;
                                 persistConfig();
-                                bot.log("Paladin: captured weapon ID from equipment", {
-                                    weaponId: item.id
-                                });
+                                bot.log("Paladin: captured weapon ID from equipment", { weaponId: item.id });
                                 const weaponIdInput = document.getElementById("minibia-bot-paladin-weapon-id");
-                                if (weaponIdInput)
-                                    weaponIdInput.value = item.id;
-                                if (typeof bot.ui?.refreshPaladinStatus === "function")
-                                    bot.ui.refreshPaladinStatus();
+                                if (weaponIdInput) weaponIdInput.value = item.id;
+                                if (typeof bot.ui?.refreshPaladinStatus === "function") bot.ui.refreshPaladinStatus();
                                 state.captureMode = false;
                                 document.removeEventListener("click", handler, true);
                                 return;
@@ -11834,9 +11810,7 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
             const containerId = Number(containerEl.getAttribute("containerindex") || containerEl.getAttribute("containerIndex"));
             const container = getContainerById(containerId);
             if (!container) {
-                bot.log("Paladin: container not found", {
-                    containerId
-                });
+                bot.log("Paladin: container not found", { containerId });
                 const available = getContainersArray().map(c => c.__containerId);
                 bot.log("Available containers:", available);
                 state.captureMode = false;
@@ -11855,14 +11829,10 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
 
             config.weaponId = item.id;
             persistConfig();
-            bot.log("Paladin: captured weapon ID", {
-                weaponId: item.id
-            });
+            bot.log("Paladin: captured weapon ID", { weaponId: item.id });
             const weaponIdInput = document.getElementById("minibia-bot-paladin-weapon-id");
-            if (weaponIdInput)
-                weaponIdInput.value = item.id;
-            if (typeof bot.ui?.refreshPaladinStatus === "function")
-                bot.ui.refreshPaladinStatus();
+            if (weaponIdInput) weaponIdInput.value = item.id;
+            if (typeof bot.ui?.refreshPaladinStatus === "function") bot.ui.refreshPaladinStatus();
 
             state.captureMode = false;
             document.removeEventListener("click", handler, true);
@@ -11871,122 +11841,186 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
         document.addEventListener("click", handler, true);
     }
 
-    // ---- Crafting - NO annoying logs ----
+    // ---- Crafter functions ----
     function tryCraft() {
-        if (!config.enabled)
-            return false;
+        if (!config.craftEnabled) return false;
         const stats = readStats();
-        if (!stats)
-            return false;
+        if (!stats) return false;
         const manaPercent = getManaPercent(stats);
         const ammo = getAmmoCount();
 
+        // High mana spell
         if (manaPercent > config.highManaThreshold && config.highManaSpellWords) {
             const sent = bot.sendChat(config.highManaSpellWords.trim());
-            if (sent) {
-                //bot.log("Paladin: cast high mana spell", { spell: config.highManaSpellWords });
-                return true;
-            }
+            if (sent) return true;
         }
 
+        // Craft ammo
         if (ammo <= config.ammoThreshold) {
             if (stats.mana.current >= config.craftManaCost && config.craftSpellWords) {
                 const sent = bot.sendChat(config.craftSpellWords.trim());
                 if (sent) {
-                    bot.log("Paladin: crafted ammo", {
-                        ammo,
-                        mana: stats.mana.current
-                    });
+                    bot.log("Paladin: crafted ammo", { ammo, mana: stats.mana.current });
                     return true;
                 }
             }
-            // SILENT: no log for insufficient mana
         }
         return false;
     }
 
-    // ---- scheduleNextTick MUST be defined before tick ----
-    function scheduleNextTick() {
-        if (!state.running)
-            return;
-        state.timerId = window.setTimeout(tick, config.tickMs);
+    // ---- Equipper functions ----
+    function tryEquip() {
+        if (!config.equipEnabled || !config.weaponId) return false;
+        const eq = window.gameClient?.player?.equipment;
+        if (!eq) return false;
+
+        let leftHandCount = 0;
+        let leftHandHasWeapon = false;
+        const leftItem = eq.getSlotItem(LEFT_HAND_SLOT);
+        if (leftItem && leftItem.id === config.weaponId) {
+            leftHandCount = leftItem.count || 1;
+            leftHandHasWeapon = true;
+        }
+
+        // Equip only if left hand is empty OR count is below threshold
+        if (!leftHandHasWeapon || leftHandCount <= config.equipThreshold) {
+            const now = Date.now();
+            if (now - state.lastEquipAt > (config.equipCooldownMs || 5000)) {
+                return equipWeapon(config.weaponId);
+            }
+        }
+        return false;
     }
 
-    // ---- Loop ----
-    function tick() {
-        if (!state.running)
-            return;
+    // ---- Tick loops ----
+    function craftTick() {
+        if (!state.running) return;
         try {
-            if (config.equipWeapon && config.weaponId) {
-                const eq = window.gameClient?.player?.equipment;
-                let leftHandCount = 0;
-                let leftHandHasWeapon = false;
-
-                if (eq) {
-                    const leftItem = eq.getSlotItem(LEFT_HAND_SLOT);
-                    if (leftItem && leftItem.id === config.weaponId) {
-                        leftHandCount = leftItem.count || 1;
-                        leftHandHasWeapon = true;
-                    }
-                }
-
-                // Equip only if left hand is empty OR count is below threshold
-                if (!leftHandHasWeapon || leftHandCount <= config.equipThreshold) {
-                    const now = Date.now();
-                    if (now - state.lastEquipAt > (config.equipCooldownMs || 5000)) {
-                        equipWeapon(config.weaponId);
-                    }
-                }
-            }
             tryCraft();
         } catch (e) {
-            bot.log("Paladin tick failed", e);
+            bot.log("Paladin craft tick failed", e);
         } finally {
-            scheduleNextTick();
+            scheduleCraftTick();
         }
     }
 
-    // ---- Public API ----
-    function start(overrides = {}) {
-        Object.assign(config, overrides, {
-            enabled: true
-        });
+    function equipTick() {
+        if (!state.equipRunning) return;
+        try {
+            tryEquip();
+        } catch (e) {
+            bot.log("Paladin equip tick failed", e);
+        } finally {
+            scheduleEquipTick();
+        }
+    }
+
+    function scheduleCraftTick() {
+        if (!state.running) return;
+        state.timerId = setTimeout(craftTick, config.craftTickMs || 2000);
+    }
+
+    function scheduleEquipTick() {
+        if (!state.equipRunning) return;
+        state.equipTimerId = setTimeout(equipTick, config.equipTickMs || 2000);
+    }
+
+    // ---- Start / Stop ----
+    function startCraft(overrides = {}) {
+        Object.assign(config, overrides);
+        config.craftEnabled = true;
         persistConfig();
-        if (state.running)
-            return false;
+        if (state.running) return false;
         state.running = true;
-        bot.log("Paladin started", {
-            config
-        });
-        tick();
+        bot.log("Paladin crafter started", { craftSpellWords: config.craftSpellWords });
+        craftTick();
         return true;
     }
 
-    function stop(options = {}) {
+    function stopCraft(options = {}) {
         const shouldPersist = options.persistEnabled !== false;
         state.running = false;
-        if (state.timerId != null) {
-            window.clearTimeout(state.timerId);
+        if (state.timerId) {
+            clearTimeout(state.timerId);
             state.timerId = null;
         }
         if (shouldPersist) {
-            config.enabled = false;
+            config.craftEnabled = false;
             persistConfig();
         }
-        bot.log("Paladin stopped");
+        bot.log("Paladin crafter stopped");
         return true;
+    }
+
+    function startEquip(overrides = {}) {
+        Object.assign(config, overrides);
+        config.equipEnabled = true;
+        persistConfig();
+        if (state.equipRunning) return false;
+        if (!config.weaponId) {
+            bot.log("Paladin equipper: no weapon ID set.");
+            return false;
+        }
+        state.equipRunning = true;
+        bot.log("Paladin equipper started", { weaponId: config.weaponId });
+        equipTick();
+        return true;
+    }
+
+    function stopEquip(options = {}) {
+        const shouldPersist = options.persistEnabled !== false;
+        state.equipRunning = false;
+        if (state.equipTimerId) {
+            clearTimeout(state.equipTimerId);
+            state.equipTimerId = null;
+        }
+        if (shouldPersist) {
+            config.equipEnabled = false;
+            persistConfig();
+        }
+        bot.log("Paladin equipper stopped");
+        return true;
+    }
+
+    // Legacy start/stop (for backward compatibility)
+    function start(overrides = {}) {
+        // Start both if their flags are true
+        let started = false;
+        if (config.craftEnabled !== false) {
+            startCraft(overrides);
+            started = true;
+        }
+        if (config.equipEnabled && config.weaponId) {
+            startEquip(overrides);
+            started = true;
+        }
+        return started;
+    }
+
+    function stop(options = {}) {
+        let stopped = false;
+        if (state.running) {
+            stopCraft(options);
+            stopped = true;
+        }
+        if (state.equipRunning) {
+            stopEquip(options);
+            stopped = true;
+        }
+        return stopped;
     }
 
     function status() {
         const stats = readStats();
         return {
             running: state.running,
-            config: {
-                ...config
-            },
+            equipRunning: state.equipRunning,
+            config: { ...config },
             stats,
             manaPercent: stats ? getManaPercent(stats) : 0,
             ammoCount: getAmmoCount(),
+            lastCraftAt: state.lastCraftAt,
+            lastEquipAt: state.lastEquipAt,
         };
     }
 
@@ -12001,29 +12035,34 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
             config.weaponId = Number(config.weaponId) || null;
         }
         persistConfig();
-        bot.log("Paladin config updated", {
-            ...config
-        });
+        bot.log("Paladin config updated", { ...config });
         const weaponIdInput = document.getElementById("minibia-bot-paladin-weapon-id");
-        if (weaponIdInput)
-            weaponIdInput.value = config.weaponId || "";
-        return {
-            ...config
-        };
+        if (weaponIdInput) weaponIdInput.value = config.weaponId || "";
+        return { ...config };
     }
 
-    if (config.enabled)
-        start();
+    // Auto-start if enabled (on load)
+    if (config.craftEnabled) startCraft();
+    if (config.equipEnabled && config.weaponId) startEquip();
 
     bot.paladin = {
+        // Core
         start,
         stop,
         status,
         updateConfig,
         config,
-        getAmmoCount,
-        equipWeapon,
+        // Crafter
+        startCraft,
+        stopCraft,
         tryCraft,
+        // Equipper
+        startEquip,
+        stopEquip,
+        equipWeapon,
+        tryEquip,
+        // Helpers
+        getAmmoCount,
         startCaptureWeapon,
     };
 };
@@ -15725,10 +15764,10 @@ function refreshCaveWaypointList() {
 <div class="mb-tab-panel" data-tab-panel="healing">
   <div class="mb-section">
     <div class="mb-label">Auto Heal</div>
-    <label class="mb-toggle mb-toggle-main"><input type="checkbox" id="minibia-bot-auto-heal-enabled" /><span>Enable Auto Heal</span></label>
+    <label class="mb-toggle"><input type="checkbox" id="minibia-bot-auto-heal-enabled" /><span>Enable Auto Heal</span></label>
     <div id="minibia-bot-heal-rules-list" class="mb-list" style="margin:8px 0;"></div>
     <div class="mb-section" style="padding:10px;background:rgba(255,255,255,0.03);">
-      <div class="mb-label" style="font-size:12px;margin-bottom:6px;">Add / Edit Rule</div>
+      <div class="mb-label" style="font-size:11px;margin-bottom:6px;">Add / Edit Rule</div>
       <div style="display:grid;grid-template-columns:80px 1fr 80px;gap:6px;margin-bottom:6px;">
         <label class="mb-field" for="minibia-bot-heal-slot"><span class="mb-field-label">Slot</span><input type="number" id="minibia-bot-heal-slot" min="1" max="12" value="1" /></label>
         <label class="mb-field" for="minibia-bot-heal-spell"><span class="mb-field-label">Spell Words (optional)</span><input type="text" id="minibia-bot-heal-spell" placeholder="ex: exura" /></label>
@@ -15814,26 +15853,24 @@ function refreshCaveWaypointList() {
       <!-- Left Column -->
       <div style="display:flex; flex-direction:column; gap:10px;">
         <div style="display:flex; align-items:center; gap:12px;">
-          <label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-auto-eat-enabled" /><span>Eat Food</span></label>
-          <label class="mb-field" style="flex:0 0 60px;">
-            <input type="number" id="minibia-bot-auto-eat-hotkey" min="1" max="12" placeholder="10" style="padding:4px 4px;font-size:12px;text-align:center;" />
-          </label>
+          <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-auto-eat-enabled" /><span>Eat Food</span></label>
+          <label class="mb-field" style="flex:0 0 60px;"><input type="number" id="minibia-bot-auto-eat-hotkey" min="1" max="12" placeholder="10" style="padding:4px 4px;font-size:11px;text-align:center;" /></label>
         </div>
-        <label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-auto-invisible-enabled" /><span>Invisible</span></label>
-        <label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-light-hack-enabled" /><span>Light Hack (Full)</span></label>
-        <label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-light-hack-legit-enabled" /><span>Light Hack (Utevo)</span></label>
-		<!-- Anti-AFK (Full Width) -->
-		<label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-antiafk-enabled" /><span>Anti-AFK</span></label>
-		<label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-autostacker-enabled" /><span>Auto Stacker</span></label>
+        <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-auto-invisible-enabled" /><span>Invisible</span></label>
+        <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-light-hack-enabled" /><span>Light Hack (Full)</span></label>
+        <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-light-hack-legit-enabled" /><span>Light Hack (Utevo)</span></label>
+        <!-- Anti-AFK (Full Width) -->
+        <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-antiafk-enabled" /><span>Anti-AFK</span></label>
+        <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-autostacker-enabled" /><span>Auto Stacker</span></label>
 	  
       </div>
       <!-- Right Column -->
       <div style="display:flex; flex-direction:column; gap:10px;">
-        <label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-auto-magic-shield-enabled" /><span>Utamo Vita</span></label>
-        <label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-equip-ring-enabled" /><span>Equip Ring</span></label>
-        <label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-pink-skull-enabled" /><span>Pink Skull</span></label>
-		<label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-reconnect-enabled" /><span>Auto‑Reconnect</span></label>
-		<label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-autostacker-convert-currency" /><span>Convert Currency</span></label>
+        <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-auto-magic-shield-enabled" /><span>Utamo Vita</span></label>
+        <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-equip-ring-enabled" /><span>Equip Ring</span></label>
+        <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-pink-skull-enabled" /><span>Pink Skull</span></label>
+        <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-reconnect-enabled" /><span>Auto‑Reconnect</span></label>
+        <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-autostacker-convert-currency" /><span>Convert Currency</span></label>
       </div>
     </div>
 
@@ -15843,26 +15880,26 @@ function refreshCaveWaypointList() {
 
     <!-- Fisher (Full Width) -->
     <div style="display:flex; align-items:center; gap:14px; margin-top:12px; padding-top:12px; border-top:1px solid rgba(255,255,255,0.08); flex-wrap:wrap;">
-      <label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-fisher-enabled" /><span>Fisher</span></label>
+      <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-fisher-enabled" /><span>Fisher</span></label>
       <button type="button" class="mb-small-button" id="minibia-bot-fisher-select-tile" style="padding:4px 14px;font-size:11px;">Set Tile</button>
-      <span style="font-size:12px; color:#cdbb8b; min-width:80px;" id="minibia-bot-fisher-tile-display">none</span>
+      <span style="font-size:11px; color:#cdbb8b; min-width:80px;" id="minibia-bot-fisher-tile-display">none</span>
       <label class="mb-field" style="flex:0 0 72px;">
         <span class="mb-field-label" style="font-size:10px;">Delay (s)</span>
-        <input type="number" id="minibia-bot-fisher-delay" min="0.5" step="0.5" value="2" style="padding:4px 4px;font-size:12px;text-align:center;" />
+        <input type="number" id="minibia-bot-fisher-delay" min="0.5" step="0.5" value="2" style="padding:4px 4px;font-size:11px;text-align:center;" />
       </label>
       <label class="mb-field" style="flex:0 0 64px;">
         <span class="mb-field-label" style="font-size:10px;">Fish Cap</span>
-        <input type="number" id="minibia-bot-fisher-threshold" min="1" value="10" style="padding:4px 4px;font-size:12px;text-align:center;" />
+        <input type="number" id="minibia-bot-fisher-threshold" min="1" value="10" style="padding:4px 4px;font-size:11px;text-align:center;" />
       </label>
-      <span style="font-size:12px; color:#cdbb8b;">Fish: <span id="minibia-bot-fisher-count" style="font-weight:bold; color:#fff;">0</span></span>
+      <span style="font-size:11px; color:#cdbb8b;">Fish: <span id="minibia-bot-fisher-count" style="font-weight:bold; color:#fff;">0</span></span>
     </div>
     
     <!-- Outfit Randomizer -->
     <div style="display:flex; align-items:center; gap:14px; margin-top:10px; padding-top:10px; border-top:1px solid rgba(255,255,255,0.08); flex-wrap:wrap;">
-      <label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-outfit-randomizer-enabled" /><span>Random Outfit</span></label>
+      <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-outfit-randomizer-enabled" /><span>Random Outfit</span></label>
       <label class="mb-field" style="flex:0 0 80px;">
         <span class="mb-field-label" style="font-size:10px;">Interval(m)</span>
-        <input type="number" id="minibia-bot-outfit-randomizer-interval" min="1" value="5" style="padding:4px 4px;font-size:12px;text-align:center;" />
+        <input type="number" id="minibia-bot-outfit-randomizer-interval" min="1" value="5" style="padding:4px 4px;font-size:11px;text-align:center;" />
       </label>
       <button type="button" class="mb-small-button" id="minibia-bot-outfit-randomizer-now" style="padding:4px 14px;font-size:11px;">Randomize Now</button>
       <span style="font-size:11px; color:#cdbb8b;" id="minibia-bot-outfit-randomizer-status">Idle</span>
@@ -15971,33 +16008,40 @@ function refreshCaveWaypointList() {
     <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
       <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-auto-attack-enabled" /><span>Enable</span></label>
       <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-auto-attack-melee" /><span>Melee</span></label>
-	  <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-auto-attack-client-chase" /><span>Client Chase</span></label>
-      <label class="mb-field" style="flex:0 0 80px;"><span class="mb-field-label" style="font-size:10px;">Target</span><input type="number" id="minibia-bot-auto-attack-hotkey" min="1" max="12" placeholder="3" style="padding:3px 4px;font-size:11px;" /></label>
-      <label class="mb-field" style="flex:0 0 80px;"><span class="mb-field-label" style="font-size:10px;">Rune</span><input type="number" id="minibia-bot-auto-attack-rune-hotkey" min="1" max="12" placeholder="4" style="padding:3px 4px;font-size:11px;" /></label>
+      <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-auto-attack-client-chase" /><span>Client Chase</span></label>
+        <span style="color:#666;">|</span>
+      <label class="mb-field" style="flex:0 0 120px;"><span class="mb-field-label" style="font-size:10px;">Max Target Dist</span><input type="number" id="minibia-bot-auto-attack-maxdist" min="1" max="10" value="5" style="padding:3px 4px;font-size:11px;" /></label>
     </div>
-  </div>
-
-  <!-- Combat Settings -->
-  <div class="mb-section" style="padding:6px 10px;">
-    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
-      <label class="mb-field" style="flex:0 0 90px;"><span class="mb-field-label" style="font-size:10px;">Max Dist</span><input type="number" id="minibia-bot-auto-attack-maxdist" min="1" max="10" value="5" style="padding:3px 4px;font-size:11px;" /></label>
-      <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-auto-attack-antiks" /><span>Anti-KS</span></label>
-      <label class="mb-field" style="flex:0 0 70px;"><span class="mb-field-label" style="font-size:10px;">Self</span><input type="number" id="minibia-bot-auto-attack-antiks-self" min="1" max="5" value="2" style="padding:3px 4px;font-size:11px;" /></label>
-      <label class="mb-field" style="flex:0 0 70px;"><span class="mb-field-label" style="font-size:10px;">Other</span><input type="number" id="minibia-bot-auto-attack-antiks-other" min="1" max="5" value="2" style="padding:3px 4px;font-size:11px;" /></label>
-    </div>
-  </div>
-
+    
+    <hr style="margin:12px 0;border-color:#444;">
+    
   <!-- Kite Mode -->
-  <div class="mb-section" style="padding:6px 10px;">
+  
     <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
       <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-auto-attack-kite" /><span>Kite</span></label>
-      <label class="mb-field" style="flex:0 0 80px;"><span class="mb-field-label" style="font-size:10px;">Ideal Dist</span><input type="number" id="minibia-bot-auto-attack-ideal-dist" min="1" max="10" value="3" style="padding:3px 4px;font-size:11px;" /></label>
-      <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-exori-enabled" /><span>Exori</span></label>
+      <label class="mb-field" style="flex:0 0 65px;"><span class="mb-field-label" style="font-size:10px;">Kite Dist</span><input type="number" id="minibia-bot-auto-attack-ideal-dist" min="1" max="10" value="3" style="padding:3px 4px;font-size:11px;" /></label>
+        <span style="color:#666;">|</span>
+      <label class="mb-field" style="flex:0 0 65px;"><span class="mb-field-label" style="font-size:10px;">Use Rune</span><input type="number" id="minibia-bot-auto-attack-rune-hotkey" min="1" max="12" placeholder="4" style="padding:3px 4px;font-size:11px;" /></label>
+        <span style="color:#666;">|</span>
+      <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-auto-attack-antiks" /><span>Anti-KS</span></label>
+      <label class="mb-field" style="flex:0 0 40px;"><span class="mb-field-label" style="font-size:10px;">Self</span><input type="number" id="minibia-bot-auto-attack-antiks-self" min="1" max="5" value="2" style="padding:3px 4px;font-size:11px;" /></label>
+      <label class="mb-field" style="flex:0 0 40px;"><span class="mb-field-label" style="font-size:10px;">Other</span><input type="number" id="minibia-bot-auto-attack-antiks-other" min="1" max="5" value="2" style="padding:3px 4px;font-size:11px;" /></label>
     </div>
-  </div>
+    
+    
+    <hr style="margin:12px 0;border-color:#444;">
+  
+  
+  <!-- Exori Settings -->
+    <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
+      <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-exori-enabled" /><span>Cast Exori</span></label>
+      <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-exori-player-check" /><span>Avoid Players</span></label>
+      <label class="mb-field" style="flex:0 0 80px;"><span class="mb-field-label" style="font-size:10px;">Avoid Dist</span><input type="number" id="minibia-bot-exori-player-dist" min="1" max="10" value="3" style="padding:3px 4px;font-size:11px;" /></label>
+    </div>
+
+    <hr style="margin:12px 0;border-color:#444;">
 
   <!-- Target Priority -->
-  <div class="mb-section" style="padding:6px 10px;">
     <div style="display:flex; gap:6px; align-items:end; flex-wrap:wrap;">
       <label class="mb-field" style="flex:1; min-width:100px;"><span class="mb-field-label" style="font-size:10px;">Preferred Mobs</span><textarea id="minibia-bot-auto-attack-preferred-names" placeholder="Orc Shaman, Amazon" style="min-height:28px;padding:3px 4px;font-size:11px;resize:vertical;"></textarea></label>
       <label class="mb-field" style="flex:0 0 110px;"><span class="mb-field-label" style="font-size:10px;">Match Mode</span><select id="minibia-bot-auto-attack-preferred-match-mode" style="padding:3px 4px;font-size:11px;"><option value="exact">Exact</option><option value="includes">Contains</option></select></label>
@@ -16007,10 +16051,10 @@ function refreshCaveWaypointList() {
       <div class="mb-small-note" id="minibia-bot-auto-attack-preferred-status" style="font-size:10px;">Preferred: none</div>
       <div class="mb-small-note" style="font-size:10px;">Ranked first, others allowed</div>
     </div>
-  </div>
+    
+    <hr style="margin:12px 0;border-color:#444;">
   
     <!-- Ignored Mobs (Blacklist) -->
-  <div class="mb-section" style="padding:6px 10px;">
     <div style="display:flex; gap:6px; align-items:end; flex-wrap:wrap;">
       <label class="mb-field" style="flex:1; min-width:100px;">
         <span class="mb-field-label">Ignored Mobs (never attack)</span>
@@ -16031,7 +16075,7 @@ function refreshCaveWaypointList() {
   <div class="mb-section">
     <div class="mb-label">Auto Responder</div>
     <div class="mb-stack">
-      <label class="mb-toggle mb-toggle-main"><input type="checkbox" id="minibia-bot-talk-enabled" /><span>Enable Auto Reply</span></label>
+      <label class="mb-toggle"><input type="checkbox" id="minibia-bot-talk-enabled" /><span>Enable Auto Reply</span></label>
       <label class="mb-field" for="minibia-bot-talk-api-key"><span class="mb-field-label">Gemini API Key</span><input type="password" id="minibia-bot-talk-api-key" placeholder="Gemini API key" /></label>
       <label class="mb-field" for="minibia-bot-talk-prompt"><span class="mb-field-label">Reply Style Prompt</span><textarea id="minibia-bot-talk-prompt" placeholder="Reply style prompt"></textarea></label>
       <label class="mb-field" for="minibia-bot-talk-ignored"><span class="mb-field-label">Ignore messages containing (comma separated)</span><input type="text" id="minibia-bot-talk-ignored" placeholder="munch., yum, burp" /></label>
@@ -16046,29 +16090,17 @@ function refreshCaveWaypointList() {
   <div class="mb-section">
     <div class="mb-label">Paladin Utilities</div>
     <div class="mb-stack">
-      <!-- Enable toggle -->
-      <label class="mb-toggle mb-toggle-main">
-        <input type="checkbox" id="minibia-bot-paladin-enabled" />
-        <span>Enable</span>
+      <!-- Crafter toggle -->
+      <label class="mb-toggle">
+        <input type="checkbox" id="minibia-bot-paladin-crafter-enabled" />
+        <span>Crafter (spell casting)</span>
       </label>
 
-      <!-- Row 1: Ammo Threshold + Equip Threshold -->
+      <!-- Row 1: Ammo Threshold + Craft Mana Cost -->
       <div class="mb-form-grid">
         <label class="mb-field" for="minibia-bot-paladin-ammo-threshold">
           <span class="mb-field-label">Ammo Threshold</span>
           <input type="number" id="minibia-bot-paladin-ammo-threshold" min="0" value="15" />
-        </label>
-        <label class="mb-field" for="minibia-bot-paladin-equip-threshold">
-          <span class="mb-field-label">Equip Threshold</span>
-          <input type="number" id="minibia-bot-paladin-equip-threshold" min="0" value="10" />
-        </label>
-      </div>
-
-      <!-- Row 2: Craft Spell Words + Craft Mana Cost -->
-      <div class="mb-form-grid">
-        <label class="mb-field" for="minibia-bot-paladin-craft-spell">
-          <span class="mb-field-label">Craft Spell Words</span>
-          <input type="text" id="minibia-bot-paladin-craft-spell" placeholder="exeta con" />
         </label>
         <label class="mb-field" for="minibia-bot-paladin-craft-mana">
           <span class="mb-field-label">Craft Mana Cost</span>
@@ -16076,45 +16108,62 @@ function refreshCaveWaypointList() {
         </label>
       </div>
 
-      <!-- Row 3: High Mana Spell + High Mana % -->
+      <!-- Row 2: Craft Spell Words + High Mana Spell -->
       <div class="mb-form-grid">
+        <label class="mb-field" for="minibia-bot-paladin-craft-spell">
+          <span class="mb-field-label">Craft Spell Words</span>
+          <input type="text" id="minibia-bot-paladin-craft-spell" placeholder="exeta con" />
+        </label>
         <label class="mb-field" for="minibia-bot-paladin-high-mana-spell">
           <span class="mb-field-label">High Mana Spell</span>
           <input type="text" id="minibia-bot-paladin-high-mana-spell" placeholder="utani hur" />
         </label>
+      </div>
+
+      <!-- Row 3: High Mana % -->
+      <div class="mb-form-grid">
         <label class="mb-field" for="minibia-bot-paladin-high-mana-threshold">
           <span class="mb-field-label">High Mana %</span>
           <input type="number" id="minibia-bot-paladin-high-mana-threshold" min="0" max="100" value="98" />
         </label>
+        <div></div> <!-- empty spacer -->
       </div>
 
-      <!-- Row 4: Equip Weapon + Weapon ID + Equip Cooldown -->
-      <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
-        <label class="mb-toggle" style="margin:0; flex:0 0 auto;">
-          <input type="checkbox" id="minibia-bot-paladin-equip-weapon" />
-          <span>Equip Weapon</span>
+      <hr style="margin:8px 0;border-color:#444;">
+
+      <!-- Equipper toggle -->
+      <label class="mb-toggle">
+        <input type="checkbox" id="minibia-bot-paladin-equipper-enabled" />
+        <span>Weapon Equipper</span>
+      </label>
+
+      <!-- Row 4: Equip Threshold + Equip Cooldown -->
+      <div class="mb-form-grid">
+        <label class="mb-field" for="minibia-bot-paladin-equip-threshold">
+          <span class="mb-field-label">Equip Threshold</span>
+          <input type="number" id="minibia-bot-paladin-equip-threshold" min="0" value="7" />
         </label>
-        <label class="mb-field" style="flex:1; min-width:80px;">
-          <span class="mb-field-label">Weapon ID</span>
-          <input type="number" id="minibia-bot-paladin-weapon-id" placeholder="e.g., 3277" />
-        </label>
-        <label class="mb-field" style="flex:0 0 120px;">
+        <label class="mb-field" for="minibia-bot-paladin-equip-cooldown">
           <span class="mb-field-label">Equip CD (MS)</span>
           <input type="number" id="minibia-bot-paladin-equip-cooldown" min="1000" value="5000" />
         </label>
       </div>
 
-      <!-- Row 5: Buttons -->
-      <div style="display:flex; gap:6px;">
+      <!-- Row 5: Weapon ID + Capture + Equip Now -->
+      <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
+        <label class="mb-field" style="flex:1; min-width:80px;">
+          <span class="mb-field-label">Weapon ID</span>
+          <input type="number" id="minibia-bot-paladin-weapon-id" placeholder="e.g., 3277" />
+        </label>
         <button type="button" class="mb-small-button" id="minibia-bot-paladin-capture-weapon" style="flex:1;">Click to Capture</button>
         <button type="button" class="mb-small-button" id="minibia-bot-paladin-equip-now" style="flex:1;background:#2a4a2a;border-color:#3a7a3a;">Equip Now</button>
       </div>
 
-      <!-- Status line -->
+      <!-- Status lines -->
       <div style="display:flex; gap:16px; flex-wrap:wrap; font-size:11px; color:#cdbb8b; margin-top:4px;">
-        <span id="minibia-bot-paladin-status">Status: idle</span>
+        <span id="minibia-bot-paladin-crafter-status">Crafter: idle</span>
+        <span id="minibia-bot-paladin-equipper-status">Equipper: idle</span>
         <span>Ammo count: <span id="minibia-bot-paladin-ammo">0</span></span>
-        <span>Hand count: <span id="minibia-bot-paladin-hand-count">0</span></span>
       </div>
     </div>
   </div>
@@ -16125,7 +16174,7 @@ function refreshCaveWaypointList() {
   <div class="mb-section">
     <div class="mb-label">Auto Looter</div>
     <div class="mb-stack">
-      <label class="mb-toggle mb-toggle-main">
+      <label class="mb-toggle">
         <input type="checkbox" id="minibia-bot-looter-enabled" />
         <span>Enable Looter</span>
       </label>
@@ -16134,7 +16183,7 @@ function refreshCaveWaypointList() {
         <button type="button" class="mb-small-button" id="minibia-bot-looter-capture-item" style="flex:1;">Track Item</button>
       </div>
       <div class="mb-small-note" id="minibia-bot-looter-dest-status">No destination selected</div>
-      <div class="mb-label" style="font-size:12px; margin-top:4px;">Tracked Items</div>
+      <div class="mb-label" style="font-size:11px; margin-top:4px;">Tracked Items</div>
       <div id="minibia-bot-looter-item-list" style="max-height:150px; overflow-y:auto; border:1px solid rgba(224,200,148,0.2); border-radius:4px; padding:4px; font-size:11px;"></div>
       <div style="display:flex; gap:6px; margin-top:4px;">
         <input type="text" id="minibia-bot-looter-manual-input" placeholder="Item name" style="flex:1;" />
@@ -16214,14 +16263,14 @@ function refreshCaveWaypointList() {
   <!-- ML Trainer -->
   <div class="mb-section" style="padding:12px 16px;">
     <div style="display:flex; gap:16px; align-items:center; flex-wrap:wrap;">
-      <label class="mb-toggle" style="margin:0; font-size:12px;"><input type="checkbox" id="minibia-bot-rune-enabled" /><span>ML Trainer</span></label>
+      <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-rune-enabled" /><span>ML Trainer</span></label>
       <label class="mb-field" style="flex:2; min-width:140px;">
         <span class="mb-field-label" style="font-size:10px;">Spell</span>
-        <input type="text" id="minibia-bot-rune-spell" placeholder="adori vita vis" style="padding:6px 10px;font-size:12px;" />
+        <input type="text" id="minibia-bot-rune-spell" placeholder="adori vita vis" style="padding:6px 10px;font-size:11px;" />
       </label>
       <label class="mb-field" style="flex:0 0 100px;">
         <span class="mb-field-label" style="font-size:10px;">Mana Percent</span>
-        <input type="number" id="minibia-bot-rune-mana" min="0" placeholder="600" style="padding:6px 10px;font-size:12px;" />
+        <input type="number" id="minibia-bot-rune-mana" min="0" placeholder="600" style="padding:6px 10px;font-size:11px;" />
       </label>
     </div>
   </div>
@@ -16229,7 +16278,7 @@ function refreshCaveWaypointList() {
   <div class="mb-section">
     <div class="mb-label">Slime Trainer</div>
     <div class="mb-stack">
-      <label class="mb-toggle mb-toggle-main">
+      <label class="mb-toggle">
         <input type="checkbox" id="minibia-bot-slime-trainer-enabled" />
         <span>Enable Slime Trainer</span>
       </label>
@@ -16258,7 +16307,7 @@ function refreshCaveWaypointList() {
       </div>
 
       <!-- Enable toggle -->
-      <label class="mb-toggle mb-toggle-main">
+      <label class="mb-toggle">
         <input type="checkbox" id="minibia-bot-combo-enabled" />
         <span>Enable ComboBot</span>
       </label>
@@ -16294,7 +16343,7 @@ function refreshCaveWaypointList() {
         <span class="mb-field-label">Player Name</span>
         <input type="text" id="minibia-bot-follow-name" placeholder="Enter player name" />
       </div>
-      <label class="mb-toggle mb-toggle-main">
+      <label class="mb-toggle">
         <input type="checkbox" id="minibia-bot-follow-enabled" />
         <span>Enable Auto Follow</span>
       </label>
@@ -16392,6 +16441,28 @@ function refreshCaveWaypointList() {
             setTimeout(refreshExoriStatus, 100);
             // Periodic refresh (optional)
             setInterval(refreshExoriStatus, 2000);
+        }
+        
+        // Exori player check
+        const exoriPlayerCheck = document.getElementById("minibia-bot-exori-player-check");
+        const exoriPlayerDist = document.getElementById("minibia-bot-exori-player-dist");
+        if (exoriPlayerCheck) {
+            // Load initial state
+            const config = bot.exori?.config;
+            if (config) {
+                exoriPlayerCheck.checked = config.playerProximityCheck !== false;
+                if (exoriPlayerDist) exoriPlayerDist.value = config.playerProximityDistance || 3;
+            }
+            exoriPlayerCheck.addEventListener("change", function() {
+                bot.exori.updateConfig({ playerProximityCheck: this.checked });
+            });
+        }
+        if (exoriPlayerDist) {
+            exoriPlayerDist.addEventListener("change", function() {
+                const val = Math.min(10, Math.max(1, Number(this.value) || 3));
+                this.value = val;
+                bot.exori.updateConfig({ playerProximityDistance: val });
+            });
         }
 
         // ---- Standalone Follow (separate from ComboBot) ----
@@ -17521,122 +17592,189 @@ function refreshCaveWaypointList() {
             });
         }
 
-        // ---- Paladin listeners ----
-        const paladinToggle = panel.querySelector("#minibia-bot-paladin-enabled");
-        const paladinAmmoThreshold = panel.querySelector("#minibia-bot-paladin-ammo-threshold");
-        const paladinCraftMana = panel.querySelector("#minibia-bot-paladin-craft-mana");
-        const paladinCraftSpell = panel.querySelector("#minibia-bot-paladin-craft-spell");
-        const paladinHighManaSpell = panel.querySelector("#minibia-bot-paladin-high-mana-spell");
-        const paladinHighManaThreshold = panel.querySelector("#minibia-bot-paladin-high-mana-threshold");
-        const paladinEquipCooldown = panel.querySelector("#minibia-bot-paladin-equip-cooldown");
-        const paladinEquipWeapon = panel.querySelector("#minibia-bot-paladin-equip-weapon");
-        const paladinWeaponId = panel.querySelector("#minibia-bot-paladin-weapon-id");
-        const paladinCaptureBtn = panel.querySelector("#minibia-bot-paladin-capture-weapon");
-        const equipNowBtn = panel.querySelector("#minibia-bot-paladin-equip-now");
+// ---- Paladin UI listeners ----
+const paladinCrafterToggle = document.getElementById("minibia-bot-paladin-crafter-enabled");
+const paladinEquipperToggle = document.getElementById("minibia-bot-paladin-equipper-enabled");
+const paladinAmmoThreshold = document.getElementById("minibia-bot-paladin-ammo-threshold");
+const paladinCraftMana = document.getElementById("minibia-bot-paladin-craft-mana");
+const paladinCraftSpell = document.getElementById("minibia-bot-paladin-craft-spell");
+const paladinHighManaSpell = document.getElementById("minibia-bot-paladin-high-mana-spell");
+const paladinHighManaThreshold = document.getElementById("minibia-bot-paladin-high-mana-threshold");
+const paladinEquipCooldown = document.getElementById("minibia-bot-paladin-equip-cooldown");
+const paladinEquipThreshold = document.getElementById("minibia-bot-paladin-equip-threshold");
+const paladinWeaponId = document.getElementById("minibia-bot-paladin-weapon-id");
+const paladinCaptureBtn = document.getElementById("minibia-bot-paladin-capture-weapon");
+const paladinEquipNowBtn = document.getElementById("minibia-bot-paladin-equip-now");
+const paladinCrafterStatus = document.getElementById("minibia-bot-paladin-crafter-status");
+const paladinEquipperStatus = document.getElementById("minibia-bot-paladin-equipper-status");
+const paladinAmmoDisplay = document.getElementById("minibia-bot-paladin-ammo");
 
-        const paladinEquipThreshold = panel.querySelector("#minibia-bot-paladin-equip-threshold");
-        if (paladinEquipThreshold) {
-            paladinEquipThreshold.value = bot.paladin?.config?.equipThreshold ?? 15;
-            paladinEquipThreshold.addEventListener("change", function () {
-                const val = Math.max(0, parseInt(this.value, 10) || 0);
-                this.value = val;
-                bot.paladin.updateConfig({
-                    equipThreshold: val
-                });
-            });
-        }
+function refreshPaladinStatus() {
+    const status = bot.paladin?.status?.();
+    if (!status) return;
 
-        function getPaladinConfigFromUI() {
-            return {
-                ammoThreshold: parseInt(document.getElementById("minibia-bot-paladin-ammo-threshold")?.value, 10) || 20,
-                craftManaCost: parseInt(document.getElementById("minibia-bot-paladin-craft-mana")?.value, 10) || 100,
-                craftSpellWords: document.getElementById("minibia-bot-paladin-craft-spell")?.value?.trim() || "",
-                highManaSpellWords: document.getElementById("minibia-bot-paladin-high-mana-spell")?.value?.trim() || "",
-                highManaThreshold: parseInt(document.getElementById("minibia-bot-paladin-high-mana-threshold")?.value, 10) || 98,
-                equipCooldownMs: parseInt(document.getElementById("minibia-bot-paladin-equip-cooldown")?.value, 10) || 5000,
-                equipWeapon: document.getElementById("minibia-bot-paladin-equip-weapon")?.checked || false,
-                weaponId: parseInt(document.getElementById("minibia-bot-paladin-weapon-id")?.value, 10) || null,
+    // Crafter toggle
+    if (paladinCrafterToggle && document.activeElement !== paladinCrafterToggle) {
+        paladinCrafterToggle.checked = status.running;
+    }
+    // Equipper toggle
+    if (paladinEquipperToggle && document.activeElement !== paladinEquipperToggle) {
+        paladinEquipperToggle.checked = status.equipRunning;
+    }
+    // Status labels
+    if (paladinCrafterStatus) {
+        paladinCrafterStatus.textContent = status.running ? "Crafter: running" : "Crafter: idle";
+    }
+    if (paladinEquipperStatus) {
+        paladinEquipperStatus.textContent = status.equipRunning ? "Equipper: running" : "Equipper: idle";
+    }
+    if (paladinAmmoDisplay) {
+        paladinAmmoDisplay.textContent = status.ammoCount ?? 0;
+    }
+
+    // Input values (only if not focused)
+    if (paladinAmmoThreshold && document.activeElement !== paladinAmmoThreshold) {
+        paladinAmmoThreshold.value = status.config.ammoThreshold ?? 4;
+    }
+    if (paladinCraftMana && document.activeElement !== paladinCraftMana) {
+        paladinCraftMana.value = status.config.craftManaCost ?? 140;
+    }
+    if (paladinCraftSpell && document.activeElement !== paladinCraftSpell) {
+        paladinCraftSpell.value = status.config.craftSpellWords || "";
+    }
+    if (paladinHighManaSpell && document.activeElement !== paladinHighManaSpell) {
+        paladinHighManaSpell.value = status.config.highManaSpellWords || "";
+    }
+    if (paladinHighManaThreshold && document.activeElement !== paladinHighManaThreshold) {
+        paladinHighManaThreshold.value = status.config.highManaThreshold ?? 98;
+    }
+    if (paladinEquipCooldown && document.activeElement !== paladinEquipCooldown) {
+        paladinEquipCooldown.value = status.config.equipCooldownMs ?? 5000;
+    }
+    if (paladinEquipThreshold && document.activeElement !== paladinEquipThreshold) {
+        paladinEquipThreshold.value = status.config.equipThreshold ?? 7;
+    }
+    if (paladinWeaponId && document.activeElement !== paladinWeaponId) {
+        paladinWeaponId.value = status.config.weaponId || "";
+    }
+}
+
+// ---- Crafter toggle ----
+if (paladinCrafterToggle) {
+    paladinCrafterToggle.addEventListener("change", function () {
+        if (this.checked) {
+            const config = {
+                ammoThreshold: parseInt(paladinAmmoThreshold?.value) || 4,
+                craftManaCost: parseInt(paladinCraftMana?.value) || 140,
+                craftSpellWords: paladinCraftSpell?.value?.trim() || "",
+                highManaSpellWords: paladinHighManaSpell?.value?.trim() || "",
+                highManaThreshold: parseInt(paladinHighManaThreshold?.value) || 98,
             };
+            bot.paladin.updateConfig(config);
+            bot.paladin.startCraft();
+        } else {
+            bot.paladin.stopCraft();
         }
+        refreshPaladinStatus();
+    });
+}
 
-        // Load initial values
-        if (paladinAmmoThreshold)
-            paladinAmmoThreshold.value = bot.paladin?.config?.ammoThreshold ?? 20;
-        if (paladinCraftMana)
-            paladinCraftMana.value = bot.paladin?.config?.craftManaCost ?? 100;
-        if (paladinCraftSpell)
-            paladinCraftSpell.value = bot.paladin?.config?.craftSpellWords || "";
-        if (paladinHighManaSpell)
-            paladinHighManaSpell.value = bot.paladin?.config?.highManaSpellWords || "";
-        if (paladinHighManaThreshold)
-            paladinHighManaThreshold.value = bot.paladin?.config?.highManaThreshold ?? 98;
-        if (paladinEquipCooldown)
-            paladinEquipCooldown.value = bot.paladin?.config?.equipCooldownMs ?? 5000;
-
-        // ---- Paladin UI ----
-        if (paladinEquipWeapon) {
-            paladinEquipWeapon.checked = bot.paladin?.config?.equipWeapon || false;
-            paladinEquipWeapon.addEventListener("change", function () {
-                const config = getPaladinConfigFromUI();
-                config.equipWeapon = this.checked;
-                bot.paladin.updateConfig(config);
-                // ❌ REMOVED: immediate equip – the tick loop handles it with threshold check
-            });
+// ---- Equipper toggle ----
+if (paladinEquipperToggle) {
+    paladinEquipperToggle.addEventListener("change", function () {
+        if (this.checked) {
+            const weaponId = parseInt(paladinWeaponId?.value) || null;
+            const config = {
+                weaponId: weaponId,
+                equipThreshold: parseInt(paladinEquipThreshold?.value) || 7,
+                equipCooldownMs: parseInt(paladinEquipCooldown?.value) || 5000,
+            };
+            if (!weaponId) {
+                bot.log("Paladin: cannot start equipper – no weapon ID set.");
+                this.checked = false;
+                return;
+            }
+            bot.paladin.updateConfig(config);
+            bot.paladin.startEquip();
+        } else {
+            bot.paladin.stopEquip();
         }
+        refreshPaladinStatus();
+    });
+}
 
-        if (paladinWeaponId)
-            paladinWeaponId.value = bot.paladin?.config?.weaponId ?? "";
+// ---- Capture weapon ----
+if (paladinCaptureBtn) {
+    paladinCaptureBtn.addEventListener("click", () => {
+        bot.paladin.startCaptureWeapon();
+    });
+}
 
-        if (paladinToggle) {
-            paladinToggle.checked = !!bot.paladin?.status?.().running;
-            paladinToggle.addEventListener("change", () => {
-                if (paladinToggle.checked) {
-                    const config = getPaladinConfigFromUI();
-                    bot.paladin.updateConfig(config);
-                    bot.paladin.start();
-                } else {
-                    bot.paladin.stop();
-                }
-                refreshPaladinStatus();
-            });
+// ---- Equip Now ----
+if (paladinEquipNowBtn) {
+    paladinEquipNowBtn.addEventListener("click", () => {
+        const weaponId = parseInt(paladinWeaponId?.value) || bot.paladin.config.weaponId;
+        if (!weaponId) {
+            bot.log("Paladin: no weapon ID set.");
+            return;
         }
+        bot.paladin.equipWeapon(weaponId);
+    });
+}
 
-        // Capture weapon ID from left hand
-        if (paladinCaptureBtn) {
-            paladinCaptureBtn.addEventListener("click", () => {
-                bot.paladin.startCaptureWeapon();
-            });
-        }
+// ---- Input changes update config immediately ----
+if (paladinAmmoThreshold) {
+    paladinAmmoThreshold.addEventListener("change", function () {
+        const val = Math.max(0, parseInt(this.value) || 0);
+        this.value = val;
+        bot.paladin.updateConfig({ ammoThreshold: val });
+    });
+}
+if (paladinCraftMana) {
+    paladinCraftMana.addEventListener("change", function () {
+        const val = Math.max(0, parseInt(this.value) || 0);
+        this.value = val;
+        bot.paladin.updateConfig({ craftManaCost: val });
+    });
+}
+if (paladinCraftSpell) {
+    paladinCraftSpell.addEventListener("change", function () {
+        bot.paladin.updateConfig({ craftSpellWords: this.value.trim() });
+    });
+}
+if (paladinHighManaSpell) {
+    paladinHighManaSpell.addEventListener("change", function () {
+        bot.paladin.updateConfig({ highManaSpellWords: this.value.trim() });
+    });
+}
+if (paladinHighManaThreshold) {
+    paladinHighManaThreshold.addEventListener("change", function () {
+        const val = Math.min(100, Math.max(0, parseInt(this.value) || 0));
+        this.value = val;
+        bot.paladin.updateConfig({ highManaThreshold: val });
+    });
+}
+if (paladinEquipCooldown) {
+    paladinEquipCooldown.addEventListener("change", function () {
+        const val = Math.max(1000, parseInt(this.value) || 1000);
+        this.value = val;
+        bot.paladin.updateConfig({ equipCooldownMs: val });
+    });
+}
+if (paladinEquipThreshold) {
+    paladinEquipThreshold.addEventListener("change", function () {
+        const val = Math.max(0, parseInt(this.value) || 0);
+        this.value = val;
+        bot.paladin.updateConfig({ equipThreshold: val });
+    });
+}
+if (paladinWeaponId) {
+    paladinWeaponId.addEventListener("change", function () {
+        const val = parseInt(this.value) || null;
+        bot.paladin.updateConfig({ weaponId: val });
+    });
+}
 
-        // ---- Ammo threshold: update config on change ----
-        if (paladinAmmoThreshold) {
-            paladinAmmoThreshold.addEventListener("change", function () {
-                const val = Math.max(0, parseInt(this.value, 10) || 0);
-                this.value = val;
-                bot.paladin.updateConfig({
-                    ammoThreshold: val
-                });
-            });
-        }
-
-        // ---- Equip Now button (manual override, optionally threshold-aware) ----
-        if (equipNowBtn) {
-            equipNowBtn.addEventListener("click", function () {
-                const weaponId = bot.paladin?.config?.weaponId;
-                if (!weaponId) {
-                    bot.log("Paladin: No weapon ID set. Capture or enter one first.");
-                    return;
-                }
-                // Optional: respect threshold on manual click? Uncomment the next lines if you want.
-                // const ammo = bot.paladin.getAmmoCount();
-                // if (ammo > bot.paladin.config.ammoThreshold) {
-                //   bot.log(`Paladin: Ammo count ${ammo} is above threshold ${bot.paladin.config.ammoThreshold}, not equipping.`);
-                //   return;
-                // }
-                const success = bot.paladin.equipWeapon(weaponId);
-                bot.log(success ? "Paladin: Weapon equipped manually." : "Paladin: Could not equip weapon. Check containers/equipment.");
-            });
-        }
 
         // ---- Looter listeners ----
         const looterToggle = panel.querySelector("#minibia-bot-looter-enabled");
@@ -18304,6 +18442,7 @@ function refreshCaveWaypointList() {
             refreshPlayerAttackStatus();
             refreshMessageAlertStatus();
             refreshLightHackLegitStatus();
+            refreshPaladinStatus();
             if (convertCurrencyToggle) {
                 convertCurrencyToggle.checked = bot.autoStacker?.config?.convertCurrency !== false;
             }
@@ -18339,6 +18478,7 @@ function refreshCaveWaypointList() {
         bot.addCleanup(() => window.clearInterval(titleTimer));
         const lightHackLegitTimer = setInterval(refreshLightHackLegitStatus, 2000);
         bot.addCleanup(() => clearInterval(lightHackLegitTimer));
+        setInterval(refreshPaladinStatus, 2000);
 
         // Position, drag, collapse
         applySavedPanelPosition(panel);
@@ -18885,13 +19025,13 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
             <div class="mb-section">
                 <div class="mb-label">Interface Tweaks</div>
                 <div class="mb-stack">
-                    <label class="mb-toggle mb-toggle-main">
+                    <label class="mb-toggle">
                         <input type="checkbox" id="minibia-bot-ui-wide-columns" />
                         <span>Wide Columns (224px)</span>
                     </label>
                     <div class="mb-small-note">Expands the container widths from 180px to 224px.</div>
 
-                    <label class="mb-toggle mb-toggle-main" style="margin-top:8px;">
+                    <label class="mb-toggle" style="margin-top:8px;">
                         <input type="checkbox" id="minibia-bot-ui-show-both-hotbar" />
                         <span>Show Both Hotbar Banks</span>
                     </label>
@@ -18899,8 +19039,8 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
 
                     <hr style="margin:12px 0;border-color:#444;">
 
-                    <div class="mb-label" style="font-size:12px;">Name Spoofer</div>
-                    <label class="mb-toggle mb-toggle-main">
+                    <div class="mb-label" style="font-size:11px;">Name Spoofer</div>
+                    <label class="mb-toggle">
                         <input type="checkbox" id="minibia-bot-ui-name-spoofer-enabled" />
                         <span>Enable Name Spoof</span>
                     </label>
@@ -18912,8 +19052,8 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
 
                     <hr style="margin:12px 0;border-color:#444;">
 
-                    <div class="mb-label" style="font-size:12px;">Floating Popups</div>
-                    <label class="mb-toggle mb-toggle-main">
+                    <div class="mb-label" style="font-size:11px;">Floating Popups</div>
+                    <label class="mb-toggle">
                         <input type="checkbox" id="minibia-bot-ui-hide-popups" />
                         <span>Hide Spell Casts &amp; Food Popups</span>
                     </label>
@@ -18922,8 +19062,8 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
                     <hr style="margin:12px 0;border-color:#444;">
 
                     <!-- NEW TTL SECTION -->
-                    <div class="mb-label" style="font-size:12px;">Time‑To‑Level</div>
-                    <label class="mb-toggle mb-toggle-main">
+                    <div class="mb-label" style="font-size:11px;">Time‑To‑Level</div>
+                    <label class="mb-toggle">
                         <input type="checkbox" id="minibia-bot-ui-ttl-enabled" />
                         <span>Show Time‑To‑Level (TTL) in Performance Overlay</span>
                     </label>
