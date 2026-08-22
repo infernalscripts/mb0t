@@ -15026,42 +15026,81 @@ function refreshCaveWaypointList() {
 
     function enableDrag(panel, key = panelPositionKey) {
         const handle = panel.querySelector(".mb-title");
-        if (!handle)
-            return;
+        if (!handle) return;
         let dragState = null;
-        const onMouseMove = (e) => {
-            if (!dragState)
-                return;
-            const next = clampPanelPosition(panel, e.clientX - dragState.offsetX, e.clientY - dragState.offsetY);
+
+        // Helper to get clientX/clientY from mouse or touch event
+        function getClientPos(e) {
+            if (e.touches && e.touches.length > 0) {
+                return { clientX: e.touches[0].clientX, clientY: e.touches[0].clientY };
+            }
+            if (e.changedTouches && e.changedTouches.length > 0) {
+                return { clientX: e.changedTouches[0].clientX, clientY: e.changedTouches[0].clientY };
+            }
+            return { clientX: e.clientX, clientY: e.clientY };
+        }
+
+        // Shared drag start logic
+        function onDragStart(e) {
+            // For touch, ignore if the user tapped a button inside the titlebar
+            if (e.type === 'touchstart') {
+                const target = e.target.closest('.mb-title-actions');
+                if (target) return;
+            } else if (e.button !== 0) {
+                return; // Only left mouse button
+            }
+
+            const pos = getClientPos(e);
+            const rect = panel.getBoundingClientRect();
+            dragState = {
+                offsetX: pos.clientX - rect.left,
+                offsetY: pos.clientY - rect.top
+            };
+            // Prevent scrolling on touch
+            if (e.type === 'touchstart') {
+                e.preventDefault();
+            }
+        }
+
+        // Shared drag move logic
+        function onDragMove(e) {
+            if (!dragState) return;
+            const pos = getClientPos(e);
+            const next = clampPanelPosition(panel, pos.clientX - dragState.offsetX, pos.clientY - dragState.offsetY);
             panel.style.left = `${next.left}px`;
             panel.style.top = `${next.top}px`;
             panel.style.right = "auto";
-        };
-        const onMouseUp = () => {
-            if (!dragState)
-                return;
+            if (e.type === 'touchmove') {
+                e.preventDefault(); // Prevent page scroll while dragging
+            }
+        }
+
+        // Shared drag end logic
+        function onDragEnd(e) {
+            if (!dragState) return;
             dragState = null;
             const rect = panel.getBoundingClientRect();
-            savePanelPosition({
-                left: rect.left,
-                top: rect.top
-            }, key);
-        };
-        handle.addEventListener("mousedown", (e) => {
-            if (e.button !== 0)
-                return;
-            const rect = panel.getBoundingClientRect();
-            dragState = {
-                offsetX: e.clientX - rect.left,
-                offsetY: e.clientY - rect.top
-            };
-            e.preventDefault();
-        });
-        window.addEventListener("mousemove", onMouseMove);
-        window.addEventListener("mouseup", onMouseUp);
+            savePanelPosition({ left: rect.left, top: rect.top }, key);
+        }
+
+        // ---- Mouse events ----
+        handle.addEventListener("mousedown", onDragStart);
+        window.addEventListener("mousemove", onDragMove);
+        window.addEventListener("mouseup", onDragEnd);
+
+        // ---- Touch events (mobile) ----
+        handle.addEventListener("touchstart", onDragStart, { passive: false });
+        window.addEventListener("touchmove", onDragMove, { passive: false });
+        window.addEventListener("touchend", onDragEnd);
+
+        // Cleanup when bot is destroyed
         bot.addCleanup(() => {
-            window.removeEventListener("mousemove", onMouseMove);
-            window.removeEventListener("mouseup", onMouseUp);
+            handle.removeEventListener("mousedown", onDragStart);
+            window.removeEventListener("mousemove", onDragMove);
+            window.removeEventListener("mouseup", onDragEnd);
+            handle.removeEventListener("touchstart", onDragStart);
+            window.removeEventListener("touchmove", onDragMove);
+            window.removeEventListener("touchend", onDragEnd);
         });
     }
 
