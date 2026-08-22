@@ -8355,6 +8355,30 @@ function isTileWalkable(x, y, z, ignoreCreatures = false) {
         persistRoute();
         return true;
     }
+    
+    function moveWaypointToIndex(fromIndex, toIndex) {
+        if (!route.length) return false;
+        const f = Math.trunc(Number(fromIndex));
+        const t = Math.trunc(Number(toIndex));
+        if (isNaN(f) || isNaN(t) || f < 0 || f >= route.length || t < 0 || t >= route.length) return false;
+        if (f === t) return true;
+
+        const wp = route.splice(f, 1)[0];
+        route.splice(t, 0, wp);
+
+        // Adjust current index if it was affected
+        if (state.currentIndex === f) {
+            state.currentIndex = t;
+        } else if (state.currentIndex > f && state.currentIndex <= t) {
+            state.currentIndex--;
+        } else if (state.currentIndex < f && state.currentIndex >= t) {
+            state.currentIndex++;
+        }
+
+        persistRoute();
+        bot.log(`Waypoint moved from ${f} to ${t}`, wp);
+        return true;
+    }
 
     function deleteWaypoint(index) {
         if (!route.length || index < 0 || index >= route.length)
@@ -8467,6 +8491,7 @@ function isTileWalkable(x, y, z, ignoreCreatures = false) {
         moveWaypointUp,
         moveWaypointDown,
         deleteWaypoint,
+        moveWaypointToIndex,
         setLoopMode,
         getLoopMode,
         inspectNearbyTiles,
@@ -14720,6 +14745,20 @@ function refreshCaveWaypointList() {
     }
     // Scroll only if cavebot is running (force = false)
     scrollToWaypointIndex();
+    // Update the "Move to Index" input with the selected or current index
+    const moveToIndexInput = document.getElementById("minibia-bot-cave-move-to-index");
+    if (moveToIndexInput) {
+        if (selectedWaypointIndex !== null && selectedWaypointIndex >= 0 && selectedWaypointIndex < route.length) {
+            moveToIndexInput.value = selectedWaypointIndex;
+        } else {
+            const status = bot.cave?.status?.();
+            if (status && typeof status.currentIndex === 'number') {
+                moveToIndexInput.value = status.currentIndex;
+            } else {
+                moveToIndexInput.value = "0";
+            }
+        }
+    }
 }
 
     function scrollToWaypointIndex(index, force = false) {
@@ -15968,8 +16007,20 @@ function refreshCaveWaypointList() {
       <div style="display:flex; align-items:center; gap:8px; margin-bottom:4px;">
         <div class="mb-label" style="font-size:11px; margin:0 0 4px;">Waypoints</div>
         <span style="color:#666;">|</span>
-        <label style="font-size:11px; color:#e9d39b; white-space:nowrap;">Skip sqm</label>
-        <input type="number" id="minibia-bot-cave-tolerance" min="0" max="5" step="1" value="0" style="width:50px; padding:2px 4px; font-size:11px;" />
+        <div style="display:flex; gap:6px; align-items:center; margin:4px 0 8px 0; padding:4px 6px; background:rgba(255,255,255,0.03); border-radius:4px;">
+         <span style="font-size:11px; color:#e9d39b;">Skip SQM</span>
+          <input type="number" id="minibia-bot-cave-tolerance" min="0" max="5" step="1" value="0" style="width:40px; padding:2px 4px; font-size:11px;" />
+        </div>
+        <span style="color:#666;">|</span>
+        <div style="display:flex; gap:6px; align-items:center; margin:4px 0 8px 0; padding:4px 6px; background:rgba(255,255,255,0.03); border-radius:4px;">
+          <span style="font-size:11px; color:#e9d39b;">Move to #</span>
+          <input type="number" id="minibia-bot-cave-move-to-index" min="0" value="0" style="width:40px; padding:2px 4px; font-size:11px;" />
+          <button type="button" class="mb-small-button" id="minibia-bot-cave-move-to-index-btn" style="padding:2px 12px;">Go</button>
+          <span id="minibia-bot-cave-move-status" style="font-size:10px; color:#999; margin-left:auto;"></span>
+        </div>
+
+
+       
       </div>
       <div id="minibia-bot-cave-waypoint-list" style="max-height:120px; overflow-y:auto; border:1px solid rgba(224,200,148,0.2); border-radius:4px; padding:2px; font-size:11px;"></div>
     </div>
@@ -16019,7 +16070,7 @@ function refreshCaveWaypointList() {
   
     <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
       <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-auto-attack-kite" /><span>Kite</span></label>
-      <label class="mb-field" style="flex:0 0 60px;"><span class="mb-field-label" style="font-size:10px;">Kite Dist</span><input type="number" id="minibia-bot-auto-attack-ideal-dist" min="1" max="10" value="3" style="padding:3px 4px;font-size:11px;" /></label>
+      <label class="mb-field" style="flex:0 0 65px;"><span class="mb-field-label" style="font-size:10px;">Kite Dist</span><input type="number" id="minibia-bot-auto-attack-ideal-dist" min="1" max="10" value="3" style="padding:3px 4px;font-size:11px;" /></label>
         <span style="color:#666;">|</span>
       <label class="mb-field" style="flex:0 0 60px;"><span class="mb-field-label" style="font-size:10px;">Use Rune</span><input type="number" id="minibia-bot-auto-attack-rune-hotkey" min="1" max="12" placeholder="4" style="padding:3px 4px;font-size:11px;" /></label>
         <span style="color:#666;">|</span>
@@ -18147,6 +18198,74 @@ if (paladinWeaponId) {
             moveDownBtn.addEventListener("click", () => moveSelectedWaypoint("down"));
         if (delBtn)
             delBtn.addEventListener("click", deleteSelectedWaypoint);
+
+        // ---- Move to Index ----
+        const moveToIndexBtn = document.getElementById("minibia-bot-cave-move-to-index-btn");
+        const moveToIndexInput = document.getElementById("minibia-bot-cave-move-to-index");
+        const moveStatusLabel = document.getElementById("minibia-bot-cave-move-status");
+
+        if (moveToIndexBtn && moveToIndexInput) {
+            moveToIndexBtn.addEventListener("click", () => {
+                const route = bot.cave.getRoute();
+                if (!route.length) {
+                    bot.log("No waypoints to move.");
+                    if (moveStatusLabel) moveStatusLabel.textContent = "No waypoints.";
+                    return;
+                }
+
+                // Determine which waypoint to move (selected, or fallback to current)
+                let fromIndex = selectedWaypointIndex;
+                if (fromIndex === null || fromIndex < 0 || fromIndex >= route.length) {
+                    const status = bot.cave.status();
+                    if (status && typeof status.currentIndex === 'number') {
+                        fromIndex = status.currentIndex;
+                    } else {
+                        bot.log("No waypoint selected. Click a waypoint first.");
+                        if (moveStatusLabel) moveStatusLabel.textContent = "Select a waypoint first.";
+                        return;
+                    }
+                }
+
+                const toIndex = parseInt(moveToIndexInput.value, 10);
+                if (isNaN(toIndex) || toIndex < 0 || toIndex >= route.length) {
+                    bot.log(`Invalid target index. Must be 0 - ${route.length - 1}.`);
+                    if (moveStatusLabel) moveStatusLabel.textContent = `Invalid (0-${route.length - 1})`;
+                    return;
+                }
+
+                if (fromIndex === toIndex) {
+                    bot.log("Waypoint is already at that index.");
+                    if (moveStatusLabel) moveStatusLabel.textContent = "Already there.";
+                    return;
+                }
+
+                const success = bot.cave.moveWaypointToIndex(fromIndex, toIndex);
+                if (success) {
+                    selectedWaypointIndex = toIndex;
+                    moveToIndexInput.value = toIndex;
+                    if (moveStatusLabel) moveStatusLabel.textContent = `Moved to ${toIndex}`;
+                    refreshCaveWaypointList();
+                    refreshCaveStatus();
+                    refreshCaveClosestStatus();
+                    refreshCaveTransitionStatus();
+                    refreshCavePresetControls();
+                    // Force‑scroll to the moved waypoint (even if cavebot is idle)
+                    scrollToWaypointIndex(toIndex, true);
+                    bot.log(`Moved waypoint to index ${toIndex}.`);
+                } else {
+                    bot.log("Failed to move waypoint.");
+                    if (moveStatusLabel) moveStatusLabel.textContent = "Move failed.";
+                }
+            });
+
+            // Press Enter in the input to trigger the move
+            moveToIndexInput.addEventListener("keydown", (e) => {
+                if (e.key === "Enter") {
+                    e.preventDefault();
+                    moveToIndexBtn.click();
+                }
+            });
+        }
 
         // Cave preset
         const presetSelect = panel.querySelector("#minibia-bot-cave-preset-select");
