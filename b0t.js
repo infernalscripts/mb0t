@@ -19673,6 +19673,209 @@ window.__minibiaBotBundle.installOutfitToggleModule = function installOutfitTogg
     };
 };
 
+/**
+ * ==================================================================================
+ * SHOVEL HOTKEY MODULE (Sprite or Blank)
+ * Shows the shovel sprite if available, otherwise blank (stealth).
+ * ==================================================================================
+ */
+window.__minibiaBotBundle.installShovelHotkeyModule = function installShovelHotkeyModule(bot) {
+    if (window.__shovelHotkeyInstalled) return;
+    window.__shovelHotkeyInstalled = true;
+
+    const SHOVEL_CID = 2556; // Standard shovel
+
+    const hotbarInstance = gameClient?.interface?.hotbarManager;
+    if (!hotbarInstance) {
+        console.warn("[ShovelHotkey] HotbarManager instance not found.");
+        return;
+    }
+
+    const HotbarManagerClass = hotbarInstance.constructor;
+    if (!HotbarManagerClass) {
+        console.warn("[ShovelHotkey] Cannot find HotbarManager constructor.");
+        return;
+    }
+
+    const proto = HotbarManagerClass.prototype;
+
+    // ---- Add action definition ----
+    proto.ACTIONS.shovelHole = {
+        name: "Shovel Nearest Hole",
+        icon: "", // no fallback emoji
+        bg: "#6b4a20",
+        border: "#cc8844",
+        fg: "#ffdd88"
+    };
+
+    // ---- Patch executor ----
+    if (!proto.__executeActionShovelPatched) {
+        const originalExecuteAction = proto.__executeAction;
+        proto.__executeAction = function(actionId) {
+            if (actionId === "shovelHole") {
+                return this.__shovelHole();
+            }
+            return originalExecuteAction.call(this, actionId);
+        };
+        proto.__executeActionShovelPatched = true;
+    }
+
+    // ---- Patch the renderer: try sprite, else blank ----
+    if (!proto.__drawActionIconShovelPatched) {
+        const originalDrawActionIcon = proto.__drawActionIcon;
+        proto.__drawActionIcon = function(slot) {
+            if (slot.action === "shovelHole") {
+                if (slot.canvas) {
+                    const ctx = slot.canvas.context;
+                    slot.canvas.clear();
+                    // Try to draw the actual shovel sprite
+                    try {
+                        const item = new Item(SHOVEL_CID, 1);
+                        // Check if the sprite is loadable (if gameClient.spriteBuffer exists and has the sprite)
+                        // We can also attempt a draw and catch any exceptions.
+                        slot.canvas.drawSprite(item, Position.prototype.NULL, 32);
+                    } catch (e) {
+                        // If sprite fails, leave it blank – no fallback
+                        // Already cleared
+                    }
+                }
+                return; // early exit – don't call original
+            }
+            return originalDrawActionIcon.call(this, slot);
+        };
+        proto.__drawActionIconShovelPatched = true;
+    }
+
+    // ---- Helper: find a shovel ----
+    proto.__findShovelInInventory = function() {
+        const player = gameClient.player;
+        if (!player) return null;
+
+        const equipment = player.equipment;
+        for (let i = 0; i < equipment.slots.length; i++) {
+            const item = equipment.getSlotItem(i);
+            if (item && this.__isShovelItem(item)) {
+                return { container: equipment, slotIndex: i, item: item };
+            }
+        }
+
+        const containers = Array.from(player.__openedContainers);
+        for (const container of containers) {
+            for (let i = 0; i < container.slots.length; i++) {
+                const item = container.getSlotItem(i);
+                if (item && this.__isShovelItem(item)) {
+                    return { container: container, slotIndex: i, item: item };
+                }
+            }
+        }
+
+        return null;
+    };
+
+    proto.__isShovelItem = function(item) {
+        if (!item) return false;
+        const def = gameClient.itemDefinitionsByCid ? gameClient.itemDefinitionsByCid[item.id] : null;
+        if (def && def.properties && def.properties.name) {
+            const name = def.properties.name.toLowerCase();
+            if (name.includes("shovel")) return true;
+        }
+        const shovelIds = [2556, 2557, 3102];
+        return shovelIds.includes(item.id);
+    };
+
+    // ---- Helper: find nearest shovel-targetable tile ----
+    proto.__findNearestShovelTarget = function() {
+        const playerPos = gameClient.player.getPosition();
+        if (!playerPos) return null;
+
+        const offsets = [
+            [0, 0], [0, -1], [1, -1], [1, 0], [1, 1],
+            [0, 1], [-1, 1], [-1, 0], [-1, -1]
+        ];
+
+        let bestTile = null;
+        let bestDist = Infinity;
+
+        for (const [dx, dy] of offsets) {
+            const x = playerPos.x + dx;
+            const y = playerPos.y + dy;
+            const z = playerPos.z;
+            const pos = new Position(x, y, z);
+            const tile = gameClient.world.getTileFromWorldPosition(pos);
+            if (!tile) continue;
+
+            if (this.__isShovelTargetTile(tile)) {
+                const dist = Math.abs(dx) + Math.abs(dy);
+                if (dist < bestDist) {
+                    bestDist = dist;
+                    bestTile = tile;
+                }
+            }
+        }
+
+        return bestTile;
+    };
+
+    proto.__isShovelTargetTile = function(tile) {
+        if (!tile) return false;
+        const things = [tile, ...(tile.items || [])];
+        for (const thing of things) {
+            if (!thing) continue;
+            const holeIds = [12396, 12400, 12401, 12402];
+            if (holeIds.includes(thing.id)) return true;
+            const def = gameClient.itemDefinitionsByCid ? gameClient.itemDefinitionsByCid[thing.id] : null;
+            if (def && def.properties && def.properties.name) {
+                const name = def.properties.name.toLowerCase();
+                if (name.includes("hole") ||
+                    name.includes("stone pile") ||
+                    name.includes("dirt pile") ||
+                    name.includes("loose stone") ||
+                    name.includes("grave") ||
+                    name.includes("sand pile") ||
+                    name.includes("bush")) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+
+    // ---- The main action ----
+    proto.__shovelHole = function() {
+        const shovelSource = this.__findShovelInInventory();
+        if (!shovelSource) {
+            gameClient.interface.setCancelMessage("You don't have a shovel.");
+            return;
+        }
+
+        const targetTile = this.__findNearestShovelTarget();
+        if (!targetTile) {
+            gameClient.interface.setCancelMessage("No hole or dirt pile nearby.");
+            return;
+        }
+
+        const from = { which: shovelSource.container, index: shovelSource.slotIndex };
+        const to = { which: targetTile, index: 0xFF };
+
+        try {
+            if (gameClient.mouse && typeof gameClient.mouse.__handleItemUseWith === 'function') {
+                gameClient.mouse.__handleItemUseWith(from, to);
+                return;
+            }
+            if (window.gameClient && gameClient.send && typeof ItemUseWithPacket === 'function') {
+                gameClient.send(new ItemUseWithPacket(from, to));
+                return;
+            }
+            gameClient.interface.setCancelMessage("Cannot use shovel on this tile.");
+        } catch (e) {
+            console.error("[ShovelHotkey] Error:", e);
+            gameClient.interface.setCancelMessage("Failed to use shovel.");
+        }
+    };
+
+    bot.log("[ShovelHotkey] Installed – shows shovel sprite if available, otherwise blank.");
+};
+
 
 /**
  * ==================================================================================
@@ -19767,6 +19970,7 @@ window.__minibiaBotBundle.installOutfitToggleModule = function installOutfitTogg
         currentBundle.installUiTweaksModule(bot);
         currentBundle.installCustomNotificationModule(bot);
         currentBundle.installOutfitToggleModule(bot);
+        currentBundle.installShovelHotkeyModule(bot);
 
         bot.ui.inject();
 
