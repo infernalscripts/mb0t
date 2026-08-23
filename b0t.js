@@ -9978,7 +9978,7 @@ window.__minibiaBotBundle.installExoriModule = function installExoriModule(bot) 
         enabled: false,
         spellWords: "exori",
         manaCost: 150,
-        cooldownMs: 6000,
+        cooldownMs: 5000,
         monsterCount: 3,
         range: 1,
     }, bot.storage.get(configStorageKey, {}));
@@ -14761,28 +14761,42 @@ function refreshCaveWaypointList() {
     }
 }
 
-    function scrollToWaypointIndex(index, force = false) {
-        const container = document.getElementById("minibia-bot-cave-waypoint-list");
-        if (!container) return;
-        if (!force && !bot.cave?.status?.().running) return;
-        if (index === undefined || index === null) {
-            // fallback to selected or current
+function scrollToWaypointIndex(index, force = false) {
+    const container = document.getElementById("minibia-bot-cave-waypoint-list");
+    if (!container) return;
+
+    // Only auto‑scroll if cavebot is running, unless forced
+    const isRunning = bot.cave?.status?.().running;
+    if (!force && !isRunning) return;
+
+    // Determine which index to scroll to
+    let targetIndex = index;
+
+    // If no index provided, choose:
+    // - If cavebot is running: use its current index (always follow the bot)
+    // - If cavebot is idle: use selectedWaypointIndex, else fallback to current
+    if (targetIndex === undefined || targetIndex === null) {
+        const status = bot.cave?.status?.();
+        if (!status || typeof status.currentIndex !== 'number') return;
+
+        if (isRunning) {
+            // ★ Running: always follow the bot's current index
+            targetIndex = status.currentIndex;
+        } else {
+            // Idle: use selected waypoint, or fallback to current
             if (selectedWaypointIndex !== null && selectedWaypointIndex >= 0) {
-                index = selectedWaypointIndex;
+                targetIndex = selectedWaypointIndex;
             } else {
-                const status = bot.cave?.status?.();
-                if (status && typeof status.currentIndex === 'number') {
-                    index = status.currentIndex;
-                } else {
-                    return;
-                }
+                targetIndex = status.currentIndex;
             }
         }
-        const rows = container.querySelectorAll("[data-index]");
-        if (index >= 0 && index < rows.length) {
-            rows[index].scrollIntoView({ block: "nearest", behavior: "smooth" });
-        }
     }
+
+    const rows = container.querySelectorAll("[data-index]");
+    if (targetIndex >= 0 && targetIndex < rows.length) {
+        rows[targetIndex].scrollIntoView({ block: "nearest", behavior: "smooth" });
+    }
+}
 
     // Keep an alias for backward compatibility (if any other code calls it)
     function scrollToSelectedWaypoint() {
@@ -19441,6 +19455,227 @@ window.__minibiaBotBundle.installCustomNotificationModule = function installCust
 
 /**
  * ==================================================================================
+ * OUTFIT TOGGLE MODULE (Stealth Mode)
+ * Hooks the "Outfit" button to completely hide/show the bot panel.
+ * Right‑click -> outfit window stays untouched.
+ * ==================================================================================
+ */
+window.__minibiaBotBundle.installOutfitToggleModule = function installOutfitToggleModule(bot) {
+    const configStorageKey = "minibiaBot.outfitToggle.config";
+    const HIDDEN_STORAGE_KEY = "minibiaBot.ui.panelHidden";
+    const state = {
+        installed: false,
+        observer: null,
+        button: null,
+        listener: null,
+        originalOnClick: null,
+    };
+
+    // Load config
+    const config = Object.assign({
+        enabled: true,
+    }, bot.storage.get(configStorageKey, {}));
+
+    function persistConfig() {
+        bot.storage.set(configStorageKey, { enabled: config.enabled });
+    }
+
+    // ---- Core functions ----
+    function getPanel() {
+        return document.getElementById("minibia-bot-panel");
+    }
+
+    function isPanelHidden() {
+        const panel = getPanel();
+        if (!panel) return false;
+        return panel.style.display === "none" || panel.dataset.hidden === "true";
+    }
+
+    function saveHiddenState(hidden) {
+        bot.storage.set(HIDDEN_STORAGE_KEY, hidden);
+    }
+
+    function loadHiddenState() {
+        return bot.storage.get(HIDDEN_STORAGE_KEY, false);
+    }
+
+    function applyHiddenState(hidden) {
+        const panel = getPanel();
+        if (!panel) return;
+        if (hidden) {
+            panel.style.display = "none";
+            panel.dataset.hidden = "true";
+        } else {
+            panel.style.display = ""; // revert to CSS default (flex)
+            panel.dataset.hidden = "false";
+        }
+        saveHiddenState(hidden);
+    }
+
+    function togglePanel() {
+        const panel = getPanel();
+        if (!panel) {
+            bot.log("[OutfitToggle] Panel not found.");
+            return;
+        }
+        const hidden = panel.style.display === "none" || panel.dataset.hidden === "true";
+        applyHiddenState(!hidden);
+    }
+
+    // ---- Install/uninstall hook ----
+    function installHook(btn) {
+        if (state.installed) return;
+        if (!btn) return;
+
+        // Store original onclick property
+        state.originalOnClick = btn.onclick;
+
+        // Clone and replace to remove all existing listeners
+        const newBtn = btn.cloneNode(true);
+        btn.parentNode.replaceChild(newBtn, btn);
+        state.button = newBtn;
+
+        // Create our click handler
+        const handler = function(event) {
+            event.preventDefault();
+            event.stopPropagation();
+            togglePanel();
+        };
+        newBtn.addEventListener("click", handler);
+        state.listener = handler;
+
+        // Apply initial hidden state
+        const hidden = loadHiddenState();
+        applyHiddenState(hidden);
+
+        state.installed = true;
+        bot.log("[OutfitToggle] Installed – left-click toggles panel visibility.");
+    }
+
+    function uninstallHook() {
+        if (!state.installed) return;
+
+        // Remove our listener
+        if (state.button && state.listener) {
+            state.button.removeEventListener("click", state.listener);
+        }
+
+        // Restore original behaviour
+        if (state.button) {
+            if (state.originalOnClick) {
+                state.button.onclick = state.originalOnClick;
+            } else {
+                // Default outfit button behaviour: open outfit modal
+                state.button.onclick = function(e) {
+                    e.preventDefault();
+                    if (gameClient && gameClient.interface && gameClient.interface.modalManager) {
+                        gameClient.interface.modalManager.open("outfit-modal");
+                    }
+                };
+            }
+        }
+
+        // Show panel if hidden (restore visibility)
+        applyHiddenState(false);
+
+        state.installed = false;
+        state.button = null;
+        state.listener = null;
+        state.originalOnClick = null;
+        bot.log("[OutfitToggle] Uninstalled.");
+    }
+
+    // ---- Find the button ----
+    function findAndHook() {
+        if (state.installed) return;
+        if (state.observer) {
+            state.observer.disconnect();
+            state.observer = null;
+        }
+
+        const btn = document.getElementById("openOutfit");
+        if (btn) {
+            installHook(btn);
+            return;
+        }
+
+        // Wait for the button to appear
+        state.observer = new MutationObserver(function() {
+            const el = document.getElementById("openOutfit");
+            if (el) {
+                state.observer.disconnect();
+                state.observer = null;
+                installHook(el);
+            }
+        });
+        state.observer.observe(document.body, { childList: true, subtree: true });
+    }
+
+    // ---- Public API ----
+    function start() {
+        if (config.enabled) return false;
+        config.enabled = true;
+        persistConfig();
+        findAndHook();
+        bot.log("[OutfitToggle] Enabled.");
+        return true;
+    }
+
+    function stop() {
+        if (!config.enabled) return false;
+        config.enabled = false;
+        persistConfig();
+        uninstallHook();
+        if (state.observer) {
+            state.observer.disconnect();
+            state.observer = null;
+        }
+        bot.log("[OutfitToggle] Disabled.");
+        return true;
+    }
+
+    function status() {
+        return {
+            running: config.enabled,
+            installed: state.installed,
+            panelHidden: isPanelHidden(),
+            config: { ...config },
+        };
+    }
+
+    function updateConfig(next) {
+        if (next.enabled !== undefined) {
+            if (next.enabled) start();
+            else stop();
+        }
+        return { ...config };
+    }
+
+    // ---- Auto‑start if enabled ----
+    if (config.enabled) {
+        setTimeout(findAndHook, 500);
+        bot.addCleanup(function() {
+            if (state.observer) state.observer.disconnect();
+            uninstallHook();
+        });
+    }
+
+    bot.outfitToggle = {
+        start,
+        stop,
+        status,
+        updateConfig,
+        config,
+        // Additional helpers
+        hidePanel: function() { applyHiddenState(true); },
+        showPanel: function() { applyHiddenState(false); },
+        togglePanel: togglePanel,
+    };
+};
+
+
+/**
+ * ==================================================================================
  * 15. BOOTSTRAP
  *     Creates the bot, installs all modules, and exposes it globally.
  *     Also implements hot‑reload.
@@ -19531,6 +19766,7 @@ window.__minibiaBotBundle.installCustomNotificationModule = function installCust
         currentBundle.installPanel(bot);
         currentBundle.installUiTweaksModule(bot);
         currentBundle.installCustomNotificationModule(bot);
+        currentBundle.installOutfitToggleModule(bot);
 
         bot.ui.inject();
 
