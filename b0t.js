@@ -2771,10 +2771,9 @@ window.__minibiaBotBundle.installRuneModule = function installRuneModule(bot) {
 
 /**
  * ==================================================================================
- * 6. HEAL MODULE
- *    Manages a list of heal rules. Each rule defines a hotbar slot (or spell words),
- *    HP and MP percentage ranges, and a mana cost. Rules are evaluated in order,
- *    and the first matching rule triggers. Supports confirming if the heal succeeded.
+ * 6. HEAL MODULE (with Exhaustion Check)
+ *    Manages a list of heal rules. Skips if the hotbar slot or spell is on cooldown,
+ *    or if the player is globally exhausted.
  * ==================================================================================
  */
 window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
@@ -2785,243 +2784,380 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
         lastHealAt: {},
         lastAttemptAt: {},
         pendingAttempt: {},
+        manualCooldownUntil: {},
     };
 
     const config = Object.assign({
         tickMs: 50,
-        healCooldownMs: 1200,
+        healCooldownMs: 1500,          // increased to cover exhaustion
         healRetryMs: 200,
         healConfirmMs: 250,
         enabled: false,
-        healRules: []
-    },
-            bot.storage.get(configStorageKey, {}));
+        healRules: [],
+        skipOnCooldown: true,
+        debugCooldown: false,
+    }, bot.storage.get(configStorageKey, {}));
 
-    // Clean old legacy keys
     delete config.hpHotbarSlot;
     delete config.manaHotbarSlot;
     delete config.minHp;
     delete config.minMana;
 
-    // Backward compatibility: convert old threshold-based rules to range-based
     if (config.healRules && config.healRules.length > 0) {
         const first = config.healRules[0];
         if (first.thresholdPercent !== undefined && first.minHpPercent === undefined) {
-            config.healRules = config.healRules.map(r => ({
-                        slot: r.slot || 1,
-                        spellWords: r.spellWords || "",
-                        manaCost: 0,
-                        minHpPercent: r.type === "hp" ? 0 : 0,
-                        maxHpPercent: r.type === "hp" ? r.thresholdPercent : 100,
-                        minManaPercent: r.type === "mana" ? 0 : 0,
-                        maxManaPercent: r.type === "mana" ? r.thresholdPercent : 100,
-                    }));
+            config.healRules = config.healRules.map(function(r) {
+                return {
+                    slot: r.slot || 1,
+                    spellWords: r.spellWords || "",
+                    manaCost: 0,
+                    minHpPercent: r.type === "hp" ? 0 : 0,
+                    maxHpPercent: r.type === "hp" ? r.thresholdPercent : 100,
+                    minManaPercent: r.type === "mana" ? 0 : 0,
+                    maxManaPercent: r.type === "mana" ? r.thresholdPercent : 100,
+                };
+            });
             bot.storage.set(configStorageKey, config);
         }
     }
 
     function persistConfig() {
         bot.storage.set(configStorageKey, {
-            ...config
+            tickMs: config.tickMs,
+            healCooldownMs: config.healCooldownMs,
+            healRetryMs: config.healRetryMs,
+            healConfirmMs: config.healConfirmMs,
+            enabled: config.enabled,
+            healRules: config.healRules,
+            skipOnCooldown: config.skipOnCooldown,
+            debugCooldown: config.debugCooldown,
         });
     }
 
     function readStats() {
-        const ps = bot.getPlayerSnapshot?.();
+        var ps = bot.getPlayerSnapshot ? bot.getPlayerSnapshot() : null;
         return ps ? {
-            hp: {
-                current: Number(ps.health ?? 0),
-                max: Number(ps.maxHealth ?? 0)
-            },
-            mana: {
-                current: Number(ps.mana ?? 0),
-                max: Number(ps.maxMana ?? 0)
-            },
-        }
-         : {
-            hp: null,
-            mana: null
-        };
+            hp: { current: Number(ps.health || 0), max: Number(ps.maxHealth || 0) },
+            mana: { current: Number(ps.mana || 0), max: Number(ps.maxMana || 0) },
+        } : { hp: null, mana: null };
     }
 
     function normalizeHotbarSlot(slot) {
-        const v = Number(slot);
-        if (!Number.isFinite(v))
-            return null;
-        const n = Math.trunc(v);
-        if (n < 1 || n > 12)
-            return null;
+        var v = Number(slot);
+        if (!isFinite(v)) return null;
+        var n = Math.trunc(v);
+        if (n < 1 || n > 12) return null;
         return n;
     }
 
     function getHpPercent(stats) {
-        if (!stats?.hp || !stats.hp.max)
-            return 100;
+        if (!stats || !stats.hp || !stats.hp.max) return 100;
         return (stats.hp.current / stats.hp.max) * 100;
     }
 
     function getManaPercent(stats) {
-        if (!stats?.mana || !stats.mana.max)
-            return 100;
+        if (!stats || !stats.mana || !stats.mana.max) return 100;
         return (stats.mana.current / stats.mana.max) * 100;
     }
 
     function hasPending() {
-        return Object.keys(state.pendingAttempt).some(k => state.pendingAttempt[k] !== null);
+        var keys = Object.keys(state.pendingAttempt);
+        for (var i = 0; i < keys.length; i++) {
+            if (state.pendingAttempt[keys[i]] !== null) return true;
+        }
+        return false;
     }
 
     function didSucceed(stats, attempt) {
-        if (!stats || !attempt)
-            return false;
-        const hpUp = stats.hp ? stats.hp.current > attempt.hpBefore : false;
-        const manaUp = stats.mana ? stats.mana.current > attempt.manaBefore : false;
+        if (!stats || !attempt) return false;
+        var hpUp = stats.hp ? stats.hp.current > attempt.hpBefore : false;
+        var manaUp = stats.mana ? stats.mana.current > attempt.manaBefore : false;
         return hpUp || manaUp;
     }
 
     function resolvePending(stats, now) {
-        Object.keys(state.pendingAttempt).forEach(slotKey => {
-            const a = state.pendingAttempt[slotKey];
-            if (!a)
-                return;
+        var keys = Object.keys(state.pendingAttempt);
+        for (var i = 0; i < keys.length; i++) {
+            var slotKey = keys[i];
+            var a = state.pendingAttempt[slotKey];
+            if (!a) continue;
             if (didSucceed(stats, a)) {
                 state.lastHealAt[slotKey] = a.attemptedAt;
                 state.pendingAttempt[slotKey] = null;
-                //bot.log("confirmed heal", { slot: a.slot });
             } else if (now - a.attemptedAt >= (config.healConfirmMs || 250)) {
                 state.pendingAttempt[slotKey] = null;
-                //bot.log("heal did not register", { slot: a.slot });
             }
-        });
+        }
+    }
+
+    // ---- Exhaustion check ----
+    function isPlayerExhausted() {
+        var player = gameClient ? gameClient.player : null;
+        if (!player) return false;
+
+        // 1. Check spellbook global cooldown
+        var spellbook = player.spellbook;
+        if (spellbook) {
+            var globalCd = spellbook.cooldowns ? spellbook.cooldowns.get(spellbook.GLOBAL_COOLDOWN) : null;
+            if (globalCd && performance.now() < globalCd) {
+                if (config.debugCooldown) bot.log("[Heal] Player exhausted (global cooldown)");
+                return true;
+            }
+        }
+
+        // 2. Check player.state.exhausted (if exists)
+        if (player.state && typeof player.state.exhausted === 'number' && player.state.exhausted > 0) {
+            if (config.debugCooldown) bot.log("[Heal] Player exhausted (state.exhausted)");
+            return true;
+        }
+
+        // 3. Check player.getGlobalCooldown method
+        if (typeof player.getGlobalCooldown === 'function') {
+            var cd = player.getGlobalCooldown();
+            if (cd && cd > 0) {
+                if (config.debugCooldown) bot.log("[Heal] Player exhausted (getGlobalCooldown)");
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // ---- Slot cooldown detection ----
+    function isSlotOnCooldown(slotIndex) {
+        var hm = gameClient && gameClient.interface && gameClient.interface.hotbarManager;
+        if (!hm) {
+            if (config.debugCooldown) bot.log("[Heal] No hotbar manager");
+            return false;
+        }
+        var slot = hm.slots[slotIndex];
+        if (!slot) {
+            if (config.debugCooldown) bot.log("[Heal] No slot at index " + slotIndex);
+            return false;
+        }
+
+        if (config.debugCooldown) {
+            bot.log("[Heal] Checking slot " + slotIndex + ": item=" + (!!slot.item) + ", spell=" + (!!slot.spell) + ", action=" + (!!slot.action) + ", text=" + (!!slot.text));
+        }
+
+        // Item (rune or fluid)
+        if (slot.item !== null) {
+            var def = gameClient.itemDefinitionsByCid ? gameClient.itemDefinitionsByCid[slot.item.id] : null;
+            if (!def) {
+                if (config.debugCooldown) bot.log("[Heal] No definition for CID " + slot.item.id);
+                return false;
+            }
+            if (def.properties && def.properties.type === "rune") {
+                var isAttack = def.properties.aggressive !== false;
+                var cd = hm.__getRuneEffectiveCooldown ? hm.__getRuneEffectiveCooldown(isAttack) : null;
+                if (cd) {
+                    var now = performance.now();
+                    if (cd.until > now) {
+                        if (config.debugCooldown) bot.log("[Heal] Rune on cooldown (" + ((cd.until - now) / 1000).toFixed(1) + "s)");
+                        return true;
+                    }
+                } else {
+                    if (config.debugCooldown) bot.log("[Heal] No rune cooldown object");
+                }
+                return false;
+            }
+            if (def.properties && def.properties.type === "fluidContainer") {
+                var cd = hm.__getFluidEffectiveCooldown ? hm.__getFluidEffectiveCooldown() : null;
+                if (cd && performance.now() < cd.until) {
+                    if (config.debugCooldown) bot.log("[Heal] Fluid on cooldown");
+                    return true;
+                }
+                return false;
+            }
+            return false;
+        }
+
+        // Spell
+        if (slot.spell !== null) {
+            var spellbook = gameClient.player ? gameClient.player.spellbook : null;
+            if (!spellbook) {
+                if (config.debugCooldown) bot.log("[Heal] No spellbook");
+                return false;
+            }
+            var now2 = performance.now();
+            var sid = slot.spell.sid;
+            var cd2 = spellbook.cooldowns ? spellbook.cooldowns.get(sid) : null;
+            if (cd2 && cd2 > now2) {
+                if (config.debugCooldown) bot.log("[Heal] Spell cooldown (" + ((cd2 - now2) / 1000).toFixed(1) + "s)");
+                return true;
+            }
+            var globalCd = spellbook.cooldowns ? spellbook.cooldowns.get(spellbook.GLOBAL_COOLDOWN) : null;
+            if (globalCd && globalCd > now2) {
+                if (config.debugCooldown) bot.log("[Heal] Global cooldown (" + ((globalCd - now2) / 1000).toFixed(1) + "s)");
+                return true;
+            }
+            return false;
+        }
+
+        return false;
+    }
+
+    function isSpellWordOnCooldown(spellWords) {
+        var spells = gameClient.interface ? gameClient.interface.SPELLS : null;
+        if (!spells) {
+            if (config.debugCooldown) bot.log("[Heal] No spells map");
+            return false;
+        }
+        var normalized = spellWords.trim().toLowerCase();
+        var found = false;
+        for (var [sid, spell] of spells) {
+            if (spell.words && spell.words.toLowerCase() === normalized) {
+                found = true;
+                var spellbook = gameClient.player ? gameClient.player.spellbook : null;
+                if (!spellbook) {
+                    if (config.debugCooldown) bot.log("[Heal] No spellbook for spell words");
+                    return false;
+                }
+                var now = performance.now();
+                var cd = spellbook.cooldowns ? spellbook.cooldowns.get(sid) : null;
+                if (cd && cd > now) {
+                    if (config.debugCooldown) bot.log("[Heal] Spell words on cooldown (" + ((cd - now) / 1000).toFixed(1) + "s)");
+                    return true;
+                }
+                var globalCd = spellbook.cooldowns ? spellbook.cooldowns.get(spellbook.GLOBAL_COOLDOWN) : null;
+                if (globalCd && globalCd > now) {
+                    if (config.debugCooldown) bot.log("[Heal] Global cooldown (" + ((globalCd - now) / 1000).toFixed(1) + "s)");
+                    return true;
+                }
+                return false;
+            }
+        }
+        if (config.debugCooldown && !found) bot.log("[Heal] Spell \"" + spellWords + "\" not found in spells list");
+        return false;
     }
 
     function canUseRule(rule, now, stats) {
-        const slot = normalizeHotbarSlot(rule.slot);
-        if (!slot)
-            return false;
-        const key = String(slot);
-        if (state.pendingAttempt[key])
-            return false;
-        if (now - (state.lastHealAt[key] || 0) < config.healCooldownMs)
-            return false;
-        if (now - (state.lastAttemptAt[key] || 0) < (config.healRetryMs || 200))
-            return false;
+        var slot = normalizeHotbarSlot(rule.slot);
+        if (!slot) return false;
+        var key = String(slot);
 
-        const hp = getHpPercent(stats);
-        const mana = getManaPercent(stats);
-        const minHp = Number(rule.minHpPercent) ?? 0;
-        const maxHp = Number(rule.maxHpPercent) ?? 100;
-        const minMana = Number(rule.minManaPercent) ?? 0;
-        const maxMana = Number(rule.maxManaPercent) ?? 100;
+        if (state.pendingAttempt[key]) return false;
 
-        if (hp < minHp || hp > maxHp)
+        // Manual cooldown (fallback)
+        if (state.manualCooldownUntil[key] && now < state.manualCooldownUntil[key]) {
+            if (config.debugCooldown) bot.log("[Heal] Manual cooldown active for slot " + slot);
             return false;
-        if (mana < minMana || mana > maxMana)
-            return false;
-
-        // Spell requires mana
-        if (rule.spellWords && rule.spellWords.trim()) {
-            const cost = Math.max(1, Number(rule.manaCost) || 0);
-            if (stats.mana.current < cost)
-                return false;
         }
-        if (stats.hp.current <= 0)
-            return false; // dead
+
+        // Own per-slot cooldown
+        if (now - (state.lastHealAt[key] || 0) < config.healCooldownMs) return false;
+        if (now - (state.lastAttemptAt[key] || 0) < (config.healRetryMs || 200)) return false;
+
+        // HP/MP conditions
+        var hp = getHpPercent(stats);
+        var mana = getManaPercent(stats);
+        var minHp = Number(rule.minHpPercent) || 0;
+        var maxHp = Number(rule.maxHpPercent) || 100;
+        var minMana = Number(rule.minManaPercent) || 0;
+        var maxMana = Number(rule.maxManaPercent) || 100;
+
+        if (hp < minHp || hp > maxHp) return false;
+        if (mana < minMana || mana > maxMana) return false;
+
+        if (rule.spellWords && rule.spellWords.trim()) {
+            var cost = Math.max(1, Number(rule.manaCost) || 0);
+            if (stats.mana.current < cost) return false;
+        }
+        if (stats.hp.current <= 0) return false;
+
+        // ---- ★ Exhaustion check (global cooldown) ----
+        if (isPlayerExhausted()) {
+            if (config.debugCooldown) bot.log("[Heal] Skipping due to exhaustion");
+            return false;
+        }
+
+        // ---- ★ Slot-specific cooldown ----
+        if (config.skipOnCooldown) {
+            if (rule.spellWords && rule.spellWords.trim()) {
+                if (isSpellWordOnCooldown(rule.spellWords.trim())) return false;
+            } else {
+                if (isSlotOnCooldown(slot - 1)) return false;
+            }
+        }
+
         return true;
     }
 
     function triggerRule(rule, now, stats) {
-        if (!canUseRule(rule, now, stats))
-            return false;
-        const slot = normalizeHotbarSlot(rule.slot);
-        const key = String(slot);
+        if (!canUseRule(rule, now, stats)) return false;
+        var slot = normalizeHotbarSlot(rule.slot);
+        var key = String(slot);
+
+        // Set manual cooldown to prevent spam (fallback)
+        state.manualCooldownUntil[key] = now + config.healCooldownMs;
 
         if (rule.spellWords && rule.spellWords.trim()) {
-            const sent = bot.sendChat(rule.spellWords.trim());
+            var sent = bot.sendChat(rule.spellWords.trim());
             if (sent) {
                 state.lastAttemptAt[key] = now;
-                state.pendingAttempt[key] = {
-                    attemptedAt: now,
-                    slot,
-                    hpBefore: stats.hp.current,
-                    manaBefore: stats.mana.current,
-                };
-                //bot.log("cast spell", { slot, words: rule.spellWords });
+                state.pendingAttempt[key] = { attemptedAt: now, slot: slot, hpBefore: stats.hp.current, manaBefore: stats.mana.current };
+                if (config.debugCooldown) bot.log("[Heal] Sent spell: " + rule.spellWords);
             }
             return sent;
         }
 
-        const clicked = bot.clickHotbar(slot - 1);
+        var clicked = bot.clickHotbar(slot - 1);
         if (clicked) {
             state.lastAttemptAt[key] = now;
-            state.pendingAttempt[key] = {
-                attemptedAt: now,
-                slot,
-                hpBefore: stats.hp.current,
-                manaBefore: stats.mana.current,
-            };
-            bot.log("pressed hotkey", {
-                slot
-            });
+            state.pendingAttempt[key] = { attemptedAt: now, slot: slot, hpBefore: stats.hp.current, manaBefore: stats.mana.current };
+            if (config.debugCooldown) bot.log("[Heal] Clicked hotbar slot " + slot);
         }
         return clicked;
     }
 
     function tryHeal() {
-        if (!config.enabled)
-            return false;
-        const now = Date.now();
-        const stats = readStats();
+        if (!config.enabled) return false;
+        var now = Date.now();
+        var stats = readStats();
         resolvePending(stats, now);
-        if (hasPending())
-            return false;
+        if (hasPending()) return false;
 
-        for (const rule of config.healRules || []) {
-            if (!rule || !rule.slot)
-                continue;
-            if (triggerRule(rule, now, stats))
-                return true;
+        for (var i = 0; i < config.healRules.length; i++) {
+            var rule = config.healRules[i];
+            if (!rule || !rule.slot) continue;
+            if (triggerRule(rule, now, stats)) return true;
         }
         return false;
     }
 
     function scheduleNextTick() {
-        if (!state.running)
-            return;
-        state.timerId = setTimeout(() => tick(), config.tickMs);
+        if (!state.running) return;
+        state.timerId = setTimeout(function() { tick(); }, config.tickMs);
     }
 
     function tick() {
-        if (!state.running)
-            return;
+        if (!state.running) return;
         try {
             tryHeal();
         } catch (e) {
-            bot.log("auto heal tick failed", e?.message || e);
+            bot.log("auto heal tick failed", e ? e.message : e);
         } finally {
             scheduleNextTick();
         }
     }
 
-    function start(overrides = {}) {
-        Object.assign(config, overrides, {
-            enabled: true
-        });
+    function start(overrides) {
+        overrides = overrides || {};
+        for (var k in overrides) config[k] = overrides[k];
+        config.enabled = true;
         persistConfig();
-        if (state.running)
-            return false;
+        if (state.running) return false;
         state.running = true;
-        bot.log("auto heal started", {
-            rules: config.healRules
-        });
+        bot.log("auto heal started", { rules: config.healRules, skipOnCooldown: config.skipOnCooldown });
         tick();
         return true;
     }
 
-    function stop(options = {}) {
-        const persist = options.persistEnabled !== false;
+    function stop(options) {
+        options = options || {};
+        var persist = options.persistEnabled !== false;
         state.running = false;
-        if (state.timerId)
-            clearTimeout(state.timerId);
+        if (state.timerId) clearTimeout(state.timerId);
         state.timerId = null;
         if (persist) {
             config.enabled = false;
@@ -3032,61 +3168,61 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
     }
 
     function status() {
-        const stats = readStats();
+        var stats = readStats();
         return {
             running: state.running,
             config: {
-                ...config
+                tickMs: config.tickMs,
+                healCooldownMs: config.healCooldownMs,
+                healRetryMs: config.healRetryMs,
+                healConfirmMs: config.healConfirmMs,
+                enabled: config.enabled,
+                healRules: config.healRules,
+                skipOnCooldown: config.skipOnCooldown,
+                debugCooldown: config.debugCooldown,
             },
-            stats,
+            stats: stats,
             hpPercent: getHpPercent(stats),
             manaPercent: getManaPercent(stats),
-            lastHealAt: {
-                ...state.lastHealAt
-            },
-            pendingAttempt: {
-                ...state.pendingAttempt
-            },
+            lastHealAt: state.lastHealAt,
+            pendingAttempt: state.pendingAttempt,
         };
     }
 
     function updateConfig(next) {
         if (next.healRules) {
-            next.healRules = next.healRules.map(r => ({
-                        slot: normalizeHotbarSlot(r.slot) || 1,
-                        spellWords: String(r.spellWords || "").trim(),
-                        manaCost: Math.max(0, Number(r.manaCost) || 0),
-                        minHpPercent: Math.max(0, Math.min(100, Number(r.minHpPercent) ?? 0)),
-                        maxHpPercent: Math.max(0, Math.min(100, Number(r.maxHpPercent) ?? 100)),
-                        minManaPercent: Math.max(0, Math.min(100, Number(r.minManaPercent) ?? 0)),
-                        maxManaPercent: Math.max(0, Math.min(100, Number(r.maxManaPercent) ?? 100)),
-                    }));
+            next.healRules = next.healRules.map(function(r) {
+                return {
+                    slot: normalizeHotbarSlot(r.slot) || 1,
+                    spellWords: String(r.spellWords || "").trim(),
+                    manaCost: Math.max(0, Number(r.manaCost) || 0),
+                    minHpPercent: Math.max(0, Math.min(100, Number(r.minHpPercent) || 0)),
+                    maxHpPercent: Math.max(0, Math.min(100, Number(r.maxHpPercent) || 100)),
+                    minManaPercent: Math.max(0, Math.min(100, Number(r.minManaPercent) || 0)),
+                    maxManaPercent: Math.max(0, Math.min(100, Number(r.maxManaPercent) || 100)),
+                };
+            });
         }
-        Object.assign(config, next);
+        for (var k in next) config[k] = next[k];
         delete config.hpHotbarSlot;
         delete config.manaHotbarSlot;
         delete config.minHp;
         delete config.minMana;
         persistConfig();
-        bot.log("auto heal config updated", {
-            ...config
-        });
-        return {
-            ...config
-        };
+        bot.log("auto heal config updated", { rules: config.healRules });
+        return { rules: config.healRules, skipOnCooldown: config.skipOnCooldown };
     }
 
-    if (config.enabled)
-        start();
+    if (config.enabled) start();
 
     bot.heal = {
-        start,
-        stop,
-        status,
-        updateConfig,
-        readStats,
-        tryHeal,
-        config,
+        start: start,
+        stop: stop,
+        status: status,
+        updateConfig: updateConfig,
+        readStats: readStats,
+        tryHeal: tryHeal,
+        config: config,
     };
 };
 
