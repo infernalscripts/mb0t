@@ -20014,41 +20014,29 @@ window.__minibiaBotBundle.installShovelHotkeyModule = function installShovelHotk
 
 /**
  * ==================================================================================
- * MOBILE STEALTH TOGGLE MODULE (with Debug Mode)
- * Adds a button in the top‑right corner to hide/show the bot panel.
+ * KEYRING STEALTH TOGGLE MODULE
+ * Hooks the "Keys" button to hide/show the bot panel.
  * ==================================================================================
  */
-window.__minibiaBotBundle.installMobileStealthToggleModule = function installMobileStealthToggleModule(bot) {
-    const configStorageKey = "minibiaBot.stealthToggle.config";
+window.__minibiaBotBundle.installKeyringStealthToggleModule = function installKeyringStealthToggleModule(bot) {
+    const configStorageKey = "minibiaBot.keyringToggle.config";
 
     const config = Object.assign({
         enabled: true,
-        buttonSize: 44,
-        top: 10,
-        right: 10,
-        opacity: 0.01,          // 0 = invisible
-        color: "#ffcc00",
-        debug: false,        // ★ set to true to see a red square
     }, bot.storage.get(configStorageKey, {}));
 
-    let buttonElement = null;
+    let button = null;
+    let originalClickHandler = null;
+    let isHooked = false;
 
     function persist() {
-        bot.storage.set(configStorageKey, {
-            enabled: config.enabled,
-            buttonSize: config.buttonSize,
-            top: config.top,
-            right: config.right,
-            opacity: config.opacity,
-            color: config.color,
-            debug: config.debug,
-        });
+        bot.storage.set(configStorageKey, { enabled: config.enabled });
     }
 
     function togglePanel() {
         const panel = document.getElementById("minibia-bot-panel");
         if (!panel) {
-            bot.log("[StealthToggle] Panel not found.");
+            bot.log("[KeyringToggle] Panel not found.");
             return;
         }
 
@@ -20056,116 +20044,113 @@ window.__minibiaBotBundle.installMobileStealthToggleModule = function installMob
         panel.style.display = hidden ? "" : "none";
         panel.dataset.hidden = hidden ? "false" : "true";
         bot.storage.set("minibiaBot.ui.panelHidden", !hidden);
-        bot.log("[StealthToggle] Panel " + (hidden ? "shown" : "hidden"));
+        bot.log("[KeyringToggle] Panel " + (hidden ? "shown" : "hidden"));
     }
 
-    function createButton() {
-        if (buttonElement) return;
+    function hookButton() {
+        if (isHooked) return;
 
-        buttonElement = document.createElement("div");
-        buttonElement.style.position = "fixed";
-        buttonElement.style.top = config.top + "px";
-        buttonElement.style.right = config.right + "px";
-        buttonElement.style.width = config.buttonSize + "px";
-        buttonElement.style.height = config.buttonSize + "px";
-        buttonElement.style.zIndex = "99999999";   // ★ very high
-        buttonElement.style.pointerEvents = "auto";
-        buttonElement.style.cursor = "pointer";
-
-        if (config.debug) {
-            // ★ Debug mode: bright red, fully visible
-            buttonElement.style.opacity = "1";
-            buttonElement.style.background = "#ff0000";
-            buttonElement.style.border = "3px solid #ffffff";
-            buttonElement.style.borderRadius = "4px";
-            buttonElement.style.boxShadow = "0 0 20px rgba(255,0,0,0.8)";
-            bot.log("[StealthToggle] DEBUG MODE – red square visible.");
-        } else {
-            buttonElement.style.opacity = config.opacity;
-            buttonElement.style.background = config.color;
-            buttonElement.style.borderRadius = "50%";
-            buttonElement.style.boxShadow = "0 0 4px rgba(0,0,0,0.3)";
+        button = document.getElementById("keyring");
+        if (!button) {
+            // Retry later if button not yet loaded
+            setTimeout(hookButton, 500);
+            return;
         }
 
-        buttonElement.addEventListener("click", togglePanel);
-        buttonElement.addEventListener("touchstart", function(e) {
+        // Store original click handler (if any)
+        originalClickHandler = button.onclick;
+
+        // Remove all existing listeners by cloning and replacing
+        const newButton = button.cloneNode(true);
+        button.parentNode.replaceChild(newButton, button);
+        button = newButton;
+
+        // Attach our toggle handler
+        button.addEventListener("click", function(e) {
             e.preventDefault();
+            e.stopPropagation();
             togglePanel();
         });
 
-        document.body.appendChild(buttonElement);
-        bot.log("[StealthToggle] Button created.");
+        isHooked = true;
+        bot.log("[KeyringToggle] Hooked the Keys button.");
 
-        // ★ Log position for debugging
-        const rect = buttonElement.getBoundingClientRect();
-        bot.log("[StealthToggle] Button rect: " + JSON.stringify(rect));
-    }
-
-    function removeButton() {
-        if (buttonElement) {
-            buttonElement.remove();
-            buttonElement = null;
-        }
-    }
-
-    function start() {
-        if (config.enabled) return;
-        config.enabled = true;
-        persist();
-        createButton();
-
+        // Restore hidden state
         const hidden = bot.storage.get("minibiaBot.ui.panelHidden", false);
         const panel = document.getElementById("minibia-bot-panel");
         if (panel && hidden) {
             panel.style.display = "none";
             panel.dataset.hidden = "true";
         }
-        bot.log("[StealthToggle] Enabled.");
+    }
+
+    function unhook() {
+        if (!isHooked || !button) return;
+        // Restore original click handler if possible
+        if (originalClickHandler) {
+            button.onclick = originalClickHandler;
+        } else {
+            // If no original handler, remove our listener (but we need to keep a reference)
+            // Since we used addEventListener, we'd need to remove it, but we replaced the button,
+            // so we can just replace it back with the original button or do nothing.
+            // Simpler: we can remove the button and let the game recreate it on next login.
+            // But for simplicity, we'll just detach our listener.
+            // However, we cloned and replaced, so the original is gone.
+            // We can set the button's onclick to null or restore the original DOM element.
+            // For a clean disable, we'll just remove our handler.
+            // We stored originalClickHandler, so we can set it back.
+            button.onclick = originalClickHandler;
+        }
+        isHooked = false;
+        bot.log("[KeyringToggle] Unhooked the Keys button.");
+    }
+
+    function start() {
+        if (config.enabled) return;
+        config.enabled = true;
+        persist();
+        hookButton();
+        bot.log("[KeyringToggle] Enabled.");
     }
 
     function stop() {
         if (!config.enabled) return;
         config.enabled = false;
         persist();
-        removeButton();
+        unhook();
+        // Show panel if hidden
         const panel = document.getElementById("minibia-bot-panel");
         if (panel && panel.style.display === "none") {
             panel.style.display = "";
             panel.dataset.hidden = "false";
             bot.storage.set("minibiaBot.ui.panelHidden", false);
         }
-        bot.log("[StealthToggle] Disabled.");
+        bot.log("[KeyringToggle] Disabled.");
     }
 
     function status() {
         return {
             running: config.enabled,
-            config: { ...config },
-            buttonExists: !!buttonElement,
+            hooked: isHooked,
+            buttonExists: !!document.getElementById("keyring"),
         };
     }
 
     function updateConfig(next) {
-        for (const k in next) {
-            if (k === "enabled") {
-                if (next.enabled) start();
-                else stop();
-            } else {
-                config[k] = next[k];
-            }
+        if (next.enabled !== undefined) {
+            if (next.enabled) start();
+            else stop();
         }
-        persist();
-        // Recreate button to apply new styles
-        removeButton();
-        createButton();
         return { ...config };
     }
 
+    // Auto‑start if enabled
     if (config.enabled) {
-        setTimeout(start, 500);
+        // Wait for UI to load
+        setTimeout(hookButton, 1000);
     }
 
-    bot.stealthToggle = {
+    bot.keyringToggle = {
         start: start,
         stop: stop,
         status: status,
@@ -20269,7 +20254,7 @@ window.__minibiaBotBundle.installMobileStealthToggleModule = function installMob
         currentBundle.installCustomNotificationModule(bot);
         currentBundle.installOutfitToggleModule(bot);
         currentBundle.installShovelHotkeyModule(bot);
-        currentBundle.installMobileStealthToggleModule(bot);
+        currentBundle.installKeyringStealthToggleModule(bot);
 
         bot.ui.inject();
 
