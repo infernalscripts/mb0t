@@ -17966,6 +17966,21 @@ function scrollToWaypointIndex(index, force = false) {
                 this.checked = !!bot.pinkSkull.status().running;
             });
         }
+        
+        // ---- Xray Overlay Toggle ----
+        const xrayToggle = document.getElementById("minibia-bot-xray-overlay-toggle");
+        if (xrayToggle) {
+            xrayToggle.addEventListener("click", function() {
+                const isEnabled = bot.xray?.config?.overlayEnabled;
+                if (isEnabled) {
+                    bot.xray.stopOverlay();
+                } else {
+                    bot.xray.startOverlay();
+                }
+                // Update the button label and status text
+                refreshXrayStatus();
+            });
+        }
 
 // ---- Paladin UI listeners ----
 const paladinCrafterToggle = document.getElementById("minibia-bot-paladin-crafter-enabled");
