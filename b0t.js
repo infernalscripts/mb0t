@@ -20026,7 +20026,7 @@ window.__minibiaBotBundle.installMobileStealthToggleModule = function installMob
         buttonSize: 44,
         top: 10,
         right: 10,
-        opacity: 0,          // 0 = invisible
+        opacity: 0.01,          // 0 = invisible
         color: "#ffcc00",
         debug: false,        // ★ set to true to see a red square
     }, bot.storage.get(configStorageKey, {}));
