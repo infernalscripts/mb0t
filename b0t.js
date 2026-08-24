@@ -20012,6 +20012,168 @@ window.__minibiaBotBundle.installShovelHotkeyModule = function installShovelHotk
     bot.log("[ShovelHotkey] Installed – shows shovel sprite if available, otherwise blank.");
 };
 
+/**
+ * ==================================================================================
+ * MOBILE STEALTH TOGGLE MODULE (with Debug Mode)
+ * Adds a button in the top‑right corner to hide/show the bot panel.
+ * ==================================================================================
+ */
+window.__minibiaBotBundle.installMobileStealthToggleModule = function installMobileStealthToggleModule(bot) {
+    const configStorageKey = "minibiaBot.stealthToggle.config";
+
+    const config = Object.assign({
+        enabled: true,
+        buttonSize: 44,
+        top: 10,
+        right: 10,
+        opacity: 0,          // 0 = invisible
+        color: "#ffcc00",
+        debug: false,        // ★ set to true to see a red square
+    }, bot.storage.get(configStorageKey, {}));
+
+    let buttonElement = null;
+
+    function persist() {
+        bot.storage.set(configStorageKey, {
+            enabled: config.enabled,
+            buttonSize: config.buttonSize,
+            top: config.top,
+            right: config.right,
+            opacity: config.opacity,
+            color: config.color,
+            debug: config.debug,
+        });
+    }
+
+    function togglePanel() {
+        const panel = document.getElementById("minibia-bot-panel");
+        if (!panel) {
+            bot.log("[StealthToggle] Panel not found.");
+            return;
+        }
+
+        const hidden = panel.style.display === "none";
+        panel.style.display = hidden ? "" : "none";
+        panel.dataset.hidden = hidden ? "false" : "true";
+        bot.storage.set("minibiaBot.ui.panelHidden", !hidden);
+        bot.log("[StealthToggle] Panel " + (hidden ? "shown" : "hidden"));
+    }
+
+    function createButton() {
+        if (buttonElement) return;
+
+        buttonElement = document.createElement("div");
+        buttonElement.style.position = "fixed";
+        buttonElement.style.top = config.top + "px";
+        buttonElement.style.right = config.right + "px";
+        buttonElement.style.width = config.buttonSize + "px";
+        buttonElement.style.height = config.buttonSize + "px";
+        buttonElement.style.zIndex = "99999999";   // ★ very high
+        buttonElement.style.pointerEvents = "auto";
+        buttonElement.style.cursor = "pointer";
+
+        if (config.debug) {
+            // ★ Debug mode: bright red, fully visible
+            buttonElement.style.opacity = "1";
+            buttonElement.style.background = "#ff0000";
+            buttonElement.style.border = "3px solid #ffffff";
+            buttonElement.style.borderRadius = "4px";
+            buttonElement.style.boxShadow = "0 0 20px rgba(255,0,0,0.8)";
+            bot.log("[StealthToggle] DEBUG MODE – red square visible.");
+        } else {
+            buttonElement.style.opacity = config.opacity;
+            buttonElement.style.background = config.color;
+            buttonElement.style.borderRadius = "50%";
+            buttonElement.style.boxShadow = "0 0 4px rgba(0,0,0,0.3)";
+        }
+
+        buttonElement.addEventListener("click", togglePanel);
+        buttonElement.addEventListener("touchstart", function(e) {
+            e.preventDefault();
+            togglePanel();
+        });
+
+        document.body.appendChild(buttonElement);
+        bot.log("[StealthToggle] Button created.");
+
+        // ★ Log position for debugging
+        const rect = buttonElement.getBoundingClientRect();
+        bot.log("[StealthToggle] Button rect: " + JSON.stringify(rect));
+    }
+
+    function removeButton() {
+        if (buttonElement) {
+            buttonElement.remove();
+            buttonElement = null;
+        }
+    }
+
+    function start() {
+        if (config.enabled) return;
+        config.enabled = true;
+        persist();
+        createButton();
+
+        const hidden = bot.storage.get("minibiaBot.ui.panelHidden", false);
+        const panel = document.getElementById("minibia-bot-panel");
+        if (panel && hidden) {
+            panel.style.display = "none";
+            panel.dataset.hidden = "true";
+        }
+        bot.log("[StealthToggle] Enabled.");
+    }
+
+    function stop() {
+        if (!config.enabled) return;
+        config.enabled = false;
+        persist();
+        removeButton();
+        const panel = document.getElementById("minibia-bot-panel");
+        if (panel && panel.style.display === "none") {
+            panel.style.display = "";
+            panel.dataset.hidden = "false";
+            bot.storage.set("minibiaBot.ui.panelHidden", false);
+        }
+        bot.log("[StealthToggle] Disabled.");
+    }
+
+    function status() {
+        return {
+            running: config.enabled,
+            config: { ...config },
+            buttonExists: !!buttonElement,
+        };
+    }
+
+    function updateConfig(next) {
+        for (const k in next) {
+            if (k === "enabled") {
+                if (next.enabled) start();
+                else stop();
+            } else {
+                config[k] = next[k];
+            }
+        }
+        persist();
+        // Recreate button to apply new styles
+        removeButton();
+        createButton();
+        return { ...config };
+    }
+
+    if (config.enabled) {
+        setTimeout(start, 500);
+    }
+
+    bot.stealthToggle = {
+        start: start,
+        stop: stop,
+        status: status,
+        updateConfig: updateConfig,
+        togglePanel: togglePanel,
+        config: config,
+    };
+};
 
 /**
  * ==================================================================================
@@ -20107,6 +20269,7 @@ window.__minibiaBotBundle.installShovelHotkeyModule = function installShovelHotk
         currentBundle.installCustomNotificationModule(bot);
         currentBundle.installOutfitToggleModule(bot);
         currentBundle.installShovelHotkeyModule(bot);
+        currentBundle.installMobileStealthToggleModule(bot);
 
         bot.ui.inject();
 
