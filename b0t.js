@@ -1553,13 +1553,6 @@ window.__minibiaBotBundle.installPzModule = function installPzModule(bot) {
     bot.goToHomePz = goToHomePz;
 };
 
-/**
- * ==================================================================================
- * 3. XRAY MODULE
- *    Tracks creatures (players and monsters) and draws an overlay showing
- *    off‑screen and on‑other‑floor creatures. Supports floor filtering.
- * ==================================================================================
- */
 window.__minibiaBotBundle.installXrayModule = function installXrayModule(bot) {
     const configStorageKey = "minibiaBot.xray.config";
     const overlayRootId = "minibia-bot-xray-overlay";
@@ -1569,38 +1562,39 @@ window.__minibiaBotBundle.installXrayModule = function installXrayModule(bot) {
         timerId: null
     };
 
+    // ---- Configuration ----
     const config = Object.assign({
         overlayEnabled: false,
-        selectedFloor: null
-    },
-            bot.storage.get(configStorageKey, {}));
+        selectedFloor: null,
+        playersOnly: false,
+    }, bot.storage.get(configStorageKey, {}));
     config.selectedFloor = normalizeSelectedFloor(config.selectedFloor);
 
     function persistConfig() {
         bot.storage.set(configStorageKey, {
-            ...config
+            overlayEnabled: config.overlayEnabled,
+            selectedFloor: config.selectedFloor,
+            playersOnly: config.playersOnly,
         });
     }
 
+    // ---- Helper functions ----
     function normalizeName(name) {
         return String(name || "").trim().toLowerCase();
     }
 
     function normalizeSelectedFloor(value) {
-        if (value == null || value === "" || value === "all")
-            return null;
+        if (value == null || value === "" || value === "all") return null;
         const floor = Number(value);
-        if (!Number.isFinite(floor))
-            return null;
+        if (!Number.isFinite(floor)) return null;
         return Math.trunc(floor);
     }
 
     function isWithinVisibleRange(me, pos) {
-        if (!me || !pos)
-            return false;
+        if (!me || !pos) return false;
         const dx = Math.abs(pos.x - me.x);
         const dy = Math.abs(pos.y - me.y);
-        return dx <= 8 && dy <= 6; // Tibia screen radius
+        return dx <= 8 && dy <= 6;
     }
 
     function getTrackedCreatures() {
@@ -1608,70 +1602,53 @@ window.__minibiaBotBundle.installXrayModule = function installXrayModule(bot) {
         const myId = window.gameClient?.player?.id;
         const myName = normalizeName(myState?.name);
         return Object.values(window.gameClient?.world?.activeCreatures || {})
-        .filter(creature => {
-            if (!creature)
-                return false;
-            if (creature.id === myId)
-                return false;
-            const name = normalizeName(creature.name);
-            if (name && name === myName)
-                return false;
-            return true;
-        });
+            .filter(creature => {
+                if (!creature) return false;
+                if (creature.id === myId) return false;
+                const name = normalizeName(creature.name);
+                if (name && name === myName) return false;
+                return true;
+            });
     }
 
-    /** Creatures visible on screen (within viewport) */
     function getVisibleCreatures() {
         const me = bot.getPlayerPosition();
-        if (!me)
-            return [];
+        if (!me) return [];
         return getTrackedCreatures().filter(c => isWithinVisibleRange(me, c.__position));
     }
 
-    /** Visible players (type === 0) – optionally only same floor */
     function getVisiblePlayers(options = {}) {
         const { sameFloorOnly = false } = options;
         const me = bot.getPlayerPosition();
-        if (!me)
-            return [];
+        if (!me) return [];
         return getVisibleCreatures().filter(c => {
-            if (c?.type !== 0)
-                return false;
-            if (!sameFloorOnly)
-                return true;
+            if (c?.type !== 0) return false;
+            if (!sameFloorOnly) return true;
             return c.__position?.z === me.z;
         });
     }
 
-    /** Visible monsters (type !== 0) – optionally only same floor */
     function getVisibleMonsters(options = {}) {
         const { sameFloorOnly = false } = options;
         const me = bot.getPlayerPosition();
-        if (!me)
-            return [];
+        if (!me) return [];
         return getVisibleCreatures().filter(c => {
-            if (c?.type === 0)
-                return false;
-            if (!sameFloorOnly)
-                return true;
+            if (c?.type === 0) return false;
+            if (!sameFloorOnly) return true;
             return c.__position?.z === me.z;
         });
     }
 
     function readCreatureHealth(creature) {
-        // Try multiple properties to get current/max/percent
         const current = [creature.health, creature.hp, creature.currentHealth, creature.state?.health]
-        .find(v => Number.isFinite(Number(v)));
+            .find(v => Number.isFinite(Number(v)));
         const max = [creature.maxHealth, creature.maxHp, creature.maximumHealth, creature.state?.maxHealth]
-        .find(v => Number.isFinite(Number(v)));
+            .find(v => Number.isFinite(Number(v)));
         const percent = [creature.healthPercent, creature.hpPercent, creature.healthpercentage, creature.state?.healthPercent]
-        .find(v => Number.isFinite(Number(v)));
-        if (current != null && max != null)
-            return `${Number(current)}/${Number(max)} HP`;
-        if (percent != null)
-            return `${Math.round(Number(percent))}% HP`;
-        if (current != null)
-            return `${Number(current)} HP`;
+            .find(v => Number.isFinite(Number(v)));
+        if (current != null && max != null) return `${Number(current)}/${Number(max)} HP`;
+        if (percent != null) return `${Math.round(Number(percent))}% HP`;
+        if (current != null) return `${Number(current)} HP`;
         return null;
     }
 
@@ -1679,56 +1656,68 @@ window.__minibiaBotBundle.installXrayModule = function installXrayModule(bot) {
         return creature?.name || (creature?.type === 0 ? "Player" : "Mob");
     }
 
-    /** Creatures to be displayed on the overlay (off‑floor or off‑screen) */
+    // ---- getOverlayCreatures (with playersOnly filter) ----
     function getOverlayCreatures() {
         const me = bot.getPlayerPosition();
-        if (!me)
-            return [];
-        return getTrackedCreatures().filter(c => {
-            const pos = c?.__position;
-            if (!pos || pos.z == null)
-                return false;
-            if (config.selectedFloor != null && pos.z !== config.selectedFloor)
-                return false;
-            if (pos.z !== me.z) {
-                return isWithinVisibleRange(me, pos); // other floors within visible radius
-            }
-            return !isWithinVisibleRange(me, pos); // same floor but off‑screen
-        });
+        if (!me) return [];
+        return getTrackedCreatures()
+            .filter(c => {
+                const pos = c?.__position;
+                if (!pos || pos.z == null) return false;
+                if (config.selectedFloor != null && pos.z !== config.selectedFloor) return false;
+                if (pos.z !== me.z) {
+                    return isWithinVisibleRange(me, pos);
+                }
+                return !isWithinVisibleRange(me, pos);
+            })
+            .filter(c => {
+                if (config.playersOnly) {
+                    return c?.type === 0;
+                }
+                return true;
+            });
     }
 
-    // ---- OVERLAY RENDERING ----
+    // ---- Overlay rendering (original viewport-based method) ----
     function clamp(value, min, max) {
         return Math.min(Math.max(value, min), max);
     }
 
     function ensureOverlayStyle() {
-        if (document.getElementById(overlayStyleId))
-            return;
+        if (document.getElementById(overlayStyleId)) return;
         const style = document.createElement("style");
         style.id = overlayStyleId;
         style.textContent = `
-      #${overlayRootId} { position: fixed; inset: 0; pointer-events: none; z-index: 999998; }
-      #${overlayRootId} .mb-xray-marker {
-        position: fixed; transform: translate(-50%, -50%);
-        padding: 2px 6px; border: 1px solid rgba(255,211,128,0.85);
-        border-radius: 999px; background: rgba(65,24,12,0.72);
-        box-shadow: 0 0 0 1px rgba(0,0,0,0.35);
-        color: #ffe7ae; font: 11px/1.2 Verdana, sans-serif;
-        white-space: nowrap;
-      }
-      #${overlayRootId} .mb-xray-marker.mb-xray-marker-offscreen {
-        border-color: rgba(123,235,178,0.92);
-        background: rgba(11,61,43,0.8); color: #d8ffea;
-      }
-    `;
+            #${overlayRootId} {
+                position: fixed;
+                inset: 0;
+                pointer-events: none;
+                z-index: 999998;
+            }
+            #${overlayRootId} .mb-xray-marker {
+                position: fixed;
+                transform: translate(-50%, -50%);
+                padding: 2px 6px;
+                border: 1px solid rgba(255,211,128,0.85);
+                border-radius: 999px;
+                background: rgba(65,24,12,0.72);
+                box-shadow: 0 0 0 1px rgba(0,0,0,0.35);
+                color: #ffe7ae;
+                font: 11px/1.2 Verdana, sans-serif;
+                white-space: nowrap;
+            }
+            #${overlayRootId} .mb-xray-marker.mb-xray-marker-offscreen {
+                border-color: rgba(123,235,178,0.92);
+                background: rgba(11,61,43,0.8);
+                color: #d8ffea;
+            }
+        `;
         document.head.appendChild(style);
     }
 
     function ensureOverlayRoot() {
         let root = document.getElementById(overlayRootId);
-        if (root)
-            return root;
+        if (root) return root;
         root = document.createElement("div");
         root.id = overlayRootId;
         document.body.appendChild(root);
@@ -1741,28 +1730,23 @@ window.__minibiaBotBundle.installXrayModule = function installXrayModule(bot) {
     }
 
     function getViewportRect() {
-        const canvases = Array.from(document.querySelectorAll("canvas"))
-            .map(c => ({
-                    canvas: c,
-                    rect: c.getBoundingClientRect()
-                }))
-            .filter(({
-                    rect
-                }) => rect.width >= 200 && rect.height >= 150)
-            .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height));
-        return canvases[0]?.rect || null;
+        // Use the screen canvas to determine the viewport
+        const canvas = document.querySelector("canvas#screen") ||
+                       gameClient?.renderer?.screen?.canvas;
+        if (!canvas || !(canvas instanceof HTMLCanvasElement)) return null;
+        const rect = canvas.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return null;
+        return rect;
     }
 
     function renderOverlay() {
-        if (!overlayState.running)
-            return;
+        if (!overlayState.running) return;
         const root = ensureOverlayRoot();
         const me = bot.getPlayerPosition();
         const viewportRect = getViewportRect();
         const creatures = getOverlayCreatures();
         root.innerHTML = "";
-        if (!me || !viewportRect || !creatures.length)
-            return;
+        if (!me || !viewportRect || !creatures.length) return;
 
         const tileWidth = viewportRect.width / 17;
         const tileHeight = viewportRect.height / 13;
@@ -1770,8 +1754,7 @@ window.__minibiaBotBundle.installXrayModule = function installXrayModule(bot) {
 
         creatures.forEach(c => {
             const pos = c.__position;
-            if (!pos)
-                return;
+            if (!pos) return;
             const dx = pos.x - me.x;
             const dy = pos.y - me.y;
             const healthLabel = readCreatureHealth(c);
@@ -1779,22 +1762,26 @@ window.__minibiaBotBundle.installXrayModule = function installXrayModule(bot) {
             marker.className = "mb-xray-marker";
 
             if (pos.z === me.z) {
+                // Same floor, off-screen (outside viewport)
                 marker.classList.add("mb-xray-marker-offscreen");
                 marker.textContent = healthLabel ? `${getCreatureLabel(c)} ${healthLabel}` : `${getCreatureLabel(c)}`;
                 marker.style.left = `${clamp(
-                        viewportRect.left + ((dx + 8.5) * tileWidth),
-                        viewportRect.left + edgePadding,
-                        viewportRect.right - edgePadding)}px`;
+                    viewportRect.left + ((dx + 8.5) * tileWidth),
+                    viewportRect.left + edgePadding,
+                    viewportRect.right - edgePadding
+                )}px`;
                 marker.style.top = `${clamp(
-                        viewportRect.top + ((dy + 6.5) * tileHeight),
-                        viewportRect.top + edgePadding,
-                        viewportRect.bottom - edgePadding)}px`;
+                    viewportRect.top + ((dy + 6.5) * tileHeight),
+                    viewportRect.top + edgePadding,
+                    viewportRect.bottom - edgePadding
+                )}px`;
             } else {
+                // Different floor
                 const floorOffset = me.z - pos.z;
                 const floorLabel = floorOffset === 0 ? "0" : floorOffset > 0 ? `+${floorOffset}` : `${floorOffset}`;
                 marker.textContent = healthLabel
-                     ? `${getCreatureLabel(c)} (${floorLabel}) ${healthLabel}`
-                     : `${getCreatureLabel(c)} (${floorLabel})`;
+                    ? `${getCreatureLabel(c)} (${floorLabel}) ${healthLabel}`
+                    : `${getCreatureLabel(c)} (${floorLabel})`;
                 marker.style.left = `${viewportRect.left + ((dx + 8.5) * tileWidth)}px`;
                 marker.style.top = `${viewportRect.top + ((dy + 6.5) * tileHeight)}px`;
             }
@@ -1802,11 +1789,11 @@ window.__minibiaBotBundle.installXrayModule = function installXrayModule(bot) {
         });
     }
 
+    // ---- Start / Stop / Toggle ----
     function startOverlay() {
         config.overlayEnabled = true;
         persistConfig();
-        if (overlayState.running)
-            return false;
+        if (overlayState.running) return false;
         overlayState.running = true;
         ensureOverlayStyle();
         renderOverlay();
@@ -1817,8 +1804,7 @@ window.__minibiaBotBundle.installXrayModule = function installXrayModule(bot) {
     function stopOverlay() {
         config.overlayEnabled = false;
         persistConfig();
-        if (!overlayState.running && overlayState.timerId == null)
-            return false;
+        if (!overlayState.running && overlayState.timerId == null) return false;
         overlayState.running = false;
         if (overlayState.timerId != null) {
             window.clearInterval(overlayState.timerId);
@@ -1830,67 +1816,31 @@ window.__minibiaBotBundle.installXrayModule = function installXrayModule(bot) {
 
     function setOverlayEnabled(enabled) {
         const next = !!enabled;
-        if (next)
-            return startOverlay();
+        if (next) return startOverlay();
         return stopOverlay();
     }
 
     function setSelectedFloor(floor) {
         config.selectedFloor = normalizeSelectedFloor(floor);
         persistConfig();
-        if (overlayState.running)
-            renderOverlay();
+        if (overlayState.running) renderOverlay();
         return config.selectedFloor;
     }
 
     function status() {
         return {
-            visibleCreatures: getVisibleCreatures().map(c => ({
-                    id: c.id,
-                    name: c.name,
-                    type: c.type,
-                    position: c.__position
-                })),
-            visiblePlayers: getVisiblePlayers().map(p => ({
-                    id: p.id,
-                    name: p.name,
-                    position: p.__position
-                })),
-            visiblePlayersCurrentFloor: getVisiblePlayers({
-                sameFloorOnly: true
-            }).map(p => ({
-                    id: p.id,
-                    name: p.name,
-                    position: p.__position
-                })),
-            visibleMonsters: getVisibleMonsters().map(m => ({
-                    id: m.id,
-                    name: m.name,
-                    type: m.type,
-                    position: m.__position
-                })),
-            visibleMonstersCurrentFloor: getVisibleMonsters({
-                sameFloorOnly: true
-            }).map(m => ({
-                    id: m.id,
-                    name: m.name,
-                    type: m.type,
-                    position: m.__position
-                })),
-            overlayCreatures: getOverlayCreatures().map(c => ({
-                    id: c.id,
-                    name: c.name,
-                    type: c.type,
-                    position: c.__position
-                })),
-            config: {
-                ...config
-            },
+            visibleCreatures: getVisibleCreatures().map(c => ({ id: c.id, name: c.name, type: c.type, position: c.__position })),
+            visiblePlayers: getVisiblePlayers().map(p => ({ id: p.id, name: p.name, position: p.__position })),
+            visiblePlayersCurrentFloor: getVisiblePlayers({ sameFloorOnly: true }).map(p => ({ id: p.id, name: p.name, position: p.__position })),
+            visibleMonsters: getVisibleMonsters().map(m => ({ id: m.id, name: m.name, type: m.type, position: m.__position })),
+            visibleMonstersCurrentFloor: getVisibleMonsters({ sameFloorOnly: true }).map(m => ({ id: m.id, name: m.name, type: m.type, position: m.__position })),
+            overlayCreatures: getOverlayCreatures().map(c => ({ id: c.id, name: c.name, type: c.type, position: c.__position })),
+            config: { ...config },
             overlayRunning: overlayState.running,
         };
     }
 
-    // Public API
+    // ---- Public API ----
     bot.xray = {
         getVisibleCreatures,
         getVisiblePlayers,
@@ -1901,14 +1851,15 @@ window.__minibiaBotBundle.installXrayModule = function installXrayModule(bot) {
         setOverlayEnabled,
         setSelectedFloor,
         status,
-        config
+        config,
+        persistConfig,
+        // Expose renderOverlay for UI refresh
+        renderOverlay: renderOverlay,
     };
 
     // Auto‑start if enabled
-    if (config.overlayEnabled)
-        startOverlay();
-    else
-        destroyOverlayElements();
+    if (config.overlayEnabled) startOverlay();
+    else destroyOverlayElements();
     bot.addCleanup(stopOverlay);
 };
 
@@ -14116,6 +14067,331 @@ window.__minibiaBotBundle.installAutoStackerModule = function installAutoStacker
 
 /**
  * ==================================================================================
+ * SUPPORT MODULE – Heal friends with runes or exura sio
+ * ==================================================================================
+ */
+window.__minibiaBotBundle.installSupportModule = function installSupportModule(bot) {
+    const configStorageKey = "minibiaBot.support.config";
+    const state = {
+        running: false,
+        timerId: null,
+        lastRuneHealAt: {},
+        lastSioHealAt: {},
+        lastLogAt: {}, // for debouncing repeated messages
+    };
+
+    const config = Object.assign({
+        enabled: false,
+        runeEnabled: false,
+        runeItemId: 236,
+        runeThreshold: 50,
+        runeCooldownMs: 2000,
+        sioEnabled: false,
+        sioThreshold: 50,
+        sioCooldownMs: 2000,
+        includeParty: true,
+        includeTrusted: true,
+        includeSelf: false,
+        debug: false,
+    }, bot.storage.get(configStorageKey, {}));
+
+    function persistConfig() {
+        bot.storage.set(configStorageKey, { ...config });
+    }
+
+    // ---- Log helpers ----
+    function logImportant(msg) {
+        bot.log(`[Support] ${msg}`);
+    }
+
+    function logDebug(msg) {
+        if (config.debug) bot.log(`[Support] ${msg}`);
+    }
+
+    function logWithDebounce(key, msg, intervalMs = 30000) {
+        const now = Date.now();
+        if (state.lastLogAt[key] && now - state.lastLogAt[key] < intervalMs) return;
+        state.lastLogAt[key] = now;
+        bot.log(`[Support] ${msg}`);
+    }
+
+    // ---- Shield constants ----
+    function getPartyShieldConstants() {
+        if (typeof CONST !== 'undefined' && CONST.SHIELD) {
+            return { MEMBER: CONST.SHIELD.MEMBER, LEADER: CONST.SHIELD.LEADER };
+        }
+        return { MEMBER: 8, LEADER: 9 };
+    }
+
+    // ---- Party members ----
+    function getPartyMemberNames() {
+        const players = bot.xray?.getVisiblePlayers({ sameFloorOnly: true }) || [];
+        const partyMembers = [];
+        const player = window.gameClient?.player;
+        if (!player) return [];
+        const { MEMBER, LEADER } = getPartyShieldConstants();
+        for (const c of players) {
+            if (c.id === player.id) continue;
+            if (c.shield === MEMBER || c.shield === LEADER) {
+                partyMembers.push(c.name);
+            }
+        }
+        logDebug(`Party members: ${partyMembers.join(', ')}`);
+        return partyMembers;
+    }
+
+    function getTrustedNames() {
+        const names = bot.panic?.getTrustedNames() || [];
+        logDebug(`Trusted names: ${names.join(', ')}`);
+        return names;
+    }
+
+    // ---- Targets ----
+    function getTargets() {
+        const targets = [];
+        const trusted = config.includeTrusted ? new Set(getTrustedNames().map(n => n.toLowerCase().trim())) : new Set();
+        const party = config.includeParty ? new Set(getPartyMemberNames().map(n => n.toLowerCase().trim())) : new Set();
+        const allPlayers = bot.xray?.getVisiblePlayers({ sameFloorOnly: true }) || [];
+        const myId = window.gameClient?.player?.id;
+
+        logDebug(`All visible players: ${allPlayers.map(p => `${p.name} (shield=${p.shield})`).join(', ')}`);
+        logDebug(`Trusted set: ${[...trusted].join(', ')}`);
+        logDebug(`Party set: ${[...party].join(', ')}`);
+
+        for (const c of allPlayers) {
+            if (c.id === myId) continue;
+            const nameLower = c.name.toLowerCase().trim();
+            if (trusted.has(nameLower) || party.has(nameLower)) {
+                targets.push(c);
+            }
+        }
+        logDebug(`Targets: ${targets.map(t => t.name).join(', ')}`);
+        return targets;
+    }
+
+    function getCreatureHealthPercent(creature) {
+        const health = creature.state?.health ?? creature.health;
+        const maxHealth = creature.maxHealth ?? creature.state?.maxHealth;
+        if (health == null || maxHealth == null || maxHealth <= 0) return null;
+        return (health / maxHealth) * 100;
+    }
+
+    function findItemInInventory(itemId) {
+        const eq = window.gameClient?.player?.equipment;
+        const containers = window.gameClient?.player?.__openedContainers || [];
+        if (eq) {
+            for (let i = 0; i < eq.slots.length; i++) {
+                const item = eq.getSlotItem(i);
+                if (item && item.id === itemId) {
+                    return { container: eq, slot: i, item };
+                }
+            }
+        }
+        const arr = Array.isArray(containers) ? containers : Array.from(containers);
+        for (const container of arr) {
+            if (!container || typeof container.size !== 'number') continue;
+            for (let i = 0; i < container.size; i++) {
+                const item = container.getSlotItem(i);
+                if (item && item.id === itemId) {
+                    return { container, slot: i, item };
+                }
+            }
+        }
+        return null;
+    }
+
+    function useItemOnCreature(source, creatureId) {
+        const from = { which: source.container, index: source.slot };
+        try {
+            const creature = window.gameClient.world.getCreature(creatureId);
+            if (!creature) {
+                logWithDebounce('creatureNotFound', `Creature ${creatureId} not found`, 10000);
+                return false;
+            }
+
+            logDebug(`Attempting rune use: ${source.container.constructor.name}, slot ${source.slot} -> ${creature.name} (${creature.id})`);
+
+            if (typeof ItemUseOnCreaturePacket !== 'undefined') {
+                window.gameClient.send(new ItemUseOnCreaturePacket(from, creatureId));
+                logDebug(`Sent ItemUseOnCreaturePacket`);
+                return true;
+            }
+
+            if (window.gameClient?.mouse?.__handleItemUseWith) {
+                window.gameClient.mouse.__handleItemUseWith(from, { which: creature, index: 0xFF });
+                logDebug(`Used mouse.__handleItemUseWith as fallback`);
+                return true;
+            }
+
+            if (typeof ThingUseWithPacket !== 'undefined') {
+                window.gameClient.send(new ThingUseWithPacket(from, { which: creature, index: 0xFF }));
+                logDebug(`Used ThingUseWithPacket`);
+                return true;
+            }
+
+            logWithDebounce('noMethod', 'No usable method found for rune use', 30000);
+            return false;
+        } catch (e) {
+            logWithDebounce('useError', `useItemOnCreature error: ${e.message}`, 30000);
+            return false;
+        }
+    }
+
+    function castSio(targetName) {
+        if (!targetName) return false;
+        const sent = bot.sendChat("exura sio " + targetName);
+        if (sent) logDebug(`Cast exura sio on ${targetName}`);
+        return sent;
+    }
+
+    function tryHealTarget(creature, now) {
+        const name = creature.name;
+        const hpPercent = getCreatureHealthPercent(creature);
+        if (hpPercent == null) return false;
+
+        // Sio
+        if (config.sioEnabled && hpPercent < config.sioThreshold) {
+            const lastSio = state.lastSioHealAt[name] || 0;
+            if (now - lastSio > config.sioCooldownMs) {
+                if (castSio(name)) {
+                    state.lastSioHealAt[name] = now;
+                    logDebug(`exura sio -> ${name} (HP ${hpPercent.toFixed(0)}%)`);
+                    return true;
+                }
+            }
+        }
+
+        // Rune
+        if (config.runeEnabled && hpPercent < config.runeThreshold) {
+            const lastRune = state.lastRuneHealAt[name] || 0;
+            if (now - lastRune > config.runeCooldownMs) {
+                const source = findItemInInventory(config.runeItemId);
+                if (source) {
+                    const success = useItemOnCreature(source, creature.id);
+                    if (success) {
+                        state.lastRuneHealAt[name] = now;
+                        logDebug(`Rune ${config.runeItemId} -> ${name} (HP ${hpPercent.toFixed(0)}%)`);
+                        return true;
+                    }
+                } else {
+                    logWithDebounce('noRune', `No rune ${config.runeItemId} in inventory`, 30000);
+                }
+            }
+        }
+        return false;
+    }
+
+    function tick() {
+        if (!state.running || !config.enabled) {
+            scheduleNextTick();
+            return;
+        }
+
+        const now = Date.now();
+        const targets = getTargets();
+        if (!targets.length) {
+            scheduleNextTick();
+            return;
+        }
+
+        targets.sort((a, b) => {
+            const hpA = getCreatureHealthPercent(a) ?? 100;
+            const hpB = getCreatureHealthPercent(b) ?? 100;
+            return hpA - hpB;
+        });
+
+        for (const creature of targets) {
+            const healed = tryHealTarget(creature, now);
+            if (healed) break;
+        }
+
+        scheduleNextTick();
+    }
+
+    function scheduleNextTick() {
+        if (!state.running) return;
+        state.timerId = setTimeout(tick, 500);
+    }
+
+    function start() {
+        if (state.running) return false;
+        config.enabled = true;
+        persistConfig();
+        state.running = true;
+        logImportant('Started');
+        tick();
+        return true;
+    }
+
+    function stop(options = {}) {
+        const persist = options.persistEnabled !== false;
+        state.running = false;
+        if (state.timerId) {
+            clearTimeout(state.timerId);
+            state.timerId = null;
+        }
+        if (persist) {
+            config.enabled = false;
+            persistConfig();
+        }
+        logImportant('Stopped');
+        return true;
+    }
+
+    function status() {
+        return {
+            running: state.running,
+            config: { ...config },
+        };
+    }
+
+    function updateConfig(next) {
+        Object.assign(config, next);
+        config.runeThreshold = Math.min(100, Math.max(0, config.runeThreshold || 0));
+        config.sioThreshold = Math.min(100, Math.max(0, config.sioThreshold || 0));
+        config.runeCooldownMs = Math.max(100, config.runeCooldownMs || 100);
+        config.sioCooldownMs = Math.max(100, config.sioCooldownMs || 100);
+        persistConfig();
+        if (config.enabled && !state.running) start();
+        if (!config.enabled && state.running) stop();
+        return { ...config };
+    }
+
+    function test() {
+        logImportant('=== TEST ===');
+        logImportant(`Config: ${JSON.stringify(config)}`);
+        const targets = getTargets();
+        logImportant(`Targets found: ${targets.length}`);
+        for (const t of targets) {
+            const hp = getCreatureHealthPercent(t);
+            logImportant(`${t.name} HP: ${hp ? hp.toFixed(0) : 'unknown'}%`);
+        }
+        const source = findItemInInventory(config.runeItemId);
+        logImportant(`Rune ${config.runeItemId} found: ${source ? 'yes' : 'no'}`);
+        if (targets.length && source) {
+            const first = targets[0];
+            logImportant(`Attempting rune heal on ${first.name}`);
+            const success = useItemOnCreature(source, first.id);
+            logImportant(`Rune use result: ${success ? 'success' : 'failed'}`);
+        } else if (!source) {
+            logImportant(`Rune not found in equipment or open containers.`);
+        }
+    }
+
+    if (config.enabled) start();
+
+    bot.support = {
+        start,
+        stop,
+        status,
+        updateConfig,
+        config,
+        test,
+    };
+};
+
+/**
+ * ==================================================================================
  * 14. UI PANEL
  *     Injects a draggable, collapsible panel with tabs for each module.
  *     Provides real‑time controls, status indicators, and refresh functions.
@@ -14577,6 +14853,8 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
         const overlayBtn = document.getElementById("minibia-bot-xray-overlay-toggle");
         const overlayLabel = document.getElementById("minibia-bot-xray-overlay-status");
         const floorSelect = document.getElementById("minibia-bot-xray-floor-select");
+        const playersOnlyCheck = document.getElementById("minibia-bot-xray-players-only");
+
         if (overlayBtn)
             overlayBtn.textContent = status?.config?.overlayEnabled ? "Disable Overlay" : "Enable Overlay";
         if (overlayLabel) {
@@ -14584,6 +14862,10 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
                  ? "all floors"
                  : (me ? (me.z - status.config.selectedFloor) : "?");
             overlayLabel.textContent = `${status?.config?.overlayEnabled ? "Overlay: on" : "Overlay: off"} • ${floorLabel}`;
+        }
+        // ★ Sync playersOnly checkbox
+        if (playersOnlyCheck && document.activeElement !== playersOnlyCheck) {
+            playersOnlyCheck.checked = !!status?.config?.playersOnly;
         }
         if (floorSelect) {
             const floors = Array.from(new Set((status?.visibleCreatures || []).map(c => c?.position?.z).filter(z => z != null)))
@@ -16088,6 +16370,7 @@ function scrollToWaypointIndex(index, force = false) {
 	<button type="button" class="mb-tab-button" data-tab-button="looter">💰 Looter</button>
     <button type="button" class="mb-tab-button" data-tab-button="panic">⚠️ Alerts</button>
     <button type="button" class="mb-tab-button" data-tab-button="utility">🛠️ Tools</button>
+    <button type="button" class="mb-tab-button" data-tab-button="support">💕 Support</button>
 	<button type="button" class="mb-tab-button" data-tab-button="training">✨ Training</button>
 	<button type="button" class="mb-tab-button" data-tab-button="paladin">🏹 Distance</button>
   <button type="button" class="mb-tab-button" data-tab-button="combo">💀 PVP</button>
@@ -16170,18 +16453,25 @@ function scrollToWaypointIndex(index, force = false) {
         </div>
     </div>
 
-    <!-- Xray Tab -->
-    <div class="mb-tab-panel" data-tab-panel="xray">
-      <div class="mb-section">
-        <div class="mb-label">Xray</div>
-          <div class="mb-stack">
-            <button type="button" class="mb-small-button" id="minibia-bot-xray-overlay-toggle">Disable Overlay</button>
-            <div class="mb-small-note" id="minibia-bot-xray-overlay-status">Overlay: on</div>
-            <label class="mb-field" for="minibia-bot-xray-floor-select"><span class="mb-field-label">Floor Filter</span><select id="minibia-bot-xray-floor-select"><option value="all">All floors</option></select></label>
-            <div class="mb-list" id="minibia-bot-visible-creatures-list"></div>
-          </div>
-        </div>
+<!-- Xray Tab -->
+<div class="mb-tab-panel" data-tab-panel="xray">
+  <div class="mb-section">
+    <div class="mb-label">Xray</div>
+      <div class="mb-stack">
+        <button type="button" class="mb-small-button" id="minibia-bot-xray-overlay-toggle">Disable Overlay</button>
+        <div class="mb-small-note" id="minibia-bot-xray-overlay-status">Overlay: on</div>
+        
+        <!-- ★ NEW: Players Only toggle -->
+        <label class="mb-toggle" style="margin:0;">
+          <input type="checkbox" id="minibia-bot-xray-players-only" />
+          <span>Players only</span>
+        </label>
+        
+        <label class="mb-field" for="minibia-bot-xray-floor-select"><span class="mb-field-label">Floor Filter</span><select id="minibia-bot-xray-floor-select"><option value="all">All floors</option></select></label>
+        <div class="mb-list" id="minibia-bot-visible-creatures-list"></div>
       </div>
+    </div>
+  </div>
 
 <!-- Utility Tab -->
 <div class="mb-tab-panel" data-tab-panel="utility">
@@ -16705,6 +16995,36 @@ function scrollToWaypointIndex(index, force = false) {
 </div>
 
 
+<!-- Support Tab -->
+<div class="mb-tab-panel" data-tab-panel="support">
+  <div class="mb-section">
+    <div class="mb-label">Support / Heal Friend</div>
+    <div class="mb-stack">
+      <label class="mb-toggle"><input type="checkbox" id="minibia-bot-support-enabled" /><span>Enable Support Module</span></label>
+      <hr>
+      <div class="mb-label" style="font-size:11px;">Rune Healing</div>
+      <label class="mb-toggle"><input type="checkbox" id="minibia-bot-support-rune-enabled" /><span>Use Rune</span></label>
+      <div class="mb-form-grid">
+        <label class="mb-field"><span class="mb-field-label">Rune Item ID</span><input type="number" id="minibia-bot-support-rune-itemid" min="1" value="3160" /></label>
+        <label class="mb-field"><span class="mb-field-label">HP Threshold %</span><input type="number" id="minibia-bot-support-rune-threshold" min="0" max="100" value="50" /></label>
+      </div>
+      <label class="mb-field"><span class="mb-field-label">Cooldown (ms)</span><input type="number" id="minibia-bot-support-rune-cooldown" min="100" value="2000" /></label>
+      <hr>
+      <div class="mb-label" style="font-size:11px;">Exura Sio</div>
+      <label class="mb-toggle"><input type="checkbox" id="minibia-bot-support-sio-enabled" /><span>Use Exura Sio</span></label>
+      <div class="mb-form-grid">
+        <label class="mb-field"><span class="mb-field-label">HP Threshold %</span><input type="number" id="minibia-bot-support-sio-threshold" min="0" max="100" value="50" /></label>
+        <label class="mb-field"><span class="mb-field-label">Cooldown (ms)</span><input type="number" id="minibia-bot-support-sio-cooldown" min="100" value="2000" /></label>
+      </div>
+      <hr>
+      <div class="mb-label" style="font-size:11px;">Targets</div>
+      <label class="mb-toggle"><input type="checkbox" id="minibia-bot-support-include-party" checked /><span>Include Party Members</span></label>
+      <label class="mb-toggle"><input type="checkbox" id="minibia-bot-support-include-trusted" checked /><span>Include Trusted Players</span></label>
+      <div class="mb-small-note" id="minibia-bot-support-status">Status: idle</div>
+    </div>
+  </div>
+</div>
+
   </div> <!-- end mb-tab-content -->
 </div> <!-- end mb-body -->
 `;
@@ -16772,6 +17092,131 @@ function scrollToWaypointIndex(index, force = false) {
         }
 
         // ---- EVENT LISTENERS ----
+        
+        // ---- Support Module UI ----
+        function refreshSupportStatus() {
+            const status = bot.support?.status?.();
+            if (!status) return;
+
+            const ids = {
+                enabled: document.getElementById("minibia-bot-support-enabled"),
+                runeEnabled: document.getElementById("minibia-bot-support-rune-enabled"),
+                runeItemId: document.getElementById("minibia-bot-support-rune-itemid"),
+                runeThreshold: document.getElementById("minibia-bot-support-rune-threshold"),
+                runeCooldown: document.getElementById("minibia-bot-support-rune-cooldown"),
+                sioEnabled: document.getElementById("minibia-bot-support-sio-enabled"),
+                sioThreshold: document.getElementById("minibia-bot-support-sio-threshold"),
+                sioCooldown: document.getElementById("minibia-bot-support-sio-cooldown"),
+                includeParty: document.getElementById("minibia-bot-support-include-party"),
+                includeTrusted: document.getElementById("minibia-bot-support-include-trusted"),
+                statusLabel: document.getElementById("minibia-bot-support-status"),
+            };
+
+            const cfg = status.config;
+            if (ids.enabled && document.activeElement !== ids.enabled) ids.enabled.checked = status.running;
+            if (ids.runeEnabled && document.activeElement !== ids.runeEnabled) ids.runeEnabled.checked = cfg.runeEnabled;
+            if (ids.runeItemId && document.activeElement !== ids.runeItemId) ids.runeItemId.value = cfg.runeItemId || 236;
+            if (ids.runeThreshold && document.activeElement !== ids.runeThreshold) ids.runeThreshold.value = cfg.runeThreshold || 50;
+            if (ids.runeCooldown && document.activeElement !== ids.runeCooldown) ids.runeCooldown.value = cfg.runeCooldownMs || 2000;
+            if (ids.sioEnabled && document.activeElement !== ids.sioEnabled) ids.sioEnabled.checked = cfg.sioEnabled;
+            if (ids.sioThreshold && document.activeElement !== ids.sioThreshold) ids.sioThreshold.value = cfg.sioThreshold || 50;
+            if (ids.sioCooldown && document.activeElement !== ids.sioCooldown) ids.sioCooldown.value = cfg.sioCooldownMs || 2000;
+            if (ids.includeParty && document.activeElement !== ids.includeParty) ids.includeParty.checked = cfg.includeParty !== false;
+            if (ids.includeTrusted && document.activeElement !== ids.includeTrusted) ids.includeTrusted.checked = cfg.includeTrusted !== false;
+            if (ids.statusLabel) ids.statusLabel.textContent = status.running ? "Status: running" : "Status: idle";
+        }
+
+        // ---- Support event listeners ----
+        const supportEnabled = document.getElementById("minibia-bot-support-enabled");
+        if (supportEnabled) {
+            supportEnabled.addEventListener("change", function() {
+                if (this.checked) bot.support.start();
+                else bot.support.stop();
+                refreshSupportStatus();
+            });
+        }
+
+        const supportRuneEnabled = document.getElementById("minibia-bot-support-rune-enabled");
+        if (supportRuneEnabled) {
+            supportRuneEnabled.addEventListener("change", function() {
+                bot.support.updateConfig({ runeEnabled: this.checked });
+                refreshSupportStatus();
+            });
+        }
+
+        const supportRuneItemId = document.getElementById("minibia-bot-support-rune-itemid");
+        if (supportRuneItemId) {
+            supportRuneItemId.addEventListener("change", function() {
+                const val = parseInt(this.value) || 236;
+                this.value = val;
+                bot.support.updateConfig({ runeItemId: val });
+                refreshSupportStatus();
+            });
+        }
+
+        const supportRuneThreshold = document.getElementById("minibia-bot-support-rune-threshold");
+        if (supportRuneThreshold) {
+            supportRuneThreshold.addEventListener("change", function() {
+                const val = Math.min(100, Math.max(0, parseInt(this.value) || 50));
+                this.value = val;
+                bot.support.updateConfig({ runeThreshold: val });
+                refreshSupportStatus();
+            });
+        }
+
+        const supportRuneCooldown = document.getElementById("minibia-bot-support-rune-cooldown");
+        if (supportRuneCooldown) {
+            supportRuneCooldown.addEventListener("change", function() {
+                const val = Math.max(100, parseInt(this.value) || 2000);
+                this.value = val;
+                bot.support.updateConfig({ runeCooldownMs: val });
+                refreshSupportStatus();
+            });
+        }
+
+        const supportSioEnabled = document.getElementById("minibia-bot-support-sio-enabled");
+        if (supportSioEnabled) {
+            supportSioEnabled.addEventListener("change", function() {
+                bot.support.updateConfig({ sioEnabled: this.checked });
+                refreshSupportStatus();
+            });
+        }
+
+        const supportSioThreshold = document.getElementById("minibia-bot-support-sio-threshold");
+        if (supportSioThreshold) {
+            supportSioThreshold.addEventListener("change", function() {
+                const val = Math.min(100, Math.max(0, parseInt(this.value) || 50));
+                this.value = val;
+                bot.support.updateConfig({ sioThreshold: val });
+                refreshSupportStatus();
+            });
+        }
+
+        const supportSioCooldown = document.getElementById("minibia-bot-support-sio-cooldown");
+        if (supportSioCooldown) {
+            supportSioCooldown.addEventListener("change", function() {
+                const val = Math.max(100, parseInt(this.value) || 2000);
+                this.value = val;
+                bot.support.updateConfig({ sioCooldownMs: val });
+                refreshSupportStatus();
+            });
+        }
+
+        const supportIncludeParty = document.getElementById("minibia-bot-support-include-party");
+        if (supportIncludeParty) {
+            supportIncludeParty.addEventListener("change", function() {
+                bot.support.updateConfig({ includeParty: this.checked });
+                refreshSupportStatus();
+            });
+        }
+
+        const supportIncludeTrusted = document.getElementById("minibia-bot-support-include-trusted");
+        if (supportIncludeTrusted) {
+            supportIncludeTrusted.addEventListener("change", function() {
+                bot.support.updateConfig({ includeTrusted: this.checked });
+                refreshSupportStatus();
+            });
+        }
         
         // ---- Exori toggle ----
         const exoriToggle = document.getElementById('minibia-bot-exori-enabled');
@@ -17981,6 +18426,31 @@ function scrollToWaypointIndex(index, force = false) {
                 refreshXrayStatus();
             });
         }
+        
+        // ---- Xray Players Only ----
+        const playersOnlyCheck = document.getElementById("minibia-bot-xray-players-only");
+        if (playersOnlyCheck) {
+            // Load initial state from config (handled by refreshXrayStatus)
+            playersOnlyCheck.addEventListener("change", function() {
+                const enabled = this.checked;
+                bot.xray.config.playersOnly = enabled;
+                bot.xray.persistConfig?.();   // persists the change
+                // Re-render overlay if it's running
+                if (bot.xray.overlayState?.running) {
+                    // We can force a re-render by calling renderOverlay directly,
+                    // but it's easier to just call startOverlay again (it will re-render)
+                    // However, startOverlay checks if already running and returns false.
+                    // We can access internal renderOverlay or just call setOverlayEnabled.
+                    // The simplest: call renderOverlay() if overlayState.running.
+                    if (typeof bot.xray.renderOverlay === 'function') {
+                        bot.xray.renderOverlay();
+                    }
+                }
+                // Update the status label
+                refreshXrayStatus();
+                bot.log("Xray players-only set to", enabled);
+            });
+        }
 
 // ---- Paladin UI listeners ----
 const paladinCrafterToggle = document.getElementById("minibia-bot-paladin-crafter-enabled");
@@ -18910,6 +19380,8 @@ if (paladinWeaponId) {
         }
 
         // Periodic refreshes
+        const supportStatus = window.setInterval(refreshSupportStatus, 2000);
+        bot.addCleanup(() => window.clearInterval(supportStatus));
         const visibleTimer = window.setInterval(refreshVisibleCreatures, 1000);
         bot.addCleanup(() => window.clearInterval(visibleTimer));
         const talkTimer = window.setInterval(refreshTalkStatus, 1000);
@@ -20375,6 +20847,8 @@ window.__minibiaBotBundle.installKeyringStealthToggleModule = function installKe
         currentBundle.installOutfitRandomizerModule(bot);
         currentBundle.installComboBotModule(bot);
         currentBundle.installExoriModule(bot);
+        currentBundle.installSupportModule(bot);
+        
         currentBundle.installPanel(bot);
         currentBundle.installUiTweaksModule(bot);
         currentBundle.installCustomNotificationModule(bot);
