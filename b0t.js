@@ -487,13 +487,13 @@ window.__minibiaBotBundle.createBot = function createBot() {
     }
 
     function getTopItemOnTile(tile) {
-        if (!tile)
-            return null;
-        if (tile.id)
-            return tile;
+        if (!tile) return null;
+        // If there are items, return the topmost one (last in the array)
         if (Array.isArray(tile.items) && tile.items.length > 0) {
-            return tile.items[0];
+            return tile.items[tile.items.length - 1];
         }
+        // Otherwise return the tile itself (ground) if it exists
+        if (tile.id) return tile;
         return null;
     }
 
@@ -929,14 +929,9 @@ window.__minibiaBotBundle.createBot = function createBot() {
 
         // ---- GET ITEM ID AT POSITION ----
         getItemAtPosition(x, y, z) {
-            const pos = {
-                x,
-                y,
-                z
-            };
+            const pos = { x, y, z };
             const tile = getTileAtPosition(pos);
-            if (!tile)
-                return null;
+            if (!tile) return null;
             const top = getTopItemOnTile(tile);
             return top ? getItemId(top) : null;
         },
@@ -1261,7 +1256,7 @@ window.__minibiaBotBundle.createBot = function createBot() {
                 return false;
             }
 
-            // 2. Find the nearest furnace tile (CID 2535)
+            // 2. Find the nearest furnace tile (CID 2535 or 2541)
             const playerPos = this.getPlayerPosition();
             if (!playerPos) {
                 this.log("Could not get player position.");
@@ -1289,9 +1284,9 @@ window.__minibiaBotBundle.createBot = function createBot() {
                     const dy = Math.abs(pos.y - playerPos.y);
                     if (dx > maxDistance || dy > maxDistance) continue;
 
-                    // Check if this tile contains a furnace (CID 2535)
+                    // Check if this tile contains a furnace (CID 2535 or 2541)
                     const items = tile.items || [];
-                    const hasFurnace = items.some(item => item && item.id === 2535);
+                    const hasFurnace = items.some(item => item && (item.id === 2535 || item.id === 2541));
                     if (hasFurnace) {
                         const dist = Math.max(dx, dy);
                         if (dist < furnaceDist) {
@@ -1303,7 +1298,7 @@ window.__minibiaBotBundle.createBot = function createBot() {
             }
 
             if (!furnaceTile) {
-                this.log(`No furnace (ID 2535) found within ${maxDistance} tiles.`);
+                this.log(`No furnace (2535 or 2541) found within ${maxDistance} tiles.`);
                 return false;
             }
 
@@ -2851,8 +2846,8 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
 
     const config = Object.assign({
         tickMs: 50,
-        healCooldownMs: 1500,          // increased to cover exhaustion
-        healRetryMs: 200,
+        healCooldownMs: 2000,
+        healRetryMs: 500,
         healConfirmMs: 250,
         enabled: false,
         healRules: [],
@@ -3101,10 +3096,10 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
         if (state.pendingAttempt[key]) return false;
 
         // Manual cooldown (fallback)
-        if (state.manualCooldownUntil[key] && now < state.manualCooldownUntil[key]) {
-            if (config.debugCooldown) bot.log("[Heal] Manual cooldown active for slot " + slot);
-            return false;
-        }
+//       if (state.manualCooldownUntil[key] && now < state.manualCooldownUntil[key]) {
+//            if (config.debugCooldown) bot.log("[Heal] Manual cooldown active for slot " + slot);
+//            return false;
+//        }
 
         // Own per-slot cooldown
         if (now - (state.lastHealAt[key] || 0) < config.healCooldownMs) return false;
@@ -3732,6 +3727,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         lastKiteWaypoint: null,
         kiteTargetKey: null,
         kiteOriginalIndex: null,
+        lastDiagonalCorrection: 0,
+        diagonalAttempted: false,
     };
 
     const storedConfig = bot.storage.get(configStorageKey, {}) || {};
@@ -3755,6 +3752,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         useClientChase: true,
         kiteStuckCount: 0,
         unreachableStart: 0,
+        keepDiagonal: false,
     },
             storedConfig);
     if (config.targetHotbarSlot == null && storedConfig.hotbarSlot != null) {
@@ -4646,6 +4644,8 @@ function isTileWalkable(x, y, z, ignoreCreatures = false) {
         state.lastProgressAt = 0;
         state.lastDistance = undefined;
         state.lastTargetHealth = null;
+        state.diagonalAttempted = false;
+        state.lastDiagonalCorrection = 0;
         resetFollowProgress();
         clearCurrentFollowTarget();
     }
@@ -5146,144 +5146,148 @@ function isTileWalkable(x, y, z, ignoreCreatures = false) {
         return null;
     }
 
-    function syncMeleeChase(now = Date.now()) {
-        if (!config.meleeMode)
-            return false;
 
-        const target = getEngagedTarget();
-        if (!target)
-            return false;
+function syncMeleeChase(now = Date.now()) {
+    if (!config.meleeMode) return false;
 
-        const playerPos = normalizePosition(bot.getPlayerPosition());
-        const targetPos = normalizePosition(target.getPosition?.() || target.__position);
-        if (!playerPos || !targetPos || playerPos.z !== targetPos.z)
-            return false;
+    const target = getEngagedTarget();
+    if (!target) return false;
 
-        const info = isTargetValidAndOnScreen(target, {
-            returnDetails: true,
-            maxDx: 7,
-            maxDy: 5
-        });
-        if (!info.valid) {
-            if (state.engagedTargetId === target.id)
-                clearEngagedTarget();
-            return false;
-        }
+    const playerPos = normalizePosition(bot.getPlayerPosition());
+    const targetPos = normalizePosition(target.getPosition?.() || target.__position);
+    if (!playerPos || !targetPos || playerPos.z !== targetPos.z) return false;
 
-        const dist = getTileDistance(playerPos, targetPos);
-        const maxDist = Math.max(1, Number(config.maxTargetDistance) || 5);
-
-        if (dist > maxDist) {
-            skipTarget(target, "too far for melee", now, 3000);
-            return false;
-        }
-
-        if (dist <= 1) {
-            state.meleeLastDist = Infinity;
-            state.meleeProgressAt = 0;
-            state.meleeStuckAt = 0;
-            return false;
-        }
-
-        // Anti‑KS (same as before)
-        const visiblePlayers = bot.xray?.getVisiblePlayers?.({
-            sameFloorOnly: true
-        }) || [];
-        const myId = window.gameClient?.player?.id;
-        const trustedNames = bot.panic?.getTrustedNames?.() || [];
-        const trustedSet = new Set(trustedNames);
-        const otherPlayers = visiblePlayers.filter(p => {
-            if (p.id === myId)
-                return false;
-            const name = normalizeCreatureName(p.name);
-            return !trustedSet.has(name);
-        });
-        const hasOtherPlayers = otherPlayers.length > 0 && config.antiKSEnabled;
-
-        if (hasOtherPlayers) {
-            const selfRange = config.antiKSSelfRange ?? 2;
-            const otherRange = config.antiKSOtherRange ?? 2;
-            if (dist > selfRange) {
-                skipTarget(target, "melee anti‑KS self range", now, 5000);
-                return false;
-            }
-            for (const player of otherPlayers) {
-                const pPos = player.getPosition?.() || player.__position;
-                if (!pPos)
-                    continue;
-                const dx = Math.abs(pPos.x - targetPos.x);
-                const dy = Math.abs(pPos.y - targetPos.y);
-                if (dx <= otherRange && dy <= otherRange) {
-                    skipTarget(target, "melee anti‑KS other range", now, 5000);
-                    return false;
-                }
-            }
-        }
-
-        // Stuck detection
-        if (state.engagedTargetId !== target.id) {
-            state.meleeLastDist = dist;
-            state.meleeProgressAt = now;
-            state.meleeStuckAt = 0;
-        } else {
-            if (dist < state.meleeLastDist) {
-                state.meleeLastDist = dist;
-                state.meleeProgressAt = now;
-                state.meleeStuckAt = 0;
-            } else {
-                if (!state.meleeStuckAt)
-                    state.meleeStuckAt = now;
-                if (now - state.meleeStuckAt > 6000) {
-                    skipTarget(target, "melee stuck (no progress)", now, 3000);
-                    return false;
-                }
-            }
-        }
-
-        if (now - state.lastMoveAt < 250)
-            return false;
-
-        const dx = targetPos.x - playerPos.x;
-        const dy = targetPos.y - playerPos.y;
-        let stepX = dx > 0 ? 1 : (dx < 0 ? -1 : 0);
-        let stepY = dy > 0 ? 1 : (dy < 0 ? -1 : 0);
-
-        const attempts = [{
-                dx: stepX,
-                dy: 0
-            }, {
-                dx: 0,
-                dy: stepY
-            }, {
-                dx: stepX,
-                dy: stepY
-            }
-        ];
-
-        for (const a of attempts) {
-            if (a.dx === 0 && a.dy === 0)
-                continue;
-            const nx = playerPos.x + a.dx;
-            const ny = playerPos.y + a.dy;
-            if (nx === targetPos.x && ny === targetPos.y)
-                continue;
-
-            // ★ Use safe check: walkable + not a hole/ladder/teleporter
-            if (isSafeToWalkTile(nx, ny, playerPos.z, false)) {
-                const dir = getDirection(a.dx, a.dy);
-                if (dir !== null && window.gameClient?.keyboard) {
-                    window.gameClient.keyboard.handleMoveKey(dir);
-                    state.lastChaseAt = now;
-                    state.lastMoveAt = now;
-                    state.meleeLastDist = dist;
-                    state.meleeStuckAt = 0;
-                    return true;
-                }
-            }
-        }
-
+    const info = isTargetValidAndOnScreen(target, {
+        returnDetails: true,
+        maxDx: 7,
+        maxDy: 5
+    });
+    if (!info.valid) {
+        if (state.engagedTargetId === target.id) clearEngagedTarget();
         return false;
     }
+
+    const dist = getTileDistance(playerPos, targetPos);
+    const maxDist = Math.max(1, Number(config.maxTargetDistance) || 5);
+
+    if (dist > maxDist) {
+        skipTarget(target, "too far for melee", now, 3000);
+        return false;
+    }
+
+    // ---- Manage client chase mode based on distance ----
+    const shouldChase = dist > 1;
+    if (shouldChase && !config.useClientChase) {
+        setClientChaseMode(2);
+        if (state._chaseEnabledForDistance === undefined) {
+            state._chaseEnabledForDistance = true;
+        }
+    } else if (!shouldChase && state._chaseEnabledForDistance) {
+        setClientChaseMode(0);
+        state._chaseEnabledForDistance = false;
+    }
+
+    // ---- If adjacent ----
+    if (dist <= 1) {
+        // Reset stuck detection – we're in range
+        state.meleeLastDist = Infinity;
+        state.meleeProgressAt = 0;
+        state.meleeStuckAt = 0;
+
+        // ---- Handle diagonal with cooldown ----
+        if (config.keepDiagonal) {
+            const dx = targetPos.x - playerPos.x;
+            const dy = targetPos.y - playerPos.y;
+            const isDiagonal = dx !== 0 && dy !== 0;
+
+            if (!isDiagonal && now - state.lastDiagonalCorrection > 2000) {
+                state.lastDiagonalCorrection = now;
+                const diagOffsets = [
+                    { dx: 1, dy: 1 }, { dx: 1, dy: -1 },
+                    { dx: -1, dy: 1 }, { dx: -1, dy: -1 }
+                ];
+                let bestOffset = null;
+                let bestDist = Infinity;
+                for (const off of diagOffsets) {
+                    const nx = targetPos.x + off.dx;
+                    const ny = targetPos.y + off.dy;
+                    const d = Math.max(Math.abs(nx - playerPos.x), Math.abs(ny - playerPos.y));
+                    if (d < bestDist && isSafeToWalkTile(nx, ny, playerPos.z, false)) {
+                        bestDist = d;
+                        bestOffset = off;
+                    }
+                }
+                if (bestOffset) {
+                    const dxMove = (targetPos.x + bestOffset.dx) - playerPos.x;
+                    const dyMove = (targetPos.y + bestOffset.dy) - playerPos.y;
+                    const dir = getDirection(dxMove, dyMove);
+                    if (dir !== null && window.gameClient?.keyboard) {
+                        window.gameClient.keyboard.handleMoveKey(dir);
+                        state.lastChaseAt = now;
+                        state.lastMoveAt = now;
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    // ---- Target is more than 1 tile away: chase using client chase ----
+    // Anti‑KS (unchanged)
+    const visiblePlayers = bot.xray?.getVisiblePlayers?.({
+        sameFloorOnly: true
+    }) || [];
+    const myId = window.gameClient?.player?.id;
+    const trustedNames = bot.panic?.getTrustedNames?.() || [];
+    const trustedSet = new Set(trustedNames);
+    const otherPlayers = visiblePlayers.filter(p => {
+        if (p.id === myId) return false;
+        const name = normalizeCreatureName(p.name);
+        return !trustedSet.has(name);
+    });
+    const hasOtherPlayers = otherPlayers.length > 0 && config.antiKSEnabled;
+
+    if (hasOtherPlayers) {
+        const selfRange = config.antiKSSelfRange ?? 2;
+        const otherRange = config.antiKSOtherRange ?? 2;
+        if (dist > selfRange) {
+            skipTarget(target, "melee anti‑KS self range", now, 5000);
+            return false;
+        }
+        for (const player of otherPlayers) {
+            const pPos = player.getPosition?.() || player.__position;
+            if (!pPos) continue;
+            const dx = Math.abs(pPos.x - targetPos.x);
+            const dy = Math.abs(pPos.y - targetPos.y);
+            if (dx <= otherRange && dy <= otherRange) {
+                skipTarget(target, "melee anti‑KS other range", now, 5000);
+                return false;
+            }
+        }
+    }
+
+    // Stuck detection – ensure we reset stuck timer when switching targets
+    if (state.engagedTargetId !== target.id) {
+        state.meleeLastDist = dist;
+        state.meleeProgressAt = now;
+        state.meleeStuckAt = 0;          // <--- RESET
+    } else {
+        if (dist < state.meleeLastDist) {
+            state.meleeLastDist = dist;
+            state.meleeProgressAt = now;
+            state.meleeStuckAt = 0;      // <--- RESET
+        } else {
+            if (!state.meleeStuckAt) state.meleeStuckAt = now;
+            if (now - state.meleeStuckAt > 6000) {
+                skipTarget(target, "melee stuck (no progress)", now, 3000);
+                return false;
+            }
+        }
+    }
+
+    return false;
+}
 
     // ---- Helper: standard away movement (fallback) ----
     function kiteAwayOnly(target, playerPos, targetPos, dist) {
@@ -5579,6 +5583,7 @@ function isTileWalkable(x, y, z, ignoreCreatures = false) {
             state.timerId = null;
         }
         setClientChaseMode(0);
+        state._chaseEnabledForDistance = false;
         if (shouldPersist) {
             config.enabled = false;
             persistConfig();
@@ -11396,13 +11401,16 @@ window.__minibiaBotBundle.installComboBotModule = function installComboBotModule
         lastTriggerAt: 0,
         retryTimer: null,
         retryCount: 0,
+        followInterval: null,       // rune spam interval
+        requestInterval: null,      // target request interval (every 500ms)
+        currentTargetId: null,      // the target we are currently following
     };
 
     const config = Object.assign({
         mode: 'follower',
         hotkeySlot: 11,
         minMana: 0,
-        cooldownMs: 1500,
+        cooldownMs: 2000,           // rune spam interval (default 2s)
         broadcastClear: true,
         channelName: 'minibia-combo-bot',
         autoFollowLeader: false,
@@ -11446,64 +11454,128 @@ window.__minibiaBotBundle.installComboBotModule = function installComboBotModule
         const targetId = msg.id;
         const leaderId = msg.leaderId;
 
+        // Stop any existing intervals
+        if (state.followInterval) {
+            clearInterval(state.followInterval);
+            state.followInterval = null;
+        }
+        // If we have a target, stop requesting
+        if (state.requestInterval) {
+            clearInterval(state.requestInterval);
+            state.requestInterval = null;
+        }
+
+        // Clear target
         if (targetId === 0) {
             if (player.__target) {
                 player.setTarget(null);
                 sendPacket('TargetPacket', 0);
+                log('Target cleared.');
             }
+            state.currentTargetId = null;
+            // Start requesting again (we lost target)
+            startRequestInterval();
             return;
         }
 
         const creature = world.getCreature(targetId);
         if (!creature) {
             log('Target creature not found:', targetId);
+            // Creature might be gone – clear and request again
+            state.currentTargetId = null;
+            startRequestInterval();
             return;
         }
 
+        // Set target if different
         if (player.__target !== creature) {
             player.setTarget(creature);
             sendPacket('TargetPacket', targetId);
             log('Targeting', creature.name, '(', targetId, ')');
         }
+        state.currentTargetId = targetId;
 
-        // ---- Auto Follow Leader ----
+        // ---- Auto Follow Leader (optional) ----
         if (config.autoFollowLeader && leaderId) {
-            log('Auto-follow enabled, leaderId:', leaderId);
             followLeaderById(leaderId);
         } else if (config.autoFollowLeader && config.leaderName) {
-            log('Auto-follow via name fallback:', config.leaderName);
             followLeaderByName();
-        } else {
-            log('Auto-follow not enabled or missing leader info.');
         }
 
-        triggerHotkey();
-    }
-
-    function followLeaderById(leaderId) {
-        // Try to follow by ID first, but if not found fallback to name
-        const world = getWorld();
-        if (!world)
-            return;
-        const player = getPlayer();
-        if (!player)
-            return;
-
-        const leader = world.getCreature(leaderId);
-        if (leader) {
-            // Use bot.follow by name (we know the leader's name from config)
-            if (config.leaderName) {
-                bot.follow(config.leaderName);
+        // ---- Start rune spam interval ----
+        triggerHotkey(); // fire once immediately
+        state.followInterval = setInterval(() => {
+            // Check that we still have a valid target
+            const currentTarget = player.__target;
+            if (!currentTarget || currentTarget.id !== state.currentTargetId) {
+                // Target lost – clear and restart request
+                state.currentTargetId = null;
+                clearInterval(state.followInterval);
+                state.followInterval = null;
+                startRequestInterval();
+                return;
             }
-            return;
-        }
-        // Fallback: try by name
-        if (config.leaderName) {
-            bot.follow(config.leaderName);
-        }
+            // Check if creature still exists and is alive
+            const creature = world.getCreature(state.currentTargetId);
+            if (!creature || (creature.state && creature.state.health <= 0)) {
+                // Target dead – clear and stop
+                if (player.__target) {
+                    player.setTarget(null);
+                    sendPacket('TargetPacket', 0);
+                }
+                state.currentTargetId = null;
+                clearInterval(state.followInterval);
+                state.followInterval = null;
+                log('Target died, stopping rune spam.');
+                startRequestInterval();
+                return;
+            }
+            // All good – shoot again
+            triggerHotkey();
+        }, config.cooldownMs);
     }
 
-    function followLeaderByName() {
+    // ---- Request interval: ask leader for target every 500ms if we have none ----
+    function startRequestInterval() {
+        if (state.requestInterval) {
+            clearInterval(state.requestInterval);
+            state.requestInterval = null;
+        }
+        // Only run if we are a follower and not already having a target
+        if (isLeader()) return;
+        if (state.currentTargetId !== null) return;
+
+        state.requestInterval = setInterval(() => {
+            // Only request if we still have no target
+            if (state.currentTargetId === null) {
+                sendMessage({ type: 'requestTarget' });
+                log('Requesting current target from leader...');
+            } else {
+                // We have a target – stop requesting
+                clearInterval(state.requestInterval);
+                state.requestInterval = null;
+            }
+        }, 500);
+    }
+
+    // ---- Leader: handle requestTarget messages ----
+    function handleRequest() {
+        const player = getPlayer();
+        if (!player) return;
+        const target = player.__target;
+        const targetId = target ? target.id : 0;
+        const leaderId = player.id;
+        // Broadcast our current target back
+        sendMessage({
+            type: 'target',
+            id: targetId,
+            leaderId: leaderId
+        });
+        log('Responded with target', targetId);
+    }
+
+    // ---- Helpers (unchanged) ----
+    function followLeaderById(leaderId) {
         if (config.leaderName) {
             bot.follow(config.leaderName);
         }
@@ -11524,8 +11596,7 @@ window.__minibiaBotBundle.installComboBotModule = function installComboBotModule
 
         const creatures = Object.values(world.activeCreatures || {});
         const leader = creatures.find(c => {
-            if (!c.name)
-                return false;
+            if (!c.name) return false;
             return c.name.toLowerCase() === leaderName.toLowerCase();
         });
 
@@ -11535,8 +11606,7 @@ window.__minibiaBotBundle.installComboBotModule = function installComboBotModule
         }
 
         const player = getPlayer();
-        if (!player)
-            return;
+        if (!player) return;
 
         if (player.id === leader.id) {
             log('Leader is self – ignoring.');
@@ -11558,26 +11628,20 @@ window.__minibiaBotBundle.installComboBotModule = function installComboBotModule
             return;
 
         const player = getPlayer();
-        if (!player)
-            return;
-
-        const now = performance.now();
-        if (now - state.lastTriggerAt < config.cooldownMs)
-            return;
+        if (!player) return;
 
         if (config.minMana > 0 && player.state.mana < config.minMana) {
             return;
         }
 
-        state.lastTriggerAt = now;
         gc.interface.hotbarManager.__handleClick(config.hotkeySlot);
+        state.lastTriggerAt = performance.now();
         log('Triggered hotkey slot', config.hotkeySlot);
     }
 
     function sendPacket(packetName, ...args) {
         const gc = window.gameClient;
-        if (!gc || !gc.send)
-            return;
+        if (!gc || !gc.send) return;
         const packetClass = window[packetName];
         if (!packetClass) {
             log('Packet class not found:', packetName);
@@ -11615,12 +11679,14 @@ window.__minibiaBotBundle.installComboBotModule = function installComboBotModule
             }
             state.originalSend.call(this, packet);
         };
-        log('Leader hook installed – broadcasting targets with leader ID.');
+        log('Leader hook installed – broadcasting targets.');
         return true;
     }
 
     function hookFollower() {
         log('Follower mode – listening for targets.');
+        // Start requesting target immediately (if we have none)
+        startRequestInterval();
         return true;
     }
 
@@ -11652,11 +11718,16 @@ window.__minibiaBotBundle.installComboBotModule = function installComboBotModule
 
         state.channel.onmessage = (event) => {
             const msg = event.data;
-            if (!msg || !msg.type)
-                return;
+            if (!msg || !msg.type) return;
+
             if (msg.type === 'target') {
                 if (!isLeader())
                     handleTarget(msg);
+            }
+            // ---- Handle target request ----
+            if (msg.type === 'requestTarget') {
+                if (isLeader())
+                    handleRequest();
             }
         };
         return true;
@@ -11721,6 +11792,17 @@ window.__minibiaBotBundle.installComboBotModule = function installComboBotModule
             state.retryCount = 0;
         }
 
+        // ---- Clear all intervals ----
+        if (state.followInterval) {
+            clearInterval(state.followInterval);
+            state.followInterval = null;
+        }
+        if (state.requestInterval) {
+            clearInterval(state.requestInterval);
+            state.requestInterval = null;
+        }
+        state.currentTargetId = null;
+
         if (state.originalSend && window.gameClient) {
             window.gameClient.send = state.originalSend;
             state.originalSend = null;
@@ -11744,6 +11826,7 @@ window.__minibiaBotBundle.installComboBotModule = function installComboBotModule
             config: {
                 ...config
             },
+            currentTargetId: state.currentTargetId,
         };
     }
 
@@ -11768,14 +11851,13 @@ window.__minibiaBotBundle.installComboBotModule = function installComboBotModule
         };
     }
 
-    // ---- Manual follow function for testing ----
+    // ---- Manual follow ----
     function followLeaderNow() {
         const player = getPlayer();
         if (!player) {
             log('Player not found.');
             return;
         }
-        // If we have a leader name, try by name
         if (config.leaderName) {
             followLeaderByName();
         } else {
@@ -11796,7 +11878,495 @@ window.__minibiaBotBundle.installComboBotModule = function installComboBotModule
         status,
         updateConfig,
         config,
-        followLeaderNow, // manual follow
+        followLeaderNow,
+    };
+};window.__minibiaBotBundle.installComboBotModule = function installComboBotModule(bot) {
+    const configStorageKey = "minibiaBot.combo.config";
+    const state = {
+        running: false,
+        channel: null,
+        originalSend: null,
+        lastTriggerAt: 0,
+        retryTimer: null,
+        retryCount: 0,
+        followInterval: null,       // rune spam interval
+        requestInterval: null,      // target request interval (every 500ms)
+        currentTargetId: null,      // the target we are currently following
+    };
+
+    const config = Object.assign({
+        mode: 'follower',
+        hotkeySlot: 11,
+        minMana: 0,
+        cooldownMs: 2000,           // rune spam interval (default 2s)
+        broadcastClear: true,
+        channelName: 'minibia-combo-bot',
+        autoFollowLeader: false,
+        leaderName: '',
+    }, bot.storage.get(configStorageKey, {}));
+
+    function persistConfig() {
+        bot.storage.set(configStorageKey, {
+            ...config
+        });
+    }
+
+    function log(...args) {
+        console.log('%c[ComboBot]', 'color:#4fc3f7', ...args);
+    }
+
+    function isLeader() {
+        return config.mode === 'leader';
+    }
+
+    function getPlayer() {
+        return window.gameClient && window.gameClient.player;
+    }
+
+    function getWorld() {
+        return window.gameClient && window.gameClient.world;
+    }
+
+    function sendMessage(msg) {
+        if (state.channel)
+            state.channel.postMessage(msg);
+    }
+
+    // ---- Follower logic ----
+    function handleTarget(msg) {
+        const player = getPlayer();
+        const world = getWorld();
+        if (!player || !world)
+            return;
+
+        const targetId = msg.id;
+        const leaderId = msg.leaderId;
+
+        // Stop any existing intervals
+        if (state.followInterval) {
+            clearInterval(state.followInterval);
+            state.followInterval = null;
+        }
+        // If we have a target, stop requesting
+        if (state.requestInterval) {
+            clearInterval(state.requestInterval);
+            state.requestInterval = null;
+        }
+
+        // Clear target
+        if (targetId === 0) {
+            if (player.__target) {
+                player.setTarget(null);
+                sendPacket('TargetPacket', 0);
+                log('Target cleared.');
+            }
+            state.currentTargetId = null;
+            // Start requesting again (we lost target)
+            startRequestInterval();
+            return;
+        }
+
+        const creature = world.getCreature(targetId);
+        if (!creature) {
+            log('Target creature not found:', targetId);
+            // Creature might be gone – clear and request again
+            state.currentTargetId = null;
+            startRequestInterval();
+            return;
+        }
+
+        // Set target if different
+        if (player.__target !== creature) {
+            player.setTarget(creature);
+            sendPacket('TargetPacket', targetId);
+            log('Targeting', creature.name, '(', targetId, ')');
+        }
+        state.currentTargetId = targetId;
+
+        // ---- Auto Follow Leader (optional) ----
+        if (config.autoFollowLeader && leaderId) {
+            followLeaderById(leaderId);
+        } else if (config.autoFollowLeader && config.leaderName) {
+            followLeaderByName();
+        }
+
+        // ---- Start rune spam interval ----
+        triggerHotkey(); // fire once immediately
+        state.followInterval = setInterval(() => {
+            // Check that we still have a valid target
+            const currentTarget = player.__target;
+            if (!currentTarget || currentTarget.id !== state.currentTargetId) {
+                // Target lost – clear and restart request
+                state.currentTargetId = null;
+                clearInterval(state.followInterval);
+                state.followInterval = null;
+                startRequestInterval();
+                return;
+            }
+            // Check if creature still exists and is alive
+            const creature = world.getCreature(state.currentTargetId);
+            if (!creature || (creature.state && creature.state.health <= 0)) {
+                // Target dead – clear and stop
+                if (player.__target) {
+                    player.setTarget(null);
+                    sendPacket('TargetPacket', 0);
+                }
+                state.currentTargetId = null;
+                clearInterval(state.followInterval);
+                state.followInterval = null;
+                log('Target died, stopping rune spam.');
+                startRequestInterval();
+                return;
+            }
+            // All good – shoot again
+            triggerHotkey();
+        }, config.cooldownMs);
+    }
+
+    // ---- Request interval: ask leader for target every 500ms if we have none ----
+    function startRequestInterval() {
+        if (state.requestInterval) {
+            clearInterval(state.requestInterval);
+            state.requestInterval = null;
+        }
+        // Only run if we are a follower and not already having a target
+        if (isLeader()) return;
+        if (state.currentTargetId !== null) return;
+
+        state.requestInterval = setInterval(() => {
+            // Only request if we still have no target
+            if (state.currentTargetId === null) {
+                sendMessage({ type: 'requestTarget' });
+                log('Requesting current target from leader...');
+            } else {
+                // We have a target – stop requesting
+                clearInterval(state.requestInterval);
+                state.requestInterval = null;
+            }
+        }, 500);
+    }
+
+    // ---- Leader: handle requestTarget messages ----
+    function handleRequest() {
+        const player = getPlayer();
+        if (!player) return;
+        const target = player.__target;
+        const targetId = target ? target.id : 0;
+        const leaderId = player.id;
+        // Broadcast our current target back
+        sendMessage({
+            type: 'target',
+            id: targetId,
+            leaderId: leaderId
+        });
+        log('Responded with target', targetId);
+    }
+
+    // ---- Helpers (unchanged) ----
+    function followLeaderById(leaderId) {
+        if (config.leaderName) {
+            bot.follow(config.leaderName);
+        }
+    }
+
+    function followLeaderByName() {
+        const world = getWorld();
+        if (!world) {
+            log('World not available.');
+            return;
+        }
+
+        const leaderName = config.leaderName.trim();
+        if (!leaderName) {
+            log('Leader name is empty.');
+            return;
+        }
+
+        const creatures = Object.values(world.activeCreatures || {});
+        const leader = creatures.find(c => {
+            if (!c.name) return false;
+            return c.name.toLowerCase() === leaderName.toLowerCase();
+        });
+
+        if (!leader) {
+            log('Leader not found by name:', leaderName);
+            return;
+        }
+
+        const player = getPlayer();
+        if (!player) return;
+
+        if (player.id === leader.id) {
+            log('Leader is self – ignoring.');
+            return;
+        }
+
+        if (player.__followTarget && player.__followTarget.id === leader.id) {
+            return;
+        }
+
+        player.setFollowTarget(leader);
+        sendPacket('FollowPacket', leader.id);
+        log('Following leader by name:', leader.name, '(', leader.id, ')');
+    }
+
+    function triggerHotkey() {
+        const gc = window.gameClient;
+        if (!gc || !gc.interface || !gc.interface.hotbarManager)
+            return;
+
+        const player = getPlayer();
+        if (!player) return;
+
+        if (config.minMana > 0 && player.state.mana < config.minMana) {
+            return;
+        }
+
+        gc.interface.hotbarManager.__handleClick(config.hotkeySlot);
+        state.lastTriggerAt = performance.now();
+        log('Triggered hotkey slot', config.hotkeySlot);
+    }
+
+    function sendPacket(packetName, ...args) {
+        const gc = window.gameClient;
+        if (!gc || !gc.send) return;
+        const packetClass = window[packetName];
+        if (!packetClass) {
+            log('Packet class not found:', packetName);
+            return;
+        }
+        gc.send(new packetClass(...args));
+    }
+
+    // ---- Leader hook ----
+    function hookLeader() {
+        const gc = window.gameClient;
+        if (!gc || typeof gc.send !== 'function') {
+            log('gameClient.send not found – will retry.');
+            return false;
+        }
+
+        if (state.originalSend) {
+            gc.send = state.originalSend;
+        }
+
+        state.originalSend = gc.send;
+        gc.send = function (packet) {
+            const buffer = packet.getBuffer();
+            if (buffer && buffer[0] === (window.CONST && CONST.PROTOCOL.CLIENT.TARGET)) {
+                const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+                const targetId = view.getUint32(1, true);
+                if (targetId !== 0 || config.broadcastClear) {
+                    const leaderId = gc.player ? gc.player.id : 0;
+                    sendMessage({
+                        type: 'target',
+                        id: targetId,
+                        leaderId: leaderId
+                    });
+                }
+            }
+            state.originalSend.call(this, packet);
+        };
+        log('Leader hook installed – broadcasting targets.');
+        return true;
+    }
+
+    function hookFollower() {
+        log('Follower mode – listening for targets.');
+        // Start requesting target immediately (if we have none)
+        startRequestInterval();
+        return true;
+    }
+
+    // ---- Communication channel ----
+    function setupChannel() {
+        if (state.channel) {
+            state.channel.close();
+            state.channel = null;
+        }
+
+        if ('BroadcastChannel' in window) {
+            state.channel = new BroadcastChannel(config.channelName);
+        } else {
+            state.channel = {
+                postMessage: (msg) => localStorage.setItem('__comboBot', JSON.stringify(msg)),
+                onmessage: null,
+                close: () => {}
+            };
+            window.addEventListener('storage', (e) => {
+                if (e.key === '__comboBot' && e.newValue) {
+                    const msg = JSON.parse(e.newValue);
+                    if (state.channel.onmessage)
+                        state.channel.onmessage({
+                            data: msg
+                        });
+                }
+            });
+        }
+
+        state.channel.onmessage = (event) => {
+            const msg = event.data;
+            if (!msg || !msg.type) return;
+
+            if (msg.type === 'target') {
+                if (!isLeader())
+                    handleTarget(msg);
+            }
+            // ---- Handle target request ----
+            if (msg.type === 'requestTarget') {
+                if (isLeader())
+                    handleRequest();
+            }
+        };
+        return true;
+    }
+
+    // ---- Start / Stop ----
+    function start() {
+        if (state.running) {
+            log('Already running.');
+            return false;
+        }
+
+        if (state.retryTimer) {
+            clearTimeout(state.retryTimer);
+            state.retryTimer = null;
+            state.retryCount = 0;
+        }
+
+        if (!setupChannel()) {
+            log('Failed to set up communication channel.');
+            return false;
+        }
+
+        if (isLeader()) {
+            const hooked = hookLeader();
+            if (!hooked) {
+                state.retryCount++;
+                if (state.retryCount > 10) {
+                    log('Giving up – gameClient.send not found after 10 retries.');
+                    state.channel.close();
+                    state.channel = null;
+                    return false;
+                }
+                state.retryTimer = setTimeout(() => {
+                    state.retryTimer = null;
+                    start();
+                }, 2000);
+                return false;
+            }
+        } else {
+            if (!hookFollower()) {
+                state.channel.close();
+                state.channel = null;
+                return false;
+            }
+        }
+
+        state.running = true;
+        config.enabled = true;
+        persistConfig();
+        log(`Started as ${config.mode}.`);
+        return true;
+    }
+
+    function stop() {
+        if (!state.running)
+            return false;
+
+        if (state.retryTimer) {
+            clearTimeout(state.retryTimer);
+            state.retryTimer = null;
+            state.retryCount = 0;
+        }
+
+        // ---- Clear all intervals ----
+        if (state.followInterval) {
+            clearInterval(state.followInterval);
+            state.followInterval = null;
+        }
+        if (state.requestInterval) {
+            clearInterval(state.requestInterval);
+            state.requestInterval = null;
+        }
+        state.currentTargetId = null;
+
+        if (state.originalSend && window.gameClient) {
+            window.gameClient.send = state.originalSend;
+            state.originalSend = null;
+        }
+
+        if (state.channel) {
+            state.channel.close();
+            state.channel = null;
+        }
+
+        state.running = false;
+        config.enabled = false;
+        persistConfig();
+        log('Stopped.');
+        return true;
+    }
+
+    function status() {
+        return {
+            running: state.running,
+            config: {
+                ...config
+            },
+            currentTargetId: state.currentTargetId,
+        };
+    }
+
+    function updateConfig(next) {
+        Object.assign(config, next);
+        if (config.cooldownMs < 100)
+            config.cooldownMs = 100;
+        if (config.hotkeySlot < 0)
+            config.hotkeySlot = 0;
+        if (config.hotkeySlot > 11)
+            config.hotkeySlot = 11;
+        if (config.leaderName)
+            config.leaderName = config.leaderName.trim();
+        persistConfig();
+
+        if (state.running) {
+            stop();
+            start();
+        }
+        return {
+            ...config
+        };
+    }
+
+    // ---- Manual follow ----
+    function followLeaderNow() {
+        const player = getPlayer();
+        if (!player) {
+            log('Player not found.');
+            return;
+        }
+        if (config.leaderName) {
+            followLeaderByName();
+        } else {
+            log('No leader name set. Use the leader name field.');
+        }
+    }
+
+    if (config.enabled) {
+        setTimeout(() => {
+            if (!state.running)
+                start();
+        }, 1000);
+    }
+
+    bot.comboBot = {
+        start,
+        stop,
+        status,
+        updateConfig,
+        config,
+        followLeaderNow,
     };
 };
 
@@ -14408,12 +14978,20 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
     }
 
     function parsePreferredTargetNames(value) {
-        return String(value || "")
-        .split(/\n/) // split by newline
-        .map(s => s.trim()) // trim whitespace
-        .filter(Boolean) // remove empty lines
-        .filter((name, idx, arr) =>
-            arr.findIndex(o => o.toLowerCase() === name.toLowerCase()) === idx); // deduplicate (case-insensitive)
+        if (!value) return [];
+        // Split by newline, or by comma if no newline
+        let parts;
+        if (value.includes('\n')) {
+            parts = value.split(/\n/);
+        } else {
+            parts = value.split(/,/);
+        }
+        return parts
+            .map(s => s.trim())
+            .filter(Boolean)
+            .filter((name, idx, arr) =>
+                arr.findIndex(o => o.toLowerCase() === name.toLowerCase()) === idx
+            );
     }
 
     // ---- REFRESH FUNCTIONS (tie UI to bot state) ----
@@ -14786,6 +15364,10 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
         };
         const kiteToggle = document.getElementById("minibia-bot-auto-attack-kite");
         const idealDistInput = document.getElementById("minibia-bot-auto-attack-ideal-dist");
+        const keepDiagonalToggle = document.getElementById("minibia-bot-auto-attack-keep-diagonal");
+        if (keepDiagonalToggle && document.activeElement !== keepDiagonalToggle) {
+            keepDiagonalToggle.checked = attackConfig.keepDiagonal || false;
+        }
         if (kiteToggle)
             kiteToggle.checked = attackConfig.kiteMode !== false;
         if (idealDistInput && document.activeElement !== idealDistInput) {
@@ -16682,6 +17264,14 @@ function scrollToWaypointIndex(index, force = false) {
     </div>
 
     <hr style="margin:12px 0;border-color:#444;">
+    
+    
+    <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
+      <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-auto-attack-keep-diagonal" /><span>Keep Diagonal</span></label>
+    </div>
+    
+    
+    <hr style="margin:12px 0;border-color:#444;">
 
   <!-- Target Priority -->
     <div style="display:flex; gap:6px; align-items:end; flex-wrap:wrap;">
@@ -17240,6 +17830,18 @@ function scrollToWaypointIndex(index, force = false) {
             setInterval(refreshExoriStatus, 2000);
         }
         
+        // ---- Keep Diagonal ----
+        const keepDiagonalToggle = document.getElementById("minibia-bot-auto-attack-keep-diagonal");
+        if (keepDiagonalToggle) {
+            // Initial sync
+            keepDiagonalToggle.checked = bot.attack?.config?.keepDiagonal || false;
+            keepDiagonalToggle.addEventListener("change", function() {
+                const enabled = this.checked;
+                bot.attack.updateConfig({ keepDiagonal: enabled });
+                bot.log("Keep diagonal set to", enabled);
+            });
+        }
+        
         // ---- Exori monster count ----
         const exoriMonstersInput = document.getElementById('minibia-bot-exori-monsters');
         if (exoriMonstersInput) {
@@ -17310,7 +17912,6 @@ function scrollToWaypointIndex(index, force = false) {
             followEnabled = false;
             bot.stopFollow();
             refreshFollowStatus();
-            // Persist state
             localStorage.setItem("minibiaBot.follow.enabled", JSON.stringify(false));
         }
 
@@ -17318,8 +17919,7 @@ function scrollToWaypointIndex(index, force = false) {
             const name = followNameInput?.value?.trim();
             if (!name) {
                 bot.log("Follow: Please enter a player name.");
-                if (followToggle)
-                    followToggle.checked = false;
+                if (followToggle) followToggle.checked = false;
                 return;
             }
             // Stop any existing follow
@@ -17328,17 +17928,68 @@ function scrollToWaypointIndex(index, force = false) {
                 followInterval = null;
             }
             followEnabled = true;
-            // Persist state
             localStorage.setItem("minibiaBot.follow.enabled", JSON.stringify(true));
             localStorage.setItem("minibiaBot.follow.name", name);
+
+            // Helper: check if the target (leader) is alive
+            function isLeaderAlive(targetName) {
+                const world = window.gameClient?.world;
+                if (!world) return false;
+                const creatures = world.activeCreatures || {};
+                const lowerName = targetName.toLowerCase();
+                for (const id in creatures) {
+                    const c = creatures[id];
+                    if (!c.name) continue;
+                    if (c.name.toLowerCase() === lowerName) {
+                        const health = c.state?.health ?? c.health;
+                        if (health !== undefined && health <= 0) return false;
+                        return true;
+                    }
+                }
+                return false;
+            }
+
+            // Helper: check if the follower has a target (i.e., is in combat)
+            function hasTarget() {
+                const player = window.gameClient?.player;
+                if (!player) return false;
+                const target = player.__target;
+                if (!target) return false;
+                // Check if target is alive
+                const health = target.state?.health ?? target.health;
+                if (health !== undefined && health <= 0) return false;
+                return true;
+            }
+
             // First attempt immediately
             bot.follow(name);
-            // Then retry every 5 seconds
+
+            // Retry every 5 seconds, but only if:
+            //  - The leader is still alive, AND
+            //  - The follower does NOT have a target (i.e., not in combat)
             followInterval = setInterval(() => {
-                if (followEnabled) {
-                    bot.follow(name);
+                if (!followEnabled) return;
+
+                // 1. Stop if leader is dead or missing
+                if (!isLeaderAlive(name)) {
+                    bot.log(`Follow: "${name}" is dead or missing, stopping.`);
+                    stopFollow();
+                    return;
                 }
-            }, 5000);
+
+                // 2. Stop if we are currently targeting something (in combat)
+                if (hasTarget()) {
+                    // We are fighting – stop following (do not re-follow)
+                    // But we want to keep the interval running, so we just skip the follow command.
+                    // However, to avoid spam, we can log occasionally.
+                    // We'll just return without re‑following.
+                    return;
+                }
+
+                // Otherwise, re‑follow (in case we lost follow due to distance or logout)
+                bot.follow(name);
+            }, 800);
+
             refreshFollowStatus();
         }
 
@@ -19324,6 +19975,29 @@ if (paladinWeaponId) {
                     returnToOriginEnabled: returnToggle.checked
                 });
                 refreshPanicStatus();
+            });
+        }
+        
+        // ---- Auto-save preferred names on blur ----
+        const prefInput = document.getElementById("minibia-bot-auto-attack-preferred-names");
+        if (prefInput) {
+            prefInput.addEventListener("blur", function() {
+                // Only save if the content actually changed
+                const current = bot.attack?.config?.preferredTargetNames || [];
+                const newNames = parsePreferredTargetNames(this.value);
+                // Compare arrays (simple length + content check)
+                const changed = current.length !== newNames.length ||
+                    current.some((n, i) => n !== newNames[i]);
+                if (changed) {
+                    saveAutoAttackPreferredConfig();
+                }
+            });
+            // Also save on Enter key (Ctrl+Enter or just Enter if you want)
+            prefInput.addEventListener("keydown", function(e) {
+                if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+                    e.preventDefault();
+                    saveAutoAttackPreferredConfig();
+                }
             });
         }
 
