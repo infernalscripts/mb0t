@@ -4636,19 +4636,25 @@ function isTileWalkable(x, y, z, ignoreCreatures = false) {
         state.lastFollowStallAt = 0;
     }
 
-    function clearEngagedTarget() {
-        state.engagedTargetId = null;
-        state.combatStartedAt = 0;
-        state.lastChaseDestinationKey = null;
-        state.kiteWaypointIndex = null;
-        state.lastProgressAt = 0;
-        state.lastDistance = undefined;
-        state.lastTargetHealth = null;
-        state.diagonalAttempted = false;
-        state.lastDiagonalCorrection = 0;
-        resetFollowProgress();
-        clearCurrentFollowTarget();
-    }
+function clearEngagedTarget() {
+    state.engagedTargetId = null;
+    state.combatStartedAt = 0;
+    state.lastChaseDestinationKey = null;
+    state.kiteWaypointIndex = null;
+    state.lastProgressAt = 0;
+    state.lastDistance = undefined;
+    state.lastTargetHealth = null;
+    state.diagonalAttempted = false;
+    state.lastDiagonalCorrection = 0;
+    // ---- ALSO RESET MELEE STUCK TRACKING ----
+    state.meleeStuckAt = 0;
+    state.meleeLastDist = undefined;
+    state.meleeProgressAt = 0;
+    state.lastPlayerPos = null;
+    state.unreachableStart = 0;
+    resetFollowProgress();
+    clearCurrentFollowTarget();
+}
 
     function restoreKiteIndex() {
         if (state.kiteOriginalIndex !== null) {
@@ -4842,40 +4848,51 @@ function isTileWalkable(x, y, z, ignoreCreatures = false) {
         });
     }
 
-    function setCurrentTarget(target) {
-        if (!target || !window.gameClient?.player || typeof window.gameClient.send !== "function")
-            return false;
-        if (typeof TargetPacket !== "function")
-            return false;
-        const info = isTargetValidAndOnScreen(target, {
-            returnDetails: true,
-            maxDx: 7,
-            maxDy: 5
+function setCurrentTarget(target) {
+    if (!target || !window.gameClient?.player || typeof window.gameClient.send !== "function")
+        return false;
+    if (typeof TargetPacket !== "function")
+        return false;
+    const info = isTargetValidAndOnScreen(target, {
+        returnDetails: true,
+        maxDx: 7,
+        maxDy: 5
+    });
+    if (!info.valid) {
+        console.log("[target] rejected", {
+            reason: info.reason,
+            id: target?.id,
+            name: target?.name,
+            dx: info.dx,
+            dy: info.dy
         });
-        if (!info.valid) {
-            console.log("[target] rejected", {
-                reason: info.reason,
-                id: target?.id,
-                name: target?.name,
-                dx: info.dx,
-                dy: info.dy
-            });
-            if (state.engagedTargetId === target.id)
-                clearEngagedTarget();
-            return false;
-        }
-        window.gameClient.player.setTarget(target);
-        window.gameClient.send(new TargetPacket(target.id));
-        state.engagedTargetId = target.id;
-        console.log("[target] accepted", {
-            id: target.id,
-            name: target.name,
-            preferred: info.preferred,
-            score: info.score,
-            distance: info.distance
-        });
-        return true;
+        if (state.engagedTargetId === target.id)
+            clearEngagedTarget();
+        return false;
     }
+    window.gameClient.player.setTarget(target);
+    window.gameClient.send(new TargetPacket(target.id));
+    state.engagedTargetId = target.id;
+
+    // ---- RESET ALL STUCK TRACKING FOR THIS NEW TARGET ----
+    state.meleeStuckAt = 0;
+    state.meleeLastDist = undefined;
+    state.meleeProgressAt = 0;
+    state.lastDistance = undefined;
+    state.lastTargetHealth = null;
+    state.lastPlayerPos = null;
+    state.lastProgressAt = 0;
+    state.unreachableStart = 0;
+
+    console.log("[target] accepted", {
+        id: target.id,
+        name: target.name,
+        preferred: info.preferred,
+        score: info.score,
+        distance: info.distance
+    });
+    return true;
+}
 
     function getValidatedEngagedTargetInfo() {
         const target = getEngagedTarget();
