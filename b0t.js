@@ -17035,6 +17035,7 @@ function scrollToWaypointIndex(index, force = false) {
     </div>
     <div class="mb-section">
       <div class="mb-label">GM Kill Switch</div>
+      <label class="mb-toggle"><input type="checkbox" id="minibia-bot-gm-chat-monitor" /><span>GM/God Chat Killswitch</span></label>
         <div class="mb-stack">
           <div class="mb-inline"><input type="text" id="minibia-bot-panic-gm-input" placeholder="Game master name" /><button type="button" class="mb-small-button" id="minibia-bot-panic-gm-add">Add</button></div>
           <div class="mb-list" id="minibia-bot-panic-gm-list"></div>
@@ -17699,6 +17700,22 @@ function scrollToWaypointIndex(index, force = false) {
         }
 
         // ---- EVENT LISTENERS ----
+        
+        // ---- GM Chat Monitor ----
+        const gmChatToggle = document.getElementById("minibia-bot-gm-chat-monitor");
+        if (gmChatToggle) {
+            gmChatToggle.checked = !!bot.gmChatMonitor?.status?.().running;
+            gmChatToggle.addEventListener("change", function() {
+                if (this.checked) bot.gmChatMonitor.start();
+                else bot.gmChatMonitor.stop();
+            });
+        }
+        
+        function refreshGmChatStatus() {
+            const toggle = document.getElementById("minibia-bot-gm-chat-monitor");
+            if (toggle) toggle.checked = !!bot.gmChatMonitor?.status?.().running;
+        }
+        
         
         // ---- Support Module UI ----
         function refreshSupportStatus() {
@@ -20062,6 +20079,7 @@ if (paladinWeaponId) {
             refreshMessageAlertStatus();
             refreshLightHackLegitStatus();
             refreshPaladinStatus();
+            refreshGmChatStatus();
             if (convertCurrencyToggle) {
                 convertCurrencyToggle.checked = bot.autoStacker?.config?.convertCurrency !== false;
             }
@@ -21449,6 +21467,150 @@ window.__minibiaBotBundle.installKeyringStealthToggleModule = function installKe
     };
 };
 
+// ==================================================================================
+// GM CHAT MONITOR – triggers killswitch if a message is sent by "gm" or "god"
+// ==================================================================================
+window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMonitorModule(bot) {
+    const configStorageKey = "minibiaBot.gmChatMonitor.config";
+    const state = {
+        running: false,
+        timerId: null,
+        seenKeys: new Set(),
+    };
+    const config = Object.assign({
+        enabled: false,
+    }, bot.storage.get(configStorageKey, {}));
+
+    function persistConfig() {
+        bot.storage.set(configStorageKey, { enabled: config.enabled });
+    }
+
+    function triggerKillswitch(sender) {
+        bot.log(`[GM Chat] Detected GM/God in chat: ${sender}`);
+        bot.playGMAlarm();
+
+        // ---- Stop all modules (same as panic killswitch) ----
+        if (bot.rune?.stop) bot.rune.stop({ persistEnabled: false });
+        if (bot.eat?.stop) bot.eat.stop({ persistEnabled: false });
+        if (bot.invisible?.stop) bot.invisible.stop({ persistEnabled: false });
+        if (bot.magicShield?.stop) bot.magicShield.stop({ persistEnabled: false });
+        if (bot.cave?.stop) bot.cave.stop({ persistEnabled: false });
+        if (bot.attack?.stop) bot.attack.stop({ persistEnabled: false });
+        if (bot.equipRing?.stop) bot.equipRing.stop({ persistEnabled: false });
+        if (bot.slimeTrainer?.stop) bot.slimeTrainer.stop({ persistEnabled: false });
+        if (bot.paladin?.stop) bot.paladin.stop({ persistEnabled: false });
+        if (bot.looter?.stop) bot.looter.stop({ persistEnabled: false });
+        if (bot.panic?.stop) bot.panic.stop({ persistEnabled: false });
+
+        // Disable this monitor itself
+        config.enabled = false;
+        persistConfig();
+        stop();
+
+        // Refresh UI if available
+        if (bot.ui?.refreshPanicStatus) bot.ui.refreshPanicStatus();
+        if (bot.ui?.refreshRuneStatus) bot.ui.refreshRuneStatus();
+        if (bot.ui?.refreshAutoEatStatus) bot.ui.refreshAutoEatStatus();
+        if (bot.ui?.refreshAutoInvisibleStatus) bot.ui.refreshAutoInvisibleStatus();
+        if (bot.ui?.refreshAutoMagicShieldStatus) bot.ui.refreshAutoMagicShieldStatus();
+        if (bot.ui?.refreshCaveStatus) bot.ui.refreshCaveStatus();
+        if (bot.ui?.refreshAutoAttackStatus) bot.ui.refreshAutoAttackStatus();
+        if (bot.ui?.refreshEquipRingStatus) bot.ui.refreshEquipRingStatus();
+        if (bot.ui?.refreshPaladinStatus) bot.ui.refreshPaladinStatus();
+        if (bot.ui?.refreshLooterStatus) bot.ui.refreshLooterStatus();
+    }
+
+    function getChatMessages() {
+        const channels = window.gameClient?.interface?.channelManager?.channels || [];
+        const messages = [];
+        for (const ch of channels) {
+            if (!ch?.__contents) continue;
+            for (const entry of ch.__contents) {
+                const raw = String(entry?.message || "").trim();
+                if (!raw) continue;
+                let sender = entry?.author || entry?.sender || entry?.name || entry?.from || null;
+                if (!sender) {
+                    // Fallback: try to extract from raw "Name: message"
+                    const match = raw.match(/^([^:]+?):\s*(.+)$/);
+                    if (match) sender = match[1].trim();
+                }
+                const key = `${ch.name}|${sender}|${raw}|${entry.__time || ''}`;
+                messages.push({ channel: ch.name, sender, raw, key, time: entry.__time });
+            }
+        }
+        return messages;
+    }
+
+    function checkMessages() {
+        if (!config.enabled || !state.running) return;
+        const messages = getChatMessages();
+        for (const msg of messages) {
+            if (state.seenKeys.has(msg.key)) continue;
+            state.seenKeys.add(msg.key);
+            if (msg.sender) {
+                const name = msg.sender.toLowerCase();
+                if (name.includes('gm') || name.includes('god')) {
+                    triggerKillswitch(msg.sender);
+                    return;
+                }
+            }
+        }
+        // Limit seen keys size
+        if (state.seenKeys.size > 500) {
+            const arr = Array.from(state.seenKeys);
+            state.seenKeys = new Set(arr.slice(-300));
+        }
+    }
+
+    function tick() {
+        if (!state.running) return;
+        try { checkMessages(); } catch (e) { bot.log("GM chat monitor error", e); }
+        state.timerId = setTimeout(tick, 1000);
+    }
+
+    function start() {
+        if (state.running) return false;
+        config.enabled = true;
+        persistConfig();
+        state.running = true;
+        bot.log("GM chat monitor started");
+        tick();
+        return true;
+    }
+
+    function stop() {
+        if (!state.running) return false;
+        state.running = false;
+        if (state.timerId) { clearTimeout(state.timerId); state.timerId = null; }
+        config.enabled = false;
+        persistConfig();
+        bot.log("GM chat monitor stopped");
+        return true;
+    }
+
+    function status() {
+        return { running: state.running, config: { ...config } };
+    }
+
+    function updateConfig(next) {
+        Object.assign(config, next);
+        persistConfig();
+        if (config.enabled && !state.running) start();
+        if (!config.enabled && state.running) stop();
+        return { ...config };
+    }
+
+    if (config.enabled) start();
+
+    bot.gmChatMonitor = {
+        start,
+        stop,
+        status,
+        updateConfig,
+        config,
+    };
+};
+
 /**
  * ==================================================================================
  * 15. BOOTSTRAP
@@ -21546,6 +21708,7 @@ window.__minibiaBotBundle.installKeyringStealthToggleModule = function installKe
         currentBundle.installOutfitToggleModule(bot);
         currentBundle.installShovelHotkeyModule(bot);
         currentBundle.installKeyringStealthToggleModule(bot);
+        currentBundle.installGmChatMonitorModule(bot);
 
         bot.ui.inject();
 
