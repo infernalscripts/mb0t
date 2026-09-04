@@ -25,6 +25,22 @@ window.__minibiaBotBundle = window.__minibiaBotBundle || {};
  * ==================================================================================
  */
 window.__minibiaBotBundle.createBot = function createBot() {
+    // ---- START: Patch __imx early ----
+    if (typeof window.__imx !== 'undefined' && window.__imx && typeof window.__imx.isHuman === 'function') {
+        try {
+            Object.defineProperty(window.__imx, 'isHuman', {
+                value: function() { return true; },
+                writable: false,
+                configurable: false
+            });
+        } catch (e) {
+            window.__imx = {
+                isHuman: function() { return true; },
+                tampered: function() { return false; },
+                padInput: function() {}
+            };
+        }
+    }
     // ---- PRIVATE STATE ----
     const cleanups = []; // Functions to run on destroy
     // ---- ALARM AUDIO (Multiple Sounds) ----
@@ -302,12 +318,26 @@ window.__minibiaBotBundle.createBot = function createBot() {
     }
     startImbReset(1000);
 
-    // ---- PATCH gameClient.send to manipulate __imA/__imB ----
+    // ---- PATCH gameClient.send to manipulate __imA/__imB AND drop RenderBeat ----
     let originalSend = null;
     if (window.gameClient && typeof window.gameClient.send === 'function') {
         originalSend = window.gameClient.send;
         window.gameClient.send = function (packet) {
-            // Call the original send
+            // ---- Drop RenderBeat ----
+            let isRenderBeat = false;
+            try {
+                const buf = packet.getBuffer ? packet.getBuffer() : null;
+                if (buf && buf.length > 0) {
+                    const opcode = buf[0];
+                    const RENDER_BEAT_OPCODE = (typeof CONST !== 'undefined' && CONST.PROTOCOL && CONST.PROTOCOL.CLIENT && CONST.PROTOCOL.CLIENT.RENDER_BEAT) 
+                        ? CONST.PROTOCOL.CLIENT.RENDER_BEAT 
+                        : 0x64;
+                    if (opcode === RENDER_BEAT_OPCODE) isRenderBeat = true;
+                }
+            } catch (e) {}
+            if (isRenderBeat) return; // silently drop
+
+            // ---- Original logic ----
             originalSend.call(this, packet);
 
             // ---- Extract opcode safely ----
@@ -1880,6 +1910,8 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         lastThreatAt: 0,
         lastReturnAttemptAt: 0,
         lastPlayerAlertAt: 0,
+        restartTimer: null,        // timeout ID for the 30‑second restart
+        restartSnapshot: null,     // snapshot of module states and panic config        
     };
 
     const config = Object.assign({
@@ -2127,45 +2159,117 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         return !!bot.pz?.goToHomePz?.();
     }
 
-    function triggerGameMasterKillSwitch(players) {
-        const detectedPlayers = (players || []).map(p => p?.name).filter(Boolean);
-        bot.playGMAlarm?.();
-        bot.log("game master kill switch triggered", {
-            players: detectedPlayers
-        });
-        // Stop all modules
-        if (bot.rune?.stop)
-            bot.rune.stop();
-        if (bot.eat?.stop)
-            bot.eat.stop();
-        if (bot.invisible?.stop)
-            bot.invisible.stop();
-        if (bot.magicShield?.stop)
-            bot.magicShield.stop();
-        if (bot.cave?.stop)
-            bot.cave.stop();
-        if (bot.attack?.stop)
-            bot.attack.stop();
-        if (bot.equipRing?.stop)
-            bot.equipRing.stop();
-        if (bot.slimeTrainer?.stop)
-            bot.slimeTrainer.stop();
-        clearPendingReturn();
-        config.unknownPlayerEnabled = false;
-        config.healthLossEnabled = false;
-        persistConfig();
-        stop(); // stop the panic loop itself
-        // Refresh UI
-        bot.ui?.refreshPanicStatus?.();
-        bot.ui?.refreshRuneStatus?.();
-        bot.ui?.refreshAutoEatStatus?.();
-        bot.ui?.refreshAutoInvisibleStatus?.();
-        bot.ui?.refreshAutoMagicShieldStatus?.();
-        bot.ui?.refreshAutoAttackStatus?.();
-        bot.ui?.refreshCaveStatus?.();
-        bot.ui?.refreshEquipRingStatus?.();
-        return true;
+function triggerGameMasterKillSwitch(players) {
+    const detectedPlayers = (players || []).map(p => p?.name).filter(Boolean);
+    bot.playGMAlarm?.();
+    bot.log("game master kill switch triggered", {
+        players: detectedPlayers
+    });
+
+    // Cancel any pending restart
+    if (state.restartTimer) {
+        clearTimeout(state.restartTimer);
+        state.restartTimer = null;
     }
+
+    // Capture snapshot of all module running states and panic config
+    const snapshot = {
+        panicRunning: state.running,
+        panicConfig: { ...config },
+        modules: {
+            rune: !!bot.rune?.status?.().running,
+            heal: !!bot.heal?.status?.().running,
+            invisible: !!bot.invisible?.status?.().running,
+            magicShield: !!bot.magicShield?.status?.().running,
+            eat: !!bot.eat?.status?.().running,
+            attack: !!bot.attack?.status?.().running,
+            cave: !!bot.cave?.status?.().running,
+            equipRing: !!bot.equipRing?.status?.().running,
+            slimeTrainer: !!bot.slimeTrainer?.status?.().running,
+            paladin: !!bot.paladin?.status?.().running,
+            looter: !!bot.looter?.status?.().running,
+        }
+    };
+    state.restartSnapshot = snapshot;
+
+    // Stop all modules (with persistEnabled: false to keep config.enabled true)
+    if (bot.rune?.stop) bot.rune.stop({ persistEnabled: false });
+    if (bot.eat?.stop) bot.eat.stop({ persistEnabled: false });
+    if (bot.invisible?.stop) bot.invisible.stop({ persistEnabled: false });
+    if (bot.magicShield?.stop) bot.magicShield.stop({ persistEnabled: false });
+    if (bot.cave?.stop) bot.cave.stop({ persistEnabled: false });
+    if (bot.attack?.stop) bot.attack.stop({ persistEnabled: false });
+    if (bot.equipRing?.stop) bot.equipRing.stop({ persistEnabled: false });
+    if (bot.slimeTrainer?.stop) bot.slimeTrainer.stop({ persistEnabled: false });
+    if (bot.paladin?.stop) bot.paladin.stop({ persistEnabled: false });
+    if (bot.looter?.stop) bot.looter.stop({ persistEnabled: false });
+
+    // Disable panic triggers and stop panic loop
+    config.unknownPlayerEnabled = false;
+    config.healthLossEnabled = false;
+    // (playerAlertEnabled is left as-is)
+    persistConfig();
+    stop(); // stops the panic runner
+
+    // Schedule restart after 30 seconds
+    state.restartTimer = setTimeout(() => {
+        state.restartTimer = null;
+        const snap = state.restartSnapshot;
+        if (!snap) return;
+        state.restartSnapshot = null;
+
+        bot.log("Restoring modules after GM killswitch...");
+
+        // Restore panic config
+        Object.assign(config, snap.panicConfig);
+        persistConfig();
+        // If panic was running before, start it
+        if (snap.panicRunning) {
+            start();
+        }
+
+        // Restart modules that were running
+        if (snap.modules.rune) bot.rune?.start?.();
+        if (snap.modules.heal) bot.heal?.start?.();
+        if (snap.modules.invisible) bot.invisible?.start?.();
+        if (snap.modules.magicShield) bot.magicShield?.start?.();
+        if (snap.modules.eat) bot.eat?.start?.();
+        if (snap.modules.attack) bot.attack?.start?.();
+        if (snap.modules.cave) bot.cave?.start?.();
+        if (snap.modules.equipRing) bot.equipRing?.start?.();
+        if (snap.modules.slimeTrainer) bot.slimeTrainer?.start?.();
+        if (snap.modules.paladin) bot.paladin?.start?.();
+        if (snap.modules.looter) bot.looter?.start?.();
+
+        // Refresh UI
+        if (bot.ui?.refreshPanicStatus) bot.ui.refreshPanicStatus();
+        if (bot.ui?.refreshRuneStatus) bot.ui.refreshRuneStatus();
+        if (bot.ui?.refreshAutoEatStatus) bot.ui.refreshAutoEatStatus();
+        if (bot.ui?.refreshAutoInvisibleStatus) bot.ui.refreshAutoInvisibleStatus();
+        if (bot.ui?.refreshAutoMagicShieldStatus) bot.ui.refreshAutoMagicShieldStatus();
+        if (bot.ui?.refreshCaveStatus) bot.ui.refreshCaveStatus();
+        if (bot.ui?.refreshAutoAttackStatus) bot.ui.refreshAutoAttackStatus();
+        if (bot.ui?.refreshEquipRingStatus) bot.ui.refreshEquipRingStatus();
+        if (bot.ui?.refreshPaladinStatus) bot.ui.refreshPaladinStatus();
+        if (bot.ui?.refreshLooterStatus) bot.ui.refreshLooterStatus();
+
+        bot.log("Modules restored after GM killswitch.");
+    }, 30000);
+
+    // Refresh UI immediately to reflect stopped state
+    if (bot.ui?.refreshPanicStatus) bot.ui.refreshPanicStatus();
+    if (bot.ui?.refreshRuneStatus) bot.ui.refreshRuneStatus();
+    if (bot.ui?.refreshAutoEatStatus) bot.ui.refreshAutoEatStatus();
+    if (bot.ui?.refreshAutoInvisibleStatus) bot.ui.refreshAutoInvisibleStatus();
+    if (bot.ui?.refreshAutoMagicShieldStatus) bot.ui.refreshAutoMagicShieldStatus();
+    if (bot.ui?.refreshCaveStatus) bot.ui.refreshCaveStatus();
+    if (bot.ui?.refreshAutoAttackStatus) bot.ui.refreshAutoAttackStatus();
+    if (bot.ui?.refreshEquipRingStatus) bot.ui.refreshEquipRingStatus();
+    if (bot.ui?.refreshPaladinStatus) bot.ui.refreshPaladinStatus();
+    if (bot.ui?.refreshLooterStatus) bot.ui.refreshLooterStatus();
+
+    return true;
+}
 
     // ---- CHECK FUNCTIONS (called on each tick) ----
     function checkGameMasters() {
@@ -2291,6 +2395,11 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
     }
 
     function start() {
+        if (state.restartTimer) {
+            clearTimeout(state.restartTimer);
+            state.restartTimer = null;
+            state.restartSnapshot = null;
+        }
         if (state.running)
             return false;
         state.running = true;
@@ -2304,6 +2413,11 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
     }
 
     function stop() {
+        if (state.restartTimer) {
+            clearTimeout(state.restartTimer);
+            state.restartTimer = null;
+            state.restartSnapshot = null;
+        }
         if (!state.running && state.timerId == null) {
             state.lastHealth = null;
             return false;
@@ -2433,6 +2547,15 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         getTrustedNames,
         getGameMasterNames,
         config,
+        cancelRestart: function() {
+            if (state.restartTimer) {
+                clearTimeout(state.restartTimer);
+                state.restartTimer = null;
+                state.restartSnapshot = null;
+                bot.log("GM killswitch restart cancelled.");
+            }
+        },
+        
     };
 };
 
@@ -17035,6 +17158,7 @@ function scrollToWaypointIndex(index, force = false) {
     </div>
     <div class="mb-section">
       <div class="mb-label">GM Kill Switch</div>
+      <button type="button" id="minibia-bot-panic-cancel-restart" style="display:none;">Cancel Restart</button>
       <label class="mb-toggle"><input type="checkbox" id="minibia-bot-gm-chat-monitor" /><span>GM/God Chat Killswitch</span></label>
         <div class="mb-stack">
           <div class="mb-inline"><input type="text" id="minibia-bot-panic-gm-input" placeholder="Game master name" /><button type="button" class="mb-small-button" id="minibia-bot-panic-gm-add">Add</button></div>
@@ -17700,6 +17824,14 @@ function scrollToWaypointIndex(index, force = false) {
         }
 
         // ---- EVENT LISTENERS ----
+        
+        const cancelRestartBtn = document.getElementById("minibia-bot-panic-cancel-restart");
+        if (cancelRestartBtn) {
+            cancelRestartBtn.addEventListener("click", function() {
+                bot.panic.cancelRestart();
+                cancelRestartBtn.style.display = "none";
+            });
+        }
         
         // ---- GM Chat Monitor ----
         const gmChatToggle = document.getElementById("minibia-bot-gm-chat-monitor");
