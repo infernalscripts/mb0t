@@ -17160,7 +17160,7 @@ function scrollToWaypointIndex(index, force = false) {
     <div class="mb-section">
       <div class="mb-label">GM Kill Switch</div>
       <button type="button" id="minibia-bot-panic-cancel-restart" style="display:none;">Cancel Restart</button>
-      
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px 32px;">
         <!-- Left Column -->
         <div style="display:flex; flex-direction:column; gap:10px;">
           <label class="mb-toggle"><input type="checkbox" id="minibia-bot-gm-chat-monitor" /><span>GM/God Chat Killswitch</span></label>
@@ -17168,8 +17168,9 @@ function scrollToWaypointIndex(index, force = false) {
         
         <!-- Right Column -->
         <div style="display:flex; flex-direction:column; gap:10px;">
-          <label class="mb-toggle"><input type="checkbox" id="minibia-bot-tormented-ghost-enabled" /><span>Tormented Ghost</span></label>
+          <label class="mb-toggle"><input type="checkbox" id="minibia-bot-tormented-ghost-enabled" /><span>Anti-Bot Creature</span></label>
         </div>
+      </div>
           
         <div class="mb-stack">
           <div class="mb-inline"><input type="text" id="minibia-bot-panic-gm-input" placeholder="Game master name" /><button type="button" class="mb-small-button" id="minibia-bot-panic-gm-add">Add</button></div>
@@ -21820,21 +21821,23 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
 };
 
 // ==================================================================================
-// TORMENTED GHOST – alerts and replies when it appears on screen
+// TORMENTED GHOST – replies to any creature that mentions your name
 // ==================================================================================
 window.__minibiaBotBundle.installTormentedGhostModule = function installTormentedGhostModule(bot) {
     const configStorageKey = "minibiaBot.tormentedGhost.config";
     const state = {
         running: false,
         timerId: null,
-        ghostDetected: false,
-        replyTimer: null,
+        replyCooldown: new Map(), // creatureId -> lastReplyTime
+        originalSay: null,
+        patched: false,
     };
 
     const config = Object.assign({
         enabled: false,
         replyDelayMs: 1000,      // wait 1 second before saying "hi"
         triggerAlarm: true,
+        cooldownMs: 30000,       // don't reply to the same creature more than once per 30s
     }, bot.storage.get(configStorageKey, {}));
 
     function persistConfig() {
@@ -21842,100 +21845,115 @@ window.__minibiaBotBundle.installTormentedGhostModule = function installTormente
             enabled: config.enabled,
             replyDelayMs: config.replyDelayMs,
             triggerAlarm: config.triggerAlarm,
+            cooldownMs: config.cooldownMs,
         });
     }
 
-    function getVisibleGhost() {
-        const creatures = bot.xray?.getVisibleCreatures?.({ sameFloorOnly: true }) || [];
-        return creatures.find(c => c.name && c.name.toLowerCase() === 'tormented ghost');
-    }
-
-    function tick() {
-        if (!state.running) return;
-
-        try {
-            const ghost = getVisibleGhost();
-
-            if (ghost) {
-                // New detection
-                if (!state.ghostDetected) {
-                    state.ghostDetected = true;
-
-                    // Trigger GM alert
-                    if (config.triggerAlarm) {
-                        bot.playGMAlarm?.();
-                        bot.log("[Tormented Ghost] Detected! Alarm triggered.");
-                    }
-
-                    // Schedule the reply (with delay)
-                    if (state.replyTimer) {
-                        clearTimeout(state.replyTimer);
-                        state.replyTimer = null;
-                    }
-
-                    state.replyTimer = setTimeout(() => {
-                        if (state.running && state.ghostDetected) {
-                            const sent = bot.sendChat("hi");
-                            if (sent) {
-                                bot.log("[Tormented Ghost] Replied 'hi'.");
-                            }
-                        }
-                        state.replyTimer = null;
-                    }, config.replyDelayMs);
-                }
-            } else {
-                // Ghost disappeared – reset detection (and cancel pending reply)
-                if (state.ghostDetected) {
-                    state.ghostDetected = false;
-                    if (state.replyTimer) {
-                        clearTimeout(state.replyTimer);
-                        state.replyTimer = null;
-                    }
-                }
-            }
-        } catch (e) {
-            bot.log("[Tormented Ghost] tick error", e);
+    // ---- Hook Creature.say ----
+    function installSpeechHook() {
+        if (state.patched) return;
+        if (typeof Creature === 'undefined' || !Creature.prototype) {
+            setTimeout(installSpeechHook, 500);
+            return;
         }
 
-        // Check every 500ms
-        state.timerId = setTimeout(tick, 500);
+        const originalSay = Creature.prototype.say;
+        state.originalSay = originalSay;
+
+        Creature.prototype.say = function(packet) {
+            // Let the original handler run first (shows the text)
+            const result = originalSay.call(this, packet);
+
+            // Only process if the module is running
+            if (!state.running || !config.enabled) return result;
+
+            // Skip if this creature is the player themselves
+            if (this === gameClient.player) return result;
+
+            const message = packet.message || "";
+            const creatureId = this.id;
+            const playerName = bot.getPlayerName();
+            if (!playerName) return result;
+
+            // Check if the message contains the player's name (case-insensitive)
+            if (message.toLowerCase().includes(playerName.toLowerCase())) {
+                const now = Date.now();
+                const last = state.replyCooldown.get(creatureId) || 0;
+                if (now - last < config.cooldownMs) return result; // cooldown per creature
+
+                // Mark this creature as replied
+                state.replyCooldown.set(creatureId, now);
+
+                // Trigger alarm if configured
+                if (config.triggerAlarm) {
+                    bot.playGMAlarm?.();
+                    bot.log(`[TormentedGhost] ${this.name} mentioned you: "${message}" – alarm triggered.`);
+                }
+
+                // Schedule the reply (with delay)
+                if (state.replyTimer) {
+                    clearTimeout(state.replyTimer);
+                }
+                state.replyTimer = setTimeout(() => {
+                    if (state.running) {
+                        const sent = bot.sendChat("hi");
+                        if (sent) {
+                            bot.log(`[TormentedGhost] Replied "hi" to ${this.name}.`);
+                        }
+                    }
+                    state.replyTimer = null;
+                }, config.replyDelayMs);
+            }
+
+            return result;
+        };
+
+        state.patched = true;
+        bot.log("[TormentedGhost] Speech hook installed.");
     }
 
+    function uninstallSpeechHook() {
+        if (!state.patched) return;
+        if (state.originalSay) {
+            Creature.prototype.say = state.originalSay;
+            state.originalSay = null;
+        }
+        state.patched = false;
+        bot.log("[TormentedGhost] Speech hook removed.");
+    }
+
+    // ---- Start / Stop ----
     function start(overrides = {}) {
         Object.assign(config, overrides, { enabled: true });
         persistConfig();
         if (state.running) {
-            bot.log("[Tormented Ghost] already running");
+            bot.log("[TormentedGhost] already running");
             return false;
         }
         state.running = true;
-        state.ghostDetected = false;
+        state.replyCooldown.clear();
         if (state.replyTimer) {
             clearTimeout(state.replyTimer);
             state.replyTimer = null;
         }
-        bot.log("[Tormented Ghost] started", { replyDelayMs: config.replyDelayMs });
-        tick();
+        installSpeechHook();
+        bot.log("[TormentedGhost] started", { replyDelayMs: config.replyDelayMs, cooldownMs: config.cooldownMs });
         return true;
     }
 
     function stop(options = {}) {
         const shouldPersist = options.persistEnabled !== false;
         state.running = false;
-        if (state.timerId) {
-            clearTimeout(state.timerId);
-            state.timerId = null;
-        }
         if (state.replyTimer) {
             clearTimeout(state.replyTimer);
             state.replyTimer = null;
         }
-        state.ghostDetected = false;
+        uninstallSpeechHook();
         if (shouldPersist) {
             config.enabled = false;
             persistConfig();
         }
-        bot.log("[Tormented Ghost] stopped");
+        bot.log("[TormentedGhost] stopped");
         return true;
     }
 
@@ -21943,14 +21961,14 @@ window.__minibiaBotBundle.installTormentedGhostModule = function installTormente
         return {
             running: state.running,
             config: { ...config },
-            ghostDetected: state.ghostDetected,
-            replyPending: !!state.replyTimer,
+            patched: state.patched,
         };
     }
 
     function updateConfig(next = {}) {
         Object.assign(config, next);
         if (config.replyDelayMs < 500) config.replyDelayMs = 500;
+        if (config.cooldownMs < 5000) config.cooldownMs = 5000;
         persistConfig();
         if (config.enabled && !state.running) start();
         if (!config.enabled && state.running) stop();
@@ -21959,7 +21977,8 @@ window.__minibiaBotBundle.installTormentedGhostModule = function installTormente
 
     // Auto-start if enabled
     if (config.enabled) {
-        start();
+        // Wait for Creature to be available
+        setTimeout(() => start(), 1000);
     }
 
     bot.tormentedGhost = {
