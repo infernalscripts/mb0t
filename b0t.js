@@ -17156,10 +17156,21 @@ function scrollToWaypointIndex(index, force = false) {
         <div class="mb-list" id="minibia-bot-panic-trusted-list"></div>
       </div>
     </div>
+    
     <div class="mb-section">
       <div class="mb-label">GM Kill Switch</div>
       <button type="button" id="minibia-bot-panic-cancel-restart" style="display:none;">Cancel Restart</button>
-      <label class="mb-toggle"><input type="checkbox" id="minibia-bot-gm-chat-monitor" /><span>GM/God Chat Killswitch</span></label>
+      
+        <!-- Left Column -->
+        <div style="display:flex; flex-direction:column; gap:10px;">
+          <label class="mb-toggle"><input type="checkbox" id="minibia-bot-gm-chat-monitor" /><span>GM/God Chat Killswitch</span></label>
+        </div>
+        
+        <!-- Right Column -->
+        <div style="display:flex; flex-direction:column; gap:10px;">
+          <label class="mb-toggle"><input type="checkbox" id="minibia-bot-tormented-ghost-enabled" /><span>Tormented Ghost</span></label>
+        </div>
+          
         <div class="mb-stack">
           <div class="mb-inline"><input type="text" id="minibia-bot-panic-gm-input" placeholder="Game master name" /><button type="button" class="mb-small-button" id="minibia-bot-panic-gm-add">Add</button></div>
           <div class="mb-list" id="minibia-bot-panic-gm-list"></div>
@@ -17824,6 +17835,59 @@ function scrollToWaypointIndex(index, force = false) {
         }
 
         // ---- EVENT LISTENERS ----
+        
+        // ---- Tormented Ghost ----
+        const ghostToggle = document.getElementById("minibia-bot-tormented-ghost-enabled");
+        const ghostDelay = document.getElementById("minibia-bot-tormented-ghost-delay");
+        const ghostStatus = document.getElementById("minibia-bot-tormented-ghost-status");
+
+        function refreshTormentedGhostStatus() {
+            const status = bot.tormentedGhost?.status?.();
+            if (!status) return;
+            if (ghostToggle && document.activeElement !== ghostToggle) {
+                ghostToggle.checked = status.running;
+            }
+            if (ghostDelay && document.activeElement !== ghostDelay) {
+                ghostDelay.value = (status.config.replyDelayMs / 1000).toFixed(1);
+            }
+            if (ghostStatus) {
+                if (status.ghostDetected) {
+                    ghostStatus.textContent = "👻 Ghost detected!";
+                } else if (status.running) {
+                    ghostStatus.textContent = "Watching...";
+                } else {
+                    ghostStatus.textContent = "Idle";
+                }
+            }
+        }
+
+        if (ghostToggle) {
+            ghostToggle.checked = !!bot.tormentedGhost?.status?.().running;
+            ghostToggle.addEventListener("change", function() {
+                if (this.checked) {
+                    const delay = Math.max(500, parseFloat(ghostDelay?.value) * 1000 || 3000);
+                    bot.tormentedGhost.updateConfig({
+                        enabled: true,
+                        replyDelayMs: delay,
+                    });
+                } else {
+                    bot.tormentedGhost.stop();
+                }
+                refreshTormentedGhostStatus();
+            });
+        }
+
+        if (ghostDelay) {
+            ghostDelay.addEventListener("change", function() {
+                const val = Math.max(0.5, parseFloat(this.value) || 1);
+                this.value = val.toFixed(1);
+                bot.tormentedGhost.updateConfig({
+                    replyDelayMs: val * 1000,
+                });
+                refreshTormentedGhostStatus();
+            });
+        }
+
         
         const cancelRestartBtn = document.getElementById("minibia-bot-panic-cancel-restart");
         if (cancelRestartBtn) {
@@ -20212,6 +20276,7 @@ if (paladinWeaponId) {
             refreshLightHackLegitStatus();
             refreshPaladinStatus();
             refreshGmChatStatus();
+            refreshTormentedGhostStatus();
             if (convertCurrencyToggle) {
                 convertCurrencyToggle.checked = bot.autoStacker?.config?.convertCurrency !== false;
             }
@@ -21600,7 +21665,7 @@ window.__minibiaBotBundle.installKeyringStealthToggleModule = function installKe
 };
 
 // ==================================================================================
-// GM CHAT MONITOR – triggers killswitch if a message is sent by "gm" or "god"
+// GM CHAT MONITOR – triggers killswitch if "GM" or "God" with space in Default chat
 // ==================================================================================
 window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMonitorModule(bot) {
     const configStorageKey = "minibiaBot.gmChatMonitor.config";
@@ -21676,16 +21741,27 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
     function checkMessages() {
         if (!config.enabled || !state.running) return;
         const messages = getChatMessages();
+        const myName = bot.getPlayerName();
         for (const msg of messages) {
             if (state.seenKeys.has(msg.key)) continue;
             state.seenKeys.add(msg.key);
-            if (msg.sender) {
-                const name = msg.sender.toLowerCase();
-                if (name.includes('gm') || name.includes('god')) {
-                    triggerKillswitch(msg.sender);
-                    return;
-                }
-            }
+
+            // ---- STRICTER CHECKS ----
+            // 1. Only process messages from the "Default" channel
+            if (msg.channel !== "Default") continue;
+
+            // 2. Sender must exist and must start with "GM " or "God " (case-insensitive)
+            if (!msg.sender) continue;
+            const name = msg.sender.trim();
+            const lowerName = name.toLowerCase();
+            if (!lowerName.startsWith('gm ') && !lowerName.startsWith('god ')) continue;
+
+            // 3. Skip messages from the player themselves
+            if (myName && name.toLowerCase() === myName.toLowerCase()) continue;
+
+            // If we reach here, it's a real GM or God message in Default chat
+            triggerKillswitch(msg.sender);
+            return;
         }
         // Limit seen keys size
         if (state.seenKeys.size > 500) {
@@ -21735,6 +21811,158 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
     if (config.enabled) start();
 
     bot.gmChatMonitor = {
+        start,
+        stop,
+        status,
+        updateConfig,
+        config,
+    };
+};
+
+// ==================================================================================
+// TORMENTED GHOST – alerts and replies when it appears on screen
+// ==================================================================================
+window.__minibiaBotBundle.installTormentedGhostModule = function installTormentedGhostModule(bot) {
+    const configStorageKey = "minibiaBot.tormentedGhost.config";
+    const state = {
+        running: false,
+        timerId: null,
+        ghostDetected: false,
+        replyTimer: null,
+    };
+
+    const config = Object.assign({
+        enabled: false,
+        replyDelayMs: 1000,      // wait 1 second before saying "hi"
+        triggerAlarm: true,
+    }, bot.storage.get(configStorageKey, {}));
+
+    function persistConfig() {
+        bot.storage.set(configStorageKey, {
+            enabled: config.enabled,
+            replyDelayMs: config.replyDelayMs,
+            triggerAlarm: config.triggerAlarm,
+        });
+    }
+
+    function getVisibleGhost() {
+        const creatures = bot.xray?.getVisibleCreatures?.({ sameFloorOnly: true }) || [];
+        return creatures.find(c => c.name && c.name.toLowerCase() === 'tormented ghost');
+    }
+
+    function tick() {
+        if (!state.running) return;
+
+        try {
+            const ghost = getVisibleGhost();
+
+            if (ghost) {
+                // New detection
+                if (!state.ghostDetected) {
+                    state.ghostDetected = true;
+
+                    // Trigger GM alert
+                    if (config.triggerAlarm) {
+                        bot.playGMAlarm?.();
+                        bot.log("[Tormented Ghost] Detected! Alarm triggered.");
+                    }
+
+                    // Schedule the reply (with delay)
+                    if (state.replyTimer) {
+                        clearTimeout(state.replyTimer);
+                        state.replyTimer = null;
+                    }
+
+                    state.replyTimer = setTimeout(() => {
+                        if (state.running && state.ghostDetected) {
+                            const sent = bot.sendChat("hi");
+                            if (sent) {
+                                bot.log("[Tormented Ghost] Replied 'hi'.");
+                            }
+                        }
+                        state.replyTimer = null;
+                    }, config.replyDelayMs);
+                }
+            } else {
+                // Ghost disappeared – reset detection (and cancel pending reply)
+                if (state.ghostDetected) {
+                    state.ghostDetected = false;
+                    if (state.replyTimer) {
+                        clearTimeout(state.replyTimer);
+                        state.replyTimer = null;
+                    }
+                }
+            }
+        } catch (e) {
+            bot.log("[Tormented Ghost] tick error", e);
+        }
+
+        // Check every 500ms
+        state.timerId = setTimeout(tick, 500);
+    }
+
+    function start(overrides = {}) {
+        Object.assign(config, overrides, { enabled: true });
+        persistConfig();
+        if (state.running) {
+            bot.log("[Tormented Ghost] already running");
+            return false;
+        }
+        state.running = true;
+        state.ghostDetected = false;
+        if (state.replyTimer) {
+            clearTimeout(state.replyTimer);
+            state.replyTimer = null;
+        }
+        bot.log("[Tormented Ghost] started", { replyDelayMs: config.replyDelayMs });
+        tick();
+        return true;
+    }
+
+    function stop(options = {}) {
+        const shouldPersist = options.persistEnabled !== false;
+        state.running = false;
+        if (state.timerId) {
+            clearTimeout(state.timerId);
+            state.timerId = null;
+        }
+        if (state.replyTimer) {
+            clearTimeout(state.replyTimer);
+            state.replyTimer = null;
+        }
+        state.ghostDetected = false;
+        if (shouldPersist) {
+            config.enabled = false;
+            persistConfig();
+        }
+        bot.log("[Tormented Ghost] stopped");
+        return true;
+    }
+
+    function status() {
+        return {
+            running: state.running,
+            config: { ...config },
+            ghostDetected: state.ghostDetected,
+            replyPending: !!state.replyTimer,
+        };
+    }
+
+    function updateConfig(next = {}) {
+        Object.assign(config, next);
+        if (config.replyDelayMs < 500) config.replyDelayMs = 500;
+        persistConfig();
+        if (config.enabled && !state.running) start();
+        if (!config.enabled && state.running) stop();
+        return { ...config };
+    }
+
+    // Auto-start if enabled
+    if (config.enabled) {
+        start();
+    }
+
+    bot.tormentedGhost = {
         start,
         stop,
         status,
@@ -21841,6 +22069,7 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
         currentBundle.installShovelHotkeyModule(bot);
         currentBundle.installKeyringStealthToggleModule(bot);
         currentBundle.installGmChatMonitorModule(bot);
+        currentBundle.installTormentedGhostModule(bot);
 
         bot.ui.inject();
 
