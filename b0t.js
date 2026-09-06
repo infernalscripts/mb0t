@@ -17682,7 +17682,8 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
     <button type="button" class="mb-tab-button" data-tab-button="targeting">️⚔️ Targeting</button>
     <button type="button" class="mb-tab-button" data-tab-button="healing">💚 Healing</button>
 	<button type="button" class="mb-tab-button" data-tab-button="looter">💰 Looter</button>
-    <button type="button" class="mb-tab-button" data-tab-button="panic">⚠️ Alerts</button>
+    <button type="button" class="mb-tab-button" data-tab-button="alert">⚠️ Alerts</button>
+    <button type="button" class="mb-tab-button" data-tab-button="antibot">🤖 Anti-Bot</button>
     <button type="button" class="mb-tab-button" data-tab-button="utility">🛠️ Tools</button>
     <button type="button" class="mb-tab-button" data-tab-button="support">💕 Support</button>
 	<button type="button" class="mb-tab-button" data-tab-button="training">✨ Training</button>
@@ -17721,65 +17722,112 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
   </div>
 </div>
 
-<!-- Panic Tab -->
-<div class="mb-tab-panel" data-tab-panel="panic">
+<!-- AntiBot Tab -->
+<div class="mb-tab-panel" data-tab-panel="antibot">
+  <div class="mb-section">
+    <div class="mb-label">GM Kill Switch</div>
+    <button type="button" id="minibia-bot-panic-cancel-restart" style="display:none;">Cancel Restart</button>
+    
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px 32px;">
+      <!-- Left Column -->
+      <div style="display:flex; flex-direction:column; gap:10px;">
+        <label class="mb-toggle"><input type="checkbox" id="minibia-bot-gm-chat-monitor" /><span>GM/God Chat Killswitch</span></label>
+      </div>
+      
+      <!-- Right Column -->
+      <div style="display:flex; flex-direction:column; gap:10px;">
+        <label class="mb-toggle"><input type="checkbox" id="minibia-bot-tormented-ghost-enabled" /><span>Anti-Bot Creature</span></label>
+      </div>
+    </div>
+        
+    <div class="mb-stack">
+      <div class="mb-inline">
+        <input type="text" id="minibia-bot-panic-gm-input" placeholder="Game master name" />
+        <button type="button" class="mb-small-button" id="minibia-bot-panic-gm-add">Add</button>
+      </div>
+      <div class="mb-list" id="minibia-bot-panic-gm-list"></div>
+    </div>
+    
+    <label class="mb-toggle">
+    <input type="checkbox" id="minibia-bot-auto-pickup-enabled" /><span>Auto Pickup (anti‑bot trap)</span></label>
+<div style="display:flex; gap:8px; flex-wrap:wrap;">
+    <label class="mb-field" style="flex:0 0 80px;">
+        <span class="mb-field-label">Radius</span>
+        <input type="number" id="minibia-bot-auto-pickup-radius" min="1" max="3" value="2" />
+    </label>
+    <label class="mb-field" style="flex:0 0 80px;">
+        <span class="mb-field-label">Delay (ms)</span>
+        <input type="number" id="minibia-bot-auto-pickup-delay" min="100" max="2000" value="300" />
+    </label>
+</div>
 
+<!-- Auto Pickup Blacklist -->
+<hr style="margin:12px 0;border-color:#444;">
+<div class="mb-label" style="font-size:11px;">Pickup Blacklist</div>
+<div style="display:flex; gap:6px; flex-wrap:wrap;">
+    <label class="mb-field" style="flex:1; min-width:140px;">
+        <span class="mb-field-label">Item IDs</span>
+        <input type="text" id="minibia-bot-auto-pickup-ignore-ids" placeholder="1234, 5678" />
+    </label>
+    <label class="mb-field" style="flex:1; min-width:140px;">
+        <span class="mb-field-label">Item Names</span>
+        <input type="text" id="minibia-bot-auto-pickup-ignore-names" placeholder="Dirt, Sand, Rubbish" />
+    </label>
+</div>
+<button type="button" class="mb-small-button" id="minibia-bot-auto-pickup-save-blacklist" style="margin-top:4px;">Save Blacklist</button>
+<div class="mb-small-note">Items matching ID or name (case-insensitive) will never be picked up by Auto Pickup.</div>
+    
+  </div>
+</div>
+  
+
+
+<!-- Alert Tab -->
+<div class="mb-tab-panel" data-tab-panel="alert">
+
+  <!-- First Section -->
   <div class="mb-section">
     <div class="mb-stack">
       <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px 32px;">
         <!-- Left Column -->
         <div style="display:flex; flex-direction:column; gap:10px;">
-      
-        <label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-player-alert" /><span>Player On Screen Alert</span></label>
-        <label class="mb-toggle"><input type="checkbox" id="minibia-bot-player-attack-alert" /><span>Player Attack Alert</span></label>
-        
-        </div>
-        <!-- Right Column -->
-        <div style="display:flex; flex-direction:column; gap:10px;">
-
-        <label class="mb-toggle"><input type="checkbox" id="minibia-bot-antibot-enabled" /><span>Anti-Bot Alert</span></label>
-        <label class="mb-toggle"><input type="checkbox" id="minibia-bot-message-alert" /><span>Message Alert</span></label>
-
-        </div>
-      </div>
-
-        <div style="display:flex;gap:6px;align-items:center;"><label style="font-size:11px;color:#e9d39b;">Alert Cooldown (s)</label><input type="number" id="minibia-bot-panic-player-cooldown" min="10" value="10" style="width:60px;padding:2px 4px" /></div>
-        <div class="mb-inline"><input type="text" id="minibia-bot-panic-trusted-input" placeholder="Trusted name" /><button type="button" class="mb-small-button" id="minibia-bot-panic-trusted-add">Add</button></div>
-        <div class="mb-list" id="minibia-bot-panic-trusted-list"></div>
-      </div>
-    </div>
-    
-    <div class="mb-section">
-      <div class="mb-label">GM Kill Switch</div>
-      <button type="button" id="minibia-bot-panic-cancel-restart" style="display:none;">Cancel Restart</button>
-      <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px 32px;">
-        <!-- Left Column -->
-        <div style="display:flex; flex-direction:column; gap:10px;">
-          <label class="mb-toggle"><input type="checkbox" id="minibia-bot-gm-chat-monitor" /><span>GM/God Chat Killswitch</span></label>
+          <label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-player-alert" /><span>Player On Screen Alert</span></label>
+          <label class="mb-toggle"><input type="checkbox" id="minibia-bot-player-attack-alert" /><span>Player Attack Alert</span></label>
         </div>
         
         <!-- Right Column -->
         <div style="display:flex; flex-direction:column; gap:10px;">
-          <label class="mb-toggle"><input type="checkbox" id="minibia-bot-tormented-ghost-enabled" /><span>Anti-Bot Creature</span></label>
+          <label class="mb-toggle"><input type="checkbox" id="minibia-bot-antibot-enabled" /><span>Anti-Bot Alert</span></label>
+          <label class="mb-toggle"><input type="checkbox" id="minibia-bot-message-alert" /><span>Message Alert</span></label>
         </div>
       </div>
-          
-        <div class="mb-stack">
-          <div class="mb-inline"><input type="text" id="minibia-bot-panic-gm-input" placeholder="Game master name" /><button type="button" class="mb-small-button" id="minibia-bot-panic-gm-add">Add</button></div>
-          <div class="mb-list" id="minibia-bot-panic-gm-list"></div>
-        </div>
+
+      <div style="display:flex;gap:6px;align-items:center;">
+        <label style="font-size:11px;color:#e9d39b;">Alert Cooldown (s)</label>
+        <input type="number" id="minibia-bot-panic-player-cooldown" min="10" value="10" style="width:60px;padding:2px 4px" />
       </div>
-	  
-      <div class="mb-section">
-        <div class="mb-label" id="minibia-bot-home">Panic Runner Home: not set</div>
-          <div class="mb-stack">
-            <button type="button" id="minibia-bot-set-home">Set Home</button>
-            <label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-unknown" /><span>Unknown Player</span></label>
-            <label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-health" /><span>Healthloss</span></label>
-            <label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-return" /><span>Auto Return to Position</span></label>
-          </div>
-        </div>
+
+      <div class="mb-inline">
+        <input type="text" id="minibia-bot-panic-trusted-input" placeholder="Trusted name" />
+        <button type="button" class="mb-small-button" id="minibia-bot-panic-trusted-add">Add</button>
+      </div>
+
+      <div class="mb-list" id="minibia-bot-panic-trusted-list"></div>
     </div>
+  </div> <!-- Properly closed the first mb-section here -->
+
+  <!-- Second Section -->
+  <div class="mb-section">
+    <div class="mb-label" id="minibia-bot-home">Panic Runner Home: not set</div>
+    <div class="mb-stack">
+      <button type="button" id="minibia-bot-set-home">Set Home</button>
+      <label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-unknown" /><span>Unknown Player</span></label>
+      <label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-health" /><span>Healthloss</span></label>
+      <label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-return" /><span>Auto Return to Position</span></label>
+    </div>
+  </div>
+
+</div>
 
 <!-- Xray Tab -->
 <div class="mb-tab-panel" data-tab-panel="xray">
@@ -18428,6 +18476,115 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
         }
 
         // ---- EVENT LISTENERS ----
+        
+        // ---- AutoPickup blacklist UI ----
+        const pickupIgnoreIds = document.getElementById("minibia-bot-auto-pickup-ignore-ids");
+        const pickupIgnoreNames = document.getElementById("minibia-bot-auto-pickup-ignore-names");
+        const pickupSaveBlacklist = document.getElementById("minibia-bot-auto-pickup-save-blacklist");
+
+        function refreshAutoPickupBlacklist() {
+            const status = bot.autoPickup?.status?.();
+            if (!status) return;
+            const cfg = status.config;
+            if (pickupIgnoreIds && document.activeElement !== pickupIgnoreIds) {
+                pickupIgnoreIds.value = (cfg.ignoredItemIds || []).join(", ");
+            }
+            if (pickupIgnoreNames && document.activeElement !== pickupIgnoreNames) {
+                pickupIgnoreNames.value = (cfg.ignoredItemNames || []).join(", ");
+            }
+        }
+
+        function saveAutoPickupBlacklist() {
+            const ids = pickupIgnoreIds?.value?.split(",")
+                .map(s => s.trim())
+                .filter(Boolean)
+                .map(Number)
+                .filter(Number.isFinite) || [];
+            const names = pickupIgnoreNames?.value?.split(",")
+                .map(s => s.trim())
+                .filter(Boolean) || [];
+            bot.autoPickup.updateConfig({
+                ignoredItemIds: ids,
+                ignoredItemNames: names,
+            });
+            refreshAutoPickupBlacklist();
+            bot.log("[AutoPickup] Blacklist saved", { ids, names });
+        }
+
+        if (pickupSaveBlacklist) {
+            pickupSaveBlacklist.addEventListener("click", saveAutoPickupBlacklist);
+        }
+        if (pickupIgnoreIds) {
+            pickupIgnoreIds.addEventListener("blur", saveAutoPickupBlacklist);
+            pickupIgnoreIds.addEventListener("keydown", function(e) {
+                if (e.key === "Enter") {
+                    e.preventDefault();
+                    saveAutoPickupBlacklist();
+                }
+            });
+        }
+        if (pickupIgnoreNames) {
+            pickupIgnoreNames.addEventListener("blur", saveAutoPickupBlacklist);
+            pickupIgnoreNames.addEventListener("keydown", function(e) {
+                if (e.key === "Enter") {
+                    e.preventDefault();
+                    saveAutoPickupBlacklist();
+                }
+            });
+        }
+
+        // Initial sync
+        setTimeout(refreshAutoPickupBlacklist, 100);
+        
+        const autoPickupToggle = document.getElementById("minibia-bot-auto-pickup-enabled");
+        const autoPickupRadius = document.getElementById("minibia-bot-auto-pickup-radius");
+        const autoPickupDelay = document.getElementById("minibia-bot-auto-pickup-delay");
+
+        function refreshAutoPickupStatus() {
+            const status = bot.autoPickup?.status?.();
+            if (!status) return;
+            if (autoPickupToggle && document.activeElement !== autoPickupToggle) {
+                autoPickupToggle.checked = status.running;
+            }
+            if (autoPickupRadius && document.activeElement !== autoPickupRadius) {
+                autoPickupRadius.value = status.config.radius;
+            }
+            if (autoPickupDelay && document.activeElement !== autoPickupDelay) {
+                autoPickupDelay.value = status.config.delayMs;
+            }
+        }
+
+        if (autoPickupToggle) {
+            autoPickupToggle.checked = !!bot.autoPickup?.status?.().running;
+            autoPickupToggle.addEventListener("change", function() {
+                if (this.checked) {
+                    const radius = parseInt(autoPickupRadius?.value) || 2;
+                    const delay = parseInt(autoPickupDelay?.value) || 300;
+                    bot.autoPickup.updateConfig({ enabled: true, radius, delayMs: delay });
+                } else {
+                    bot.autoPickup.stop();
+                }
+                refreshAutoPickupStatus();
+            });
+        }
+        if (autoPickupRadius) {
+            autoPickupRadius.addEventListener("change", function() {
+                const val = Math.max(1, Math.min(3, parseInt(this.value) || 2));
+                this.value = val;
+                bot.autoPickup.updateConfig({ radius: val });
+                refreshAutoPickupStatus();
+            });
+        }
+        if (autoPickupDelay) {
+            autoPickupDelay.addEventListener("change", function() {
+                const val = Math.max(100, Math.min(2000, parseInt(this.value) || 300));
+                this.value = val;
+                bot.autoPickup.updateConfig({ delayMs: val });
+                refreshAutoPickupStatus();
+            });
+        }
+        // Initial refresh
+        setTimeout(refreshAutoPickupStatus, 100);
 
         // ---- Tormented Ghost ----
         const ghostToggle = document.getElementById("minibia-bot-tormented-ghost-enabled");
@@ -22680,7 +22837,7 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
 window.__minibiaBotBundle.installTormentedGhostModule = function installTormentedGhostModule(bot) {
     const configStorageKey = "minibiaBot.tormentedGhost.config";
     const state = {
-        running: false,
+        running: true,
         timerId: null,
         replyCooldown: new Map(), // creatureId -> lastReplyTime
         originalSay: null,
@@ -22863,6 +23020,323 @@ window.__minibiaBotBundle.installTormentedGhostModule = function installTormente
     };
 };
 
+// ==================================================================================
+// AUTO PICKUP – picks up ground items (anti‑bot trap) with cave/attack pause
+//                 + blacklist support (FIXED: no bot.getTopItemOnTile)
+// ==================================================================================
+window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupModule(bot) {
+    const configStorageKey = "minibiaBot.autoPickup.config";
+    const state = {
+        running: true,
+        pickupInProgress: false,
+        cooldown: new Map(), // tileKey -> lastPickupTime
+        originalHandleItemAdd: null,
+        patched: false,
+        resumeCave: false,
+        resumeAttack: false,
+    };
+
+    const config = Object.assign({
+        enabled: false,
+        radius: 5,              // Chebyshev distance
+        cooldownMs: 2000,       // don't pick up from same tile too often
+        delayMs: 300,           // small delay before acting (human reaction)
+        walkTimeoutMs: 5000,    // give up walking after this long
+        ignoredItemIds: [],     // array of item client IDs (CID) to ignore
+        ignoredItemNames: [],   // array of item name substrings to ignore (case-insensitive)
+    }, bot.storage.get(configStorageKey, {}));
+
+    function persistConfig() {
+        bot.storage.set(configStorageKey, {
+            enabled: config.enabled,
+            radius: config.radius,
+            cooldownMs: config.cooldownMs,
+            delayMs: config.delayMs,
+            walkTimeoutMs: config.walkTimeoutMs,
+            ignoredItemIds: config.ignoredItemIds,
+            ignoredItemNames: config.ignoredItemNames,
+        });
+    }
+
+    // ---- Helper: get top item from a tile ----
+    function getTopItemOnTile(tile) {
+        if (!tile) return null;
+        if (Array.isArray(tile.items) && tile.items.length > 0) {
+            // The last item in the array is the topmost
+            return tile.items[tile.items.length - 1];
+        }
+        return null;
+    }
+
+    // ---- Blacklist check ----
+    function isItemIgnored(itemId, itemName) {
+        // Check by ID
+        if (config.ignoredItemIds.includes(itemId)) {
+            return true;
+        }
+        // Check by name (case-insensitive substring match)
+        if (itemName) {
+            const lowerName = itemName.toLowerCase();
+            for (const pattern of config.ignoredItemNames) {
+                if (lowerName.includes(pattern.toLowerCase())) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // ---- Core pickup logic with walk and pause ----
+    function __doPickup(pos, itemId, callback) {
+        const tile = gameClient.world.getTileFromWorldPosition(pos);
+        if (!tile) {
+            if (callback) callback(false);
+            return false;
+        }
+        const topItem = getTopItemOnTile(tile);
+        if (!topItem || topItem.id !== itemId) {
+            if (callback) callback(false);
+            return false;
+        }
+
+        // Extra safety: re-check blacklist just before picking up
+        const def = gameClient.itemDefinitionsByCid?.[topItem.id];
+        const name = def?.properties?.name || "";
+        if (isItemIgnored(topItem.id, name)) {
+            bot.log(`[AutoPickup] Skipping blacklisted item ${topItem.id} (${name})`);
+            if (callback) callback(false);
+            return false;
+        }
+
+        const success = bot.pickUpItem(pos.x, pos.y, pos.z);
+        if (callback) callback(success);
+        return success;
+    }
+
+    function __resumeModules() {
+        if (state.resumeCave) {
+            bot.cave.start();
+            state.resumeCave = false;
+        }
+        if (state.resumeAttack) {
+            bot.attack.start();
+            state.resumeAttack = false;
+        }
+        state.pickupInProgress = false;
+        const pf = gameClient.world.pathfinder;
+        pf.setPathfindCache(null);
+        pf.__finalDestination = null;
+    }
+
+    function __walkAndPickup(pos, itemId) {
+        if (state.pickupInProgress) return;
+        state.pickupInProgress = true;
+
+        const playerPos = bot.getPlayerPosition();
+        if (!playerPos) { state.pickupInProgress = false; return; }
+
+        const dist = Math.max(Math.abs(pos.x - playerPos.x), Math.abs(pos.y - playerPos.y));
+        if (dist <= 1) {
+            __doPickup(pos, itemId, function(success) {
+                __resumeModules();
+            });
+            return;
+        }
+
+        const caveRunning = bot.cave?.status?.().running || false;
+        const attackRunning = bot.attack?.status?.().running || false;
+        if (caveRunning) {
+            bot.cave.stop({ persistEnabled: false });
+            state.resumeCave = true;
+        }
+        if (attackRunning) {
+            bot.attack.stop({ persistEnabled: false });
+            state.resumeAttack = true;
+        }
+
+        const pf = gameClient.world.pathfinder;
+        pf.setPathfindCache(null);
+        pf.__finalDestination = null;
+        pf.findPath(playerPos, pos);
+
+        let intervalId = setInterval(() => {
+            const currentPos = bot.getPlayerPosition();
+            if (!currentPos) return;
+            const d = Math.max(Math.abs(pos.x - currentPos.x), Math.abs(pos.y - currentPos.y));
+            if (d <= 1) {
+                clearInterval(intervalId);
+                __doPickup(pos, itemId, function(success) {
+                    __resumeModules();
+                });
+            }
+        }, 100);
+
+        setTimeout(() => {
+            if (intervalId) {
+                clearInterval(intervalId);
+                intervalId = null;
+            }
+            __doPickup(pos, itemId, function(success) {
+                __resumeModules();
+            });
+        }, config.walkTimeoutMs);
+    }
+
+    // ---- Hook PacketHandler.handleItemAdd ----
+    function installHook() {
+        if (state.patched) return;
+        const handler = gameClient?.networkManager?.packetHandler;
+        if (!handler || typeof handler.handleItemAdd !== "function") {
+            setTimeout(installHook, 500);
+            return;
+        }
+
+        state.originalHandleItemAdd = handler.handleItemAdd;
+        handler.handleItemAdd = function(packet) {
+            const result = state.originalHandleItemAdd.call(this, packet);
+
+            if (!state.running || !config.enabled) return result;
+
+            const pos = packet.position;
+            if (!pos) return result;
+
+            const playerPos = bot.getPlayerPosition();
+            if (!playerPos) return result;
+
+            const dx = Math.abs(pos.x - playerPos.x);
+            const dy = Math.abs(pos.y - playerPos.y);
+            if (dx > config.radius || dy > config.radius || pos.z !== playerPos.z) {
+                return result;
+            }
+
+            // ---- BLACKLIST CHECK (early) ----
+            const itemId = packet.id;
+            const def = gameClient.itemDefinitionsByCid?.[itemId];
+            const name = def?.properties?.name || "";
+            if (isItemIgnored(itemId, name)) {
+                bot.log(`[AutoPickup] Ignoring blacklisted item ${itemId} (${name}) at ${pos.x},${pos.y},${pos.z}`);
+                return result;
+            }
+
+            const tileKey = `${pos.x},${pos.y},${pos.z}`;
+            const now = Date.now();
+            const last = state.cooldown.get(tileKey) || 0;
+            if (now - last < config.cooldownMs) {
+                return result;
+            }
+            state.cooldown.set(tileKey, now);
+
+            setTimeout(() => {
+                if (!state.running || !config.enabled) return;
+                const tile = gameClient.world.getTileFromWorldPosition(pos);
+                if (!tile) return;
+                const topItem = getTopItemOnTile(tile);
+                if (!topItem || topItem.id !== itemId) return;
+                // Re-check blacklist
+                const def2 = gameClient.itemDefinitionsByCid?.[topItem.id];
+                const name2 = def2?.properties?.name || "";
+                if (isItemIgnored(topItem.id, name2)) {
+                    bot.log(`[AutoPickup] Skipping blacklisted item (late check) ${topItem.id} (${name2})`);
+                    return;
+                }
+                __walkAndPickup(pos, itemId);
+            }, config.delayMs);
+
+            return result;
+        };
+
+        state.patched = true;
+        bot.log("[AutoPickup] Hook installed.");
+    }
+
+    function uninstallHook() {
+        if (!state.patched) return;
+        const handler = gameClient?.networkManager?.packetHandler;
+        if (handler && state.originalHandleItemAdd) {
+            handler.handleItemAdd = state.originalHandleItemAdd;
+            state.originalHandleItemAdd = null;
+        }
+        state.patched = false;
+        bot.log("[AutoPickup] Hook removed.");
+    }
+
+    // ---- Start / Stop ----
+    function start(overrides = {}) {
+        Object.assign(config, overrides, { enabled: true });
+        persistConfig();
+        if (state.running) {
+            bot.log("[AutoPickup] already running");
+            return false;
+        }
+        state.running = true;
+        state.cooldown.clear();
+        state.pickupInProgress = false;
+        state.resumeCave = false;
+        state.resumeAttack = false;
+        installHook();
+        bot.log("[AutoPickup] started", { radius: config.radius, delayMs: config.delayMs });
+        return true;
+    }
+
+    function stop(options = {}) {
+        const shouldPersist = options.persistEnabled !== false;
+        state.running = false;
+        if (state.pickupInProgress) {
+            __resumeModules();
+        }
+        uninstallHook();
+        if (shouldPersist) {
+            config.enabled = false;
+            persistConfig();
+        }
+        bot.log("[AutoPickup] stopped");
+        return true;
+    }
+
+    function status() {
+        return {
+            running: state.running,
+            config: { ...config },
+            patched: state.patched,
+            pickupInProgress: state.pickupInProgress,
+        };
+    }
+
+    function updateConfig(next = {}) {
+        if (next.ignoredItemIds !== undefined) {
+            next.ignoredItemIds = Array.isArray(next.ignoredItemIds)
+                ? next.ignoredItemIds.map(id => Number(id)).filter(Number.isFinite)
+                : [];
+        }
+        if (next.ignoredItemNames !== undefined) {
+            next.ignoredItemNames = Array.isArray(next.ignoredItemNames)
+                ? next.ignoredItemNames.map(s => String(s).trim()).filter(Boolean)
+                : [];
+        }
+        Object.assign(config, next);
+        if (config.radius < 1) config.radius = 1;
+        if (config.cooldownMs < 500) config.cooldownMs = 500;
+        if (config.delayMs < 100) config.delayMs = 100;
+        if (config.walkTimeoutMs < 2000) config.walkTimeoutMs = 2000;
+        persistConfig();
+        if (config.enabled && !state.running) start();
+        if (!config.enabled && state.running) stop();
+        return { ...config };
+    }
+
+    if (config.enabled) {
+        setTimeout(() => start(), 1000);
+    }
+
+    bot.autoPickup = {
+        start,
+        stop,
+        status,
+        updateConfig,
+        config,
+    };
+};
+
 /**
  * ==================================================================================
  * 15. BOOTSTRAP
@@ -22962,6 +23436,8 @@ window.__minibiaBotBundle.installTormentedGhostModule = function installTormente
         currentBundle.installKeyringStealthToggleModule(bot);
         currentBundle.installGmChatMonitorModule(bot);
         currentBundle.installTormentedGhostModule(bot);
+        currentBundle.installAutoPickupModule(bot);
+      
 
         bot.ui.inject();
 
