@@ -590,6 +590,103 @@ window.__minibiaBotBundle.createBot = function createBot() {
         }
     }
 
+    function selectTravelDestination(destName) {
+        const modal = document.getElementById('travel-modal');
+        if (!modal || modal.style.display === 'none') {
+            if (this.log)
+                this.log('Travel modal is not open.');
+            return false;
+        }
+
+        // Find the destination element
+        const destSpans = modal.querySelectorAll('.travel-dest-name');
+        let target = null;
+        for (const span of destSpans) {
+            if (span.textContent.trim() === destName) {
+                target = span.closest('.travel-destination') || span;
+                break;
+            }
+        }
+
+        if (!target) {
+            if (this.log)
+                this.log(`Destination "${destName}" not found.`);
+            return false;
+        }
+
+        // Click the destination to select it
+        const clickEvent = new MouseEvent('click', {
+            bubbles: true
+        });
+        target.dispatchEvent(clickEvent);
+
+        // Find and click the confirm button
+        const confirmBtn = modal.querySelector('.modal-footer button[action="confirm"]');
+        if (!confirmBtn) {
+            if (this.log)
+                this.log('Confirm button not found.');
+            return false;
+        }
+
+        // Short delay to let selection register, then confirm
+        setTimeout(() => {
+            confirmBtn.click();
+            if (this.log)
+                this.log(`Travel to "${destName}" confirmed.`);
+        }, 150);
+
+        return true;
+    }
+
+    // ---- Generic NPC keyword clicker ----
+    function clickNpcKeyword(keyword) {
+        // First, try to find the button inside the NPC dialog (if visible)
+        const dialog = document.getElementById('npc-dialog');
+        if (dialog && dialog.style.display !== 'none') {
+            const buttons = dialog.querySelectorAll('#npc-dialog-buttons button');
+            for (const btn of buttons) {
+                if (btn.textContent.trim() === keyword) {
+                    btn.click();
+                    if (this.log)
+                        this.log(`Clicked keyword "${keyword}" in NPC dialog.`);
+                    return true;
+                }
+            }
+        }
+
+        // Fallback: search all visible modals (travel, shop, etc.)
+        const modalIds = ['travel-modal', 'offer-modal', 'shop-modal'];
+        for (const id of modalIds) {
+            const modal = document.getElementById(id);
+            if (!modal || modal.style.display === 'none')
+                continue;
+            const clickables = modal.querySelectorAll('span, a, button');
+            for (const el of clickables) {
+                if (el.textContent.trim() === keyword) {
+                    el.click();
+                    if (this.log)
+                        this.log(`Clicked keyword "${keyword}" in modal #${id}.`);
+                    return true;
+                }
+            }
+        }
+
+        // Last resort: search entire document for any button with matching text
+        const allButtons = document.querySelectorAll('button');
+        for (const btn of allButtons) {
+            if (btn.textContent.trim() === keyword) {
+                btn.click();
+                if (this.log)
+                    this.log(`Clicked keyword "${keyword}" (fallback).`);
+                return true;
+            }
+        }
+
+        if (this.log)
+            this.log(`Keyword "${keyword}" not found.`);
+        return false;
+    }
+
     // ---- PUBLIC API ----
     return {
         version: "0.7.7",
@@ -661,6 +758,9 @@ window.__minibiaBotBundle.createBot = function createBot() {
                 window.localStorage.removeItem(key);
             }
         },
+
+        clickTravel: selectTravelDestination,
+        clickNpc: clickNpcKeyword,
 
         reconnect: {
             enable: () => {
@@ -18476,7 +18576,7 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
         }
 
         // ---- EVENT LISTENERS ----
-        
+
         // ---- AutoPickup blacklist UI ----
         const pickupIgnoreIds = document.getElementById("minibia-bot-auto-pickup-ignore-ids");
         const pickupIgnoreNames = document.getElementById("minibia-bot-auto-pickup-ignore-names");
@@ -18484,7 +18584,8 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
 
         function refreshAutoPickupBlacklist() {
             const status = bot.autoPickup?.status?.();
-            if (!status) return;
+            if (!status)
+                return;
             const cfg = status.config;
             if (pickupIgnoreIds && document.activeElement !== pickupIgnoreIds) {
                 pickupIgnoreIds.value = (cfg.ignoredItemIds || []).join(", ");
@@ -18508,7 +18609,10 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
                 ignoredItemNames: names,
             });
             refreshAutoPickupBlacklist();
-            bot.log("[AutoPickup] Blacklist saved", { ids, names });
+            bot.log("[AutoPickup] Blacklist saved", {
+                ids,
+                names
+            });
         }
 
         if (pickupSaveBlacklist) {
@@ -18516,7 +18620,7 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
         }
         if (pickupIgnoreIds) {
             pickupIgnoreIds.addEventListener("blur", saveAutoPickupBlacklist);
-            pickupIgnoreIds.addEventListener("keydown", function(e) {
+            pickupIgnoreIds.addEventListener("keydown", function (e) {
                 if (e.key === "Enter") {
                     e.preventDefault();
                     saveAutoPickupBlacklist();
@@ -18525,7 +18629,7 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
         }
         if (pickupIgnoreNames) {
             pickupIgnoreNames.addEventListener("blur", saveAutoPickupBlacklist);
-            pickupIgnoreNames.addEventListener("keydown", function(e) {
+            pickupIgnoreNames.addEventListener("keydown", function (e) {
                 if (e.key === "Enter") {
                     e.preventDefault();
                     saveAutoPickupBlacklist();
@@ -18535,14 +18639,15 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
 
         // Initial sync
         setTimeout(refreshAutoPickupBlacklist, 100);
-        
+
         const autoPickupToggle = document.getElementById("minibia-bot-auto-pickup-enabled");
         const autoPickupRadius = document.getElementById("minibia-bot-auto-pickup-radius");
         const autoPickupDelay = document.getElementById("minibia-bot-auto-pickup-delay");
 
         function refreshAutoPickupStatus() {
             const status = bot.autoPickup?.status?.();
-            if (!status) return;
+            if (!status)
+                return;
             if (autoPickupToggle && document.activeElement !== autoPickupToggle) {
                 autoPickupToggle.checked = status.running;
             }
@@ -18556,11 +18661,15 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
 
         if (autoPickupToggle) {
             autoPickupToggle.checked = !!bot.autoPickup?.status?.().running;
-            autoPickupToggle.addEventListener("change", function() {
+            autoPickupToggle.addEventListener("change", function () {
                 if (this.checked) {
                     const radius = parseInt(autoPickupRadius?.value) || 2;
                     const delay = parseInt(autoPickupDelay?.value) || 300;
-                    bot.autoPickup.updateConfig({ enabled: true, radius, delayMs: delay });
+                    bot.autoPickup.updateConfig({
+                        enabled: true,
+                        radius,
+                        delayMs: delay
+                    });
                 } else {
                     bot.autoPickup.stop();
                 }
@@ -18568,18 +18677,22 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
             });
         }
         if (autoPickupRadius) {
-            autoPickupRadius.addEventListener("change", function() {
+            autoPickupRadius.addEventListener("change", function () {
                 const val = Math.max(1, Math.min(3, parseInt(this.value) || 2));
                 this.value = val;
-                bot.autoPickup.updateConfig({ radius: val });
+                bot.autoPickup.updateConfig({
+                    radius: val
+                });
                 refreshAutoPickupStatus();
             });
         }
         if (autoPickupDelay) {
-            autoPickupDelay.addEventListener("change", function() {
+            autoPickupDelay.addEventListener("change", function () {
                 const val = Math.max(100, Math.min(2000, parseInt(this.value) || 300));
                 this.value = val;
-                bot.autoPickup.updateConfig({ delayMs: val });
+                bot.autoPickup.updateConfig({
+                    delayMs: val
+                });
                 refreshAutoPickupStatus();
             });
         }
@@ -23038,12 +23151,12 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
 
     const config = Object.assign({
         enabled: false,
-        radius: 5,              // Chebyshev distance
-        cooldownMs: 2000,       // don't pick up from same tile too often
-        delayMs: 300,           // small delay before acting (human reaction)
-        walkTimeoutMs: 5000,    // give up walking after this long
-        ignoredItemIds: [],     // array of item client IDs (CID) to ignore
-        ignoredItemNames: [],   // array of item name substrings to ignore (case-insensitive)
+        radius: 5, // Chebyshev distance
+        cooldownMs: 2000, // don't pick up from same tile too often
+        delayMs: 300, // small delay before acting (human reaction)
+        walkTimeoutMs: 5000, // give up walking after this long
+        ignoredItemIds: [], // array of item client IDs (CID) to ignore
+        ignoredItemNames: [], // array of item name substrings to ignore (case-insensitive)
     }, bot.storage.get(configStorageKey, {}));
 
     function persistConfig() {
@@ -23060,7 +23173,8 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
 
     // ---- Helper: get top item from a tile ----
     function getTopItemOnTile(tile) {
-        if (!tile) return null;
+        if (!tile)
+            return null;
         if (Array.isArray(tile.items) && tile.items.length > 0) {
             // The last item in the array is the topmost
             return tile.items[tile.items.length - 1];
@@ -23090,12 +23204,14 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
     function __doPickup(pos, itemId, callback) {
         const tile = gameClient.world.getTileFromWorldPosition(pos);
         if (!tile) {
-            if (callback) callback(false);
+            if (callback)
+                callback(false);
             return false;
         }
         const topItem = getTopItemOnTile(tile);
         if (!topItem || topItem.id !== itemId) {
-            if (callback) callback(false);
+            if (callback)
+                callback(false);
             return false;
         }
 
@@ -23104,12 +23220,14 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
         const name = def?.properties?.name || "";
         if (isItemIgnored(topItem.id, name)) {
             bot.log(`[AutoPickup] Skipping blacklisted item ${topItem.id} (${name})`);
-            if (callback) callback(false);
+            if (callback)
+                callback(false);
             return false;
         }
 
         const success = bot.pickUpItem(pos.x, pos.y, pos.z);
-        if (callback) callback(success);
+        if (callback)
+            callback(success);
         return success;
     }
 
@@ -23129,15 +23247,19 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
     }
 
     function __walkAndPickup(pos, itemId) {
-        if (state.pickupInProgress) return;
+        if (state.pickupInProgress)
+            return;
         state.pickupInProgress = true;
 
         const playerPos = bot.getPlayerPosition();
-        if (!playerPos) { state.pickupInProgress = false; return; }
+        if (!playerPos) {
+            state.pickupInProgress = false;
+            return;
+        }
 
         const dist = Math.max(Math.abs(pos.x - playerPos.x), Math.abs(pos.y - playerPos.y));
         if (dist <= 1) {
-            __doPickup(pos, itemId, function(success) {
+            __doPickup(pos, itemId, function (success) {
                 __resumeModules();
             });
             return;
@@ -23146,11 +23268,15 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
         const caveRunning = bot.cave?.status?.().running || false;
         const attackRunning = bot.attack?.status?.().running || false;
         if (caveRunning) {
-            bot.cave.stop({ persistEnabled: false });
+            bot.cave.stop({
+                persistEnabled: false
+            });
             state.resumeCave = true;
         }
         if (attackRunning) {
-            bot.attack.stop({ persistEnabled: false });
+            bot.attack.stop({
+                persistEnabled: false
+            });
             state.resumeAttack = true;
         }
 
@@ -23161,11 +23287,12 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
 
         let intervalId = setInterval(() => {
             const currentPos = bot.getPlayerPosition();
-            if (!currentPos) return;
+            if (!currentPos)
+                return;
             const d = Math.max(Math.abs(pos.x - currentPos.x), Math.abs(pos.y - currentPos.y));
             if (d <= 1) {
                 clearInterval(intervalId);
-                __doPickup(pos, itemId, function(success) {
+                __doPickup(pos, itemId, function (success) {
                     __resumeModules();
                 });
             }
@@ -23176,7 +23303,7 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
                 clearInterval(intervalId);
                 intervalId = null;
             }
-            __doPickup(pos, itemId, function(success) {
+            __doPickup(pos, itemId, function (success) {
                 __resumeModules();
             });
         }, config.walkTimeoutMs);
@@ -23184,7 +23311,8 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
 
     // ---- Hook PacketHandler.handleItemAdd ----
     function installHook() {
-        if (state.patched) return;
+        if (state.patched)
+            return;
         const handler = gameClient?.networkManager?.packetHandler;
         if (!handler || typeof handler.handleItemAdd !== "function") {
             setTimeout(installHook, 500);
@@ -23192,16 +23320,19 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
         }
 
         state.originalHandleItemAdd = handler.handleItemAdd;
-        handler.handleItemAdd = function(packet) {
+        handler.handleItemAdd = function (packet) {
             const result = state.originalHandleItemAdd.call(this, packet);
 
-            if (!state.running || !config.enabled) return result;
+            if (!state.running || !config.enabled)
+                return result;
 
             const pos = packet.position;
-            if (!pos) return result;
+            if (!pos)
+                return result;
 
             const playerPos = bot.getPlayerPosition();
-            if (!playerPos) return result;
+            if (!playerPos)
+                return result;
 
             const dx = Math.abs(pos.x - playerPos.x);
             const dy = Math.abs(pos.y - playerPos.y);
@@ -23227,11 +23358,14 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
             state.cooldown.set(tileKey, now);
 
             setTimeout(() => {
-                if (!state.running || !config.enabled) return;
+                if (!state.running || !config.enabled)
+                    return;
                 const tile = gameClient.world.getTileFromWorldPosition(pos);
-                if (!tile) return;
+                if (!tile)
+                    return;
                 const topItem = getTopItemOnTile(tile);
-                if (!topItem || topItem.id !== itemId) return;
+                if (!topItem || topItem.id !== itemId)
+                    return;
                 // Re-check blacklist
                 const def2 = gameClient.itemDefinitionsByCid?.[topItem.id];
                 const name2 = def2?.properties?.name || "";
@@ -23250,7 +23384,8 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
     }
 
     function uninstallHook() {
-        if (!state.patched) return;
+        if (!state.patched)
+            return;
         const handler = gameClient?.networkManager?.packetHandler;
         if (handler && state.originalHandleItemAdd) {
             handler.handleItemAdd = state.originalHandleItemAdd;
@@ -23262,7 +23397,9 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
 
     // ---- Start / Stop ----
     function start(overrides = {}) {
-        Object.assign(config, overrides, { enabled: true });
+        Object.assign(config, overrides, {
+            enabled: true
+        });
         persistConfig();
         if (state.running) {
             bot.log("[AutoPickup] already running");
@@ -23274,7 +23411,10 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
         state.resumeCave = false;
         state.resumeAttack = false;
         installHook();
-        bot.log("[AutoPickup] started", { radius: config.radius, delayMs: config.delayMs });
+        bot.log("[AutoPickup] started", {
+            radius: config.radius,
+            delayMs: config.delayMs
+        });
         return true;
     }
 
@@ -23296,7 +23436,9 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
     function status() {
         return {
             running: state.running,
-            config: { ...config },
+            config: {
+                ...config
+            },
             patched: state.patched,
             pickupInProgress: state.pickupInProgress,
         };
@@ -23305,23 +23447,31 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
     function updateConfig(next = {}) {
         if (next.ignoredItemIds !== undefined) {
             next.ignoredItemIds = Array.isArray(next.ignoredItemIds)
-                ? next.ignoredItemIds.map(id => Number(id)).filter(Number.isFinite)
-                : [];
+                 ? next.ignoredItemIds.map(id => Number(id)).filter(Number.isFinite)
+                 : [];
         }
         if (next.ignoredItemNames !== undefined) {
             next.ignoredItemNames = Array.isArray(next.ignoredItemNames)
-                ? next.ignoredItemNames.map(s => String(s).trim()).filter(Boolean)
-                : [];
+                 ? next.ignoredItemNames.map(s => String(s).trim()).filter(Boolean)
+                 : [];
         }
         Object.assign(config, next);
-        if (config.radius < 1) config.radius = 1;
-        if (config.cooldownMs < 500) config.cooldownMs = 500;
-        if (config.delayMs < 100) config.delayMs = 100;
-        if (config.walkTimeoutMs < 2000) config.walkTimeoutMs = 2000;
+        if (config.radius < 1)
+            config.radius = 1;
+        if (config.cooldownMs < 500)
+            config.cooldownMs = 500;
+        if (config.delayMs < 100)
+            config.delayMs = 100;
+        if (config.walkTimeoutMs < 2000)
+            config.walkTimeoutMs = 2000;
         persistConfig();
-        if (config.enabled && !state.running) start();
-        if (!config.enabled && state.running) stop();
-        return { ...config };
+        if (config.enabled && !state.running)
+            start();
+        if (!config.enabled && state.running)
+            stop();
+        return {
+            ...config
+        };
     }
 
     if (config.enabled) {
@@ -23437,7 +23587,6 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
         currentBundle.installGmChatMonitorModule(bot);
         currentBundle.installTormentedGhostModule(bot);
         currentBundle.installAutoPickupModule(bot);
-      
 
         bot.ui.inject();
 
