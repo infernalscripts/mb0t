@@ -21872,6 +21872,15 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
                         <span>Show Time‑To‑Level (TTL) in Performance Overlay</span>
                     </label>
                     <div class="mb-small-note">Displays remaining time until next level (requires Debugger overlay).</div>
+                    
+                    <hr style="margin:12px 0;border-color:#444;">
+
+                    <div class="mb-label" style="font-size:11px;">Item IDs</div>
+                    <label class="mb-toggle">
+                        <input type="checkbox" id="minibia-bot-ui-show-item-ids" />
+                        <span>Show SID / CID when looking at items</span>
+                    </label>
+                    <div class="mb-small-note">Displays server ID and client ID of items in the look description.</div>
                 </div>
             </div>
         `;
@@ -21910,19 +21919,14 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
         const ttlCheck = document.getElementById("minibia-bot-ui-ttl-enabled");
 
         function refreshUI() {
-            if (wideCheck)
-                wideCheck.checked = config.wideColumns;
-            if (bothCheck)
-                bothCheck.checked = config.showBothHotbarBanks;
-            if (nameSpoofCheck)
-                nameSpoofCheck.checked = config.nameSpooferEnabled;
-            if (spoofNameInput)
-                spoofNameInput.value = config.spoofedName || "";
-            if (hidePopupsCheck)
-                hidePopupsCheck.checked = config.hideFloatingPopups;
-            if (ttlCheck)
-                ttlCheck.checked = config.ttlEnabled;
+            if (wideCheck) wideCheck.checked = config.wideColumns;
+            if (bothCheck) bothCheck.checked = config.showBothHotbarBanks;
+            if (nameSpoofCheck) nameSpoofCheck.checked = config.nameSpooferEnabled;
+            if (spoofNameInput) spoofNameInput.value = config.spoofedName || "";
+            if (hidePopupsCheck) hidePopupsCheck.checked = config.hideFloatingPopups;
+            if (ttlCheck) ttlCheck.checked = config.ttlEnabled;
         }
+      
 
         function applyAllWithTTL() {
             applyAll();
@@ -21980,6 +21984,43 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
                 applyTTL(); // apply toggle immediately
             });
         }
+        
+        // ---- Item ID display toggle ----
+(function bindItemIdToggle() {
+    const tryBind = function() {
+        const cb = document.getElementById("minibia-bot-ui-show-item-ids");
+        if (!cb) return false;
+        if (cb.__boundItemId) return true;
+        cb.__boundItemId = true;
+
+        cb.addEventListener("change", function() {
+            const live = window.minibiaBot;
+            if (!live || !live.itemIdDisplay) {
+                this.checked = false;
+                return;
+            }
+            if (this.checked) live.itemIdDisplay.start();
+            else live.itemIdDisplay.stop();
+        });
+        return true;
+    };
+    if (!tryBind()) {
+        let n = 0;
+        const t = setInterval(() => { if (tryBind() || ++n > 20) clearInterval(t); }, 250);
+    }
+})();
+
+const itemIdSync = setInterval(function() {
+    const cb = document.getElementById("minibia-bot-ui-show-item-ids");
+    const live = window.minibiaBot;
+    if (!cb || !live || !live.itemIdDisplay) return;
+    const running = !!live.itemIdDisplay.status().running;
+    if (document.activeElement !== cb && cb.checked !== running) {
+        cb.checked = running;
+    }
+}, 500);
+bot.addCleanup(() => clearInterval(itemIdSync));
+        
 
         refreshUI();
         applyAll();
@@ -22945,23 +22986,25 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
 };
 
 // ==================================================================================
-// TORMENTED GHOST – replies to any creature that mentions your name
+// TORMENTED GHOST – replies to any creature that mentions your name (robust match)
 // ==================================================================================
 window.__minibiaBotBundle.installTormentedGhostModule = function installTormentedGhostModule(bot) {
     const configStorageKey = "minibiaBot.tormentedGhost.config";
     const state = {
-        running: true,
-        timerId: null,
+        running: false,
         replyCooldown: new Map(), // creatureId -> lastReplyTime
         originalSay: null,
         patched: false,
+        replyTimer: null,
+        debug: false,
     };
 
     const config = Object.assign({
         enabled: false,
-        replyDelayMs: 1000, // wait 1 second before saying "hi"
+        replyDelayMs: 1000,
         triggerAlarm: true,
-        cooldownMs: 30000, // don't reply to the same creature more than once per 30s
+        cooldownMs: 30000,
+        debug: false, // NEW: log every creature saying
     }, bot.storage.get(configStorageKey, {}));
 
     function persistConfig() {
@@ -22970,13 +23013,52 @@ window.__minibiaBotBundle.installTormentedGhostModule = function installTormente
             replyDelayMs: config.replyDelayMs,
             triggerAlarm: config.triggerAlarm,
             cooldownMs: config.cooldownMs,
+            debug: config.debug,
         });
+    }
+
+    // ---- Normalize: lowercase, strip punctuation/whitespace/quotes ----
+    function normalize(str) {
+        return String(str || "")
+            .toLowerCase()
+            .replace(/[^a-z0-9 ]/g, "") // keep letters, digits, spaces
+            .replace(/\s+/g, " ")
+            .trim();
+    }
+
+    // ---- Check if a message mentions the player ----
+    function messageMentionsPlayer(message, playerName) {
+        if (!message || !playerName) return false;
+
+        // 1) Direct case-insensitive substring (handles most cases)
+        if (message.toLowerCase().includes(playerName.toLowerCase())) {
+            return true;
+        }
+
+        // 2) Normalized comparison (strips brackets, quotes, punctuation, spacing)
+        const normMsg = normalize(message);
+        const normName = normalize(playerName);
+        if (normMsg.includes(normName)) {
+            return true;
+        }
+
+        // 3) First-word match (handles "Name The Great" vs "Name")
+        const firstName = playerName.split(/\s+/)[0];
+        if (firstName && firstName.length >= 3) {
+            const normFirst = normalize(firstName);
+            // Word-boundary match on the first name
+            const re = new RegExp("\\b" + normFirst.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\b", "i");
+            if (re.test(normMsg)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     // ---- Hook Creature.say ----
     function installSpeechHook() {
-        if (state.patched)
-            return;
+        if (state.patched) return;
         if (typeof Creature === 'undefined' || !Creature.prototype) {
             setTimeout(installSpeechHook, 500);
             return;
@@ -22985,144 +23067,102 @@ window.__minibiaBotBundle.installTormentedGhostModule = function installTormente
         const originalSay = Creature.prototype.say;
         state.originalSay = originalSay;
 
-        Creature.prototype.say = function (packet) {
-            // Let the original handler run first (shows the text)
+        Creature.prototype.say = function(packet) {
             const result = originalSay.call(this, packet);
 
-            // Only process if the module is running
-            if (!state.running || !config.enabled)
-                return result;
-
-            // Skip if this creature is the player themselves
-            if (this === gameClient.player)
-                return result;
+            if (!state.running || !config.enabled) return result;
+            if (this === gameClient.player) return result;
 
             const message = packet.message || "";
-            const creatureId = this.id;
             const playerName = bot.getPlayerName();
-            if (!playerName)
-                return result;
 
-            // Check if the message contains the player's name (case-insensitive)
-            if (message.toLowerCase().includes(playerName.toLowerCase())) {
-                const now = Date.now();
-                const last = state.replyCooldown.get(creatureId) || 0;
-                if (now - last < config.cooldownMs)
-                    return result; // cooldown per creature
-
-                // Mark this creature as replied
-                state.replyCooldown.set(creatureId, now);
-
-                // Trigger alarm if configured
-                if (config.triggerAlarm) {
-                    bot.playGMAlarm?.();
-                    bot.log(`[TormentedGhost] ${this.name} mentioned you: "${message}" – alarm triggered.`);
-                }
-
-                // Schedule the reply (with delay)
-                if (state.replyTimer) {
-                    clearTimeout(state.replyTimer);
-                }
-                state.replyTimer = setTimeout(() => {
-                    if (state.running) {
-                        const sent = bot.sendChat("hi");
-                        if (sent) {
-                            bot.log(`[TormentedGhost] Replied "hi" to ${this.name}.`);
-                        }
-                    }
-                    state.replyTimer = null;
-                }, config.replyDelayMs);
+            // ---- DEBUG: log every creature saying so we can see the format ----
+            if (config.debug) {
+                bot.log(`[Ghost-Debug] ${this.name} says: "${message}" (player="${playerName}")`);
             }
+
+            if (!playerName) return result;
+
+            if (!messageMentionsPlayer(message, playerName)) return result;
+
+            const now = Date.now();
+            const creatureId = this.id;
+            const last = state.replyCooldown.get(creatureId) || 0;
+            if (now - last < config.cooldownMs) return result;
+            state.replyCooldown.set(creatureId, now);
+
+            if (config.triggerAlarm) {
+                bot.playGMAlarm?.();
+            }
+            bot.log(`[Ghost] ${this.name} mentioned you: "${message}"`);
+
+            if (state.replyTimer) clearTimeout(state.replyTimer);
+            const self = this;
+            state.replyTimer = setTimeout(() => {
+                if (state.running) {
+                    const sent = bot.sendChat("hi");
+                    if (sent) bot.log(`[Ghost] Replied "hi" to ${self.name}.`);
+                }
+                state.replyTimer = null;
+            }, config.replyDelayMs);
 
             return result;
         };
 
         state.patched = true;
-        bot.log("[TormentedGhost] Speech hook installed.");
+        bot.log("[Ghost] Speech hook installed.");
     }
 
     function uninstallSpeechHook() {
-        if (!state.patched)
-            return;
+        if (!state.patched) return;
         if (state.originalSay) {
             Creature.prototype.say = state.originalSay;
             state.originalSay = null;
         }
         state.patched = false;
-        bot.log("[TormentedGhost] Speech hook removed.");
+        bot.log("[Ghost] Speech hook removed.");
     }
 
-    // ---- Start / Stop ----
     function start(overrides = {}) {
-        Object.assign(config, overrides, {
-            enabled: true
-        });
+        Object.assign(config, overrides, { enabled: true });
         persistConfig();
-        if (state.running) {
-            bot.log("[TormentedGhost] already running");
-            return false;
-        }
+        if (state.running) return false;
         state.running = true;
         state.replyCooldown.clear();
-        if (state.replyTimer) {
-            clearTimeout(state.replyTimer);
-            state.replyTimer = null;
-        }
+        if (state.replyTimer) { clearTimeout(state.replyTimer); state.replyTimer = null; }
         installSpeechHook();
-        bot.log("[TormentedGhost] started", {
-            replyDelayMs: config.replyDelayMs,
-            cooldownMs: config.cooldownMs
-        });
+        bot.log("[Ghost] started");
         return true;
     }
 
     function stop(options = {}) {
         const shouldPersist = options.persistEnabled !== false;
         state.running = false;
-        if (state.replyTimer) {
-            clearTimeout(state.replyTimer);
-            state.replyTimer = null;
-        }
+        if (state.replyTimer) { clearTimeout(state.replyTimer); state.replyTimer = null; }
         uninstallSpeechHook();
         if (shouldPersist) {
             config.enabled = false;
             persistConfig();
         }
-        bot.log("[TormentedGhost] stopped");
+        bot.log("[Ghost] stopped");
         return true;
     }
 
     function status() {
-        return {
-            running: state.running,
-            config: {
-                ...config
-            },
-            patched: state.patched,
-        };
+        return { running: state.running, config: { ...config }, patched: state.patched };
     }
 
     function updateConfig(next = {}) {
         Object.assign(config, next);
-        if (config.replyDelayMs < 500)
-            config.replyDelayMs = 500;
-        if (config.cooldownMs < 5000)
-            config.cooldownMs = 5000;
+        if (config.replyDelayMs < 500) config.replyDelayMs = 500;
+        if (config.cooldownMs < 5000) config.cooldownMs = 5000;
         persistConfig();
-        if (config.enabled && !state.running)
-            start();
-        if (!config.enabled && state.running)
-            stop();
-        return {
-            ...config
-        };
+        if (config.enabled && !state.running) start();
+        if (!config.enabled && state.running) stop();
+        return { ...config };
     }
 
-    // Auto-start if enabled
-    if (config.enabled) {
-        // Wait for Creature to be available
-        setTimeout(() => start(), 1000);
-    }
+    if (config.enabled) setTimeout(() => start(), 1000);
 
     bot.tormentedGhost = {
         start,
@@ -23130,6 +23170,8 @@ window.__minibiaBotBundle.installTormentedGhostModule = function installTormente
         status,
         updateConfig,
         config,
+        // expose for console testing
+        _debugMatch: (msg, name) => messageMentionsPlayer(msg, name || bot.getPlayerName()),
     };
 };
 
@@ -23140,7 +23182,7 @@ window.__minibiaBotBundle.installTormentedGhostModule = function installTormente
 window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupModule(bot) {
     const configStorageKey = "minibiaBot.autoPickup.config";
     const state = {
-        running: true,
+        running: false,
         pickupInProgress: false,
         cooldown: new Map(), // tileKey -> lastPickupTime
         originalHandleItemAdd: null,
@@ -23487,6 +23529,96 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
     };
 };
 
+// ==================================================================================
+// ITEM ID DISPLAY – force SID/CID on look
+// ==================================================================================
+window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDisplayModule(bot) {
+    const configStorageKey = "minibiaBot.itemIdDisplay.config";
+    const state = {
+        running: false,
+        originalIsDevMode: null,
+        debuggerProto: null,
+    };
+
+    const config = Object.assign({ enabled: false }, bot.storage.get(configStorageKey, {}));
+
+    function persistConfig() {
+        bot.storage.set(configStorageKey, { enabled: config.enabled });
+    }
+
+    function installHook() {
+        if (state.originalIsDevMode) return;
+        const dbg = gameClient?.renderer?.debugger;
+        if (!dbg || typeof dbg.isDevMode !== "function") {
+            setTimeout(installHook, 500);
+            return;
+        }
+        const proto = Object.getPrototypeOf(dbg);
+        if (!proto || typeof proto.isDevMode !== "function") return;
+
+        state.debuggerProto = proto;
+        state.originalIsDevMode = proto.isDevMode;
+
+        proto.isDevMode = function() {
+            if (state.running && config.enabled) return true;
+            return state.originalIsDevMode.call(this);
+        };
+        bot.log("[ItemID] isDevMode patched.");
+    }
+
+    function uninstallHook() {
+        if (!state.originalIsDevMode || !state.debuggerProto) return;
+        state.debuggerProto.isDevMode = state.originalIsDevMode;
+        state.originalIsDevMode = null;
+        state.debuggerProto = null;
+        bot.log("[ItemID] isDevMode restored.");
+    }
+
+    function start() {
+        if (state.running) return false;
+        config.enabled = true;
+        persistConfig();
+        state.running = true;
+        installHook();
+        return true;
+    }
+
+    function stop() {
+        if (!state.running) return false;
+        config.enabled = false;
+        persistConfig();
+        state.running = false;
+        uninstallHook();
+        return true;
+    }
+
+    function status() {
+        return {
+            running: state.running,
+            config: { ...config },
+            patched: !!state.originalIsDevMode,
+        };
+    }
+
+    function updateConfig(next = {}) {
+        if (next.enabled !== undefined) {
+            if (next.enabled) start(); else stop();
+        }
+        return { ...config };
+    }
+
+    // Proper cleanup on bot reload — this is the key fix
+    bot.addCleanup(() => {
+        state.running = false;
+        uninstallHook();
+    });
+
+    if (config.enabled) setTimeout(() => start(), 500);
+
+    bot.itemIdDisplay = { start, stop, status, updateConfig, config };
+};
+
+
 /**
  * ==================================================================================
  * 15. BOOTSTRAP
@@ -23587,6 +23719,7 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
         currentBundle.installGmChatMonitorModule(bot);
         currentBundle.installTormentedGhostModule(bot);
         currentBundle.installAutoPickupModule(bot);
+        currentBundle.installItemIdDisplayModule(bot);
 
         bot.ui.inject();
 
