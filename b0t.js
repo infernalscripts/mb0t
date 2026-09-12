@@ -18577,6 +18577,58 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
 
         // ---- EVENT LISTENERS ----
 
+        // ---- Auto Invisible ----
+        const autoInvisibleToggle = panel.querySelector("#minibia-bot-auto-invisible-enabled");
+        if (autoInvisibleToggle) {
+            autoInvisibleToggle.checked = !!bot.invisible?.status?.().running;
+            autoInvisibleToggle.addEventListener("change", function () {
+                if (this.checked)
+                    bot.invisible.start();
+                else
+                    bot.invisible.stop();
+                refreshAutoInvisibleStatus();
+            });
+        }
+
+        // ---- Auto Magic Shield ----
+        const autoMagicShieldToggle = panel.querySelector("#minibia-bot-auto-magic-shield-enabled");
+        if (autoMagicShieldToggle) {
+            autoMagicShieldToggle.checked = !!bot.magicShield?.status?.().running;
+            autoMagicShieldToggle.addEventListener("change", function () {
+                if (this.checked)
+                    bot.magicShield.start();
+                else
+                    bot.magicShield.stop();
+                refreshAutoMagicShieldStatus();
+            });
+        }
+
+        // ---- Equip Ring ----
+        const equipRingToggle = panel.querySelector("#minibia-bot-equip-ring-enabled");
+        if (equipRingToggle) {
+            equipRingToggle.checked = !!bot.equipRing?.status?.().running;
+            equipRingToggle.addEventListener("change", function () {
+                if (this.checked)
+                    bot.equipRing.start();
+                else
+                    bot.equipRing.stop();
+                refreshEquipRingStatus();
+            });
+        }
+
+        // ---- Light Hack (Legit / Utevo) ----
+        const lightHackLegitToggle = panel.querySelector("#minibia-bot-light-hack-legit-enabled");
+        if (lightHackLegitToggle) {
+            lightHackLegitToggle.checked = !!bot.lightHackLegit?.status?.().running;
+            lightHackLegitToggle.addEventListener("change", function () {
+                if (this.checked)
+                    bot.lightHackLegit.start();
+                else
+                    bot.lightHackLegit.stop();
+                refreshLightHackLegitStatus();
+            });
+        }
+
         // ---- AutoPickup blacklist UI ----
         const pickupIgnoreIds = document.getElementById("minibia-bot-auto-pickup-ignore-ids");
         const pickupIgnoreNames = document.getElementById("minibia-bot-auto-pickup-ignore-names");
@@ -21919,14 +21971,19 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
         const ttlCheck = document.getElementById("minibia-bot-ui-ttl-enabled");
 
         function refreshUI() {
-            if (wideCheck) wideCheck.checked = config.wideColumns;
-            if (bothCheck) bothCheck.checked = config.showBothHotbarBanks;
-            if (nameSpoofCheck) nameSpoofCheck.checked = config.nameSpooferEnabled;
-            if (spoofNameInput) spoofNameInput.value = config.spoofedName || "";
-            if (hidePopupsCheck) hidePopupsCheck.checked = config.hideFloatingPopups;
-            if (ttlCheck) ttlCheck.checked = config.ttlEnabled;
+            if (wideCheck)
+                wideCheck.checked = config.wideColumns;
+            if (bothCheck)
+                bothCheck.checked = config.showBothHotbarBanks;
+            if (nameSpoofCheck)
+                nameSpoofCheck.checked = config.nameSpooferEnabled;
+            if (spoofNameInput)
+                spoofNameInput.value = config.spoofedName || "";
+            if (hidePopupsCheck)
+                hidePopupsCheck.checked = config.hideFloatingPopups;
+            if (ttlCheck)
+                ttlCheck.checked = config.ttlEnabled;
         }
-      
 
         function applyAllWithTTL() {
             applyAll();
@@ -21984,43 +22041,50 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
                 applyTTL(); // apply toggle immediately
             });
         }
-        
+
         // ---- Item ID display toggle ----
-(function bindItemIdToggle() {
-    const tryBind = function() {
-        const cb = document.getElementById("minibia-bot-ui-show-item-ids");
-        if (!cb) return false;
-        if (cb.__boundItemId) return true;
-        cb.__boundItemId = true;
+        (function bindItemIdToggle() {
+            const tryBind = function () {
+                const cb = document.getElementById("minibia-bot-ui-show-item-ids");
+                if (!cb)
+                    return false;
+                if (cb.__boundItemId)
+                    return true;
+                cb.__boundItemId = true;
 
-        cb.addEventListener("change", function() {
-            const live = window.minibiaBot;
-            if (!live || !live.itemIdDisplay) {
-                this.checked = false;
-                return;
+                cb.addEventListener("change", function () {
+                    const live = window.minibiaBot;
+                    if (!live || !live.itemIdDisplay) {
+                        this.checked = false;
+                        return;
+                    }
+                    if (this.checked)
+                        live.itemIdDisplay.start();
+                    else
+                        live.itemIdDisplay.stop();
+                });
+                return true;
+            };
+            if (!tryBind()) {
+                let n = 0;
+                const t = setInterval(() => {
+                    if (tryBind() || ++n > 20)
+                        clearInterval(t);
+                }, 250);
             }
-            if (this.checked) live.itemIdDisplay.start();
-            else live.itemIdDisplay.stop();
-        });
-        return true;
-    };
-    if (!tryBind()) {
-        let n = 0;
-        const t = setInterval(() => { if (tryBind() || ++n > 20) clearInterval(t); }, 250);
-    }
-})();
+        })();
 
-const itemIdSync = setInterval(function() {
-    const cb = document.getElementById("minibia-bot-ui-show-item-ids");
-    const live = window.minibiaBot;
-    if (!cb || !live || !live.itemIdDisplay) return;
-    const running = !!live.itemIdDisplay.status().running;
-    if (document.activeElement !== cb && cb.checked !== running) {
-        cb.checked = running;
-    }
-}, 500);
-bot.addCleanup(() => clearInterval(itemIdSync));
-        
+        const itemIdSync = setInterval(function () {
+            const cb = document.getElementById("minibia-bot-ui-show-item-ids");
+            const live = window.minibiaBot;
+            if (!cb || !live || !live.itemIdDisplay)
+                return;
+            const running = !!live.itemIdDisplay.status().running;
+            if (document.activeElement !== cb && cb.checked !== running) {
+                cb.checked = running;
+            }
+        }, 500);
+        bot.addCleanup(() => clearInterval(itemIdSync));
 
         refreshUI();
         applyAll();
@@ -22991,7 +23055,7 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
 window.__minibiaBotBundle.installTormentedGhostModule = function installTormentedGhostModule(bot) {
     const configStorageKey = "minibiaBot.tormentedGhost.config";
     const state = {
-        running: false,
+        running: true,
         replyCooldown: new Map(), // creatureId -> lastReplyTime
         originalSay: null,
         patched: false,
@@ -23020,15 +23084,16 @@ window.__minibiaBotBundle.installTormentedGhostModule = function installTormente
     // ---- Normalize: lowercase, strip punctuation/whitespace/quotes ----
     function normalize(str) {
         return String(str || "")
-            .toLowerCase()
-            .replace(/[^a-z0-9 ]/g, "") // keep letters, digits, spaces
-            .replace(/\s+/g, " ")
-            .trim();
+        .toLowerCase()
+        .replace(/[^a-z0-9 ]/g, "") // keep letters, digits, spaces
+        .replace(/\s+/g, " ")
+        .trim();
     }
 
     // ---- Check if a message mentions the player ----
     function messageMentionsPlayer(message, playerName) {
-        if (!message || !playerName) return false;
+        if (!message || !playerName)
+            return false;
 
         // 1) Direct case-insensitive substring (handles most cases)
         if (message.toLowerCase().includes(playerName.toLowerCase())) {
@@ -23058,7 +23123,8 @@ window.__minibiaBotBundle.installTormentedGhostModule = function installTormente
 
     // ---- Hook Creature.say ----
     function installSpeechHook() {
-        if (state.patched) return;
+        if (state.patched)
+            return;
         if (typeof Creature === 'undefined' || !Creature.prototype) {
             setTimeout(installSpeechHook, 500);
             return;
@@ -23067,11 +23133,13 @@ window.__minibiaBotBundle.installTormentedGhostModule = function installTormente
         const originalSay = Creature.prototype.say;
         state.originalSay = originalSay;
 
-        Creature.prototype.say = function(packet) {
+        Creature.prototype.say = function (packet) {
             const result = originalSay.call(this, packet);
 
-            if (!state.running || !config.enabled) return result;
-            if (this === gameClient.player) return result;
+            if (!state.running || !config.enabled)
+                return result;
+            if (this === gameClient.player)
+                return result;
 
             const message = packet.message || "";
             const playerName = bot.getPlayerName();
@@ -23081,14 +23149,17 @@ window.__minibiaBotBundle.installTormentedGhostModule = function installTormente
                 bot.log(`[Ghost-Debug] ${this.name} says: "${message}" (player="${playerName}")`);
             }
 
-            if (!playerName) return result;
+            if (!playerName)
+                return result;
 
-            if (!messageMentionsPlayer(message, playerName)) return result;
+            if (!messageMentionsPlayer(message, playerName))
+                return result;
 
             const now = Date.now();
             const creatureId = this.id;
             const last = state.replyCooldown.get(creatureId) || 0;
-            if (now - last < config.cooldownMs) return result;
+            if (now - last < config.cooldownMs)
+                return result;
             state.replyCooldown.set(creatureId, now);
 
             if (config.triggerAlarm) {
@@ -23096,12 +23167,14 @@ window.__minibiaBotBundle.installTormentedGhostModule = function installTormente
             }
             bot.log(`[Ghost] ${this.name} mentioned you: "${message}"`);
 
-            if (state.replyTimer) clearTimeout(state.replyTimer);
+            if (state.replyTimer)
+                clearTimeout(state.replyTimer);
             const self = this;
             state.replyTimer = setTimeout(() => {
                 if (state.running) {
                     const sent = bot.sendChat("hi");
-                    if (sent) bot.log(`[Ghost] Replied "hi" to ${self.name}.`);
+                    if (sent)
+                        bot.log(`[Ghost] Replied "hi" to ${self.name}.`);
                 }
                 state.replyTimer = null;
             }, config.replyDelayMs);
@@ -23114,7 +23187,8 @@ window.__minibiaBotBundle.installTormentedGhostModule = function installTormente
     }
 
     function uninstallSpeechHook() {
-        if (!state.patched) return;
+        if (!state.patched)
+            return;
         if (state.originalSay) {
             Creature.prototype.say = state.originalSay;
             state.originalSay = null;
@@ -23124,12 +23198,18 @@ window.__minibiaBotBundle.installTormentedGhostModule = function installTormente
     }
 
     function start(overrides = {}) {
-        Object.assign(config, overrides, { enabled: true });
+        Object.assign(config, overrides, {
+            enabled: true
+        });
         persistConfig();
-        if (state.running) return false;
+        if (state.running)
+            return false;
         state.running = true;
         state.replyCooldown.clear();
-        if (state.replyTimer) { clearTimeout(state.replyTimer); state.replyTimer = null; }
+        if (state.replyTimer) {
+            clearTimeout(state.replyTimer);
+            state.replyTimer = null;
+        }
         installSpeechHook();
         bot.log("[Ghost] started");
         return true;
@@ -23138,7 +23218,10 @@ window.__minibiaBotBundle.installTormentedGhostModule = function installTormente
     function stop(options = {}) {
         const shouldPersist = options.persistEnabled !== false;
         state.running = false;
-        if (state.replyTimer) { clearTimeout(state.replyTimer); state.replyTimer = null; }
+        if (state.replyTimer) {
+            clearTimeout(state.replyTimer);
+            state.replyTimer = null;
+        }
         uninstallSpeechHook();
         if (shouldPersist) {
             config.enabled = false;
@@ -23149,20 +23232,33 @@ window.__minibiaBotBundle.installTormentedGhostModule = function installTormente
     }
 
     function status() {
-        return { running: state.running, config: { ...config }, patched: state.patched };
+        return {
+            running: state.running,
+            config: {
+                ...config
+            },
+            patched: state.patched
+        };
     }
 
     function updateConfig(next = {}) {
         Object.assign(config, next);
-        if (config.replyDelayMs < 500) config.replyDelayMs = 500;
-        if (config.cooldownMs < 5000) config.cooldownMs = 5000;
+        if (config.replyDelayMs < 500)
+            config.replyDelayMs = 500;
+        if (config.cooldownMs < 5000)
+            config.cooldownMs = 5000;
         persistConfig();
-        if (config.enabled && !state.running) start();
-        if (!config.enabled && state.running) stop();
-        return { ...config };
+        if (config.enabled && !state.running)
+            start();
+        if (!config.enabled && state.running)
+            stop();
+        return {
+            ...config
+        };
     }
 
-    if (config.enabled) setTimeout(() => start(), 1000);
+    if (config.enabled)
+        setTimeout(() => start(), 1000);
 
     bot.tormentedGhost = {
         start,
@@ -23540,34 +23636,42 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         debuggerProto: null,
     };
 
-    const config = Object.assign({ enabled: false }, bot.storage.get(configStorageKey, {}));
+    const config = Object.assign({
+        enabled: false
+    }, bot.storage.get(configStorageKey, {}));
 
     function persistConfig() {
-        bot.storage.set(configStorageKey, { enabled: config.enabled });
+        bot.storage.set(configStorageKey, {
+            enabled: config.enabled
+        });
     }
 
     function installHook() {
-        if (state.originalIsDevMode) return;
+        if (state.originalIsDevMode)
+            return;
         const dbg = gameClient?.renderer?.debugger;
         if (!dbg || typeof dbg.isDevMode !== "function") {
             setTimeout(installHook, 500);
             return;
         }
         const proto = Object.getPrototypeOf(dbg);
-        if (!proto || typeof proto.isDevMode !== "function") return;
+        if (!proto || typeof proto.isDevMode !== "function")
+            return;
 
         state.debuggerProto = proto;
         state.originalIsDevMode = proto.isDevMode;
 
-        proto.isDevMode = function() {
-            if (state.running && config.enabled) return true;
+        proto.isDevMode = function () {
+            if (state.running && config.enabled)
+                return true;
             return state.originalIsDevMode.call(this);
         };
         bot.log("[ItemID] isDevMode patched.");
     }
 
     function uninstallHook() {
-        if (!state.originalIsDevMode || !state.debuggerProto) return;
+        if (!state.originalIsDevMode || !state.debuggerProto)
+            return;
         state.debuggerProto.isDevMode = state.originalIsDevMode;
         state.originalIsDevMode = null;
         state.debuggerProto = null;
@@ -23575,7 +23679,8 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
     }
 
     function start() {
-        if (state.running) return false;
+        if (state.running)
+            return false;
         config.enabled = true;
         persistConfig();
         state.running = true;
@@ -23584,7 +23689,8 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
     }
 
     function stop() {
-        if (!state.running) return false;
+        if (!state.running)
+            return false;
         config.enabled = false;
         persistConfig();
         state.running = false;
@@ -23595,16 +23701,23 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
     function status() {
         return {
             running: state.running,
-            config: { ...config },
+            config: {
+                ...config
+            },
             patched: !!state.originalIsDevMode,
         };
     }
 
     function updateConfig(next = {}) {
         if (next.enabled !== undefined) {
-            if (next.enabled) start(); else stop();
+            if (next.enabled)
+                start();
+            else
+                stop();
         }
-        return { ...config };
+        return {
+            ...config
+        };
     }
 
     // Proper cleanup on bot reload — this is the key fix
@@ -23613,11 +23726,17 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         uninstallHook();
     });
 
-    if (config.enabled) setTimeout(() => start(), 500);
+    if (config.enabled)
+        setTimeout(() => start(), 500);
 
-    bot.itemIdDisplay = { start, stop, status, updateConfig, config };
+    bot.itemIdDisplay = {
+        start,
+        stop,
+        status,
+        updateConfig,
+        config
+    };
 };
-
 
 /**
  * ==================================================================================
