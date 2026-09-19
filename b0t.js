@@ -2146,6 +2146,15 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         lastPlayerAlertAt: 0,
         restartTimer: null, // timeout ID for the 30‑second restart
         restartSnapshot: null, // snapshot of module states and panic config
+        // ---- Audio alert state ----
+        audioCtx: null,
+        lastTargetId: null,
+        lowHealthBeepLast: 0,
+        manaFullSince: null,
+        manaFullBeepLast: 0,
+        noTargetSince: null,
+        noTargetBeepLast: 0,
+        itemAlertLast: {},      // itemId -> timestamp
     };
 
     const config = Object.assign({
@@ -2159,6 +2168,18 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         healthLossEnabled: false,
         playerAlertEnabled: false,
         playerAlertCooldownMs: 60000,
+        // ---- Audio alerts ----
+        targetDeathBeep:        true,
+        lowHealthBeep:          true,
+        lowHealthBeepThreshold: 40,
+        lowHealthBeepRepeatMs:  5000,
+        manaFullBeep:           false,
+        manaFullDelayMs:        10000,
+        manaFullRepeatMs:       30000,
+        noTargetBeep:           false,
+        noTargetDelayMs:        10000,
+        noTargetRepeatMs:       30000,
+        itemAlerts:             [],   // [{ id, name, threshold, cooldownMs }]
         trustedNames: [],
         gameMasterNames: [],
     },
@@ -2178,6 +2199,70 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         const next = Math.trunc(Number(value));
         return Number.isFinite(next) ? Math.max(0, next) : fallback;
     }
+
+    // ------------------------------------------------------------------
+    // Audio alert helpers (self-contained, no external files needed)
+    // ------------------------------------------------------------------
+    function getAlertAudioCtx() {
+        if (!state.audioCtx) {
+            try {
+                state.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            } catch { return null; }
+        }
+        if (state.audioCtx.state === "suspended") {
+            state.audioCtx.resume().catch(() => {});
+        }
+        return state.audioCtx;
+    }
+
+    function playAlertTone(freq, durationMs, volume = 0.35) {
+        try {
+            const ctx = getAlertAudioCtx();
+            if (!ctx) return;
+            const osc  = ctx.createOscillator();
+            const gain = ctx.createGain();
+            osc.type = "sine";
+            osc.frequency.value = freq;
+            const now = ctx.currentTime;
+            gain.gain.setValueAtTime(volume, now);
+            gain.gain.exponentialRampToValueAtTime(0.001, now + durationMs / 1000);
+            osc.connect(gain);
+            gain.connect(ctx.destination);
+            osc.start(now);
+            osc.stop(now + durationMs / 1000);
+        } catch { /* ignore */ }
+    }
+
+    function playToneSequence(notes) {
+        for (const n of notes) {
+            setTimeout(() => playAlertTone(n.freq, n.dur, n.vol ?? 0.35), n.delay || 0);
+        }
+    }
+
+    function playTargetDeathBeep() {
+        playToneSequence([{ freq: 800, dur: 150 }, { freq: 400, dur: 200, delay: 100 }]);
+    }
+    function playLowHealthBeep() {
+        playToneSequence([{ freq: 880, dur: 150, vol: 0.45 }, { freq: 880, dur: 150, delay: 200, vol: 0.45 }]);
+    }
+    function playManaFullBeep() {
+        playToneSequence([
+            { freq: 1200, dur: 100, vol: 0.3 },
+            { freq: 1200, dur: 100, delay: 150, vol: 0.3 },
+            { freq: 1200, dur: 100, delay: 300, vol: 0.3 },
+        ]);
+    }
+    function playNoTargetBeep() {
+        playToneSequence([{ freq: 300, dur: 400, vol: 0.5 }, { freq: 300, dur: 400, delay: 200, vol: 0.5 }]);
+    }
+    function playItemLowBeep() {
+        playToneSequence([
+            { freq: 500, dur: 200, vol: 0.4 },
+            { freq: 700, dur: 200, delay: 250, vol: 0.4 },
+            { freq: 500, dur: 200, delay: 500, vol: 0.4 },
+        ]);
+    }
+
 
     function normalizePosition(position) {
         const x = Number(position?.x);
@@ -2639,6 +2724,87 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
             currentHealth
         });
     }
+    
+    function checkAudioAlerts(now) {
+        const player = window.gameClient?.player;
+        if (!player) return;
+
+        const st = player.state || {};
+        const health    = Number(st.health || 0);
+        const maxHealth = Number(st.maxHealth || 0);
+        const mana      = Number(st.mana || 0);
+        const maxMana   = Number(st.maxMana || 0);
+
+        // ---- Target Death (fires once per target → none transition) ----
+        const target    = player.__target;
+        const currentId = target ? target.id : null;
+        if (config.targetDeathBeep && state.lastTargetId !== null && currentId === null) {
+            playTargetDeathBeep();
+        }
+        state.lastTargetId = currentId;
+
+        // ---- Low Health: repeat while below threshold ----
+        if (config.lowHealthBeep && maxHealth > 0) {
+            const hpPct = (health / maxHealth) * 100;
+            if (hpPct > 0 && hpPct < config.lowHealthBeepThreshold) {
+                if (now - state.lowHealthBeepLast >= config.lowHealthBeepRepeatMs) {
+                    state.lowHealthBeepLast = now;
+                    playLowHealthBeep();
+                }
+            } else {
+                state.lowHealthBeepLast = 0;
+            }
+        }
+
+        // ---- Mana Full: after delay, repeat every N seconds ----
+        if (config.manaFullBeep && maxMana > 0) {
+            const isFull = mana >= maxMana;
+            if (isFull) {
+                if (state.manaFullSince === null) state.manaFullSince = now;
+                if (now - state.manaFullSince >= config.manaFullDelayMs &&
+                    now - state.manaFullBeepLast >= config.manaFullRepeatMs) {
+                    state.manaFullBeepLast = now;
+                    playManaFullBeep();
+                }
+            } else {
+                state.manaFullSince = null;
+                state.manaFullBeepLast = 0;
+            }
+        }
+
+        // ---- No Target: after delay, repeat every N seconds ----
+        if (config.noTargetBeep) {
+            if (currentId === null) {
+                if (state.noTargetSince === null) state.noTargetSince = now;
+                if (now - state.noTargetSince >= config.noTargetDelayMs &&
+                    now - state.noTargetBeepLast >= config.noTargetRepeatMs) {
+                    state.noTargetBeepLast = now;
+                    playNoTargetBeep();
+                }
+            } else {
+                state.noTargetSince = null;
+                state.noTargetBeepLast = 0;
+            }
+        }
+
+        // ---- Item count alerts (potions) ----
+        if (config.itemAlerts && config.itemAlerts.length) {
+            for (const a of config.itemAlerts) {
+                if (!a || !Number.isFinite(a.id) || !a.threshold) continue;
+                let count = 0;
+                try { count = bot.itemCount(a.id); } catch { continue; }
+                if (count < a.threshold) {
+                    const last = state.itemAlertLast[a.id] || 0;
+                    const cd = Math.max(1000, a.cooldownMs || 30000);
+                    if (now - last >= cd) {
+                        state.itemAlertLast[a.id] = now;
+                        playItemLowBeep();
+                        bot.log(`Audio alert: ${a.name || a.id} low (${count}/${a.threshold})`);
+                    }
+                }
+            }
+        }
+    }
 
     // ---- TICK LOOP ----
     function scheduleNextTick() {
@@ -2679,17 +2845,25 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
                     });
                 }
             }
+            // ★ ---- Audio alerts (independent of panic triggers) ----
+            checkAudioAlerts(now);
         } finally {
             scheduleNextTick();
         }
     }
 
     function shouldRun() {
-        // Run if any panic trigger is enabled OR if playerAlert is enabled
-        return !!(getGameMasterNames().length ||
+        return !!(
+            getGameMasterNames().length ||
             config.unknownPlayerEnabled ||
-            config.healthLossEnabled ||
-            config.playerAlertEnabled);
+            config.healthLossEnabled   ||
+            config.playerAlertEnabled  ||
+            config.targetDeathBeep     ||
+            config.lowHealthBeep       ||
+            config.manaFullBeep        ||
+            config.noTargetBeep        ||
+            (config.itemAlerts && config.itemAlerts.length > 0)
+        );
     }
 
     function start() {
@@ -2767,6 +2941,36 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         if (next.playerAlertCooldownMs !== undefined) {
             next.playerAlertCooldownMs = Math.max(10000, Number(next.playerAlertCooldownMs) || 60000);
         }
+                // ---- Audio alert normalization ----
+        if (next.lowHealthBeepThreshold !== undefined) {
+            next.lowHealthBeepThreshold = Math.max(1, Math.min(99, Number(next.lowHealthBeepThreshold) || 50));
+        }
+        if (next.lowHealthBeepRepeatMs !== undefined) {
+            next.lowHealthBeepRepeatMs = Math.max(1000, Number(next.lowHealthBeepRepeatMs) || 5000);
+        }
+        if (next.manaFullDelayMs !== undefined) {
+            next.manaFullDelayMs = Math.max(1000, Number(next.manaFullDelayMs) || 10000);
+        }
+        if (next.manaFullRepeatMs !== undefined) {
+            next.manaFullRepeatMs = Math.max(1000, Number(next.manaFullRepeatMs) || 30000);
+        }
+        if (next.noTargetDelayMs !== undefined) {
+            next.noTargetDelayMs = Math.max(1000, Number(next.noTargetDelayMs) || 10000);
+        }
+        if (next.noTargetRepeatMs !== undefined) {
+            next.noTargetRepeatMs = Math.max(1000, Number(next.noTargetRepeatMs) || 30000);
+        }
+        if (Array.isArray(next.itemAlerts)) {
+            next.itemAlerts = next.itemAlerts
+                .map(a => ({
+                    id:         Number(a?.id),
+                    name:       String(a?.name || "").trim() || `Item ${a?.id}`,
+                    threshold:  Math.max(1, Math.trunc(Number(a?.threshold) || 1)),
+                    cooldownMs: Math.max(1000, Number(a?.cooldownMs) || 30000),
+                }))
+                .filter(a => Number.isFinite(a.id));
+        }
+        
         Object.assign(config, next);
         if (!config.returnToOriginEnabled)
             clearPendingReturn();
@@ -11214,6 +11418,275 @@ window.__minibiaBotBundle.installSlimeTrainerModule = function installSlimeTrain
     };
 };
 
+//Monk
+
+window.__minibiaBotBundle.installMonkTrainerModule = function installMonkTrainerModule(bot) {
+    const configStorageKey = "minibiaBot.monkTrainer.config";
+    const state = {
+        running: false,
+        timerId: null,
+        lastAttackAt: 0,
+        lastStatusLog: 0,
+        tickCount: 0,
+        tickWindowStart: 0,
+    };
+
+    const config = Object.assign({
+        enabled: false,
+        monkNameContains: "monk",
+        minHpPercent: 30,
+        maxTargetDistance: 6,
+        attackCooldownMs: 500,
+        tickMs: 250,
+    }, bot.storage.get(configStorageKey, {}));
+
+    function persistConfig() {
+        bot.storage.set(configStorageKey, { ...config });
+    }
+
+    function normalizeName(name) {
+        return String(name || "").trim().toLowerCase();
+    }
+
+    function isMonk(creature) {
+        if (!creature) return false;
+        const needle = normalizeName(config.monkNameContains);
+        if (!needle) return false;
+        return normalizeName(creature.name).includes(needle);
+    }
+
+    function getCreatureHpPercent(creature) {
+        if (!creature) return null;
+        const health    = creature.state?.health    ?? creature.health    ?? creature.hp;
+        const maxHealth = creature.state?.maxHealth ?? creature.maxHealth ?? creature.maxHp;
+        if (health == null || maxHealth == null || maxHealth <= 0) return null;
+        return (Number(health) / Number(maxHealth)) * 100;
+    }
+
+    function getVisibleMonks() {
+        const me = bot.getPlayerPosition();
+        if (!me) return [];
+        const monsters = bot.xray?.getVisibleMonsters?.({ sameFloorOnly: true }) || [];
+        return monsters
+            .filter(isMonk)
+            .filter(c => {
+                const pos = c.__position || c.getPosition?.();
+                if (!pos) return false;
+                const dx = Math.abs(pos.x - me.x);
+                const dy = Math.abs(pos.y - me.y);
+                return dx <= config.maxTargetDistance && dy <= config.maxTargetDistance;
+            });
+    }
+
+    function getCurrentTarget() {
+        return window.gameClient?.player?.__target || null;
+    }
+
+    function setTarget(creature) {
+        if (!creature) return false;
+        try {
+            window.gameClient.player.setTarget(creature);
+            window.gameClient.send(new TargetPacket(creature.id));
+            state.lastAttackAt = Date.now();
+            return true;
+        } catch (e) {
+            bot.log("Monk trainer: setTarget failed", e);
+            return false;
+        }
+    }
+
+    function clearTarget() {
+        try {
+            const player = window.gameClient?.player;
+            if (!player || !player.__target) return;
+            player.setTarget(null);
+            window.gameClient.send(new TargetPacket(0));
+        } catch (e) {
+            bot.log("Monk trainer: clearTarget failed", e);
+        }
+    }
+
+    function tick() {
+        if (!state.running) return;
+
+        // Sanity check: if running but config says disabled, stop cleanly.
+        if (!config.enabled) {
+            state.running = false;
+            return;
+        }
+
+        // Runaway detector — if we're doing way more ticks than expected
+        // (e.g. because another copy of this module scheduled extras),
+        // hard-reset.
+        const now = Date.now();
+        if (!state.tickWindowStart || now - state.tickWindowStart > 1000) {
+            state.tickWindowStart = now;
+            state.tickCount = 1;
+        } else {
+            state.tickCount++;
+            if (state.tickCount > 40) { // 250ms ticks ≈ 4/s; 40 is way over
+                console.warn("[Monk trainer] runaway tick detected – self-stopping");
+                stop({ persistEnabled: false });
+                return;
+            }
+        }
+
+        try {
+            const current = getCurrentTarget();
+
+            // Case 1: currently fighting a monk whose HP is too low → break off
+            if (current && isMonk(current)) {
+                const hp = getCreatureHpPercent(current);
+                if (hp != null && hp < config.minHpPercent) {
+                    clearTarget();
+                    if (now - state.lastStatusLog > 5000) {
+                        state.lastStatusLog = now;
+                        bot.log(
+                            `Monk trainer: paused (monk HP ` +
+                            `${hp.toFixed(1)}% < ${config.minHpPercent}%) – letting it regen`
+                        );
+                    }
+                    return;
+                }
+                // HP is fine → keep attacking
+                return;
+            }
+
+            // Case 2: no valid monk target → pick the closest healthy one
+            const targetDead = current &&
+                (current.state?.health != null && current.state.health <= 0);
+            if (!current || targetDead) {
+                if (now - state.lastAttackAt < config.attackCooldownMs) return;
+
+                const me = bot.getPlayerPosition();
+                if (!me) return;
+
+                const monks = getVisibleMonks();
+                const healthy = monks.filter(m => {
+                    const hp = getCreatureHpPercent(m);
+                    return hp == null || hp >= config.minHpPercent;
+                });
+                if (!healthy.length) return;
+
+                healthy.sort((a, b) => {
+                    const pa = a.__position || a.getPosition?.() || {};
+                    const pb = b.__position || b.getPosition?.() || {};
+                    const da = Math.max(Math.abs(pa.x - me.x), Math.abs(pa.y - me.y));
+                    const db = Math.max(Math.abs(pb.x - me.x), Math.abs(pb.y - me.y));
+                    return da - db;
+                });
+
+                if (setTarget(healthy[0])) {
+                    const hp = getCreatureHpPercent(healthy[0]);
+                    bot.log(
+                        `Monk trainer: targeting ${healthy[0].name} ` +
+                        `(${hp != null ? hp.toFixed(1) + "% HP" : "HP ?"})`
+                    );
+                }
+            }
+        } catch (e) {
+            bot.log("Monk trainer tick error", e);
+        } finally {
+            scheduleNextTick();
+        }
+    }
+
+    // ★ The critical fix: always cancel any pending timer before scheduling
+    //   a new one, so there can never be more than one in flight.
+    function scheduleNextTick() {
+        if (!state.running) return;
+        if (state.timerId != null) {
+            clearTimeout(state.timerId);
+            state.timerId = null;
+        }
+        state.timerId = setTimeout(tick, config.tickMs);
+    }
+
+    function start(overrides = {}) {
+        Object.assign(config, overrides, { enabled: true });
+        persistConfig();
+        if (state.running) {
+            bot.log("Monk trainer already running");
+            return false;
+        }
+        state.running = true;
+        state.tickCount = 0;
+        state.tickWindowStart = Date.now();
+        bot.log("Monk trainer started", { ...config });
+        scheduleNextTick();
+        return true;
+    }
+
+    function stop(options = {}) {
+        const shouldPersist = options.persistEnabled !== false;
+        state.running = false;
+        if (state.timerId != null) {
+            clearTimeout(state.timerId);
+            state.timerId = null;
+        }
+        clearTarget();
+        if (shouldPersist) {
+            config.enabled = false;
+            persistConfig();
+        }
+        bot.log("Monk trainer stopped");
+        return true;
+    }
+
+    function status() {
+        const current = getCurrentTarget();
+        const monks = getVisibleMonks();
+        return {
+            running: state.running,
+            config: { ...config },
+            currentTarget: current ? {
+                id: current.id,
+                name: current.name,
+                hp: getCreatureHpPercent(current),
+            } : null,
+            visibleMonks: monks.map(m => ({
+                id: m.id,
+                name: m.name,
+                hp: getCreatureHpPercent(m),
+            })),
+        };
+    }
+
+    function updateConfig(next = {}) {
+        if (next.minHpPercent !== undefined) {
+            next.minHpPercent = Math.max(1, Math.min(99, Number(next.minHpPercent) || 30));
+        }
+        if (next.maxTargetDistance !== undefined) {
+            next.maxTargetDistance = Math.max(1, Math.min(10, Number(next.maxTargetDistance) || 6));
+        }
+        if (next.monkNameContains !== undefined) {
+            next.monkNameContains = String(next.monkNameContains || "monk").trim() || "monk";
+        }
+        // Keep running state in sync if the caller flips `enabled`
+        const wantsEnabled = next.enabled;
+        Object.assign(config, next);
+        persistConfig();
+
+        if (wantsEnabled === true && !state.running) {
+            start();
+        } else if (wantsEnabled === false && state.running) {
+            stop({ persistEnabled: false });
+        }
+        return { ...config };
+    }
+
+    if (config.enabled) start();
+
+    bot.monkTrainer = {
+        start,
+        stop,
+        status,
+        updateConfig,
+        config,
+    };
+};
+
+
 // Light hack
 
 window.__minibiaBotBundle.installLightHackModule = function installLightHackModule(bot) {
@@ -12070,505 +12543,6 @@ if (typeof window.__minibiaBotBundle === 'undefined') {
     window.__minibiaBotBundle = {};
 }
 
-window.__minibiaBotBundle.installComboBotModule = function installComboBotModule(bot) {
-    const configStorageKey = "minibiaBot.combo.config";
-    const state = {
-        running: false,
-        channel: null,
-        originalSend: null,
-        lastTriggerAt: 0,
-        retryTimer: null,
-        retryCount: 0,
-        followInterval: null, // rune spam interval
-        requestInterval: null, // target request interval (every 500ms)
-        currentTargetId: null, // the target we are currently following
-    };
-
-    const config = Object.assign({
-        mode: 'follower',
-        hotkeySlot: 11,
-        minMana: 0,
-        cooldownMs: 2000, // rune spam interval (default 2s)
-        broadcastClear: true,
-        channelName: 'minibia-combo-bot',
-        autoFollowLeader: false,
-        leaderName: '',
-    }, bot.storage.get(configStorageKey, {}));
-
-    function persistConfig() {
-        bot.storage.set(configStorageKey, {
-            ...config
-        });
-    }
-
-    function log(...args) {
-        console.log('%c[ComboBot]', 'color:#4fc3f7', ...args);
-    }
-
-    function isLeader() {
-        return config.mode === 'leader';
-    }
-
-    function getPlayer() {
-        return window.gameClient && window.gameClient.player;
-    }
-
-    function getWorld() {
-        return window.gameClient && window.gameClient.world;
-    }
-
-    function sendMessage(msg) {
-        if (state.channel)
-            state.channel.postMessage(msg);
-    }
-
-    // ---- Follower logic ----
-    function handleTarget(msg) {
-        const player = getPlayer();
-        const world = getWorld();
-        if (!player || !world)
-            return;
-
-        const targetId = msg.id;
-        const leaderId = msg.leaderId;
-
-        // Stop any existing intervals
-        if (state.followInterval) {
-            clearInterval(state.followInterval);
-            state.followInterval = null;
-        }
-        // If we have a target, stop requesting
-        if (state.requestInterval) {
-            clearInterval(state.requestInterval);
-            state.requestInterval = null;
-        }
-
-        // Clear target
-        if (targetId === 0) {
-            if (player.__target) {
-                player.setTarget(null);
-                sendPacket('TargetPacket', 0);
-                log('Target cleared.');
-            }
-            state.currentTargetId = null;
-            // Start requesting again (we lost target)
-            startRequestInterval();
-            return;
-        }
-
-        const creature = world.getCreature(targetId);
-        if (!creature) {
-            log('Target creature not found:', targetId);
-            // Creature might be gone – clear and request again
-            state.currentTargetId = null;
-            startRequestInterval();
-            return;
-        }
-
-        // Set target if different
-        if (player.__target !== creature) {
-            player.setTarget(creature);
-            sendPacket('TargetPacket', targetId);
-            log('Targeting', creature.name, '(', targetId, ')');
-        }
-        state.currentTargetId = targetId;
-
-        // ---- Auto Follow Leader (optional) ----
-        if (config.autoFollowLeader && leaderId) {
-            followLeaderById(leaderId);
-        } else if (config.autoFollowLeader && config.leaderName) {
-            followLeaderByName();
-        }
-
-        // ---- Start rune spam interval ----
-        triggerHotkey(); // fire once immediately
-        state.followInterval = setInterval(() => {
-            // Check that we still have a valid target
-            const currentTarget = player.__target;
-            if (!currentTarget || currentTarget.id !== state.currentTargetId) {
-                // Target lost – clear and restart request
-                state.currentTargetId = null;
-                clearInterval(state.followInterval);
-                state.followInterval = null;
-                startRequestInterval();
-                return;
-            }
-            // Check if creature still exists and is alive
-            const creature = world.getCreature(state.currentTargetId);
-            if (!creature || (creature.state && creature.state.health <= 0)) {
-                // Target dead – clear and stop
-                if (player.__target) {
-                    player.setTarget(null);
-                    sendPacket('TargetPacket', 0);
-                }
-                state.currentTargetId = null;
-                clearInterval(state.followInterval);
-                state.followInterval = null;
-                log('Target died, stopping rune spam.');
-                startRequestInterval();
-                return;
-            }
-            // All good – shoot again
-            triggerHotkey();
-        }, config.cooldownMs);
-    }
-
-    // ---- Request interval: ask leader for target every 500ms if we have none ----
-    function startRequestInterval() {
-        if (state.requestInterval) {
-            clearInterval(state.requestInterval);
-            state.requestInterval = null;
-        }
-        // Only run if we are a follower and not already having a target
-        if (isLeader())
-            return;
-        if (state.currentTargetId !== null)
-            return;
-
-        state.requestInterval = setInterval(() => {
-            // Only request if we still have no target
-            if (state.currentTargetId === null) {
-                sendMessage({
-                    type: 'requestTarget'
-                });
-                log('Requesting current target from leader...');
-            } else {
-                // We have a target – stop requesting
-                clearInterval(state.requestInterval);
-                state.requestInterval = null;
-            }
-        }, 500);
-    }
-
-    // ---- Leader: handle requestTarget messages ----
-    function handleRequest() {
-        const player = getPlayer();
-        if (!player)
-            return;
-        const target = player.__target;
-        const targetId = target ? target.id : 0;
-        const leaderId = player.id;
-        // Broadcast our current target back
-        sendMessage({
-            type: 'target',
-            id: targetId,
-            leaderId: leaderId
-        });
-        log('Responded with target', targetId);
-    }
-
-    // ---- Helpers (unchanged) ----
-    function followLeaderById(leaderId) {
-        if (config.leaderName) {
-            bot.follow(config.leaderName);
-        }
-    }
-
-    function followLeaderByName() {
-        const world = getWorld();
-        if (!world) {
-            log('World not available.');
-            return;
-        }
-
-        const leaderName = config.leaderName.trim();
-        if (!leaderName) {
-            log('Leader name is empty.');
-            return;
-        }
-
-        const creatures = Object.values(world.activeCreatures || {});
-        const leader = creatures.find(c => {
-            if (!c.name)
-                return false;
-            return c.name.toLowerCase() === leaderName.toLowerCase();
-        });
-
-        if (!leader) {
-            log('Leader not found by name:', leaderName);
-            return;
-        }
-
-        const player = getPlayer();
-        if (!player)
-            return;
-
-        if (player.id === leader.id) {
-            log('Leader is self – ignoring.');
-            return;
-        }
-
-        if (player.__followTarget && player.__followTarget.id === leader.id) {
-            return;
-        }
-
-        player.setFollowTarget(leader);
-        sendPacket('FollowPacket', leader.id);
-        log('Following leader by name:', leader.name, '(', leader.id, ')');
-    }
-
-    function triggerHotkey() {
-        const gc = window.gameClient;
-        if (!gc || !gc.interface || !gc.interface.hotbarManager)
-            return;
-
-        const player = getPlayer();
-        if (!player)
-            return;
-
-        if (config.minMana > 0 && player.state.mana < config.minMana) {
-            return;
-        }
-
-        gc.interface.hotbarManager.__handleClick(config.hotkeySlot);
-        state.lastTriggerAt = performance.now();
-        log('Triggered hotkey slot', config.hotkeySlot);
-    }
-
-    function sendPacket(packetName, ...args) {
-        const gc = window.gameClient;
-        if (!gc || !gc.send)
-            return;
-        const packetClass = window[packetName];
-        if (!packetClass) {
-            log('Packet class not found:', packetName);
-            return;
-        }
-        gc.send(new packetClass(...args));
-    }
-
-    // ---- Leader hook ----
-    function hookLeader() {
-        const gc = window.gameClient;
-        if (!gc || typeof gc.send !== 'function') {
-            log('gameClient.send not found – will retry.');
-            return false;
-        }
-
-        if (state.originalSend) {
-            gc.send = state.originalSend;
-        }
-
-        state.originalSend = gc.send;
-        gc.send = function (packet) {
-            const buffer = packet.getBuffer();
-            if (buffer && buffer[0] === (window.CONST && CONST.PROTOCOL.CLIENT.TARGET)) {
-                const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
-                const targetId = view.getUint32(1, true);
-                if (targetId !== 0 || config.broadcastClear) {
-                    const leaderId = gc.player ? gc.player.id : 0;
-                    sendMessage({
-                        type: 'target',
-                        id: targetId,
-                        leaderId: leaderId
-                    });
-                }
-            }
-            state.originalSend.call(this, packet);
-        };
-        log('Leader hook installed – broadcasting targets.');
-        return true;
-    }
-
-    function hookFollower() {
-        log('Follower mode – listening for targets.');
-        // Start requesting target immediately (if we have none)
-        startRequestInterval();
-        return true;
-    }
-
-    // ---- Communication channel ----
-    function setupChannel() {
-        if (state.channel) {
-            state.channel.close();
-            state.channel = null;
-        }
-
-        if ('BroadcastChannel' in window) {
-            state.channel = new BroadcastChannel(config.channelName);
-        } else {
-            state.channel = {
-                postMessage: (msg) => localStorage.setItem('__comboBot', JSON.stringify(msg)),
-                onmessage: null,
-                close: () => {}
-            };
-            window.addEventListener('storage', (e) => {
-                if (e.key === '__comboBot' && e.newValue) {
-                    const msg = JSON.parse(e.newValue);
-                    if (state.channel.onmessage)
-                        state.channel.onmessage({
-                            data: msg
-                        });
-                }
-            });
-        }
-
-        state.channel.onmessage = (event) => {
-            const msg = event.data;
-            if (!msg || !msg.type)
-                return;
-
-            if (msg.type === 'target') {
-                if (!isLeader())
-                    handleTarget(msg);
-            }
-            // ---- Handle target request ----
-            if (msg.type === 'requestTarget') {
-                if (isLeader())
-                    handleRequest();
-            }
-        };
-        return true;
-    }
-
-    // ---- Start / Stop ----
-    function start() {
-        if (state.running) {
-            log('Already running.');
-            return false;
-        }
-
-        if (state.retryTimer) {
-            clearTimeout(state.retryTimer);
-            state.retryTimer = null;
-            state.retryCount = 0;
-        }
-
-        if (!setupChannel()) {
-            log('Failed to set up communication channel.');
-            return false;
-        }
-
-        if (isLeader()) {
-            const hooked = hookLeader();
-            if (!hooked) {
-                state.retryCount++;
-                if (state.retryCount > 10) {
-                    log('Giving up – gameClient.send not found after 10 retries.');
-                    state.channel.close();
-                    state.channel = null;
-                    return false;
-                }
-                state.retryTimer = setTimeout(() => {
-                    state.retryTimer = null;
-                    start();
-                }, 2000);
-                return false;
-            }
-        } else {
-            if (!hookFollower()) {
-                state.channel.close();
-                state.channel = null;
-                return false;
-            }
-        }
-
-        state.running = true;
-        config.enabled = true;
-        persistConfig();
-        log(`Started as ${config.mode}.`);
-        return true;
-    }
-
-    function stop() {
-        if (!state.running)
-            return false;
-
-        if (state.retryTimer) {
-            clearTimeout(state.retryTimer);
-            state.retryTimer = null;
-            state.retryCount = 0;
-        }
-
-        // ---- Clear all intervals ----
-        if (state.followInterval) {
-            clearInterval(state.followInterval);
-            state.followInterval = null;
-        }
-        if (state.requestInterval) {
-            clearInterval(state.requestInterval);
-            state.requestInterval = null;
-        }
-        state.currentTargetId = null;
-
-        if (state.originalSend && window.gameClient) {
-            window.gameClient.send = state.originalSend;
-            state.originalSend = null;
-        }
-
-        if (state.channel) {
-            state.channel.close();
-            state.channel = null;
-        }
-
-        state.running = false;
-        config.enabled = false;
-        persistConfig();
-        log('Stopped.');
-        return true;
-    }
-
-    function status() {
-        return {
-            running: state.running,
-            config: {
-                ...config
-            },
-            currentTargetId: state.currentTargetId,
-        };
-    }
-
-    function updateConfig(next) {
-        Object.assign(config, next);
-        if (config.cooldownMs < 100)
-            config.cooldownMs = 100;
-        if (config.hotkeySlot < 0)
-            config.hotkeySlot = 0;
-        if (config.hotkeySlot > 11)
-            config.hotkeySlot = 11;
-        if (config.leaderName)
-            config.leaderName = config.leaderName.trim();
-        persistConfig();
-
-        if (state.running) {
-            stop();
-            start();
-        }
-        return {
-            ...config
-        };
-    }
-
-    // ---- Manual follow ----
-    function followLeaderNow() {
-        const player = getPlayer();
-        if (!player) {
-            log('Player not found.');
-            return;
-        }
-        if (config.leaderName) {
-            followLeaderByName();
-        } else {
-            log('No leader name set. Use the leader name field.');
-        }
-    }
-
-    if (config.enabled) {
-        setTimeout(() => {
-            if (!state.running)
-                start();
-        }, 1000);
-    }
-
-    bot.comboBot = {
-        start,
-        stop,
-        status,
-        updateConfig,
-        config,
-        followLeaderNow,
-    };
-};
 window.__minibiaBotBundle.installComboBotModule = function installComboBotModule(bot) {
     const configStorageKey = "minibiaBot.combo.config";
     const state = {
@@ -18078,42 +18052,129 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
 <!-- Alert Tab -->
 <div class="mb-tab-panel" data-tab-panel="alert">
 
-  <!-- First Section -->
+  <!-- General & Audio Alerts -->
   <div class="mb-section">
+    <div class="mb-label">General & Audio Alerts</div>
     <div class="mb-stack">
-      <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px 32px;">
-        <!-- Left Column -->
-        <div style="display:flex; flex-direction:column; gap:10px;">
-          <label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-player-alert" /><span>Player On Screen Alert</span></label>
-          <label class="mb-toggle"><input type="checkbox" id="minibia-bot-player-attack-alert" /><span>Player Attack Alert</span></label>
-        </div>
-        
-        <!-- Right Column -->
-        <div style="display:flex; flex-direction:column; gap:10px;">
-          <label class="mb-toggle"><input type="checkbox" id="minibia-bot-antibot-enabled" /><span>Anti-Bot Alert</span></label>
-          <label class="mb-toggle"><input type="checkbox" id="minibia-bot-message-alert" /><span>Message Alert</span></label>
-        </div>
+      
+      <!-- Top Alert Checkboxes (2 Rows) -->
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px 16px;">
+        <label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-player-alert" /><span>Player On Screen Alert</span></label>
+        <label class="mb-toggle"><input type="checkbox" id="minibia-bot-antibot-enabled" /><span>Anti-Bot Alert</span></label>
+        <label class="mb-toggle"><input type="checkbox" id="minibia-bot-player-attack-alert" /><span>Player Attack Alert</span></label>
+        <label class="mb-toggle"><input type="checkbox" id="minibia-bot-message-alert" /><span>Message Alert</span></label>
       </div>
 
-      <div style="display:flex;gap:6px;align-items:center;">
-        <label style="font-size:11px;color:#e9d39b;">Alert Cooldown (s)</label>
-        <input type="number" id="minibia-bot-panic-player-cooldown" min="10" value="10" style="width:60px;padding:2px 4px" />
+      <div style="display:flex; gap:8px; align-items:center; margin-top:4px;">
+        <label style="font-size:11px; color:#e9d39b;">Alert Cooldown (s)</label>
+        <input type="number" id="minibia-bot-panic-player-cooldown" min="10" value="10" style="width:60px; padding:2px 4px;" />
       </div>
 
+      <hr style="margin:8px 0; border:0; border-top:1px solid #444;" />
+
+      <!-- Audio Triggers -->
+      <label class="mb-toggle" style="margin:0;">
+        <input type="checkbox" id="minibia-bot-panic-target-death-beep" />
+        <span>Target Death (descending tone)</span>
+      </label>
+
+      <div style="display:grid; grid-template-columns:auto 1fr 1fr; gap:6px; align-items:end;">
+        <label class="mb-toggle" style="margin:0;">
+          <input type="checkbox" id="minibia-bot-panic-low-health-beep" />
+          <span>Low Health</span>
+        </label>
+        <label class="mb-field">
+          <span class="mb-field-label">Threshold %</span>
+          <input type="number" id="minibia-bot-panic-low-health-threshold" min="1" max="99" value="50" />
+        </label>
+        <label class="mb-field">
+          <span class="mb-field-label">Repeat (s)</span>
+          <input type="number" id="minibia-bot-panic-low-health-repeat" min="1" value="5" />
+        </label>
+      </div>
+
+      <div style="display:grid; grid-template-columns:auto 1fr 1fr; gap:6px; align-items:end;">
+        <label class="mb-toggle" style="margin:0;">
+          <input type="checkbox" id="minibia-bot-panic-mana-full-beep" />
+          <span>Mana Full</span>
+        </label>
+        <label class="mb-field">
+          <span class="mb-field-label">After (s)</span>
+          <input type="number" id="minibia-bot-panic-mana-full-delay" min="1" value="10" />
+        </label>
+        <label class="mb-field">
+          <span class="mb-field-label">Repeat (s)</span>
+          <input type="number" id="minibia-bot-panic-mana-full-repeat" min="1" value="30" />
+        </label>
+      </div>
+
+      <div style="display:grid; grid-template-columns:auto 1fr 1fr; gap:6px; align-items:end;">
+        <label class="mb-toggle" style="margin:0;">
+          <input type="checkbox" id="minibia-bot-panic-no-target-beep" />
+          <span>No Target</span>
+        </label>
+        <label class="mb-field">
+          <span class="mb-field-label">After (s)</span>
+          <input type="number" id="minibia-bot-panic-no-target-delay" min="1" value="10" />
+        </label>
+        <label class="mb-field">
+          <span class="mb-field-label">Repeat (s)</span>
+          <input type="number" id="minibia-bot-panic-no-target-repeat" min="1" value="30" />
+        </label>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- Item Count Alerts Section -->
+  <div class="mb-section">
+    <div class="mb-label">Item Count Alerts (Potions)</div>
+    <div class="mb-stack">
+      <div id="minibia-bot-panic-item-alerts-list" class="mb-list" style="max-height:110px;"></div>
+      
+      <div style="display:grid; grid-template-columns:70px 1fr 60px auto; gap:4px; align-items:end;">
+        <label class="mb-field">
+          <span class="mb-field-label">Item ID</span>
+          <input type="text" id="minibia-bot-panic-item-alert-id" placeholder="266" />
+        </label>
+        <label class="mb-field">
+          <span class="mb-field-label">Name</span>
+          <input type="text" id="minibia-bot-panic-item-alert-name" placeholder="Health Potion" />
+        </label>
+        <label class="mb-field">
+          <span class="mb-field-label">Below</span>
+          <input type="number" id="minibia-bot-panic-item-alert-threshold" min="1" value="10" />
+        </label>
+        <button type="button" class="mb-small-button" id="minibia-bot-panic-item-alert-add" style="padding:6px 10px;">Add</button>
+      </div>
+      
+      <div class="mb-small-note">
+        Common IDs: 3160 UH · 2874 MP/HP.
+      </div>
+    </div>
+  </div>
+
+  <!-- Trusted Names Section -->
+  <div class="mb-section">
+    <div class="mb-label">Trusted Names</div>
+    <div class="mb-stack">
       <div class="mb-inline">
         <input type="text" id="minibia-bot-panic-trusted-input" placeholder="Trusted name" />
         <button type="button" class="mb-small-button" id="minibia-bot-panic-trusted-add">Add</button>
       </div>
-
       <div class="mb-list" id="minibia-bot-panic-trusted-list"></div>
     </div>
-  </div> <!-- Properly closed the first mb-section here -->
+  </div>
 
-  <!-- Second Section -->
+  <!-- Panic Runner Section -->
   <div class="mb-section">
-    <div class="mb-label" id="minibia-bot-home">Panic Runner Home: not set</div>
+    <div class="mb-label">Panic Runner</div>
     <div class="mb-stack">
-      <button type="button" id="minibia-bot-set-home">Set Home</button>
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <span id="minibia-bot-home" style="font-size:11px;">Panic Runner Home: not set</span>
+        <button type="button" class="mb-small-button" id="minibia-bot-set-home">Set Home</button>
+      </div>
+      
       <label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-unknown" /><span>Unknown Player</span></label>
       <label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-health" /><span>Healthloss</span></label>
       <label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-return" /><span>Auto Return to Position</span></label>
@@ -18613,6 +18674,32 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
       <div class="mb-small-note">Attacks adjacent slimes (except the mother slime). Stops when a GM is detected.</div>
     </div>
   </div>
+  
+  <div class="mb-section">
+    <div class="mb-label">Monk Trainer</div>
+    <div class="mb-stack">
+      <label class="mb-toggle">
+        <input type="checkbox" id="minibia-bot-monk-trainer-enabled" />
+        <span>Enable Monk Trainer</span>
+      </label>
+      <div class="mb-form-grid">
+        <label class="mb-field">
+          <span class="mb-field-label">Monk Name Contains</span>
+          <input type="text" id="minibia-bot-monk-trainer-name" placeholder="monk" />
+        </label>
+        <label class="mb-field">
+          <span class="mb-field-label">Stop Below HP %</span>
+          <input type="number" id="minibia-bot-monk-trainer-hp" min="1" max="99" value="30" />
+        </label>
+      </div>
+      <div class="mb-small-note" id="minibia-bot-monk-trainer-status">Status: idle</div>
+      <div class="mb-small-note">
+        Attacks monks and pauses when their HP drops below the threshold so they can regenerate.
+        Name matching is case-insensitive and matches any part of the creature name.
+      </div>
+    </div>
+  </div>
+  
 </div>
 
 <!-- Combo Tab -->
@@ -19864,6 +19951,75 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
                 bot.slimeTrainer.startCaptureMotherSlime();
             });
         }
+        
+        // ---- Monk Trainer UI ----
+        const monkToggle   = panel.querySelector("#minibia-bot-monk-trainer-enabled");
+        const monkNameInput = panel.querySelector("#minibia-bot-monk-trainer-name");
+        const monkHpInput  = panel.querySelector("#minibia-bot-monk-trainer-hp");
+        const monkStatus   = panel.querySelector("#minibia-bot-monk-trainer-status");
+
+        function refreshMonkTrainerStatus() {
+            const status = bot.monkTrainer?.status?.();
+            if (!status) return;
+
+            if (monkToggle && document.activeElement !== monkToggle) {
+                monkToggle.checked = !!status.running;
+            }
+            if (monkNameInput && document.activeElement !== monkNameInput) {
+                monkNameInput.value = status.config.monkNameContains || "";
+            }
+            if (monkHpInput && document.activeElement !== monkHpInput) {
+                monkHpInput.value = status.config.minHpPercent ?? 30;
+            }
+            if (monkStatus) {
+                if (!status.running) {
+                    monkStatus.textContent = "Status: idle";
+                } else if (status.currentTarget) {
+                    const hp = status.currentTarget.hp;
+                    monkStatus.textContent =
+                        `Attacking ${status.currentTarget.name} ` +
+                        `(${hp != null ? hp.toFixed(0) + "% HP" : "HP ?"})`;
+                } else {
+                    monkStatus.textContent =
+                        `Waiting for a healthy monk ` +
+                        `(${status.visibleMonks.length} visible)`;
+                }
+            }
+        }
+
+        if (monkToggle) {
+            monkToggle.checked = !!bot.monkTrainer?.status?.().running;
+            monkToggle.addEventListener("change", function () {
+                if (this.checked) {
+                    bot.monkTrainer.start();
+                } else {
+                    bot.monkTrainer.stop();
+                }
+                refreshMonkTrainerStatus();
+            });
+        }
+
+        if (monkNameInput) {
+            monkNameInput.addEventListener("change", function () {
+                bot.monkTrainer.updateConfig({
+                    monkNameContains: this.value.trim() || "monk",
+                });
+                refreshMonkTrainerStatus();
+            });
+        }
+
+        if (monkHpInput) {
+            monkHpInput.addEventListener("change", function () {
+                const val = Math.max(1, Math.min(99, parseInt(this.value) || 30));
+                this.value = val;
+                bot.monkTrainer.updateConfig({ minHpPercent: val });
+                refreshMonkTrainerStatus();
+            });
+        }
+
+        const monkTimer = window.setInterval(refreshMonkTrainerStatus, 1000);
+        bot.addCleanup(() => window.clearInterval(monkTimer));
+        setTimeout(refreshMonkTrainerStatus, 100);
 
         // ---- Fisher ----
         const fisherToggle = panel.querySelector("#minibia-bot-fisher-enabled");
@@ -21526,6 +21682,161 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
                 refreshPanicStatus();
             });
         }
+        
+                // ---- Audio Alert toggles + inputs ----
+        const audioIds = {
+            targetDeath:      panel.querySelector("#minibia-bot-panic-target-death-beep"),
+            lowHealth:        panel.querySelector("#minibia-bot-panic-low-health-beep"),
+            lowHealthThresh:  panel.querySelector("#minibia-bot-panic-low-health-threshold"),
+            lowHealthRepeat:  panel.querySelector("#minibia-bot-panic-low-health-repeat"),
+            manaFull:         panel.querySelector("#minibia-bot-panic-mana-full-beep"),
+            manaFullDelay:    panel.querySelector("#minibia-bot-panic-mana-full-delay"),
+            manaFullRepeat:   panel.querySelector("#minibia-bot-panic-mana-full-repeat"),
+            noTarget:         panel.querySelector("#minibia-bot-panic-no-target-beep"),
+            noTargetDelay:    panel.querySelector("#minibia-bot-panic-no-target-delay"),
+            noTargetRepeat:   panel.querySelector("#minibia-bot-panic-no-target-repeat"),
+            itemList:         panel.querySelector("#minibia-bot-panic-item-alerts-list"),
+            itemId:           panel.querySelector("#minibia-bot-panic-item-alert-id"),
+            itemName:         panel.querySelector("#minibia-bot-panic-item-alert-name"),
+            itemThresh:       panel.querySelector("#minibia-bot-panic-item-alert-threshold"),
+            itemAdd:          panel.querySelector("#minibia-bot-panic-item-alert-add"),
+        };
+
+        function refreshPanicItemAlertsList() {
+            const list = audioIds.itemList;
+            if (!list) return;
+            const alerts = bot.panic?.config?.itemAlerts || [];
+            list.innerHTML = "";
+            if (!alerts.length) {
+                const empty = document.createElement("div");
+                empty.className = "mb-small-note";
+                empty.textContent = "No item alerts configured.";
+                list.appendChild(empty);
+                return;
+            }
+            alerts.forEach((a, idx) => {
+                const row = document.createElement("div");
+                row.className = "mb-list-row";
+                row.style.cssText = "display:flex;justify-content:space-between;align-items:center;padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.05);";
+                const label = document.createElement("span");
+                label.textContent = `${a.name} (${a.id}) — alert below ${a.threshold}`;
+                const removeBtn = document.createElement("button");
+                removeBtn.type = "button";
+                removeBtn.className = "mb-small-button";
+                removeBtn.textContent = "✕";
+                removeBtn.style.cssText = "width:24px;padding:2px;background:#5a2020;color:#ff8888;border-color:#883030;";
+                removeBtn.addEventListener("click", () => {
+                    const current = (bot.panic.config.itemAlerts || []).slice();
+                    current.splice(idx, 1);
+                    bot.panic.updateConfig({ itemAlerts: current });
+                    refreshPanicItemAlertsList();
+                });
+                row.appendChild(label);
+                row.appendChild(removeBtn);
+                list.appendChild(row);
+            });
+        }
+
+        function refreshAudioAlertInputs() {
+            const c = bot.panic?.config;
+            if (!c) return;
+            if (audioIds.targetDeath && document.activeElement !== audioIds.targetDeath)
+                audioIds.targetDeath.checked = !!c.targetDeathBeep;
+            if (audioIds.lowHealth && document.activeElement !== audioIds.lowHealth)
+                audioIds.lowHealth.checked = !!c.lowHealthBeep;
+            if (audioIds.lowHealthThresh && document.activeElement !== audioIds.lowHealthThresh)
+                audioIds.lowHealthThresh.value = c.lowHealthBeepThreshold ?? 50;
+            if (audioIds.lowHealthRepeat && document.activeElement !== audioIds.lowHealthRepeat)
+                audioIds.lowHealthRepeat.value = Math.round((c.lowHealthBeepRepeatMs ?? 5000) / 1000);
+            if (audioIds.manaFull && document.activeElement !== audioIds.manaFull)
+                audioIds.manaFull.checked = !!c.manaFullBeep;
+            if (audioIds.manaFullDelay && document.activeElement !== audioIds.manaFullDelay)
+                audioIds.manaFullDelay.value = Math.round((c.manaFullDelayMs ?? 10000) / 1000);
+            if (audioIds.manaFullRepeat && document.activeElement !== audioIds.manaFullRepeat)
+                audioIds.manaFullRepeat.value = Math.round((c.manaFullRepeatMs ?? 30000) / 1000);
+            if (audioIds.noTarget && document.activeElement !== audioIds.noTarget)
+                audioIds.noTarget.checked = !!c.noTargetBeep;
+            if (audioIds.noTargetDelay && document.activeElement !== audioIds.noTargetDelay)
+                audioIds.noTargetDelay.value = Math.round((c.noTargetDelayMs ?? 10000) / 1000);
+            if (audioIds.noTargetRepeat && document.activeElement !== audioIds.noTargetRepeat)
+                audioIds.noTargetRepeat.value = Math.round((c.noTargetRepeatMs ?? 30000) / 1000);
+        }
+
+        // Simple booleans
+        const boolToggles = [
+            ["targetDeath", "targetDeathBeep"],
+            ["lowHealth",   "lowHealthBeep"],
+            ["manaFull",    "manaFullBeep"],
+            ["noTarget",    "noTargetBeep"],
+        ];
+        for (const [uiKey, cfgKey] of boolToggles) {
+            const el = audioIds[uiKey];
+            if (!el) continue;
+            el.addEventListener("change", function () {
+                bot.panic.updateConfig({ [cfgKey]: this.checked });
+            });
+        }
+
+        // Numeric inputs (seconds → ms where applicable)
+        const numericInputs = [
+            ["lowHealthThresh", "lowHealthBeepThreshold", 1,   99,  v => v],
+            ["lowHealthRepeat", "lowHealthBeepRepeatMs",  1,  600,  v => v * 1000],
+            ["manaFullDelay",   "manaFullDelayMs",        1, 3600,  v => v * 1000],
+            ["manaFullRepeat",  "manaFullRepeatMs",       1, 3600,  v => v * 1000],
+            ["noTargetDelay",   "noTargetDelayMs",        1, 3600,  v => v * 1000],
+            ["noTargetRepeat",  "noTargetRepeatMs",       1, 3600,  v => v * 1000],
+        ];
+        for (const [uiKey, cfgKey, min, max, xform] of numericInputs) {
+            const el = audioIds[uiKey];
+            if (!el) continue;
+            el.addEventListener("change", function () {
+                const raw = Number(this.value) || min;
+                const clamped = Math.max(min, Math.min(max, raw));
+                this.value = clamped;
+                bot.panic.updateConfig({ [cfgKey]: xform(clamped) });
+            });
+        }
+
+        // Add an item alert
+        if (audioIds.itemAdd) {
+            const addItemAlert = () => {
+                const id = Number(audioIds.itemId?.value);
+                if (!Number.isFinite(id) || id <= 0) {
+                    bot.log("Item alert: enter a valid item ID.");
+                    return;
+                }
+                const name = audioIds.itemName?.value?.trim() || `Item ${id}`;
+                const threshold = Math.max(1, Number(audioIds.itemThresh?.value) || 1);
+                const current = (bot.panic.config.itemAlerts || []).slice();
+                if (current.some(a => a.id === id)) {
+                    bot.log(`Item alert: ${id} already listed.`);
+                    return;
+                }
+                current.push({ id, name, threshold, cooldownMs: 30000 });
+                bot.panic.updateConfig({ itemAlerts: current });
+                refreshPanicItemAlertsList();
+                if (audioIds.itemId) audioIds.itemId.value = "";
+                if (audioIds.itemName) audioIds.itemName.value = "";
+                if (audioIds.itemThresh) audioIds.itemThresh.value = "10";
+            };
+            audioIds.itemAdd.addEventListener("click", addItemAlert);
+            if (audioIds.itemId) {
+                audioIds.itemId.addEventListener("keydown", (e) => {
+                    if (e.key === "Enter") { e.preventDefault(); addItemAlert(); }
+                });
+            }
+        }
+
+        // Initial paint + periodic refresh (in case another tab changes them)
+        setTimeout(() => {
+            refreshAudioAlertInputs();
+            refreshPanicItemAlertsList();
+        }, 150);
+        const audioAlertRefresh = window.setInterval(() => {
+            refreshAudioAlertInputs();
+            refreshPanicItemAlertsList();
+        }, 2000);
+        bot.addCleanup(() => window.clearInterval(audioAlertRefresh));
 
         // ---- Auto-save preferred names on blur ----
         const prefInput = document.getElementById("minibia-bot-auto-attack-preferred-names");
@@ -24100,19 +24411,6 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         "minibiaBot.profiles.",      // one key per profile: minibiaBot.profiles.<name>
     ];
 
-    function scopedKey(key) {
-        if (typeof key !== "string")       return key;
-        if (!key.startsWith(BASE_PREFIX))  return key;
-        if (key.startsWith(CHAR_PREFIX))   return key; // already scoped
-        if (GLOBAL_KEYS.has(key))          return key;
-        for (const p of GLOBAL_KEY_PREFIXES) {
-            if (key.startsWith(p))         return key;
-        }
-        const current = window.__minibiaBotCurrentCharacter;
-        if (!current)                      return key;
-        return `${CHAR_PREFIX}${safeName(current)}.${key.slice(BASE_PREFIX.length)}`;
-    }
-
     function readCharacterName() {
         try {
             const stateName = window.gameClient?.player?.state?.name;
@@ -24257,6 +24555,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         currentBundle.installTalkModule(bot);
         currentBundle.installAntiBotMonitorModule(bot);
         currentBundle.installSlimeTrainerModule(bot);
+        currentBundle.installMonkTrainerModule(bot);
         currentBundle.installPaladinModule(bot);
         currentBundle.installLooterModule(bot);
         currentBundle.installLightHackModule(bot);
