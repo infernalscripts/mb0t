@@ -689,7 +689,7 @@ window.__minibiaBotBundle.createBot = function createBot() {
 
     // ---- PUBLIC API ----
     return {
-        version: "0.7.7",
+        version: "1.0.0",
         addCleanup,
 
         /** Destroy the bot and all its modules (call before reload) */
@@ -9300,6 +9300,42 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         updateWaypoint,
         mergePresets: mergePresets,
         renamePreset: renamePreset,
+
+        // ★ NEW — return a single preset as a fresh object
+        //   If name is omitted, uses the currently active preset.
+        //   Falls back to the live in-memory route/transitions when the
+        //   requested name matches the active preset (so unsaved edits
+        //   are included).
+        exportPreset: function (name) {
+            const wanted = String(name || getActivePresetName() || "").trim();
+            if (!wanted) return null;
+
+            const isActive = wanted.toLowerCase() === getActivePresetName().toLowerCase();
+
+            if (isActive) {
+                return {
+                    name: getActivePresetName(),
+                    route: getRoute(),
+                    transitions: getTransitions(),
+                };
+            }
+
+            // Otherwise pull the snapshot from storage
+            const all = bot.storage.get(presetStorageKey, []);
+            const found = (Array.isArray(all) ? all : [])
+                .find(p => p && String(p.name).toLowerCase() === wanted.toLowerCase());
+            if (!found) return null;
+
+            return {
+                name: String(found.name),
+                route: Array.isArray(found.route)
+                    ? found.route.map(w => JSON.parse(JSON.stringify(w)))
+                    : [],
+                transitions: Array.isArray(found.transitions)
+                    ? found.transitions.map(t => JSON.parse(JSON.stringify(t)))
+                    : [],
+            };
+        },
     };
 };
 
@@ -14139,7 +14175,10 @@ window.__minibiaBotBundle.installPinkSkullDetectorModule = function installPinkS
  * ==================================================================================
  */
 window.__minibiaBotBundle.installProfileModule = function installProfileModule(bot) {
-    const PROFILES_STORAGE_KEY = "minibiaBot.profiles";
+    const INDEX_KEY      = "minibiaBot.profileIndex";       // array of names
+    const PROFILE_PREFIX = "minibiaBot.profiles.";          // one key per profile
+    const LEGACY_KEY     = "minibiaBot.profiles";           // old single blob
+    const GZIP_PREFIX    = "GZ1:";                          // marker for gzipped payloads
 
     const CONFIG_KEYS = [
         "minibiaBot.rune.config",
@@ -14167,6 +14206,126 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
         "minibiaBot.ui.panelCollapsed",
     ];
 
+    // ----------------------------------------------------------
+    // Byte helpers
+    // ----------------------------------------------------------
+    function formatBytes(n) {
+        if (n < 1024) return `${n} B`;
+        if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+        return `${(n / 1024 / 1024).toFixed(2)} MB`;
+    }
+
+    function base64FromBytes(bytes) {
+        let bin = "";
+        const chunk = 0x8000;
+        for (let i = 0; i < bytes.length; i += chunk) {
+            bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+        }
+        return btoa(bin);
+    }
+    function bytesFromBase64(b64) {
+        const bin = atob(b64);
+        const out = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+        return out;
+    }
+
+    async function gzipJson(str) {
+        if (typeof CompressionStream === "undefined") return null;
+        try {
+            const cs = new CompressionStream("gzip");
+            const writer = cs.writable.getWriter();
+            writer.write(new TextEncoder().encode(str));
+            writer.close();
+            const buf = await new Response(cs.readable).arrayBuffer();
+            return base64FromBytes(new Uint8Array(buf));
+        } catch {
+            return null;
+        }
+    }
+    async function gunzipJson(b64) {
+        if (typeof DecompressionStream === "undefined") return null;
+        try {
+            const bytes = bytesFromBase64(b64);
+            const ds = new DecompressionStream("gzip");
+            const writer = ds.writable.getWriter();
+            writer.write(bytes);
+            writer.close();
+            const buf = await new Response(ds.readable).arrayBuffer();
+            return new TextDecoder().decode(buf);
+        } catch {
+            return null;
+        }
+    }
+
+    // ----------------------------------------------------------
+    // Key helpers
+    // ----------------------------------------------------------
+    function safeName(name) {
+        return String(name).replace(/[^A-Za-z0-9_.-]/g, "_");
+    }
+    function profileKey(name) {
+        return PROFILE_PREFIX + safeName(name);
+    }
+
+    function getIndex() {
+        try {
+            const raw = localStorage.getItem(INDEX_KEY);
+            const arr = raw ? JSON.parse(raw) : [];
+            return Array.isArray(arr) ? arr : [];
+        } catch { return []; }
+    }
+    function setIndex(names) {
+        try {
+            localStorage.setItem(INDEX_KEY, JSON.stringify(names));
+        } catch (e) {
+            console.error("[profiles] could not update index", e);
+        }
+    }
+
+    // ----------------------------------------------------------
+    // One-time migration from old single-blob layout
+    // ----------------------------------------------------------
+    (function migrateLegacy() {
+        try {
+            const legacy = localStorage.getItem(LEGACY_KEY);
+            if (!legacy) return;
+            const parsed = JSON.parse(legacy);
+            if (!parsed || typeof parsed !== "object") {
+                localStorage.removeItem(LEGACY_KEY);
+                return;
+            }
+            const names = getIndex();
+            let migrated = 0;
+            for (const [name, snapshot] of Object.entries(parsed)) {
+                const key = profileKey(name);
+                if (localStorage.getItem(key)) continue; // already migrated
+                try {
+                    // Plain JSON for migration (gzip happens on next save)
+                    localStorage.setItem(key, JSON.stringify(snapshot));
+                    if (!names.some(n => n.toLowerCase() === name.toLowerCase()))
+                        names.push(name);
+                    migrated++;
+                } catch (e) {
+                    console.error(`[profiles] could not migrate "${name}"`, e);
+                }
+            }
+            setIndex(names);
+            // Only nuke the legacy blob if every profile was migrated
+            if (migrated === Object.keys(parsed).length) {
+                localStorage.removeItem(LEGACY_KEY);
+                console.log(`[profiles] migrated ${migrated} legacy profile(s)`);
+            } else {
+                console.warn(`[profiles] partially migrated ${migrated}/${Object.keys(parsed).length} — legacy blob kept as backup`);
+            }
+        } catch (e) {
+            console.warn("[profiles] migration skipped", e);
+        }
+    })();
+
+    // ----------------------------------------------------------
+    // Config snapshot IO
+    // ----------------------------------------------------------
     function getAllConfigs() {
         const snapshot = {};
         for (const key of CONFIG_KEYS) {
@@ -14179,7 +14338,6 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
         }
         return snapshot;
     }
-
     function setAllConfigs(snapshot) {
         for (const key of CONFIG_KEYS) {
             const value = snapshot[key];
@@ -14191,60 +14349,88 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
         }
     }
 
+    // ----------------------------------------------------------
+    // Profile CRUD (async because of compression)
+    // ----------------------------------------------------------
     function listProfiles() {
-        try {
-            const raw = localStorage.getItem(PROFILES_STORAGE_KEY);
-            return raw ? Object.keys(JSON.parse(raw)) : [];
-        } catch {
-            return [];
-        }
+        return getIndex().slice();
     }
 
-    function getProfile(name) {
-        if (!name)
-            return null;
-        try {
-            const raw = localStorage.getItem(PROFILES_STORAGE_KEY);
-            const profiles = raw ? JSON.parse(raw) : {};
-            return profiles[name] || null;
-        } catch {
-            return null;
+    async function getProfile(name) {
+        if (!name) return null;
+        const raw = localStorage.getItem(profileKey(name));
+        if (!raw) return null;
+
+        // Gzipped?
+        if (raw.startsWith(GZIP_PREFIX)) {
+            const json = await gunzipJson(raw.slice(GZIP_PREFIX.length));
+            if (!json) return null;
+            try { return JSON.parse(json); } catch { return null; }
         }
+        // Plain JSON
+        try { return JSON.parse(raw); } catch { return null; }
     }
 
-    function saveProfile(name) {
+    function isQuotaError(e) {
+        return !!e && (
+            e.name === "QuotaExceededError" ||
+            e.code === 22 ||
+            e.code === 1014 ||
+            /quota/i.test(String(e.message || ""))
+        );
+    }
+
+    async function saveProfile(name) {
         if (!name || typeof name !== "string") {
             bot.log("Profile name required");
             return false;
         }
         const nameTrim = name.trim();
-        if (!nameTrim)
-            return false;
+        if (!nameTrim) return false;
 
         const snapshot = getAllConfigs();
-        let profiles = {};
+        const rawJson  = JSON.stringify(snapshot);
+
+        // Compress
+        const gz = await gzipJson(rawJson);
+        const payload = gz ? (GZIP_PREFIX + gz) : rawJson;
+
         try {
-            const raw = localStorage.getItem(PROFILES_STORAGE_KEY);
-            profiles = raw ? JSON.parse(raw) : {};
-        } catch {
-            profiles = {};
+            localStorage.setItem(profileKey(nameTrim), payload);
+        } catch (e) {
+            if (isQuotaError(e)) {
+                const u = getUsage();
+                bot.log(
+                    `Could not save "${nameTrim}" — localStorage full. ` +
+                    `Used ${formatBytes(u.used)} of ~${formatBytes(u.quota)}. ` +
+                    `Try deleting old profiles (Profiles tab → Delete).`
+                );
+            } else {
+                bot.log(`Failed to save profile "${nameTrim}": ${e.message}`);
+            }
+            return false;
         }
-        profiles[nameTrim] = snapshot;
-        localStorage.setItem(PROFILES_STORAGE_KEY, JSON.stringify(profiles));
-        bot.log(`Profile "${nameTrim}" saved`);
+
+        const names = getIndex();
+        if (!names.some(n => n.toLowerCase() === nameTrim.toLowerCase())) {
+            names.push(nameTrim);
+            setIndex(names);
+        }
+        const ratio = gz ? ` (compressed ${formatBytes(rawJson.length)} → ${formatBytes(payload.length)})` : "";
+        bot.log(`Profile "${nameTrim}" saved${ratio}`);
         return true;
     }
 
-    function loadProfile(name) {
-        if (!name)
-            return false;
-        const snapshot = getProfile(name);
+    async function loadProfile(name) {
+        if (!name) return false;
+        const snapshot = await getProfile(name);
         if (!snapshot) {
             bot.log(`Profile "${name}" not found`);
             return false;
         }
         setAllConfigs(snapshot);
         bot.log(`Profile "${name}" loaded – reloading bot...`);
+        window.__minibiaBotSkipEnabledRestore = true;
         if (typeof window.minibiaBotReload === "function") {
             window.minibiaBotReload();
         } else {
@@ -14254,81 +14440,26 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
     }
 
     function deleteProfile(name) {
-        if (!name)
-            return false;
-        let profiles = {};
-        try {
-            const raw = localStorage.getItem(PROFILES_STORAGE_KEY);
-            profiles = raw ? JSON.parse(raw) : {};
-        } catch {
-            profiles = {};
-        }
-        if (!profiles[name])
-            return false;
-        delete profiles[name];
-        localStorage.setItem(PROFILES_STORAGE_KEY, JSON.stringify(profiles));
+        if (!name) return false;
+        try { localStorage.removeItem(profileKey(name)); } catch {}
+        const names = getIndex().filter(n => n.toLowerCase() !== name.toLowerCase());
+        setIndex(names);
         bot.log(`Profile "${name}" deleted`);
         return true;
     }
 
-    /**
-     * Import waypoint presets from a profile JSON file.
-     * Merges them into the current cave presets, skipping duplicates by name.
-     * @param {File} file – The .json file to read.
-     * @returns {Promise<{ added: number, skipped: number }>}
-     */
-    function importWaypointsFromFile(file) {
-        return new Promise((resolve, reject) => {
-            const reader = new FileReader();
-            reader.onload = (e) => {
-                try {
-                    const data = JSON.parse(e.target.result);
-                    if (typeof data !== "object" || data === null) {
-                        reject(new Error("Invalid file format – not an object."));
-                        return;
-                    }
+    // ----------------------------------------------------------
+    // File export / import
+    // ----------------------------------------------------------
+    async function exportProfileToFile(name) {
+        if (!name) { bot.log("Profile name required for export"); return false; }
+        const snapshot = await getProfile(name);
+        if (!snapshot) { bot.log(`Profile "${name}" not found`); return false; }
 
-                    // Look for cave presets in the imported data
-                    const presetsData = data["minibiaBot.cave.presets"];
-                    if (!presetsData) {
-                        reject(new Error("No cave presets found in this file."));
-                        return;
-                    }
-
-                    if (!Array.isArray(presetsData) || presetsData.length === 0) {
-                        reject(new Error("Cave presets array is empty or invalid."));
-                        return;
-                    }
-
-                    // Merge into current cave module
-                    const result = bot.cave.mergePresets(presetsData, true);
-                    resolve(result);
-                } catch (err) {
-                    reject(new Error(`Import failed: ${err.message}`));
-                }
-            };
-            reader.onerror = () => reject(new Error("File read error"));
-            reader.readAsText(file);
-        });
-    }
-
-    // ---- NEW: Export to file ----
-    function exportProfileToFile(name) {
-        if (!name) {
-            bot.log("Profile name required for export");
-            return false;
-        }
-        const snapshot = getProfile(name);
-        if (!snapshot) {
-            bot.log(`Profile "${name}" not found`);
-            return false;
-        }
         const data = JSON.stringify(snapshot, null, 2);
-        const blob = new Blob([data], {
-            type: "application/json"
-        });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
+        const blob = new Blob([data], { type: "application/json" });
+        const url  = URL.createObjectURL(blob);
+        const a    = document.createElement("a");
         a.href = url;
         a.download = `${name}.profile.json`;
         document.body.appendChild(a);
@@ -14339,34 +14470,42 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
         return true;
     }
 
-    // ---- NEW: Import from file ----
     function importProfileFromFile(file, profileName) {
         return new Promise((resolve, reject) => {
             const reader = new FileReader();
-            reader.onload = (e) => {
+            reader.onload = async (e) => {
                 try {
                     const data = JSON.parse(e.target.result);
-                    if (typeof data !== "object" || data === null) {
-                        reject(new Error("Invalid profile data: not an object"));
-                        return;
-                    }
-                    // Optional: check that it contains at least one known config key
-                    const hasConfig = CONFIG_KEYS.some(key => key in data);
-                    if (!hasConfig) {
-                        reject(new Error("Invalid profile: no recognized config keys"));
-                        return;
-                    }
-                    const name = profileName?.trim() || file.name.replace(/\.profile\.json$/i, "") || "imported";
-                    // Load existing profiles
-                    let profiles = {};
+                    if (typeof data !== "object" || data === null)
+                        return reject(new Error("Invalid profile data: not an object"));
+                    if (!CONFIG_KEYS.some(k => k in data))
+                        return reject(new Error("Invalid profile: no recognized config keys"));
+
+                    const name = (profileName?.trim()
+                        || file.name.replace(/\.profile\.json$/i, "")
+                        || "imported");
+
+                    const rawJson = JSON.stringify(data);
+                    const gz = await gzipJson(rawJson);
+                    const payload = gz ? (GZIP_PREFIX + gz) : rawJson;
+
                     try {
-                        const raw = localStorage.getItem(PROFILES_STORAGE_KEY);
-                        profiles = raw ? JSON.parse(raw) : {};
-                    } catch {
-                        profiles = {};
+                        localStorage.setItem(profileKey(name), payload);
+                    } catch (err) {
+                        if (isQuotaError(err)) {
+                            return reject(new Error(
+                                `Storage full — could not import "${name}" ` +
+                                `(${formatBytes(payload.length)}). Delete old profiles and retry.`
+                            ));
+                        }
+                        return reject(err);
                     }
-                    profiles[name] = data;
-                    localStorage.setItem(PROFILES_STORAGE_KEY, JSON.stringify(profiles));
+
+                    const names = getIndex();
+                    if (!names.some(n => n.toLowerCase() === name.toLowerCase())) {
+                        names.push(name);
+                        setIndex(names);
+                    }
                     bot.log(`Profile "${name}" imported from file`);
                     resolve(name);
                 } catch (err) {
@@ -14378,18 +14517,72 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
         });
     }
 
-    // Public API
+    function importWaypointsFromFile(file) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                try {
+                    const data = JSON.parse(e.target.result);
+                    if (typeof data !== "object" || data === null)
+                        return reject(new Error("Invalid file format – not an object."));
+                    const presetsData = data["minibiaBot.cave.presets"];
+                    if (!presetsData)
+                        return reject(new Error("No cave presets found in this file."));
+                    if (!Array.isArray(presetsData) || presetsData.length === 0)
+                        return reject(new Error("Cave presets array is empty or invalid."));
+                    const result = bot.cave.mergePresets(presetsData, true);
+                    resolve(result);
+                } catch (err) {
+                    reject(new Error(`Import failed: ${err.message}`));
+                }
+            };
+            reader.onerror = () => reject(new Error("File read error"));
+            reader.readAsText(file);
+        });
+    }
+
+    // ----------------------------------------------------------
+    // Storage usage report
+    // ----------------------------------------------------------
+    function getUsage() {
+        let used = 0;
+        const perKey = {};
+        try {
+            for (let i = 0; i < localStorage.length; i++) {
+                const k = localStorage.key(i);
+                const v = localStorage.getItem(k) || "";
+                const bytes = k.length + v.length;
+                used += bytes;
+                perKey[k] = bytes;
+            }
+        } catch {}
+        return { used, quota: 5 * 1024 * 1024, perKey };
+    }
+
+    function printUsage() {
+        const u = getUsage();
+        const rows = Object.entries(u.perKey)
+            .sort((a, b) => b[1] - a[1])
+            .map(([k, v]) => ({ key: k, size: formatBytes(v) }));
+        console.log(`[profiles] localStorage used: ${formatBytes(u.used)} of ~${formatBytes(u.quota)}`);
+        console.table(rows);
+        return u;
+    }
+
     bot.profiles = {
         list: listProfiles,
         save: saveProfile,
         load: loadProfile,
-        delete : deleteProfile,
+        delete: deleteProfile,
         get: getProfile,
         getAllConfigs,
         setAllConfigs,
         export: exportProfileToFile,
         import: importProfileFromFile,
-        importWaypointsFromFile: importWaypointsFromFile,
+        importWaypointsFromFile,
+        usage: getUsage,
+        printUsage,
+        formatBytes,
     };
 };
 
@@ -18033,6 +18226,7 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
       <button type="button" class="mb-small-button" id="minibia-bot-cave-preset-new" style="padding:2px 8px; font-size:10px;">New</button>
       <button type="button" class="mb-small-button" id="minibia-bot-cave-preset-delete" style="padding:2px 8px; font-size:10px;">Del</button>
       <button type="button" class="mb-small-button" id="minibia-bot-cave-preset-rename" style="padding:2px 8px; font-size:10px;">Rename</button>
+      <button type="button" class="mb-small-button" id="minibia-bot-cave-preset-export" style="padding:2px 8px; font-size:10px;">Export</button>
     </div>
 
     <!-- Controls -->
@@ -18357,6 +18551,9 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
           <button type="button" class="mb-small-button" id="minibia-bot-profile-import-waypoints">Import Waypoints</button>
         </div>
       </div>
+      
+      <button type="button" class="mb-small-button"id="minibia-bot-profile-force-save"style="margin-top:6px;">💾 Force Save All Settings</button>
+      <button type="button" class="mb-small-button"id="minibia-bot-profile-delete-character"style="margin-top:6px;background:#5a2020;border-color:#883030;">🗑️ Delete Character Data</button>
       
     </div>
   </div>
@@ -18764,7 +18961,7 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
                 ghostToggle.checked = status.running;
             }
             if (ghostDelay && document.activeElement !== ghostDelay) {
-                ghostDelay.value = (status.config.replyDelayMs / 1000).toFixed(1);
+                ghostDelay.value = (status.config.replyDelayMs / 500).toFixed(1);
             }
             if (ghostStatus) {
                 if (status.ghostDetected) {
@@ -19878,6 +20075,22 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
         }
 
         // ---- Profile Manager ----
+        
+        const forceSaveBtn = panel.querySelector("#minibia-bot-profile-force-save");
+        if (forceSaveBtn) {
+            forceSaveBtn.addEventListener("click", () => {
+                const result = bot.saveAll?.();
+                if (profileStatus) {
+                    profileStatus.textContent = result
+                        ? `Saved ${result.saved} entries for "${result.character}".`
+                        : "saveAll() not available.";
+                }
+                if (result?.errors?.length) {
+                    bot.log("[ForceSave] errors:", result.errors);
+                }
+            });
+        }
+        
         const profileNameInput = panel.querySelector("#minibia-bot-profile-name");
         const profileSaveBtn = panel.querySelector("#minibia-bot-profile-save");
         const profileSelect = panel.querySelector("#minibia-bot-profile-select");
@@ -19912,39 +20125,40 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
             }
         }
 
-        function saveProfile() {
+        async function saveProfile() {
             const name = profileNameInput?.value?.trim();
             if (!name) {
-                if (profileStatus)
-                    profileStatus.textContent = "Please enter a profile name";
+                if (profileStatus) profileStatus.textContent = "Please enter a profile name";
                 return;
             }
-            const success = bot.profiles?.save(name);
+            if (profileStatus) profileStatus.textContent = "Saving…";
+            const success = await bot.profiles?.save(name);
             if (success) {
                 profileNameInput.value = "";
                 refreshProfileList();
-                if (profileStatus)
-                    profileStatus.textContent = `Profile "${name}" saved.`;
+                if (profileStatus) {
+                    const u = bot.profiles.usage();
+                    profileStatus.textContent = `Saved "${name}". Storage: ${bot.profiles.formatBytes(u.used)} used.`;
+                }
             } else {
-                if (profileStatus)
-                    profileStatus.textContent = `Failed to save "${name}".`;
+                if (profileStatus) {
+                    const u = bot.profiles.usage();
+                    profileStatus.textContent = `Failed to save "${name}". Storage full (${bot.profiles.formatBytes(u.used)} of ~${bot.profiles.formatBytes(u.quota)}).`;
+                }
             }
         }
 
-        function loadProfile() {
+        async function loadProfile() {
             const name = profileSelect?.value;
             if (!name) {
-                if (profileStatus)
-                    profileStatus.textContent = "Select a profile to load.";
+                if (profileStatus) profileStatus.textContent = "Select a profile to load.";
                 return;
             }
             if (!confirm(`Load profile "${name}"? This will restart the bot with the saved settings.`))
                 return;
-            const success = bot.profiles?.load(name);
-            if (!success && profileStatus) {
-                profileStatus.textContent = `Failed to load "${name}".`;
-            }
-            // reload will happen inside loadProfile
+            if (profileStatus) profileStatus.textContent = `Loading "${name}"…`;
+            const success = await bot.profiles?.load(name);
+            if (!success && profileStatus) profileStatus.textContent = `Failed to load "${name}".`;
         }
 
         function deleteProfile() {
@@ -20065,15 +20279,14 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
 
         // Export
         if (exportBtn) {
-            exportBtn.addEventListener("click", () => {
-                const name = profileSelect?.value;
-                if (!name) {
-                    if (profileStatus)
-                        profileStatus.textContent = "Select a profile to export.";
-                    return;
-                }
-                bot.profiles.export(name);
-            });
+          exportBtn.addEventListener("click", async () => {
+              const name = profileSelect?.value;
+              if (!name) {
+                  if (profileStatus) profileStatus.textContent = "Select a profile to export.";
+                  return;
+              }
+              await bot.profiles.export(name);
+          });
         }
 
         // Import
@@ -20099,6 +20312,77 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
                 }
                 importInput.value = ''; // Reset file input
             });
+        }
+        
+                // ★ NEW: Delete an entire character's stored data
+        async function deleteCharacterData() {
+            const current = window.__minibiaBotCurrentCharacter;
+
+            // Build a list of every character that currently has data
+            const names = new Set();
+            for (let i = 0; i < localStorage.length; i++) {
+                const k = localStorage.key(i);
+                if (!k || !k.startsWith("minibiaBot.char.")) continue;
+                const rest = k.slice("minibiaBot.char.".length);
+                const dot = rest.indexOf(".");
+                if (dot > 0) names.add(rest.slice(0, dot));
+            }
+            const list = Array.from(names).sort();
+            if (!list.length) {
+                alert("No character data found.");
+                return;
+            }
+
+            const answer = window.prompt(
+                "Delete ALL stored data for which character?\n" +
+                "(Case-sensitive, must match exactly.)\n\n" +
+                "Currently stored:\n  " + list.join("\n  ")
+            );
+            if (!answer) return;
+
+            const safe = String(answer).trim().replace(/[^A-Za-z0-9_.-]/g, "_");
+            if (current && safe === current) {
+                if (!confirm(
+                    `"${safe}" is the character you are currently playing.\n` +
+                    `Deleting now will wipe your live settings on the next reload.\n\n` +
+                    `Continue?`
+                )) return;
+            }
+
+            const prefix = `minibiaBot.char.${safe}.`;
+            const matches = [];
+            for (let i = 0; i < localStorage.length; i++) {
+                const k = localStorage.key(i);
+                if (k && k.startsWith(prefix)) matches.push(k);
+            }
+            if (!matches.length) {
+                alert(`No data found for "${answer}".`);
+                return;
+            }
+
+            const total = matches.reduce(
+                (sum, k) => sum + k.length + (localStorage.getItem(k) || "").length, 0);
+            const totalKb = (total / 1024).toFixed(1);
+
+            if (!confirm(`Delete ${matches.length} key(s) for "${safe}" (${totalKb} KB)?`))
+                return;
+
+            matches.forEach(k => localStorage.removeItem(k));
+            bot.log(`Deleted ${matches.length} key(s) for character "${safe}" (${totalKb} KB).`);
+
+            if (profileStatus)
+                profileStatus.textContent = `Deleted ${matches.length} key(s) for "${safe}".`;
+
+            if (current && safe === current) {
+                if (confirm(`Reload now to start "${safe}" fresh?`)) {
+                    window.minibiaBotReload?.();
+                }
+            }
+        }
+
+        const deleteCharBtn = panel.querySelector("#minibia-bot-profile-delete-character");
+        if (deleteCharBtn) {
+            deleteCharBtn.addEventListener("click", deleteCharacterData);
         }
 
         const clientChaseToggle = panel.querySelector("#minibia-bot-auto-attack-client-chase");
@@ -21009,6 +21293,45 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
                 } else {
                     bot.log("Rename failed. Check for duplicate names.");
                 }
+            });
+        }
+        
+        // ---- Export selected preset ----
+        const exportPresetBtn = panel.querySelector("#minibia-bot-cave-preset-export");
+        if (exportPresetBtn) {
+            exportPresetBtn.addEventListener("click", () => {
+                const select = document.getElementById("minibia-bot-cave-preset-select");
+                const name = select?.value;
+                if (!name) {
+                    bot.log("No preset selected to export.");
+                    return;
+                }
+
+                const preset = bot.cave.exportPreset(name);
+                if (!preset) {
+                    bot.log(`Preset "${name}" could not be exported (not found).`);
+                    return;
+                }
+
+                const payload = { "minibiaBot.cave.presets": [preset] };
+                const json = JSON.stringify(payload, null, 2);
+
+                const safeName = preset.name.replace(/[^A-Za-z0-9_.-]/g, "_");
+                const blob = new Blob([json], { type: "application/json" });
+                const url  = URL.createObjectURL(blob);
+                const a    = document.createElement("a");
+                a.href     = url;
+                a.download = `${safeName}.preset.json`;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                setTimeout(() => URL.revokeObjectURL(url), 1000);
+
+                bot.log(
+                    `Exported preset "${preset.name}" ` +
+                    `(${preset.route.length} waypoint${preset.route.length === 1 ? "" : "s"}, ` +
+                    `${preset.transitions.length} transition${preset.transitions.length === 1 ? "" : "s"})`
+                );
             });
         }
 
@@ -23065,7 +23388,7 @@ window.__minibiaBotBundle.installTormentedGhostModule = function installTormente
 
     const config = Object.assign({
         enabled: false,
-        replyDelayMs: 1000,
+        replyDelayMs: 500,
         triggerAlarm: true,
         cooldownMs: 30000,
         debug: false, // NEW: log every creature saying
@@ -23172,7 +23495,7 @@ window.__minibiaBotBundle.installTormentedGhostModule = function installTormente
             const self = this;
             state.replyTimer = setTimeout(() => {
                 if (state.running) {
-                    const sent = bot.sendChat("hi");
+                    const sent = bot.sendChat("lol");
                     if (sent)
                         bot.log(`[Ghost] Replied "hi" to ${self.name}.`);
                 }
@@ -23749,32 +24072,132 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
 (() => {
     const bundle = window.__minibiaBotBundle || window.__minibiaBotReloadBundle || {};
     const persistedEnabledModules = [
-        ["rune", "minibiaBot.rune.config"],
-        ["heal", "minibiaBot.heal.config"],
-        ["invisible", "minibiaBot.invisible.config"],
-        ["magicShield", "minibiaBot.magicShield.config"],
-        ["attack", "minibiaBot.attack.config"],
-        ["cave", "minibiaBot.cave.config"],
-        ["equipRing", "minibiaBot.equipRing.config"],
-        ["eat", "minibiaBot.eat.config"],
-        ["talk", "minibiaBot.talk.config"],
+        ["rune",          "minibiaBot.rune.config"],
+        ["heal",          "minibiaBot.heal.config"],
+        ["invisible",     "minibiaBot.invisible.config"],
+        ["magicShield",   "minibiaBot.magicShield.config"],
+        ["attack",        "minibiaBot.attack.config"],
+        ["cave",          "minibiaBot.cave.config"],
+        ["equipRing",     "minibiaBot.equipRing.config"],
+        ["eat",           "minibiaBot.eat.config"],
+        ["talk",          "minibiaBot.talk.config"],
     ];
 
+    // ============================================================
+    // CHARACTER-SCOPED STORAGE
+    // ============================================================
+    const BASE_PREFIX = "minibiaBot.";
+    const CHAR_PREFIX = "minibiaBot.char.";
+
+    // Keys that must remain global (shared by every character)
+    // Keys (and key prefixes) that stay global — shared across every character.
+    const GLOBAL_KEYS = new Set([
+        "minibiaBot.profiles",       // legacy single-blob key (kept for migration)
+        "minibiaBot.profileIndex",   // new index of profile names
+    ]);
+
+    const GLOBAL_KEY_PREFIXES = [
+        "minibiaBot.profiles.",      // one key per profile: minibiaBot.profiles.<name>
+    ];
+
+    function scopedKey(key) {
+        if (typeof key !== "string")       return key;
+        if (!key.startsWith(BASE_PREFIX))  return key;
+        if (key.startsWith(CHAR_PREFIX))   return key; // already scoped
+        if (GLOBAL_KEYS.has(key))          return key;
+        for (const p of GLOBAL_KEY_PREFIXES) {
+            if (key.startsWith(p))         return key;
+        }
+        const current = window.__minibiaBotCurrentCharacter;
+        if (!current)                      return key;
+        return `${CHAR_PREFIX}${safeName(current)}.${key.slice(BASE_PREFIX.length)}`;
+    }
+
+    function readCharacterName() {
+        try {
+            const stateName = window.gameClient?.player?.state?.name;
+            if (stateName && String(stateName).trim()) return String(stateName).trim();
+            const playerName = window.gameClient?.player?.name;
+            if (playerName && String(playerName).trim()) return String(playerName).trim();
+        } catch (e) { /* ignore */ }
+        return null;
+    }
+
+    function safeName(name) {
+        return String(name).replace(/[^A-Za-z0-9_.-]/g, "_");
+    }
+
+    function scopedKey(key) {
+        if (typeof key !== "string")          return key;
+        if (!key.startsWith(BASE_PREFIX))     return key;
+        if (GLOBAL_KEYS.has(key))             return key;
+        if (key.startsWith(CHAR_PREFIX))      return key; // already scoped
+        const current = window.__minibiaBotCurrentCharacter;
+        if (!current)                         return key; // fall back to global
+        return `${CHAR_PREFIX}${safeName(current)}.${key.slice(BASE_PREFIX.length)}`;
+    }
+
+    function installCharacterStorage(characterName) {
+        // ★ Never overwrite the current character with null/empty — the
+        //   detector needs a stable value to compare against.
+        if (characterName) {
+            window.__minibiaBotCurrentCharacter = characterName;
+        }
+
+        if (window.__minibiaBotStoragePatched) return;
+
+        const origGet    = Storage.prototype.getItem;
+        const origSet    = Storage.prototype.setItem;
+        const origRemove = Storage.prototype.removeItem;
+
+        Storage.prototype.getItem = function (key) {
+            if (this === window.localStorage) key = scopedKey(key);
+            return origGet.call(this, key);
+        };
+        Storage.prototype.setItem = function (key, value) {
+            if (this === window.localStorage) key = scopedKey(key);
+            return origSet.call(this, key, value);
+        };
+        Storage.prototype.removeItem = function (key) {
+            if (this === window.localStorage) key = scopedKey(key);
+            return origRemove.call(this, key);
+        };
+
+        window.__minibiaBotStoragePatched = true;
+        console.log("[minibia-bot] Character-scoped storage installed for:", characterName || "(global)");
+    }
+    
+    // One-time cleanup of legacy mBot.* keys from earlier bot versions.
+    (function purgeLegacyMBotKeys() {
+        try {
+            const toRemove = [];
+            for (let i = 0; i < localStorage.length; i++) {
+                const k = localStorage.key(i);
+                if (k && k.startsWith("mBot.")) toRemove.push(k);
+            }
+            for (const k of toRemove) localStorage.removeItem(k);
+            if (toRemove.length) {
+                console.log(`[minibia-bot] Removed ${toRemove.length} legacy mBot.* key(s).`);
+            }
+        } catch (e) { /* ignore */ }
+    })();
+
+    // ============================================================
+    // ENABLED-STATE SNAPSHOT HELPERS
+    // ============================================================
     function getPersistedEnabledSnapshot(bot) {
         const snapshot = {};
         const status = typeof bot?.status === "function" ? bot.status() : null;
         persistedEnabledModules.forEach(([name]) => {
             const enabled = status?.[name]?.config?.enabled;
-            if (typeof enabled === "boolean")
-                snapshot[name] = enabled;
+            if (typeof enabled === "boolean") snapshot[name] = enabled;
         });
         return snapshot;
     }
 
     function restorePersistedEnabledSnapshot(snapshot) {
         persistedEnabledModules.forEach(([name, storageKey]) => {
-            if (typeof snapshot?.[name] !== "boolean")
-                return;
+            if (typeof snapshot?.[name] !== "boolean") return;
             try {
                 const raw = window.localStorage.getItem(storageKey);
                 const config = raw ? JSON.parse(raw) : {};
@@ -23782,18 +24205,41 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
                 window.localStorage.setItem(storageKey, JSON.stringify(config));
             } catch (e) {
                 console.error("[minibia-bot] failed to restore persisted enabled state", {
-                    module: name,
-                    error: e
+                    module: name, error: e,
                 });
             }
         });
     }
 
-    function boot(currentBundle = bundle) {
-        const prevSnapshot = getPersistedEnabledSnapshot(window.minibiaBot);
-        if (window.minibiaBot?.destroy)
+    // ============================================================
+    // BOOT
+    // ============================================================
+    function boot(currentBundle, characterName) {
+        // Detect a character switch BEFORE we touch the namespace.
+        const prevName = window.__minibiaBotCurrentCharacter;
+        const nameChanged = !!(prevName && characterName && prevName !== characterName);
+
+        // ★ Install the namespacer BEFORE createBot() so every module
+        //   reads/writes into the right character's storage slot.
+        installCharacterStorage(characterName);
+
+        // ★ Skip the enabled-restore in two cases:
+        //    1. A profile was just loaded (explicit override).
+        //    2. The character name changed (new character = fresh state).
+        const skipRestore = !!window.__minibiaBotSkipEnabledRestore || nameChanged;
+        window.__minibiaBotSkipEnabledRestore = false;
+
+        const prevSnapshot = skipRestore ? {} : getPersistedEnabledSnapshot(window.minibiaBot);
+        if (window.minibiaBot?.destroy) {
             window.minibiaBot.destroy();
-        restorePersistedEnabledSnapshot(prevSnapshot);
+        }
+        if (!skipRestore) {
+            restorePersistedEnabledSnapshot(prevSnapshot);
+        }
+
+        if (nameChanged) {
+            console.log(`[minibia-bot] Character changed "${prevName}" -> "${characterName}": starting fresh.`);
+        }
 
         const bot = currentBundle.createBot();
         currentBundle.installPzModule(bot);
@@ -23842,14 +24288,12 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
 
         bot.ui.inject();
 
-        bot.start = (...args) => bot.rune.start(...args);
-        bot.stop = (...args) => bot.rune.stop(...args);
+        bot.start  = (...args) => bot.rune.start(...args);
+        bot.stop   = (...args) => bot.rune.stop(...args);
         bot.reload = () => window.minibiaBotReload?.();
         bot.status = () => ({
             version: bot.version,
-            pz: {
-                home: bot.pz.getHomePz()
-            },
+            pz: { home: bot.pz.getHomePz() },
             xray: bot.xray.status(),
             panic: bot.panic.status(),
             rune: bot.rune.status(),
@@ -23864,6 +24308,87 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         });
 
         window.minibiaBot = bot;
+        
+        // ============================================================
+        // FORCE-SAVE: flush every module's in-memory config to localStorage
+        // ============================================================
+        bot.saveAll = function () {
+            // [moduleName on bot, storage key] — mirrors the keys used across modules
+            const modules = [
+                ["rune",                "minibiaBot.rune.config"],
+                ["heal",                "minibiaBot.heal.config"],
+                ["invisible",           "minibiaBot.invisible.config"],
+                ["magicShield",         "minibiaBot.magicShield.config"],
+                ["attack",              "minibiaBot.attack.config"],
+                ["equipRing",           "minibiaBot.equipRing.config"],
+                ["eat",                 "minibiaBot.eat.config"],
+                ["talk",                "minibiaBot.talk.config"],
+                ["panic",               "minibiaBot.panic.config"],
+                ["xray",                "minibiaBot.xray.config"],
+                ["autoStacker",         "minibiaBot.autostacker.config"],
+                ["exori",               "minibiaBot.exori.config"],
+                ["paladin",             "minibiaBot.paladin.config"],
+                ["looter",              "minibiaBot.looter.config"],
+                ["support",             "minibiaBot.support.config"],
+                ["comboBot",            "minibiaBot.combo.config"],
+                ["autoPickup",          "minibiaBot.autoPickup.config"],
+                ["antiAfk",             "minibiaBot.antiafk.config"],
+                ["fisher",              "minibiaBot.fisher.config"],
+                ["slimeTrainer",        "minibiaBot.slimeTrainer.config"],
+                ["blacklist",           "minibiaBot.blacklist.config"],
+                ["lightHack",           "minibiaBot.lightHack.config"],
+                ["lightHackLegit",      "minibiaBot.lightHackLegit.config"],
+                ["pinkSkull",           "minibiaBot.pinkSkull.config"],
+                ["outfitRandomizer",    "minibiaBot.outfitRandomizer.config"],
+                ["playerAttackMonitor", "minibiaBot.playerAttack.config"],
+                ["messageAlert",        "minibiaBot.messageAlert.config"],
+                ["antiBotMonitor",      "minibiaBot.antibot.config"],
+                ["gmChatMonitor",       "minibiaBot.gmChatMonitor.config"],
+                ["tormentedGhost",      "minibiaBot.tormentedGhost.config"],
+                ["keyringToggle",       "minibiaBot.keyringToggle.config"],
+                ["outfitToggle",        "minibiaBot.outfitToggle.config"],
+                ["itemIdDisplay",       "minibiaBot.itemIdDisplay.config"],
+            ];
+
+            let saved = 0;
+            const errors = [];
+
+            for (const [name, key] of modules) {
+                const mod = bot[name];
+                if (!mod || !mod.config) continue;
+                try {
+                    // Write the live config object directly — no side effects,
+                    // no module restart, no onEnabled toggles.
+                    bot.storage.set(key, JSON.parse(JSON.stringify(mod.config)));
+                    saved++;
+                } catch (e) {
+                    errors.push(`${name}: ${e.message}`);
+                }
+            }
+
+            // Cave is special: route, transitions and presets
+            try {
+                bot.storage.set("minibiaBot.cave.route",       bot.cave.getRoute());
+                bot.storage.set("minibiaBot.cave.transitions", bot.cave.getTransitions());
+                // Persist presets by re-upserting the active one (no activate flip)
+                bot.cave.savePreset(bot.cave.getActivePresetName(), { activate: false });
+                saved += 3;
+            } catch (e) {
+                errors.push(`cave: ${e.message}`);
+            }
+
+            // PZ home is written directly by setHomePzCurrentSpot();
+            // nothing to flush here unless you changed it programmatically.
+
+            const character = window.__minibiaBotCurrentCharacter || "(global)";
+            bot.log(`[saveAll] Flushed ${saved} entries to localStorage for "${character}"`);
+            if (errors.length) console.warn("[saveAll] Errors:", errors);
+
+            return { saved, errors, character };
+        };
+
+        // Handy shortcut in the console
+        window.save = () => bot.saveAll();
 
         // ---- EXTERNAL COMBAT COOLDOWN MONITOR ----
         bot._combatCooldownUntil = 0;
@@ -23871,16 +24396,17 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         bot._combatMonitorInterval = null;
 
         function startCombatMonitor() {
-            if (bot._combatMonitorInterval)
-                return;
+            if (bot._combatMonitorInterval) return;
             bot._combatMonitorInterval = setInterval(() => {
                 const now = Date.now();
                 const hasTarget = !!(window.gameClient?.player?.__target ||
                     window.gameClient?.player?.getTarget?.() ||
                     bot.attack?.getCurrentTarget?.());
                 const attackStatus = bot.attack?.status?.() || null;
-                const combatActive = !!(attackStatus?.combatActive && Number(attackStatus?.combatDurationMs || 0) < 60000);
-                const inCombat = combatActive || hasTarget || (bot.attack?.config?.kiteMode && !!attackStatus?.engagedTargetId);
+                const combatActive = !!(attackStatus?.combatActive &&
+                    Number(attackStatus?.combatDurationMs || 0) < 60000);
+                const inCombat = combatActive || hasTarget ||
+                    (bot.attack?.config?.kiteMode && !!attackStatus?.engagedTargetId);
 
                 if (inCombat) {
                     bot._wasInCombat = true;
@@ -23891,65 +24417,144 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
                 }
             }, 200);
         }
-
         function stopCombatMonitor() {
             if (bot._combatMonitorInterval) {
                 clearInterval(bot._combatMonitorInterval);
                 bot._combatMonitorInterval = null;
             }
         }
-
         startCombatMonitor();
         bot.addCleanup(stopCombatMonitor);
 
-        // ---- PATCH CAVEBOT TICK TO CHECK COOLDOWN ----
+        // ---- CAVEBOT TICK PATCH ----
         const origCaveTick = bot.cave?.tick;
         if (origCaveTick) {
             bot.cave.tick = function () {
-                // If cooldown is active, wait
                 if (this._running && bot._combatCooldownUntil > Date.now()) {
                     if (this._running) {
                         this._timerId = setTimeout(() => this.tick(), this._config.tickMs);
                     }
                     return;
                 }
-                // Otherwise, run original tick
                 return origCaveTick.call(this);
             };
         }
 
-        // Unlock audio on first user interaction
         const unlock = () => {
-            if (window.minibiaBot) {
-                window.minibiaBot.unlockAudio();
-            }
+            if (window.minibiaBot) window.minibiaBot.unlockAudio();
             document.removeEventListener("click", unlock);
             document.removeEventListener("touchstart", unlock);
         };
-        document.addEventListener("click", unlock, {
-            once: true
-        });
-        document.addEventListener("touchstart", unlock, {
-            once: true
-        });
+        document.addEventListener("click", unlock, { once: true });
+        document.addEventListener("touchstart", unlock, { once: true });
 
         window.pzBot = bot.pz;
         console.log("[minibia-bot] ready", {
             version: bot.version,
-            modules: ["pz", "xray", "panic", "rune", "heal", "invisible", "magicShield", "attack", "cave", "equipRing", "eat", "talk", "ui"]
+            character: characterName || "(global)",
+            modules: ["pz","xray","panic","rune","heal","invisible","magicShield",
+                      "attack","cave","equipRing","eat","talk","ui"]
         });
         console.log("minibiaBot.reload()");
         return bot;
     }
 
+    // ============================================================
+    // FIRST-LOAD WAIT (only used on initial page load)
+    // ============================================================
+    function bootWhenReady(currentBundle) {
+        const name = readCharacterName();
+        if (name) {
+            boot(currentBundle, name);
+            return;
+        }
+        let ticks = 0;
+        const maxTicks = 120; // 60 s at 500 ms
+        const timer = setInterval(() => {
+            const detected = readCharacterName();
+            if (detected) {
+                clearInterval(timer);
+                boot(currentBundle, detected);
+                return;
+            }
+            if (++ticks >= maxTicks) {
+                clearInterval(timer);
+                console.warn("[minibia-bot] Character name not detected; using shared (global) storage.");
+                boot(currentBundle, null);
+            }
+        }, 500);
+    }
+
+    // ============================================================
+    // RELOAD — always re-read the character name fresh
+    // ============================================================
     window.minibiaBotReload = () => {
+        const name = readCharacterName();
+        if (!name) {
+            // Fall back to the initial wait loop if the game hasn't
+            // finished loading the character yet.
+            bootWhenReady(bundle);
+            return;
+        }
         try {
-            boot(window.__minibiaBotReloadBundle || bundle);
+            boot(bundle, name);
         } catch (e) {
             console.error("[minibia-bot] reload failed", e);
             location.reload();
         }
     };
+
     delete window.__minibiaBotBundle;
-    boot(bundle);
+    bootWhenReady(bundle);
+
+    // ============================================================
+    // CHARACTER-CHANGE DETECTOR
+    //   Requires the new name to be seen twice in a row, so we don't
+    //   fire during transient loading states.
+    // ============================================================
+    let lastSeenName = null;
+    let stableCount = 0;
+    let reloadInProgress = false;
+
+    setInterval(() => {
+        if (reloadInProgress) return;
+
+        const name = readCharacterName();
+        if (!name) {
+            lastSeenName = null;
+            stableCount = 0;
+            return;
+        }
+
+        if (name === lastSeenName) {
+            stableCount++;
+        } else {
+            lastSeenName = name;
+            stableCount = 1;
+        }
+
+        if (stableCount < 2) return;
+
+        const current = window.__minibiaBotCurrentCharacter;
+
+        // Case A: we booted without a name (global mode), but the game
+        //         eventually handed us one. Reboot into scoped storage.
+        if (!current) {
+            console.log(`[minibia-bot] Character detected late: "${name}". Rebooting with scoped storage.`);
+            reloadInProgress = true;
+            try { window.minibiaBotReload(); }
+            finally { reloadInProgress = false; }
+            stableCount = 0;
+            return;
+        }
+
+        // Case B: character actually changed mid-session.
+        if (name !== current) {
+            console.log(`[minibia-bot] Character changed: "${current}" -> "${name}". Reloading bot.`);
+            reloadInProgress = true;
+            try { window.minibiaBotReload(); }
+            finally { reloadInProgress = false; }
+            stableCount = 0;
+        }
+    }, 1500);
 })();
