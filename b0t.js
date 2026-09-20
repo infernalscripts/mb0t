@@ -19461,6 +19461,12 @@ function upgradeSectionHeaders(panel) {
       <div class="mb-small-note">Removes floating bubbles above your character when casting spells or eating food.</div>
 
       <label class="mb-toggle" style="margin-top:8px;">
+        <input type="checkbox" id="minibia-bot-ui-hide-loot-messages" />
+        <span>Hide Loot Messages</span>
+      </label>
+      <div class="mb-small-note">Blocks "Loot of …" notifications from the centre of the screen. Loot still goes to the server log.</div>
+
+      <label class="mb-toggle" style="margin-top:8px;">
         <input type="checkbox" id="minibia-bot-ui-ttl-enabled" />
         <span>Show Time‑To‑Level (TTL) in Performance Overlay</span>
       </label>
@@ -22775,7 +22781,8 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
         nameSpooferEnabled: false,
         spoofedName: "",
         hideFloatingPopups: false,
-        ttlEnabled: false, // NEW
+        ttlEnabled: false,
+        hideLootMessages: false,
     }, bot.storage.get(configStorageKey, {}));
 
     function persistConfig() {
@@ -22862,6 +22869,74 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
         } catch (e) {
             return "?";
         }
+    }
+
+    // ---- Loot message filter ----
+    const lootFilterState = {
+        installed: false,
+        nm: null,
+        originalSetServerMessage: null,
+        retryTimer: null,
+    };
+
+    const LOOT_PREFIX = "Loot of ";
+
+    function installLootFilter() {
+        if (lootFilterState.installed) return;
+
+        const nm = window.gameClient?.interface?.notificationManager;
+        if (!nm || typeof nm.setServerMessage !== "function") {
+            // Notification manager not ready yet — retry until it is, or until
+            // the user turns the option off.
+            if (!lootFilterState.retryTimer) {
+                lootFilterState.retryTimer = window.setInterval(() => {
+                    if (lootFilterState.installed || !config.hideLootMessages) {
+                        window.clearInterval(lootFilterState.retryTimer);
+                        lootFilterState.retryTimer = null;
+                        return;
+                    }
+                    installLootFilter();
+                }, 500);
+            }
+            return;
+        }
+
+        lootFilterState.nm = nm;
+        lootFilterState.originalSetServerMessage = nm.setServerMessage.bind(nm);
+
+        nm.setServerMessage = function (message, color, priority) {
+            if (config.hideLootMessages &&
+                typeof message === "string" &&
+                message.startsWith(LOOT_PREFIX)) {
+                return false; // drop it
+            }
+            return lootFilterState.originalSetServerMessage(message, color, priority);
+        };
+
+        lootFilterState.installed = true;
+        bot.log("[UI Tweaks] Loot message filter installed.");
+    }
+
+    function uninstallLootFilter() {
+        if (lootFilterState.retryTimer) {
+            window.clearInterval(lootFilterState.retryTimer);
+            lootFilterState.retryTimer = null;
+        }
+        if (!lootFilterState.installed ||
+            !lootFilterState.nm ||
+            !lootFilterState.originalSetServerMessage) {
+            return;
+        }
+        lootFilterState.nm.setServerMessage = lootFilterState.originalSetServerMessage;
+        lootFilterState.installed = false;
+        lootFilterState.nm = null;
+        lootFilterState.originalSetServerMessage = null;
+        bot.log("[UI Tweaks] Loot message filter removed.");
+    }
+
+    function applyLootFilter() {
+        if (config.hideLootMessages) installLootFilter();
+        else uninstallLootFilter();
     }
 
     function findBuildLine(container) {
@@ -23245,6 +23320,7 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
         applyNameSpoof();
         applyFloatingTextPatch();
         applyTTL();
+        applyLootFilter();
     }
 
     function applyAll() {
@@ -23265,6 +23341,7 @@ function bindControls(panel) {
     const applySpooferBtn = panel.querySelector("#minibia-bot-ui-apply-spoofer");
     const hidePopupsCheck = panel.querySelector("#minibia-bot-ui-hide-popups");
     const ttlCheck       = panel.querySelector("#minibia-bot-ui-ttl-enabled");
+    const hideLootCheck  = panel.querySelector("#minibia-bot-ui-hide-loot-messages");
 
     function refreshUI() {
         if (wideCheck)      wideCheck.checked      = config.wideColumns;
@@ -23325,6 +23402,13 @@ function bindControls(panel) {
             applyTTL();
         });
     }
+    if (hideLootCheck) {
+        hideLootCheck.addEventListener("change", function () {
+            config.hideLootMessages = this.checked;
+            persistConfig();
+            applyLootFilter();
+        });
+    }
 
     // ---- Item ID display toggle ----
     const itemIdCb = panel.querySelector("#minibia-bot-ui-show-item-ids");
@@ -23351,6 +23435,24 @@ function bindControls(panel) {
         }, 500);
         bot.addCleanup(() => window.clearInterval(sync));
     }
+    
+    // ---- Auto-bind when the panel is available ----
+    function tryAutoBind() {
+        const panel = document.getElementById("minibia-bot-panel");
+        if (!panel)
+            return false;
+        if (bot.uiTweaks?.bindControls)
+            bot.uiTweaks.bindControls(panel);
+        return true;
+    }
+
+    if (!tryAutoBind()) {
+        const bindTimer = window.setInterval(() => {
+            if (tryAutoBind())
+                window.clearInterval(bindTimer);
+        }, 500);
+        bot.addCleanup(() => window.clearInterval(bindTimer));
+    }
 
     refreshUI();
     applyAll();
@@ -23359,6 +23461,7 @@ function bindControls(panel) {
     // ---- Cleanup on bot destroy ----
     bot.addCleanup(() => {
         uninstallTTL();
+        applyLootFilter();
         // Restore other patches if needed (handled individually)
     });
 
@@ -23373,6 +23476,7 @@ function bindControls(panel) {
         applyFloatingTextPatch,
         applyTTL,
         uninstallTTL,
+        bindControls, 
     };
 };
 
@@ -24879,8 +24983,8 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
     const configStorageKey = "minibiaBot.itemIdDisplay.config";
     const state = {
         running: false,
+        debuggerInstance: null,
         originalIsDevMode: null,
-        debuggerProto: null,
     };
 
     const config = Object.assign({
@@ -24893,97 +24997,109 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         });
     }
 
-    function installHook() {
-        if (state.originalIsDevMode)
-            return;
+    function findDebugger() {
         const dbg = gameClient?.renderer?.debugger;
-        if (!dbg || typeof dbg.isDevMode !== "function") {
+        if (!dbg || typeof dbg.isDevMode !== "function") return null;
+        return dbg;
+    }
+
+    function installHook() {
+        if (state.originalIsDevMode) return true;
+        const dbg = findDebugger();
+        if (!dbg) {
+            // Debugger instance not ready yet — retry
             setTimeout(installHook, 500);
-            return;
+            return false;
         }
-        const proto = Object.getPrototypeOf(dbg);
-        if (!proto || typeof proto.isDevMode !== "function")
-            return;
 
-        state.debuggerProto = proto;
-        state.originalIsDevMode = proto.isDevMode;
+        // Save the original — bind so we can call it later without `this` trouble
+        state.debuggerInstance = dbg;
+        state.originalIsDevMode = dbg.isDevMode.bind(dbg);
 
-        proto.isDevMode = function () {
-            if (state.running && config.enabled)
-                return true;
-            return state.originalIsDevMode.call(this);
+        // Patch the INSTANCE (not the prototype). Most Tibia builds set
+        // isDevMode as an own property, so a prototype patch is a no-op.
+        dbg.isDevMode = function () {
+            if (state.running && config.enabled) return true;
+            return state.originalIsDevMode();
         };
-        bot.log("[ItemID] isDevMode patched.");
+
+        bot.log("[ItemID] isDevMode patched on debugger instance.");
+        return true;
     }
 
     function uninstallHook() {
-        if (!state.originalIsDevMode || !state.debuggerProto)
-            return;
-        state.debuggerProto.isDevMode = state.originalIsDevMode;
+        if (!state.debuggerInstance || !state.originalIsDevMode) return;
+        state.debuggerInstance.isDevMode = state.originalIsDevMode;
+        state.debuggerInstance = null;
         state.originalIsDevMode = null;
-        state.debuggerProto = null;
         bot.log("[ItemID] isDevMode restored.");
     }
 
+    function forceRedraw() {
+        try {
+            const gc = gameClient;
+            if (gc?.renderer?.render) gc.renderer.render();
+            // Force the look window (if open) to re-render
+            const look = gc?.interface?.windowManager?.getWindow?.("look-window");
+            if (look?.render) look.render();
+        } catch (e) { /* ignore */ }
+    }
+
     function start() {
-        if (state.running)
-            return false;
         config.enabled = true;
         persistConfig();
         state.running = true;
         installHook();
+        forceRedraw();
         return true;
     }
 
     function stop() {
-        if (!state.running)
-            return false;
         config.enabled = false;
         persistConfig();
         state.running = false;
         uninstallHook();
+        forceRedraw();
         return true;
     }
 
     function status() {
         return {
             running: state.running,
-            config: {
-                ...config
-            },
+            config: { ...config },
             patched: !!state.originalIsDevMode,
         };
     }
 
     function updateConfig(next = {}) {
         if (next.enabled !== undefined) {
-            if (next.enabled)
-                start();
-            else
-                stop();
+            if (next.enabled) start();
+            else stop();
         }
-        return {
-            ...config
-        };
+        return { ...config };
     }
 
-    // Proper cleanup on bot reload — this is the key fix
+    // Restore on bot destroy
     bot.addCleanup(() => {
         state.running = false;
         uninstallHook();
     });
 
-    if (config.enabled)
-        setTimeout(() => start(), 500);
+    // Auto-start if the user had it enabled before reload
+    if (config.enabled) {
+        state.running = true;
+        setTimeout(() => installHook(), 500);
+    }
 
     bot.itemIdDisplay = {
         start,
         stop,
         status,
         updateConfig,
-        config
+        config,
     };
 };
+
 
 /**
  * ==================================================================================
@@ -25205,9 +25321,9 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         currentBundle.installComboBotModule(bot);
         currentBundle.installExoriModule(bot);
         currentBundle.installSupportModule(bot);
+        currentBundle.installUiTweaksModule(bot);
 
         currentBundle.installPanel(bot);
-        currentBundle.installUiTweaksModule(bot);
         currentBundle.installCustomNotificationModule(bot);
         currentBundle.installOutfitToggleModule(bot);
         currentBundle.installShovelHotkeyModule(bot);
