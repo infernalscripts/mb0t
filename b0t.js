@@ -21,7 +21,7 @@ window.__minibiaBotBundle = window.__minibiaBotBundle || {};
  * 1. CORE BOT FACTORY (createBot)
  *    Creates the base bot object with utility methods, storage, chat, reconnect,
  *    alarm audio, and cleanup. It also starts a watcher to auto‑reconnect and a
- *    counter reset for the in‑game input metrics (`__imB`).
+ *    normal game movement/input safety and metrics are left untouched.
  * ==================================================================================
  */
 window.__minibiaBotBundle.createBot = function createBot() {
@@ -304,178 +304,38 @@ window.__minibiaBotBundle.createBot = function createBot() {
         startReconnectWatcher();
     }
 
-    // ---- __imB COUNTER RESET (prevents input spam detection) ----
-    let __imbResetInterval = null;
-    function startImbReset(intervalMs = 5000) {
-        if (__imbResetInterval)
-            return;
-        __imbResetInterval = setInterval(() => {
-            if (typeof __imB !== 'undefined')
-                __imB = 0;
-            if (typeof __provTicks !== 'undefined')
-                __provTicks = 0;
-        }, intervalMs);
-    }
-    function stopImbReset() {
-        if (__imbResetInterval) {
-            clearInterval(__imbResetInterval);
-            __imbResetInterval = null;
-        }
-    }
-    startImbReset(1000);
-
-    // ---- PATCH gameClient.send to manipulate __imA/__imB AND drop RenderBeat ----
-    let originalSend = null;
-    if (window.gameClient && typeof window.gameClient.send === 'function') {
-        originalSend = window.gameClient.send;
-        window.gameClient.send = function (packet) {
-            // ---- Drop RenderBeat ----
-            let isRenderBeat = false;
-            try {
-                const buf = packet.getBuffer ? packet.getBuffer() : null;
-                if (buf && buf.length > 0) {
-                    const opcode = buf[0];
-                    const RENDER_BEAT_OPCODE = (typeof CONST !== 'undefined' && CONST.PROTOCOL && CONST.PROTOCOL.CLIENT && CONST.PROTOCOL.CLIENT.RENDER_BEAT)
-                     ? CONST.PROTOCOL.CLIENT.RENDER_BEAT
-                     : 0x64;
-                    if (opcode === RENDER_BEAT_OPCODE)
-                        isRenderBeat = true;
-                }
-            } catch (e) {}
-            if (isRenderBeat)
-                return; // silently drop
-
-            // ---- Original logic ----
-            originalSend.call(this, packet);
-
-            // ---- Extract opcode safely ----
-            let opcode = -1;
-            if (packet && typeof packet.getBuffer === 'function') {
-                const buf = packet.getBuffer();
-                if (buf && buf.length > 0)
-                    opcode = buf[0];
-            } else if (packet && packet.opcode !== undefined) {
-                opcode = packet.opcode;
-            } else if (packet && packet.length > 0) {
-                opcode = packet[0];
-            }
-
-            // ---- Classify direct-intent opcodes ----
-            // Use window.CONST if available, otherwise fallback to numeric values
-            const CLIENT = (typeof CONST !== 'undefined' && CONST.PROTOCOL?.CLIENT)
-             ? CONST.PROTOCOL.CLIENT
-             : {
-                TARGET: 0x01,
-                CAST_SPELL: 0x02,
-                THING_USE_WITH: 0x03,
-                THING_USE_ON_CREATURE: 0x04,
-                CHANNEL_MESSAGE: 0x05
-            };
-
-            const classified = [
-                CLIENT.TARGET,
-                CLIENT.CAST_SPELL,
-                CLIENT.THING_USE_WITH,
-                CLIENT.THING_USE_ON_CREATURE,
-                CLIENT.CHANNEL_MESSAGE
-            ];
-
-            if (classified.includes(opcode)) {
-                if (typeof __imA !== 'undefined')
-                    __imA++;
-                if (typeof __imB !== 'undefined')
-                    __imB = 0;
-            }
-        };
-
-        // Add cleanup to restore original send when bot is destroyed
-        addCleanup(() => {
-            if (window.gameClient && originalSend) {
-                window.gameClient.send = originalSend;
-            }
-        });
-    } else {
-        console.warn('[minibia-bot] gameClient.send not available – counter patch skipped');
-    }
-
-    // ---- DEADMAN SWITCH BYPASS ----
-    function applyDeadmanBypass() {
-        try {
-            if (typeof Keyboard !== 'undefined' && Keyboard.prototype) {
-                Keyboard.prototype.MOVEMENT_RECOVERY_ENABLED = false;
-                Keyboard.prototype.MOVEMENT_DEADMAN_SILENCE_MS = 99999999;
-                Keyboard.prototype.MOVEMENT_DEADMAN_ARM_MS = 99999999;
-                console.log('[minibia-bot] Deadman switch disabled via prototype');
-            }
-            // Also apply to the current instance if it exists
-            const kb = window.gameClient?.keyboard;
-            if (kb) {
-                kb.MOVEMENT_RECOVERY_ENABLED = false;
-                kb.MOVEMENT_DEADMAN_SILENCE_MS = 99999999;
-                kb.MOVEMENT_DEADMAN_ARM_MS = 99999999;
-                kb.__checkMovementDeadman = function () {};
-                console.log('[minibia-bot] Deadman switch disabled on instance');
-            }
-        } catch (e) {
-            // Ignore
-        }
-    }
-    applyDeadmanBypass();
-
-    // Periodically refresh keyboard timestamps (defense in depth)
-    let deadmanRefreshInterval = null;
-    function startDeadmanRefresh(intervalMs = 500) {
-        if (deadmanRefreshInterval)
-            return;
-        deadmanRefreshInterval = setInterval(() => {
-            try {
-                const kb = window.gameClient?.keyboard;
-                if (kb) {
-                    const now = performance.now();
-                    kb.__lastInputAt = now;
-                    kb.__lastFreshPressAt = now;
-                }
-            } catch (e) { /* ignore */
-            }
-        }, intervalMs);
-    }
-    startDeadmanRefresh(500);
-
-    // Clean up the interval when the bot is destroyed
-    addCleanup(() => {
-        if (deadmanRefreshInterval) {
-            clearInterval(deadmanRefreshInterval);
-            deadmanRefreshInterval = null;
-        }
-    });
-
     // ---- ITEM FINDER ----
-    function findItemById(itemId) {
+    // CID is the client item/sprite id (the value used by runeId and packets).
+    // SID is optional and is only used when a caller needs to distinguish two
+    // server item variants sharing the same CID.
+    function findItemById(itemId, sid) {
+        const wantedId = Number(itemId);
+        const wantedSid = sid == null ? null : Number(sid);
         const eq = window.gameClient?.player?.equipment;
         const containers = window.gameClient?.player?.__openedContainers || [];
-        if (eq) {
+
+        function matches(item) {
+            if (!item || Number(item.id) !== wantedId) return false;
+            if (wantedSid != null && wantedSid > 0 && Number(item.sid || 0) !== wantedSid) return false;
+            return true;
+        }
+
+        if (eq?.slots) {
             for (let i = 0; i < eq.slots.length; i++) {
                 const item = eq.getSlotItem(i);
-                if (item && item.id === itemId)
-                    return {
-                        container: eq,
-                        slot: i,
-                        item
-                    };
+                if (matches(item)) return { container: eq, slot: i, item };
             }
         }
+
         const arr = Array.isArray(containers) ? containers : Array.from(containers);
         for (const container of arr) {
-            if (!container || typeof container.size !== 'number')
-                continue;
-            for (let i = 0; i < container.size; i++) {
+            if (!container || typeof container.getSlotItem !== 'function') continue;
+            const size = Array.isArray(container.slots)
+                ? container.slots.length
+                : Number(container.size) || 0;
+            for (let i = 0; i < size; i++) {
                 const item = container.getSlotItem(i);
-                if (item && item.id === itemId)
-                    return {
-                        container,
-                        slot: i,
-                        item
-                    };
+                if (matches(item)) return { container, slot: i, item };
             }
         }
         return null;
@@ -779,13 +639,97 @@ function getItemCountReading(itemId, fluidType = 0) {
 
 // Best-effort: install the observer early so any count the client
 // already syncs from the server is captured automatically.
-setTimeout(() => { try { installItemCountObserver(); } catch (e) {} }, 1500);
+let itemCountInstallTimer = setTimeout(() => {
+    itemCountInstallTimer = null;
+    try { installItemCountObserver(); } catch (e) {}
+}, 1500);
+addCleanup(() => {
+    if (itemCountInstallTimer) {
+        clearTimeout(itemCountInstallTimer);
+        itemCountInstallTimer = null;
+    }
+    uninstallItemCountObserver();
+    itemCountState.listeners.clear();
+});
     
+
+    // ---- SHARED ITEM API ----
+    // Keep CID/SID semantics in one place so modules do not accidentally compare
+    // a server SID (for example a rune id) against the client CID.
+    const itemsApi = {
+        find({ cid = null, sid = null, predicate = null } = {}) {
+            const wantedCid = cid == null ? null : Number(cid);
+            const wantedSid = sid == null ? null : Number(sid);
+            const eq = window.gameClient?.player?.equipment;
+            const containers = window.gameClient?.player?.__openedContainers || [];
+
+            const matches = (item) => {
+                if (!item) return false;
+                if (wantedCid != null && Number(item.id) !== wantedCid) return false;
+                if (wantedSid != null && Number(item.sid || 0) !== wantedSid) return false;
+                return typeof predicate === "function" ? !!predicate(item) : true;
+            };
+
+            const scan = (container) => {
+                if (!container || typeof container.getSlotItem !== "function") return null;
+                const size = Array.isArray(container.slots)
+                    ? container.slots.length
+                    : Number(container.size) || 0;
+                for (let slot = 0; slot < size; slot++) {
+                    const item = container.getSlotItem(slot);
+                    if (matches(item)) return { container, slot, item };
+                }
+                return null;
+            };
+
+            const equipped = scan(eq);
+            if (equipped) return equipped;
+            const list = Array.isArray(containers) ? containers : Array.from(containers);
+            for (const container of list) {
+                const found = scan(container);
+                if (found) return found;
+            }
+            return null;
+        },
+        findByCid(cid) { return itemsApi.find({ cid }); },
+        findBySid(sid) { return itemsApi.find({ sid }); },
+    };
+
+    // Lightweight cross-module action mutex. It is deliberately not a queue:
+    // an expired/blocked action should not make a later action wait behind it.
+    const actionLocks = new Map();
+    const actionsApi = {
+        tryAcquire(name, ttlMs = 1500) {
+            const key = String(name || "default");
+            const now = performance.now();
+            const existing = actionLocks.get(key);
+            if (existing && existing.expiresAt > now) return null;
+            const token = Symbol(key);
+            actionLocks.set(key, { token, expiresAt: now + Math.max(100, Number(ttlMs) || 1500) });
+            return () => {
+                const current = actionLocks.get(key);
+                if (current?.token === token) actionLocks.delete(key);
+            };
+        },
+        isLocked(name) {
+            const key = String(name || "default");
+            const current = actionLocks.get(key);
+            if (!current) return false;
+            if (current.expiresAt <= performance.now()) {
+                actionLocks.delete(key);
+                return false;
+            }
+            return true;
+        },
+        clear() { actionLocks.clear(); },
+    };
 
     // ---- PUBLIC API ----
     return {
-        version: "1.0.0",
+        version: "1.2.2",
         addCleanup,
+        items: itemsApi,
+        actions: actionsApi,
 
         /** Destroy the bot and all its modules (call before reload) */
         destroy() {
@@ -826,7 +770,6 @@ setTimeout(() => { try { installItemCountObserver(); } catch (e) {} }, 1500);
             if (this.ui?.destroy)
                 this.ui.destroy();
             stopReconnectWatcher();
-            stopImbReset();
             destroyAlarmAudio();
             runCleanups();
         },
@@ -1056,16 +999,6 @@ setTimeout(() => { try { installItemCountObserver(); } catch (e) {} }, 1500);
                 console.error(`[minibia-bot] ${label} creation failed:`, error);
                 this.log(`${label} creation failed`, error?.message || error);
                 return false;
-            }
-        },
-
-        /** Control the __imB reset interval */
-        imbReset: {
-            start: () => startImbReset(1000),
-            stop: stopImbReset,
-            reset: () => {
-                if (typeof __imB !== 'undefined')
-                    __imB = 0;
             }
         },
 
@@ -12030,12 +11963,23 @@ window.__minibiaBotBundle.installLightHackModule = function installLightHackModu
         }
     }
 
+    let ensurePatchedTimer = null;
+
     function ensurePatched() {
-        if (state.patched)
+        if (state.patched) {
+            if (ensurePatchedTimer) {
+                clearTimeout(ensurePatchedTimer);
+                ensurePatchedTimer = null;
+            }
             return;
+        }
         if (!patch()) {
-            // Retry if settings not ready yet
-            setTimeout(ensurePatched, 500);
+            // Retry if settings not ready yet, but keep the retry reload-safe.
+            if (ensurePatchedTimer) clearTimeout(ensurePatchedTimer);
+            ensurePatchedTimer = setTimeout(() => {
+                ensurePatchedTimer = null;
+                ensurePatched();
+            }, 500);
         }
     }
 
@@ -12050,6 +11994,10 @@ window.__minibiaBotBundle.installLightHackModule = function installLightHackModu
     }
 
     function stop() {
+        if (ensurePatchedTimer) {
+            clearTimeout(ensurePatchedTimer);
+            ensurePatchedTimer = null;
+        }
         if (!config.enabled)
             return false;
         config.enabled = false;
@@ -12245,10 +12193,15 @@ window.__minibiaBotBundle.installLightHackLegitModule = function installLightHac
         persistConfig();
 
         const waitForRenderer = (callback) => {
+            if (state.rendererWaitTimer) clearTimeout(state.rendererWaitTimer);
             if (gameClient?.renderer?.screen?.__spriteBatch) {
+                state.rendererWaitTimer = null;
                 callback(gameClient.renderer);
             } else {
-                setTimeout(() => waitForRenderer(callback), 200);
+                state.rendererWaitTimer = setTimeout(() => {
+                    state.rendererWaitTimer = null;
+                    waitForRenderer(callback);
+                }, 200);
             }
         };
 
@@ -12260,6 +12213,10 @@ window.__minibiaBotBundle.installLightHackLegitModule = function installLightHac
     }
 
     function stop() {
+        if (state.rendererWaitTimer) {
+            clearTimeout(state.rendererWaitTimer);
+            state.rendererWaitTimer = null;
+        }
         if (!state.running)
             return false;
         config.enabled = false;
@@ -12487,11 +12444,22 @@ window.__minibiaBotBundle.installMovementPatch = function installMovementPatch(b
     (function install() {
         const TAG = "[MovementPatch]";
         let installed = false;
+        let cleanupDone = false;
+        let waitForClientTimer = null;
+        let clientRef = null;
+        let originalSend = null;
+        let targetDescriptor = null;
+        let targetWasOwnProperty = false;
+        let targetValue = null;
 
         function waitForClient() {
             const c = window.gameClient || window.GameClient?.instance || window.client;
             if (!c || !c.player || !c.world?.pathfinder) {
-                setTimeout(waitForClient, 200);
+                if (waitForClientTimer) clearTimeout(waitForClientTimer);
+                waitForClientTimer = setTimeout(() => {
+                    waitForClientTimer = null;
+                    waitForClient();
+                }, 200);
                 return;
             }
             if (installed)
@@ -12502,10 +12470,57 @@ window.__minibiaBotBundle.installMovementPatch = function installMovementPatch(b
         }
 
         function installPatches(client) {
+            clientRef = client;
             guardPlayerTarget(client);
             patchGameClientSend(client);
             // No findPath patch.
         }
+
+        function cleanup() {
+            if (cleanupDone) return;
+            cleanupDone = true;
+            if (waitForClientTimer) {
+                clearTimeout(waitForClientTimer);
+                waitForClientTimer = null;
+            }
+
+            const client = clientRef;
+            const player = client?.player;
+
+            // Restore the original send function so hot-reload never stacks or
+            // leaves a stale movement packet interceptor behind.
+            if (client && originalSend && client.send === patchedSendRef) {
+                client.send = originalSend;
+            }
+            if (client && client.__stopOnTargetSendPatched) {
+                delete client.__stopOnTargetSendPatched;
+            }
+
+            // Restore the player's original __target property descriptor.
+            // The previous implementation permanently replaced this property
+            // during the first install, which made later reloads inherit the
+            // old closure and target guard.
+            if (player && player.__stopOnTargetTargetGuarded) {
+                try {
+                    if (targetDescriptor) {
+                        Object.defineProperty(player, "__target", targetDescriptor);
+                    } else {
+                        delete player.__target;
+                        if (targetWasOwnProperty) player.__target = targetValue;
+                    }
+                } catch (e) {
+                    console.warn(`${TAG} failed to restore __target`, e);
+                }
+                delete player.__stopOnTargetTargetGuarded;
+            }
+
+            clientRef = null;
+            originalSend = null;
+            patchedSendRef = null;
+            targetDescriptor = null;
+        }
+
+        let patchedSendRef = null;
 
         // Helper: does the player have a valid target (alive, on screen)?
         function hasValidTarget(client) {
@@ -12553,10 +12568,13 @@ window.__minibiaBotBundle.installMovementPatch = function installMovementPatch(b
             if (!p || p.__stopOnTargetTargetGuarded)
                 return;
 
-            let targetValue = p.__target ?? null;
+            targetWasOwnProperty = Object.prototype.hasOwnProperty.call(p, "__target");
+            targetDescriptor = Object.getOwnPropertyDescriptor(p, "__target") || null;
+            targetValue = p.__target ?? null;
 
             Object.defineProperty(p, "__target", {
                 configurable: true,
+                enumerable: targetDescriptor?.enumerable ?? true,
                 get() {
                     return targetValue;
                 },
@@ -12565,7 +12583,6 @@ window.__minibiaBotBundle.installMovementPatch = function installMovementPatch(b
                     if (value !== null && value !== undefined) {
                         // Target acquired – cancel autowalk immediately
                         stopMovement(client);
-                        // bot.log(`${TAG} target acquired – autowalk cancelled`);
                     }
                 }
             });
@@ -12577,9 +12594,10 @@ window.__minibiaBotBundle.installMovementPatch = function installMovementPatch(b
             if (!client || typeof client.send !== "function" || client.__stopOnTargetSendPatched)
                 return;
 
-            const originalSend = client.send;
+            const original = client.send;
+            originalSend = original;
 
-            client.send = function (packet) {
+            const patched = function (packet) {
                 const packetName = packet?.constructor?.name || "";
 
                 // Always allow StopWalkPacket
@@ -12595,12 +12613,16 @@ window.__minibiaBotBundle.installMovementPatch = function installMovementPatch(b
                     }
                 }
 
-                return originalSend.call(this, packet);
+                return original.call(this, packet);
             };
 
+            patchedSendRef = patched;
+            client.send = patched;
             client.__stopOnTargetSendPatched = true;
+            return;
         }
 
+        bot.addCleanup(cleanup);
         waitForClient();
     })();
 };
@@ -12791,6 +12813,8 @@ window.__minibiaBotBundle.installComboBotModule = function installComboBotModule
         running: false,
         channel: null,
         originalSend: null,
+        hookedSend: null,
+        storageListener: null,
         lastTriggerAt: 0,
         retryTimer: null,
         retryCount: 0,
@@ -13060,27 +13084,36 @@ window.__minibiaBotBundle.installComboBotModule = function installComboBotModule
             return false;
         }
 
-        if (state.originalSend) {
+        // Restore our own previous wrapper before installing a fresh one. This
+        // keeps repeated start/stop/reload cycles from stacking send wrappers.
+        if (state.originalSend && state.hookedSend && gc.send === state.hookedSend) {
             gc.send = state.originalSend;
         }
 
-        state.originalSend = gc.send;
-        gc.send = function (packet) {
-            const buffer = packet.getBuffer();
-            if (buffer && buffer[0] === (window.CONST && CONST.PROTOCOL.CLIENT.TARGET)) {
-                const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
-                const targetId = view.getUint32(1, true);
-                if (targetId !== 0 || config.broadcastClear) {
-                    const leaderId = gc.player ? gc.player.id : 0;
-                    sendMessage({
-                        type: 'target',
-                        id: targetId,
-                        leaderId: leaderId
-                    });
+        const originalSend = gc.send;
+        state.originalSend = originalSend;
+
+        const hookedSend = function (packet) {
+            try {
+                const buffer = packet?.getBuffer?.();
+                const targetOpcode = window.CONST?.PROTOCOL?.CLIENT?.TARGET;
+                if (buffer && targetOpcode != null && buffer.byteLength >= 5 && buffer[0] === targetOpcode) {
+                    const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+                    const targetId = view.getUint32(1, true);
+                    if (targetId !== 0 || config.broadcastClear) {
+                        const leaderId = gc.player ? gc.player.id : 0;
+                        sendMessage({ type: 'target', id: targetId, leaderId });
+                    }
                 }
+            } catch (e) {
+                // Broadcasting must never prevent the real packet from being sent.
+                log('Target broadcast hook error:', e);
             }
-            state.originalSend.call(this, packet);
+            return originalSend.apply(this, arguments);
         };
+
+        state.hookedSend = hookedSend;
+        gc.send = hookedSend;
         log('Leader hook installed – broadcasting targets.');
         return true;
     }
@@ -13094,6 +13127,10 @@ window.__minibiaBotBundle.installComboBotModule = function installComboBotModule
 
     // ---- Communication channel ----
     function setupChannel() {
+        if (state.storageListener) {
+            window.removeEventListener('storage', state.storageListener);
+            state.storageListener = null;
+        }
         if (state.channel) {
             state.channel.close();
             state.channel = null;
@@ -13107,15 +13144,16 @@ window.__minibiaBotBundle.installComboBotModule = function installComboBotModule
                 onmessage: null,
                 close: () => {}
             };
-            window.addEventListener('storage', (e) => {
-                if (e.key === '__comboBot' && e.newValue) {
+            state.storageListener = (e) => {
+                if (e.key !== '__comboBot' || !e.newValue) return;
+                try {
                     const msg = JSON.parse(e.newValue);
-                    if (state.channel.onmessage)
-                        state.channel.onmessage({
-                            data: msg
-                        });
+                    if (state.channel?.onmessage) state.channel.onmessage({ data: msg });
+                } catch (err) {
+                    log('Invalid combo storage message:', err);
                 }
-            });
+            };
+            window.addEventListener('storage', state.storageListener);
         }
 
         state.channel.onmessage = (event) => {
@@ -13207,13 +13245,20 @@ window.__minibiaBotBundle.installComboBotModule = function installComboBotModule
         state.currentTargetId = null;
 
         if (state.originalSend && window.gameClient) {
-            window.gameClient.send = state.originalSend;
+            if (!state.hookedSend || window.gameClient.send === state.hookedSend) {
+                window.gameClient.send = state.originalSend;
+            }
             state.originalSend = null;
+            state.hookedSend = null;
         }
 
         if (state.channel) {
             state.channel.close();
             state.channel = null;
+        }
+        if (state.storageListener) {
+            window.removeEventListener('storage', state.storageListener);
+            state.storageListener = null;
         }
 
         state.running = false;
@@ -14418,6 +14463,24 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
         "minibiaBot.paladin.config",
         "minibiaBot.looter.config",
         "minibiaBot.blacklist.config",
+        "minibiaBot.support.config",
+        "minibiaBot.combo.config",
+        "minibiaBot.autoPickup.config",
+        "minibiaBot.antiAfk.config",
+        "minibiaBot.fisher.config",
+        "minibiaBot.slimeTrainer.config",
+        "minibiaBot.monkTrainer.config",
+        "minibiaBot.lightHackLegit.config",
+        "minibiaBot.pinkSkull.config",
+        "minibiaBot.outfitRandomizer.config",
+        "minibiaBot.playerAttack.config",
+        "minibiaBot.messageAlert.config",
+        "minibiaBot.antibot.config",
+        "minibiaBot.gmChatMonitor.config",
+        "minibiaBot.tormentedGhost.config",
+        "minibiaBot.keyringToggle.config",
+        "minibiaBot.outfitToggle.config",
+        "minibiaBot.itemIdDisplay.config",
         "minibiaBot.ui.panelPosition",
         "minibiaBot.ui.panelCollapsed",
     ];
@@ -15847,14 +15910,17 @@ window.__minibiaBotBundle.installSupportModule = function installSupportModule(b
         timerId: null,
         lastRuneHealAt: {},
         lastSioHealAt: {},
-        lastLogAt: {}, // for debouncing repeated messages
+        lastLogAt: {},
+        actionInProgress: false,
     };
 
     const config = Object.assign({
         enabled: false,
         runeEnabled: false,
-        runeItemId: 236,
+        // 3160 is the CID/client item id for Ultimate Healing Rune in the game.
+        runeItemId: 3160,
         runeThreshold: 50,
+        // Local debounce only. The actual rune cooldown is read from HotbarManager.
         runeCooldownMs: 2000,
         sioEnabled: false,
         sioThreshold: 50,
@@ -15865,173 +15931,191 @@ window.__minibiaBotBundle.installSupportModule = function installSupportModule(b
         debug: false,
     }, bot.storage.get(configStorageKey, {}));
 
-    function persistConfig() {
-        bot.storage.set(configStorageKey, {
-            ...config
-        });
+    // Migrate the old broken default once. A user who deliberately configured
+    // another CID keeps that value; only the known bad legacy default changes.
+    if (Number(config.runeItemId) === 236) {
+        config.runeItemId = 3160;
+        bot.storage.set(configStorageKey, { ...config });
     }
 
-    // ---- Log helpers ----
+    function persistConfig() {
+        bot.storage.set(configStorageKey, { ...config });
+    }
+
     function logImportant(msg) {
         bot.log(`[Support] ${msg}`);
     }
 
     function logDebug(msg) {
-        if (config.debug)
-            bot.log(`[Support] ${msg}`);
+        if (config.debug) bot.log(`[Support] ${msg}`);
     }
 
     function logWithDebounce(key, msg, intervalMs = 30000) {
         const now = Date.now();
-        if (state.lastLogAt[key] && now - state.lastLogAt[key] < intervalMs)
-            return;
+        if (state.lastLogAt[key] && now - state.lastLogAt[key] < intervalMs) return;
         state.lastLogAt[key] = now;
         bot.log(`[Support] ${msg}`);
     }
 
-    // ---- Shield constants ----
+    function normalizeName(name) {
+        return String(name || "").trim().toLowerCase();
+    }
+
     function getPartyShieldConstants() {
         if (typeof CONST !== 'undefined' && CONST.SHIELD) {
             return {
                 MEMBER: CONST.SHIELD.MEMBER,
-                LEADER: CONST.SHIELD.LEADER
+                LEADER: CONST.SHIELD.LEADER,
             };
         }
-        return {
-            MEMBER: 8,
-            LEADER: 9
-        };
-    }
-
-    // ---- Party members ----
-    function getPartyMemberNames() {
-        const players = bot.xray?.getVisiblePlayers({
-            sameFloorOnly: true
-        }) || [];
-        const partyMembers = [];
-        const player = window.gameClient?.player;
-        if (!player)
-            return [];
-        const { MEMBER, LEADER } = getPartyShieldConstants();
-        for (const c of players) {
-            if (c.id === player.id)
-                continue;
-            if (c.shield === MEMBER || c.shield === LEADER) {
-                partyMembers.push(c.name);
-            }
-        }
-        logDebug(`Party members: ${partyMembers.join(', ')}`);
-        return partyMembers;
+        return { MEMBER: 8, LEADER: 9 };
     }
 
     function getTrustedNames() {
-        const names = bot.panic?.getTrustedNames() || [];
-        logDebug(`Trusted names: ${names.join(', ')}`);
-        return names;
+        return bot.panic?.getTrustedNames?.() || [];
     }
 
-    // ---- Targets ----
+    // One world scan only. Party membership comes directly from the creature's
+    // server-provided shield state; there is no need to build a second name list.
     function getTargets() {
+        const allPlayers = bot.xray?.getVisiblePlayers({ sameFloorOnly: true }) || [];
+        const player = window.gameClient?.player;
+        const myId = player?.id;
+        const trusted = config.includeTrusted
+            ? new Set(getTrustedNames().map(normalizeName).filter(Boolean))
+            : null;
+        const { MEMBER, LEADER } = getPartyShieldConstants();
         const targets = [];
-        const trusted = config.includeTrusted ? new Set(getTrustedNames().map(n => n.toLowerCase().trim())) : new Set();
-        const party = config.includeParty ? new Set(getPartyMemberNames().map(n => n.toLowerCase().trim())) : new Set();
-        const allPlayers = bot.xray?.getVisiblePlayers({
-            sameFloorOnly: true
-        }) || [];
-        const myId = window.gameClient?.player?.id;
 
-        logDebug(`All visible players: ${allPlayers.map(p => `${p.name} (shield=${p.shield})`).join(', ')}`);
-        logDebug(`Trusted set: ${[...trusted].join(', ')}`);
-        logDebug(`Party set: ${[...party].join(', ')}`);
+        for (const creature of allPlayers) {
+            if (!creature || creature.id === myId) continue;
+            if (typeof CONST !== 'undefined' && CONST.TYPES?.PLAYER != null
+                && creature.type !== CONST.TYPES.PLAYER) continue;
 
-        for (const c of allPlayers) {
-            if (c.id === myId)
-                continue;
-            const nameLower = c.name.toLowerCase().trim();
-            if (trusted.has(nameLower) || party.has(nameLower)) {
-                targets.push(c);
-            }
+            const name = normalizeName(creature.name);
+            const isParty = config.includeParty
+                && (creature.shield === MEMBER || creature.shield === LEADER);
+            const isTrusted = !!trusted && trusted.has(name);
+
+            if (isParty || isTrusted) targets.push(creature);
         }
-        logDebug(`Targets: ${targets.map(t => t.name).join(', ')}`);
+
+        if (config.includeSelf && player) targets.push(player);
+
+        logDebug(`Targets: ${targets.map(t => `${t.name} (${getCreatureHealthPercent(t)?.toFixed?.(0) ?? '?'}%)`).join(', ')}`);
         return targets;
     }
 
     function getCreatureHealthPercent(creature) {
-        const health = creature.state?.health ?? creature.health;
-        const maxHealth = creature.maxHealth ?? creature.state?.maxHealth;
-        if (health == null || maxHealth == null || maxHealth <= 0)
-            return null;
+        const health = creature?.state?.health ?? creature?.health;
+        const maxHealth = creature?.maxHealth ?? creature?.state?.maxHealth;
+        if (health == null || maxHealth == null || maxHealth <= 0) return null;
         return (health / maxHealth) * 100;
     }
 
     function findItemInInventory(itemId) {
-        const eq = window.gameClient?.player?.equipment;
-        const containers = window.gameClient?.player?.__openedContainers || [];
-        if (eq) {
-            for (let i = 0; i < eq.slots.length; i++) {
-                const item = eq.getSlotItem(i);
-                if (item && item.id === itemId) {
-                    return {
-                        container: eq,
-                        slot: i,
-                        item
-                    };
-                }
-            }
-        }
-        const arr = Array.isArray(containers) ? containers : Array.from(containers);
-        for (const container of arr) {
-            if (!container || typeof container.size !== 'number')
-                continue;
-            for (let i = 0; i < container.size; i++) {
-                const item = container.getSlotItem(i);
-                if (item && item.id === itemId) {
-                    return {
-                        container,
-                        slot: i,
-                        item
-                    };
-                }
-            }
+        // Support is installed in its own module scope, so it must use the
+        // shared bot item API rather than the legacy global findItemById().
+        // The shared API returns the same { container, slot, item } shape.
+        return bot.items?.findByCid?.(itemId) || null;
+    }
+
+    // If the rune is not locally visible, use a bound hotbar item as the
+    // authoritative source. HotbarManager will fall back to HotbarUsePacket,
+    // allowing the server to resolve items that live in closed/nested bags.
+    function findRuneHotbarBinding(itemId) {
+        const hm = window.gameClient?.interface?.hotbarManager;
+        if (!hm || !Array.isArray(hm.slots)) return null;
+
+        const wanted = Number(itemId);
+        for (let i = 0; i < hm.slots.length; i++) {
+            const slot = hm.slots[i];
+            const item = slot?.item;
+            if (!item || Number(item.id) !== wanted) continue;
+            return { hotbar: hm, slot, slotIndex: i, item };
         }
         return null;
     }
 
-    function useItemOnCreature(source, creatureId) {
-        const from = {
-            which: source.container,
-            index: source.slot
-        };
+    function getRuneCooldown() {
+        const hm = window.gameClient?.interface?.hotbarManager;
+        if (!hm || typeof hm.__getRuneEffectiveCooldown !== 'function') return null;
+
+        const defs = window.gameClient?.itemDefinitionsByCid;
+        const def = defs ? defs[Number(config.runeItemId)] : null;
+        // UH is a healing rune. Unknown definitions are treated as non-aggressive
+        // rather than incorrectly blocking on the attack-rune bucket.
+        const isAttack = !!(def?.properties && def.properties.aggressive !== false);
         try {
-            const creature = window.gameClient.world.getCreature(creatureId);
+            return hm.__getRuneEffectiveCooldown(isAttack);
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function isRuneOnCooldown() {
+        const cd = getRuneCooldown();
+        return !!(cd && performance.now() < cd.until);
+    }
+
+    function useItemOnCreature(source, creatureId) {
+        try {
+            const world = window.gameClient?.world;
+            const creature = world?.getCreature?.(creatureId);
             if (!creature) {
                 logWithDebounce('creatureNotFound', `Creature ${creatureId} not found`, 10000);
                 return false;
             }
 
-            logDebug(`Attempting rune use: ${source.container.constructor.name}, slot ${source.slot} -> ${creature.name} (${creature.id})`);
+            if (typeof CONST !== 'undefined' && CONST.TYPES?.PLAYER != null
+                && creature.type !== CONST.TYPES.PLAYER) {
+                logWithDebounce('notPlayer', `Creature ${creatureId} is no longer a player`, 10000);
+                return false;
+            }
 
+            if (source?.kind === 'hotbar') {
+                // Do NOT call HotbarManager.__handleItemUseWithMode() here.
+                // That helper resolves the player's CURRENT target, which can
+                // differ from the support target we just selected. The native
+                // HotbarUsePacket supports server-side inventory lookup for
+                // closed/nested containers while also carrying the exact
+                // creature id we intend to heal.
+                if (typeof HotbarUsePacket === 'function' && window.gameClient?.send) {
+                    window.gameClient.send(new HotbarUsePacket(
+                        source.item.id,
+                        source.item.fluidType || 0,
+                        1,
+                        creature.id
+                    ));
+                    logDebug(`Used hotbar rune CID ${source.item.id} -> ${creature.name} (${creature.id})`);
+                    return true;
+                }
+                logWithDebounce('noHotbarMethod', 'HotbarUsePacket unavailable for server-side rune lookup', 30000);
+                return false;
+            }
+
+            if (!source?.container || source.slot == null) return false;
+
+            const from = { which: source.container, index: source.slot };
             if (typeof ItemUseOnCreaturePacket !== 'undefined') {
-                window.gameClient.send(new ItemUseOnCreaturePacket(from, creatureId));
-                logDebug(`Sent ItemUseOnCreaturePacket`);
+                window.gameClient.send(new ItemUseOnCreaturePacket(from, creature.id));
+                logDebug(`Sent rune CID ${source.item?.id ?? config.runeItemId} -> ${creature.name} (${creature.id})`);
                 return true;
             }
 
             if (window.gameClient?.mouse?.__handleItemUseWith) {
                 window.gameClient.mouse.__handleItemUseWith(from, {
                     which: creature,
-                    index: 0xFF
+                    index: 0xFF,
                 });
-                logDebug(`Used mouse.__handleItemUseWith as fallback`);
                 return true;
             }
 
             if (typeof ThingUseWithPacket !== 'undefined') {
                 window.gameClient.send(new ThingUseWithPacket(from, {
-                        which: creature,
-                        index: 0xFF
-                    }));
-                logDebug(`Used ThingUseWithPacket`);
+                    which: creature,
+                    index: 0xFF,
+                }));
                 return true;
             }
 
@@ -16044,49 +16128,79 @@ window.__minibiaBotBundle.installSupportModule = function installSupportModule(b
     }
 
     function castSio(targetName) {
-        if (!targetName)
-            return false;
+        if (!targetName) return false;
         const sent = bot.sendChat("exura sio " + targetName);
-        if (sent)
-            logDebug(`Cast exura sio on ${targetName}`);
+        if (sent) logDebug(`Cast exura sio on ${targetName}`);
         return sent;
     }
 
     function tryHealTarget(creature, now) {
-        const name = creature.name;
-        const hpPercent = getCreatureHealthPercent(creature);
-        if (hpPercent == null)
-            return false;
+        if (!creature || state.actionInProgress) return false;
 
-        // Sio
+        // Re-resolve immediately before acting. A player can disappear between
+        // the Xray scan and the send, especially during floor changes.
+        const current = window.gameClient?.world?.getCreature?.(creature.id);
+        if (!current) return false;
+        if (typeof CONST !== 'undefined' && CONST.TYPES?.PLAYER != null
+            && current.type !== CONST.TYPES.PLAYER) return false;
+
+        const name = String(current.name || creature.name || '').trim();
+        if (!name) return false;
+        const hpPercent = getCreatureHealthPercent(current);
+        if (hpPercent == null) return false;
+
+        // Sio first, preserving the existing module behaviour.
         if (config.sioEnabled && hpPercent < config.sioThreshold) {
-            const lastSio = state.lastSioHealAt[name] || 0;
+            const key = normalizeName(name);
+            const lastSio = state.lastSioHealAt[key] || 0;
             if (now - lastSio > config.sioCooldownMs) {
-                if (castSio(name)) {
-                    state.lastSioHealAt[name] = now;
-                    logDebug(`exura sio -> ${name} (HP ${hpPercent.toFixed(0)}%)`);
-                    return true;
-                }
-            }
-        }
-
-        // Rune
-        if (config.runeEnabled && hpPercent < config.runeThreshold) {
-            const lastRune = state.lastRuneHealAt[name] || 0;
-            if (now - lastRune > config.runeCooldownMs) {
-                const source = findItemInInventory(config.runeItemId);
-                if (source) {
-                    const success = useItemOnCreature(source, creature.id);
-                    if (success) {
-                        state.lastRuneHealAt[name] = now;
-                        logDebug(`Rune ${config.runeItemId} -> ${name} (HP ${hpPercent.toFixed(0)}%)`);
+                state.actionInProgress = true;
+                try {
+                    if (castSio(name)) {
+                        state.lastSioHealAt[key] = now;
+                        logDebug(`exura sio -> ${name} (HP ${hpPercent.toFixed(0)}%)`);
                         return true;
                     }
-                } else {
-                    logWithDebounce('noRune', `No rune ${config.runeItemId} in inventory`, 30000);
+                } finally {
+                    state.actionInProgress = false;
                 }
             }
         }
+
+        if (!config.runeEnabled || hpPercent >= config.runeThreshold) return false;
+
+        const key = normalizeName(name);
+        const lastRune = state.lastRuneHealAt[key] || 0;
+        if (now - lastRune <= config.runeCooldownMs) return false;
+        if (isRuneOnCooldown()) return false;
+
+        let source = findItemInInventory(config.runeItemId);
+        if (!source) {
+            const hotbar = findRuneHotbarBinding(config.runeItemId);
+            if (hotbar) source = { kind: 'hotbar', ...hotbar };
+        }
+
+        if (!source) {
+            logWithDebounce('noRune', `No rune CID ${config.runeItemId} in equipment/open containers or hotbar`, 30000);
+            return false;
+        }
+
+        const releaseAction = bot.actions?.tryAcquire?.('rune-heal', config.runeCooldownMs + 500) || null;
+        if (bot.actions && !releaseAction) return false;
+
+        state.actionInProgress = true;
+        try {
+            const success = useItemOnCreature(source, current.id);
+            if (success) {
+                state.lastRuneHealAt[key] = now;
+                logDebug(`Rune CID ${config.runeItemId} -> ${name} (HP ${hpPercent.toFixed(0)}%)`);
+                return true;
+            }
+        } finally {
+            state.actionInProgress = false;
+            releaseAction?.();
+        }
+
         return false;
     }
 
@@ -16103,30 +16217,46 @@ window.__minibiaBotBundle.installSupportModule = function installSupportModule(b
             return;
         }
 
+        // Lowest HP first; stable distance tie-breaker is intentionally omitted
+        // because Xray already returns same-floor visible players and health is
+        // the useful support priority.
         targets.sort((a, b) => {
             const hpA = getCreatureHealthPercent(a) ?? 100;
             const hpB = getCreatureHealthPercent(b) ?? 100;
-            return hpA - hpB;
+            if (hpA !== hpB) return hpA - hpB;
+
+            const player = window.gameClient?.player;
+            try {
+                const pp = player?.getPosition?.();
+                const ap = a?.getPosition?.();
+                const bp = b?.getPosition?.();
+                const da = pp && ap && pp.z === ap.z
+                    ? Math.max(Math.abs(pp.x - ap.x), Math.abs(pp.y - ap.y))
+                    : Number.POSITIVE_INFINITY;
+                const db = pp && bp && pp.z === bp.z
+                    ? Math.max(Math.abs(pp.x - bp.x), Math.abs(pp.y - bp.y))
+                    : Number.POSITIVE_INFINITY;
+                return da - db;
+            } catch (e) {
+                return 0;
+            }
         });
 
         for (const creature of targets) {
-            const healed = tryHealTarget(creature, now);
-            if (healed)
-                break;
+            if (tryHealTarget(creature, now)) break;
         }
 
         scheduleNextTick();
     }
 
     function scheduleNextTick() {
-        if (!state.running)
-            return;
+        if (!state.running) return;
+        if (state.timerId) clearTimeout(state.timerId);
         state.timerId = setTimeout(tick, 500);
     }
 
     function start() {
-        if (state.running)
-            return false;
+        if (state.running) return false;
         config.enabled = true;
         persistConfig();
         state.running = true;
@@ -16138,6 +16268,7 @@ window.__minibiaBotBundle.installSupportModule = function installSupportModule(b
     function stop(options = {}) {
         const persist = options.persistEnabled !== false;
         state.running = false;
+        state.actionInProgress = false;
         if (state.timerId) {
             clearTimeout(state.timerId);
             state.timerId = null;
@@ -16153,26 +16284,26 @@ window.__minibiaBotBundle.installSupportModule = function installSupportModule(b
     function status() {
         return {
             running: state.running,
-            config: {
-                ...config
-            },
+            actionInProgress: state.actionInProgress,
+            runeOnCooldown: isRuneOnCooldown(),
+            config: { ...config },
         };
     }
 
-    function updateConfig(next) {
+    function updateConfig(next = {}) {
         Object.assign(config, next);
-        config.runeThreshold = Math.min(100, Math.max(0, config.runeThreshold || 0));
-        config.sioThreshold = Math.min(100, Math.max(0, config.sioThreshold || 0));
-        config.runeCooldownMs = Math.max(100, config.runeCooldownMs || 100);
-        config.sioCooldownMs = Math.max(100, config.sioCooldownMs || 100);
+        config.runeItemId = Math.max(1, Number(config.runeItemId) || 3160);
+        // If an old saved config sneaks back in from an older build, migrate it.
+        if (config.runeItemId === 236) config.runeItemId = 3160;
+        config.runeThreshold = Math.min(100, Math.max(0, Number(config.runeThreshold) || 0));
+        config.sioThreshold = Math.min(100, Math.max(0, Number(config.sioThreshold) || 0));
+        config.runeCooldownMs = Math.max(100, Number(config.runeCooldownMs) || 100);
+        config.sioCooldownMs = Math.max(100, Number(config.sioCooldownMs) || 100);
         persistConfig();
-        if (config.enabled && !state.running)
-            start();
-        if (!config.enabled && state.running)
-            stop();
-        return {
-            ...config
-        };
+
+        if (config.enabled && !state.running) start();
+        if (!config.enabled && state.running) stop();
+        return { ...config };
     }
 
     function test() {
@@ -16182,22 +16313,28 @@ window.__minibiaBotBundle.installSupportModule = function installSupportModule(b
         logImportant(`Targets found: ${targets.length}`);
         for (const t of targets) {
             const hp = getCreatureHealthPercent(t);
-            logImportant(`${t.name} HP: ${hp ? hp.toFixed(0) : 'unknown'}%`);
+            logImportant(`${t.name} HP: ${hp == null ? 'unknown' : hp.toFixed(0)}%`);
         }
-        const source = findItemInInventory(config.runeItemId);
-        logImportant(`Rune ${config.runeItemId} found: ${source ? 'yes' : 'no'}`);
-        if (targets.length && source) {
+        const source = findItemInInventory(config.runeItemId) || (() => {
+            const h = findRuneHotbarBinding(config.runeItemId);
+            return h ? { kind: 'hotbar', ...h } : null;
+        })();
+        logImportant(`Rune CID ${config.runeItemId} found: ${source ? 'yes' : 'no'}`);
+        if (targets.length && source && !isRuneOnCooldown()) {
             const first = targets[0];
             logImportant(`Attempting rune heal on ${first.name}`);
             const success = useItemOnCreature(source, first.id);
             logImportant(`Rune use result: ${success ? 'success' : 'failed'}`);
         } else if (!source) {
-            logImportant(`Rune not found in equipment or open containers.`);
+            logImportant(`Rune CID ${config.runeItemId} not found in equipment/open containers or hotbar.`);
+        } else if (isRuneOnCooldown()) {
+            logImportant(`Rune CID ${config.runeItemId} is currently on cooldown.`);
         }
     }
 
-    if (config.enabled)
-        start();
+    bot.addCleanup(() => stop({ persistEnabled: false }));
+
+    if (config.enabled) start();
 
     bot.support = {
         start,
@@ -19407,7 +19544,7 @@ function upgradeSectionHeaders(panel) {
         <span class="mb-title-text">Rune Healing</span>
       </div>
       <div class="mb-form-grid">
-        <label class="mb-field"><span class="mb-field-label">Rune Item ID</span><input type="number" id="minibia-bot-support-rune-itemid" min="1" value="3160" /></label>
+        <label class="mb-field"><span class="mb-field-label">Rune Item ID (CID)</span><input type="number" id="minibia-bot-support-rune-itemid" min="1" value="3160" /></label>
         <label class="mb-field"><span class="mb-field-label">HP Threshold %</span><input type="number" id="minibia-bot-support-rune-threshold" min="0" max="100" value="50" /></label>
       </div>
       <label class="mb-field"><span class="mb-field-label">Cooldown (ms)</span><input type="number" id="minibia-bot-support-rune-cooldown" min="100" value="2000" /></label>
@@ -19843,7 +19980,7 @@ function upgradeSectionHeaders(panel) {
             if (ids.runeEnabled && document.activeElement !== ids.runeEnabled)
                 ids.runeEnabled.checked = cfg.runeEnabled;
             if (ids.runeItemId && document.activeElement !== ids.runeItemId)
-                ids.runeItemId.value = cfg.runeItemId || 236;
+                ids.runeItemId.value = cfg.runeItemId || 3160;
             if (ids.runeThreshold && document.activeElement !== ids.runeThreshold)
                 ids.runeThreshold.value = cfg.runeThreshold || 50;
             if (ids.runeCooldown && document.activeElement !== ids.runeCooldown)
@@ -19887,7 +20024,7 @@ function upgradeSectionHeaders(panel) {
         const supportRuneItemId = document.getElementById("minibia-bot-support-rune-itemid");
         if (supportRuneItemId) {
             supportRuneItemId.addEventListener("change", function () {
-                const val = parseInt(this.value) || 236;
+                const val = Math.max(1, parseInt(this.value) || 3160);
                 this.value = val;
                 bot.support.updateConfig({
                     runeItemId: val
@@ -22714,13 +22851,15 @@ function upgradeSectionHeaders(panel) {
             if (loopToggle)
                 loopToggle.checked = bot.cave?.getLoopMode?.() ?? false;
         }, 1000);
-        setInterval(refreshBlacklist, 2000);
+        const blacklistTimer = window.setInterval(refreshBlacklist, 2000);
+        bot.addCleanup(() => window.clearInterval(blacklistTimer));
         bot.addCleanup(() => window.clearInterval(caveTimer));
         const titleTimer = window.setInterval(refreshTitlebarRunIndicators, 500);
         bot.addCleanup(() => window.clearInterval(titleTimer));
         const lightHackLegitTimer = setInterval(refreshLightHackLegitStatus, 2000);
         bot.addCleanup(() => clearInterval(lightHackLegitTimer));
-        setInterval(refreshPaladinStatus, 2000);
+        const paladinStatusTimer = window.setInterval(refreshPaladinStatus, 2000);
+        bot.addCleanup(() => window.clearInterval(paladinStatusTimer));
 
         // Position, drag, collapse
         applySavedPanelPosition(panel);
@@ -22988,12 +23127,18 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
     }
 
     // ---- TTL install / uninstall ----
+    let ttlInstallTimer = null;
+
     function installTTL() {
         if (ttlState.installed)
             return;
         const debuggerInstance = gameClient?.renderer?.debugger;
         if (!debuggerInstance) {
-            setTimeout(installTTL, 500);
+            if (ttlInstallTimer) clearTimeout(ttlInstallTimer);
+            ttlInstallTimer = setTimeout(() => {
+                ttlInstallTimer = null;
+                installTTL();
+            }, 500);
             return;
         }
         ttlState.debuggerInstance = debuggerInstance;
@@ -23018,6 +23163,10 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
     }
 
     function uninstallTTL() {
+        if (ttlInstallTimer) {
+            clearTimeout(ttlInstallTimer);
+            ttlInstallTimer = null;
+        }
         if (ttlState.intervalId) {
             clearInterval(ttlState.intervalId);
             ttlState.intervalId = null;
@@ -25354,6 +25503,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
             equipRing: bot.equipRing.status(),
             eat: bot.eat.status(),
             talk: bot.talk.status(),
+            support: bot.support.status(),
         });
 
         window.minibiaBot = bot;
@@ -25579,7 +25729,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
     let stableCount = 0;
     let reloadInProgress = false;
 
-    setInterval(() => {
+    const characterChangeTimer = setInterval(() => {
         if (reloadInProgress)
             return;
 
@@ -25628,4 +25778,12 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
             stableCount = 0;
         }
     }, 1500);
+
+    // This watcher lives outside the bot bundle, so explicitly replace/clear
+    // it on reload instead of allowing one watcher to accumulate per reload.
+    const previousCharacterWatcher = window.__minibiaBotCharacterWatcher;
+    if (previousCharacterWatcher) {
+        clearInterval(previousCharacterWatcher);
+    }
+    window.__minibiaBotCharacterWatcher = characterChangeTimer;
 })();
