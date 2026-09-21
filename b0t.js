@@ -726,7 +726,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.2.2",
+        version: "1.4.2",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -3540,6 +3540,10 @@ window.__minibiaBotBundle.installRuneModule = function installRuneModule(bot) {
     function stop(options = {}) {
         const shouldPersist = options.persistEnabled !== false;
         state.running = false;
+        if (state.fallbackMoveTimerId != null) {
+            clearTimeout(state.fallbackMoveTimerId);
+            state.fallbackMoveTimerId = null;
+        }
         if (state.timerId != null) {
             window.clearTimeout(state.timerId);
             state.timerId = null;
@@ -6627,6 +6631,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         running: false,
         timerId: null,
         observerTimerId: null,
+        fallbackMoveTimerId: null,
         currentIndex: 0,
         direction: 1,
         lastPathAt: 0,
@@ -6641,6 +6646,11 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         skipAttemptCount: 0,
         pathAttemptStart: 0,
         stuckCount: 0,
+        stuckRecoveryAttempts: 0,
+        lastRecoveryAt: 0,
+        lastAutoProbeKey: null,
+        lastAutoProbeLogAt: 0,
+        lastTransitionLogKey: null,
         lastDistanceToWaypoint: null,
         positionHistory: [],
         _stuckLogged: false,
@@ -6650,6 +6660,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         _shovelUsed: null, // index -> true
         _shovelState: null,
         _shovelOpened: null,
+        _shovelOpenedAt: null, // index -> timestamp
         _shovelRetry: null, // { index, count, lastTry }
         _ladderUsed: null, // index -> true
         combatCooldownUntil: 0,
@@ -6666,7 +6677,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         enabled: false,
         activePresetName: defaultPresetName,
         loopMode: true,
-        autoTransitions: true,
+        autoTransitions: false,
+        autoTransitionRadius: 6,
         stuckTimeoutMs: 2000,
         maxSkipAttempts: 10,
     },
@@ -7332,12 +7344,45 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         return shovelTargetNamePatterns.some(p => p.test(name));
     }
     function isShovelTargetTile(tile) {
-        return getTileThings(tile).some(t => isShovelTargetThing(t));
+        if (!tile)
+            return false;
+        return getTileThings(tile).some(t => {
+            if (t?.id !== undefined && holeItemIds.has(Number(t.id)))
+                return true;
+            return isShovelTargetThing(t);
+        });
+    }
+
+    // A shovel waypoint can race the server: the hole may close again between
+    // the successful shovel action and the movement step onto the hole.
+    // Minibia's native helper is authoritative when available. A closed shovel
+    // target is NOT a step-on floor-change tile; an opened hole is.
+    function isClosedShovelTargetTile(tile) {
+        if (!tile)
+            return false;
+
+        try {
+            if (window.gameClient?.mouse?.__isStepOnTile?.(tile))
+                return false;
+            if (window.gameClient?.mouse?.__isShovelTargetTile?.(tile))
+                return true;
+        } catch (e) {}
+
+        return isShovelTargetTile(tile);
     }
 
     function isTransitionCandidateTile(tile, waypoint, position) {
         if (!tile)
             return false;
+
+        // Prefer Minibia's own authoritative step-on classification when available.
+        // This covers floor-change tiles whose names/CIDs are not in the bot's
+        // local lists, while retaining the bot's existing fallbacks.
+        try {
+            if (window.gameClient?.mouse?.__isStepOnTile?.(tile))
+                return true;
+        } catch (e) {}
+
         if (isFloorChangeTile(tile))
             return true;
         if (!waypoint || !position || !Number.isFinite(waypoint.z) || !Number.isFinite(position.z))
@@ -7558,17 +7603,42 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     function getNearbyTransitionTiles(position, waypoint, radius = 8) {
         if (!position)
             return [];
-        return getLoadedTiles()
-        .map(t => ({
-                tile: t,
-                position: getTilePosition(t)
-            }))
-        .filter(e =>
-            e.position &&
-            e.position.z === position.z &&
-            Math.abs(e.position.x - position.x) <= radius &&
-            Math.abs(e.position.y - position.y) <= radius &&
-            isTransitionCandidateTile(e.tile, waypoint, position));
+
+        // Transition searches are local. Query only the square around the player
+        // instead of walking every loaded chunk/tile in the world.
+        const r = Math.max(1, Math.min(20, Math.trunc(Number(radius) || 8)));
+        const result = [];
+
+        for (let dy = -r; dy <= r; dy++) {
+            for (let dx = -r; dx <= r; dx++) {
+                const p = {
+                    x: position.x + dx,
+                    y: position.y + dy,
+                    z: position.z
+                };
+
+                let tile = null;
+                try {
+                    tile = window.gameClient?.world?.getTileFromWorldPosition?.(
+                        new Position(p.x, p.y, p.z)
+                    ) || null;
+                } catch (e) {
+                    tile = null;
+                }
+
+                if (!tile)
+                    continue;
+
+                if (isTransitionCandidateTile(tile, waypoint, position)) {
+                    result.push({
+                        tile,
+                        position: p
+                    });
+                }
+            }
+        }
+
+        return result;
     }
 
     function findTransitionTileNearPosition(position, waypoint, radius = 1) {
@@ -7598,7 +7668,14 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             const landingDist = getDistance(t.to, waypoint);
             if (!Number.isFinite(playerDist) || !Number.isFinite(landingDist))
                 return;
-            const score = playerDist * 10 + landingDist;
+
+            // Repeated observations make a learned transition more trustworthy;
+            // old observations receive a small penalty so newly learned routes can win.
+            const count = Math.min(5, Math.max(1, Number(t.count) || 1));
+            const ageDays = t.lastSeenAt ? Math.max(0, (Date.now() - t.lastSeenAt) / 86400000) : 999;
+            const confidenceBonus = (count - 1) * 3;
+            const agePenalty = Math.min(10, ageDays / 7);
+            const score = playerDist * 10 + landingDist * 2 + agePenalty - confidenceBonus;
             if (score < bestScore) {
                 bestScore = score;
                 best = t;
@@ -7611,7 +7688,11 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         if (!position || !waypoint)
             return null;
         const wpDist = Math.abs(position.x - waypoint.x) + Math.abs(position.y - waypoint.y);
-        const radius = Math.max(4, Math.min(20, wpDist + 2));
+        // Auto transitions are intentionally conservative. Manual rope/shovel/ladder
+        // waypoints remain the authoritative route mechanism; auto mode is a helper
+        // for simple routes and should not go hunting for random stairs across town.
+        const configuredRadius = Number(config.autoTransitionRadius) || 6;
+        const radius = Math.max(2, Math.min(8, configuredRadius, wpDist + 2));
         let best = null,
         bestScore = Infinity;
         getNearbyTransitionTiles(position, waypoint, radius).forEach(e => {
@@ -7667,44 +7748,44 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             // pathfinder threw – we'll fallback
         }
 
-        // If pathfinder didn't set a path (or failed), try to move one step manually
-        if (!success || !window.gameClient?.world?.pathfinder?.__finalDestination) {
-            const pf = window.gameClient?.world?.pathfinder;
-            // Wait a tiny moment for pathfinder to set its state, then check
-            setTimeout(() => {
-                if (pf && !pf.__finalDestination) {
-                    // Move one step toward waypoint
-                    const dx = waypoint.x - from.x;
-                    const dy = waypoint.y - from.y;
-                    let stepX = dx > 0 ? 1 : (dx < 0 ? -1 : 0);
-                    let stepY = dy > 0 ? 1 : (dy < 0 ? -1 : 0);
-                    const attempts = [{
-                            dx: stepX,
-                            dy: 0
-                        }, {
-                            dx: 0,
-                            dy: stepY
-                        }, {
-                            dx: stepX,
-                            dy: stepY
-                        }
-                    ];
-                    for (const a of attempts) {
-                        const nx = from.x + a.dx;
-                        const ny = from.y + a.dy;
-                        if (bot.blacklist?.isBlacklisted(nx, ny, from.z))
-                            continue;
-                        if (isTileWalkable(nx, ny, from.z, true)) {
-                            const dir = getDirection(a.dx, a.dy);
-                            if (dir !== null && window.gameClient?.keyboard) {
-                                window.gameClient.keyboard.handleMoveKey(dir);
-                                state.lastPathAt = Date.now();
-                                break;
-                            }
-                        }
+        // Native Pathfinder owns movement. Only use the manual one-step fallback
+        // when it genuinely failed to establish a destination. Track the delayed
+        // fallback so reload/stop cannot leave an orphaned movement command behind.
+        const pf = window.gameClient?.world?.pathfinder;
+        if (!success || !pf?.__finalDestination) {
+            if (state.fallbackMoveTimerId != null) {
+                clearTimeout(state.fallbackMoveTimerId);
+                state.fallbackMoveTimerId = null;
+            }
+            state.fallbackMoveTimerId = setTimeout(() => {
+                state.fallbackMoveTimerId = null;
+                if (!state.running) return;
+                if (pf?.__finalDestination || pf?.__isAutoWalking) return;
+                const current = bot.getPlayerPosition();
+                if (!current) return;
+                const dx = waypoint.x - current.x;
+                const dy = waypoint.y - current.y;
+                const stepX = dx > 0 ? 1 : (dx < 0 ? -1 : 0);
+                const stepY = dy > 0 ? 1 : (dy < 0 ? -1 : 0);
+                const attempts = [
+                    { dx: stepX, dy: 0 },
+                    { dx: 0, dy: stepY },
+                    { dx: stepX, dy: stepY }
+                ];
+                for (const a of attempts) {
+                    const nx = current.x + a.dx;
+                    const ny = current.y + a.dy;
+                    if (!a.dx && !a.dy) continue;
+                    if (bot.blacklist?.isBlacklisted(nx, ny, current.z)) continue;
+                    if (!isTileWalkable(nx, ny, current.z, true)) continue;
+                    const dir = getDirection(a.dx, a.dy);
+                    if (dir !== null && window.gameClient?.keyboard) {
+                        window.gameClient.keyboard.handleMoveKey(dir);
+                        state.lastPathAt = Date.now();
+                        break;
                     }
                 }
-            }, 50);
+            }, 75);
         }
         return success;
     }
@@ -7738,19 +7819,32 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             count: idx >= 0 ? transitions[idx].count + 1 : 1,
             lastSeenAt: Date.now(),
         };
+        const previousCount = idx >= 0 ? Math.max(1, Number(transitions[idx].count) || 1) : 0;
         if (idx >= 0)
             transitions[idx] = next;
         else
             transitions.push(next);
         persistTransitions();
-        bot.log("cave learned floor transition", next);
+
+        // Avoid console spam from the 200 ms observer. A transition can be
+        // observed repeatedly while the client is settling after a floor hop.
+        // Only announce a new transition and meaningful confidence milestones.
+        const milestone = next.count === 1 || next.count === 2 || next.count === 3
+            || next.count === 5 || next.count === 10 || next.count % 10 === 0;
+        if (idx < 0 || (next.count !== previousCount && milestone))
+            bot.log("cave learned floor transition", next);
+
         return cloneValue(next);
     }
 
     function resolveObservedTransitionSource(prevPos) {
-        const pending = normalizePosition(state.pendingTransitionSource);
+        const pendingRaw = state.pendingTransitionSource;
+        const pendingAge = pendingRaw?.at ? (Date.now() - pendingRaw.at) : Infinity;
+        const pending = pendingAge <= 3000 ? normalizePosition(pendingRaw) : null;
         if (pending && pending.z === prevPos.z)
             return pending;
+        if (pendingAge > 3000)
+            state.pendingTransitionSource = null;
         const tile = getTileAt(prevPos);
         if (tile && isFloorChangeTile(tile))
             return prevPos;
@@ -7988,14 +8082,24 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             }
 
             // For non‑teleporter tiles (stairs, ladders, holes), use them
+            const beforeUseAt = state.lastStairsUseAt;
             const moved = useFloorChangeTile(visible, waypoint, now);
             if (moved) {
-                bot.log("cave probing visible floor-change tile", {
-                    tileX: visible.position.x,
-                    tileY: visible.position.y,
-                    tileZ: visible.position.z,
-                    targetZ: waypoint.z,
-                });
+                // useFloorChangeTile returns true during its short action cooldown
+                // so the cave tick can wait. Only log when a real use was issued.
+                if (state.lastStairsUseAt !== beforeUseAt) {
+                    const key = `${visible.position.x},${visible.position.y},${visible.position.z}->${waypoint.z}`;
+                    if (state.lastAutoProbeKey !== key || now - state.lastAutoProbeLogAt > 1500) {
+                        state.lastAutoProbeKey = key;
+                        state.lastAutoProbeLogAt = now;
+                        bot.log("cave auto transition used", {
+                            tileX: visible.position.x,
+                            tileY: visible.position.y,
+                            tileZ: visible.position.z,
+                            targetZ: waypoint.z,
+                        });
+                    }
+                }
                 return true;
             }
         }
@@ -8022,13 +8126,20 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 }
             }
 
+            const beforeUseAt = state.lastStairsUseAt;
             const moved = useFloorChangeTile(target, waypoint, now);
             if (moved) {
-                bot.log("cave using learned floor transition", {
-                    from: known.from,
-                    to: known.to,
-                    waypoint
-                });
+                if (state.lastStairsUseAt !== beforeUseAt) {
+                    const key = `${getPositionKey(known.from)}->${getPositionKey(known.to)}`;
+                    if (state.lastTransitionLogKey !== key) {
+                        state.lastTransitionLogKey = key;
+                        bot.log("cave using learned floor transition", {
+                            from: known.from,
+                            to: known.to,
+                            waypoint
+                        });
+                    }
+                }
                 return true;
             }
             bot.log("cave learned transition unavailable, falling back to live scan", {
@@ -8047,6 +8158,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         state._ropeUsed = undefined;
         state._shovelUsed = undefined;
         state._shovelOpened = undefined;
+        state._shovelOpenedAt = undefined;
         state._shovelRetry = null;
         // Clear reached flag for old index
         if (state.standReached) {
@@ -8747,12 +8859,49 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                     return;
                 }
 
-                // ---- STEP 2: HOLE IS OPEN, WALK INTO IT ----
+                // ---- STEP 2: HOLE WAS OPENED, WAIT FOR / ENTER IT ----
                 if (state._shovelOpened && state._shovelOpened[index]) {
-                    // If we are already on the hole tile (same z) or z changed (fallen), advance
-                    if ((position.z === waypoint.z && tileDist === 0) || position.z < waypoint.z) {
-                        bot.log("Shovel waypoint: walked into hole, advancing");
+                    const targetTile = getTileAt(waypoint);
+                    const openedAt = state._shovelOpenedAt?.[index] || now;
+                    const openAge = now - openedAt;
+
+                    // IMPORTANT: being on the waypoint at the original floor is
+                    // NOT proof that the hole was entered. The hole can close
+                    // during the walk, leaving the player standing on a closed
+                    // dirt/stone tile. Never advance in that situation.
+                    if (isClosedShovelTargetTile(targetTile)) {
+                        bot.log("Shovel waypoint: hole closed before entry, recovering");
+                        delete state._shovelOpened[index];
+                        if (state._shovelOpenedAt)
+                            delete state._shovelOpenedAt[index];
+                        state.lastPathAt = 0;
+                        state.lastWaypointTarget = null;
+                        state.pathAttemptStart = now;
+
+                        // If we are standing on the now-closed hole, get off it
+                        // first. A shovel cannot be used while standing on the
+                        // target tile. The next tick will shovel from an adjacent
+                        // tile and retry the transition.
+                        if (tileDist === 0) {
+                            const adjPos = findAdjacentWalkablePosition(waypoint, position);
+                            if (adjPos) {
+                                goToPosition(adjPos);
+                            } else {
+                                bot.log("Shovel waypoint: closed hole has no adjacent escape tile");
+                            }
+                            return;
+                        }
+
+                        // Already adjacent/far enough to retry normally.
+                        return;
+                    }
+
+                    // The only successful entry is a server-confirmed descent.
+                    // Shovel waypoints are downward transitions, so z must increase.
+                    if (position.z > waypoint.z) {
+                        bot.log("Shovel waypoint: entered hole, advancing");
                         state._shovelOpened = undefined;
+                        state._shovelOpenedAt = undefined;
                         if (!state._shovelUsed)
                             state._shovelUsed = {};
                         state._shovelUsed[index] = true;
@@ -8774,12 +8923,23 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                             goToWaypoint(waypoint);
                         }
                         return;
-                    } else {
-                        // Hole is open but we are not on it – walk onto it
-                        bot.log("Shovel waypoint: walking into opened hole");
-                        goToWaypoint(waypoint);
-                        return;
                     }
+
+                    // If the server has not confirmed the descent yet, don't
+                    // declare success just because we're standing on the tile.
+                    // Reissue the walk only when we're still away from the target.
+                    if (tileDist > 0) {
+                        if (openAge < 5000 || tileDist > 0) {
+                            bot.log("Shovel waypoint: walking into opened hole");
+                            goToWaypoint(waypoint);
+                        }
+                    }
+
+                    // After a few seconds with no descent, simply re-check the
+                    // tile on the next ticks. If it closed, the branch above
+                    // immediately recovers instead of waiting for CaveBot's
+                    // global (possibly 30s) stuck timeout.
+                    return;
                 }
 
                 // ---- STEP 1: OPEN THE HOLE ----
@@ -8851,7 +9011,10 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                     if (used) {
                         if (!state._shovelOpened)
                             state._shovelOpened = {};
+                        if (!state._shovelOpenedAt)
+                            state._shovelOpenedAt = {};
                         state._shovelOpened[index] = true;
+                        state._shovelOpenedAt[index] = now;
                         bot.log("Shovel waypoint: hole opened, walking into it");
                         goToWaypoint(waypoint);
                         return;
@@ -9116,6 +9279,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 state.lastPositionKey = positionKey;
                 state.lastProgressAt = now;
                 state.stuckCount = 0;
+                state.stuckRecoveryAttempts = 0;
+                state.lastRecoveryAt = 0;
                 state.positionHistory = [];
             }
             if (now - state.lastStairsUseAt < 2000) {
@@ -9123,22 +9288,65 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 state.lastProgressAt = now;
             }
 
-            // ---- STUCK DETECTION ----
+            // ---- STUCK DETECTION / GUARDED RECOVERY ----
             const stuckTimeout = config.stuckTimeoutMs || 2000;
-            if (!madeProgress && (now - state.lastProgressAt) > stuckTimeout) {
-                // Only skip if we actually have a waypoint and are not in combat
+            const stalledFor = now - state.lastProgressAt;
+
+            if (!madeProgress && stalledFor > stuckTimeout) {
                 const currentWp = getCurrentWaypoint();
+
                 if (currentWp) {
-                    bot.log(`Cave: stuck on tile for ${(now - state.lastProgressAt) / 1000}s – skipping to closest waypoint`);
+                    // First recover by rebuilding the native path. This avoids
+                    // skipping a perfectly valid waypoint just because one path
+                    // attempt got blocked by a creature, door, or transient state.
+                    if (state.stuckRecoveryAttempts < 2) {
+                        state.stuckRecoveryAttempts++;
+                        state.lastRecoveryAt = now;
+
+                        const pf = window.gameClient?.world?.pathfinder;
+                        try {
+                            pf?.setPathfindCache?.(null);
+                            if (pf) {
+                                pf.__isAutoWalking = false;
+                                pf.__finalDestination = null;
+                                pf.__hybridPath = null;
+                            }
+                        } catch (e) {}
+
+                        bot.log(
+                            `Cave: movement stalled for ${(stalledFor / 1000).toFixed(1)}s – ` +
+                            `repath recovery ${state.stuckRecoveryAttempts}/2`
+                        );
+
+                        state.lastProgressAt = now;
+                        state.lastPathAt = 0;
+                        state.lastWaypointTarget = null;
+                        state.pathAttemptStart = now;
+                        goToWaypoint(currentWp);
+                        return;
+                    }
+
+                    // Only after repeated genuine failures use the existing
+                    // closest-waypoint recovery policy.
+                    bot.log(
+                        `Cave: movement still stalled after ${state.stuckRecoveryAttempts} ` +
+                        `recovery attempts – selecting recovery waypoint`
+                    );
+
+                    state.stuckRecoveryAttempts = 0;
+                    state.lastRecoveryAt = now;
+
                     const nextWp = skipToClosestWaypoint();
                     if (nextWp) {
                         state.lastProgressAt = now;
+                        state.lastPathAt = 0;
+                        state.lastWaypointTarget = null;
                         state._stuckLogged = false;
-                        return; // tick will continue on next interval
-                    } else {
-                        stop();
                         return;
                     }
+
+                    stop();
+                    return;
                 }
             }
 
@@ -9191,8 +9399,11 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 state.pathAttemptStart = 0;
                 state.lastDistanceToWaypoint = null;
                 state.stuckCount = 0;
+                state.stuckRecoveryAttempts = 0;
+                state.lastRecoveryAt = 0;
                 state.positionHistory = [];
                 state.skipAttemptCount = 0;
+                state.pendingTransitionSource = null;
 
                 // ---- EXECUTE SCRIPT IF PRESENT ----
                 if (waypoint.script) {
@@ -9269,11 +9480,23 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 return;
             }
 
-            const shouldRepath = now - state.lastPathAt >= config.repathMs ||
-                !state.lastProgressAt ||
-                now - state.lastProgressAt >= config.repathMs;
-            if (shouldRepath) {
+            const nativePathActive = !!(pf?.__finalDestination || pf?.__isAutoWalking || pf?.__pathfindCache?.length);
+            const stalled = !state.lastProgressAt || (now - state.lastProgressAt >= config.repathMs);
+            const pathExpired = !state.lastPathAt || (now - state.lastPathAt >= config.repathMs);
+
+            // Native Pathfinder already owns its active AutoWalk batch and has
+            // its own loop detection / continuation. While it is active, CaveBot
+            // observes instead of competing with it. Rebuild only after the native
+            // state disappears, or after two guarded local stall observations.
+            if (!nativePathActive) {
                 goToWaypoint(waypoint);
+            } else if (stalled && pathExpired && (now - state.lastRecoveryAt) > 1000) {
+                state.lastRecoveryAt = now;
+                state.stuckCount++;
+                if (state.stuckCount >= 2) {
+                    state.stuckCount = 0;
+                    goToWaypoint(waypoint);
+                }
             }
 
         } catch (error) {
@@ -9303,6 +9526,18 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         state.observerTimerId = null;
     }
 
+    bot.addCleanup(() => {
+        if (state.fallbackMoveTimerId != null) {
+            clearTimeout(state.fallbackMoveTimerId);
+            state.fallbackMoveTimerId = null;
+        }
+        stopObserver();
+        if (state.timerId != null) {
+            clearTimeout(state.timerId);
+            state.timerId = null;
+        }
+    });
+
     // ---- PUBLIC API ----
     function start(overrides = {}) {
         Object.assign(config, overrides, {
@@ -9327,6 +9562,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         state.lastPathAt = 0;
         state.lastPositionKey = getPositionKey(pos);
         state.lastProgressAt = Date.now();
+        state.stuckRecoveryAttempts = 0;
+        state.lastRecoveryAt = 0;
         state.pausedForCombat = false;
         state.pathAttemptStart = 0;
         state.currentIndex = findClosestWaypointIndex(pos);
@@ -9353,6 +9590,10 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         if (state.timerId != null) {
             window.clearTimeout(state.timerId);
             state.timerId = null;
+        }
+        if (state.fallbackMoveTimerId != null) {
+            window.clearTimeout(state.fallbackMoveTimerId);
+            state.fallbackMoveTimerId = null;
         }
         if (shouldPersist) {
             config.enabled = false;
@@ -14479,7 +14720,6 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
         "minibiaBot.gmChatMonitor.config",
         "minibiaBot.tormentedGhost.config",
         "minibiaBot.keyringToggle.config",
-        "minibiaBot.outfitToggle.config",
         "minibiaBot.itemIdDisplay.config",
         "minibiaBot.ui.panelPosition",
         "minibiaBot.ui.panelCollapsed",
@@ -22386,7 +22626,7 @@ function upgradeSectionHeaders(panel) {
 
         const autoTransToggle = panel.querySelector("#minibia-bot-cave-auto-transitions");
         if (autoTransToggle) {
-            autoTransToggle.checked = bot.cave?.config?.autoTransitions ?? true;
+            autoTransToggle.checked = bot.cave?.config?.autoTransitions ?? false;
             autoTransToggle.addEventListener("change", () => {
                 bot.cave.updateConfig({
                     autoTransitions: autoTransToggle.checked
@@ -23688,250 +23928,6 @@ window.__minibiaBotBundle.installCustomNotificationModule = function installCust
 
 /**
  * ==================================================================================
- * OUTFIT TOGGLE MODULE (Stealth Mode)
- * Hooks the "Outfit" button to completely hide/show the bot panel.
- * Right‑click -> outfit window stays untouched.
- * ==================================================================================
- */
-window.__minibiaBotBundle.installOutfitToggleModule = function installOutfitToggleModule(bot) {
-    const configStorageKey = "minibiaBot.outfitToggle.config";
-    const HIDDEN_STORAGE_KEY = "minibiaBot.ui.panelHidden";
-    const state = {
-        installed: false,
-        observer: null,
-        button: null,
-        listener: null,
-        originalOnClick: null,
-    };
-
-    // Load config
-    const config = Object.assign({
-        enabled: true,
-    }, bot.storage.get(configStorageKey, {}));
-
-    function persistConfig() {
-        bot.storage.set(configStorageKey, {
-            enabled: config.enabled
-        });
-    }
-
-    // ---- Core functions ----
-    function getPanel() {
-        return document.getElementById("minibia-bot-panel");
-    }
-
-    function isPanelHidden() {
-        const panel = getPanel();
-        if (!panel)
-            return false;
-        return panel.style.display === "none" || panel.dataset.hidden === "true";
-    }
-
-    function saveHiddenState(hidden) {
-        bot.storage.set(HIDDEN_STORAGE_KEY, hidden);
-    }
-
-    function loadHiddenState() {
-        return bot.storage.get(HIDDEN_STORAGE_KEY, false);
-    }
-
-    function applyHiddenState(hidden) {
-        const panel = getPanel();
-        if (!panel)
-            return;
-        if (hidden) {
-            panel.style.display = "none";
-            panel.dataset.hidden = "true";
-        } else {
-            panel.style.display = ""; // revert to CSS default (flex)
-            panel.dataset.hidden = "false";
-        }
-        saveHiddenState(hidden);
-    }
-
-    function togglePanel() {
-        const panel = getPanel();
-        if (!panel) {
-            bot.log("[OutfitToggle] Panel not found.");
-            return;
-        }
-        const hidden = panel.style.display === "none" || panel.dataset.hidden === "true";
-        applyHiddenState(!hidden);
-    }
-
-    // ---- Install/uninstall hook ----
-    function installHook(btn) {
-        if (state.installed)
-            return;
-        if (!btn)
-            return;
-
-        // Store original onclick property
-        state.originalOnClick = btn.onclick;
-
-        // Clone and replace to remove all existing listeners
-        const newBtn = btn.cloneNode(true);
-        btn.parentNode.replaceChild(newBtn, btn);
-        state.button = newBtn;
-
-        // Create our click handler
-        const handler = function (event) {
-            event.preventDefault();
-            event.stopPropagation();
-            togglePanel();
-        };
-        newBtn.addEventListener("click", handler);
-        state.listener = handler;
-
-        // Apply initial hidden state
-        const hidden = loadHiddenState();
-        applyHiddenState(hidden);
-
-        state.installed = true;
-        bot.log("[OutfitToggle] Installed – left-click toggles panel visibility.");
-    }
-
-    function uninstallHook() {
-        if (!state.installed)
-            return;
-
-        // Remove our listener
-        if (state.button && state.listener) {
-            state.button.removeEventListener("click", state.listener);
-        }
-
-        // Restore original behaviour
-        if (state.button) {
-            if (state.originalOnClick) {
-                state.button.onclick = state.originalOnClick;
-            } else {
-                // Default outfit button behaviour: open outfit modal
-                state.button.onclick = function (e) {
-                    e.preventDefault();
-                    if (gameClient && gameClient.interface && gameClient.interface.modalManager) {
-                        gameClient.interface.modalManager.open("outfit-modal");
-                    }
-                };
-            }
-        }
-
-        // Show panel if hidden (restore visibility)
-        applyHiddenState(false);
-
-        state.installed = false;
-        state.button = null;
-        state.listener = null;
-        state.originalOnClick = null;
-        bot.log("[OutfitToggle] Uninstalled.");
-    }
-
-    // ---- Find the button ----
-    function findAndHook() {
-        if (state.installed)
-            return;
-        if (state.observer) {
-            state.observer.disconnect();
-            state.observer = null;
-        }
-
-        const btn = document.getElementById("openOutfit");
-        if (btn) {
-            installHook(btn);
-            return;
-        }
-
-        // Wait for the button to appear
-        state.observer = new MutationObserver(function () {
-            const el = document.getElementById("openOutfit");
-            if (el) {
-                state.observer.disconnect();
-                state.observer = null;
-                installHook(el);
-            }
-        });
-        state.observer.observe(document.body, {
-            childList: true,
-            subtree: true
-        });
-    }
-
-    // ---- Public API ----
-    function start() {
-        if (config.enabled)
-            return false;
-        config.enabled = true;
-        persistConfig();
-        findAndHook();
-        bot.log("[OutfitToggle] Enabled.");
-        return true;
-    }
-
-    function stop() {
-        if (!config.enabled)
-            return false;
-        config.enabled = false;
-        persistConfig();
-        uninstallHook();
-        if (state.observer) {
-            state.observer.disconnect();
-            state.observer = null;
-        }
-        bot.log("[OutfitToggle] Disabled.");
-        return true;
-    }
-
-    function status() {
-        return {
-            running: config.enabled,
-            installed: state.installed,
-            panelHidden: isPanelHidden(),
-            config: {
-                ...config
-            },
-        };
-    }
-
-    function updateConfig(next) {
-        if (next.enabled !== undefined) {
-            if (next.enabled)
-                start();
-            else
-                stop();
-        }
-        return {
-            ...config
-        };
-    }
-
-    // ---- Auto‑start if enabled ----
-    if (config.enabled) {
-        setTimeout(findAndHook, 500);
-        bot.addCleanup(function () {
-            if (state.observer)
-                state.observer.disconnect();
-            uninstallHook();
-        });
-    }
-
-    bot.outfitToggle = {
-        start,
-        stop,
-        status,
-        updateConfig,
-        config,
-        // Additional helpers
-        hidePanel: function () {
-            applyHiddenState(true);
-        },
-        showPanel: function () {
-            applyHiddenState(false);
-        },
-        togglePanel: togglePanel,
-    };
-};
-
-/**
- * ==================================================================================
  * SHOVEL HOTKEY MODULE (Sprite or Blank)
  * Shows the shovel sprite if available, otherwise blank (stealth).
  * ==================================================================================
@@ -24171,7 +24167,9 @@ window.__minibiaBotBundle.installKeyringStealthToggleModule = function installKe
 
     let button = null;
     let originalClickHandler = null;
+    let clickHandler = null;
     let isHooked = false;
+    let retryTimer = null;
 
     function persist() {
         bot.storage.set(configStorageKey, {
@@ -24199,8 +24197,14 @@ window.__minibiaBotBundle.installKeyringStealthToggleModule = function installKe
 
         button = document.getElementById("keyring");
         if (!button) {
-            // Retry later if button not yet loaded
-            setTimeout(hookButton, 500);
+            // Retry later if button not yet loaded. Keep the timer tracked so
+            // a bot reload cannot leave a retry loop behind.
+            if (retryTimer == null) {
+                retryTimer = setTimeout(() => {
+                    retryTimer = null;
+                    hookButton();
+                }, 500);
+            }
             return;
         }
 
@@ -24213,11 +24217,12 @@ window.__minibiaBotBundle.installKeyringStealthToggleModule = function installKe
         button = newButton;
 
         // Attach our toggle handler
-        button.addEventListener("click", function (e) {
+        clickHandler = function (e) {
             e.preventDefault();
             e.stopPropagation();
             togglePanel();
-        });
+        };
+        button.addEventListener("click", clickHandler);
 
         isHooked = true;
         bot.log("[KeyringToggle] Hooked the Keys button.");
@@ -24232,23 +24237,19 @@ window.__minibiaBotBundle.installKeyringStealthToggleModule = function installKe
     }
 
     function unhook() {
+        if (retryTimer != null) {
+            clearTimeout(retryTimer);
+            retryTimer = null;
+        }
         if (!isHooked || !button)
             return;
-        // Restore original click handler if possible
-        if (originalClickHandler) {
-            button.onclick = originalClickHandler;
-        } else {
-            // If no original handler, remove our listener (but we need to keep a reference)
-            // Since we used addEventListener, we'd need to remove it, but we replaced the button,
-            // so we can just replace it back with the original button or do nothing.
-            // Simpler: we can remove the button and let the game recreate it on next login.
-            // But for simplicity, we'll just detach our listener.
-            // However, we cloned and replaced, so the original is gone.
-            // We can set the button's onclick to null or restore the original DOM element.
-            // For a clean disable, we'll just remove our handler.
-            // We stored originalClickHandler, so we can set it back.
-            button.onclick = originalClickHandler;
+
+        if (clickHandler) {
+            button.removeEventListener("click", clickHandler);
+            clickHandler = null;
         }
+        button.onclick = originalClickHandler;
+        originalClickHandler = null;
         isHooked = false;
         bot.log("[KeyringToggle] Unhooked the Keys button.");
     }
@@ -24300,9 +24301,19 @@ window.__minibiaBotBundle.installKeyringStealthToggleModule = function installKe
 
     // Auto‑start if enabled
     if (config.enabled) {
-        // Wait for UI to load
-        setTimeout(hookButton, 1000);
+        retryTimer = setTimeout(() => {
+            retryTimer = null;
+            hookButton();
+        }, 1000);
     }
+
+    bot.addCleanup(() => {
+        if (retryTimer != null) {
+            clearTimeout(retryTimer);
+            retryTimer = null;
+        }
+        unhook();
+    });
 
     bot.keyringToggle = {
         start: start,
@@ -25474,7 +25485,6 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
 
         currentBundle.installPanel(bot);
         currentBundle.installCustomNotificationModule(bot);
-        currentBundle.installOutfitToggleModule(bot);
         currentBundle.installShovelHotkeyModule(bot);
         currentBundle.installKeyringStealthToggleModule(bot);
         currentBundle.installGmChatMonitorModule(bot);
@@ -25545,7 +25555,6 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
                 ["gmChatMonitor", "minibiaBot.gmChatMonitor.config"],
                 ["tormentedGhost", "minibiaBot.tormentedGhost.config"],
                 ["keyringToggle", "minibiaBot.keyringToggle.config"],
-                ["outfitToggle", "minibiaBot.outfitToggle.config"],
                 ["itemIdDisplay", "minibiaBot.itemIdDisplay.config"],
             ];
 
