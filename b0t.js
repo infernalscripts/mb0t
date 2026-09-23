@@ -726,7 +726,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.4.2",
+        version: "1.4.33",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -6631,6 +6631,10 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         running: false,
         timerId: null,
         observerTimerId: null,
+        noWayObserver: null,
+        noWayLastSeenAt: 0,
+        noWayLastText: "",
+        noWayRecoveryIndex: -1,
         fallbackMoveTimerId: null,
         currentIndex: 0,
         direction: 1,
@@ -6639,6 +6643,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         lastProgressAt: 0,
         lastStairsUseAt: 0,
         lastObservedPosition: null,
+        lastTeleportResetAt: 0,
         pendingTransitionSource: null,
         pausedForCombat: false,
         lastWaypointTarget: null,
@@ -6648,6 +6653,18 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         stuckCount: 0,
         stuckRecoveryAttempts: 0,
         lastRecoveryAt: 0,
+        recoverySideStepAt: 0,
+        recoverySideStepAttempts: 0,
+        recoverySideStepLastKey: null,
+        recoverySideStepOriginKey: null,
+        recoveryBestDistance: Infinity,
+        recoveryNoProgressAt: 0,
+        recoveryLastTargetIndex: -1,
+        recoveryLastTargetAt: 0,
+        recoveryLastTargetKey: null,
+        recoveryBlockerWaitAt: 0,
+        recoveryBlockerWaitKey: null,
+        floorRecoveryLoop: null, // { key: string, count: number, firstAt: number, lastAt: number }
         lastAutoProbeKey: null,
         lastAutoProbeLogAt: 0,
         lastTransitionLogKey: null,
@@ -6657,12 +6674,14 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         standReached: {},
         _standAttempt: null, // { index: number, adjacentAt: number }
         _ropeUsed: null, // index -> true
+        _ropeNextUseAt: null, // index -> timestamp; prevents rapid repeated rope attempts
         _shovelUsed: null, // index -> true
         _shovelState: null,
         _shovelOpened: null,
         _shovelOpenedAt: null, // index -> timestamp
         _shovelRetry: null, // { index, count, lastTry }
         _ladderUsed: null, // index -> true
+        _ladderNextUseAt: null, // index -> timestamp; prevents rapid repeated ladder attempts
         combatCooldownUntil: 0,
         _ladderWaitingFloorChange: null, // { index: number, fromZ: number, usedAt: number }
     };
@@ -6679,8 +6698,33 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         loopMode: true,
         autoTransitions: false,
         autoTransitionRadius: 6,
-        stuckTimeoutMs: 2000,
+        stuckTimeoutMs: 5000,
+        standTimeoutMs: 10000,
         maxSkipAttempts: 10,
+        maxWaypointDistance: 50,
+        // Recovery movement must make real route progress before its failure counters reset.
+        // This prevents short A↔B oscillations from creating an endless fresh recovery cycle.
+        recoveryNoProgressWindowMs: 5000,
+        // Avoid immediately selecting the exact same recovery waypoint again when
+        // the previous recovery made no route progress. If it is the only viable
+        // target, the fallback pass may still select it.
+        recoveryAvoidRepeatMs: 10000,
+        // Number of native Pathfinder repath recoveries before route-level recovery.
+        maxRepathRecoveries: 2,
+        // Number of controlled side-steps around a confirmed temporary blocker.
+        maxRecoverySideSteps: 2,
+        // Minimum time between controlled recovery side-steps.
+        recoverySideStepCooldownMs: 1500,
+        // Recovery should normally land on ordinary walk waypoints, not on
+        // rope/shovel/ladder/stand/script transition points. Those waypoints
+        // can intentionally change floors or trigger scripts and can create a
+        // recovery loop after a teleport or unexpected floor change.
+        recoveryAllowTransitionWaypoints: false,
+        // Stop quickly when floor-mismatch recovery selects the same route point
+        // repeatedly. This prevents rope/teleport/script cycles from looping forever.
+        maxFloorRecoveryRepeats: 1,
+        floorRecoveryLoopTimeoutMs: 30000,
+        temporaryBlockerWaitMs: 2500,
     },
             bot.storage.get(configStorageKey, {}));
     config.tickMs = 500;
@@ -8156,10 +8200,14 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     function advanceWaypoint() {
         state._standAttempt = null;
         state._ropeUsed = undefined;
+        state._ropeNextUseAt = undefined;
+        state._ropeWaitingFloorChange = null;
         state._shovelUsed = undefined;
         state._shovelOpened = undefined;
         state._shovelOpenedAt = undefined;
         state._shovelRetry = null;
+        state._ladderNextUseAt = undefined;
+        state._ladderWaitingFloorChange = null;
         // Clear reached flag for old index
         if (state.standReached) {
             delete state.standReached[state.currentIndex];
@@ -8173,6 +8221,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             // Always go forward, wrap around to 0 when at the end
             let next = (state.currentIndex + 1) % route.length;
             state.currentIndex = next;
+            state.noWayRecoveryIndex = -1;
             state.direction = 1; // ensure direction is forward
             state.pathAttemptStart = 0;
             return getCurrentWaypoint();
@@ -8187,37 +8236,166 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 next = 1;
             }
             state.currentIndex = Math.max(0, Math.min(route.length - 1, next));
+            state.noWayRecoveryIndex = -1;
             state.pathAttemptStart = 0;
             return getCurrentWaypoint();
         }
     }
 
     /**
+     * Recovery targets are ordinary walking waypoints by default. Only actual
+     * movement/floor-transition waypoints participate in transition recovery.
+     * SCRIPT waypoints are intentionally excluded completely: a SCRIPT waypoint
+     * is an action point and must never be treated as a recovery target, fallback
+     * target, transition target, or reason to enable transition recovery.
+     */
+    function isRecoveryTransitionWaypoint(wp) {
+        if (!wp)
+            return false;
+        return wp.stand === true || wp.rope === true || wp.shovel === true || wp.ladder === true;
+    }
+
+    function isAllowedRecoveryWaypoint(wp) {
+        return !!wp && (config.recoveryAllowTransitionWaypoints === true || !isRecoveryTransitionWaypoint(wp));
+    }
+
+    /**
      * Skips to the waypoint closest to the player's current position.
      * Returns the new waypoint, or null if no route exists.
      */
-    function skipToClosestWaypoint() {
-        const pos = bot.getPlayerPosition();
+    function skipToClosestWaypoint(options = {}) {
+        const pos = normalizePosition(bot.getPlayerPosition());
         if (!pos || !route.length)
             return null;
 
-        // Find the closest waypoint by distance (Manhattan)
-        let bestIdx = 0;
-        let bestDist = Infinity;
-        for (let i = 0; i < route.length; i++) {
-            const wp = route[i];
-            const dist = Math.abs(wp.x - pos.x) + Math.abs(wp.y - pos.y) + Math.abs(wp.z - pos.z) * 10;
-            if (dist < bestDist) {
-                bestDist = dist;
-                bestIdx = i;
+        // Recovery must never choose a waypoint on another floor or an arbitrarily
+        // distant waypoint. After a temple/GM teleport, the native Pathfinder can
+        // sometimes claim a route across disconnected terrain (for example, water
+        // between islands). A bounded, same-floor recovery keeps us inside the
+        // portion of the route that is actually relevant to the player's location.
+        const limit = Math.max(1, Math.trunc(Number(config.maxWaypointDistance) || 50));
+        const allowTransitionFallback = options.allowTransitionFallback === true;
+        const excludeIndex = Number.isInteger(options.excludeIndex) ? options.excludeIndex : -1;
+        const avoidIndex = Number.isInteger(options.avoidIndex) ? options.avoidIndex : -1;
+        const avoidKey = typeof options.avoidKey === "string" ? options.avoidKey : null;
+        const avoidRepeat = (avoidIndex >= 0 || avoidKey !== null) && Number.isFinite(Number(config.recoveryAvoidRepeatMs)) &&
+            Date.now() - (Number(state.recoveryLastTargetAt) || 0) < Math.max(0, Number(config.recoveryAvoidRepeatMs));
+
+        const findBest = (allowTransitions, skipAvoided, skipCurrentTile = true) => {
+            let bestIdx = -1;
+            let bestScore = Infinity;
+            let bestProgress = Infinity;
+            let bestIsTransition = false;
+
+            for (let i = 0; i < route.length; i++) {
+                if (i === excludeIndex)
+                    continue;
+                const wp = route[i];
+                if (skipAvoided && avoidRepeat && (i === avoidIndex || (avoidKey !== null && wp && `${wp.x},${wp.y},${wp.z}` === avoidKey)))
+                    continue;
+                if (!wp || wp.x === undefined || wp.y === undefined || wp.z === undefined)
+                    continue;
+                if (wp.z !== pos.z)
+                    continue;
+
+                // Never select a blacklisted tile as a recovery target.
+                // goToWaypoint() already protects normal navigation, but allowing a
+                // blacklisted waypoint into recovery first can make recovery jump to
+                // a useless index and immediately advance again. Filtering it here
+                // keeps recovery focused on actually usable route points.
+                try {
+                    if (bot.blacklist?.isBlacklisted?.(wp.x, wp.y, wp.z))
+                        continue;
+                } catch (e) {}
+
+                const isTransition = isRecoveryTransitionWaypoint(wp);
+                if (isTransition && !allowTransitions)
+                    continue;
+
+                const cheb = Math.max(Math.abs(wp.x - pos.x), Math.abs(wp.y - pos.y));
+                if (cheb > limit)
+                    continue;
+
+                // Do not immediately "recover" onto the exact tile the player is
+                // already standing on. That can happen when a nearby route waypoint
+                // overlaps a teleporter/stand tile: selecting it changes currentIndex
+                // but creates no movement, so the next stall can repeat the same cycle.
+                // Keep an exact-tile candidate available as a final fallback below so
+                // a very small/compact route is never made unrecoverable.
+                if (cheb === 0 && !skipCurrentTile)
+                    continue;
+
+                const manhattan = Math.abs(wp.x - pos.x) + Math.abs(wp.y - pos.y);
+
+                // Prefer a nearby waypoint. When distances are essentially equal, prefer
+                // the waypoint that is ahead of the current route position so recovery
+                // does not unnecessarily jump backwards through the route.
+                const forwardPenalty = config.loopMode
+                    ? Math.min((i - state.currentIndex + route.length) % route.length, route.length) * 0.01
+                    : (i < state.currentIndex ? route.length * 0.01 : 0);
+                const score = manhattan + forwardPenalty;
+
+                if (score < bestScore) {
+                    bestScore = score;
+                    bestIdx = i;
+                    bestProgress = cheb;
+                    bestIsTransition = isTransition;
+                }
             }
+
+            return { bestIdx, bestProgress, bestIsTransition, bestScore };
+        };
+
+        // Normal recovery remains conservative: ordinary walking waypoints only.
+        let result = findBest(false, true);
+
+        // A STAND waypoint can legitimately be placed on/next to a teleporter or
+        // other transition tile. If that stand has genuinely stalled, ordinary
+        // recovery may have no usable target nearby. In that specific fallback case
+        // allow another same-floor transition waypoint, but never the stalled stand
+        // itself. SCRIPT waypoints are never included in this fallback. This does
+        // NOT change the special STAND floor-mismatch semantics.
+        if (result.bestIdx < 0 && allowTransitionFallback)
+            result = findBest(true, true);
+
+        // If repeat-avoidance found nothing, retry once without that preference.
+        // Never let the safety preference turn a recoverable route into a hard stop.
+        if (result.bestIdx < 0 && avoidRepeat) {
+            result = findBest(false, false);
+            if (result.bestIdx < 0 && allowTransitionFallback)
+                result = findBest(true, false);
         }
 
-        state.currentIndex = bestIdx;
-        state.direction = 1; // reset direction to forward
+        // Last-resort pass: if the route is extremely compact and every useful
+        // candidate overlaps the player's current tile, allow that exact tile.
+        // This is intentionally after all moving recovery candidates have failed.
+        if (result.bestIdx < 0) {
+            result = findBest(false, false, false);
+            if (result.bestIdx < 0 && allowTransitionFallback)
+                result = findBest(true, false, false);
+        }
 
-        const wp = route[bestIdx];
-        bot.log(`Cave: skipping to closest waypoint #${bestIdx + 1} (${wp.x}, ${wp.y}, ${wp.z})`);
+        if (result.bestIdx < 0) {
+            bot.log(`Cave: no same-floor recovery waypoint within ${limit} tiles – stopping navigation`);
+            return null;
+        }
+
+        state.currentIndex = result.bestIdx;
+        // Preserve the route direction during recovery. Recovery changes the
+        // waypoint index, not the user's intended traversal direction. For
+        // reverse/non-loop routes, forcing direction back to +1 could make the
+        // bot immediately walk the route backwards after a successful recovery.
+        if (state.direction !== 1 && state.direction !== -1)
+            state.direction = 1;
+        const wp = route[result.bestIdx];
+        state.recoveryLastTargetIndex = result.bestIdx;
+        state.recoveryLastTargetAt = Date.now();
+        state.recoveryLastTargetKey = `${wp.x},${wp.y},${wp.z}`;
+        bot.log(
+            `Cave: skipping to closest same-floor ${result.bestIsTransition ? 'transition ' : ''}waypoint #${result.bestIdx + 1} ` +
+            `(${wp.x}, ${wp.y}, ${wp.z}) – ${result.bestProgress} tiles away` +
+            `${avoidRepeat && (result.bestIdx !== avoidIndex || avoidKey !== `${wp.x},${wp.y},${wp.z}`) ? ' (avoided previous recovery target)' : ''}`
+        );
         goToWaypoint(wp);
         return wp;
     }
@@ -8294,6 +8472,127 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         stop();
         return null;
     }
+    // ---- TELEPORT / POSITION RESET SAFETY ----
+    // GM teleports, temple returns, death/reconnects and other server-side
+    // position changes can invalidate all special-waypoint state. Detect a
+    // large position jump before CaveBot starts acting on the old waypoint.
+    function detectUnexpectedPositionJump(position, now) {
+        if (!position || !state.lastObservedPosition) {
+            if (position)
+                state.lastObservedPosition = { x: position.x, y: position.y, z: position.z };
+            return false;
+        }
+
+        const prev = state.lastObservedPosition;
+        const dx = Math.abs(position.x - prev.x);
+        const dy = Math.abs(position.y - prev.y);
+        const dz = Math.abs(position.z - prev.z);
+        const jumped = (dx + dy >= 20) || dz >= 2;
+
+        state.lastObservedPosition = { x: position.x, y: position.y, z: position.z };
+        if (!jumped)
+            return false;
+
+        // Do not repeatedly reset on every tick after the jump.
+        if (now - state.lastTeleportResetAt < 1500)
+            return true;
+
+        state.lastTeleportResetAt = now;
+        state._standAttempt = null;
+        state._ropeUsed = undefined;
+        state._ropeNextUseAt = undefined;
+        state._ropeWaitingFloorChange = null;
+        state._shovelUsed = undefined;
+        state._shovelOpened = undefined;
+        state._shovelOpenedAt = undefined;
+        state._shovelRetry = null;
+        state._ladderUsed = undefined;
+        state._ladderWaitingFloorChange = null;
+        state.lastWaypointTarget = null;
+        state.pathAttemptStart = 0;
+        state.lastDistanceToWaypoint = null;
+        state.lastPathAt = 0;
+        state.stuckCount = 0;
+        state.stuckRecoveryAttempts = 0;
+        state.positionHistory = [];
+
+        const pf = window.gameClient?.world?.pathfinder;
+        if (pf) {
+            try { pf.setPathfindCache(null); } catch (e) {}
+            try { pf.__isAutoWalking = false; } catch (e) {}
+            try { pf.__finalDestination = null; } catch (e) {}
+            try { pf.__hybridPath = null; } catch (e) {}
+        }
+
+        bot.log(`Cave: unexpected position jump detected (${dx}, ${dy}, z ${dz}) – resetting navigation`);
+        return true;
+    }
+
+    // ---- DISTANCE SAFETY ----
+    // A waypoint more than the configured maxWaypointDistance away cannot be reached reliably from the
+    // current loaded area (and can happen after a GM teleport / temple return).
+    // Never let a special waypoint such as shovel/rope/ladder hold CaveBot there
+    // forever. Skip over every overlong waypoint immediately, up to one full route
+    // pass so loop mode can still find a nearby waypoint.
+    function skipOverlongWaypoints(position) {
+        if (!position || !route.length)
+            return null;
+
+        const limit = Math.max(1, Math.trunc(Number(config.maxWaypointDistance) || 50));
+        let skipped = 0;
+        const maxPasses = Math.max(1, route.length);
+
+        while (skipped < maxPasses) {
+            const wp = getCurrentWaypoint();
+            if (!wp || wp.x === undefined || wp.y === undefined || wp.z === undefined)
+                return wp;
+
+            const dx = Math.abs(position.x - wp.x);
+            const dy = Math.abs(position.y - wp.y);
+            const distance = Math.max(dx, dy);
+            if (distance <= limit)
+                return wp;
+
+            const oldIndex = state.currentIndex;
+            bot.log(`Cave: skipping waypoint #${oldIndex + 1} – ${distance} tiles away (limit ${limit})`);
+
+            // Clear any special-waypoint state before advancing so a stale shovel
+            // retry/opened flag can never follow us onto the next waypoint.
+            state._standAttempt = null;
+            state._ropeUsed = undefined;
+            state._ropeNextUseAt = undefined;
+            state._ropeWaitingFloorChange = null;
+            state._shovelUsed = undefined;
+            state._shovelOpened = undefined;
+            state._shovelOpenedAt = undefined;
+            state._shovelRetry = null;
+            state._ladderUsed = undefined;
+            state._ladderWaitingFloorChange = null;
+            state.lastWaypointTarget = null;
+            state.pathAttemptStart = 0;
+            state.lastDistanceToWaypoint = null;
+            state.lastPathAt = 0;
+
+            const next = advanceWaypoint();
+            skipped++;
+            if (!next)
+                return null;
+
+            // In non-loop mode advanceWaypoint can reverse direction at an end.
+            // If it brings us back to the same far waypoint, stop instead of
+            // cycling forever.
+            if (state.currentIndex === oldIndex) {
+                bot.log("Cave: no waypoint within distance limit – stopping");
+                stop();
+                return null;
+            }
+        }
+
+        bot.log("Cave: skipped a full route pass with no waypoint within distance limit – stopping");
+        stop();
+        return null;
+    }
+
     // ---- MAIN LOOP ----
     function scheduleNextTick() {
         if (!state.running)
@@ -8420,6 +8719,10 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             const positionKey = getPositionKey(position);
             const now = Date.now();
 
+            // Reset special waypoint state immediately after a GM teleport,
+            // temple return, floor jump or similar server-side relocation.
+            detectUnexpectedPositionJump(position, now);
+
             // ---- Helper: is the player currently targeting something? ----
             //function _hasTarget() {
             //    return !!window.gameClient?.player?.__target || !!bot.attack?.getCurrentTarget?.();
@@ -8427,6 +8730,17 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
             // ---- DECLARE WAYPOINT HERE ----
             let waypoint = getCurrentWaypoint();
+
+            // Hard distance guard applies to EVERY waypoint type, including
+            // shovel/rope/ladder. This is intentionally before special-waypoint
+            // handling so a GM teleport cannot leave us retrying a remote shovel.
+            if (waypoint && position) {
+                waypoint = skipOverlongWaypoints(position);
+                if (!waypoint) {
+                    scheduleNextTick();
+                    return;
+                }
+            }
 
             // ---- STAND WAYPOINT ----
             if (waypoint && waypoint.stand) {
@@ -8464,111 +8778,107 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                     return;
                 }
 
-                // ---- FLOOR CHECK: if waypoint is on different floor, mark reached ----
+                // ---- FLOOR CHECK ----
+                // IMPORTANT: A STAND waypoint may intentionally be saved on the
+                // destination floor of a hole. The player can therefore be on a
+                // different Z while the route is still correct. Do NOT recover to
+                // the closest waypoint here: that can select the ROPE waypoint on
+                // the other side of the same vertical transition and create an
+                // endless up/down loop.
+                //
+                // For a stand waypoint on a different floor, simply advance to the
+                // next route waypoint. The following STAND waypoint (the hole) owns
+                // the downward transition, while a ROPE waypoint owns the upward
+                // transition. We intentionally do not try to interpret or execute
+                // the floor change from this mismatch.
                 if (waypoint.z !== undefined && waypoint.z !== position.z) {
-                    bot.log(`Stand waypoint ${index + 1} is on different floor (${waypoint.z} vs ${position.z}), marking reached`);
-                    if (!state.standReached)
-                        state.standReached = {};
-                    state.standReached[index] = true;
                     delete state.standStartAt?.[index];
-                    waypoint = advanceWaypoint();
-                    if (!waypoint) {
+                    state._standAttempt = null;
+                    state.floorRecoveryLoop = null;
+
+                    const nextWp = advanceWaypoint();
+                    if (!nextWp) {
                         stop();
                         return;
                     }
-                    state._standAttempt = null;
+
+                    bot.log(`Cave: stand waypoint #${index + 1} is on floor ${waypoint.z}, player is on floor ${position.z} – advancing to next waypoint #${state.currentIndex + 1}`);
                     state.lastWaypointTarget = null;
                     state.pathAttemptStart = 0;
                     state.lastDistanceToWaypoint = null;
-                    state.stuckCount = 0;
-                    state.positionHistory = [];
-                    state.skipAttemptCount = 0;
-                    if (waypoint.x !== undefined) {
-                        state.lastWaypointTarget = waypoint;
-                        state.pathAttemptStart = Date.now();
-                        state.lastDistanceToWaypoint = getDistanceToWaypoint(position, waypoint);
-                        goToWaypoint(waypoint);
+                    state.stuckRecoveryAttempts = 0;
+                    state.recoverySideStepAttempts = 0;
+                    state.recoverySideStepLastKey = null;
+                    state.recoverySideStepOriginKey = null;
+                    state.recoveryBlockerWaitAt = 0;
+                    state.recoveryBlockerWaitKey = null;
+                    state.lastProgressAt = now;
+
+                    if (nextWp.x !== undefined && nextWp.y !== undefined) {
+                        state.lastWaypointTarget = nextWp;
+                        state.pathAttemptStart = now;
+                        state.lastDistanceToWaypoint = getDistanceToWaypoint(position, nextWp);
+                        goToWaypoint(nextWp);
                     }
                     return;
                 }
 
-                // ---- WALKABILITY CHECK: if tile is not walkable, mark reached ----
-                if (waypoint.x !== undefined && waypoint.y !== undefined && waypoint.z !== undefined) {
-                    if (!isTileWalkable(waypoint.x, waypoint.y, waypoint.z, true)) {
-                        bot.log(`Stand waypoint ${index + 1} is on non-walkable tile, marking reached`);
-                        if (!state.standReached)
-                            state.standReached = {};
-                        state.standReached[index] = true;
-                        delete state.standStartAt?.[index];
-                        waypoint = advanceWaypoint();
-                        if (!waypoint) {
-                            stop();
-                            return;
-                        }
-                        state._standAttempt = null;
-                        state.lastWaypointTarget = null;
-                        state.pathAttemptStart = 0;
-                        state.lastDistanceToWaypoint = null;
-                        state.stuckCount = 0;
-                        state.positionHistory = [];
-                        state.skipAttemptCount = 0;
-                        if (waypoint.x !== undefined) {
-                            state.lastWaypointTarget = waypoint;
-                            state.pathAttemptStart = Date.now();
-                            state.lastDistanceToWaypoint = getDistanceToWaypoint(position, waypoint);
-                            goToWaypoint(waypoint);
-                        }
-                        return;
-                    }
-                }
-
-                // ---- Record start time for this waypoint ----
-                if (!state.standStartAt)
-                    state.standStartAt = {};
-                if (!state.standStartAt[index]) {
-                    state.standStartAt[index] = now;
-                    bot.log(`Stand waypoint ${index + 1} start timer`);
-                }
-
-                // ---- Stuck timeout check ----
-                const stuckTimeout = config.stuckTimeoutMs || 2000;
-                if (now - state.standStartAt[index] > stuckTimeout) {
-                    if (!state.standReached)
-                        state.standReached = {};
-                    state.standReached[index] = true;
-                    delete state.standStartAt[index];
-                    bot.log(`Stand waypoint timed out after ${stuckTimeout / 1000}s, advancing`);
-                    waypoint = advanceWaypoint();
-                    if (!waypoint) {
-                        stop();
-                        return;
-                    }
-                    state._standAttempt = null;
-                    state.lastWaypointTarget = null;
-                    state.pathAttemptStart = 0;
-                    state.lastDistanceToWaypoint = null;
-                    state.stuckCount = 0;
-                    state.positionHistory = [];
-                    state.skipAttemptCount = 0;
-                    if (waypoint.x !== undefined) {
-                        state.lastWaypointTarget = waypoint;
-                        state.pathAttemptStart = Date.now();
-                        state.lastDistanceToWaypoint = getDistanceToWaypoint(position, waypoint);
-                        goToWaypoint(waypoint);
-                    }
-                    return;
-                }
+                // Do not infer waypoint completion from the tile walkability API.
+                // The client can report a valid waypoint as temporarily/unloaded/non-walkable,
+                // especially after teleports or when the local map cache is incomplete.
+                // A stand waypoint is completed only by actual arrival or the normal recovery rules.
 
                 const dx = Math.abs(position.x - waypoint.x);
                 const dy = Math.abs(position.y - waypoint.y);
                 const dz = position.z === waypoint.z;
                 const dist = Math.max(dx, dy);
 
+                // Start the stand timer only once we are actually on/next to the waypoint.
+                // A distant waypoint must not expire simply because it took Pathfinder
+                // more than a couple of seconds to reach it.
+                if (!state.standStartAt) state.standStartAt = {};
+                if (dist <= 1 && !state.standStartAt[index]) {
+                    state.standStartAt[index] = now;
+                    bot.log(`Stand waypoint ${index + 1} start timer`);
+                }
+
+                // If we are genuinely stalled at the waypoint, recover to the closest
+                // route waypoint instead of blindly advancing to the next waypoint.
+                const standTimeout = Math.max(5000, Number(config.standTimeoutMs) || 10000);
+                if (state.standStartAt[index] && now - state.standStartAt[index] > standTimeout) {
+                    delete state.standStartAt[index];
+                    state._standAttempt = null;
+                    bot.log(`Stand waypoint stalled for ${standTimeout / 1000}s – selecting recovery waypoint`);
+                    state.stuckRecoveryAttempts = 0;
+                    state.recoverySideStepAttempts = 0;
+                    state.recoverySideStepLastKey = null;
+                    state.recoverySideStepOriginKey = null;
+                    state.recoveryBlockerWaitAt = 0;
+                    state.recoveryBlockerWaitKey = null;
+                    state.lastRecoveryAt = now;
+                    const nextWp = skipToClosestWaypoint({
+                        allowTransitionFallback: true,
+                        excludeIndex: index,
+                        avoidIndex: state.recoveryLastTargetIndex,
+                        avoidKey: state.recoveryLastTargetKey
+                    });
+                    if (nextWp) {
+                        state.lastProgressAt = now;
+                        state.lastPathAt = 0;
+                        state.lastWaypointTarget = null;
+                        state._stuckLogged = false;
+                        return;
+                    }
+                    stop();
+                    return;
+                }
+
                 // ---- Exact arrival (on the tile) ----
                 if (dx === 0 && dy === 0 && dz) {
                     if (!state.standReached)
                         state.standReached = {};
                     state.standReached[index] = true;
+                    state.floorRecoveryLoop = null;
                     delete state.standStartAt[index];
                     state._standAttempt = null;
                     bot.log("Stand waypoint reached (exact tile)");
@@ -8645,19 +8955,88 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 const index = state.currentIndex;
                 const now = Date.now();
 
-                // ---- TIMEOUT TRACKING ----
+                // Rope actions are floor-change waypoints. Never mark the waypoint
+                // complete merely because the rope packet was sent; require the
+                // server to confirm an actual floor change first.
                 if (!state._ropeStartAt)
                     state._ropeStartAt = {};
                 if (!state._ropeStartAt[index])
                     state._ropeStartAt[index] = now;
-                const stuckTimeout = config.stuckTimeoutMs || 2000;
-                if (now - state._ropeStartAt[index] > stuckTimeout) {
-                    bot.log(`Rope waypoint ${index + 1} timed out after ${stuckTimeout / 1000}s – skipping`);
+
+                // Give the complete rope action a little more time than the global
+                // movement timeout. This prevents a valid rope use from being
+                // skipped while the server is still processing the floor change.
+                const ropeTimeout = Math.max(config.stuckTimeoutMs || 2000, 7000);
+
+                // ---- WAITING FOR FLOOR CHANGE AFTER USING ROPE ----
+                if (state._ropeWaitingFloorChange && state._ropeWaitingFloorChange.index === index) {
+                    if (position && position.z !== state._ropeWaitingFloorChange.fromZ) {
+                        if (!state._ropeUsed)
+                            state._ropeUsed = {};
+                        state._ropeUsed[index] = true;
+                        delete state._ropeStartAt[index];
+                        state._ropeWaitingFloorChange = null;
+                        bot.log("Rope waypoint: floor changed, advancing");
+
+                        const nextWp = advanceWaypoint();
+                        if (!nextWp) {
+                            stop();
+                            return;
+                        }
+                        state.lastWaypointTarget = null;
+                        state.pathAttemptStart = 0;
+                        state.lastDistanceToWaypoint = null;
+                        state.stuckCount = 0;
+                        state.positionHistory = [];
+                        state.skipAttemptCount = 0;
+                        if (nextWp.x !== undefined) {
+                            state.lastWaypointTarget = nextWp;
+                            state.pathAttemptStart = now;
+                            state.lastDistanceToWaypoint = getDistanceToWaypoint(position, nextWp);
+                            goToWaypoint(nextWp);
+                        }
+                        return;
+                    }
+
+                    if (now - state._ropeWaitingFloorChange.usedAt > 5000) {
+                        bot.log("Rope waypoint: floor change timeout, skipping");
+                        if (!state._ropeUsed)
+                            state._ropeUsed = {};
+                        state._ropeUsed[index] = true;
+                        delete state._ropeStartAt[index];
+                        state._ropeWaitingFloorChange = null;
+
+                        const nextWp = advanceWaypoint();
+                        if (!nextWp) {
+                            stop();
+                            return;
+                        }
+                        state.lastWaypointTarget = null;
+                        state.pathAttemptStart = 0;
+                        state.lastDistanceToWaypoint = null;
+                        state.stuckCount = 0;
+                        state.positionHistory = [];
+                        state.skipAttemptCount = 0;
+                        if (nextWp.x !== undefined) {
+                            state.lastWaypointTarget = nextWp;
+                            state.pathAttemptStart = now;
+                            state.lastDistanceToWaypoint = getDistanceToWaypoint(position, nextWp);
+                            goToWaypoint(nextWp);
+                        }
+                    }
+                    return;
+                }
+
+                // ---- OVERALL ROPE TIMEOUT ----
+                if (now - state._ropeStartAt[index] > ropeTimeout) {
+                    bot.log(`Rope waypoint ${index + 1} timed out after ${ropeTimeout / 1000}s – skipping`);
                     if (!state._ropeUsed)
                         state._ropeUsed = {};
                     state._ropeUsed[index] = true;
                     delete state._ropeStartAt[index];
-                    let nextWp = advanceWaypoint();
+                    state._ropeWaitingFloorChange = null;
+
+                    const nextWp = advanceWaypoint();
                     if (!nextWp) {
                         stop();
                         return;
@@ -8677,11 +9056,12 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                     return;
                 }
 
-                // ---- ALREADY USED ROPE ----
+                // ---- ALREADY CONFIRMED USED ROPE ----
                 if (state._ropeUsed && state._ropeUsed[index]) {
                     delete state._ropeStartAt[index];
+                    state._ropeWaitingFloorChange = null;
                     bot.log("Rope waypoint already used, advancing");
-                    let nextWp = advanceWaypoint();
+                    const nextWp = advanceWaypoint();
                     if (!nextWp) {
                         stop();
                         return;
@@ -8702,22 +9082,17 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                     return;
                 }
 
-                // ---- POSITION CHECK ----
-                if (!position) {
+                if (!position)
                     return;
-                }
 
-                // ---- TARGET CHECK: pause if we have a target ----
-                //if (_hasTarget()) {
-                //    bot.log("Rope waypoint paused – target active");
-                //    return;
-                //}
-
-                // If the waypoint is on a different floor, skip it
+                // A route can only use a rope from the floor on which the waypoint
+                // was recorded. If the player is already elsewhere, don't try to
+                // use the rope tile from a stale floor.
                 if (waypoint.z !== position.z) {
                     bot.log("Rope waypoint on different floor, skipping");
                     delete state._ropeStartAt[index];
-                    let nextWp = advanceWaypoint();
+                    state._ropeWaitingFloorChange = null;
+                    const nextWp = advanceWaypoint();
                     if (!nextWp) {
                         stop();
                         return;
@@ -8739,24 +9114,18 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
                 // ---- ADJACENCY CHECK (Chebyshev) ----
                 const adj = isAdjacentTile(position, waypoint);
-
-                // If not adjacent, try to move to an adjacent walkable tile
                 if (!adj) {
-                    // Find the best adjacent walkable tile near the rope spot
                     const adjPos = findAdjacentWalkablePosition(waypoint, position);
                     if (adjPos) {
                         bot.log(`Rope waypoint: moving to adjacent tile (${adjPos.x}, ${adjPos.y}, ${adjPos.z})`);
                         goToPosition(adjPos);
                         return;
-                    } else {
-                        // Fallback: try to path directly to the rope tile (may get stuck if occupied)
-                        bot.log("Rope waypoint: no adjacent walkable tile – pathing to rope tile");
-                        goToWaypoint(waypoint);
-                        return;
                     }
+                    bot.log("Rope waypoint: no adjacent walkable tile – pathing to rope tile");
+                    goToWaypoint(waypoint);
+                    return;
                 }
 
-                // ---- WE ARE ADJACENT (including on tile) – use rope ----
                 const tile = getTileAt(waypoint);
                 if (!tile) {
                     bot.log("Rope waypoint: tile not loaded");
@@ -8773,7 +9142,17 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                     return;
                 }
 
-                // Use rope on tile
+                // Avoid hammering the rope action if the client/server rejected
+                // the previous attempt. A short cooldown also gives the tile and
+                // server state time to settle between attempts.
+                if (!state._ropeNextUseAt)
+                    state._ropeNextUseAt = {};
+                if (state._ropeNextUseAt[index] && now < state._ropeNextUseAt[index])
+                    return;
+
+                // Use the rope, but only enter the waiting state when a real use
+                // method was available. Completion is confirmed by the next tick
+                // when the server reports a changed Z level.
                 try {
                     const source = {
                         which: ropeSource.which,
@@ -8783,45 +9162,35 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                         which: tile,
                         index: 0xFF
                     };
+                    let used = false;
+
                     if (window.gameClient?.mouse?.__handleItemUseWith) {
                         window.gameClient.mouse.__handleItemUseWith(source, target);
+                        used = true;
                         bot.log("Rope waypoint: used rope via mouse.__handleItemUseWith");
                     } else if (window.gameClient?.send && typeof ThingUseWithPacket === 'function') {
                         window.gameClient.send(new ThingUseWithPacket(source, target));
+                        used = true;
                         bot.log("Rope waypoint: used rope via ThingUseWithPacket");
                     } else {
+                        state._ropeNextUseAt[index] = now + 750;
                         bot.log("Rope waypoint: cannot use rope – no method available");
                     }
-                    // Mark as used and advance
-                    if (!state._ropeUsed)
-                        state._ropeUsed = {};
-                    state._ropeUsed[index] = true;
-                    delete state._ropeStartAt[index];
-                    bot.log("Rope waypoint: rope used, advancing");
-                    let nextWp = advanceWaypoint();
-                    if (!nextWp) {
-                        stop();
-                        return;
-                    }
-                    state.lastWaypointTarget = null;
-                    state.pathAttemptStart = 0;
-                    state.lastDistanceToWaypoint = null;
-                    state.stuckCount = 0;
-                    state.positionHistory = [];
-                    state.skipAttemptCount = 0;
-                    if (nextWp.x !== undefined) {
-                        state.lastWaypointTarget = nextWp;
-                        state.pathAttemptStart = now;
-                        state.lastDistanceToWaypoint = getDistanceToWaypoint(position, nextWp);
-                        goToWaypoint(nextWp);
+
+                    if (used) {
+                        state._ropeNextUseAt[index] = now + 1000;
+                        state._ropeWaitingFloorChange = {
+                            index,
+                            fromZ: position.z,
+                            usedAt: now
+                        };
+                        bot.log("Rope waypoint: rope used, waiting for floor change...");
                     }
                     return;
                 } catch (e) {
+                    state._ropeNextUseAt[index] = now + 1000;
                     bot.log("Rope waypoint: error using rope", e.message);
-                    if (!state._ropeUsed)
-                        state._ropeUsed = {};
-                    state._ropeUsed[index] = true;
-                    delete state._ropeStartAt[index];
+                    state._ropeWaitingFloorChange = null;
                     return;
                 }
             }
@@ -8830,6 +9199,20 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             if (waypoint && waypoint.shovel) {
                 const index = state.currentIndex;
                 const tileDist = Math.max(Math.abs(position.x - waypoint.x), Math.abs(position.y - waypoint.y));
+
+                // ---- SHOVEL RETRY SAFETY ----
+                // Never allow a failed floor change to hammer the shovel forever.
+                // A normal successful shovel should produce a server-confirmed Z
+                // change immediately; a few retries cover lag / a closing hole.
+                if (!state._shovelRetry || state._shovelRetry.index !== index) {
+                    state._shovelRetry = { index, count: 0, firstAt: now, lastTry: 0 };
+                }
+                const retryWindowMs = 10000;
+                const maxShovelRetries = 3;
+                if (now - state._shovelRetry.firstAt > retryWindowMs) {
+                    state._shovelRetry.count = 0;
+                    state._shovelRetry.firstAt = now;
+                }
 
                 // ---- CHECK IF ALREADY ENTERED HOLE (z changed) ----
                 if (position.z > waypoint.z) {
@@ -8977,10 +9360,33 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                         goToPosition(adjPos);
                         return;
                     } else {
-                        bot.log("Shovel waypoint: on target but no adjacent walkable tile, marking as used");
+                        // Never leave CaveBot sitting forever on an unusable
+                        // shovel tile. If we cannot get off the target tile,
+                        // abandon this special waypoint and continue the route.
+                        bot.log("Shovel waypoint: on target but no adjacent walkable tile – skipping");
                         if (!state._shovelUsed)
                             state._shovelUsed = {};
                         state._shovelUsed[index] = true;
+                        state._shovelOpened = undefined;
+                        state._shovelOpenedAt = undefined;
+                        state._shovelRetry = null;
+                        waypoint = advanceWaypoint();
+                        if (!waypoint) {
+                            stop();
+                            return;
+                        }
+                        state.lastWaypointTarget = null;
+                        state.pathAttemptStart = 0;
+                        state.lastDistanceToWaypoint = null;
+                        state.stuckCount = 0;
+                        state.positionHistory = [];
+                        state.skipAttemptCount = 0;
+                        if (waypoint.x !== undefined) {
+                            state.lastWaypointTarget = waypoint;
+                            state.pathAttemptStart = now;
+                            state.lastDistanceToWaypoint = getDistanceToWaypoint(position, waypoint);
+                            goToWaypoint(waypoint);
+                        }
                         return;
                     }
                 }
@@ -9009,6 +9415,37 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
                     const used = useToolOnTile(shovelSource, tile, waypoint, "Shovel waypoint used", now);
                     if (used) {
+                        state._shovelRetry.count++;
+                        state._shovelRetry.lastTry = now;
+
+                        if (state._shovelRetry.count > maxShovelRetries) {
+                            bot.log(`Shovel waypoint: ${maxShovelRetries} retries without floor change – skipping`);
+                            if (!state._shovelUsed)
+                                state._shovelUsed = {};
+                            state._shovelUsed[index] = true;
+                            state._shovelOpened = undefined;
+                            state._shovelOpenedAt = undefined;
+                            state._shovelRetry = null;
+                            waypoint = advanceWaypoint();
+                            if (!waypoint) {
+                                stop();
+                                return;
+                            }
+                            state.lastWaypointTarget = null;
+                            state.pathAttemptStart = 0;
+                            state.lastDistanceToWaypoint = null;
+                            state.stuckCount = 0;
+                            state.positionHistory = [];
+                            state.skipAttemptCount = 0;
+                            if (waypoint.x !== undefined) {
+                                state.lastWaypointTarget = waypoint;
+                                state.pathAttemptStart = now;
+                                state.lastDistanceToWaypoint = getDistanceToWaypoint(position, waypoint);
+                                goToWaypoint(waypoint);
+                            }
+                            return;
+                        }
+
                         if (!state._shovelOpened)
                             state._shovelOpened = {};
                         if (!state._shovelOpenedAt)
@@ -9050,9 +9487,9 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                     state._ladderStartAt = {};
                 if (!state._ladderStartAt[index])
                     state._ladderStartAt[index] = now;
-                const stuckTimeout = config.stuckTimeoutMs || 2000;
-                if (now - state._ladderStartAt[index] > stuckTimeout) {
-                    bot.log(`Ladder waypoint ${index + 1} timed out after ${stuckTimeout / 1000}s – skipping`);
+                const ladderTimeout = Math.max(config.stuckTimeoutMs || 2000, 7000);
+                if (now - state._ladderStartAt[index] > ladderTimeout) {
+                    bot.log(`Ladder waypoint ${index + 1} timed out after ${ladderTimeout / 1000}s – skipping`);
                     if (!state._ladderUsed)
                         state._ladderUsed = {};
                     state._ladderUsed[index] = true;
@@ -9210,6 +9647,13 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                     return;
                 }
 
+                // A failed ladder use should not be retried every CaveBot tick.
+                // Give the client/tile a short moment before trying again.
+                if (!state._ladderNextUseAt)
+                    state._ladderNextUseAt = {};
+                if (state._ladderNextUseAt[index] && now < state._ladderNextUseAt[index])
+                    return;
+
                 let used = false;
                 try {
                     if (window.gameClient?.mouse?.use) {
@@ -9222,13 +9666,16 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                         window.gameClient.send(new UsePacket(tile, 0xFF));
                         used = true;
                     } else {
+                        state._ladderNextUseAt[index] = now + 750;
                         bot.log("Ladder waypoint: cannot use tile – no method available");
                     }
                 } catch (e) {
+                    state._ladderNextUseAt[index] = now + 1000;
                     bot.log("Ladder waypoint: error using ladder", e.message);
                 }
 
                 if (used) {
+                    state._ladderNextUseAt[index] = now + 1000;
                     // Start waiting for floor change
                     state._ladderWaitingFloorChange = {
                         index: index,
@@ -9277,10 +9724,64 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             if (positionKey && positionKey !== state.lastPositionKey) {
                 madeProgress = true;
                 state.lastPositionKey = positionKey;
-                state.lastProgressAt = now;
                 state.stuckCount = 0;
-                state.stuckRecoveryAttempts = 0;
-                state.lastRecoveryAt = 0;
+                // Normal movement resets recovery state, but movement caused by a
+                // recovery sidestep must NOT reset it. Otherwise a one-tile sidestep
+                // on a shoreline counts as fresh progress and starts the same
+                // two-repath cycle again forever.
+                const recoveryMoveActive = state.recoverySideStepAttempts > 0 || state.stuckRecoveryAttempts > 0;
+                if (!recoveryMoveActive) {
+                    state.stuckRecoveryAttempts = 0;
+                    state.lastRecoveryAt = 0;
+                    state.recoverySideStepAt = 0;
+                    state.recoverySideStepAttempts = 0;
+                    state.recoverySideStepLastKey = null;
+                    state.recoverySideStepOriginKey = null;
+                    state.recoveryBlockerWaitAt = 0;
+                    state.recoveryBlockerWaitKey = null;
+                    state.recoveryBestDistance = Infinity;
+                    state.recoveryNoProgressAt = 0;
+                    state.recoveryLastTargetIndex = -1;
+                    state.recoveryLastTargetAt = 0;
+                    state.recoveryLastTargetKey = null;
+                } else {
+                    // Merely changing tiles is not necessarily route progress: an
+                    // unreachable Pathfinder target can make the player oscillate
+                    // between two or three nearby tiles. Keep recovery armed until
+                    // the distance to the current waypoint actually improves.
+                    const recoveryWp = getCurrentWaypoint();
+                    const recoveryDist = recoveryWp
+                        ? getDistanceToWaypoint(position, recoveryWp)
+                        : Infinity;
+                    const windowMs = Math.max(1000, Number(config.recoveryNoProgressWindowMs) || 5000);
+                    if (Number.isFinite(recoveryDist)) {
+                        if (!Number.isFinite(state.recoveryBestDistance) || recoveryDist < state.recoveryBestDistance) {
+                            state.recoveryBestDistance = recoveryDist;
+                            state.recoveryNoProgressAt = now;
+                            // Only real route progress resets the global stall timer
+                            // while recovery is active. A monster pushing us around
+                            // must not keep postponing waypoint recovery indefinitely.
+                            state.lastProgressAt = now;
+                        } else if (!state.recoveryNoProgressAt) {
+                            state.recoveryNoProgressAt = now;
+                        }
+                    }
+                    // Once recovery has failed to make any measurable route progress
+                    // for the whole window, allow a genuinely successful movement cycle
+                    // to reset the counters again.
+                    if (state.recoveryNoProgressAt && now - state.recoveryNoProgressAt >= windowMs) {
+                        state.stuckRecoveryAttempts = 0;
+                        state.lastRecoveryAt = 0;
+                        state.recoverySideStepAt = 0;
+                        state.recoverySideStepAttempts = 0;
+                        state.recoverySideStepLastKey = null;
+                        state.recoverySideStepOriginKey = null;
+                        state.recoveryBlockerWaitAt = 0;
+                        state.recoveryBlockerWaitKey = null;
+                        state.recoveryBestDistance = recoveryDist;
+                        state.recoveryNoProgressAt = now;
+                    }
+                }
                 state.positionHistory = [];
             }
             if (now - state.lastStairsUseAt < 2000) {
@@ -9299,8 +9800,12 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                     // First recover by rebuilding the native path. This avoids
                     // skipping a perfectly valid waypoint just because one path
                     // attempt got blocked by a creature, door, or transient state.
-                    if (state.stuckRecoveryAttempts < 2) {
+                    const maxRepathRecoveries = Math.max(0, Math.trunc(Number(config.maxRepathRecoveries) || 2));
+                    if (state.stuckRecoveryAttempts < maxRepathRecoveries) {
                         state.stuckRecoveryAttempts++;
+                        const recoveryDistance = getDistanceToWaypoint(position, currentWp);
+                        state.recoveryBestDistance = Number.isFinite(recoveryDistance) ? recoveryDistance : Infinity;
+                        state.recoveryNoProgressAt = now;
                         state.lastRecoveryAt = now;
 
                         const pf = window.gameClient?.world?.pathfinder;
@@ -9326,6 +9831,135 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                         return;
                     }
 
+                    // If a creature is occupying a useful adjacent tile, give it a
+                    // short grace period to move before we sidestep. This avoids
+                    // unnecessary detours when a player/monster is only temporarily
+                    // blocking a one-tile route. Static map/item blockers are not
+                    // treated as temporary here.
+                    const blockerWaitMs = Math.max(0, Number(config.temporaryBlockerWaitMs) || 2500);
+                    const posForBlocker = normalizePosition(bot.getPlayerPosition());
+                    let temporaryBlockerConfirmed = false;
+                    if (posForBlocker && now - state.recoveryBlockerWaitAt > blockerWaitMs) {
+                        const dxToWp = Math.sign(currentWp.x - posForBlocker.x);
+                        const dyToWp = Math.sign(currentWp.y - posForBlocker.y);
+                        const probeOffsets = [];
+                        if (dxToWp || dyToWp) {
+                            probeOffsets.push({ dx: dxToWp, dy: dyToWp });
+                            if (dxToWp) probeOffsets.push({ dx: dxToWp, dy: 0 });
+                            if (dyToWp) probeOffsets.push({ dx: 0, dy: dyToWp });
+                        }
+                        const creatures = window.gameClient?.world?.activeCreatures || {};
+                        let temporaryBlocker = false;
+                        for (const off of probeOffsets) {
+                            const bx = posForBlocker.x + off.dx;
+                            const by = posForBlocker.y + off.dy;
+                            if (!isTileWalkable(bx, by, posForBlocker.z, true)) continue;
+                            if (isTileOccupiedByCreature(bx, by, posForBlocker.z)) {
+                                temporaryBlocker = true;
+                                break;
+                            }
+                        }
+                        if (temporaryBlocker) {
+                            temporaryBlockerConfirmed = true;
+                            const blockerKey = `${posForBlocker.x},${posForBlocker.y},${posForBlocker.z}|${currentWp.x},${currentWp.y},${currentWp.z}`;
+                            if (state.recoveryBlockerWaitKey !== blockerKey) {
+                                state.recoveryBlockerWaitKey = blockerKey;
+                                state.recoveryBlockerWaitAt = now;
+                                state.lastProgressAt = now;
+                                state.lastPathAt = 0;
+                                state.lastWaypointTarget = null;
+                                bot.log(`Cave: temporary creature blocker detected – waiting ${blockerWaitMs / 1000}s before sidestep`);
+                                return;
+                            }
+                            if (now - state.recoveryBlockerWaitAt < blockerWaitMs) {
+                                state.lastProgressAt = now;
+                                return;
+                            }
+                        } else {
+                            state.recoveryBlockerWaitKey = null;
+                            state.recoveryBlockerWaitAt = 0;
+                        }
+                    }
+
+                    // Before abandoning the current waypoint, make one controlled
+                    // side-step around a temporary blocker (creature/door/one-tile
+                    // obstruction). This keeps the route intact instead of jumping
+                    // to an unrelated waypoint too early.
+                    // Sidestep only when we actually confirmed a temporary creature
+                    // blocker. Never sidestep blindly after Pathfinder failures: that
+                    // can make the bot bounce along a shoreline/water edge while the
+                    // native Pathfinder keeps insisting on an unreachable island route.
+                    const maxRecoverySideSteps = Math.max(0, Math.trunc(Number(config.maxRecoverySideSteps) || 2));
+                    const recoverySideStepCooldownMs = Math.max(250, Number(config.recoverySideStepCooldownMs) || 1500);
+                    if (temporaryBlockerConfirmed && state.recoverySideStepAttempts < maxRecoverySideSteps && now - state.recoverySideStepAt > recoverySideStepCooldownMs) {
+                        const posNow = normalizePosition(bot.getPlayerPosition());
+                        if (posNow) {
+                            const candidates = [
+                                { dx: 1, dy: 0 }, { dx: -1, dy: 0 },
+                                { dx: 0, dy: 1 }, { dx: 0, dy: -1 },
+                                { dx: 1, dy: 1 }, { dx: 1, dy: -1 },
+                                { dx: -1, dy: 1 }, { dx: -1, dy: -1 }
+                            ];
+                            // Prefer recovery tiles that keep the character aligned with
+                            // the waypoint instead of simply choosing the mathematically
+                            // closest tile. This is especially useful around corners and
+                            // narrow corridors where a diagonal/side move can otherwise
+                            // send the character farther around the wrong side of a block.
+                            const toWpX = currentWp.x - posNow.x;
+                            const toWpY = currentWp.y - posNow.y;
+                            candidates.sort((a, b) => {
+                                const score = (c) => {
+                                    const nx = posNow.x + c.dx;
+                                    const ny = posNow.y + c.dy;
+                                    const dist = Math.max(
+                                        Math.abs(nx - currentWp.x),
+                                        Math.abs(ny - currentWp.y)
+                                    );
+                                    const dot = (c.dx * toWpX) + (c.dy * toWpY);
+                                    const primaryAxis = Math.max(Math.abs(toWpX), Math.abs(toWpY));
+                                    const diagonalPenalty = (c.dx !== 0 && c.dy !== 0 && primaryAxis > 0) ? 0.15 : 0;
+                                    // A positive dot means the step generally points toward
+                                    // the waypoint; prefer it without making distance the only
+                                    // deciding factor.
+                                    const directionPenalty = dot < 0 ? 1.5 : (dot === 0 ? 0.35 : 0);
+                                    return dist + directionPenalty + diagonalPenalty;
+                                };
+                                return score(a) - score(b);
+                            });
+                            for (const c of candidates) {
+                                const nx = posNow.x + c.dx;
+                                const ny = posNow.y + c.dy;
+                                if (bot.blacklist?.isBlacklisted(nx, ny, posNow.z)) continue;
+                                if (!isTileWalkable(nx, ny, posNow.z, true)) continue;
+                                const candidateKey = `${nx},${ny},${posNow.z}`;
+                                if (state.recoverySideStepLastKey === candidateKey) continue;
+                                if (state.recoverySideStepOriginKey === candidateKey) continue;
+                                state.recoverySideStepAt = now;
+                                state.recoveryBlockerWaitAt = 0;
+                                state.recoveryBlockerWaitKey = null;
+                                state.recoverySideStepAttempts++;
+                                state.recoverySideStepOriginKey = `${posNow.x},${posNow.y},${posNow.z}`;
+                                state.recoverySideStepLastKey = candidateKey;
+                                // Do NOT reset stuckRecoveryAttempts here. The two native
+                                // repath attempts and the limited side-step attempts form
+                                // one bounded recovery cycle. Resetting this counter caused
+                                // a permanent loop where every side-step started a fresh
+                                // recovery cycle and closest-waypoint recovery was never
+                                // reached after a teleport onto the wrong island.
+                                state.lastRecoveryAt = now;
+                                state.lastProgressAt = now;
+                                state.lastWaypointTarget = null;
+                                state.lastPathAt = 0;
+                                bot.log(
+                                    `Cave: temporary obstruction – side-step ${state.recoverySideStepAttempts}/${maxRecoverySideSteps} ` +
+                                    `to (${nx}, ${ny}) before final waypoint recovery`
+                                );
+                                goToPosition({ x: nx, y: ny, z: posNow.z });
+                                return;
+                            }
+                        }
+                    }
+
                     // Only after repeated genuine failures use the existing
                     // closest-waypoint recovery policy.
                     bot.log(
@@ -9334,9 +9968,26 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                     );
 
                     state.stuckRecoveryAttempts = 0;
+                    state.recoverySideStepAttempts = 0;
+                    state.recoverySideStepLastKey = null;
+                    state.recoverySideStepOriginKey = null;
+                    state.recoveryBlockerWaitAt = 0;
+                    state.recoveryBlockerWaitKey = null;
+                    state.recoveryBestDistance = Infinity;
+                    state.recoveryNoProgressAt = 0;
                     state.lastRecoveryAt = now;
 
-                    const nextWp = skipToClosestWaypoint();
+                    // If the stalled waypoint itself is an actual movement transition
+                    // (rope/shovel/ladder/stand), give recovery one conservative transition
+                    // fallback too. SCRIPT waypoints are deliberately excluded from all
+                    // recovery checks and never enable this fallback.
+                    const allowTransitionFallback = isRecoveryTransitionWaypoint(currentWp);
+                    const nextWp = skipToClosestWaypoint({
+                        allowTransitionFallback,
+                        excludeIndex: allowTransitionFallback ? state.currentIndex : -1,
+                        avoidIndex: state.recoveryLastTargetIndex,
+                        avoidKey: state.recoveryLastTargetKey
+                    });
                     if (nextWp) {
                         state.lastProgressAt = now;
                         state.lastPathAt = 0;
@@ -9507,7 +10158,97 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     }
 
     // ---- OBSERVER (learn transitions in background) ----
+    // The native Pathfinder explicitly reports a hard routing failure through
+    // the DOM cancel-message element.  Treat "There is no way." as a stronger
+    // signal than ordinary movement stalls: a wall/static map blocker can keep
+    // the player moving because creatures push them around, which would otherwise
+    // delay route-level recovery indefinitely.
+    function installNoWayObserver() {
+        if (state.noWayObserver)
+            return;
+
+        const attach = () => {
+            const element = document.getElementById("notification");
+            if (!element || !window.MutationObserver)
+                return false;
+
+            const check = () => {
+                if (!state.running)
+                    return;
+                const text = String(element.textContent || "").trim();
+                if (!text || !/there is no way\.?/i.test(text))
+                    return;
+
+                const now = Date.now();
+                // The same DOM message can fire several mutation records.
+                if (text === state.noWayLastText && now - state.noWayLastSeenAt < 1000)
+                    return;
+                state.noWayLastText = text;
+                state.noWayLastSeenAt = now;
+
+                // Do not repeatedly re-arm recovery from the same DOM message while
+                // CaveBot is still working on the same waypoint. The notification
+                // element can receive unrelated mutations without representing a
+                // genuinely new Pathfinder failure. A different current waypoint
+                // is allowed to trigger recovery again.
+                if (state.noWayRecoveryIndex === state.currentIndex)
+                    return;
+                state.noWayRecoveryIndex = state.currentIndex;
+
+                const maxRepathRecoveries = Math.max(0, Math.trunc(Number(config.maxRepathRecoveries) || 2));
+                const maxRecoverySideSteps = Math.max(0, Math.trunc(Number(config.maxRecoverySideSteps) || 2));
+
+                // A native "There is no way." means Pathfinder already exhausted
+                // its route to this destination. Skip the normal repath/blocker
+                // grace stages and let the existing closest-waypoint recovery run
+                // on the next CaveBot tick. This does not alter STAND floor-mismatch
+                // semantics and SCRIPT remains completely outside recovery checks.
+                state.stuckRecoveryAttempts = maxRepathRecoveries;
+                state.recoverySideStepAttempts = maxRecoverySideSteps;
+                state.recoveryBlockerWaitAt = now;
+                state.recoveryBlockerWaitKey = null;
+                state.recoveryBestDistance = Infinity;
+                state.recoveryNoProgressAt = now;
+                state.lastRecoveryAt = 0;
+                state.lastProgressAt = now - Math.max(1000, Number(config.stuckTimeoutMs) || 5000) - 1;
+                state._stuckLogged = false;
+                bot.log('Cave: Pathfinder reported "There is no way." – forcing waypoint recovery');
+            };
+
+            const observer = new MutationObserver(check);
+            observer.observe(element, {
+                childList: true,
+                characterData: true,
+                subtree: true
+            });
+            state.noWayObserver = observer;
+            check();
+            return true;
+        };
+
+        if (attach())
+            return;
+
+        // UI may not have created #notification yet. Retry briefly without
+        // introducing another permanent polling loop.
+        const retryId = window.setInterval(() => {
+            if (attach())
+                window.clearInterval(retryId);
+        }, 500);
+        bot.addCleanup(() => window.clearInterval(retryId));
+    }
+
+    function stopNoWayObserver() {
+        if (state.noWayObserver) {
+            try {
+                state.noWayObserver.disconnect();
+            } catch (e) {}
+            state.noWayObserver = null;
+        }
+    }
+
     function startObserver() {
+        installNoWayObserver();
         if (state.observerTimerId != null)
             return;
         state.observerTimerId = window.setInterval(() => {
@@ -9532,6 +10273,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             state.fallbackMoveTimerId = null;
         }
         stopObserver();
+        stopNoWayObserver();
         if (state.timerId != null) {
             clearTimeout(state.timerId);
             state.timerId = null;
@@ -9566,6 +10308,9 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         state.lastRecoveryAt = 0;
         state.pausedForCombat = false;
         state.pathAttemptStart = 0;
+        state.noWayLastSeenAt = 0;
+        state.noWayLastText = "";
+        state.noWayRecoveryIndex = -1;
         state.currentIndex = findClosestWaypointIndex(pos);
         if (config.loopMode) {
             state.direction = 1; // always forward when looping
@@ -12514,7 +13259,7 @@ window.__minibiaBotBundle.installLightHackLegitModule = function installLightHac
 
 /**
  * ==================================================================================
- * NOTIFICATION MODULE – Shows toast alerts for alarms
+ * NOTIFICATION MODULE – Shows toast alerts for alarms (top-right, 15s)
  * ==================================================================================
  */
 window.__minibiaBotBundle.installNotificationModule = function installNotificationModule(bot) {
@@ -12528,7 +13273,8 @@ window.__minibiaBotBundle.installNotificationModule = function installNotificati
       #mb-notification-container {
         position: fixed;
         top: 0px;
-        left: 224px;
+        right: 224px;
+        left: auto;
         z-index: 9999999;
         display: flex;
         flex-direction: column;
@@ -12555,7 +13301,7 @@ window.__minibiaBotBundle.installNotificationModule = function installNotificati
       }
       .mb-notification.hiding {
         opacity: 0;
-        transform: translateX(-40px);
+        transform: translateX(40px);
       }
       .mb-notification .mb-notif-title {
         font-weight: bold;
@@ -12593,7 +13339,7 @@ window.__minibiaBotBundle.installNotificationModule = function installNotificati
     // Track active notifications by type
     const activeNotifications = new Map(); // type -> { element, timer }
 
-    function showNotification(title, message, type = 'alarm', duration = 5000) {
+    function showNotification(title, message, type = 'alarm', duration = 15000) {
         // Remove existing notification of the same type (if any)
         if (activeNotifications.has(type)) {
             const old = activeNotifications.get(type);
@@ -12671,7 +13417,7 @@ window.__minibiaBotBundle.installNotificationModule = function installNotificati
         return orig.playMessageAlarm.call(this);
     };
 
-    bot.log('Notification system updated – top‑left, one per type.');
+    bot.log('Notification system updated – top-right, 15s, one per type.');
 };
 
 /**
@@ -18370,7 +19116,16 @@ function upgradeSectionHeaders(panel) {
 #minibia-bot-panel[data-collapsed="true"] .mb-body {
   display: none !important;
 }
-#minibia-bot-panel[data-collapsed="true"] .mb-titlebar {
+#minibia-bot-panel .mb-title-version {
+    font-size: 0.72em;
+    font-weight: 600;
+    opacity: 0.72;
+    margin-left: 4px;
+  }
+  #minibia-bot-panel[data-collapsed="true"] .mb-title-version {
+    display: none;
+  }
+  #minibia-bot-panel[data-collapsed="true"] .mb-titlebar {
   border-bottom: none;
 }
 
@@ -18804,7 +19559,7 @@ function upgradeSectionHeaders(panel) {
         panel.id = "minibia-bot-panel";
         panel.innerHTML = `
 <div class="mb-titlebar">
-  <div class="mb-title">MBot</div>
+  <div class="mb-title">mb0t <span class="mb-title-version">v1.4.36</span></div>
   <div class="mb-title-status">
     <span class="mb-run-indicator" id="minibia-bot-title-cave-status" data-running="false"><span class="mb-run-dot"></span><span class="mb-run-label">🏃‍♂️‍➡️</span></span>
     <span class="mb-run-indicator" id="minibia-bot-title-attack-status" data-running="false"><span class="mb-run-dot"></span><span class="mb-run-label">⚔️</span></span>
