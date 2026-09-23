@@ -2220,6 +2220,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         noTargetBeepLast: 0,
         itemCountRequestAt: 0,
         itemAlertLast: {}, // itemId -> timestamp
+        lowCapBeepLast: 0,
     };
 
     const config = Object.assign({
@@ -2244,6 +2245,9 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         noTargetBeep: false,
         noTargetDelayMs: 10000,
         noTargetRepeatMs: 30000,
+        lowCapBeep: false,
+        lowCapThreshold: 100,
+        lowCapRepeatMs: 30000,
         itemAlerts: [], // [{ id, name, threshold, cooldownMs }]
         trustedNames: [],
         gameMasterNames: [],
@@ -2908,6 +2912,23 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
             }
         }
 
+        // ---- Low capacity ----
+        if (config.lowCapBeep) {
+            let capacity = null;
+            try { capacity = Number(bot.getPlayerSnapshot?.().capacity); } catch {}
+            if (Number.isFinite(capacity)) {
+                if (capacity < Math.max(0, Number(config.lowCapThreshold) || 0)) {
+                    if (now - state.lowCapBeepLast >= Math.max(1000, Number(config.lowCapRepeatMs) || 30000)) {
+                        state.lowCapBeepLast = now;
+                        playItemLowBeep();
+                        bot.log(`Audio alert: low capacity (${capacity.toFixed(0)} < ${Number(config.lowCapThreshold) || 0})`);
+                    }
+                } else {
+                    state.lowCapBeepLast = 0;
+                }
+            }
+        }
+
         // ---- Item count alerts (potions / fluids) ----
         if (config.itemAlerts && config.itemAlerts.length) {
             // Ask the server for a fresh count, throttled.
@@ -3004,6 +3025,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
             config.lowHealthBeep ||
             config.manaFullBeep ||
             config.noTargetBeep ||
+            config.lowCapBeep ||
             (config.itemAlerts && config.itemAlerts.length > 0));
     }
 
@@ -3100,6 +3122,15 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         }
         if (next.noTargetRepeatMs !== undefined) {
             next.noTargetRepeatMs = Math.max(1000, Number(next.noTargetRepeatMs) || 30000);
+        }
+        if (next.lowCapThreshold !== undefined) {
+            next.lowCapThreshold = Math.max(0, Number(next.lowCapThreshold) || 0);
+        }
+        if (next.lowCapRepeatMs !== undefined) {
+            next.lowCapRepeatMs = Math.max(1000, Number(next.lowCapRepeatMs) || 30000);
+        }
+        if (next.lowCapBeep !== undefined) {
+            next.lowCapBeep = !!next.lowCapBeep;
         }
         if (Array.isArray(next.itemAlerts)) {
             next.itemAlerts = next.itemAlerts
@@ -3616,6 +3647,7 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
         lastAttemptAt: {},
         pendingAttempt: {},
         manualCooldownUntil: {},
+        lastParalyzeAt: 0,
     };
 
     const config = Object.assign({
@@ -3627,6 +3659,10 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
         healRules: [],
         skipOnCooldown: true,
         debugCooldown: false,
+        paralyzeEnabled: false,
+        paralyzeSpellWords: "",
+        paralyzeMinHpPercent: 70,
+        paralyzeCooldownMs: 1500,
     }, bot.storage.get(configStorageKey, {}));
 
     delete config.hpHotbarSlot;
@@ -4000,12 +4036,40 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
         return clicked;
     }
 
+    function tryClearParalyze(stats, now) {
+        if (!config.paralyzeEnabled || !String(config.paralyzeSpellWords || "").trim())
+            return false;
+        const player = window.gameClient?.player;
+        const paralyzeId = typeof ConditionManager !== "undefined" ? ConditionManager.prototype.PARALYZE : 16;
+        if (!player?.hasCondition?.(paralyzeId))
+            return false;
+        const hp = getHpPercent(stats);
+        if (hp < Math.max(0, Math.min(100, Number(config.paralyzeMinHpPercent) || 0)))
+            return false;
+        if (now - (state.lastParalyzeAt || 0) < Math.max(250, Number(config.paralyzeCooldownMs) || 1500))
+            return false;
+        if (isPlayerExhausted())
+            return false;
+        const words = String(config.paralyzeSpellWords).trim();
+        if (config.skipOnCooldown && isSpellWordOnCooldown(words))
+            return false;
+        const sent = bot.sendChat(words);
+        if (sent) {
+            state.lastParalyzeAt = now;
+            if (config.debugCooldown)
+                bot.log(`[Heal] Cleared paralyze with ${words} at ${hp.toFixed(0)}% HP`);
+        }
+        return sent;
+    }
+
     function tryHeal() {
         if (!config.enabled)
             return false;
         var now = Date.now();
         var stats = readStats();
         resolvePending(stats, now);
+        if (tryClearParalyze(stats, now))
+            return true;
         if (hasPending())
             return false;
 
@@ -4084,6 +4148,10 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
                 healRules: config.healRules,
                 skipOnCooldown: config.skipOnCooldown,
                 debugCooldown: config.debugCooldown,
+                paralyzeEnabled: config.paralyzeEnabled,
+                paralyzeSpellWords: config.paralyzeSpellWords,
+                paralyzeMinHpPercent: config.paralyzeMinHpPercent,
+                paralyzeCooldownMs: config.paralyzeCooldownMs,
             },
             stats: stats,
             hpPercent: getHpPercent(stats),
@@ -4109,6 +4177,10 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
         }
         for (var k in next)
             config[k] = next[k];
+        config.paralyzeEnabled = config.paralyzeEnabled === true;
+        config.paralyzeSpellWords = String(config.paralyzeSpellWords || "").trim();
+        config.paralyzeMinHpPercent = Math.max(0, Math.min(100, Number(config.paralyzeMinHpPercent) || 0));
+        config.paralyzeCooldownMs = Math.max(250, Number(config.paralyzeCooldownMs) || 1500);
         delete config.hpHotbarSlot;
         delete config.manaHotbarSlot;
         delete config.minHp;
@@ -6702,6 +6774,10 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         standTimeoutMs: 10000,
         maxSkipAttempts: 10,
         maxWaypointDistance: 50,
+        // Walk through magic fields (fire/energy/poison) by default.
+        // The option only affects CaveBot pathfinding; normal map collision
+        // objects such as walls remain blocked.
+        ignoreFields: true,
         // Recovery movement must make real route progress before its failure counters reset.
         // This prevents short A↔B oscillations from creating an endless fresh recovery cycle.
         recoveryNoProgressWindowMs: 5000,
@@ -6728,6 +6804,9 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     },
             bot.storage.get(configStorageKey, {}));
     config.tickMs = 500;
+    // Recovery distance is intentionally capped at 50 tiles. A persisted value
+    // from an older build must not silently expand the recovery search again.
+    config.maxWaypointDistance = Math.max(1, Math.min(50, Math.trunc(Number(config.maxWaypointDistance) || 50)));
 
     // ---- PRESET MANAGEMENT ----
     function normalizePresetName(value) {
@@ -7763,6 +7842,174 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         return d <= Math.max(0, Number(config.waypointTolerance) || 0);
     }
 
+    // ---- FIELD-IGNORING CAVEBOT PATHFINDER ----
+    // Native Pathfinder treats some magic-field sprites as blocking. CaveBot can
+    // optionally override that decision without weakening normal wall/item
+    // collision. The override is active only while CaveBot itself is requesting
+    // a path, so other modules keep the game's normal pathing rules.
+    function isMagicFieldItem(item) {
+        if (!item)
+            return false;
+        try {
+            const def = window.gameClient?.itemDefinitionsByCid?.[item.id];
+            if (def?.properties?.type === "magicfield")
+                return true;
+            const sidDef = item.sid != null ? window.gameClient?.itemDefinitionsBySid?.[item.sid] : null;
+            if (sidDef?.properties?.type === "magicfield")
+                return true;
+        } catch (e) {}
+        return false;
+    }
+
+    function caveFieldPassable(tile, destination = null) {
+        if (!tile || tile.id === 0)
+            return false;
+
+        const items = Array.isArray(tile.items) ? tile.items : [];
+        const hasMagicField = items.some(item => isMagicFieldItem(item));
+
+        // Native Tile.isWalkable() can report false solely because a magic field is
+        // sitting on an otherwise perfectly walkable ground tile. When field-ignore
+        // mode is enabled, do not let that stack item turn the tile into a wall.
+        // Still require either native walkability or an explicitly walkable ground
+        // item; a real wall/water/void tile remains blocked.
+        if (!tile.isWalkable?.() && !tile.__hasWalkableGroundItem?.() && !hasMagicField)
+            return false;
+
+        for (const item of items) {
+            if (!item || isMagicFieldItem(item))
+                continue;
+            if (typeof item.isWalkable === "function" && !item.isWalkable())
+                return false;
+            if (typeof item.hasFlag === "function" &&
+                typeof PropBitFlag !== "undefined" &&
+                item.hasFlag(PropBitFlag.prototype.flags.DatFlagNotPathable)) {
+                if (tile !== destination)
+                    return false;
+            }
+        }
+
+        // Preserve floor-change / stair restrictions. A transition destination can
+        // itself be the final tile; intermediate floor-change tiles remain blocked.
+        if (tile !== destination && tile.isNotPathable?.()) {
+            let onlyFieldNotPathable = true;
+            if (typeof tile.hasFlag === "function" && typeof PropBitFlag !== "undefined" &&
+                tile.hasFlag(PropBitFlag.prototype.flags.DatFlagNotPathable)) {
+                onlyFieldNotPathable = false;
+            }
+            for (const item of items) {
+                if (isMagicFieldItem(item)) continue;
+                if (typeof item.hasFlag === "function" && typeof PropBitFlag !== "undefined" &&
+                    item.hasFlag(PropBitFlag.prototype.flags.DatFlagNotPathable)) {
+                    onlyFieldNotPathable = false;
+                    break;
+                }
+            }
+            if (!onlyFieldNotPathable)
+                return false;
+        }
+
+        // Creatures remain blockers. A field never makes a creature disappear.
+        const player = window.gameClient?.player;
+        const blockers = Array.from(tile.monsters || []).filter(c => {
+            if (!c || c === player) return false;
+            if (typeof c.isMoving === "function" && c.isMoving()) return false;
+            if (c.outfit?.verifiedGhost === true) return false;
+            return true;
+        });
+        if (blockers.length)
+            return false;
+
+        return true;
+    }
+
+    function installFieldIgnoringPathfinder() {
+        const pf = window.gameClient?.world?.pathfinder;
+        if (!pf || typeof pf.search !== "function")
+            return false;
+        if (pf.__mbCaveFieldSearchInstalled)
+            return true;
+
+        const originalSearch = pf.search;
+        pf.__mbCaveOriginalSearch = originalSearch;
+        pf.search = function (from, to) {
+            const caveActive = state.running && config.ignoreFields === true;
+            if (!caveActive)
+                return originalSearch.call(this, from, to);
+
+            // Mirror native A* while changing only the field collision test.
+            this.__dirtyNodes.forEach(node => node.cleanPathfinding());
+            this.__dirtyNodes = new Array(from);
+            from.__h = this.heuristic(from, to);
+            const openHeap = new BinaryHeap();
+            openHeap.push(from);
+
+            while (openHeap.size() > 0) {
+                const currentNode = openHeap.pop();
+                if (currentNode === to)
+                    return this.pathTo(currentNode);
+                currentNode.__closed = true;
+
+                for (let i = 0; i < currentNode.neighbours.length; i++) {
+                    const neighbourNode = currentNode.neighbours[i];
+                    if (neighbourNode.__closed)
+                        continue;
+                    if (!caveFieldPassable(neighbourNode, to))
+                        continue;
+
+                    const dx = neighbourNode.__position.x - currentNode.__position.x;
+                    const dy = neighbourNode.__position.y - currentNode.__position.y;
+                    const isDiagonal = dx !== 0 && dy !== 0;
+                    if (isDiagonal && !this.__isDiagonalPassable(currentNode, neighbourNode))
+                        continue;
+
+                    const penalty = isDiagonal ? 3 : 1;
+                    const gScore = currentNode.__g + penalty * neighbourNode.getCost(currentNode);
+                    const visited = neighbourNode.__visited;
+                    if (!visited || gScore < neighbourNode.__g) {
+                        neighbourNode.__visited = true;
+                        neighbourNode.__parent = currentNode;
+                        neighbourNode.__h = neighbourNode.__h || this.heuristic(neighbourNode, to);
+                        neighbourNode.__g = gScore;
+                        neighbourNode.__f = neighbourNode.__g + neighbourNode.__h;
+                        this.__dirtyNodes.push(neighbourNode);
+                        if (!visited)
+                            openHeap.push(neighbourNode);
+                        else
+                            openHeap.rescoreElement(neighbourNode);
+                    }
+                }
+            }
+
+            let bestFrontier = null;
+            let bestFrontierDist = Infinity;
+            for (let i = 0; i < this.__dirtyNodes.length; i++) {
+                const node = this.__dirtyNodes[i];
+                if (!node.__closed) continue;
+                const d = Math.abs(node.__position.x - to.__position.x) +
+                    Math.abs(node.__position.y - to.__position.y);
+                if (d < bestFrontierDist) {
+                    bestFrontierDist = d;
+                    bestFrontier = node;
+                }
+            }
+            this.__lastFrontierNode = bestFrontier;
+            return new Array();
+        };
+        pf.__mbCaveFieldSearchInstalled = true;
+        return true;
+    }
+
+    function uninstallFieldIgnoringPathfinder() {
+        const pf = window.gameClient?.world?.pathfinder;
+        if (!pf || !pf.__mbCaveFieldSearchInstalled)
+            return;
+        if (pf.__mbCaveOriginalSearch)
+            pf.search = pf.__mbCaveOriginalSearch;
+        delete pf.__mbCaveOriginalSearch;
+        delete pf.__mbCaveFieldSearchInstalled;
+    }
+
     function goToWaypoint(waypoint) {
         // If this is a script-only waypoint, nothing to move
         if (!waypoint || waypoint.x === undefined || waypoint.x === null) {
@@ -7785,6 +8032,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         const to = new Position(waypoint.x, waypoint.y, waypoint.z);
         let success = false;
         try {
+            installFieldIgnoringPathfinder();
             window.gameClient?.world?.pathfinder?.findPath?.(from, to);
             state.lastPathAt = Date.now();
             success = true;
@@ -8263,6 +8511,10 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
      * Skips to the waypoint closest to the player's current position.
      * Returns the new waypoint, or null if no route exists.
      */
+    // Recovery intentionally does not perform a local connectivity/path test here.
+    // The native Pathfinder owns mapclick reachability and can legitimately route
+    // across locally disconnected terrain such as separate islands.
+
     function skipToClosestWaypoint(options = {}) {
         const pos = normalizePosition(bot.getPlayerPosition());
         if (!pos || !route.length)
@@ -8270,9 +8522,9 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
         // Recovery must never choose a waypoint on another floor or an arbitrarily
         // distant waypoint. After a temple/GM teleport, the native Pathfinder can
-        // sometimes claim a route across disconnected terrain (for example, water
-        // between islands). A bounded, same-floor recovery keeps us inside the
-        // portion of the route that is actually relevant to the player's location.
+        // across disconnected terrain (for example, water between islands). Keep
+        // recovery bounded by floor and distance, while leaving actual reachability
+        // to the native Pathfinder.
         const limit = Math.max(1, Math.trunc(Number(config.maxWaypointDistance) || 50));
         const allowTransitionFallback = options.allowTransitionFallback === true;
         const excludeIndex = Number.isInteger(options.excludeIndex) ? options.excludeIndex : -1;
@@ -8309,7 +8561,12 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 } catch (e) {}
 
                 const isTransition = isRecoveryTransitionWaypoint(wp);
-                if (isTransition && !allowTransitions)
+                const isStand = wp.stand === true;
+                // STAND waypoints are also ordinary precision walking markers in
+                // cities. They must remain valid recovery targets. Other transition
+                // waypoints stay protected unless an explicit transition fallback is
+                // active. SCRIPT is never a recovery target.
+                if (isTransition && !isStand && !allowTransitions)
                     continue;
 
                 const cheb = Math.max(Math.abs(wp.x - pos.x), Math.abs(wp.y - pos.y));
@@ -9719,18 +9976,33 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                     state.positionHistory.shift();
             }
 
-            // Check if we've moved (new tile) or used a floor change
+            // Check if we've moved to a new tile. Movement by itself is not
+            // necessarily route progress: creatures can push the player around,
+            // and a failed Pathfinder route can make the character shuffle between
+            // equally-distant tiles forever. Only movement that actually reduces
+            // the distance to the current waypoint resets the normal stall timer.
             let madeProgress = false;
             if (positionKey && positionKey !== state.lastPositionKey) {
-                madeProgress = true;
+                const progressWaypoint = getCurrentWaypoint();
+                const currentWaypointDistance = progressWaypoint
+                    ? getDistanceToWaypoint(position, progressWaypoint)
+                    : Infinity;
+                const previousWaypointDistance = Number(state.lastDistanceToWaypoint);
+                const distanceImproved = Number.isFinite(currentWaypointDistance) &&
+                    (!Number.isFinite(previousWaypointDistance) || currentWaypointDistance < previousWaypointDistance);
+
+                madeProgress = distanceImproved;
                 state.lastPositionKey = positionKey;
-                state.stuckCount = 0;
-                // Normal movement resets recovery state, but movement caused by a
-                // recovery sidestep must NOT reset it. Otherwise a one-tile sidestep
-                // on a shoreline counts as fresh progress and starts the same
-                // two-repath cycle again forever.
+                if (Number.isFinite(currentWaypointDistance))
+                    state.lastDistanceToWaypoint = currentWaypointDistance;
+                if (distanceImproved)
+                    state.stuckCount = 0;
+
+                // Normal movement resets recovery state only when it is genuine
+                // route progress. A creature pushing us around must not keep
+                // postponing waypoint recovery indefinitely.
                 const recoveryMoveActive = state.recoverySideStepAttempts > 0 || state.stuckRecoveryAttempts > 0;
-                if (!recoveryMoveActive) {
+                if (!recoveryMoveActive && distanceImproved) {
                     state.stuckRecoveryAttempts = 0;
                     state.lastRecoveryAt = 0;
                     state.recoverySideStepAt = 0;
@@ -9744,7 +10016,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                     state.recoveryLastTargetIndex = -1;
                     state.recoveryLastTargetAt = 0;
                     state.recoveryLastTargetKey = null;
-                } else {
+                } else if (recoveryMoveActive) {
                     // Merely changing tiles is not necessarily route progress: an
                     // unreachable Pathfinder target can make the player oscillate
                     // between two or three nearby tiles. Keep recovery armed until
@@ -10168,11 +10440,20 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             return;
 
         const attach = () => {
-            const element = document.getElementById("notification");
-            if (!element || !window.MutationObserver)
+            if (!window.MutationObserver)
                 return false;
 
-            const check = () => {
+            // Different client builds expose the Pathfinder cancellation message
+            // through different DOM nodes. Prefer the real cancel-message node,
+            // but also watch the legacy notification node as a fallback.
+            const elements = [
+                document.getElementById("cancelmessage"),
+                document.getElementById("notification")
+            ].filter(Boolean);
+            if (!elements.length)
+                return false;
+
+            const check = (element) => {
                 if (!state.running)
                     return;
                 const text = String(element.textContent || "").trim();
@@ -10180,17 +10461,15 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                     return;
 
                 const now = Date.now();
-                // The same DOM message can fire several mutation records.
+                // MutationObserver can report several mutations for one message.
                 if (text === state.noWayLastText && now - state.noWayLastSeenAt < 1000)
                     return;
                 state.noWayLastText = text;
                 state.noWayLastSeenAt = now;
 
                 // Do not repeatedly re-arm recovery from the same DOM message while
-                // CaveBot is still working on the same waypoint. The notification
-                // element can receive unrelated mutations without representing a
-                // genuinely new Pathfinder failure. A different current waypoint
-                // is allowed to trigger recovery again.
+                // CaveBot is still working on the same waypoint. A different current
+                // waypoint is allowed to trigger recovery again.
                 if (state.noWayRecoveryIndex === state.currentIndex)
                     return;
                 state.noWayRecoveryIndex = state.currentIndex;
@@ -10215,21 +10494,31 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 bot.log('Cave: Pathfinder reported "There is no way." – forcing waypoint recovery');
             };
 
-            const observer = new MutationObserver(check);
-            observer.observe(element, {
-                childList: true,
-                characterData: true,
-                subtree: true
-            });
-            state.noWayObserver = observer;
-            check();
+            const observers = [];
+            for (const element of elements) {
+                // Establish a baseline without treating an already-visible old
+                // cancellation message as a brand-new Pathfinder failure.
+                const initialText = String(element.textContent || "").trim();
+                if (initialText)
+                    state.noWayLastText = initialText;
+
+                const observer = new MutationObserver(() => check(element));
+                observer.observe(element, {
+                    childList: true,
+                    characterData: true,
+                    subtree: true
+                });
+                observers.push(observer);
+            }
+
+            state.noWayObserver = observers;
             return true;
         };
 
         if (attach())
             return;
 
-        // UI may not have created #notification yet. Retry briefly without
+        // UI may not have created the cancel-message node yet. Retry briefly without
         // introducing another permanent polling loop.
         const retryId = window.setInterval(() => {
             if (attach())
@@ -10240,9 +10529,12 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
     function stopNoWayObserver() {
         if (state.noWayObserver) {
-            try {
-                state.noWayObserver.disconnect();
-            } catch (e) {}
+            const observers = Array.isArray(state.noWayObserver) ? state.noWayObserver : [state.noWayObserver];
+            for (const observer of observers) {
+                try {
+                    observer.disconnect();
+                } catch (e) {}
+            }
             state.noWayObserver = null;
         }
     }
@@ -10596,6 +10888,10 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     bot.addCleanup(stopMinimapOverlay);
     if (config.enabled && route.length)
         start();
+
+    bot.addCleanup(() => {
+        uninstallFieldIgnoringPathfinder();
+    });
 
     bot.cave = {
         start,
@@ -18761,13 +19057,29 @@ function upgradeSectionHeaders(panel) {
         });
     }
 
-    function updateCollapsedStopButton(panel) {
-        if (!panel)
-            return;
-        const btn = panel.querySelector("#minibia-bot-collapsed-stop");
-        if (!btn)
-            return;
-        btn.style.display = panel.dataset.collapsed === "true" ? "" : "none";
+    function getCollapsedQuickModules() {
+        return [
+            { id: "minibia-bot-collapsed-cave", isRunning: () => !!bot.cave?.status?.().running, start: () => bot.cave?.start?.(), stop: () => bot.cave?.stop?.() },
+            { id: "minibia-bot-collapsed-attack", isRunning: () => !!bot.attack?.status?.().running, start: () => bot.attack?.start?.(), stop: () => bot.attack?.stop?.() },
+            { id: "minibia-bot-collapsed-heal", isRunning: () => !!bot.heal?.status?.().running, start: () => bot.heal?.start?.(), stop: () => bot.heal?.stop?.() },
+            { id: "minibia-bot-collapsed-rune", isRunning: () => !!bot.rune?.status?.().running, start: () => bot.rune?.start?.(), stop: () => bot.rune?.stop?.() },
+            { id: "minibia-bot-collapsed-paladin", isRunning: () => !!bot.paladin?.status?.().running, start: () => bot.paladin?.startCraft?.(), stop: () => bot.paladin?.stopCraft?.() },
+            { id: "minibia-bot-collapsed-looter", isRunning: () => !!bot.looter?.status?.().running, start: () => bot.looter?.start?.(), stop: () => bot.looter?.stop?.() },
+            { id: "minibia-bot-collapsed-fisher", isRunning: () => !!bot.fisher?.status?.().running, start: () => bot.fisher?.start?.(), stop: () => bot.fisher?.stop?.() },
+        ];
+    }
+
+    function refreshCollapsedQuickModules() {
+        const panel = document.getElementById("minibia-bot-panel");
+        if (!panel) return;
+        getCollapsedQuickModules().forEach(m => {
+            const btn = panel.querySelector(`#${m.id}`);
+            if (!btn) return;
+            let running = false;
+            try { running = !!m.isRunning(); } catch {}
+            btn.dataset.running = running ? "true" : "false";
+            btn.title = `${btn.title.split(" – ")[0]} ${running ? "(running)" : "(stopped)"}`;
+        });
     }
 
     // ---- TITLE BAR RUN INDICATORS (clickable) ----
@@ -18793,24 +19105,6 @@ function upgradeSectionHeaders(panel) {
             attackInd.dataset.running = attackRunning ? "true" : "false";
             attackInd.title = attackRunning ? "Targeting running" : "Targeting stopped";
         }
-    }
-
-    function stopCaveAndAttackManual() {
-        try {
-            bot.cave?.stop?.();
-        } catch (e) {
-            console.warn("[minibia-bot-ui] failed to stop cave", e);
-        }
-        try {
-            bot.attack?.stop?.();
-        } catch (e) {
-            console.warn("[minibia-bot-ui] failed to stop attack", e);
-        }
-        try {
-            refreshCaveStatus?.();
-            refreshAutoAttackStatus?.();
-            refreshTitlebarRunIndicators?.();
-        } catch {}
     }
 
     // ---- INJECT THE PANEL ----
@@ -19013,14 +19307,14 @@ function upgradeSectionHeaders(panel) {
 #minibia-bot-panel .mb-titlebar {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 4px 8px;
+  gap: 6px;
+  padding: 3px 8px;
   background-image: url("/png/bg2.png");
   background-color: #2a241e;
   border-bottom: 1px solid #000;
   flex-shrink: 0;
   cursor: grab;
-  min-height: 28px;
+  min-height: 26px;
 }
 #minibia-bot-panel .mb-title {
   margin: 0;
@@ -19077,6 +19371,7 @@ function upgradeSectionHeaders(panel) {
   display: flex;
   gap: 4px;
   flex: 0 0 auto;
+  margin-left: auto;
 }
 #minibia-bot-panel .mb-title-actions button {
   width: 24px;
@@ -19099,21 +19394,52 @@ function upgradeSectionHeaders(panel) {
   background: rgba(255, 255, 255, 0.08);
   color: #fff;
 }
-#minibia-bot-panel .mb-collapsed-stop-button {
-  color: #ff8888;
-  border-color: #663333;
+#minibia-bot-panel .mb-collapsed-module-rows {
+  display: none;
+  flex-direction: column;
+  gap: 0;
+  background-image: url("/png/bg2.png");
+  background-color: #2a241e;
+  border-bottom: 1px solid #000;
+  flex-shrink: 0;
 }
-#minibia-bot-panel .mb-collapsed-stop-button:hover {
-  border-color: #ff6666;
-  background: rgba(255, 0, 0, 0.12);
-  color: #ffaaaa;
+#minibia-bot-panel .mb-collapsed-module-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 2px 8px;
+  min-height: 22px;
+}
+/* Collapsed quick buttons intentionally reuse the exact same visual treatment
+   as the Cave/Attack status pills in the title row. */
+#minibia-bot-panel .mb-collapsed-module-button {
+  appearance: none;
+  -webkit-appearance: none;
+  margin: 0;
+  font-family: inherit;
+  font-weight: normal;
+  line-height: 1;
+  flex: 0 0 auto;
+}
+#minibia-bot-panel .mb-collapsed-module-button .mb-run-dot {
+  flex: 0 0 auto;
+}
+#minibia-bot-panel[data-collapsed="true"] .mb-collapsed-module-rows {
+  display: flex;
 }
 
 /* ── Collapsed state ── */
 #minibia-bot-panel[data-collapsed="true"] {
-  width: 222px;
+  width: 232px;
+  min-height: 0;
+  background-image: url("/png/bg2.png");
+  background-color: #2a241e;
 }
 #minibia-bot-panel[data-collapsed="true"] .mb-body {
+  display: none !important;
+}
+#minibia-bot-panel[data-collapsed="true"] .mb-title-status {
   display: none !important;
 }
 #minibia-bot-panel .mb-title-version {
@@ -19123,7 +19449,7 @@ function upgradeSectionHeaders(panel) {
     margin-left: 4px;
   }
   #minibia-bot-panel[data-collapsed="true"] .mb-title-version {
-    display: none;
+    display: inline;
   }
   #minibia-bot-panel[data-collapsed="true"] .mb-titlebar {
   border-bottom: none;
@@ -19559,14 +19885,26 @@ function upgradeSectionHeaders(panel) {
         panel.id = "minibia-bot-panel";
         panel.innerHTML = `
 <div class="mb-titlebar">
-  <div class="mb-title">mb0t <span class="mb-title-version">v1.4.36</span></div>
+  <div class="mb-title">mb0t <span class="mb-title-version">v1.4.46</span></div>
   <div class="mb-title-status">
     <span class="mb-run-indicator" id="minibia-bot-title-cave-status" data-running="false"><span class="mb-run-dot"></span><span class="mb-run-label">🏃‍♂️‍➡️</span></span>
     <span class="mb-run-indicator" id="minibia-bot-title-attack-status" data-running="false"><span class="mb-run-dot"></span><span class="mb-run-label">⚔️</span></span>
   </div>
   <div class="mb-title-actions">
-    <button type="button" class="mb-icon-button mb-collapsed-stop-button" id="minibia-bot-collapsed-stop" title="Stop Cave + Attack">■</button>
     <button type="button" class="mb-icon-button" id="minibia-bot-collapse" title="Minimize">−</button>
+  </div>
+</div>
+<div class="mb-collapsed-module-rows" aria-label="Quick module toggles">
+  <div class="mb-collapsed-module-row" aria-label="Movement and combat">
+    <button type="button" class="mb-run-indicator mb-collapsed-module-button" id="minibia-bot-collapsed-cave" title="Cavebot"><span class="mb-run-dot"></span><span class="mb-run-label">🏃‍♂️‍➡️</span></button>
+    <button type="button" class="mb-run-indicator mb-collapsed-module-button" id="minibia-bot-collapsed-attack" title="Targeting"><span class="mb-run-dot"></span><span class="mb-run-label">⚔️</span></button>
+    <button type="button" class="mb-run-indicator mb-collapsed-module-button" id="minibia-bot-collapsed-heal" title="Healing"><span class="mb-run-dot"></span><span class="mb-run-label">💚</span></button>
+    <button type="button" class="mb-run-indicator mb-collapsed-module-button" id="minibia-bot-collapsed-rune" title="Mana Training"><span class="mb-run-dot"></span><span class="mb-run-label">✨</span></button>
+  </div>
+  <div class="mb-collapsed-module-row" aria-label="Utility modules">
+    <button type="button" class="mb-run-indicator mb-collapsed-module-button" id="minibia-bot-collapsed-paladin" title="Spear Crafter"><span class="mb-run-dot"></span><span class="mb-run-label">🏹</span></button>
+    <button type="button" class="mb-run-indicator mb-collapsed-module-button" id="minibia-bot-collapsed-looter" title="Looter"><span class="mb-run-dot"></span><span class="mb-run-label">💰</span></button>
+    <button type="button" class="mb-run-indicator mb-collapsed-module-button" id="minibia-bot-collapsed-fisher" title="Fishing"><span class="mb-run-dot"></span><span class="mb-run-label">🎣</span></button>
   </div>
 </div>
 
@@ -19729,6 +20067,16 @@ function upgradeSectionHeaders(panel) {
       </div>
       <div style="display:flex;gap:6px;"><button type="button" id="minibia-bot-heal-save" style="flex:1;">Add Rule</button><button type="button" id="minibia-bot-heal-cancel" style="flex:0;width:auto;padding:8px 12px;">Cancel</button></div>
     </div>
+    <div class="mb-section" style="margin-top:8px;padding:10px;background:rgba(255,255,255,0.03);">
+      <div class="mb-section-title mb-section-title--sub" style="margin-top:0;">
+        <span class="mb-title-text">🧊 Clear Paralyze</span>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 90px;gap:6px;margin-bottom:6px;">
+        <label class="mb-field"><span class="mb-field-label">Spell Words</span><input type="text" id="minibia-bot-paralyze-spell" placeholder="exura" /></label>
+        <label class="mb-field"><span class="mb-field-label">Only Above HP %</span><input type="number" id="minibia-bot-paralyze-minhp" min="0" max="100" value="70" /></label>
+      </div>
+      <label class="mb-toggle" style="font-size:11px;"><input type="checkbox" id="minibia-bot-paralyze-enabled" /> Enable paralyze clear</label>
+    </div>
     <div class="mb-small-note" style="margin-top:6px;">Rules are checked in order. First rule whose HP and MP ranges match will trigger. If spell words are given, mana cost must be set (and current mana must be ≥ that).</div>
   </div>
 </div>
@@ -19882,6 +20230,24 @@ function upgradeSectionHeaders(panel) {
             <label class="mb-field">
               <span class="mb-field-label">Repeat (s)</span>
               <input type="number" id="minibia-bot-panic-no-target-repeat" min="1" value="30" />
+            </label>
+          </div>
+        </div>
+
+        <!-- Row 3 · Col 1: Low Capacity -->
+        <div style="display:flex; flex-direction:column; gap:4px;">
+          <label class="mb-toggle" style="margin:0;">
+            <input type="checkbox" id="minibia-bot-panic-low-cap-beep" />
+            <span>Low Capacity</span>
+          </label>
+          <div style="display:grid; grid-template-columns:1fr 1fr; gap:4px;">
+            <label class="mb-field">
+              <span class="mb-field-label">Below Cap</span>
+              <input type="number" id="minibia-bot-panic-low-cap-threshold" min="0" value="100" />
+            </label>
+            <label class="mb-field">
+              <span class="mb-field-label">Repeat (s)</span>
+              <input type="number" id="minibia-bot-panic-low-cap-repeat" min="1" value="30" />
             </label>
           </div>
         </div>
@@ -20065,6 +20431,7 @@ function upgradeSectionHeaders(panel) {
     <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-bottom:6px;">
       <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-cave-loop" /> Loop</label>
       <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-cave-auto-transitions" /> Auto Transitions</label>
+      <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-cave-ignore-fields" /> Walk Through Fields</label>
     </div>
 
     <!-- Presets -->
@@ -20660,18 +21027,27 @@ function upgradeSectionHeaders(panel) {
             collapseBtn.addEventListener("click", () => {
                 const isCollapsed = panel.dataset.collapsed === "true";
                 setPanelCollapsed(panel, !isCollapsed);
-                updateCollapsedStopButton(panel);
             });
         }
 
-        // Collapsed stop button
-        const stopBtn = panel.querySelector("#minibia-bot-collapsed-stop");
-        if (stopBtn) {
-            stopBtn.addEventListener("click", (e) => {
+        // Collapsed quick module toggles
+        getCollapsedQuickModules().forEach(m => {
+            const btn = panel.querySelector(`#${m.id}`);
+            if (!btn) return;
+            btn.addEventListener("click", (e) => {
                 e.preventDefault();
-                stopCaveAndAttackManual();
+                let running = false;
+                try { running = !!m.isRunning(); } catch {}
+                try { running ? m.stop() : m.start(); } catch (error) {
+                    bot.log?.(`Collapsed toggle failed for ${m.id}`, error?.message || error);
+                }
+                refreshCollapsedQuickModules();
+                try { refreshAutoHealStatus?.(); } catch {}
+                try { refreshRuneStatus?.(); } catch {}
+                try { refreshPaladinStatus?.(); } catch {}
+                try { refreshLooterStatus?.(); } catch {}
             });
-        }
+        });
 
         // Title bar click toggles
         const titleCave = panel.querySelector("#minibia-bot-title-cave-status");
@@ -22881,6 +23257,28 @@ function upgradeSectionHeaders(panel) {
             });
         }
 
+        const paralyzeEnabled = panel.querySelector("#minibia-bot-paralyze-enabled");
+        const paralyzeSpell = panel.querySelector("#minibia-bot-paralyze-spell");
+        const paralyzeMinHp = panel.querySelector("#minibia-bot-paralyze-minhp");
+        if (paralyzeEnabled && paralyzeSpell && paralyzeMinHp) {
+            const hc = bot.heal?.config || {};
+            paralyzeEnabled.checked = hc.paralyzeEnabled === true;
+            paralyzeSpell.value = hc.paralyzeSpellWords || "";
+            paralyzeMinHp.value = hc.paralyzeMinHpPercent ?? 70;
+            const saveParalyze = () => {
+                const hp = Math.max(0, Math.min(100, Number(paralyzeMinHp.value) || 0));
+                paralyzeMinHp.value = String(hp);
+                bot.heal.updateConfig({
+                    paralyzeEnabled: paralyzeEnabled.checked,
+                    paralyzeSpellWords: paralyzeSpell.value.trim(),
+                    paralyzeMinHpPercent: hp,
+                });
+            };
+            paralyzeEnabled.addEventListener("change", saveParalyze);
+            paralyzeSpell.addEventListener("change", saveParalyze);
+            paralyzeMinHp.addEventListener("change", saveParalyze);
+        }
+
         // Auto Attack
         const autoAttackEnabledInput = panel.querySelector("#minibia-bot-auto-attack-enabled");
         const autoAttackMeleeInput = panel.querySelector("#minibia-bot-auto-attack-melee");
@@ -23389,6 +23787,16 @@ function upgradeSectionHeaders(panel) {
             });
         }
 
+        const ignoreFieldsToggle = panel.querySelector("#minibia-bot-cave-ignore-fields");
+        if (ignoreFieldsToggle) {
+            ignoreFieldsToggle.checked = bot.cave?.config?.ignoreFields !== false;
+            ignoreFieldsToggle.addEventListener("change", () => {
+                bot.cave.updateConfig({
+                    ignoreFields: ignoreFieldsToggle.checked
+                });
+            });
+        }
+
         // ---- Reload Bot ----
         const reloadButton = panel.querySelector("#minibia-bot-reload");
         if (reloadButton) {
@@ -23546,6 +23954,9 @@ function upgradeSectionHeaders(panel) {
             noTarget: panel.querySelector("#minibia-bot-panic-no-target-beep"),
             noTargetDelay: panel.querySelector("#minibia-bot-panic-no-target-delay"),
             noTargetRepeat: panel.querySelector("#minibia-bot-panic-no-target-repeat"),
+            lowCap: panel.querySelector("#minibia-bot-panic-low-cap-beep"),
+            lowCapThresh: panel.querySelector("#minibia-bot-panic-low-cap-threshold"),
+            lowCapRepeat: panel.querySelector("#minibia-bot-panic-low-cap-repeat"),
             itemList: panel.querySelector("#minibia-bot-panic-item-alerts-list"),
             itemId: panel.querySelector("#minibia-bot-panic-item-alert-id"),
             itemName: panel.querySelector("#minibia-bot-panic-item-alert-name"),
@@ -23617,6 +24028,12 @@ function upgradeSectionHeaders(panel) {
                 audioIds.noTargetDelay.value = Math.round((c.noTargetDelayMs ?? 10000) / 1000);
             if (audioIds.noTargetRepeat && document.activeElement !== audioIds.noTargetRepeat)
                 audioIds.noTargetRepeat.value = Math.round((c.noTargetRepeatMs ?? 30000) / 1000);
+            if (audioIds.lowCap && document.activeElement !== audioIds.lowCap)
+                audioIds.lowCap.checked = !!c.lowCapBeep;
+            if (audioIds.lowCapThresh && document.activeElement !== audioIds.lowCapThresh)
+                audioIds.lowCapThresh.value = c.lowCapThreshold ?? 100;
+            if (audioIds.lowCapRepeat && document.activeElement !== audioIds.lowCapRepeat)
+                audioIds.lowCapRepeat.value = Math.round((c.lowCapRepeatMs ?? 30000) / 1000);
         }
 
         // Simple booleans
@@ -23625,6 +24042,7 @@ function upgradeSectionHeaders(panel) {
             ["lowHealth", "lowHealthBeep"],
             ["manaFull", "manaFullBeep"],
             ["noTarget", "noTargetBeep"],
+            ["lowCap", "lowCapBeep"],
         ];
         for (const [uiKey, cfgKey] of boolToggles) {
             const el = audioIds[uiKey];
@@ -23645,6 +24063,8 @@ function upgradeSectionHeaders(panel) {
             ["manaFullRepeat", "manaFullRepeatMs", 1, 3600, v => v * 1000],
             ["noTargetDelay", "noTargetDelayMs", 1, 3600, v => v * 1000],
             ["noTargetRepeat", "noTargetRepeatMs", 1, 3600, v => v * 1000],
+            ["lowCapThresh", "lowCapThreshold", 0, 1000000, v => v],
+            ["lowCapRepeat", "lowCapRepeatMs", 1, 3600, v => v * 1000],
         ];
         for (const [uiKey, cfgKey, min, max, xform] of numericInputs) {
             const el = audioIds[uiKey];
@@ -23809,6 +24229,7 @@ function upgradeSectionHeaders(panel) {
             refreshGmChatStatus();
             refreshTormentedGhostStatus();
             refreshStatusTab();
+            refreshCollapsedQuickModules();
             if (convertCurrencyToggle) {
                 convertCurrencyToggle.checked = bot.autoStacker?.config?.convertCurrency !== false;
             }
@@ -23830,7 +24251,7 @@ function upgradeSectionHeaders(panel) {
         bot.addCleanup(() => window.clearInterval(talkTimer));
         const paladinTimer = window.setInterval(refreshPaladinStatus, 2000);
         bot.addCleanup(() => window.clearInterval(paladinTimer));
-        const statusTabTimer = window.setInterval(refreshStatusTab, 1000);
+        const statusTabTimer = window.setInterval(() => { refreshStatusTab(); refreshCollapsedQuickModules(); }, 1000);
         bot.addCleanup(() => window.clearInterval(statusTabTimer));
         const looterTimer = window.setInterval(refreshLooterStatus, 1000);
         bot.addCleanup(() => window.clearInterval(looterTimer));
@@ -23861,7 +24282,6 @@ function upgradeSectionHeaders(panel) {
         enableDrag(panel);
         const savedCollapsed = getSavedPanelCollapsed();
         setPanelCollapsed(panel, savedCollapsed);
-        updateCollapsedStopButton(panel);
 
         // Audio unlock
         const unlockAudio = () => bot.unlockAudio?.();
