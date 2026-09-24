@@ -726,7 +726,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.4.53",
+        version: "1.4.33",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -6734,35 +6734,6 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         recoveryLastTargetIndex: -1,
         recoveryLastTargetAt: 0,
         recoveryLastTargetKey: null,
-        // Temporary memory for recovery side-step tiles that proved unhelpful.
-        // Entries are short-lived and only influence recovery/side-step selection.
-        recoveryObstacleTiles: new Map(),
-        // Lightweight route-health/telemetry counters. These never drive normal
-        // Pathfinder navigation; they are for bounded recovery decisions and status.
-        routeHealth: new Map(),
-        // Recent recovery event history for diagnostics. Bounded so long-running
-        // CaveBot sessions cannot grow memory indefinitely. This is telemetry only
-        // and never changes Pathfinder navigation decisions.
-        recoveryHistory: [],
-        telemetry: {
-            progressEvents: 0,
-            recoveryEvents: 0,
-            nativeStalls: 0,
-            noWayEvents: 0,
-            teleportEvents: 0,
-            lastEventAt: 0,
-            lastEvent: null,
-        },
-        recoveryReason: null,
-        recoveryReasonAt: 0,
-        recoveryReasonIndex: -1,
-        recoveryReasonKey: null,
-        nativePathWatchKey: null,
-        nativePathWatchAt: 0,
-        nativePathWatchBestDistance: Infinity,
-        noWayLastWaypointKey: null,
-        noWayFailureKey: null,
-        noWayFailureAt: 0,
         recoveryBlockerWaitAt: 0,
         recoveryBlockerWaitKey: null,
         floorRecoveryLoop: null, // { key: string, count: number, firstAt: number, lastAt: number }
@@ -6770,8 +6741,6 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         lastAutoProbeLogAt: 0,
         lastTransitionLogKey: null,
         lastDistanceToWaypoint: null,
-        bestDistanceToWaypoint: Infinity,
-        waypointProgressKey: null,
         positionHistory: [],
         _stuckLogged: false,
         standReached: {},
@@ -6816,36 +6785,16 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         // the previous recovery made no route progress. If it is the only viable
         // target, the fallback pass may still select it.
         recoveryAvoidRepeatMs: 10000,
-        // Temporarily avoid the exact waypoint that produced a native "There is no way." failure.
-        noWayAvoidMs: 10000,
-        // Remember failed recovery side-step tiles briefly. This is deliberately
-        // short-lived so a temporary blocker can become usable again.
-        recoveryObstacleMemoryMs: 10000,
-        // Log a compact route-health warning after this many recovery events on
-        // the same waypoint. This does not stop or reroute the bot.
-        routeHealthWarningThreshold: 3,
-        // Temporarily avoid a recovery hotspot after repeated recent failures.
-        // This affects recovery selection only; normal route traversal is untouched.
-        recoveryHotspotAvoidMs: 10000,
-        // Give lightly unhealthy recovery targets a small score penalty before
-        // they become full hotspots. This keeps recovery adaptive without making
-        // a waypoint unavailable after only one or two failures.
-        recoveryHealthPenalty: 0.75,
-        // Keep the most recent recovery events available through CaveBot status.
-        recoveryHistoryLimit: 50,
         // Number of native Pathfinder repath recoveries before route-level recovery.
         maxRepathRecoveries: 2,
         // Number of controlled side-steps around a confirmed temporary blocker.
         maxRecoverySideSteps: 2,
         // Minimum time between controlled recovery side-steps.
         recoverySideStepCooldownMs: 1500,
-        // Native Pathfinder watchdog waits for the normal stuck timeout before
-        // intervening in an active-but-stalled native path.
-        nativePathWatchdogMs: 5000,
-        // Recovery normally prefers ordinary walking waypoints. STAND remains
-        // eligible because it is also used as a precise walking marker;
-        // rope/shovel/ladder stay protected unless transition fallback is active.
-        // SCRIPT waypoints are never recovery targets or recovery checks.
+        // Recovery should normally land on ordinary walk waypoints, not on
+        // rope/shovel/ladder/stand/script transition points. Those waypoints
+        // can intentionally change floors or trigger scripts and can create a
+        // recovery loop after a teleport or unexpected floor change.
         recoveryAllowTransitionWaypoints: false,
         // Stop quickly when floor-mismatch recovery selects the same route point
         // repeatedly. This prevents rope/teleport/script cycles from looping forever.
@@ -6858,14 +6807,6 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     // Recovery distance is intentionally capped at 50 tiles. A persisted value
     // from an older build must not silently expand the recovery search again.
     config.maxWaypointDistance = Math.max(1, Math.min(50, Math.trunc(Number(config.maxWaypointDistance) || 50)));
-    config.nativePathWatchdogMs = Math.max(5000, Math.trunc(Number(config.nativePathWatchdogMs) || 5000));
-    config.noWayAvoidMs = Math.max(1000, Math.trunc(Number(config.noWayAvoidMs) || 10000));
-    config.recoveryObstacleMemoryMs = Math.max(1000, Math.trunc(Number(config.recoveryObstacleMemoryMs) || 10000));
-    config.routeHealthWarningThreshold = Math.max(1, Math.trunc(Number(config.routeHealthWarningThreshold) || 3));
-    config.recoveryHotspotAvoidMs = Math.max(1000, Math.min(60000, Math.trunc(Number(config.recoveryHotspotAvoidMs) || 10000)));
-    config.recoveryHealthPenalty = Math.max(0, Math.min(10, Number(config.recoveryHealthPenalty) || 0.75));
-    config.recoveryHealthPenaltyWindowMs = Math.max(5000, Math.min(300000, Math.trunc(Number(config.recoveryHealthPenaltyWindowMs) || 30000)));
-    config.recoveryHistoryLimit = Math.max(10, Math.min(200, Math.trunc(Number(config.recoveryHistoryLimit) || 50)));
 
     // ---- PRESET MANAGEMENT ----
     function normalizePresetName(value) {
@@ -6951,26 +6892,6 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         return config.activePresetName;
     }
 
-    // Route edits can invalidate recovery decisions made against the old route
-    // topology. Keep the current waypoint/index, but discard stale recovery
-    // penalties, NO_WAY quarantine, remembered blockers, and target-avoidance
-    // state so an edited route gets a clean recovery context.
-    function resetRecoveryContext(reason = "route changed") {
-        resetRecoveryContext("preset changed");
-        state.recoveryBlockerWaitAt = 0;
-        state.recoveryBlockerWaitKey = null;
-        state.floorRecoveryLoop = null;
-        state.nativePathWatchKey = null;
-        state.nativePathWatchAt = 0;
-        state.nativePathWatchBestDistance = Infinity;
-        state.lastDistanceToWaypoint = null;
-        state.bestDistanceToWaypoint = Infinity;
-        state.waypointProgressKey = null;
-        state._stuckLogged = false;
-        if (reason)
-            bot.log(`Cave: recovery context reset (${reason})`);
-    }
-
     function upsertPreset(name, nextRoute = route, nextTransitions = transitions) {
         const norm = normalizePresetName(name);
         if (!norm)
@@ -7003,24 +6924,6 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         state.currentIndex = 0;
         state.direction = 1;
         state.pendingTransitionSource = null;
-        // A preset is a different route context. Do not carry recovery health,
-        // NO_WAY history, or recovery-target avoidance from the previous route
-        // into the newly loaded preset. Otherwise a waypoint that merely shares
-        // the same coordinates with an old route point could start with a stale
-        // recovery penalty/hotspot state.
-        state.routeHealth.clear();
-        state.recoveryHistory.length = 0;
-        state.recoveryObstacleTiles.clear();
-        state.recoveryLastTargetIndex = -1;
-        state.recoveryLastTargetAt = 0;
-        state.recoveryLastTargetKey = null;
-        state.noWayRecoveryIndex = -1;
-        state.noWayFailureKey = null;
-        state.noWayFailureAt = 0;
-        state.recoveryReason = null;
-        state.recoveryReasonAt = 0;
-        state.recoveryReasonIndex = -1;
-        state.recoveryReasonKey = null;
         setActivePresetName(preset.name);
         persistLegacyActivePreset();
         return preset;
@@ -8543,9 +8446,6 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
     // ---- WAYPOINT NAVIGATION ----
     function advanceWaypoint() {
-        state.noWayRecoveryIndex = -1;
-        state.noWayFailureKey = null;
-        state.noWayFailureAt = 0;
         state._standAttempt = null;
         state._ropeUsed = undefined;
         state._ropeNextUseAt = undefined;
@@ -8603,7 +8503,9 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         return wp.stand === true || wp.rope === true || wp.shovel === true || wp.ladder === true;
     }
 
-
+    function isAllowedRecoveryWaypoint(wp) {
+        return !!wp && (config.recoveryAllowTransitionWaypoints === true || !isRecoveryTransitionWaypoint(wp));
+    }
 
     /**
      * Skips to the waypoint closest to the player's current position.
@@ -8612,109 +8514,6 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     // Recovery intentionally does not perform a local connectivity/path test here.
     // The native Pathfinder owns mapclick reachability and can legitimately route
     // across locally disconnected terrain such as separate islands.
-
-    function getWaypointKey(waypoint) {
-        if (!waypoint || waypoint.x === undefined || waypoint.y === undefined || waypoint.z === undefined)
-            return null;
-        return `${waypoint.x},${waypoint.y},${waypoint.z}`;
-    }
-
-    function rememberRecoveryObstacle(key, now = Date.now()) {
-        if (!key) return;
-        state.recoveryObstacleTiles.set(String(key), now + Math.max(1000, Number(config.recoveryObstacleMemoryMs) || 10000));
-    }
-
-    function isRememberedRecoveryObstacle(key, now = Date.now()) {
-        if (!key) return false;
-        const expiresAt = state.recoveryObstacleTiles.get(String(key));
-        if (!expiresAt) return false;
-        if (expiresAt <= now) {
-            state.recoveryObstacleTiles.delete(String(key));
-            return false;
-        }
-        return true;
-    }
-
-    function pruneRecoveryObstacleMemory(now = Date.now()) {
-        for (const [key, expiresAt] of state.recoveryObstacleTiles.entries()) {
-            if (expiresAt <= now) state.recoveryObstacleTiles.delete(key);
-        }
-    }
-
-    function setRecoveryReason(reason, now = Date.now(), waypoint = getCurrentWaypoint()) {
-        state.recoveryReason = reason || null;
-        state.recoveryReasonAt = now;
-        state.recoveryReasonIndex = state.currentIndex;
-        state.recoveryReasonKey = getWaypointKey(waypoint);
-
-        if (reason) {
-            state.telemetry.recoveryEvents++;
-            state.telemetry.lastEventAt = now;
-            state.telemetry.lastEvent = reason;
-            if (reason === 'NATIVE_STALL') state.telemetry.nativeStalls++;
-            if (reason === 'NO_WAY') state.telemetry.noWayEvents++;
-            if (reason === 'TELEPORT') state.telemetry.teleportEvents++;
-
-            const key = state.recoveryReasonKey || `index:${state.currentIndex}`;
-
-            // Keep a compact recent event trail. This is intentionally separate
-            // from routeHealth so the aggregate counters remain cheap while the
-            // caller can still inspect what happened most recently.
-            state.recoveryHistory.push({
-                at: now,
-                reason,
-                index: state.currentIndex,
-                key,
-                waypoint: getCurrentWaypoint() ? cloneValue(getCurrentWaypoint()) : null,
-            });
-            if (state.recoveryHistory.length > config.recoveryHistoryLimit) {
-                state.recoveryHistory.splice(0, state.recoveryHistory.length - config.recoveryHistoryLimit);
-            }
-
-            const health = state.routeHealth.get(key) || {
-                index: state.currentIndex,
-                key,
-                recoveries: 0,
-                noWay: 0,
-                nativeStalls: 0,
-                teleports: 0,
-                lastReason: null,
-                lastAt: 0,
-            };
-            health.index = state.currentIndex;
-            health.recoveries++;
-            health.lastReason = reason;
-            health.lastAt = now;
-            if (reason === 'NO_WAY') health.noWay++;
-            if (reason === 'NATIVE_STALL') health.nativeStalls++;
-            if (reason === 'TELEPORT') health.teleports++;
-            state.routeHealth.set(key, health);
-
-            // Keep the map bounded on long-running bots. Old route points naturally
-            // fall out once they have not produced a recovery for a while.
-            if (state.routeHealth.size > 256) {
-                const oldest = Array.from(state.routeHealth.entries())
-                    .sort((a, b) => (a[1].lastAt || 0) - (b[1].lastAt || 0))[0];
-                if (oldest) state.routeHealth.delete(oldest[0]);
-            }
-
-            if (health.recoveries === config.routeHealthWarningThreshold) {
-                bot.log(`Cave: route health warning – waypoint #${state.currentIndex + 1} has ${health.recoveries} recovery events`, health);
-            }
-        }
-    }
-
-    function resetWaypointProgressTracking(waypoint, position, now = Date.now()) {
-        const key = getWaypointKey(waypoint);
-        const distance = getDistanceToWaypoint(position, waypoint);
-        state.waypointProgressKey = key;
-        state.lastDistanceToWaypoint = Number.isFinite(distance) ? distance : null;
-        state.bestDistanceToWaypoint = Number.isFinite(distance) ? distance : Infinity;
-        state.lastProgressAt = now;
-        state.nativePathWatchKey = key;
-        state.nativePathWatchAt = now;
-        state.nativePathWatchBestDistance = Number.isFinite(distance) ? distance : Infinity;
-    }
 
     function skipToClosestWaypoint(options = {}) {
         const pos = normalizePosition(bot.getPlayerPosition());
@@ -8731,14 +8530,10 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         const excludeIndex = Number.isInteger(options.excludeIndex) ? options.excludeIndex : -1;
         const avoidIndex = Number.isInteger(options.avoidIndex) ? options.avoidIndex : -1;
         const avoidKey = typeof options.avoidKey === "string" ? options.avoidKey : null;
-        const now = Date.now();
         const avoidRepeat = (avoidIndex >= 0 || avoidKey !== null) && Number.isFinite(Number(config.recoveryAvoidRepeatMs)) &&
-            now - (Number(state.recoveryLastTargetAt) || 0) < Math.max(0, Number(config.recoveryAvoidRepeatMs));
-        const noWayKey = state.noWayFailureKey || null;
-        const noWayAvoidActive = !!noWayKey && Number.isFinite(Number(state.noWayFailureAt)) &&
-            now - Number(state.noWayFailureAt) < Math.max(0, Number(config.noWayAvoidMs) || 10000);
+            Date.now() - (Number(state.recoveryLastTargetAt) || 0) < Math.max(0, Number(config.recoveryAvoidRepeatMs));
 
-        const findBest = (allowTransitions, skipAvoided, skipCurrentTile = true, skipFailedNoWay = true) => {
+        const findBest = (allowTransitions, skipAvoided, skipCurrentTile = true) => {
             let bestIdx = -1;
             let bestScore = Infinity;
             let bestProgress = Infinity;
@@ -8750,28 +8545,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 const wp = route[i];
                 if (skipAvoided && avoidRepeat && (i === avoidIndex || (avoidKey !== null && wp && `${wp.x},${wp.y},${wp.z}` === avoidKey)))
                     continue;
-                if (skipAvoided && skipFailedNoWay && noWayAvoidActive &&
-                    (i === state.noWayRecoveryIndex || (noWayKey !== null && wp && `${wp.x},${wp.y},${wp.z}` === noWayKey)))
-                    continue;
                 if (!wp || wp.x === undefined || wp.y === undefined || wp.z === undefined)
                     continue;
-
-                // Adaptive recovery: a route tile that has repeatedly caused
-                // recoveries recently becomes a temporary recovery hotspot.
-                // Keep it out of normal recovery selection when another target
-                // exists. This never skips the waypoint during ordinary traversal,
-                // never permanently blacklists it, and later fallback passes may
-                // still select it if it is the only viable recovery target.
-                const candidateKey = `${wp.x},${wp.y},${wp.z}`;
-                const candidateHealth = state.routeHealth.get(candidateKey);
-                const hotspotAvoidMs = Math.max(1000, Number(config.recoveryHotspotAvoidMs) || 10000);
-                const hotspotActive = candidateHealth &&
-                    candidateHealth.recoveries >= Math.max(1, Number(config.routeHealthWarningThreshold) || 3) &&
-                    Number.isFinite(candidateHealth.lastAt) &&
-                    (now - candidateHealth.lastAt) < hotspotAvoidMs;
-                if (skipAvoided && hotspotActive && i !== state.currentIndex)
-                    continue;
-
                 if (wp.z !== pos.z)
                     continue;
 
@@ -8812,32 +8587,10 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 // Prefer a nearby waypoint. When distances are essentially equal, prefer
                 // the waypoint that is ahead of the current route position so recovery
                 // does not unnecessarily jump backwards through the route.
-                const routeForwardDistance = config.loopMode
-                    ? (i - state.currentIndex + route.length) % route.length
-                    : Math.max(0, i - state.currentIndex);
-                const routeBackwardDistance = config.loopMode
-                    ? (state.currentIndex - i + route.length) % route.length
-                    : Math.max(0, state.currentIndex - i);
-                const preferredRouteDistance = state.direction === -1 ? routeBackwardDistance : routeForwardDistance;
-                const wrongDirectionPenalty = state.direction === -1
-                    ? routeForwardDistance < routeBackwardDistance ? 0.35 : 0
-                    : routeBackwardDistance < routeForwardDistance ? 0.35 : 0;
-                const routePenalty = Math.min(preferredRouteDistance, route.length) * 0.012;
-                const transitionPenalty = isStand ? 0 : (isTransition ? 0.08 : 0);
-                // Before a waypoint reaches the hotspot threshold, lightly penalize
-                // candidates that have already caused recent recoveries. This makes
-                // recovery prefer an equally-near, healthier route point without
-                // creating a hard exclusion after a single transient failure.
-                const healthPenaltyWindowMs = Math.max(5000, Number(config.recoveryHealthPenaltyWindowMs) || 30000);
-                const healthPenaltyActive = candidateHealth && candidateHealth.recoveries > 0 &&
-                    Number.isFinite(candidateHealth.lastAt) &&
-                    (now - candidateHealth.lastAt) < healthPenaltyWindowMs;
-                const healthPenalty = healthPenaltyActive
-                    ? Math.min(2, candidateHealth.recoveries) *
-                      Math.max(0, Number(config.recoveryHealthPenalty) || 0.75)
-                    : 0;
-                const score = manhattan + routePenalty + wrongDirectionPenalty +
-                    transitionPenalty + healthPenalty;
+                const forwardPenalty = config.loopMode
+                    ? Math.min((i - state.currentIndex + route.length) % route.length, route.length) * 0.01
+                    : (i < state.currentIndex ? route.length * 0.01 : 0);
+                const score = manhattan + forwardPenalty;
 
                 if (score < bestScore) {
                     bestScore = score;
@@ -8865,17 +8618,9 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         // If repeat-avoidance found nothing, retry once without that preference.
         // Never let the safety preference turn a recoverable route into a hard stop.
         if (result.bestIdx < 0 && avoidRepeat) {
-            result = findBest(false, false, true, noWayAvoidActive);
+            result = findBest(false, false);
             if (result.bestIdx < 0 && allowTransitionFallback)
-                result = findBest(true, false, true, noWayAvoidActive);
-        }
-
-        // If the recent NO_WAY target is the only viable candidate, allow it only
-        // as a final fallback rather than making a tiny route unrecoverable.
-        if (result.bestIdx < 0 && noWayAvoidActive) {
-            result = findBest(false, false, true, false);
-            if (result.bestIdx < 0 && allowTransitionFallback)
-                result = findBest(true, false, true, false);
+                result = findBest(true, false);
         }
 
         // Last-resort pass: if the route is extremely compact and every useful
@@ -8904,10 +8649,9 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         state.recoveryLastTargetAt = Date.now();
         state.recoveryLastTargetKey = `${wp.x},${wp.y},${wp.z}`;
         bot.log(
-            `Cave: recovery (${state.recoveryReason || 'UNKNOWN'}) → closest same-floor ${result.bestIsTransition ? 'transition ' : ''}waypoint #${result.bestIdx + 1} ` +
-            `(${wp.x}, ${wp.y}, ${wp.z}) – ${result.bestProgress} tiles away, score ${Number(result.bestScore).toFixed(3)}` +
-            `${avoidRepeat && (result.bestIdx !== avoidIndex || avoidKey !== `${wp.x},${wp.y},${wp.z}`) ? ' (avoided previous recovery target)' : ''}` +
-            `${noWayAvoidActive && result.bestIdx !== state.noWayRecoveryIndex ? ' (avoided recent NO_WAY target)' : ''}`
+            `Cave: skipping to closest same-floor ${result.bestIsTransition ? 'transition ' : ''}waypoint #${result.bestIdx + 1} ` +
+            `(${wp.x}, ${wp.y}, ${wp.z}) – ${result.bestProgress} tiles away` +
+            `${avoidRepeat && (result.bestIdx !== avoidIndex || avoidKey !== `${wp.x},${wp.y},${wp.z}`) ? ' (avoided previous recovery target)' : ''}`
         );
         goToWaypoint(wp);
         return wp;
@@ -9011,10 +8755,6 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             return true;
 
         state.lastTeleportResetAt = now;
-        // A teleport invalidates the active native path, but not the short-lived
-        // obstacle memory: those tiles describe local failures and may still be
-        // useful if the teleport lands nearby. Expired entries are removed now.
-        pruneRecoveryObstacleMemory(now);
         state._standAttempt = null;
         state._ropeUsed = undefined;
         state._ropeNextUseAt = undefined;
@@ -9028,14 +8768,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         state.lastWaypointTarget = null;
         state.pathAttemptStart = 0;
         state.lastDistanceToWaypoint = null;
-        state.bestDistanceToWaypoint = Infinity;
-        state.waypointProgressKey = null;
-        state.nativePathWatchKey = null;
-        state.nativePathWatchAt = 0;
-        state.nativePathWatchBestDistance = Infinity;
         state.lastPathAt = 0;
         state.stuckCount = 0;
-        setRecoveryReason('TELEPORT', now, getCurrentWaypoint());
         state.stuckRecoveryAttempts = 0;
         state.positionHistory = [];
 
@@ -9094,11 +8828,6 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             state.lastWaypointTarget = null;
             state.pathAttemptStart = 0;
             state.lastDistanceToWaypoint = null;
-            state.bestDistanceToWaypoint = Infinity;
-            state.waypointProgressKey = null;
-            state.nativePathWatchKey = null;
-            state.nativePathWatchAt = 0;
-            state.nativePathWatchBestDistance = Infinity;
             state.lastPathAt = 0;
 
             const next = advanceWaypoint();
@@ -9374,7 +9103,6 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 // route waypoint instead of blindly advancing to the next waypoint.
                 const standTimeout = Math.max(5000, Number(config.standTimeoutMs) || 10000);
                 if (state.standStartAt[index] && now - state.standStartAt[index] > standTimeout) {
-                    setRecoveryReason('STAND_TIMEOUT', now, waypoint);
                     delete state.standStartAt[index];
                     state._standAttempt = null;
                     bot.log(`Stand waypoint stalled for ${standTimeout / 1000}s – selecting recovery waypoint`);
@@ -10256,28 +9984,19 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             let madeProgress = false;
             if (positionKey && positionKey !== state.lastPositionKey) {
                 const progressWaypoint = getCurrentWaypoint();
-                const progressKey = getWaypointKey(progressWaypoint);
                 const currentWaypointDistance = progressWaypoint
                     ? getDistanceToWaypoint(position, progressWaypoint)
                     : Infinity;
-                if (progressKey !== state.waypointProgressKey) {
-                    resetWaypointProgressTracking(progressWaypoint, position, now);
-                }
-                const previousBestDistance = Number(state.bestDistanceToWaypoint);
+                const previousWaypointDistance = Number(state.lastDistanceToWaypoint);
                 const distanceImproved = Number.isFinite(currentWaypointDistance) &&
-                    (!Number.isFinite(previousBestDistance) || currentWaypointDistance < previousBestDistance);
+                    (!Number.isFinite(previousWaypointDistance) || currentWaypointDistance < previousWaypointDistance);
 
                 madeProgress = distanceImproved;
                 state.lastPositionKey = positionKey;
                 if (Number.isFinite(currentWaypointDistance))
                     state.lastDistanceToWaypoint = currentWaypointDistance;
-                if (distanceImproved) {
-                    state.bestDistanceToWaypoint = currentWaypointDistance;
-                    state.lastProgressAt = now;
+                if (distanceImproved)
                     state.stuckCount = 0;
-                    state.nativePathWatchBestDistance = currentWaypointDistance;
-                    state.nativePathWatchAt = now;
-                }
 
                 // Normal movement resets recovery state only when it is genuine
                 // route progress. A creature pushing us around must not keep
@@ -10343,25 +10062,6 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             }
 
             // ---- STUCK DETECTION / GUARDED RECOVERY ----
-            const currentProgressWaypoint = getCurrentWaypoint();
-            const currentProgressKey = getWaypointKey(currentProgressWaypoint);
-            const currentProgressDistance = currentProgressWaypoint
-                ? getDistanceToWaypoint(position, currentProgressWaypoint)
-                : Infinity;
-            if (currentProgressKey !== state.waypointProgressKey) {
-                resetWaypointProgressTracking(currentProgressWaypoint, position, now);
-            } else if (Number.isFinite(currentProgressDistance) && currentProgressDistance < Number(state.bestDistanceToWaypoint)) {
-                state.bestDistanceToWaypoint = currentProgressDistance;
-                state.lastDistanceToWaypoint = currentProgressDistance;
-                state.lastProgressAt = now;
-                state.nativePathWatchBestDistance = currentProgressDistance;
-                state.nativePathWatchAt = now;
-                state.telemetry.progressEvents++;
-                state.telemetry.lastEventAt = now;
-                state.telemetry.lastEvent = 'PROGRESS';
-                madeProgress = true;
-            }
-
             const stuckTimeout = config.stuckTimeoutMs || 2000;
             const stalledFor = now - state.lastProgressAt;
 
@@ -10373,17 +10073,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                     // skipping a perfectly valid waypoint just because one path
                     // attempt got blocked by a creature, door, or transient state.
                     const maxRepathRecoveries = Math.max(0, Math.trunc(Number(config.maxRepathRecoveries) || 2));
-                    // If the previous recovery side-step did not produce route progress,
-                    // remember that exact tile briefly. This prevents repeated attempts
-                    // to step onto the same temporarily bad square without constraining
-                    // native Pathfinder pathfinding.
-                    if (state.recoverySideStepLastKey && state.recoverySideStepOriginKey &&
-                        state.recoverySideStepLastKey !== getPositionKey(position)) {
-                        rememberRecoveryObstacle(state.recoverySideStepLastKey, now);
-                    }
-                    pruneRecoveryObstacleMemory(now);
                     if (state.stuckRecoveryAttempts < maxRepathRecoveries) {
-                        setRecoveryReason('STUCK', now, currentWp);
                         state.stuckRecoveryAttempts++;
                         const recoveryDistance = getDistanceToWaypoint(position, currentWp);
                         state.recoveryBestDistance = Number.isFinite(recoveryDistance) ? recoveryDistance : Infinity;
@@ -10445,7 +10135,6 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                             temporaryBlockerConfirmed = true;
                             const blockerKey = `${posForBlocker.x},${posForBlocker.y},${posForBlocker.z}|${currentWp.x},${currentWp.y},${currentWp.z}`;
                             if (state.recoveryBlockerWaitKey !== blockerKey) {
-                                setRecoveryReason('TEMP_BLOCKER', now, currentWp);
                                 state.recoveryBlockerWaitKey = blockerKey;
                                 state.recoveryBlockerWaitAt = now;
                                 state.lastProgressAt = now;
@@ -10517,7 +10206,6 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                                 const candidateKey = `${nx},${ny},${posNow.z}`;
                                 if (state.recoverySideStepLastKey === candidateKey) continue;
                                 if (state.recoverySideStepOriginKey === candidateKey) continue;
-                                if (isRememberedRecoveryObstacle(candidateKey, now)) continue;
                                 state.recoverySideStepAt = now;
                                 state.recoveryBlockerWaitAt = 0;
                                 state.recoveryBlockerWaitKey = null;
@@ -10630,17 +10318,9 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
             // ---- AT WAYPOINT ----
             if (isAtWaypoint(position, waypoint)) {
-                // A successful arrival is strong evidence that the immediate route
-                // area is usable again. Keep only genuinely expired obstacle memory.
-                pruneRecoveryObstacleMemory(now);
                 state.lastWaypointTarget = null;
                 state.pathAttemptStart = 0;
                 state.lastDistanceToWaypoint = null;
-                state.bestDistanceToWaypoint = Infinity;
-                state.waypointProgressKey = null;
-                state.nativePathWatchKey = null;
-                state.nativePathWatchAt = 0;
-                state.nativePathWatchBestDistance = Infinity;
                 state.stuckCount = 0;
                 state.stuckRecoveryAttempts = 0;
                 state.lastRecoveryAt = 0;
@@ -10667,7 +10347,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 }
                 state.lastWaypointTarget = waypoint;
                 state.pathAttemptStart = now;
-                resetWaypointProgressTracking(waypoint, position, now);
+                state.lastDistanceToWaypoint = getDistanceToWaypoint(position, waypoint);
                 goToWaypoint(waypoint);
                 return;
             }
@@ -10726,46 +10406,13 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             const nativePathActive = !!(pf?.__finalDestination || pf?.__isAutoWalking || pf?.__pathfindCache?.length);
             const stalled = !state.lastProgressAt || (now - state.lastProgressAt >= config.repathMs);
             const pathExpired = !state.lastPathAt || (now - state.lastPathAt >= config.repathMs);
-            const waypointKey = getWaypointKey(waypoint);
 
-            if (state.nativePathWatchKey !== waypointKey) {
-                state.nativePathWatchKey = waypointKey;
-                state.nativePathWatchAt = now;
-                state.nativePathWatchBestDistance = Number.isFinite(currentDist) ? currentDist : Infinity;
-            }
-            if (Number.isFinite(currentDist) && currentDist < state.nativePathWatchBestDistance) {
-                state.nativePathWatchBestDistance = currentDist;
-                state.nativePathWatchAt = now;
-            }
-
-            // Native Pathfinder owns active AutoWalk batches. We normally leave it
-            // completely alone, but a path can remain flagged as active while the
-            // character has made no real route progress. This watchdog waits for the
-            // full stuck window before allowing one guarded native-path reset.
-            const nativeStallMs = Math.max(Number(config.nativePathWatchdogMs) || 5000, Number(config.stuckTimeoutMs) || 5000);
-            const nativeWatchStalled = nativePathActive && state.nativePathWatchAt > 0 &&
-                (now - state.nativePathWatchAt >= nativeStallMs);
-
+            // Native Pathfinder already owns its active AutoWalk batch and has
+            // its own loop detection / continuation. While it is active, CaveBot
+            // observes instead of competing with it. Rebuild only after the native
+            // state disappears, or after two guarded local stall observations.
             if (!nativePathActive) {
                 goToWaypoint(waypoint);
-            } else if (nativeWatchStalled && (now - state.lastRecoveryAt) > 1000) {
-                setRecoveryReason('NATIVE_STALL', now, waypoint);
-                state.lastRecoveryAt = now;
-                state.stuckCount++;
-                state.nativePathWatchAt = now;
-                state.lastPathAt = 0;
-                state.lastWaypointTarget = null;
-                bot.log(`Cave: native Pathfinder active but no route progress for ${(nativeStallMs / 1000).toFixed(1)}s – guarded repath ${state.stuckCount}/2`);
-                if (state.stuckCount >= 2) {
-                    state.stuckCount = 0;
-                    state.lastProgressAt = now - nativeStallMs;
-                    state.stuckRecoveryAttempts = Math.max(state.stuckRecoveryAttempts, Math.max(0, Math.trunc(Number(config.maxRepathRecoveries) || 2)));
-                    // Let the existing bounded recovery path decide whether to
-                    // sidestep, wait for a creature, or select a recovery waypoint.
-                    goToWaypoint(waypoint);
-                } else {
-                    goToWaypoint(waypoint);
-                }
             } else if (stalled && pathExpired && (now - state.lastRecoveryAt) > 1000) {
                 state.lastRecoveryAt = now;
                 state.stuckCount++;
@@ -10814,28 +10461,18 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                     return;
 
                 const now = Date.now();
-                const currentWp = getCurrentWaypoint();
-                // Script-only waypoints are actions, not navigation targets. Never let
-                // a stale DOM Pathfinder message trigger recovery while one is active.
-                if (!currentWp || currentWp.x === undefined || currentWp.y === undefined || currentWp.z === undefined)
-                    return;
-                const waypointKey = getWaypointKey(currentWp);
-                const failureKey = `${state.currentIndex}:${waypointKey || 'script'}`;
                 // MutationObserver can report several mutations for one message.
-                // Treat the DOM message as a fresh failure only when either the
-                // waypoint changed or the same waypoint has been quiet long enough.
-                if (text === state.noWayLastText && now - state.noWayLastSeenAt < 1000 &&
-                    state.noWayFailureKey === failureKey)
+                if (text === state.noWayLastText && now - state.noWayLastSeenAt < 1000)
                     return;
                 state.noWayLastText = text;
                 state.noWayLastSeenAt = now;
-                if (state.noWayFailureKey === failureKey && now - state.noWayFailureAt < 1500)
+
+                // Do not repeatedly re-arm recovery from the same DOM message while
+                // CaveBot is still working on the same waypoint. A different current
+                // waypoint is allowed to trigger recovery again.
+                if (state.noWayRecoveryIndex === state.currentIndex)
                     return;
-                state.noWayFailureKey = failureKey;
-                state.noWayFailureAt = now;
-                state.noWayLastWaypointKey = waypointKey;
                 state.noWayRecoveryIndex = state.currentIndex;
-                setRecoveryReason('NO_WAY', now, currentWp);
 
                 const maxRepathRecoveries = Math.max(0, Math.trunc(Number(config.maxRepathRecoveries) || 2));
                 const maxRecoverySideSteps = Math.max(0, Math.trunc(Number(config.maxRecoverySideSteps) || 2));
@@ -10854,7 +10491,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 state.lastRecoveryAt = 0;
                 state.lastProgressAt = now - Math.max(1000, Number(config.stuckTimeoutMs) || 5000) - 1;
                 state._stuckLogged = false;
-                bot.log(`Cave: Pathfinder reported "There is no way." at waypoint #${state.currentIndex + 1} – forcing waypoint recovery`);
+                bot.log('Cave: Pathfinder reported "There is no way." – forcing waypoint recovery');
             };
 
             const observers = [];
@@ -10959,18 +10596,6 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         state.lastPathAt = 0;
         state.lastPositionKey = getPositionKey(pos);
         state.lastProgressAt = Date.now();
-        state.bestDistanceToWaypoint = Infinity;
-        state.waypointProgressKey = null;
-        state.nativePathWatchKey = null;
-        state.nativePathWatchAt = 0;
-        state.nativePathWatchBestDistance = Infinity;
-        state.recoveryReason = null;
-        state.recoveryReasonAt = 0;
-        state.recoveryReasonIndex = -1;
-        state.recoveryReasonKey = null;
-        state.noWayLastWaypointKey = null;
-        state.noWayFailureKey = null;
-        state.noWayFailureAt = 0;
         state.stuckRecoveryAttempts = 0;
         state.lastRecoveryAt = 0;
         state.pausedForCombat = false;
@@ -11012,10 +10637,6 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             persistConfig();
         }
         state.pausedForCombat = false;
-        state.recoveryReason = null;
-        state.recoveryReasonAt = 0;
-        state.recoveryReasonIndex = -1;
-        state.recoveryReasonKey = null;
         bot.log("cave bot stopped");
         return true;
     }
@@ -11030,7 +10651,6 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         } else {
             route.push(norm);
         }
-        resetRecoveryContext("waypoint added");
         persistRoute();
         bot.log("cave waypoint added", {
             ...norm,
@@ -11053,7 +10673,6 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         route = [];
         state.currentIndex = 0;
         state.direction = 1;
-        resetRecoveryContext("route cleared");
         persistRoute();
         bot.log("cave route cleared");
         if (state.running)
@@ -11075,7 +10694,6 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         const removed = route.pop();
         if (state.currentIndex >= route.length)
             state.currentIndex = Math.max(0, route.length - 1);
-        resetRecoveryContext("waypoint removed");
         if (route.length <= 1)
             state.direction = 1;
         persistRoute();
@@ -11094,51 +10712,9 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         const next = Math.max(0, Math.min(route.length - 1, Math.trunc(Number(index) || 0)));
         state.currentIndex = next;
         state.direction = next >= route.length - 1 ? -1 : 1;
-        resetRecoveryContext("current waypoint changed");
         if (route.length <= 1)
             state.direction = 1;
         return state.currentIndex;
-    }
-
-    function getRouteHealth() {
-        return Array.from(state.routeHealth.values())
-            .sort((a, b) => (b.lastAt || 0) - (a.lastAt || 0))
-            .map(entry => ({ ...entry }));
-    }
-
-    function getRecoveryHistory(limit = config.recoveryHistoryLimit) {
-        const max = Math.max(1, Math.min(config.recoveryHistoryLimit, Math.trunc(Number(limit) || config.recoveryHistoryLimit)));
-        return state.recoveryHistory.slice(-max).map(entry => ({
-            ...entry,
-            waypoint: entry.waypoint ? { ...entry.waypoint } : null,
-        }));
-    }
-
-    function clearRouteHealth() {
-        state.routeHealth.clear();
-        state.recoveryHistory.length = 0;
-        state.recoveryReason = null;
-        state.recoveryReasonAt = 0;
-        state.recoveryReasonIndex = -1;
-        state.recoveryReasonKey = null;
-        bot.log("Cave: route health history cleared");
-        return true;
-    }
-
-    function getTelemetry() {
-        const pos = normalizePosition(bot.getPlayerPosition());
-        const wp = getCurrentWaypoint();
-        return {
-            ...state.telemetry,
-            currentIndex: state.currentIndex,
-            currentDistance: getDistanceToWaypoint(pos, wp),
-            bestDistance: state.bestDistanceToWaypoint,
-            stalledForMs: Math.max(0, Date.now() - (state.lastProgressAt || Date.now())),
-            nativePathActive: !!(window.gameClient?.world?.pathfinder?.__finalDestination ||
-                window.gameClient?.world?.pathfinder?.__isAutoWalking ||
-                window.gameClient?.world?.pathfinder?.__pathfindCache?.length),
-            rememberedObstacleTiles: state.recoveryObstacleTiles.size,
-        };
     }
 
     function status() {
@@ -11156,27 +10732,11 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             currentIndex: state.currentIndex,
             direction: state.direction,
             currentWaypoint: cloneValue(wp),
-            recoveryReason: state.recoveryReason,
-            recoveryReasonAt: state.recoveryReasonAt,
-            recoveryReasonIndex: state.recoveryReasonIndex,
-            recoveryReasonKey: state.recoveryReasonKey,
             distanceToWaypoint: getDistanceToWaypoint(pos, wp),
             lastPathAt: state.lastPathAt,
             lastProgressAt: state.lastProgressAt,
             pendingTransitionSource: cloneValue(state.pendingTransitionSource),
             pausedForCombat: state.pausedForCombat,
-            telemetry: {
-                ...state.telemetry,
-                currentDistance: getDistanceToWaypoint(pos, wp),
-                bestDistance: state.bestDistanceToWaypoint,
-                stalledForMs: Math.max(0, Date.now() - (state.lastProgressAt || Date.now())),
-                nativePathActive: !!(window.gameClient?.world?.pathfinder?.__finalDestination ||
-                    window.gameClient?.world?.pathfinder?.__isAutoWalking ||
-                    window.gameClient?.world?.pathfinder?.__pathfindCache?.length),
-                rememberedObstacleTiles: state.recoveryObstacleTiles.size,
-            },
-            routeHealth: getRouteHealth().slice(0, 25),
-            recoveryHistory: getRecoveryHistory(10),
         };
     }
 
@@ -11312,7 +10872,6 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         if (updates.script !== undefined) {
             wp.script = updates.script ? String(updates.script).trim() : undefined;
         }
-        resetRecoveryContext("waypoint updated");
         persistRoute();
         bot.log("Waypoint updated", {
             index,
@@ -11369,9 +10928,6 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         getLoopMode,
         inspectNearbyTiles,
         isAtWaypoint,
-        getRouteHealth,
-        getRecoveryHistory,
-        clearRouteHealth,
         updateWaypoint,
         mergePresets: mergePresets,
         renamePreset: renamePreset,
@@ -15995,110 +15551,122 @@ window.__minibiaBotBundle.installPinkSkullDetectorModule = function installPinkS
     const configStorageKey = "minibiaBot.pinkSkull.config";
     let checkInterval = null;
 
-    const PINK_SKULL_VALUE = 6; // confirmed for this client build
-
     const config = Object.assign({
         enabled: false
     },
             bot.storage.get(configStorageKey, {}));
 
     function persistConfig() {
-        bot.storage.set(configStorageKey, { ...config });
+        bot.storage.set(configStorageKey, {
+            ...config
+        });
     }
 
-    // ---- DOM fallback: pink is rendered via hue-rotate(280deg) ----
-    function isPinkViaDom(player) {
-        try {
-            const ce = player?.characterElement;
-            const root = (ce?.element instanceof Element) ? ce.element
-                : (ce instanceof Element) ? ce
-                : document.getElementById('character-element-prototype');
-            if (!root) return false;
-
-            const skullIcon = root.querySelector('.skull-icon');
-            if (!skullIcon) return false;
-
-            const computed = window.getComputedStyle(skullIcon);
-            if (computed.display === 'none' ||
-                computed.visibility === 'hidden' ||
-                Number(computed.opacity || 1) === 0) {
-                return false;
-            }
-
-            const hueMatch = (computed.filter || '').match(/hue-rotate\(\s*(-?\d+(?:\.\d+)?)deg\s*\)/i);
-            if (!hueMatch) return false;
-            const hue = ((Number(hueMatch[1]) % 360) + 360) % 360;
-            return Math.abs(hue - 280) <= 15;
-        } catch (e) {
-            return false;
+    function getPinkSkullValue() {
+        // Attempt to get the pink skull constant from CONST.SKULL
+        if (typeof CONST !== 'undefined' && CONST.SKULL && typeof CONST.SKULL.PINK !== 'undefined') {
+            return CONST.SKULL.PINK;
         }
-    }
-
-    function isPlayerPinkSkull(player) {
-        if (player?.skull === PINK_SKULL_VALUE)
-            return { detected: true, method: `player.skull=${PINK_SKULL_VALUE}` };
-        if (isPinkViaDom(player))
-            return { detected: true, method: "DOM hue-rotate(280deg)" };
-        return { detected: false, method: null };
+        // Fallback: numeric value from common OTC implementations (often 4)
+        return 4;
     }
 
     function checkSkull() {
-        if (!config.enabled) return;
+        if (!config.enabled)
+            return;
 
         const player = window.gameClient?.player;
-        if (!player) return;
+        if (!player)
+            return;
 
-        const result = isPlayerPinkSkull(player);
-        if (!result.detected) return;
+        const pink = getPinkSkullValue();
+        if (player.skull === pink) {
+            bot.log("PINK SKULL DETECTED! Disconnecting...");
+            bot.playAlarm?.();
 
-        bot.log(`PINK SKULL DETECTED via ${result.method}! Disconnecting...`);
-        bot.playAlarm?.();
+            // Stop all modules (like panic does)
+            if (bot.cave?.stop)
+                bot.cave.stop({
+                    persistEnabled: false
+                });
+            if (bot.attack?.stop)
+                bot.attack.stop({
+                    persistEnabled: false
+                });
+            if (bot.rune?.stop)
+                bot.rune.stop({
+                    persistEnabled: false
+                });
+            if (bot.heal?.stop)
+                bot.heal.stop({
+                    persistEnabled: false
+                });
+            if (bot.invisible?.stop)
+                bot.invisible.stop({
+                    persistEnabled: false
+                });
+            if (bot.magicShield?.stop)
+                bot.magicShield.stop({
+                    persistEnabled: false
+                });
+            if (bot.equipRing?.stop)
+                bot.equipRing.stop({
+                    persistEnabled: false
+                });
+            if (bot.eat?.stop)
+                bot.eat.stop({
+                    persistEnabled: false
+                });
+            if (bot.paladin?.stop)
+                bot.paladin.stop({
+                    persistEnabled: false
+                });
+            if (bot.looter?.stop)
+                bot.looter.stop({
+                    persistEnabled: false
+                });
 
-        if (bot.cave?.stop)        bot.cave.stop({ persistEnabled: false });
-        if (bot.attack?.stop)      bot.attack.stop({ persistEnabled: false });
-        if (bot.rune?.stop)        bot.rune.stop({ persistEnabled: false });
-        if (bot.heal?.stop)        bot.heal.stop({ persistEnabled: false });
-        if (bot.invisible?.stop)   bot.invisible.stop({ persistEnabled: false });
-        if (bot.magicShield?.stop) bot.magicShield.stop({ persistEnabled: false });
-        if (bot.equipRing?.stop)   bot.equipRing.stop({ persistEnabled: false });
-        if (bot.eat?.stop)         bot.eat.stop({ persistEnabled: false });
-        if (bot.paladin?.stop)     bot.paladin.stop({ persistEnabled: false });
-        if (bot.looter?.stop)      bot.looter.stop({ persistEnabled: false });
-
-        try {
-            if (typeof window.gameClient?.disconnect === 'function') {
-                window.gameClient.disconnect();
-                bot.log("Game client disconnected.");
-            } else {
-                bot.log("Could not disconnect: gameClient.disconnect not available.");
+            // Disconnect
+            try {
+                if (window.gameClient && typeof window.gameClient.disconnect === 'function') {
+                    window.gameClient.disconnect();
+                    bot.log("Game client disconnected.");
+                } else {
+                    bot.log("Could not disconnect: gameClient.disconnect not available.");
+                }
+            } catch (e) {
+                bot.log("Disconnect failed:", e);
             }
-        } catch (e) {
-            bot.log("Disconnect failed:", e);
-        }
 
-        config.enabled = false;
-        persistConfig();
-        if (checkInterval) {
-            clearInterval(checkInterval);
-            checkInterval = null;
-        }
-        if (typeof bot.ui?.refreshPinkSkullStatus === 'function') {
-            bot.ui.refreshPinkSkullStatus();
+            // Disable the detector to prevent repeated triggers
+            config.enabled = false;
+            persistConfig();
+            if (checkInterval) {
+                clearInterval(checkInterval);
+                checkInterval = null;
+            }
+            // Update UI toggle
+            if (typeof bot.ui?.refreshPinkSkullStatus === 'function') {
+                bot.ui.refreshPinkSkullStatus();
+            }
         }
     }
 
     function start() {
-        if (config.enabled) return false;
+        if (config.enabled)
+            return false;
         config.enabled = true;
         persistConfig();
-        if (checkInterval) clearInterval(checkInterval);
+        if (checkInterval)
+            clearInterval(checkInterval);
         checkInterval = setInterval(checkSkull, 1000);
         bot.log("Pink Skull Detector enabled");
         return true;
     }
 
     function stop() {
-        if (!config.enabled) return false;
+        if (!config.enabled)
+            return false;
         config.enabled = false;
         persistConfig();
         if (checkInterval) {
@@ -16112,31 +15680,36 @@ window.__minibiaBotBundle.installPinkSkullDetectorModule = function installPinkS
     function status() {
         return {
             running: config.enabled,
-            config: { ...config },
+            config: {
+                ...config
+            },
+            profiles: bot.profiles?.list?.() || [],
         };
     }
 
     function updateConfig(next) {
         if (next.enabled !== undefined) {
-            if (next.enabled) start();
-            else stop();
+            if (next.enabled)
+                start();
+            else
+                stop();
         }
-        return { ...config };
+        return {
+            ...config
+        };
     }
 
-    if (config.enabled) start();
+    // Auto-start if enabled
+    if (config.enabled) {
+        start();
+    }
 
     bot.pinkSkull = {
-        start, stop, status, updateConfig, config,
-        _debugState: () => {
-            const p = window.gameClient?.player;
-            return {
-                playerSkull: p?.skull,
-                pinkValue: PINK_SKULL_VALUE,
-                domPink: p ? isPinkViaDom(p) : null,
-                detected: p ? isPlayerPinkSkull(p) : null,
-            };
-        },
+        start,
+        stop,
+        status,
+        updateConfig,
+        config,
     };
 };
 
@@ -19505,9 +19078,7 @@ function upgradeSectionHeaders(panel) {
             let running = false;
             try { running = !!m.isRunning(); } catch {}
             btn.dataset.running = running ? "true" : "false";
-            const baseTitle = btn.dataset.mbBaseTitle || btn.title || "Module";
-            btn.dataset.mbBaseTitle = baseTitle.replace(/\s+\((?:running|stopped)\)(?:\s+\((?:running|stopped)\))*$/i, "");
-            btn.title = `${btn.dataset.mbBaseTitle} ${running ? "(running)" : "(stopped)"}`;
+            btn.title = `${btn.title.split(" – ")[0]} ${running ? "(running)" : "(stopped)"}`;
         });
     }
 
@@ -20314,7 +19885,7 @@ function upgradeSectionHeaders(panel) {
         panel.id = "minibia-bot-panel";
         panel.innerHTML = `
 <div class="mb-titlebar">
-  <div class="mb-title">mb0t <span class="mb-title-version">v1.4.54</span></div>
+  <div class="mb-title">mb0t <span class="mb-title-version">v1.4.46</span></div>
   <div class="mb-title-status">
     <span class="mb-run-indicator" id="minibia-bot-title-cave-status" data-running="false"><span class="mb-run-dot"></span><span class="mb-run-label">🏃‍♂️‍➡️</span></span>
     <span class="mb-run-indicator" id="minibia-bot-title-attack-status" data-running="false"><span class="mb-run-dot"></span><span class="mb-run-label">⚔️</span></span>
