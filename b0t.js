@@ -803,7 +803,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.5.33",
+        version: "1.5.35",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -3331,7 +3331,12 @@ window.__minibiaBotBundle.installPlayerAttackMonitorModule = function installPla
 
     function persistConfig() {
         bot.storage.set(configStorageKey, {
-            enabled: config.enabled
+            enabled: config.enabled,
+            restartDelayMs: config.restartDelayMs,
+            firstReplyDelayMs: config.firstReplyDelayMs,
+            secondReplyDelayMs: config.secondReplyDelayMs,
+            firstReplyText: config.firstReplyText,
+            secondReplyText: config.secondReplyText,
         });
     }
 
@@ -3446,6 +3451,14 @@ window.__minibiaBotBundle.installPlayerAttackMonitorModule = function installPla
     function status() {
         return {
             running: state.running,
+            killSwitchActive: state.killSwitchActive,
+            restartPending: state.restartTimerId != null,
+            replyTimersPending:
+                state.replyTimerIds?.length || 0,
+            lastTriggerAt: state.lastTriggerAt || 0,
+            lastSender: state.lastSender,
+            repliesSent: state.repliesSent || 0,
+            restoresCompleted: state.restoresCompleted || 0,
             config: {
                 ...config
             }
@@ -12303,6 +12316,17 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         lastStairsUseAt: 0,
         lastObservedPosition: null,
         lastTeleportResetAt: 0,
+
+        // v1.5.34: temple/GM relocations recover directly to the nearest
+        // same-floor STAND instead of sequentially skipping old-route entries.
+        teleportRecoverySelections: 0,
+        teleportRecoveryStandSelections: 0,
+        teleportRecoveryFallbackSelections: 0,
+        teleportRecoveryLastAt: 0,
+        teleportRecoveryLastIndex: -1,
+        teleportRecoveryLastReason: null,
+        teleportRecoveryLastDistance: null,
+
         pendingTransitionSource: null,
         pausedForCombat: false,
         lureLeashPaused: false,
@@ -17176,6 +17200,267 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         return wp;
     }
 
+    function findClosestSameFloorStandForTeleport(position) {
+        if (!position || !route.length)
+            return null;
+
+        const limit = boundedWaypointDistance(
+            config.maxWaypointDistance
+        );
+        let best = null;
+
+        for (let i = 0; i < route.length; i++) {
+            const wp = route[i];
+
+            if (
+                !wp ||
+                wp.script ||
+                wp.stand !== true ||
+                wp.x === undefined ||
+                wp.y === undefined ||
+                wp.z === undefined
+            ) {
+                continue;
+            }
+
+            if (Number(wp.z) !== Number(position.z))
+                continue;
+
+            try {
+                if (
+                    bot.blacklist?.isBlacklisted?.(
+                        wp.x,
+                        wp.y,
+                        wp.z
+                    )
+                ) {
+                    continue;
+                }
+            } catch (e) {}
+
+            const dx = Math.abs(wp.x - position.x);
+            const dy = Math.abs(wp.y - position.y);
+            const cheb = Math.max(dx, dy);
+
+            // Keep temple recovery local, but deliberately do NOT use a map
+            // connectivity test. The client graph can misclassify islands.
+            if (cheb > limit)
+                continue;
+
+            const manhattan = dx + dy;
+
+            if (
+                !best ||
+                cheb < best.cheb ||
+                (
+                    cheb === best.cheb &&
+                    manhattan < best.manhattan
+                ) ||
+                (
+                    cheb === best.cheb &&
+                    manhattan === best.manhattan &&
+                    i < best.index
+                )
+            ) {
+                best = {
+                    index: i,
+                    waypoint: wp,
+                    cheb,
+                    manhattan
+                };
+            }
+        }
+
+        return best;
+    }
+
+    function resetSpecialWaypointStateForTeleportRecovery(
+        now = Date.now()
+    ) {
+        state._standAttempt = null;
+        state._ropeUsed = undefined;
+        state._ropeNextUseAt = undefined;
+        state._ropeWaitingFloorChange = null;
+        state._shovelUsed = undefined;
+        state._shovelOpened = undefined;
+        state._shovelOpenedAt = undefined;
+        state._shovelRetry = null;
+        state._ladderUsed = undefined;
+        state._ladderWaitingFloorChange = null;
+
+        state.lastWaypointTarget = null;
+        state.pathAttemptStart = 0;
+        state.lastDistanceToWaypoint = null;
+        state.bestDistanceToWaypoint = Infinity;
+        state.waypointProgressKey = null;
+        state.nativePathWatchKey = null;
+        state.nativePathWatchAt = 0;
+        state.nativePathWatchBestDistance = Infinity;
+        state.lastPathAt = 0;
+        state.stuckCount = 0;
+        state.stuckRecoveryAttempts = 0;
+        state.recoverySideStepAttempts = 0;
+        state.recoveryBlockerWaitAt = 0;
+        state.recoveryBlockerWaitKey = null;
+        state.positionHistory = [];
+        state.skipAttemptCount = 0;
+
+        clearLureDetourPlan("teleport recovery");
+        clearLureStaticRouteCache("teleport recovery");
+        clearLureRouteBlocker("teleport recovery");
+        clearLureBlockerDeadlock("teleport recovery", now);
+        clearLureEmergencyClear("teleport recovery", now);
+    }
+
+    function recoverAfterTeleportRelocation(
+        position,
+        now = Date.now(),
+        reason = "teleport"
+    ) {
+        if (!position || !route.length)
+            return null;
+
+        const originalIndex = state.currentIndex;
+        resetSpecialWaypointStateForTeleportRecovery(now);
+
+        const stand = findClosestSameFloorStandForTeleport(
+            position
+        );
+
+        if (stand) {
+            state.currentIndex = stand.index;
+            if (
+                state.direction !== 1 &&
+                state.direction !== -1
+            ) {
+                state.direction = 1;
+            }
+
+            state.recoveryActive = true;
+            state.recoveryReason = "TELEPORT";
+            state.recoveryReasonAt = now;
+            state.recoveryReasonIndex = stand.index;
+            state.recoveryReasonKey =
+                getWaypointKey(stand.waypoint);
+
+            state.recoveryLastTargetIndex = stand.index;
+            state.recoveryLastTargetAt = now;
+            state.recoveryLastTargetKey =
+                `${stand.waypoint.x},${stand.waypoint.y},${stand.waypoint.z}`;
+
+            state.teleportRecoverySelections++;
+            state.teleportRecoveryStandSelections++;
+            state.teleportRecoveryLastAt = now;
+            state.teleportRecoveryLastIndex = stand.index;
+            state.teleportRecoveryLastReason = reason;
+            state.teleportRecoveryLastDistance = stand.cheb;
+
+            resetWaypointProgressTracking(
+                stand.waypoint,
+                position,
+                now
+            );
+
+            bot.log(
+                `Cave: teleport recovery → closest same-floor Stand ` +
+                `waypoint #${stand.index + 1} ` +
+                `(${stand.waypoint.x}, ${stand.waypoint.y}, ` +
+                `${stand.waypoint.z}) – ${stand.cheb} tiles away`,
+                {
+                    reason,
+                    fromIndex: originalIndex + 1,
+                    selectedIndex: stand.index + 1
+                }
+            );
+
+            goToWaypoint(stand.waypoint);
+            return stand.waypoint;
+        }
+
+        // No local STAND exists: use the existing bounded same-floor recovery
+        // selector, not sequential wrong-floor / distance skipping.
+        const fallback = skipToClosestWaypoint({
+            allowTransitionFallback: false,
+            excludeIndex: -1,
+            avoidIndex: -1,
+            avoidKey: null
+        });
+
+        if (fallback) {
+            state.teleportRecoverySelections++;
+            state.teleportRecoveryFallbackSelections++;
+            state.teleportRecoveryLastAt = now;
+            state.teleportRecoveryLastIndex =
+                state.currentIndex;
+            state.teleportRecoveryLastReason =
+                `${reason}: no same-floor Stand`;
+            state.teleportRecoveryLastDistance =
+                Math.max(
+                    Math.abs(fallback.x - position.x),
+                    Math.abs(fallback.y - position.y)
+                );
+        }
+
+        return fallback;
+    }
+
+    function shouldRecoverAsRelocation(
+        position,
+        waypoint,
+        unexpectedJump
+    ) {
+        if (!position || !waypoint)
+            return false;
+        if (
+            waypoint.x === undefined ||
+            waypoint.y === undefined ||
+            waypoint.z === undefined
+        ) {
+            return false;
+        }
+
+        if (unexpectedJump)
+            return true;
+
+        const floorDelta =
+            Math.abs(Number(waypoint.z) - Number(position.z));
+
+        // Normal manual holes/ropes are one-floor transitions and keep the
+        // existing STAND floor-mismatch "advance to next waypoint" behavior.
+        if (floorDelta >= 2)
+            return true;
+
+        const limit = boundedWaypointDistance(
+            config.maxWaypointDistance
+        );
+
+        // Handles reconnect/character-load cases where lastObservedPosition
+        // was reset and there is no previous tile to compare against.
+        if (floorDelta === 0) {
+            const distance = Math.max(
+                Math.abs(waypoint.x - position.x),
+                Math.abs(waypoint.y - position.y)
+            );
+
+            if (distance > limit) {
+                const closestStand =
+                    findClosestSameFloorStandForTeleport(
+                        position
+                    );
+
+                if (
+                    closestStand &&
+                    closestStand.cheb <= limit &&
+                    closestStand.cheb < distance
+                ) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
     /**
      * Advances to the next waypoint, skipping any that are on a different floor
      * and cannot be reached via a known or visible transition.
@@ -17804,7 +18089,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
             // Reset special waypoint state immediately after a GM teleport,
             // temple return, floor jump or similar server-side relocation.
-            detectUnexpectedPositionJump(position, now);
+            const unexpectedJump =
+                detectUnexpectedPositionJump(position, now);
             noteCircuitMovement(position, now);
 
             // ---- Helper: is the player currently targeting something? ----
@@ -17814,6 +18100,47 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
             // ---- DECLARE WAYPOINT HERE ----
             let waypoint = getCurrentWaypoint();
+
+            // v1.5.34: consume a relocation BEFORE ordinary sequential floor /
+            // distance skipping. Temple recovery anchors to nearest same-floor
+            // STAND first, then uses generic same-floor recovery as fallback.
+            if (
+                waypoint &&
+                position &&
+                shouldRecoverAsRelocation(
+                    position,
+                    waypoint,
+                    unexpectedJump
+                )
+            ) {
+                // The jump detector already records TELEPORT when it had a
+                // previous position. Reconnect-first-frame mismatches do not,
+                // so record one recovery event here.
+                if (
+                    state.recoveryReason !== "TELEPORT" ||
+                    now - Number(state.recoveryReasonAt || 0) > 1500
+                ) {
+                    setRecoveryReason(
+                        "TELEPORT",
+                        now,
+                        waypoint
+                    );
+                }
+
+                const recovered =
+                    recoverAfterTeleportRelocation(
+                        position,
+                        now,
+                        unexpectedJump
+                            ? "unexpected position jump"
+                            : "route/player relocation mismatch"
+                    );
+
+                if (recovered) {
+                    scheduleNextTick();
+                    return;
+                }
+            }
 
             // Hard distance guard applies to EVERY waypoint type, including
             // shovel/rope/ladder. This is intentionally before special-waypoint
@@ -20117,6 +20444,13 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         state._ladderWaitingFloorChange = null;
         state.pendingTransitionSource = null;
         state.lastObservedPosition = null;
+        state.teleportRecoverySelections = 0;
+        state.teleportRecoveryStandSelections = 0;
+        state.teleportRecoveryFallbackSelections = 0;
+        state.teleportRecoveryLastAt = 0;
+        state.teleportRecoveryLastIndex = -1;
+        state.teleportRecoveryLastReason = null;
+        state.teleportRecoveryLastDistance = null;
         state.currentIndex = findClosestWaypointIndex(pos);
         state.direction = state.currentIndex >= route.length - 1 ? -1 : 1;
         if (route.length <= 1)
@@ -20546,6 +20880,20 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             recoveryReasonAt: state.recoveryReasonAt,
             recoveryReasonIndex: state.recoveryReasonIndex,
             recoveryReasonKey: state.recoveryReasonKey,
+            teleportRecoverySelections:
+                state.teleportRecoverySelections || 0,
+            teleportRecoveryStandSelections:
+                state.teleportRecoveryStandSelections || 0,
+            teleportRecoveryFallbackSelections:
+                state.teleportRecoveryFallbackSelections || 0,
+            teleportRecoveryLastAt:
+                state.teleportRecoveryLastAt || 0,
+            teleportRecoveryLastIndex:
+                state.teleportRecoveryLastIndex,
+            teleportRecoveryLastReason:
+                state.teleportRecoveryLastReason,
+            teleportRecoveryLastDistance:
+                state.teleportRecoveryLastDistance,
             distanceToWaypoint: getDistanceToWaypoint(pos, wp),
             lastPathAt: state.lastPathAt,
             lastProgressAt: state.lastProgressAt,
@@ -22476,6 +22824,16 @@ window.__minibiaBotBundle.installMessageAlertModule = function installMessageAle
         running: false,
         timerId: null,
         seenKeys: new Set(),
+
+        // v1.5.35: temporary GM-chat killswitch recovery.
+        killSwitchActive: false,
+        restartTimerId: null,
+        replyTimerIds: [],
+        restartSnapshot: null,
+        lastTriggerAt: 0,
+        lastSender: null,
+        repliesSent: 0,
+        restoresCompleted: 0,
     };
 
     const config = Object.assign({
@@ -23578,11 +23936,31 @@ window.__minibiaBotBundle.installSlimeTrainerModule = function installSlimeTrain
 
     function updateConfig(next) {
         Object.assign(config, next);
+
+        config.restartDelayMs = Math.max(
+            5000,
+            Math.min(60000, Number(config.restartDelayMs) || 15000)
+        );
+        config.firstReplyDelayMs = Math.max(
+            100,
+            Math.min(5000, Number(config.firstReplyDelayMs) || 500)
+        );
+        config.secondReplyDelayMs = Math.max(
+            config.firstReplyDelayMs,
+            Math.min(8000, Number(config.secondReplyDelayMs) || 1000)
+        );
+        config.firstReplyText =
+            String(config.firstReplyText || "Hey :D");
+        config.secondReplyText =
+            String(config.secondReplyText || "i am here");
+
         persistConfig();
-        if (config.enabled && !state.running)
+
+        if (config.enabled && !state.running && !state.killSwitchActive)
             start();
         if (!config.enabled && state.running)
             stop();
+
         return {
             ...config
         };
@@ -36742,7 +37120,25 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
     };
     const config = Object.assign({
         enabled: false,
+        restartDelayMs: 15000,
+        firstReplyDelayMs: 500,
+        secondReplyDelayMs: 1000,
+        firstReplyText: "Hey :D",
+        secondReplyText: "i am here",
     }, bot.storage.get(configStorageKey, {}));
+
+    config.restartDelayMs = Math.max(
+        5000,
+        Math.min(60000, Number(config.restartDelayMs) || 15000)
+    );
+    config.firstReplyDelayMs = Math.max(
+        100,
+        Math.min(5000, Number(config.firstReplyDelayMs) || 500)
+    );
+    config.secondReplyDelayMs = Math.max(
+        config.firstReplyDelayMs,
+        Math.min(8000, Number(config.secondReplyDelayMs) || 1000)
+    );
 
     function persistConfig() {
         bot.storage.set(configStorageKey, {
@@ -36750,62 +37146,122 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
         });
     }
 
-    function triggerKillswitch(sender) {
-        bot.log(`[GM Chat] Detected GM/God in chat: ${sender}`);
-        bot.playGMAlarm();
+    function clearReplyTimers() {
+        for (const id of state.replyTimerIds || []) {
+            if (id != null)
+                clearTimeout(id);
+        }
+        state.replyTimerIds = [];
+    }
 
-        // ---- Stop all modules (same as panic killswitch) ----
+    function clearRestartTimer() {
+        if (state.restartTimerId != null) {
+            clearTimeout(state.restartTimerId);
+            state.restartTimerId = null;
+        }
+    }
+
+    function snapshotRunningModules() {
+        return {
+            monitorRunning: state.running,
+            modules: {
+                rune: !!bot.rune?.status?.().running,
+                eat: !!bot.eat?.status?.().running,
+                invisible: !!bot.invisible?.status?.().running,
+                magicShield: !!bot.magicShield?.status?.().running,
+                cave: !!bot.cave?.status?.().running,
+                attack: !!bot.attack?.status?.().running,
+                equipRing: !!bot.equipRing?.status?.().running,
+                slimeTrainer: !!bot.slimeTrainer?.status?.().running,
+                paladin: !!bot.paladin?.status?.().running,
+                looter: !!bot.looter?.status?.().running,
+                panic: !!bot.panic?.status?.().running,
+            }
+        };
+    }
+
+    function stopKillswitchModules() {
         if (bot.rune?.stop)
-            bot.rune.stop({
-                persistEnabled: false
-            });
+            bot.rune.stop({ persistEnabled: false });
         if (bot.eat?.stop)
-            bot.eat.stop({
-                persistEnabled: false
-            });
+            bot.eat.stop({ persistEnabled: false });
         if (bot.invisible?.stop)
-            bot.invisible.stop({
-                persistEnabled: false
-            });
+            bot.invisible.stop({ persistEnabled: false });
         if (bot.magicShield?.stop)
-            bot.magicShield.stop({
-                persistEnabled: false
-            });
+            bot.magicShield.stop({ persistEnabled: false });
         if (bot.cave?.stop)
-            bot.cave.stop({
-                persistEnabled: false
-            });
+            bot.cave.stop({ persistEnabled: false });
         if (bot.attack?.stop)
-            bot.attack.stop({
-                persistEnabled: false
-            });
+            bot.attack.stop({ persistEnabled: false });
         if (bot.equipRing?.stop)
-            bot.equipRing.stop({
-                persistEnabled: false
-            });
+            bot.equipRing.stop({ persistEnabled: false });
         if (bot.slimeTrainer?.stop)
-            bot.slimeTrainer.stop({
-                persistEnabled: false
-            });
+            bot.slimeTrainer.stop({ persistEnabled: false });
         if (bot.paladin?.stop)
-            bot.paladin.stop({
-                persistEnabled: false
-            });
+            bot.paladin.stop({ persistEnabled: false });
         if (bot.looter?.stop)
-            bot.looter.stop({
-                persistEnabled: false
-            });
+            bot.looter.stop({ persistEnabled: false });
         if (bot.panic?.stop)
-            bot.panic.stop({
-                persistEnabled: false
-            });
+            bot.panic.stop({ persistEnabled: false });
+    }
 
-        // Disable this monitor itself
-        config.enabled = false;
-        persistConfig();
-        stop();
+    function sendGmAutoReply(message, label) {
+        if (!message)
+            return false;
 
-        // Refresh UI if available
+        let sent = false;
+        try {
+            sent = bot.sendChat?.(message) === true;
+        } catch (e) {
+            bot.log(`[GM Chat] ${label} reply failed`, e);
+            return false;
+        }
+
+        if (sent) {
+            state.repliesSent++;
+            bot.log(`[GM Chat] Auto reply sent: ${message}`);
+        } else {
+            bot.log(`[GM Chat] Auto reply was not sent: ${message}`);
+        }
+        return sent;
+    }
+
+    function scheduleGmAutoReplies() {
+        clearReplyTimers();
+
+        const firstDelay = Math.max(
+            100,
+            Math.min(5000, Number(config.firstReplyDelayMs) || 500)
+        );
+        const secondDelay = Math.max(
+            firstDelay,
+            Math.min(8000, Number(config.secondReplyDelayMs) || 1000)
+        );
+
+        const firstId = setTimeout(() => {
+            state.replyTimerIds = state.replyTimerIds.filter(
+                id => id !== firstId
+            );
+            sendGmAutoReply(
+                String(config.firstReplyText || "Hey :D"),
+                "first"
+            );
+        }, firstDelay);
+
+        const secondId = setTimeout(() => {
+            state.replyTimerIds = state.replyTimerIds.filter(
+                id => id !== secondId
+            );
+            sendGmAutoReply(
+                String(config.secondReplyText || "i am here"),
+                "second"
+            );
+        }, secondDelay);
+
+        state.replyTimerIds.push(firstId, secondId);
+    }
+
+    function refreshKillswitchUi() {
         if (bot.ui?.refreshPanicStatus)
             bot.ui.refreshPanicStatus();
         if (bot.ui?.refreshRuneStatus)
@@ -36826,6 +37282,123 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
             bot.ui.refreshPaladinStatus();
         if (bot.ui?.refreshLooterStatus)
             bot.ui.refreshLooterStatus();
+    }
+
+    function restoreKillswitchModules(snapshot) {
+        if (!snapshot)
+            return false;
+
+        const modules = snapshot.modules || {};
+
+        // Restore the same modules that were running before the GM message.
+        // Attack comes before CaveBot so Cave movement resumes into a fully
+        // initialized targeting state.
+        if (modules.rune)
+            bot.rune?.start?.();
+        if (modules.eat)
+            bot.eat?.start?.();
+        if (modules.invisible)
+            bot.invisible?.start?.();
+        if (modules.magicShield)
+            bot.magicShield?.start?.();
+        if (modules.attack)
+            bot.attack?.start?.();
+        if (modules.cave)
+            bot.cave?.start?.();
+        if (modules.equipRing)
+            bot.equipRing?.start?.();
+        if (modules.slimeTrainer)
+            bot.slimeTrainer?.start?.();
+        if (modules.paladin)
+            bot.paladin?.start?.();
+        if (modules.looter)
+            bot.looter?.start?.();
+        if (modules.panic)
+            bot.panic?.start?.();
+
+        if (snapshot.monitorRunning)
+            start();
+
+        state.restoresCompleted++;
+        refreshKillswitchUi();
+        return true;
+    }
+
+    function scheduleKillswitchRestore() {
+        clearRestartTimer();
+
+        const delayMs = Math.max(
+            5000,
+            Math.min(60000, Number(config.restartDelayMs) || 15000)
+        );
+
+        state.restartTimerId = setTimeout(() => {
+            state.restartTimerId = null;
+
+            const snapshot = state.restartSnapshot;
+            state.restartSnapshot = null;
+            state.killSwitchActive = false;
+
+            if (!snapshot)
+                return;
+
+            bot.log(
+                `[GM Chat] Restoring interrupted modules after ` +
+                `${Math.round(delayMs / 1000)}s...`
+            );
+
+            restoreKillswitchModules(snapshot);
+
+            bot.log(
+                "[GM Chat] Interrupted modules and monitor restored."
+            );
+        }, delayMs);
+    }
+
+    function triggerKillswitch(sender) {
+        if (state.killSwitchActive)
+            return false;
+
+        state.killSwitchActive = true;
+        state.lastTriggerAt = Date.now();
+        state.lastSender = sender || null;
+
+        bot.log(`[GM Chat] Detected GM/God in chat: ${sender}`);
+        bot.playGMAlarm();
+
+        // Preserve exactly what was running so the 15s restore does not enable
+        // modules the user had intentionally left off.
+        state.restartSnapshot = snapshotRunningModules();
+
+        clearRestartTimer();
+        clearReplyTimers();
+
+        // Stop the affected gameplay modules immediately.
+        stopKillswitchModules();
+
+        // Pause this monitor without persisting enabled=false. The monitor will
+        // be restarted from the snapshot after the temporary killswitch window.
+        stop({
+            persistEnabled: false,
+            cancelRecovery: false
+        });
+
+        // Reply like a human shortly after the GM/God message.
+        // First reply at ~500ms, second one ~500ms later.
+        scheduleGmAutoReplies();
+
+        // Bring back the same pre-killswitch module set after 15 seconds.
+        scheduleKillswitchRestore();
+
+        refreshKillswitchUi();
+
+        bot.log(
+            `[GM Chat] Killswitch active for ` +
+            `${Math.round(config.restartDelayMs / 1000)}s; ` +
+            `auto replies scheduled.`
+        );
+
+        return true;
     }
 
     function getChatMessages() {
@@ -36918,18 +37491,38 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
         return true;
     }
 
-    function stop() {
-        if (!state.running)
-            return false;
+    function stop(options = {}) {
+        const wasRunning = state.running;
+        const persistEnabled =
+            options.persistEnabled !== false;
+        const cancelRecovery =
+            options.cancelRecovery !== false;
+
         state.running = false;
+
         if (state.timerId) {
             clearTimeout(state.timerId);
             state.timerId = null;
         }
-        config.enabled = false;
-        persistConfig();
-        bot.log("GM chat monitor stopped");
-        return true;
+
+        if (persistEnabled) {
+            config.enabled = false;
+            persistConfig();
+        }
+
+        // A manual stop means "stay stopped": cancel any pending automatic
+        // replies/restart. The killswitch itself opts out of this cancellation.
+        if (cancelRecovery) {
+            clearReplyTimers();
+            clearRestartTimer();
+            state.restartSnapshot = null;
+            state.killSwitchActive = false;
+        }
+
+        if (wasRunning)
+            bot.log("GM chat monitor stopped");
+
+        return wasRunning;
     }
 
     function status() {
@@ -36952,6 +37545,18 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
             ...config
         };
     }
+
+    bot.addCleanup(() => {
+        if (state.timerId) {
+            clearTimeout(state.timerId);
+            state.timerId = null;
+        }
+        clearReplyTimers();
+        clearRestartTimer();
+        state.restartSnapshot = null;
+        state.killSwitchActive = false;
+        state.running = false;
+    });
 
     if (config.enabled)
         start();
