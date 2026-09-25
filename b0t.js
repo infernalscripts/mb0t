@@ -803,7 +803,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.5.38",
+        version: "1.5.40",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -38880,14 +38880,17 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
         repliesSent: 0,
         replyPairsScheduled: 0,
         restoresCompleted: 0,
+        restoreRetries: 0,
+        restoreFailures: 0,
+        lastRestoreFailure: null,
         suppressedGmMessages: 0,
         consumedMessageKeys: 0,
     };
     const config = Object.assign({
         enabled: false,
         restartDelayMs: 15000,
-        firstReplyDelayMs: 500,
-        secondReplyDelayMs: 1000,
+        firstReplyDelayMs: 0,
+        secondReplyDelayMs: 500,
         firstReplyText: "Hey :D",
         secondReplyText: "i am here",
 
@@ -38900,13 +38903,20 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
         5000,
         Math.min(60000, Number(config.restartDelayMs) || 15000)
     );
-    config.firstReplyDelayMs = Math.max(
-        100,
-        Math.min(5000, Number(config.firstReplyDelayMs) || 500)
-    );
+    // v1.5.39: first GM reply is synchronous. Migrate the old default
+    // 500ms/1000ms pair so existing saved config does not preserve the delay.
+    if (
+        Number(config.firstReplyDelayMs) === 500 &&
+        Number(config.secondReplyDelayMs) === 1000
+    ) {
+        config.firstReplyDelayMs = 0;
+        config.secondReplyDelayMs = 500;
+    }
+
+    config.firstReplyDelayMs = 0;
     config.secondReplyDelayMs = Math.max(
-        config.firstReplyDelayMs,
-        Math.min(8000, Number(config.secondReplyDelayMs) || 1000)
+        100,
+        Math.min(3000, Number(config.secondReplyDelayMs) || 500)
     );
     config.triggerCooldownMs = Math.max(
         15000,
@@ -38998,23 +39008,153 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
         }
     }
 
-    function snapshotRunningModules() {
+    function getModuleRuntimeSnapshot(module) {
+        let status = null;
+
+        try {
+            status = module?.status?.() || null;
+        } catch (e) {}
+
+        const running =
+            status?.running === true;
+
+        const enabled =
+            status?.config?.enabled === true ||
+            module?.config?.enabled === true;
+
         return {
+            running,
+            enabled,
+            shouldRestore:
+                running || enabled
+        };
+    }
+
+    function isModuleRunning(module) {
+        try {
+            return module?.status?.().running === true;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function restoreModuleFromSnapshot(
+        label,
+        module,
+        snapshotEntry,
+        retryDelayMs = 250
+    ) {
+        const shouldRestore =
+            snapshotEntry === true ||
+            snapshotEntry?.shouldRestore === true ||
+            snapshotEntry?.running === true ||
+            snapshotEntry?.enabled === true;
+
+        if (!shouldRestore || !module?.start)
+            return false;
+
+        try {
+            module.start();
+        } catch (e) {
+            state.restoreFailures++;
+            state.lastRestoreFailure =
+                `${label}: ${e?.message || e}`;
+            bot.log(
+                `[GM Chat] Failed to restore ${label}`,
+                e
+            );
+            return false;
+        }
+
+        if (isModuleRunning(module)) {
+            bot.log(
+                `[GM Chat] Restored ${label}`
+            );
+            return true;
+        }
+
+        // A few modules can still be settling from their stop cleanup. Retry
+        // once shortly after the main restore instead of silently leaving them
+        // disabled.
+        window.setTimeout(() => {
+            if (
+                !state.running &&
+                label === "GM Chat Monitor"
+            ) {
+                return;
+            }
+
+            if (isModuleRunning(module))
+                return;
+
+            state.restoreRetries++;
+
+            try {
+                module.start();
+            } catch (e) {
+                state.restoreFailures++;
+                state.lastRestoreFailure =
+                    `${label}: ${e?.message || e}`;
+                bot.log(
+                    `[GM Chat] Retry failed restoring ${label}`,
+                    e
+                );
+                return;
+            }
+
+            if (isModuleRunning(module)) {
+                bot.log(
+                    `[GM Chat] Restored ${label} on retry`
+                );
+            } else {
+                state.restoreFailures++;
+                state.lastRestoreFailure =
+                    `${label}: start() returned but module is still not running`;
+                bot.log(
+                    `[GM Chat] ${label} did not resume after retry`
+                );
+            }
+        }, Math.max(100, retryDelayMs));
+
+        return true;
+    }
+
+    function snapshotRunningModules() {
+        const snapshot = {
             monitorRunning: state.running,
             modules: {
-                rune: !!bot.rune?.status?.().running,
-                eat: !!bot.eat?.status?.().running,
-                invisible: !!bot.invisible?.status?.().running,
-                magicShield: !!bot.magicShield?.status?.().running,
-                cave: !!bot.cave?.status?.().running,
-                attack: !!bot.attack?.status?.().running,
-                equipRing: !!bot.equipRing?.status?.().running,
-                slimeTrainer: !!bot.slimeTrainer?.status?.().running,
-                paladin: !!bot.paladin?.status?.().running,
-                looter: !!bot.looter?.status?.().running,
-                panic: !!bot.panic?.status?.().running,
+                // Mana Training is bot.rune. Capture BOTH runtime state and
+                // persisted enabled state so a transient status=false cannot
+                // make it disappear after the 15-second GM pause.
+                rune: getModuleRuntimeSnapshot(bot.rune),
+                eat: getModuleRuntimeSnapshot(bot.eat),
+                invisible: getModuleRuntimeSnapshot(bot.invisible),
+                magicShield: getModuleRuntimeSnapshot(bot.magicShield),
+                cave: getModuleRuntimeSnapshot(bot.cave),
+                attack: getModuleRuntimeSnapshot(bot.attack),
+                equipRing: getModuleRuntimeSnapshot(bot.equipRing),
+                slimeTrainer: getModuleRuntimeSnapshot(bot.slimeTrainer),
+                paladin: getModuleRuntimeSnapshot(bot.paladin),
+                looter: getModuleRuntimeSnapshot(bot.looter),
+                panic: getModuleRuntimeSnapshot(bot.panic),
             }
         };
+
+        bot.log(
+            "[GM Chat] Restart snapshot",
+            {
+                manaTraining:
+                    snapshot.modules.rune,
+                targeting:
+                    snapshot.modules.attack,
+                cavebot:
+                    snapshot.modules.cave,
+                looter:
+                    snapshot.modules.looter
+            }
+        );
+
+        return snapshot;
     }
 
     function stopKillswitchModules() {
@@ -39068,36 +39208,35 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
         clearReplyTimers();
         state.replyPairsScheduled++;
 
-        const firstDelay = Math.max(
-            100,
-            Math.min(5000, Number(config.firstReplyDelayMs) || 500)
-        );
-        const secondDelay = Math.max(
-            firstDelay,
-            Math.min(8000, Number(config.secondReplyDelayMs) || 1000)
+        // v1.5.39: first reply is sent in the SAME GM trigger call. Do not use
+        // setTimeout here: browser timer throttling must never make the reply
+        // appear tied to the 15-second module restart.
+        sendGmAutoReply(
+            String(config.firstReplyText || "Hey :D"),
+            "first"
         );
 
-        const firstId = setTimeout(() => {
-            state.replyTimerIds = state.replyTimerIds.filter(
-                id => id !== firstId
-            );
-            sendGmAutoReply(
-                String(config.firstReplyText || "Hey :D"),
-                "first"
-            );
-        }, firstDelay);
+        const secondDelay = Math.max(
+            100,
+            Math.min(
+                3000,
+                Number(config.secondReplyDelayMs) || 500
+            )
+        );
 
         const secondId = setTimeout(() => {
-            state.replyTimerIds = state.replyTimerIds.filter(
-                id => id !== secondId
-            );
+            state.replyTimerIds =
+                state.replyTimerIds.filter(
+                    id => id !== secondId
+                );
+
             sendGmAutoReply(
                 String(config.secondReplyText || "i am here"),
                 "second"
             );
         }, secondDelay);
 
-        state.replyTimerIds.push(firstId, secondId);
+        state.replyTimerIds.push(secondId);
     }
 
     function refreshKillswitchUi() {
@@ -39129,31 +39268,80 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
 
         const modules = snapshot.modules || {};
 
-        // Restore the same modules that were running before the GM message.
-        // Attack comes before CaveBot so Cave movement resumes into a fully
-        // initialized targeting state.
-        if (modules.rune)
-            bot.rune?.start?.();
-        if (modules.eat)
-            bot.eat?.start?.();
-        if (modules.invisible)
-            bot.invisible?.start?.();
-        if (modules.magicShield)
-            bot.magicShield?.start?.();
-        if (modules.attack)
-            bot.attack?.start?.();
-        if (modules.cave)
-            bot.cave?.start?.();
-        if (modules.equipRing)
-            bot.equipRing?.start?.();
-        if (modules.slimeTrainer)
-            bot.slimeTrainer?.start?.();
-        if (modules.paladin)
-            bot.paladin?.start?.();
-        if (modules.looter)
-            bot.looter?.start?.();
-        if (modules.panic)
-            bot.panic?.start?.();
+        // Restore exactly what was running OR enabled before the GM message.
+        // Mana Training is bot.rune. Attack still comes before CaveBot so Cave
+        // movement resumes into a fully initialized targeting state.
+        restoreModuleFromSnapshot(
+            "Mana Training",
+            bot.rune,
+            modules.rune
+        );
+        restoreModuleFromSnapshot(
+            "Auto Eat",
+            bot.eat,
+            modules.eat
+        );
+        restoreModuleFromSnapshot(
+            "Auto Invisible",
+            bot.invisible,
+            modules.invisible
+        );
+        restoreModuleFromSnapshot(
+            "Magic Shield",
+            bot.magicShield,
+            modules.magicShield
+        );
+        restoreModuleFromSnapshot(
+            "Targeting",
+            bot.attack,
+            modules.attack
+        );
+        restoreModuleFromSnapshot(
+            "CaveBot",
+            bot.cave,
+            modules.cave
+        );
+        restoreModuleFromSnapshot(
+            "Equip Ring",
+            bot.equipRing,
+            modules.equipRing
+        );
+        restoreModuleFromSnapshot(
+            "Slime Trainer",
+            bot.slimeTrainer,
+            modules.slimeTrainer
+        );
+        restoreModuleFromSnapshot(
+            "Paladin",
+            bot.paladin,
+            modules.paladin
+        );
+        restoreModuleFromSnapshot(
+            "Looter",
+            bot.looter,
+            modules.looter
+        );
+        restoreModuleFromSnapshot(
+            "Panic",
+            bot.panic,
+            modules.panic
+        );
+
+        const runeSnapshot = modules.rune;
+        const runeShouldRestore =
+            runeSnapshot === true ||
+            runeSnapshot?.shouldRestore === true ||
+            runeSnapshot?.running === true ||
+            runeSnapshot?.enabled === true;
+
+        if (
+            runeShouldRestore &&
+            !isModuleRunning(bot.rune)
+        ) {
+            bot.log(
+                "[GM Chat] Mana Training still not running after restore pass; retry queued"
+            );
+        }
 
         if (snapshot.monitorRunning) {
             // The monitor was intentionally paused for 15s. Any GM lines that
@@ -39251,8 +39439,8 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
             cancelRecovery: false
         });
 
-        // Reply like a human shortly after the GM/God message.
-        // First reply at ~500ms, second one ~500ms later.
+        // Reply immediately, independently of the 15-second module restore.
+        // "Hey :D" is synchronous; "i am here" follows ~500ms later.
         scheduleGmAutoReplies();
 
         // Bring back the same pre-killswitch module set after 15 seconds.
@@ -39263,7 +39451,7 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
         bot.log(
             `[GM Chat] Killswitch active for ` +
             `${Math.round(config.restartDelayMs / 1000)}s; ` +
-            `auto replies scheduled.`
+            `first reply sent immediately; follow-up scheduled.`
         );
 
         return true;
@@ -39431,6 +39619,12 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
                 state.replyPairsScheduled || 0,
             restoresCompleted:
                 state.restoresCompleted || 0,
+            restoreRetries:
+                state.restoreRetries || 0,
+            restoreFailures:
+                state.restoreFailures || 0,
+            lastRestoreFailure:
+                state.lastRestoreFailure,
             suppressedGmMessages:
                 state.suppressedGmMessages || 0,
             consumedMessageKeys:
@@ -39453,18 +39647,12 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
                 Number(config.restartDelayMs) || 15000
             )
         );
-        config.firstReplyDelayMs = Math.max(
+        config.firstReplyDelayMs = 0;
+        config.secondReplyDelayMs = Math.max(
             100,
             Math.min(
-                5000,
-                Number(config.firstReplyDelayMs) || 500
-            )
-        );
-        config.secondReplyDelayMs = Math.max(
-            config.firstReplyDelayMs,
-            Math.min(
-                8000,
-                Number(config.secondReplyDelayMs) || 1000
+                3000,
+                Number(config.secondReplyDelayMs) || 500
             )
         );
         config.triggerCooldownMs = Math.max(
