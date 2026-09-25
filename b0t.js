@@ -803,7 +803,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.5.40",
+        version: "1.5.45",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -928,15 +928,82 @@ addCleanup(() => {
             };
         },
 
-        /** Send a chat message via the default channel, remembering it for deduplication */
-        sendChat(text) {
-            const channelManager = window.gameClient?.interface?.channelManager;
+        /**
+         * Send to a specific OPEN chat channel.
+         * channelRef may be a channel name, numeric id, or channel object.
+         */
+        sendChatToChannel(text, channelRef = "Default", noHistory = false) {
+            const channelManager =
+                window.gameClient?.interface?.channelManager;
             if (!channelManager || !text)
                 return false;
-            channelManager.sendMessageText(text);
+
+            const channels =
+                Array.isArray(channelManager.channels)
+                    ? channelManager.channels
+                    : [];
+
+            let channel = null;
+
+            if (
+                channelRef &&
+                typeof channelRef === "object"
+            ) {
+                channel = channelRef;
+            } else if (
+                typeof channelRef === "number"
+            ) {
+                channel =
+                    channelManager.getChannelById?.(
+                        channelRef
+                    ) || null;
+            } else {
+                const requestedName =
+                    String(
+                        channelRef ?? "Default"
+                    ).trim() || "Default";
+
+                channel =
+                    channelManager.getChannel?.(
+                        requestedName
+                    ) || null;
+
+                if (
+                    !channel &&
+                    requestedName.toLowerCase() ===
+                        "default"
+                ) {
+                    channel =
+                        channelManager.getChannelById?.(0) ||
+                        null;
+                }
+            }
+
+            if (!channel)
+                return false;
+
+            const channelIndex =
+                channels.indexOf(channel);
+
+            if (channelIndex < 0)
+                return false;
+
+            channelManager.sendMessageText(
+                text,
+                channelIndex,
+                noHistory === true
+            );
+
             rememberSentChat(text);
-            //this.log("sent chat:", text);
             return true;
+        },
+
+        /** Send through Default chat regardless of the currently selected tab. */
+        sendChat(text) {
+            return this.sendChatToChannel(
+                text,
+                "Default"
+            );
         },
 
         isRecentSentChat(text, withinMs) {
@@ -5005,6 +5072,19 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         preferredAccessHandoffs: 0,
         preferredAccessExoriHints: 0,
 
+        // v1.5.44: ignored names are a hard veto for every mb0t-created
+        // target path, including access-clear and lure emergency overrides.
+        ignoredAutoTargetRejects: 0,
+        ignoredAutoTargetReleases: 0,
+        ignoredAccessBlockersSkipped: 0,
+        ignoredEmergencyBlockersSkipped: 0,
+        ignoredLastMobClears: 0,
+        ignoredPreferredTrackSkips: 0,
+        ignoredLastTargetId: null,
+        ignoredLastTargetName: null,
+        ignoredLastAt: 0,
+        ignoredLastReason: null,
+
         // v1.5.36: ordinary mb0t-selected targets get a lighter access-clear
         // state. If live pathing is blocked by a monster but static geometry
         // can reach the target, clear the real blocker and then hand back to
@@ -5366,6 +5446,111 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     // ---- PREFERRED TARGETS ----
     function normalizeCreatureName(name) {
         return String(name || "").trim().toLowerCase();
+    }
+
+    function getIgnoredTargetNameSet() {
+        return new Set(
+            (Array.isArray(config.ignoredTargetNames)
+                ? config.ignoredTargetNames
+                : []
+            )
+                .map(name => normalizeCreatureName(name))
+                .filter(Boolean)
+        );
+    }
+
+    function isIgnoredTargetName(name) {
+        const normalized =
+            normalizeCreatureName(name);
+        if (!normalized)
+            return false;
+
+        return getIgnoredTargetNameSet().has(
+            normalized
+        );
+    }
+
+    function isIgnoredTargetCreature(creature) {
+        return !!creature &&
+            isIgnoredTargetName(creature.name);
+    }
+
+    function noteIgnoredTargetEvent(
+        creature,
+        reason,
+        now = Date.now()
+    ) {
+        state.ignoredLastTargetId =
+            creature?.id ?? null;
+        state.ignoredLastTargetName =
+            creature?.name || null;
+        state.ignoredLastAt = now;
+        state.ignoredLastReason =
+            reason || "ignored target";
+    }
+
+    function releaseIgnoredAutoTarget(
+        now = Date.now()
+    ) {
+        const current = getCurrentTarget();
+        if (
+            !current ||
+            state.autoTargetId !== current.id ||
+            !isIgnoredTargetCreature(current)
+        ) {
+            return false;
+        }
+
+        noteIgnoredTargetEvent(
+            current,
+            "current auto-target is now ignored",
+            now
+        );
+        state.ignoredAutoTargetReleases++;
+
+        if (
+            state.preferredAccessTargetId ===
+                current.id ||
+            state.preferredAccessClearTargetId ===
+                current.id
+        ) {
+            clearPreferredAccessState(
+                "ignored target",
+                now,
+                false
+            );
+        }
+
+        if (
+            state.ordinaryAccessTargetId ===
+                current.id ||
+            state.ordinaryAccessClearTargetId ===
+                current.id
+        ) {
+            clearOrdinaryAccessState(
+                "ignored target",
+                now,
+                false
+            );
+        }
+
+        if (
+            state.lureLastMobId === current.id
+        ) {
+            clearLureLastMobState(
+                "last mob is ignored"
+            );
+            state.ignoredLastMobClears++;
+        }
+
+        handoffTarget(
+            current,
+            "ignored mob",
+            now,
+            1200
+        );
+
+        return true;
     }
 
     function getPreferredTargetNames() {
@@ -5947,6 +6132,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         // Otherwise an off-screen target can keep stale combat ownership alive
         // while lure/normal branches disagree about who owns movement.
         releaseCurrentTargetIfOffScreen(now);
+
+        // v1.5.44: ignored names are an unconditional veto for mb0t-owned
+        // targets. This also handles changing the Ignore list mid-fight.
+        releaseIgnoredAutoTarget(now);
 
         // v1.5.08: below the requested on-screen mob count, keep attacking
         // ordinary mobs while CaveBot continues pulling toward the waypoint.
@@ -7124,6 +7313,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 continue;
             if (creature.masterId === player?.id)
                 continue;
+            if (isIgnoredTargetCreature(creature)) {
+                state.ignoredAccessBlockersSkipped++;
+                continue;
+            }
 
             const hp = Number(creature.state?.health ?? creature.health);
             if (Number.isFinite(hp) && hp <= 0)
@@ -7375,7 +7568,11 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         if (handoffPreferred && preferredId != null) {
             const preferred = getCanonicalActiveCreature({ id: preferredId }) ||
                 window.gameClient?.world?.activeCreatures?.[preferredId] || null;
-            if (preferred && isPreferredCreature(preferred)) {
+            if (
+                preferred &&
+                isPreferredCreature(preferred) &&
+                !isIgnoredTargetCreature(preferred)
+            ) {
                 const hp = Number(preferred.state?.health ?? preferred.health);
                 if (!Number.isFinite(hp) || hp > 0) {
                     const approach = getTargetApproachInfo(preferred);
@@ -8107,6 +8304,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 continue;
             if (!isPreferredCreature(creature))
                 continue;
+            if (isIgnoredTargetCreature(creature)) {
+                state.ignoredPreferredTrackSkips++;
+                continue;
+            }
             if ((state.skippedTargetIds.get(creature.id) || 0) > now)
                 continue;
 
@@ -8670,6 +8871,19 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
         if (!creature || !isNativeVisibleMonster(creature))
             return null;
+
+        if (isIgnoredTargetCreature(creature)) {
+            clearLureLastMobState(
+                "forced last mob is ignored"
+            );
+            state.ignoredLastMobClears++;
+            noteIgnoredTargetEvent(
+                creature,
+                "forced lure last-mob veto",
+                now
+            );
+            return null;
+        }
 
         const healthPct = getCreatureHealthPercent(creature);
         if (!Number.isFinite(healthPct) || healthPct <= 0)
@@ -10619,6 +10833,16 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         state.ordinaryAccessWallRejects = 0;
         state.ordinaryAccessNoBlockerRejects = 0;
         state.ordinaryAccessManualBypasses = 0;
+        state.ignoredAutoTargetRejects = 0;
+        state.ignoredAutoTargetReleases = 0;
+        state.ignoredAccessBlockersSkipped = 0;
+        state.ignoredEmergencyBlockersSkipped = 0;
+        state.ignoredLastMobClears = 0;
+        state.ignoredPreferredTrackSkips = 0;
+        state.ignoredLastTargetId = null;
+        state.ignoredLastTargetName = null;
+        state.ignoredLastAt = 0;
+        state.ignoredLastReason = null;
         state.preferredWallBlocks = 0;
         state.preferredWallBlockLastId = null;
         state.preferredWallBlockLastName = null;
@@ -11012,6 +11236,45 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         target = getCanonicalActiveCreature(target);
         if (!target || !window.gameClient?.player || typeof window.gameClient.send !== "function")
             return false;
+
+        if (isIgnoredTargetCreature(target)) {
+            state.ignoredAutoTargetRejects++;
+            noteIgnoredTargetEvent(
+                target,
+                "automatic setCurrentTarget veto",
+                now
+            );
+
+            // If a special access state was trying to force this ignored mob,
+            // tear that ownership down so it cannot retry every attack tick.
+            if (
+                state.preferredAccessClearTargetId ===
+                    target.id ||
+                state.preferredAccessTargetId ===
+                    target.id
+            ) {
+                clearPreferredAccessState(
+                    "ignored mob veto",
+                    now,
+                    false
+                );
+            }
+
+            if (
+                state.ordinaryAccessClearTargetId ===
+                    target.id ||
+                state.ordinaryAccessTargetId ===
+                    target.id
+            ) {
+                clearOrdinaryAccessState(
+                    "ignored mob veto",
+                    now,
+                    false
+                );
+            }
+
+            return false;
+        }
         if (typeof TargetPacket !== "function")
             return false;
         const info = isTargetValidAndOnScreen(target, {
@@ -12322,6 +12585,16 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         state.ordinaryAccessWallRejects = 0;
         state.ordinaryAccessNoBlockerRejects = 0;
         state.ordinaryAccessManualBypasses = 0;
+        state.ignoredAutoTargetRejects = 0;
+        state.ignoredAutoTargetReleases = 0;
+        state.ignoredAccessBlockersSkipped = 0;
+        state.ignoredEmergencyBlockersSkipped = 0;
+        state.ignoredLastMobClears = 0;
+        state.ignoredPreferredTrackSkips = 0;
+        state.ignoredLastTargetId = null;
+        state.ignoredLastTargetName = null;
+        state.ignoredLastAt = 0;
+        state.ignoredLastReason = null;
         state.preferredWallBlocks = 0;
         state.preferredWallBlockLastId = null;
         state.preferredWallBlockLastName = null;
@@ -12586,6 +12859,24 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             ordinaryAccess: getOrdinaryAccessInfo(),
             ordinaryAccessBlocked:
                 isOrdinaryAccessBlocked(),
+            ignoredAutoTargetRejects:
+                state.ignoredAutoTargetRejects || 0,
+            ignoredAutoTargetReleases:
+                state.ignoredAutoTargetReleases || 0,
+            ignoredAccessBlockersSkipped:
+                state.ignoredAccessBlockersSkipped || 0,
+            ignoredLastMobClears:
+                state.ignoredLastMobClears || 0,
+            ignoredPreferredTrackSkips:
+                state.ignoredPreferredTrackSkips || 0,
+            ignoredLastTargetId:
+                state.ignoredLastTargetId,
+            ignoredLastTargetName:
+                state.ignoredLastTargetName,
+            ignoredLastAt:
+                state.ignoredLastAt || 0,
+            ignoredLastReason:
+                state.ignoredLastReason,
             preferredWallBlocks: state.preferredWallBlocks || 0,
             preferredWallBlockLastId: state.preferredWallBlockLastId,
             preferredWallBlockLastName: state.preferredWallBlockLastName,
@@ -12943,7 +13234,9 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                  ? nextConfig.preferredTargetNames.map(n => String(n).trim()).filter(Boolean)
                  : [];
         }
-        if (nextConfig.ignoredTargetNames !== undefined) {
+        const ignoredNamesChanged =
+            nextConfig.ignoredTargetNames !== undefined;
+        if (ignoredNamesChanged) {
             nextConfig.ignoredTargetNames = Array.isArray(nextConfig.ignoredTargetNames)
                  ? nextConfig.ignoredTargetNames.map(n => String(n).trim()).filter(Boolean)
                  : [];
@@ -12952,6 +13245,9 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         Object.assign(config, nextConfig);
         invalidateCandidateSnapshot();
         invalidateAntiKSSnapshot();
+
+        if (ignoredNamesChanged)
+            releaseIgnoredAutoTarget(Date.now());
 
         if (!config.lureMode)
             clearLureState("disabled");
@@ -13019,6 +13315,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         getPreferredAccessInfo,
         isOrdinaryAccessBlocked,
         getOrdinaryAccessInfo,
+        isIgnoredTarget: isIgnoredTargetCreature,
         isProtectionZoneBlocked,
         getProtectionZoneBlockInfo,
         isCombatActive,
@@ -13961,7 +14258,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         const current = bot.attack?.getCurrentTarget?.();
         if (
             current?.id != null &&
-            idSet.has(Number(current.id))
+            idSet.has(Number(current.id)) &&
+            !bot.attack?.isIgnoredTarget?.(current)
         ) {
             const hp = Number(current.state?.health ?? current.health);
             if (!Number.isFinite(hp) || hp > 0)
@@ -13970,7 +14268,10 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
         if (
             fallbackCreature?.id != null &&
-            idSet.has(Number(fallbackCreature.id))
+            idSet.has(Number(fallbackCreature.id)) &&
+            !bot.attack?.isIgnoredTarget?.(
+                fallbackCreature
+            )
         ) {
             const hp = Number(
                 fallbackCreature.state?.health ??
@@ -14252,6 +14553,18 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         if (!creature?.id)
             return false;
 
+        if (bot.attack?.isIgnoredTarget?.(creature)) {
+            bot.log(
+                "Cave: lure blocker is ignored – will not emergency-attack",
+                {
+                    blockerId: creature.id,
+                    blockerName: creature.name || "Mob",
+                    reason
+                }
+            );
+            return false;
+        }
+
         const same = state.lureEmergencyClearId === creature.id;
         if (!same) {
             state.lureEmergencyClearId = creature.id;
@@ -14312,6 +14625,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             const id = Number(rawId);
             const creature = creatures[id] || creatures[rawId] || null;
             if (!creature)
+                continue;
+            if (bot.attack?.isIgnoredTarget?.(creature))
                 continue;
             const health = Number(creature.state?.health ?? creature.health);
             if (Number.isFinite(health) && health <= 0)
@@ -27346,23 +27661,194 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         return false;
     }
 
-    function clearNativePendingCorpseUse(job) {
-        const mouse = window.gameClient?.mouse;
-        if (!mouse || !job?.position)
+    function clearCorpseApproachMovement(job) {
+        const pf = window.gameClient?.world?.pathfinder;
+        if (!pf || !job?.walkDestination)
             return;
 
         try {
-            const pending = mouse.__pendingUsePosition;
+            const final = pf.__finalDestination;
             if (
-                pending &&
-                pending.x === job.position.x &&
-                pending.y === job.position.y &&
-                pending.z === job.position.z
+                final &&
+                Number(final.x) === Number(job.walkDestination.x) &&
+                Number(final.y) === Number(job.walkDestination.y) &&
+                Number(final.z) === Number(job.walkDestination.z)
             ) {
-                mouse.__pendingUseObject = null;
-                mouse.__pendingUsePosition = null;
+                pf.__pathfindCache = new Array();
+                pf.__finalDestination = null;
+                pf.__isAutoWalking = false;
+
+                const player = window.gameClient?.player;
+                if (player?.__preWalks)
+                    player.__preWalks.length = 0;
+
+                try {
+                    if (
+                        window.gameClient?.send &&
+                        typeof StopWalkPacket === "function"
+                    ) {
+                        window.gameClient.send(
+                            new StopWalkPacket()
+                        );
+                    }
+                } catch (e) {}
             }
         } catch (e) {}
+    }
+
+    function getCorpseApproachDestination(
+        corpsePosition,
+        playerPosition
+    ) {
+        if (!corpsePosition || !playerPosition)
+            return null;
+
+        const mouse = window.gameClient?.mouse;
+
+        try {
+            if (
+                mouse &&
+                typeof mouse.__findAdjacentWalkable === "function"
+            ) {
+                const nativeDestination =
+                    mouse.__findAdjacentWalkable(
+                        new Position(
+                            corpsePosition.x,
+                            corpsePosition.y,
+                            corpsePosition.z
+                        ),
+                        playerPosition
+                    );
+
+                if (nativeDestination)
+                    return nativeDestination;
+            }
+        } catch (e) {}
+
+        // Conservative fallback: inspect only the eight adjacent tiles and let
+        // the native pathfinder decide whether the selected tile is reachable.
+        const world = window.gameClient?.world;
+        const candidates = [];
+        for (let dx = -1; dx <= 1; dx++) {
+            for (let dy = -1; dy <= 1; dy++) {
+                if (dx === 0 && dy === 0)
+                    continue;
+
+                const pos = new Position(
+                    Number(corpsePosition.x) + dx,
+                    Number(corpsePosition.y) + dy,
+                    Number(corpsePosition.z)
+                );
+
+                let tile = null;
+                try {
+                    tile =
+                        world?.getTileFromWorldPosition?.(pos) ||
+                        null;
+                } catch (e) {}
+
+                if (!tile)
+                    continue;
+
+                let walkable = false;
+                try {
+                    walkable =
+                        tile.isWalkable?.() === true &&
+                        tile.isOccupied?.() !== true;
+                } catch (e) {}
+
+                if (!walkable)
+                    continue;
+
+                const distance = Math.max(
+                    Math.abs(pos.x - playerPosition.x),
+                    Math.abs(pos.y - playerPosition.y)
+                );
+
+                candidates.push({
+                    pos,
+                    distance
+                });
+            }
+        }
+
+        candidates.sort((a, b) =>
+            a.distance - b.distance
+        );
+
+        return candidates[0]?.pos || null;
+    }
+
+    function walkAdjacentToCorpse(
+        job,
+        now = Date.now()
+    ) {
+        if (!job?.position)
+            return false;
+
+        const playerPos = bot.getPlayerPosition();
+        if (
+            !playerPos ||
+            Number(playerPos.z) !==
+                Number(job.position.z)
+        ) {
+            return false;
+        }
+
+        const dx = Math.abs(
+            Number(job.position.x) -
+            Number(playerPos.x)
+        );
+        const dy = Math.abs(
+            Number(job.position.y) -
+            Number(playerPos.y)
+        );
+
+        // Already beside it. The game's auto-open-corpse behavior owns the
+        // actual opening; Looter deliberately sends no use/open action.
+        if (dx <= 1 && dy <= 1) {
+            job.arrivedAdjacentAt =
+                job.arrivedAdjacentAt || now;
+            return true;
+        }
+
+        const destination =
+            getCorpseApproachDestination(
+                job.position,
+                playerPos
+            );
+
+        if (!destination)
+            return false;
+
+        const pf = window.gameClient?.world?.pathfinder;
+        if (!pf || typeof pf.findPath !== "function")
+            return false;
+
+        try {
+            pf.__pathfindCache = new Array();
+            pf.__finalDestination = null;
+
+            pf.findPath(
+                playerPos,
+                destination
+            );
+
+            job.walkDestination = {
+                x: Number(destination.x),
+                y: Number(destination.y),
+                z: Number(destination.z)
+            };
+            job.lastWalkAt = now;
+            job.walkAttempts++;
+            return true;
+        } catch (e) {
+            bot.log(
+                "Looter: corpse approach path failed",
+                e
+            );
+            return false;
+        }
     }
 
     function pauseModulesForCorpse(job) {
@@ -27420,7 +27906,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         if (!job)
             return false;
 
-        clearNativePendingCorpseUse(job);
+        clearCorpseApproachMovement(job);
 
         if (success)
             state.corpseJobsCompleted++;
@@ -27445,36 +27931,6 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         state.corpseJob = null;
         resumeModulesAfterCorpse(job);
         return true;
-    }
-
-    function useCorpseNatively(job, now = Date.now()) {
-        if (!job?.position)
-            return false;
-
-        const info =
-            getCorpseTileInfo(job.position);
-        if (!info)
-            return false;
-
-        const mouse = window.gameClient?.mouse;
-        if (!mouse || typeof mouse.use !== "function")
-            return false;
-
-        try {
-            // Native Mouse.use already does the important part for ground
-            // containers: path to an adjacent walkable tile, then use/open the
-            // corpse after arrival. We deliberately reuse that client logic.
-            mouse.use({
-                which: info.tile,
-                index: 0xFF
-            });
-            job.lastUseAt = now;
-            job.useAttempts++;
-            return true;
-        } catch (e) {
-            bot.log("Looter: native corpse use failed", e);
-            return false;
-        }
     }
 
     function enqueueCorpseDeath(
@@ -27769,8 +28225,10 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                 ...candidate,
                 startedAt: now,
                 lootStartedAt: 0,
-                lastUseAt: 0,
-                useAttempts: 0,
+                lastWalkAt: 0,
+                walkAttempts: 0,
+                arrivedAdjacentAt: 0,
+                walkDestination: null,
                 baselineContainerIds:
                     getOpenContainerIds(),
                 openedContainerId: null,
@@ -27794,10 +28252,10 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                 }
             );
 
-            if (!useCorpseNatively(job, now)) {
+            if (!walkAdjacentToCorpse(job, now)) {
                 finishCorpseJob(
                     false,
-                    "native corpse use unavailable"
+                    "no adjacent corpse approach path"
                 );
                 return false;
             }
@@ -27863,26 +28321,62 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                     getCorpseTileInfo(job.position);
 
                 if (!corpseInfo) {
-                    // Give the death/item packets a little room before
-                    // declaring the corpse gone.
+                    // Give death/item packets a little room before declaring
+                    // the corpse gone.
                     if (
                         now - job.startedAt > 1200
                     ) {
                         finishCorpseJob(
                             false,
-                            "corpse disappeared before opening"
+                            "corpse disappeared before auto-open"
                         );
                     }
                     return true;
                 }
 
-                // Native pending-use normally handles this itself. Re-issue at
-                // a low rate if the client dropped the pending action.
+                const playerPos =
+                    bot.getPlayerPosition();
+
+                if (!playerPos) {
+                    return true;
+                }
+
+                const dx = Math.abs(
+                    Number(job.position.x) -
+                    Number(playerPos.x)
+                );
+                const dy = Math.abs(
+                    Number(job.position.y) -
+                    Number(playerPos.y)
+                );
+                const adjacent =
+                    dx <= 1 &&
+                    dy <= 1 &&
+                    Number(playerPos.z) ===
+                        Number(job.position.z);
+
+                if (adjacent) {
+                    job.arrivedAdjacentAt =
+                        job.arrivedAdjacentAt || now;
+
+                    // Do nothing here. The game/server auto-opens corpses when
+                    // the player is close enough. We only wait for the new
+                    // container to appear.
+                    return true;
+                }
+
+                // Re-path at a low rate if movement was interrupted before
+                // reaching the adjacent tile.
                 if (
-                    now - job.lastUseAt > 1200 &&
-                    job.useAttempts < 3
+                    now - job.lastWalkAt > 1000 &&
+                    job.walkAttempts < 5
                 ) {
-                    useCorpseNatively(job, now);
+                    if (!walkAdjacentToCorpse(job, now)) {
+                        finishCorpseJob(
+                            false,
+                            "corpse approach path unavailable"
+                        );
+                    }
                 }
 
                 return true;
@@ -28121,7 +28615,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         state.corpseJob = null;
 
         if (activeCorpseJob) {
-            clearNativePendingCorpseUse(
+            clearCorpseApproachMovement(
                 activeCorpseJob
             );
             // Explicit stop must not restart gameplay modules.
@@ -33783,15 +34277,15 @@ function upgradeSectionHeaders(panel) {
         <button type="button" class="mb-small-button" id="minibia-bot-looter-capture-item" style="flex:1;">Track Item</button>
       </div>
       <div class="mb-small-note" id="minibia-bot-looter-dest-status">No destination selected</div>
-      <label class="mb-inline" style="justify-content:space-between;gap:8px;">
-        <span>Walk to distant corpses</span>
+      <label class="mb-toggle">
         <input type="checkbox" id="minibia-bot-looter-walk-corpses" />
+        <span>Walk to distant corpses</span>
       </label>
       <label class="mb-inline" style="justify-content:space-between;gap:8px;">
         <span>Max corpse distance</span>
         <input type="number" id="minibia-bot-looter-corpse-distance" min="1" max="30" value="12" style="width:64px;" />
       </label>
-      <div class="mb-small-note">When enabled, Looter pauses Targeting/CaveBot, walks beside the corpse, opens it, transfers tracked items, then resumes.</div>
+      <div class="mb-small-note">When enabled, Looter pauses Targeting/CaveBot, walks beside the corpse, waits for auto-open, transfers tracked items, then resumes.</div>
       <div class="mb-section-title mb-section-title--sub">
         <span class="mb-title-text">Tracked Items</span>
       </div>
@@ -38869,6 +39363,13 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
         timerId: null,
         seenKeys: new Set(),
 
+        // v1.5.45: chat entry.__time is not stable across UI rebuilds. Keep a
+        // second dedupe map based on channel + sender + normalized message text
+        // so the same visible GM line cannot retrigger with a new DOM/UI key.
+        seenSignatures: new Map(),
+        duplicateSignatureSkips: 0,
+        monitorStartConsumes: 0,
+
         // v1.5.38: explicit one-encounter reply/restart state.
         killSwitchActive: false,
         restartTimerId: null,
@@ -38889,8 +39390,8 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
     const config = Object.assign({
         enabled: false,
         restartDelayMs: 15000,
-        firstReplyDelayMs: 0,
-        secondReplyDelayMs: 500,
+        firstReplyDelayMs: 1000,
+        secondReplyDelayMs: 1000,
         firstReplyText: "Hey :D",
         secondReplyText: "i am here",
 
@@ -38903,20 +39404,43 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
         5000,
         Math.min(60000, Number(config.restartDelayMs) || 15000)
     );
-    // v1.5.39: first GM reply is synchronous. Migrate the old default
-    // 500ms/1000ms pair so existing saved config does not preserve the delay.
+    // v1.5.43: use a human-paced sequential reply:
+    // wait ~1s -> "Hey :D" -> wait ~1s -> "i am here".
+    // Migrate both previous default pairs to the new timing.
+    const storedFirstReplyDelay =
+        Number(config.firstReplyDelayMs);
+    const storedSecondReplyDelay =
+        Number(config.secondReplyDelayMs);
+
     if (
-        Number(config.firstReplyDelayMs) === 500 &&
-        Number(config.secondReplyDelayMs) === 1000
+        (
+            storedFirstReplyDelay === 0 &&
+            storedSecondReplyDelay === 500
+        ) ||
+        (
+            storedFirstReplyDelay === 500 &&
+            storedSecondReplyDelay === 1000
+        )
     ) {
-        config.firstReplyDelayMs = 0;
-        config.secondReplyDelayMs = 500;
+        config.firstReplyDelayMs = 1000;
+        config.secondReplyDelayMs = 1000;
     }
 
-    config.firstReplyDelayMs = 0;
+    config.firstReplyDelayMs = Math.max(
+        250,
+        Math.min(
+            5000,
+            Number(config.firstReplyDelayMs) || 1000
+        )
+    );
+
+    // This value is the gap AFTER the first reply has actually been sent.
     config.secondReplyDelayMs = Math.max(
-        100,
-        Math.min(3000, Number(config.secondReplyDelayMs) || 500)
+        250,
+        Math.min(
+            5000,
+            Number(config.secondReplyDelayMs) || 1000
+        )
     );
     config.triggerCooldownMs = Math.max(
         15000,
@@ -38933,6 +39457,178 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
             secondReplyText: config.secondReplyText,
             triggerCooldownMs: config.triggerCooldownMs,
         });
+    }
+
+    function normalizeChatMessageText(
+        raw,
+        sender = null
+    ) {
+        let value = String(raw || "")
+            .replace(/\s+/g, " ")
+            .trim();
+
+        if (sender) {
+            const prefix =
+                `${String(sender).trim()}:`;
+            if (
+                value
+                    .toLowerCase()
+                    .startsWith(
+                        prefix.toLowerCase()
+                    )
+            ) {
+                value = value
+                    .slice(prefix.length)
+                    .trim();
+            }
+        }
+
+        return value;
+    }
+
+    function getStableMessageSignature(msg) {
+        if (!msg)
+            return "";
+
+        const channel =
+            String(msg.channel || "")
+                .trim()
+                .toLowerCase();
+        const sender =
+            String(msg.sender || "")
+                .trim()
+                .toLowerCase();
+        const body =
+            normalizeChatMessageText(
+                msg.raw,
+                msg.sender
+            )
+                .toLowerCase();
+
+        return `${channel}|${sender}|${body}`;
+    }
+
+    function isMessageAlreadySeen(msg) {
+        if (!msg)
+            return true;
+
+        if (
+            msg.key &&
+            state.seenKeys.has(msg.key)
+        ) {
+            return true;
+        }
+
+        const signature =
+            msg.signature ||
+            getStableMessageSignature(msg);
+
+        if (
+            signature &&
+            state.seenSignatures.has(signature)
+        ) {
+            state.duplicateSignatureSkips++;
+            return true;
+        }
+
+        return false;
+    }
+
+    function markMessageSeen(
+        msg,
+        now = Date.now()
+    ) {
+        if (!msg)
+            return false;
+
+        if (msg.key)
+            state.seenKeys.add(msg.key);
+
+        const signature =
+            msg.signature ||
+            getStableMessageSignature(msg);
+
+        if (signature)
+            state.seenSignatures.set(signature, now);
+
+        return true;
+    }
+
+    function pruneSeenMessageState(
+        currentMessages = []
+    ) {
+        // Volatile keys are only a fast path; signatures are the real defense.
+        if (state.seenKeys.size > 1200) {
+            const arr =
+                Array.from(state.seenKeys);
+            state.seenKeys =
+                new Set(arr.slice(-800));
+        }
+
+        const currentlyVisible =
+            new Set(
+                currentMessages
+                    .map(msg =>
+                        msg.signature ||
+                        getStableMessageSignature(msg)
+                    )
+                    .filter(Boolean)
+            );
+
+        const now = Date.now();
+        const retentionMs = 30 * 60 * 1000;
+
+        for (
+            const [signature, seenAt] of
+            state.seenSignatures.entries()
+        ) {
+            if (
+                currentlyVisible.has(signature)
+            ) {
+                continue;
+            }
+
+            if (
+                now - Number(seenAt || 0) >
+                retentionMs
+            ) {
+                state.seenSignatures.delete(
+                    signature
+                );
+            }
+        }
+
+        // Hard memory bound. Prefer deleting old signatures that are no longer
+        // visible. Visible lines remain protected from retrigger indefinitely.
+        if (state.seenSignatures.size > 2500) {
+            const candidates =
+                Array.from(
+                    state.seenSignatures.entries()
+                )
+                    .filter(
+                        ([signature]) =>
+                            !currentlyVisible.has(
+                                signature
+                            )
+                    )
+                    .sort(
+                        (a, b) =>
+                            Number(a[1] || 0) -
+                            Number(b[1] || 0)
+                    );
+
+            while (
+                state.seenSignatures.size >
+                    1800 &&
+                candidates.length
+            ) {
+                const [signature] =
+                    candidates.shift();
+                state.seenSignatures.delete(
+                    signature
+                );
+            }
+        }
     }
 
     function isGmDefaultMessage(msg) {
@@ -38968,10 +39664,13 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
         let added = 0;
 
         for (const msg of messages) {
-            if (!state.seenKeys.has(msg.key)) {
-                state.seenKeys.add(msg.key);
+            if (!isMessageAlreadySeen(msg)) {
                 added++;
             }
+            markMessageSeen(
+                msg,
+                Date.now()
+            );
         }
 
         state.consumedMessageKeys += added;
@@ -38983,13 +39682,7 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
             );
         }
 
-        // Keep the dedupe set bounded.
-        if (state.seenKeys.size > 700) {
-            const arr = Array.from(state.seenKeys);
-            state.seenKeys =
-                new Set(arr.slice(-450));
-        }
-
+        pruneSeenMessageState(messages);
         return added;
     }
 
@@ -39188,7 +39881,11 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
 
         let sent = false;
         try {
-            sent = bot.sendChat?.(message) === true;
+            sent =
+                bot.sendChatToChannel?.(
+                    message,
+                    "Default"
+                ) === true;
         } catch (e) {
             bot.log(`[GM Chat] ${label} reply failed`, e);
             return false;
@@ -39204,39 +39901,62 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
     }
 
     function scheduleGmAutoReplies() {
-        // There must never be more than one reply pair pending.
         clearReplyTimers();
         state.replyPairsScheduled++;
 
-        // v1.5.39: first reply is sent in the SAME GM trigger call. Do not use
-        // setTimeout here: browser timer throttling must never make the reply
-        // appear tied to the 15-second module restart.
-        sendGmAutoReply(
-            String(config.firstReplyText || "Hey :D"),
-            "first"
-        );
-
-        const secondDelay = Math.max(
-            100,
+        const firstDelay = Math.max(
+            250,
             Math.min(
-                3000,
-                Number(config.secondReplyDelayMs) || 500
+                5000,
+                Number(config.firstReplyDelayMs) ||
+                    1000
             )
         );
 
-        const secondId = setTimeout(() => {
+        const secondGap = Math.max(
+            250,
+            Math.min(
+                5000,
+                Number(config.secondReplyDelayMs) ||
+                    1000
+            )
+        );
+
+        // Wait ~1 second, send the first line, THEN begin the next ~1 second
+        // wait so timer throttling cannot collapse the gap between messages.
+        const firstId = setTimeout(() => {
             state.replyTimerIds =
                 state.replyTimerIds.filter(
-                    id => id !== secondId
+                    id => id !== firstId
                 );
 
             sendGmAutoReply(
-                String(config.secondReplyText || "i am here"),
-                "second"
+                String(
+                    config.firstReplyText ||
+                        "Hey :D"
+                ),
+                "first"
             );
-        }, secondDelay);
 
-        state.replyTimerIds.push(secondId);
+            const secondId = setTimeout(() => {
+                state.replyTimerIds =
+                    state.replyTimerIds.filter(
+                        id => id !== secondId
+                    );
+
+                sendGmAutoReply(
+                    String(
+                        config.secondReplyText ||
+                            "i am here"
+                    ),
+                    "second"
+                );
+            }, secondGap);
+
+            state.replyTimerIds.push(secondId);
+        }, firstDelay);
+
+        state.replyTimerIds.push(firstId);
     }
 
     function refreshKillswitchUi() {
@@ -39439,8 +40159,8 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
             cancelRecovery: false
         });
 
-        // Reply immediately, independently of the 15-second module restore.
-        // "Hey :D" is synchronous; "i am here" follows ~500ms later.
+        // Replies are independent of the 15-second module restore:
+        // ~1s -> "Hey :D" -> ~1s -> "i am here", both in Default chat.
         scheduleGmAutoReplies();
 
         // Bring back the same pre-killswitch module set after 15 seconds.
@@ -39451,7 +40171,7 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
         bot.log(
             `[GM Chat] Killswitch active for ` +
             `${Math.round(config.restartDelayMs / 1000)}s; ` +
-            `first reply sent immediately; follow-up scheduled.`
+            `human-paced Default-chat replies scheduled.`
         );
 
         return true;
@@ -39475,13 +40195,18 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
                         sender = match[1].trim();
                 }
                 const key = `${ch.name}|${sender}|${raw}|${entry.__time || ''}`;
-                messages.push({
+                const message = {
                     channel: ch.name,
                     sender,
                     raw,
                     key,
                     time: entry.__time
-                });
+                };
+                message.signature =
+                    getStableMessageSignature(
+                        message
+                    );
+                messages.push(message);
             }
         }
         return messages;
@@ -39495,12 +40220,13 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
         const now = Date.now();
 
         for (const msg of messages) {
-            if (state.seenKeys.has(msg.key))
+            if (isMessageAlreadySeen(msg))
                 continue;
 
-            // Always consume first. Even a suppressed GM line should never be
-            // reconsidered after the cooldown expires.
-            state.seenKeys.add(msg.key);
+            // Always consume both the volatile key and the stable signature
+            // first. Even a suppressed/re-rendered GM line can never become a
+            // fresh event later in this monitor session.
+            markMessageSeen(msg, now);
 
             if (!isGmDefaultMessage(msg))
                 continue;
@@ -39528,11 +40254,7 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
             return;
         }
 
-        if (state.seenKeys.size > 700) {
-            const arr = Array.from(state.seenKeys);
-            state.seenKeys =
-                new Set(arr.slice(-450));
-        }
+        pruneSeenMessageState(messages);
     }
 
     function tick() {
@@ -39549,8 +40271,20 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
     function start() {
         if (state.running)
             return false;
+
         config.enabled = true;
         persistConfig();
+
+        // Never treat pre-existing visible chat lines as new just because the
+        // monitor was restarted/re-enabled. New lines that arrive after this
+        // warm-up are still detected normally.
+        const consumed =
+            consumeCurrentChatMessages(
+                "monitor start"
+            );
+        state.monitorStartConsumes +=
+            consumed;
+
         state.running = true;
         bot.log("GM chat monitor started");
         tick();
@@ -39629,8 +40363,14 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
                 state.suppressedGmMessages || 0,
             consumedMessageKeys:
                 state.consumedMessageKeys || 0,
+            duplicateSignatureSkips:
+                state.duplicateSignatureSkips || 0,
+            monitorStartConsumes:
+                state.monitorStartConsumes || 0,
             seenKeyCount:
                 state.seenKeys.size,
+            seenSignatureCount:
+                state.seenSignatures.size,
             config: {
                 ...config
             }
@@ -39647,12 +40387,18 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
                 Number(config.restartDelayMs) || 15000
             )
         );
-        config.firstReplyDelayMs = 0;
-        config.secondReplyDelayMs = Math.max(
-            100,
+        config.firstReplyDelayMs = Math.max(
+            250,
             Math.min(
-                3000,
-                Number(config.secondReplyDelayMs) || 500
+                5000,
+                Number(config.firstReplyDelayMs) || 1000
+            )
+        );
+        config.secondReplyDelayMs = Math.max(
+            250,
+            Math.min(
+                5000,
+                Number(config.secondReplyDelayMs) || 1000
             )
         );
         config.triggerCooldownMs = Math.max(
@@ -39695,6 +40441,8 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
         state.restartSnapshot = null;
         state.killSwitchActive = false;
         state.suppressUntil = 0;
+        state.seenKeys.clear();
+        state.seenSignatures.clear();
         state.running = false;
     });
 
