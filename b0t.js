@@ -803,7 +803,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.5.18",
+        version: "1.5.33",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -4833,12 +4833,44 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         retargetCandidateSince: 0,
         retargetCandidateAdvantage: 0,
         lastRetargetReason: null,
+
+        // v1.5.28: ordinary retargets use a short-lived smoothed route-quality
+        // history so one noisy pathfinder frame cannot start target churn.
+        retargetScoreHistory: new Map(),
+        retargetScorePrunes: 0,
+        retargetSmoothedComparisons: 0,
+        retargetNoiseBlocks: 0,
+        retargetMomentumBlocks: 0,
+        retargetInsufficientSampleBlocks: 0,
+        lastRetargetRawAdvantage: 0,
+        lastRetargetSmoothedAdvantage: 0,
+        lastRetargetEffectiveThreshold: 0,
+        lastRetargetMomentumBonus: 0,
+        lastRetargetCurrentSmoothedScore: null,
+        lastRetargetChallengerSmoothedScore: null,
+        lastRetargetCurrentSamples: 0,
+        lastRetargetChallengerSamples: 0,
+
         // v1.4.90: fast, gapless handoff after death/removal/skip.
         lastTargetLossAt: 0,
         lastTargetLossId: null,
         lastTargetHandoffAt: 0,
         lastInvalidTargetAt: 0,
         lastInvalidTargetReason: null,
+
+        // v1.5.31: current target visibility is enforced before lure/normal
+        // combat branching. A target outside the native 15x11 small-screen
+        // envelope can never keep combat/movement ownership alive.
+        offscreenTargetClears: 0,
+        offscreenTargetLastAt: 0,
+        offscreenTargetLastId: null,
+        offscreenTargetLastName: null,
+        offscreenTargetLastDx: null,
+        offscreenTargetLastDy: null,
+        offscreenTargetLastDistance: null,
+        offscreenTargetLastReason: null,
+        offscreenEngagedRejects: 0,
+
         canonicalTargetRefreshes: 0,
         canonicalFollowRefreshes: 0,
         candidateSnapshotAt: 0,
@@ -4936,6 +4968,38 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         lurePreferredHandoffs: 0,
         lurePreferredLastReason: null,
 
+        // v1.5.21: preferred-pending keeps safe basic attack-through instead
+        // of disabling all combat while CaveBot moves toward the preferred.
+        lurePreferredSoftAttackTicks: 0,
+        lurePreferredSoftAttackAcquires: 0,
+        lurePreferredSoftAttackReleases: 0,
+        lurePreferredSoftAttackNoSafeTarget: 0,
+
+        // v1.5.20: a preferred target may be inside the engage envelope but
+        // temporarily inaccessible because ordinary mobs physically occupy the
+        // route. Clear those blockers without losing preferred-target intent.
+        preferredAccessBlocked: false,
+        preferredAccessTargetId: null,
+        preferredAccessTargetName: null,
+        preferredAccessBlockerIds: [],
+        preferredAccessBlockerNames: [],
+        preferredAccessClearTargetId: null,
+        preferredAccessSince: 0,
+        preferredAccessLastProbeAt: 0,
+        preferredAccessLastReason: null,
+        preferredAccessActivations: 0,
+        preferredAccessClears: 0,
+        preferredAccessHandoffs: 0,
+        preferredAccessExoriHints: 0,
+
+        // v1.5.23: preferred mobs separated by static geometry must not pin
+        // lure/targeting. Only creature-blocked routes get access-clear logic.
+        preferredWallBlocks: 0,
+        preferredWallBlockLastId: null,
+        preferredWallBlockLastName: null,
+        preferredWallBlockLastAt: 0,
+        preferredWallBlockLastReason: null,
+
         lureReason: null,
         lureWaypointIndex: null,
         lureWaypoint: null,
@@ -4981,6 +5045,15 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         lureLastMobActivations: 0,
         lureLastMobFinishes: 0,
         lureLastMobRuneBursts: 0,
+
+        // v1.5.26: Last Mob is a hard finish override, not merely a Smart Lure
+        // scoring hint. Keep that exact mob targeted until it dies while Slow
+        // mode continues shaping CaveBot movement.
+        lureLastMobForcedAttackTicks: 0,
+        lureLastMobForcedReacquires: 0,
+        lureLastMobRangeExtensions: 0,
+        lureLastMobSkipOverrides: 0,
+        lureLastMobLastForcedAt: 0,
 
         // v1.5.09: screen leash. CaveBot pauses forward movement when a mob
         // being pulled falls toward the trailing edge of the native viewport.
@@ -5048,6 +5121,15 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         // A non-preferred challenger must remain meaningfully better for this
         // long before an ordinary retarget. Preferred targets still pre-empt.
         retargetConfirmMs: 450,
+
+        // Smooth route-score noise before optional target switches. A target
+        // that was just damaged also gets a small temporary switching margin.
+        retargetScoreAlpha: 0.45,
+        retargetScoreMemoryMs: 2500,
+        retargetScoreMinSamples: 2,
+        retargetMomentumMs: 1200,
+        retargetMomentumAdvantage: 1,
+
         // Finish a low-HP monster if we're actively damaging it. This only
         // suppresses ordinary route/distance retargets; preferred targets and
         // forced death/unreachable/invalid handoffs still pre-empt immediately.
@@ -5087,6 +5169,12 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         lurePreferredTrackRadius: 12,
         lurePreferredLostGraceMs: 1200,
 
+        // Preferred access-clear only activates when static map geometry can
+        // reach the preferred mob but live creature occupancy cannot.
+        preferredAccessProbeMs: 300,
+        preferredAccessSearchRadius: 9,
+        preferredWallSkipMs: 8000,
+
         // Native small-screen bounds are <8 x <6 projected tiles. Pause route
         // movement before a trailing mob reaches that hard edge, then resume
         // only after it catches up into the inner band (hysteresis).
@@ -5117,6 +5205,26 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         config.retargetCooldownMs = Number.isFinite(cooldown) ? Math.max(0, Math.min(10000, cooldown)) : 1200;
         config.retargetDistanceAdvantage = Number.isFinite(advantage) ? Math.max(1, Math.min(10, Math.trunc(advantage))) : 2;
         config.retargetConfirmMs = Math.max(100, Math.min(2000, Number(config.retargetConfirmMs) || 450));
+        config.retargetScoreAlpha = Math.max(
+            0.15,
+            Math.min(0.9, Number(config.retargetScoreAlpha) || 0.45)
+        );
+        config.retargetScoreMemoryMs = Math.max(
+            800,
+            Math.min(8000, Number(config.retargetScoreMemoryMs) || 2500)
+        );
+        config.retargetScoreMinSamples = Math.max(
+            1,
+            Math.min(6, Math.trunc(Number(config.retargetScoreMinSamples) || 2))
+        );
+        config.retargetMomentumMs = Math.max(
+            0,
+            Math.min(5000, Number(config.retargetMomentumMs) || 1200)
+        );
+        config.retargetMomentumAdvantage = Math.max(
+            0,
+            Math.min(5, Number(config.retargetMomentumAdvantage) || 1)
+        );
         config.finishTargetHealthPct = Math.max(1, Math.min(90, Number(config.finishTargetHealthPct) || 30));
         config.finishTargetDamageGraceMs = Math.max(500, Math.min(10000, Number(config.finishTargetDamageGraceMs) || 2500));
         config.manualTargetHoldMs = Math.max(500, Math.min(10000, Number(config.manualTargetHoldMs) || 3000));
@@ -5143,6 +5251,9 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             300,
             Math.min(3000, Number(config.lurePreferredLostGraceMs) || 1200)
         );
+        config.preferredAccessProbeMs = Math.max(150, Math.min(1000, Number(config.preferredAccessProbeMs) || 300));
+        config.preferredAccessSearchRadius = Math.max(4, Math.min(14, Math.trunc(Number(config.preferredAccessSearchRadius) || 9)));
+        config.preferredWallSkipMs = Math.max(2000, Math.min(30000, Number(config.preferredWallSkipMs) || 8000));
         config.lureLeashEdgeX = Math.max(3, Math.min(7, Number(config.lureLeashEdgeX) || 6));
         config.lureLeashEdgeY = Math.max(2, Math.min(5, Number(config.lureLeashEdgeY) || 4));
         config.lureLeashResumeX = Math.max(2, Math.min(config.lureLeashEdgeX - 1, Number(config.lureLeashResumeX) || 4));
@@ -5788,6 +5899,11 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         if (suspendTargetingForProtectionZone(now))
             return false;
 
+        // v1.5.31: visibility lifecycle guard must run before syncLureMode().
+        // Otherwise an off-screen target can keep stale combat ownership alive
+        // while lure/normal branches disagree about who owns movement.
+        releaseCurrentTargetIfOffScreen(now);
+
         // v1.5.08: below the requested on-screen mob count, keep attacking
         // ordinary mobs while CaveBot continues pulling toward the waypoint.
         // Targeting is forbidden from owning movement in this branch.
@@ -5850,6 +5966,11 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             return false;
         }
 
+        // v1.5.20: preferred targets can be boxed off by ordinary mobs even
+        // though the underlying map route is valid. Temporarily attack those
+        // blockers instead of standing still with an unreachable preferred mob.
+        syncPreferredAccessClear(now);
+
         // 2) Movement
         if (config.kiteMode && getEngagedTarget()) {
             if (syncChase(now))
@@ -5905,6 +6026,33 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
         // ---- REACHABILITY CHECK (new) ----
         if (dist <= maxDist + 2 && !isTargetReachable(current)) {
+            if (isPreferredCreature(current)) {
+                const accessInfo = probePreferredCreatureBlock(current, now);
+                if (accessInfo && activatePreferredAccessState(accessInfo, now)) {
+                    state.unreachableStart = 0;
+                    return true;
+                }
+
+                markPreferredWallBlocked(
+                    current,
+                    "unreachable preferred has no creature blocker on verified route",
+                    now
+                );
+                handoffTarget(
+                    current,
+                    "preferred blocked by wall/static geometry",
+                    now,
+                    Math.max(
+                        2000,
+                        Math.min(
+                            30000,
+                            Number(config.preferredWallSkipMs) || 8000
+                        )
+                    )
+                );
+                state.unreachableStart = 0;
+                return false;
+            }
             if (!state.unreachableStart)
                 state.unreachableStart = now;
             if (now - state.unreachableStart > 3000) {
@@ -6056,36 +6204,188 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                     // retargeting is preference-neutral and compares the same
                     // route/distance score that selected "best" in the first
                     // place, fixing the old route-score vs tile-distance split.
-                    const preferredUpgrade = bestInfo.preferred && !currentInfo.preferred;
-                    const currentScore = getCreatureRetargetScore(current);
-                    const bestScore = getCreatureRetargetScore(best);
+                    const preferredBestApproach =
+                        bestInfo.preferred
+                            ? getTargetApproachInfo(best)
+                            : null;
+                    const preferredBestAccessInfo =
+                        bestInfo.preferred &&
+                        !preferredBestApproach?.reachable
+                            ? probePreferredCreatureBlock(best, now)
+                            : null;
+                    const preferredUpgrade =
+                        !state.preferredAccessBlocked &&
+                        bestInfo.preferred &&
+                        !currentInfo.preferred &&
+                        (
+                            preferredBestApproach?.reachable ||
+                            !!preferredBestAccessInfo
+                        );
+                    const rawCurrentScore =
+                        getCreatureRetargetScore(current);
+                    const rawBestScore =
+                        getCreatureRetargetScore(best);
+                    const currentScoreInfo =
+                        getSmoothedRetargetScore(
+                            current,
+                            rawCurrentScore,
+                            now
+                        );
+                    const bestScoreInfo =
+                        getSmoothedRetargetScore(
+                            best,
+                            rawBestScore,
+                            now
+                        );
+
+                    state.retargetSmoothedComparisons++;
+
+                    const rawScoreAdvantage =
+                        Number.isFinite(rawCurrentScore) &&
+                        Number.isFinite(rawBestScore)
+                            ? rawCurrentScore - rawBestScore
+                            : 0;
                     const scoreAdvantage =
-                        Number.isFinite(currentScore) && Number.isFinite(bestScore)
-                            ? currentScore - bestScore
+                        Number.isFinite(currentScoreInfo.score) &&
+                        Number.isFinite(bestScoreInfo.score)
+                            ? currentScoreInfo.score -
+                                bestScoreInfo.score
                             : 0;
 
-                    const heldForMs = state.targetSelectedAt ? now - state.targetSelectedAt : 0;
-                    const stickMs = Math.max(0, Number(config.targetStickMs) || 0);
-                    const retargetCooldownMs = Math.max(0, Number(config.retargetCooldownMs) || 0);
-                    const confirmMs = Math.max(100, Number(config.retargetConfirmMs) || 450);
+                    const heldForMs =
+                        state.targetSelectedAt
+                            ? now - state.targetSelectedAt
+                            : 0;
+                    const stickMs = Math.max(
+                        0,
+                        Number(config.targetStickMs) || 0
+                    );
+                    const retargetCooldownMs = Math.max(
+                        0,
+                        Number(config.retargetCooldownMs) || 0
+                    );
+                    const confirmMs = Math.max(
+                        100,
+                        Number(config.retargetConfirmMs) || 450
+                    );
 
-                    // Existing "distance advantage" remains backward-compatible:
-                    // one tile maps to 100 path-cost points, matching the game's
-                    // minimum A* ground cost. Default 2 therefore requires about
-                    // two cardinal steps of real route improvement.
-                    const distanceAdvantage = Math.max(1, Number(config.retargetDistanceAdvantage) || 2);
-                    const scoreThreshold = distanceAdvantage * 100;
-                    const clearlyBetter = scoreAdvantage >= scoreThreshold;
-                    const challengerHeldMs = clearlyBetter
-                        ? trackRetargetCandidate(best, scoreAdvantage, now)
-                        : (resetRetargetCandidate(), 0);
-
-                    const currentHealthPct = getCreatureHealthPercent(current);
-                    const finishHealthPct = Math.max(1, Math.min(90, Number(config.finishTargetHealthPct) || 30));
-                    const finishDamageGraceMs = Math.max(500, Number(config.finishTargetDamageGraceMs) || 2500);
+                    const currentHealthPct =
+                        getCreatureHealthPercent(current);
+                    const finishHealthPct = Math.max(
+                        1,
+                        Math.min(
+                            90,
+                            Number(config.finishTargetHealthPct) || 30
+                        )
+                    );
+                    const finishDamageGraceMs = Math.max(
+                        500,
+                        Number(config.finishTargetDamageGraceMs) || 2500
+                    );
                     const damageAgeMs = state.lastDamageAt
                         ? Math.max(0, now - state.lastDamageAt)
                         : Number.POSITIVE_INFINITY;
+
+                    // One tile maps to ~100 path-cost points. Preserve the
+                    // existing threshold, then add a small temporary margin
+                    // when the current target was just successfully damaged.
+                    const distanceAdvantage = Math.max(
+                        1,
+                        Number(config.retargetDistanceAdvantage) || 2
+                    );
+                    const baseScoreThreshold =
+                        distanceAdvantage * 100;
+
+                    const momentumMs = Math.max(
+                        0,
+                        Math.min(
+                            5000,
+                            Number(config.retargetMomentumMs) || 1200
+                        )
+                    );
+                    const momentumAdvantage = Math.max(
+                        0,
+                        Math.min(
+                            5,
+                            Number(config.retargetMomentumAdvantage) || 1
+                        )
+                    );
+                    const momentumActive =
+                        !preferredUpgrade &&
+                        momentumMs > 0 &&
+                        damageAgeMs <= momentumMs;
+                    const momentumBonus =
+                        momentumActive
+                            ? momentumAdvantage * 100
+                            : 0;
+                    const scoreThreshold =
+                        baseScoreThreshold + momentumBonus;
+
+                    const minSamples = Math.max(
+                        1,
+                        Math.min(
+                            6,
+                            Math.trunc(
+                                Number(config.retargetScoreMinSamples) || 2
+                            )
+                        )
+                    );
+                    const sampleReady =
+                        currentScoreInfo.samples >= minSamples &&
+                        bestScoreInfo.samples >= minSamples;
+
+                    const clearlyBetter =
+                        sampleReady &&
+                        scoreAdvantage >= scoreThreshold;
+
+                    state.lastRetargetRawAdvantage =
+                        rawScoreAdvantage;
+                    state.lastRetargetSmoothedAdvantage =
+                        scoreAdvantage;
+                    state.lastRetargetEffectiveThreshold =
+                        scoreThreshold;
+                    state.lastRetargetMomentumBonus =
+                        momentumBonus;
+                    state.lastRetargetCurrentSmoothedScore =
+                        Number.isFinite(currentScoreInfo.score)
+                            ? currentScoreInfo.score
+                            : null;
+                    state.lastRetargetChallengerSmoothedScore =
+                        Number.isFinite(bestScoreInfo.score)
+                            ? bestScoreInfo.score
+                            : null;
+                    state.lastRetargetCurrentSamples =
+                        currentScoreInfo.samples;
+                    state.lastRetargetChallengerSamples =
+                        bestScoreInfo.samples;
+
+                    if (
+                        rawScoreAdvantage >= baseScoreThreshold &&
+                        !sampleReady
+                    ) {
+                        state.retargetInsufficientSampleBlocks++;
+                    } else if (
+                        rawScoreAdvantage >= baseScoreThreshold &&
+                        scoreAdvantage < baseScoreThreshold
+                    ) {
+                        state.retargetNoiseBlocks++;
+                    }
+
+                    if (
+                        momentumBonus > 0 &&
+                        scoreAdvantage >= baseScoreThreshold &&
+                        scoreAdvantage < scoreThreshold
+                    ) {
+                        state.retargetMomentumBlocks++;
+                    }
+
+                    const challengerHeldMs = clearlyBetter
+                        ? trackRetargetCandidate(
+                            best,
+                            scoreAdvantage,
+                            now
+                        )
+                        : (resetRetargetCandidate(), 0);
 
                     // If we're already actively burning down a low-HP target,
                     // finish it instead of changing targets for a merely better
@@ -6111,6 +6411,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                     }
 
                     const ordinaryRetargetReady =
+                        !state.preferredAccessBlocked &&
                         !manualTargetProtected &&
                         !finishTargetProtected &&
                         heldForMs >= stickMs &&
@@ -6136,8 +6437,14 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                                 toId: best.id,
                                 toName: best.name || "Mob",
                                 reason,
+                                rawScoreAdvantage,
                                 scoreAdvantage,
                                 scoreThreshold,
+                                momentumBonus,
+                                currentScoreSamples:
+                                    currentScoreInfo.samples,
+                                challengerScoreSamples:
+                                    bestScoreInfo.samples,
                                 challengerHeldMs,
                                 currentHealthPct,
                                 damageAgeMs,
@@ -6262,6 +6569,92 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             : (Number.isFinite(approach.pathSteps) ? approach.pathSteps * 100 : 100000);
     }
 
+    function pruneRetargetScoreHistory(now = Date.now()) {
+        const memoryMs = Math.max(
+            800,
+            Math.min(8000, Number(config.retargetScoreMemoryMs) || 2500)
+        );
+
+        for (const [id, entry] of state.retargetScoreHistory) {
+            if (
+                !entry ||
+                now - Number(entry.lastAt || 0) > memoryMs
+            ) {
+                state.retargetScoreHistory.delete(id);
+                state.retargetScorePrunes++;
+            }
+        }
+
+        while (state.retargetScoreHistory.size > 64) {
+            const oldestId =
+                state.retargetScoreHistory.keys().next().value;
+            if (oldestId === undefined)
+                break;
+            state.retargetScoreHistory.delete(oldestId);
+            state.retargetScorePrunes++;
+        }
+    }
+
+    function getSmoothedRetargetScore(
+        creature,
+        rawScore,
+        now = Date.now()
+    ) {
+        if (
+            !creature?.id ||
+            !Number.isFinite(Number(rawScore))
+        ) {
+            return {
+                raw: Number(rawScore),
+                score: Number(rawScore),
+                samples: 0
+            };
+        }
+
+        pruneRetargetScoreHistory(now);
+
+        const id = creature.id;
+        const alpha = Math.max(
+            0.15,
+            Math.min(0.9, Number(config.retargetScoreAlpha) || 0.45)
+        );
+        const memoryMs = Math.max(
+            800,
+            Math.min(8000, Number(config.retargetScoreMemoryMs) || 2500)
+        );
+        const previous = state.retargetScoreHistory.get(id);
+
+        let score = Number(rawScore);
+        let samples = 1;
+
+        if (
+            previous &&
+            now - Number(previous.lastAt || 0) <= memoryMs &&
+            Number.isFinite(Number(previous.score))
+        ) {
+            score =
+                (alpha * Number(rawScore)) +
+                ((1 - alpha) * Number(previous.score));
+            samples = Math.min(
+                1000,
+                Math.max(1, Number(previous.samples) || 1) + 1
+            );
+        }
+
+        state.retargetScoreHistory.set(id, {
+            score,
+            raw: Number(rawScore),
+            samples,
+            lastAt: now
+        });
+
+        return {
+            raw: Number(rawScore),
+            score,
+            samples
+        };
+    }
+
     function getCreatureSelectionScore(creature) {
         const distance = getCreatureDistanceFromPlayer(creature);
         const preferred = isPreferredCreature(creature);
@@ -6281,6 +6674,186 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 return sa - sb;
             return String(a?.name || "").localeCompare(String(b?.name || ""));
         });
+    }
+
+    function getNativeSmallScreenInfo(creature) {
+        const player = window.gameClient?.player;
+        if (!player || !creature) {
+            return {
+                visible: false,
+                reason: !player ? "no player" : "no creature",
+                dx: null,
+                dy: null,
+                distance: Number.POSITIVE_INFINITY
+            };
+        }
+
+        const playerPos = normalizePosition(
+            player.getPosition?.()
+        );
+        const creaturePos = normalizePosition(
+            creature.getPosition?.() || creature.__position
+        );
+
+        if (!playerPos || !creaturePos) {
+            return {
+                visible: false,
+                reason: "missing position",
+                dx: null,
+                dy: null,
+                distance: Number.POSITIVE_INFINITY
+            };
+        }
+
+        if (playerPos.z !== creaturePos.z) {
+            return {
+                visible: false,
+                reason: "different floor",
+                dx: null,
+                dy: null,
+                distance: Number.POSITIVE_INFINITY
+            };
+        }
+
+        let dx = null;
+        let dy = null;
+        try {
+            const pp = player.getPosition().projected();
+            const cp =
+                (creature.getPosition?.() || creature.__position)
+                    .projected();
+            dx = Math.abs(pp.x - cp.x);
+            dy = Math.abs(pp.y - cp.y);
+        } catch (e) {
+            return {
+                visible: false,
+                reason: "projection failed",
+                dx: null,
+                dy: null,
+                distance:
+                    getTileDistance(playerPos, creaturePos)
+            };
+        }
+
+        // MiniSource Creature.canSeeSmall() is exactly dx < 8 && dy < 6.
+        // Require both the native function and the explicit projected envelope
+        // when available so a stale/custom client result cannot pin targeting.
+        const projectedVisible =
+            Number.isFinite(dx) &&
+            Number.isFinite(dy) &&
+            dx < 8 &&
+            dy < 6;
+        const nativeVisible =
+            typeof player.canSeeSmall === "function"
+                ? !!player.canSeeSmall(creature)
+                : projectedVisible;
+
+        return {
+            visible: nativeVisible && projectedVisible,
+            reason:
+                nativeVisible && projectedVisible
+                    ? "visible"
+                    : `off screen dx=${dx} dy=${dy}`,
+            dx,
+            dy,
+            distance: getTileDistance(playerPos, creaturePos)
+        };
+    }
+
+    function releaseCurrentTargetIfOffScreen(
+        now = Date.now()
+    ) {
+        const current = getCurrentTarget();
+        if (!current)
+            return false;
+
+        const screen = getNativeSmallScreenInfo(current);
+        if (screen.visible)
+            return false;
+
+        state.offscreenTargetClears++;
+        state.offscreenTargetLastAt = now;
+        state.offscreenTargetLastId = current.id ?? null;
+        state.offscreenTargetLastName =
+            current.name || "Mob";
+        state.offscreenTargetLastDx =
+            Number.isFinite(screen.dx) ? screen.dx : null;
+        state.offscreenTargetLastDy =
+            Number.isFinite(screen.dy) ? screen.dy : null;
+        state.offscreenTargetLastDistance =
+            Number.isFinite(screen.distance)
+                ? screen.distance
+                : null;
+        state.offscreenTargetLastReason =
+            screen.reason;
+
+        state.lastInvalidTargetAt = now;
+        state.lastInvalidTargetReason =
+            screen.reason;
+
+        // Very short skip: this prevents same-tick stale snapshot reacquire but
+        // allows the creature to become eligible again almost immediately if it
+        // genuinely returns to the visible screen.
+        rememberSkippedTarget(
+            current,
+            now,
+            Math.max(
+                250,
+                Math.min(
+                    600,
+                    Number(config.fastReacquireMs) || 150
+                )
+            )
+        );
+        invalidateCandidateSnapshot();
+
+        if (
+            isSameCreature(
+                getCurrentFollowTarget(),
+                current
+            )
+        ) {
+            clearCurrentFollowTarget();
+        }
+
+        if (
+            isSameCreature(
+                getCurrentTarget(),
+                current
+            )
+        ) {
+            clearCurrentTarget();
+        }
+
+        if (state.engagedTargetId === current.id)
+            clearEngagedTarget();
+
+        // Release all movement/combat ownership immediately. Lure will hand
+        // movement back to CaveBot; normal targeting may reacquire another
+        // visible target later in this SAME tick.
+        state.engagedTargetId = null;
+        state.movementOwner = null;
+        state.movementOwnedUntil = 0;
+        state.unreachableStart = 0;
+        state.lastProgressAt = 0;
+        state.lastDistance = undefined;
+        state.lastApproachCost = null;
+        state.lastTargetPos = null;
+        resetRetargetCandidate();
+
+        bot.log(
+            "Target left native screen – released immediately",
+            {
+                id: current.id,
+                name: current.name || "Mob",
+                dx: screen.dx,
+                dy: screen.dy,
+                distance: screen.distance,
+                lure: isLureActive()
+            }
+        );
+
+        return true;
     }
 
     function isNativeVisibleMonster(creature) {
@@ -6319,18 +6892,9 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 !Object.prototype.hasOwnProperty.call(world.activeCreatures, creature.id))
             return false;
 
-        // The client already owns the authoritative 15x11 visibility test.
-        if (typeof player.canSeeSmall === "function")
-            return !!player.canSeeSmall(creature);
-
-        // Compatibility fallback for older clients.
-        try {
-            const pp = playerPos.projected();
-            const cp = creaturePos.projected();
-            return Math.abs(pp.x - cp.x) < 8 && Math.abs(pp.y - cp.y) < 6;
-        } catch {
-            return false;
-        }
+        // Exact native small-screen envelope. The helper also performs the
+        // explicit projected dx<8/dy<6 check used by MiniSource.
+        return getNativeSmallScreenInfo(creature).visible;
     }
 
     function getNearbyMonsters(sortByDistance = true) {
@@ -6367,6 +6931,413 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
             return getTileDistance(me, pos) <= radius;
         });
+    }
+
+    function getLureVisibleMonsterSnapshot() {
+        const me = normalizePosition(bot.getPlayerPosition());
+        if (!me)
+            return [];
+
+        return getLureVisibleMonsters()
+            .map(monster => {
+                const pos = normalizePosition(
+                    monster?.getPosition?.() || monster?.__position
+                );
+                if (!pos || pos.z !== me.z || monster?.id == null)
+                    return null;
+
+                return {
+                    id: monster.id,
+                    name: monster.name || "Mob",
+                    x: pos.x,
+                    y: pos.y,
+                    z: pos.z,
+                    distance: getTileDistance(me, pos),
+                    healthPct: getCreatureHealthPercent(monster)
+                };
+            })
+            .filter(Boolean);
+    }
+
+    function getNativeMonsterAtTile(x, y, z, excludeId = null) {
+        const creatures = window.gameClient?.world?.activeCreatures || {};
+        const player = window.gameClient?.player;
+        const monsterType =
+            (typeof CONST !== "undefined" && CONST.TYPES)
+                ? CONST.TYPES.MONSTER
+                : undefined;
+
+        for (const id in creatures) {
+            const creature = creatures[id];
+            if (!creature || creature.id === player?.id || creature.id === excludeId)
+                continue;
+            if (monsterType !== undefined && creature.type !== monsterType)
+                continue;
+            if (creature.masterId === player?.id)
+                continue;
+
+            const hp = Number(creature.state?.health ?? creature.health);
+            if (Number.isFinite(hp) && hp <= 0)
+                continue;
+
+            const pos = normalizePosition(creature.getPosition?.() || creature.__position);
+            if (pos && pos.x === x && pos.y === y && pos.z === z)
+                return creature;
+        }
+        return null;
+    }
+
+    function isStaticPreferredAccessStepValid(from, to, z) {
+        if (!from || !to)
+            return false;
+
+        if (!isTileWalkable(to.x, to.y, z, true))
+            return false;
+
+        const tile = getTileAtPosition({ x: to.x, y: to.y, z });
+        if (tile && isFloorChangeTile(tile))
+            return false;
+
+        const dx = to.x - from.x;
+        const dy = to.y - from.y;
+
+        if (dx !== 0 && dy !== 0) {
+            const sideA = { x: from.x + dx, y: from.y, z };
+            const sideB = { x: from.x, y: from.y + dy, z };
+
+            if (
+                !isTileWalkable(sideA.x, sideA.y, z, true) ||
+                !isTileWalkable(sideB.x, sideB.y, z, true)
+            ) {
+                return false;
+            }
+
+            const tileA = getTileAtPosition(sideA);
+            const tileB = getTileAtPosition(sideB);
+            if (
+                (tileA && isFloorChangeTile(tileA)) ||
+                (tileB && isFloorChangeTile(tileB))
+            ) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    function findStaticPreferredAccessRoute(target, playerPos = null) {
+        const start = playerPos || normalizePosition(bot.getPlayerPosition());
+        const targetPos = normalizePosition(target?.getPosition?.() || target?.__position);
+        if (!start || !targetPos || start.z !== targetPos.z)
+            return null;
+
+        const radius = Math.max(
+            Math.max(4, Number(config.maxTargetDistance) + 3 || 8),
+            Math.max(4, Math.min(14, Number(config.preferredAccessSearchRadius) || 9))
+        );
+        const minX = start.x - radius;
+        const maxX = start.x + radius;
+        const minY = start.y - radius;
+        const maxY = start.y + radius;
+        const key = (x, y) => `${x},${y}`;
+        const queue = [{ x: start.x, y: start.y }];
+        const parent = new Map();
+        const seen = new Set([key(start.x, start.y)]);
+        const offsets = [
+            [0, -1], [1, 0], [0, 1], [-1, 0],
+            [-1, -1], [1, -1], [-1, 1], [1, 1]
+        ];
+
+        let goal = null;
+        for (let qi = 0; qi < queue.length && qi < 256; qi++) {
+            const cur = queue[qi];
+            const distToTarget = Math.max(
+                Math.abs(cur.x - targetPos.x),
+                Math.abs(cur.y - targetPos.y)
+            );
+            if (distToTarget <= 1) {
+                goal = cur;
+                break;
+            }
+
+            const ordered = offsets.slice().sort((a, b) => {
+                const da = Math.abs(targetPos.x - (cur.x + a[0])) +
+                    Math.abs(targetPos.y - (cur.y + a[1]));
+                const db = Math.abs(targetPos.x - (cur.x + b[0])) +
+                    Math.abs(targetPos.y - (cur.y + b[1]));
+                return da - db;
+            });
+
+            for (const [dx, dy] of ordered) {
+                const nx = cur.x + dx;
+                const ny = cur.y + dy;
+                if (nx < minX || nx > maxX || ny < minY || ny > maxY)
+                    continue;
+                if (nx === targetPos.x && ny === targetPos.y)
+                    continue;
+
+                const nk = key(nx, ny);
+                if (seen.has(nk))
+                    continue;
+                if (
+                    !isStaticPreferredAccessStepValid(
+                        cur,
+                        { x: nx, y: ny },
+                        start.z
+                    )
+                )
+                    continue;
+
+                seen.add(nk);
+                parent.set(nk, cur);
+                queue.push({ x: nx, y: ny });
+            }
+        }
+
+        if (!goal)
+            return null;
+
+        const route = [];
+        let cur = goal;
+        while (cur && !(cur.x === start.x && cur.y === start.y)) {
+            route.push({ x: cur.x, y: cur.y, z: start.z });
+            cur = parent.get(key(cur.x, cur.y)) || null;
+        }
+        route.reverse();
+        return route;
+    }
+
+    function markPreferredWallBlocked(target, reason, now = Date.now()) {
+        if (!target?.id)
+            return;
+
+        const skipMs = Math.max(
+            2000,
+            Math.min(30000, Number(config.preferredWallSkipMs) || 8000)
+        );
+        const oldExpiry = state.skippedTargetIds.get(target.id) || 0;
+        state.skippedTargetIds.set(
+            target.id,
+            Math.max(oldExpiry, now + skipMs)
+        );
+
+        state.preferredWallBlocks++;
+        state.preferredWallBlockLastId = target.id;
+        state.preferredWallBlockLastName = target.name || "Preferred";
+        state.preferredWallBlockLastAt = now;
+        state.preferredWallBlockLastReason = reason;
+
+        bot.log("Preferred target behind static geometry – skipping temporarily", {
+            id: target.id,
+            name: target.name || "Preferred",
+            reason,
+            skipMs
+        });
+    }
+
+    function probePreferredCreatureBlock(target, now = Date.now()) {
+        if (!target || !isPreferredCreature(target))
+            return null;
+
+        const playerPos = normalizePosition(bot.getPlayerPosition());
+        const targetPos = normalizePosition(target.getPosition?.() || target.__position);
+        if (!playerPos || !targetPos || playerPos.z !== targetPos.z)
+            return null;
+
+        const liveApproach = getTargetApproachInfo(target);
+        if (liveApproach?.reachable)
+            return null;
+
+        // A static route proves walls/map geometry are not the problem.
+        const staticRoute = findStaticPreferredAccessRoute(target, playerPos);
+        if (!staticRoute?.length)
+            return null;
+
+        const antiKS = getAntiKSContext(now);
+        const blockers = [];
+        const seen = new Set();
+        for (let i = 0; i < staticRoute.length; i++) {
+            const step = staticRoute[i];
+            const blocker = getNativeMonsterAtTile(
+                step.x,
+                step.y,
+                step.z,
+                target.id
+            );
+            if (!blocker || seen.has(blocker.id))
+                continue;
+            if (getAntiKSBlockReason(blocker, antiKS, now))
+                continue;
+            seen.add(blocker.id);
+            blockers.push({ monster: blocker, routeIndex: i });
+        }
+
+        // Only a creature actually occupying the verified static route may
+        // justify preferred-access clearing. Nearby unrelated mobs must not
+        // make a wall-separated preferred target look creature-blocked.
+        if (!blockers.length)
+            return null;
+
+        blockers.sort((a, b) => {
+            if (a.routeIndex !== b.routeIndex)
+                return a.routeIndex - b.routeIndex;
+            const ah = getCreatureHealthPercent(a.monster);
+            const bh = getCreatureHealthPercent(b.monster);
+            if (Number.isFinite(ah) && Number.isFinite(bh) && ah !== bh)
+                return ah - bh;
+            return Number(a.monster?.id || 0) - Number(b.monster?.id || 0);
+        });
+
+        return {
+            preferred: target,
+            staticRoute,
+            blockers: blockers.map(entry => entry.monster),
+            clearTarget: blockers[0].monster,
+            reason: `${blockers.length} creature blocker${blockers.length === 1 ? "" : "s"} sealing preferred route`
+        };
+    }
+
+    function clearPreferredAccessState(reason = null, now = Date.now(), handoffPreferred = true) {
+        const preferredId = state.preferredAccessTargetId;
+        const wasBlocked = state.preferredAccessBlocked;
+        state.preferredAccessBlocked = false;
+        state.preferredAccessTargetId = null;
+        state.preferredAccessTargetName = null;
+        state.preferredAccessBlockerIds = [];
+        state.preferredAccessBlockerNames = [];
+        state.preferredAccessClearTargetId = null;
+        state.preferredAccessSince = 0;
+        state.preferredAccessLastProbeAt = now;
+        state.preferredAccessLastReason = reason;
+        if (wasBlocked)
+            state.preferredAccessClears++;
+
+        if (handoffPreferred && preferredId != null) {
+            const preferred = getCanonicalActiveCreature({ id: preferredId }) ||
+                window.gameClient?.world?.activeCreatures?.[preferredId] || null;
+            if (preferred && isPreferredCreature(preferred)) {
+                const hp = Number(preferred.state?.health ?? preferred.health);
+                if (!Number.isFinite(hp) || hp > 0) {
+                    const approach = getTargetApproachInfo(preferred);
+                    if (approach?.reachable) {
+                        if (setCurrentTarget(preferred))
+                            state.preferredAccessHandoffs++;
+                    } else {
+                        markPreferredWallBlocked(
+                            preferred,
+                            "blockers cleared but preferred route is still unreachable",
+                            now
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    function activatePreferredAccessState(info, now = Date.now()) {
+        if (!info?.preferred || !info?.clearTarget)
+            return false;
+
+        const newActivation =
+            !state.preferredAccessBlocked ||
+            state.preferredAccessTargetId !== info.preferred.id;
+        if (newActivation) {
+            state.preferredAccessActivations++;
+            state.preferredAccessSince = now;
+            bot.log("Preferred target access blocked – clearing mobs", {
+                preferredId: info.preferred.id,
+                preferredName: info.preferred.name || "Preferred",
+                blockers: info.blockers.map(m => ({ id: m.id, name: m.name || "Mob" }))
+            });
+        }
+
+        state.preferredAccessBlocked = true;
+        state.preferredAccessTargetId = info.preferred.id;
+        state.preferredAccessTargetName = info.preferred.name || "Preferred";
+        state.preferredAccessBlockerIds = info.blockers.map(m => m.id);
+        state.preferredAccessBlockerNames = info.blockers.map(m => m.name || "Mob");
+        state.preferredAccessClearTargetId = info.clearTarget.id;
+        state.preferredAccessLastProbeAt = now;
+        state.preferredAccessLastReason = info.reason;
+
+        const current = getCurrentTarget();
+        if (!current || current.id !== info.clearTarget.id) {
+            if (setCurrentTarget(info.clearTarget))
+                state.preferredAccessHandoffs++;
+        }
+        return true;
+    }
+
+    function syncPreferredAccessClear(now = Date.now()) {
+        const probeMs = Math.max(150, Number(config.preferredAccessProbeMs) || 300);
+
+        if (!state.preferredAccessBlocked) {
+            const current = getCurrentTarget();
+            if (!current || !isPreferredCreature(current))
+                return false;
+            if (now - state.preferredAccessLastProbeAt < probeMs)
+                return false;
+            state.preferredAccessLastProbeAt = now;
+            const info = probePreferredCreatureBlock(current, now);
+            return info ? activatePreferredAccessState(info, now) : false;
+        }
+
+        const preferred =
+            window.gameClient?.world?.activeCreatures?.[state.preferredAccessTargetId] || null;
+        const hp = Number(preferred?.state?.health ?? preferred?.health);
+        if (!preferred || (Number.isFinite(hp) && hp <= 0)) {
+            clearPreferredAccessState("preferred target gone", now, false);
+            return false;
+        }
+
+        if (now - state.preferredAccessLastProbeAt >= probeMs) {
+            state.preferredAccessLastProbeAt = now;
+            const info = probePreferredCreatureBlock(preferred, now);
+            if (!info) {
+                clearPreferredAccessState("preferred access opened", now, true);
+                return false;
+            }
+            activatePreferredAccessState(info, now);
+        }
+
+        let clearTarget =
+            window.gameClient?.world?.activeCreatures?.[state.preferredAccessClearTargetId] || null;
+        const clearHp = Number(clearTarget?.state?.health ?? clearTarget?.health);
+        if (!clearTarget || (Number.isFinite(clearHp) && clearHp <= 0)) {
+            const info = probePreferredCreatureBlock(preferred, now);
+            if (!info) {
+                clearPreferredAccessState("blocker cleared; preferred reachable", now, true);
+                return false;
+            }
+            activatePreferredAccessState(info, now);
+            clearTarget = info.clearTarget;
+        }
+
+        const current = getCurrentTarget();
+        if (clearTarget && (!current || current.id !== clearTarget.id))
+            setCurrentTarget(clearTarget);
+
+        return true;
+    }
+
+    function isPreferredAccessBlocked() {
+        return !!state.preferredAccessBlocked;
+    }
+
+    function getPreferredAccessInfo() {
+        return {
+            active: !!state.preferredAccessBlocked,
+            preferredId: state.preferredAccessTargetId,
+            preferredName: state.preferredAccessTargetName,
+            blockerIds: Array.from(state.preferredAccessBlockerIds || []),
+            blockerNames: Array.from(state.preferredAccessBlockerNames || []),
+            clearTargetId: state.preferredAccessClearTargetId,
+            since: state.preferredAccessSince || 0,
+            reason: state.preferredAccessLastReason,
+            activations: state.preferredAccessActivations || 0,
+            clears: state.preferredAccessClears || 0,
+            handoffs: state.preferredAccessHandoffs || 0
+        };
     }
 
     function isStrictPreferredScreenVisible(creature) {
@@ -6422,6 +7393,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 continue;
             if (!isPreferredCreature(creature))
                 continue;
+            if ((state.skippedTargetIds.get(creature.id) || 0) > now)
+                continue;
 
             const health = Number(creature.state?.health ?? creature.health);
             if (Number.isFinite(health) && health <= 0)
@@ -6467,6 +7440,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             .filter(monster => {
                 if (!isPreferredCreature(monster))
                     return false;
+                if ((state.skippedTargetIds.get(monster.id) || 0) > now)
+                    return false;
                 if (ignoredNames.has(normalizeCreatureName(monster?.name)))
                     return false;
                 if (!isStrictPreferredScreenVisible(monster))
@@ -6485,10 +7460,21 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 const info = isTargetValidAndOnScreen(monster, {
                     returnDetails: true,
                     maxDx: 8,
-                    maxDy: 6
+                    maxDy: 6,
+                    skipReachability: true
                 });
                 if (!info.valid)
                     return false;
+
+                const approach = getTargetApproachInfo(monster);
+                if (!approach.reachable) {
+                    // A static route by itself is not enough: it may simply go
+                    // around a wall. Only a verified creature occupying that
+                    // route may keep the preferred target actionable.
+                    const accessInfo = probePreferredCreatureBlock(monster, now);
+                    if (!accessInfo)
+                        return false;
+                }
 
                 if (getAntiKSBlockReason(monster, antiKS, now))
                     return false;
@@ -6953,6 +7939,52 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         };
     }
 
+    function getForcedLureLastMobTarget(now = Date.now()) {
+        if (
+            !state.lureLastMobActive ||
+            state.lureLastMobId == null
+        ) {
+            return null;
+        }
+
+        // Re-resolve through activeCreatures every tick so a stale Creature
+        // object cannot make the forced-finish state silently stop attacking.
+        const creature =
+            window.gameClient?.world?.activeCreatures?.[
+                state.lureLastMobId
+            ] || null;
+
+        if (!creature || !isNativeVisibleMonster(creature))
+            return null;
+
+        const healthPct = getCreatureHealthPercent(creature);
+        if (!Number.isFinite(healthPct) || healthPct <= 0)
+            return null;
+
+        const me = normalizePosition(bot.getPlayerPosition());
+        const pos = normalizePosition(
+            creature.getPosition?.() || creature.__position
+        );
+        if (!me || !pos || me.z !== pos.z)
+            return null;
+
+        // Last Mob follows the lure radius, not Max Target Dist. Slow mode is
+        // specifically meant to let the monster catch up while it remains the
+        // selected attack target.
+        const lureRadius = Math.max(
+            1,
+            Math.min(8, Math.trunc(Number(config.lureRadius) || 5))
+        );
+        const distance = getTileDistance(me, pos);
+        if (!Number.isFinite(distance) || distance > lureRadius)
+            return null;
+
+        if (getAntiKSBlockReason(creature, getAntiKSContext(now), now))
+            return null;
+
+        return creature;
+    }
+
     function updateLureScreenLeash(context, now = Date.now()) {
         if (!context?.active || !context.waypoint) {
             clearLureMovementHold("lure inactive", now);
@@ -7258,20 +8290,30 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                         : null;
             }
 
-            // Never keep chewing on an ordinary auto-target while a preferred
-            // mob is known but not yet engageable. CaveBot should keep moving.
+            // v1.5.21: keep a healthy lure target selected while the
+            // preferred mob is still pending. Release it only at Preserve HP.
             const current = getCurrentTarget();
+            const emergencyId = bot.cave?.getLureEmergencyClearId?.() ?? null;
+            const preserveHp = Math.max(
+                5,
+                Math.min(90, Number(config.lurePreserveHpPct) || 30)
+            );
             if (
                 current &&
                 state.autoTargetId === current.id &&
-                !isPreferredCreature(current)
+                !isPreferredCreature(current) &&
+                current.id !== emergencyId
             ) {
-                state.lastTargetLossAt = now;
-                state.lastTargetLossId = current.id;
-                clearCurrentFollowTarget();
-                clearCurrentTarget();
-                clearEngagedTarget();
-                state.lurePreferredSuppressedTargets++;
+                const hp = getCreatureHealthPercent(current);
+                if (Number.isFinite(hp) && hp <= preserveHp) {
+                    state.lastTargetLossAt = now;
+                    state.lastTargetLossId = current.id;
+                    clearCurrentFollowTarget();
+                    clearCurrentTarget();
+                    clearEngagedTarget();
+                    state.lurePreferredSuppressedTargets++;
+                    state.lurePreferredSoftAttackReleases++;
+                }
             }
 
             clearLureLastMobState("preferred pending");
@@ -7327,8 +8369,23 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 )
                     return false;
 
-                if ((state.skippedTargetIds.get(monster?.id) || 0) > now)
+                const forcedLastMob =
+                    state.lureLastMobActive &&
+                    state.lureLastMobId != null &&
+                    monster?.id === state.lureLastMobId;
+
+                if (
+                    (state.skippedTargetIds.get(monster?.id) || 0) > now &&
+                    !forcedLastMob
+                )
                     return false;
+
+                if (
+                    forcedLastMob &&
+                    (state.skippedTargetIds.get(monster?.id) || 0) > now
+                ) {
+                    state.lureLastMobSkipOverrides++;
+                }
 
                 const info = isTargetValidAndOnScreen(monster, {
                     returnDetails: true,
@@ -7379,8 +8436,14 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 ? isMobTrailingWaypoint(monster, waypoint, me)
                 : false;
             const leashMob = leashMobId != null && monster?.id === leashMobId;
+            const forcedLastMob =
+                state.lureLastMobActive &&
+                state.lureLastMobId != null &&
+                monster?.id === state.lureLastMobId;
 
-            // Lower score is better. Health dominates only while luring:
+            // Lower score is better. Last Mob is authoritative: once it has
+            // crossed the configured finish threshold, do not let the normal
+            // preserve scoring push it behind anything else.
             // preserve low-HP pack members, prefer healthy mobs, and avoid
             // focusing the exact mob that is already struggling to keep up.
             const lowHpPenalty =
@@ -7404,11 +8467,15 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 trailing,
                 leashMob,
                 score:
-                    lowHpPenalty +
-                    healthSpreadPenalty +
-                    trailingPenalty +
-                    leashPenalty +
-                    distancePenalty
+                    forcedLastMob
+                        ? -100000
+                        : (
+                            lowHpPenalty +
+                            healthSpreadPenalty +
+                            trailingPenalty +
+                            leashPenalty +
+                            distancePenalty
+                        )
             };
         });
 
@@ -7436,8 +8503,87 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         return scored.map(entry => entry.monster);
     }
 
+    function getPreferredPendingLureCandidates(now = Date.now()) {
+        const preserveHp = Math.max(
+            5,
+            Math.min(90, Number(config.lurePreserveHpPct) || 30)
+        );
+
+        return getLureAttackCandidates(now).filter(monster => {
+            if (!monster || isPreferredCreature(monster))
+                return false;
+
+            const hp = getCreatureHealthPercent(monster);
+            if (Number.isFinite(hp) && hp <= preserveHp)
+                return false;
+
+            return true;
+        });
+    }
+
+    function tryPreferredPendingLureAttack(now = Date.now()) {
+        state.lurePreferredSoftAttackTicks++;
+
+        setClientChaseMode(false);
+        state._chaseEnabledForDistance = false;
+        state.movementOwner = null;
+        state.movementOwnedUntil = 0;
+
+        const candidates = getPreferredPendingLureCandidates(now);
+        let current = getCurrentTarget();
+
+        if (
+            current &&
+            state.autoTargetId === current.id &&
+            isPreferredCreature(current)
+        ) {
+            clearLureCombatTarget(
+                current,
+                now,
+                "preferred tracked but not actionable yet"
+            );
+            current = null;
+        }
+
+        const currentStillSafe =
+            current &&
+            candidates.some(monster => monster?.id === current.id);
+
+        if (current && !currentStillSafe) {
+            if (state.autoTargetId === current.id) {
+                clearLureCombatTarget(
+                    current,
+                    now,
+                    "preferred-pending preserve floor"
+                );
+                state.lurePreferredSoftAttackReleases++;
+            }
+            current = null;
+        }
+
+        if (current)
+            return false;
+
+        if (!candidates.length) {
+            state.lurePreferredSoftAttackNoSafeTarget++;
+            return false;
+        }
+
+        if (triggerAttack(now, candidates)) {
+            state.lureTargetsAcquired++;
+            state.lurePreferredSoftAttackAcquires++;
+            return true;
+        }
+
+        return false;
+    }
+
     function maybeRotateSmartLureTarget(current, now = Date.now()) {
         if (!current || !config.lureSmartTargeting)
+            return current;
+
+        const emergencyId = bot.cave?.getLureEmergencyClearId?.() ?? null;
+        if (emergencyId != null && current.id === emergencyId)
             return current;
 
         // With exactly one low-HP mob left, preservation has served its purpose.
@@ -7543,25 +8689,26 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     function tryLureAttack(now = Date.now()) {
         state.lureAttackTicks++;
 
-        // A tracked-but-not-actionable preferred mob keeps lure movement alive,
-        // but ordinary lure combat is intentionally suppressed until the
-        // preferred mob enters the real engage envelope.
-        if (state.lurePreferredPending) {
-            const current = getCurrentTarget();
-            if (
-                current &&
-                state.autoTargetId === current.id &&
-                !isPreferredCreature(current)
-            ) {
-                clearLureCombatTarget(
-                    current,
-                    now,
-                    "preferred mob pending"
-                );
-                state.lurePreferredSuppressedTargets++;
+        const emergencyId = bot.cave?.getLureEmergencyClearId?.() ?? null;
+        let emergencyTarget = null;
+        if (emergencyId != null) {
+            emergencyTarget = window.gameClient?.world?.activeCreatures?.[emergencyId] || null;
+            if (emergencyTarget && isNativeVisibleMonster(emergencyTarget)) {
+                const current = getCurrentTarget();
+                if (!current || current.id !== emergencyId) {
+                    if (current && state.autoTargetId === current.id) {
+                        clearLureCombatTarget(current, now, "escape blocker takes priority");
+                    }
+                    setCurrentTarget(emergencyTarget);
+                }
             }
-            return false;
         }
+
+        // v1.5.21: pending preferred targets use soft attack-through.
+        // Emergency Clear is still higher priority. Otherwise hit healthy
+        // lure mobs with basic attacks and release them at Preserve HP.
+        if (state.lurePreferredPending && emergencyId == null)
+            return tryPreferredPendingLureAttack(now);
 
         // Reassert movement separation every lure attack tick. This prevents a
         // live Client Chase toggle or combat helper from stealing the route.
@@ -7571,6 +8718,43 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         state.movementOwnedUntil = 0;
 
         let current = getCurrentTarget();
+
+        // v1.5.26: exactly one low-HP lure mob is a forced finish target.
+        // Slow mode may pulse movement, but Targeting must not "preserve",
+        // skip, rotate away from, or forget this creature at 1% HP.
+        const forcedLastMob = getForcedLureLastMobTarget(now);
+        if (forcedLastMob) {
+            state.lureLastMobForcedAttackTicks++;
+            state.lureLastMobLastForcedAt = now;
+
+            if (!current || current.id !== forcedLastMob.id) {
+                if (
+                    current &&
+                    state.autoTargetId === current.id
+                ) {
+                    clearLureCombatTarget(
+                        current,
+                        now,
+                        "last low-HP mob forced finish"
+                    );
+                    current = null;
+                }
+
+                if (!current && setCurrentTarget(forcedLastMob)) {
+                    state.lureTargetsAcquired++;
+                    state.lureLastMobForcedReacquires++;
+                    current = getCurrentTarget() || forcedLastMob;
+
+                    bot.log("Lure last-mob forced finish target", {
+                        id: forcedLastMob.id,
+                        name: forcedLastMob.name || "Mob",
+                        healthPct:
+                            getCreatureHealthPercent(forcedLastMob),
+                        mode: state.lureLastMobMode || "slow"
+                    });
+                }
+            }
+        }
 
         const lureBlockedIds = new Set(
             bot.cave?.getLureBlockedCreatureIds?.() ||
@@ -7585,7 +8769,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 state.lureLastMobActive &&
                 state.lureLastMobId != null &&
                 current.id === state.lureLastMobId
-            )
+            ) &&
+            current.id !== emergencyId
         ) {
             clearLureCombatTarget(
                 current,
@@ -7637,20 +8822,75 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         if (current) {
             const playerPos = normalizePosition(bot.getPlayerPosition());
             const targetPos = normalizePosition(current.getPosition?.() || current.__position);
-            const maxDist = Math.max(1, Number(config.maxTargetDistance) || 5);
+            const maxDist = Math.max(
+                1,
+                Number(config.maxTargetDistance) || 5
+            );
+            const lastMobException =
+                state.lureLastMobActive &&
+                state.lureLastMobId != null &&
+                current?.id === state.lureLastMobId;
+            const lureRadius = Math.max(
+                1,
+                Math.min(
+                    8,
+                    Math.trunc(Number(config.lureRadius) || 5)
+                )
+            );
+            const effectiveMaxDist =
+                lastMobException
+                    ? Math.max(maxDist, lureRadius)
+                    : maxDist;
             const dist = playerPos && targetPos && playerPos.z === targetPos.z
                 ? getTileDistance(playerPos, targetPos)
                 : Number.POSITIVE_INFINITY;
 
-            // Do not turn around/chase a mob that fell behind the pull.
-            if (!Number.isFinite(dist) || dist > maxDist) {
-                clearLureCombatTarget(current, now, "fell outside lure attack range");
+            if (
+                lastMobException &&
+                Number.isFinite(dist) &&
+                dist > maxDist &&
+                dist <= effectiveMaxDist
+            ) {
+                state.lureLastMobRangeExtensions++;
+            }
+
+            // Ordinary lure mobs still use Max Target Dist. The final low-HP
+            // mob stays selected out to Lure Radius so Slow mode can actually
+            // finish it while moving instead of repeatedly dropping it.
+            if (!Number.isFinite(dist) || dist > effectiveMaxDist) {
+                clearLureCombatTarget(
+                    current,
+                    now,
+                    lastMobException
+                        ? "last mob left lure radius"
+                        : "fell outside lure attack range"
+                );
                 state.lureOutOfRangeClears++;
                 current = null;
             }
         }
 
         if (!current) {
+            if (
+                emergencyTarget &&
+                emergencyId != null &&
+                setCurrentTarget(emergencyTarget)
+            ) {
+                state.lureTargetsAcquired++;
+                return true;
+            }
+
+            const lastMobTarget = getForcedLureLastMobTarget(now);
+            if (
+                lastMobTarget &&
+                setCurrentTarget(lastMobTarget)
+            ) {
+                state.lureTargetsAcquired++;
+                state.lureLastMobForcedReacquires++;
+                state.lureLastMobLastForcedAt = now;
+                return true;
+            }
+
             const candidates = getLureAttackCandidates(now);
             const before = getCurrentTarget();
             if (!before && triggerAttack(now, candidates)) {
@@ -7674,10 +8914,14 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             state.lureLastMobActive &&
             state.lureLastMobId != null &&
             current?.id === state.lureLastMobId;
+        const emergencyException =
+            emergencyId != null &&
+            current?.id === emergencyId;
 
         const preserveRune =
             !!config.lureSmartTargeting &&
             !lastMobException &&
+            !emergencyException &&
             Number.isFinite(currentHp) &&
             currentHp <= preserveHp;
 
@@ -8531,11 +9775,34 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         state.lastRetargetAt = 0;
         resetRetargetCandidate();
         state.lastRetargetReason = null;
+        state.retargetScoreHistory.clear();
+        state.retargetScorePrunes = 0;
+        state.retargetSmoothedComparisons = 0;
+        state.retargetNoiseBlocks = 0;
+        state.retargetMomentumBlocks = 0;
+        state.retargetInsufficientSampleBlocks = 0;
+        state.lastRetargetRawAdvantage = 0;
+        state.lastRetargetSmoothedAdvantage = 0;
+        state.lastRetargetEffectiveThreshold = 0;
+        state.lastRetargetMomentumBonus = 0;
+        state.lastRetargetCurrentSmoothedScore = null;
+        state.lastRetargetChallengerSmoothedScore = null;
+        state.lastRetargetCurrentSamples = 0;
+        state.lastRetargetChallengerSamples = 0;
         state.lastTargetLossAt = 0;
         state.lastTargetLossId = null;
         state.lastTargetHandoffAt = 0;
         state.lastInvalidTargetAt = 0;
         state.lastInvalidTargetReason = null;
+        state.offscreenTargetClears = 0;
+        state.offscreenTargetLastAt = 0;
+        state.offscreenTargetLastId = null;
+        state.offscreenTargetLastName = null;
+        state.offscreenTargetLastDx = null;
+        state.offscreenTargetLastDy = null;
+        state.offscreenTargetLastDistance = null;
+        state.offscreenTargetLastReason = null;
+        state.offscreenEngagedRejects = 0;
         state.canonicalTargetRefreshes = 0;
         state.canonicalFollowRefreshes = 0;
         state.candidateSnapshotAt = 0;
@@ -8606,6 +9873,28 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         state.lurePreferredSuppressedTargets = 0;
         state.lurePreferredHandoffs = 0;
         state.lurePreferredLastReason = null;
+        state.lurePreferredSoftAttackTicks = 0;
+        state.lurePreferredSoftAttackAcquires = 0;
+        state.lurePreferredSoftAttackReleases = 0;
+        state.lurePreferredSoftAttackNoSafeTarget = 0;
+        state.preferredAccessBlocked = false;
+        state.preferredAccessTargetId = null;
+        state.preferredAccessTargetName = null;
+        state.preferredAccessBlockerIds = [];
+        state.preferredAccessBlockerNames = [];
+        state.preferredAccessClearTargetId = null;
+        state.preferredAccessSince = 0;
+        state.preferredAccessLastProbeAt = 0;
+        state.preferredAccessLastReason = null;
+        state.preferredAccessActivations = 0;
+        state.preferredAccessClears = 0;
+        state.preferredAccessHandoffs = 0;
+        state.preferredAccessExoriHints = 0;
+        state.preferredWallBlocks = 0;
+        state.preferredWallBlockLastId = null;
+        state.preferredWallBlockLastName = null;
+        state.preferredWallBlockLastAt = 0;
+        state.preferredWallBlockLastReason = null;
         state.lureReason = null;
         state.lureWaypointIndex = null;
         state.lureWaypoint = null;
@@ -8640,6 +9929,11 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         state.lureLastMobActivations = 0;
         state.lureLastMobFinishes = 0;
         state.lureLastMobRuneBursts = 0;
+        state.lureLastMobForcedAttackTicks = 0;
+        state.lureLastMobForcedReacquires = 0;
+        state.lureLastMobRangeExtensions = 0;
+        state.lureLastMobSkipOverrides = 0;
+        state.lureLastMobLastForcedAt = 0;
         state.lureMovementHeld = false;
         state.lureLeashMobId = null;
         state.lureLeashMobName = null;
@@ -8807,6 +10101,11 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     function getEngagedTarget() {
         const current = getCurrentTarget();
         if (current) {
+            if (!getNativeSmallScreenInfo(current).visible) {
+                state.offscreenEngagedRejects++;
+                return null;
+            }
+
             state.engagedTargetId = current.id;
             noteTargetEngagement(current);
             return current;
@@ -8933,15 +10232,23 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             });
         }
 
-        const visible = typeof player.canSeeSmall === "function"
-            ? !!player.canSeeSmall(target)
-            : (dx < maxDx && dy < maxDy);
-        if (!visible) {
+        const screenInfo =
+            getNativeSmallScreenInfo(target);
+        if (!screenInfo.visible) {
             return result(false, {
-                reason: `off screen dx=${dx} dy=${dy}`,
-                dx,
-                dy,
-                distance
+                reason: screenInfo.reason,
+                dx:
+                    Number.isFinite(screenInfo.dx)
+                        ? screenInfo.dx
+                        : dx,
+                dy:
+                    Number.isFinite(screenInfo.dy)
+                        ? screenInfo.dy
+                        : dy,
+                distance:
+                    Number.isFinite(screenInfo.distance)
+                        ? screenInfo.distance
+                        : distance
             });
         }
         // ---- REACHABILITY CHECK ----
@@ -9448,9 +10755,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         const dist = getTileDistance(playerPos, targetPos);
         if (dist > maxDist + 1)
             return true;
-        // Also check if target is off-screen (but don't give up immediately – maybe it's just around a corner)
-        // We'll only give up if target is off-screen AND we haven't made progress for a while (handled in tryAttack)
-        // So here we only use distance.
+        // Screen visibility is handled earlier by the hard v1.5.31 lifecycle
+        // guard. This helper intentionally remains distance-only.
         return false;
     }
 
@@ -10178,6 +11484,15 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         state.lastTargetHandoffAt = 0;
         state.lastInvalidTargetAt = 0;
         state.lastInvalidTargetReason = null;
+        state.offscreenTargetClears = 0;
+        state.offscreenTargetLastAt = 0;
+        state.offscreenTargetLastId = null;
+        state.offscreenTargetLastName = null;
+        state.offscreenTargetLastDx = null;
+        state.offscreenTargetLastDy = null;
+        state.offscreenTargetLastDistance = null;
+        state.offscreenTargetLastReason = null;
+        state.offscreenEngagedRejects = 0;
         state.canonicalTargetRefreshes = 0;
         state.canonicalFollowRefreshes = 0;
         state.candidateSnapshotAt = 0;
@@ -10246,6 +11561,28 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         state.lurePreferredSuppressedTargets = 0;
         state.lurePreferredHandoffs = 0;
         state.lurePreferredLastReason = null;
+        state.lurePreferredSoftAttackTicks = 0;
+        state.lurePreferredSoftAttackAcquires = 0;
+        state.lurePreferredSoftAttackReleases = 0;
+        state.lurePreferredSoftAttackNoSafeTarget = 0;
+        state.preferredAccessBlocked = false;
+        state.preferredAccessTargetId = null;
+        state.preferredAccessTargetName = null;
+        state.preferredAccessBlockerIds = [];
+        state.preferredAccessBlockerNames = [];
+        state.preferredAccessClearTargetId = null;
+        state.preferredAccessSince = 0;
+        state.preferredAccessLastProbeAt = 0;
+        state.preferredAccessLastReason = null;
+        state.preferredAccessActivations = 0;
+        state.preferredAccessClears = 0;
+        state.preferredAccessHandoffs = 0;
+        state.preferredAccessExoriHints = 0;
+        state.preferredWallBlocks = 0;
+        state.preferredWallBlockLastId = null;
+        state.preferredWallBlockLastName = null;
+        state.preferredWallBlockLastAt = 0;
+        state.preferredWallBlockLastReason = null;
         state.lureReason = null;
         state.lureWaypointIndex = null;
         state.lureWaypoint = null;
@@ -10280,6 +11617,11 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         state.lureLastMobActivations = 0;
         state.lureLastMobFinishes = 0;
         state.lureLastMobRuneBursts = 0;
+        state.lureLastMobForcedAttackTicks = 0;
+        state.lureLastMobForcedReacquires = 0;
+        state.lureLastMobRangeExtensions = 0;
+        state.lureLastMobSkipOverrides = 0;
+        state.lureLastMobLastForcedAt = 0;
         state.lureMovementHeld = false;
         state.lureLeashMobId = null;
         state.lureLeashMobName = null;
@@ -10350,7 +11692,36 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             retargetCandidateHeldMs: state.retargetCandidateSince
                 ? Math.max(0, now - state.retargetCandidateSince)
                 : 0,
-            retargetCandidateAdvantage: state.retargetCandidateAdvantage || 0,
+            retargetCandidateAdvantage:
+                state.retargetCandidateAdvantage || 0,
+            retargetScoreHistorySize:
+                state.retargetScoreHistory?.size || 0,
+            retargetScorePrunes:
+                state.retargetScorePrunes || 0,
+            retargetSmoothedComparisons:
+                state.retargetSmoothedComparisons || 0,
+            retargetNoiseBlocks:
+                state.retargetNoiseBlocks || 0,
+            retargetMomentumBlocks:
+                state.retargetMomentumBlocks || 0,
+            retargetInsufficientSampleBlocks:
+                state.retargetInsufficientSampleBlocks || 0,
+            lastRetargetRawAdvantage:
+                state.lastRetargetRawAdvantage || 0,
+            lastRetargetSmoothedAdvantage:
+                state.lastRetargetSmoothedAdvantage || 0,
+            lastRetargetEffectiveThreshold:
+                state.lastRetargetEffectiveThreshold || 0,
+            lastRetargetMomentumBonus:
+                state.lastRetargetMomentumBonus || 0,
+            lastRetargetCurrentSmoothedScore:
+                state.lastRetargetCurrentSmoothedScore,
+            lastRetargetChallengerSmoothedScore:
+                state.lastRetargetChallengerSmoothedScore,
+            lastRetargetCurrentSamples:
+                state.lastRetargetCurrentSamples || 0,
+            lastRetargetChallengerSamples:
+                state.lastRetargetChallengerSamples || 0,
             lastDamageAt: state.lastDamageAt || 0,
             lastDamageAgeMs: damageAgeMs,
             lastApproachCost: Number.isFinite(state.lastApproachCost) ? state.lastApproachCost : null,
@@ -10363,6 +11734,24 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             lastTargetHandoffAt: state.lastTargetHandoffAt || 0,
             lastInvalidTargetAt: state.lastInvalidTargetAt || 0,
             lastInvalidTargetReason: state.lastInvalidTargetReason,
+            offscreenTargetClears:
+                state.offscreenTargetClears || 0,
+            offscreenTargetLastAt:
+                state.offscreenTargetLastAt || 0,
+            offscreenTargetLastId:
+                state.offscreenTargetLastId,
+            offscreenTargetLastName:
+                state.offscreenTargetLastName,
+            offscreenTargetLastDx:
+                state.offscreenTargetLastDx,
+            offscreenTargetLastDy:
+                state.offscreenTargetLastDy,
+            offscreenTargetLastDistance:
+                state.offscreenTargetLastDistance,
+            offscreenTargetLastReason:
+                state.offscreenTargetLastReason,
+            offscreenEngagedRejects:
+                state.offscreenEngagedRejects || 0,
             canonicalTargetRefreshes: state.canonicalTargetRefreshes || 0,
             canonicalFollowRefreshes: state.canonicalFollowRefreshes || 0,
             candidateSnapshotBuilds: state.candidateSnapshotBuilds || 0,
@@ -10443,6 +11832,18 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             lurePreferredSuppressedTargets: state.lurePreferredSuppressedTargets || 0,
             lurePreferredHandoffs: state.lurePreferredHandoffs || 0,
             lurePreferredLastReason: state.lurePreferredLastReason,
+            lurePreferredSoftAttackTicks: state.lurePreferredSoftAttackTicks || 0,
+            lurePreferredSoftAttackAcquires: state.lurePreferredSoftAttackAcquires || 0,
+            lurePreferredSoftAttackReleases: state.lurePreferredSoftAttackReleases || 0,
+            lurePreferredSoftAttackNoSafeTarget: state.lurePreferredSoftAttackNoSafeTarget || 0,
+            preferredAccess: getPreferredAccessInfo(),
+            preferredAccessBlocked: isPreferredAccessBlocked(),
+            preferredAccessExoriHints: state.preferredAccessExoriHints || 0,
+            preferredWallBlocks: state.preferredWallBlocks || 0,
+            preferredWallBlockLastId: state.preferredWallBlockLastId,
+            preferredWallBlockLastName: state.preferredWallBlockLastName,
+            preferredWallBlockLastAt: state.preferredWallBlockLastAt || 0,
+            preferredWallBlockLastReason: state.preferredWallBlockLastReason,
             lureReason: state.lureReason,
             lureWaypointIndex: state.lureWaypointIndex,
             lureWaypoint: state.lureWaypoint,
@@ -10482,6 +11883,24 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             lureLastMobActivations: state.lureLastMobActivations || 0,
             lureLastMobFinishes: state.lureLastMobFinishes || 0,
             lureLastMobRuneBursts: state.lureLastMobRuneBursts || 0,
+            lureLastMobForcedAttackTicks:
+                state.lureLastMobForcedAttackTicks || 0,
+            lureLastMobForcedReacquires:
+                state.lureLastMobForcedReacquires || 0,
+            lureLastMobRangeExtensions:
+                state.lureLastMobRangeExtensions || 0,
+            lureLastMobSkipOverrides:
+                state.lureLastMobSkipOverrides || 0,
+            lureLastMobLastForcedAt:
+                state.lureLastMobLastForcedAt || 0,
+            lureEmergencyClear:
+                bot.cave?.getLureEmergencyClearInfo?.() || {
+                    active: false,
+                    id: null,
+                    name: null,
+                    since: 0,
+                    reason: null
+                },
             lureCrowdBlocked: bot.cave?.isLureCrowdBlocked?.() === true,
             lureCrowdBlockerCount:
                 bot.cave?.getLureBlockedCreatureIds?.()?.length || 0,
@@ -10575,6 +11994,36 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             const value = Number(nextConfig.retargetConfirmMs);
             nextConfig.retargetConfirmMs = Number.isFinite(value) ? Math.max(100, Math.min(2000, value)) : config.retargetConfirmMs;
         }
+        if (nextConfig.retargetScoreAlpha !== undefined) {
+            const value = Number(nextConfig.retargetScoreAlpha);
+            nextConfig.retargetScoreAlpha = Number.isFinite(value)
+                ? Math.max(0.15, Math.min(0.9, value))
+                : config.retargetScoreAlpha;
+        }
+        if (nextConfig.retargetScoreMemoryMs !== undefined) {
+            const value = Number(nextConfig.retargetScoreMemoryMs);
+            nextConfig.retargetScoreMemoryMs = Number.isFinite(value)
+                ? Math.max(800, Math.min(8000, value))
+                : config.retargetScoreMemoryMs;
+        }
+        if (nextConfig.retargetScoreMinSamples !== undefined) {
+            const value = Number(nextConfig.retargetScoreMinSamples);
+            nextConfig.retargetScoreMinSamples = Number.isFinite(value)
+                ? Math.max(1, Math.min(6, Math.trunc(value)))
+                : config.retargetScoreMinSamples;
+        }
+        if (nextConfig.retargetMomentumMs !== undefined) {
+            const value = Number(nextConfig.retargetMomentumMs);
+            nextConfig.retargetMomentumMs = Number.isFinite(value)
+                ? Math.max(0, Math.min(5000, value))
+                : config.retargetMomentumMs;
+        }
+        if (nextConfig.retargetMomentumAdvantage !== undefined) {
+            const value = Number(nextConfig.retargetMomentumAdvantage);
+            nextConfig.retargetMomentumAdvantage = Number.isFinite(value)
+                ? Math.max(0, Math.min(5, value))
+                : config.retargetMomentumAdvantage;
+        }
         if (nextConfig.finishTargetHealthPct !== undefined) {
             const value = Number(nextConfig.finishTargetHealthPct);
             nextConfig.finishTargetHealthPct = Number.isFinite(value) ? Math.max(1, Math.min(90, value)) : config.finishTargetHealthPct;
@@ -10665,6 +12114,24 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             nextConfig.lurePreferredLostGraceMs = Number.isFinite(value)
                 ? Math.max(300, Math.min(3000, value))
                 : config.lurePreferredLostGraceMs;
+        }
+        if (nextConfig.preferredAccessProbeMs !== undefined) {
+            const value = Number(nextConfig.preferredAccessProbeMs);
+            nextConfig.preferredAccessProbeMs = Number.isFinite(value)
+                ? Math.max(150, Math.min(1000, value))
+                : config.preferredAccessProbeMs;
+        }
+        if (nextConfig.preferredAccessSearchRadius !== undefined) {
+            const value = Number(nextConfig.preferredAccessSearchRadius);
+            nextConfig.preferredAccessSearchRadius = Number.isFinite(value)
+                ? Math.max(4, Math.min(14, Math.trunc(value)))
+                : config.preferredAccessSearchRadius;
+        }
+        if (nextConfig.preferredWallSkipMs !== undefined) {
+            const value = Number(nextConfig.preferredWallSkipMs);
+            nextConfig.preferredWallSkipMs = Number.isFinite(value)
+                ? Math.max(2000, Math.min(30000, value))
+                : config.preferredWallSkipMs;
         }
         if (nextConfig.lureLeashEdgeX !== undefined) {
             const value = Number(nextConfig.lureLeashEdgeX);
@@ -10768,6 +12235,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         getRuneCountState: () => getAttackRuneCountState(Date.now(), false),
         getRuneCooldownRemainingMs: getAttackRuneCooldownRemainingMs,
         getNearbyMonsters,
+        getLureVisibleMonsterSnapshot,
         getCurrentTarget,
         getCurrentFollowTarget,
         isRunning: () => state.running,
@@ -10776,6 +12244,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         isLureMovementHeld,
         getLureLastMobInfo,
         getLureContext,
+        isPreferredAccessBlocked,
+        getPreferredAccessInfo,
         isProtectionZoneBlocked,
         getProtectionZoneBlockInfo,
         isCombatActive,
@@ -10849,9 +12319,58 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         lureBlockerReason: null,
         lureBlockerDetourAt: 0,
         lureBlockerDetours: 0,
+
+        // v1.5.30: blocker detours are now short persisted mini-routes that
+        // reconnect to the wall-valid route beyond the blocking creature.
+        // This replaces one-tile "pick a side again next tick" oscillation.
+        lureDetourPlan: [],
+        lureDetourPlanWaypointKey: null,
+        lureDetourPlanBlockerId: null,
+        lureDetourPlanCreatedAt: 0,
+        lureDetourPlanRejoinKey: null,
+        lureDetourPlanBuilds: 0,
+        lureDetourPlanSteps: 0,
+        lureDetourPlanInvalidations: 0,
+        lureDetourPlanFailures: 0,
+        lureDetourPlanLastReason: null,
+        lureDetourPlanLastStepAt: 0,
+
         lureBlockerWaits: 0,
         lureBlockedWaypointSkips: 0,
         lureBlockerClears: 0,
+        lureBlockerLastWaitLogAt: 0,
+
+        // v1.5.25: rolling detector for A<->B lure-blocker oscillation.
+        // Unlike the single-blocker timer, this survives blocker ID swaps.
+        lureBlockerPatternEvents: [],
+        lureBlockerPatternWaypointKey: null,
+        lureBlockerDeadlockActive: false,
+        lureBlockerDeadlockSince: 0,
+        lureBlockerDeadlockIds: [],
+        lureBlockerDeadlockNames: [],
+        lureBlockerDeadlockReason: null,
+        lureBlockerDeadlockActivations: 0,
+        lureBlockerDeadlockClears: 0,
+        lureBlockerSingleLoopActivations: 0,
+
+        // v1.5.29: intentional lure movement (screen leash, slow-last-mob
+        // pacing, blocker detours/holds) must not be reinterpreted by the
+        // generic 2s stuck watchdog as navigation failure.
+        lureIntentionalNavAt: 0,
+        lureIntentionalNavReason: null,
+        lureIntentionalRecoverySuppressions: 0,
+        lureIntentionalRecoveryLastAt: 0,
+
+        // v1.5.19: fail-safe for corners/dead-ends. Preserve/detour first,
+        // but never wait forever on a creature that physically seals the only
+        // route. After a short timeout, that blocker becomes an attack target.
+        lureEmergencyClearId: null,
+        lureEmergencyClearName: null,
+        lureEmergencyClearSince: 0,
+        lureEmergencyClearReason: null,
+        lureEmergencyClearActivations: 0,
+        lureEmergencyClearCompletions: 0,
+        lureEmergencyClearLastAt: 0,
 
         // v1.5.14: multiple lure mobs sealing a tight local route is treated
         // as intentional pack congestion, not a CaveBot navigation failure.
@@ -10865,6 +12384,16 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         lureCrowdClears: 0,
         lureCrowdHoldTicks: 0,
         lureCrowdNoWaySuppressions: 0,
+
+        // v1.5.27: CaveBot now consumes Targeting's exact lure-pack snapshot
+        // instead of independently reclassifying nearby monsters.
+        lureCrowdPackSnapshotCount: 0,
+        lureCrowdActualBlockerCount: 0,
+        lureCrowdUsefulTileCount: 0,
+        lureCrowdMixedBlockRejects: 0,
+        lureCrowdNonPackRejects: 0,
+        lureCrowdSnapshotFallbacks: 0,
+        lureLeashStaleNavClears: 0,
 
         // v1.5.17: native Pathfinder NO_WAY arrives asynchronously and can
         // beat the next CaveBot tick. During lure, defer a NO_WAY briefly when
@@ -10882,6 +12411,32 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         lureNoWayEscalations: 0,
         lureNoWayLastResolution: null,
         lureNoWayLastResolutionAt: 0,
+
+        // v1.5.22: verify NO_WAY against a creature-ignoring static map route
+        // before abandoning the waypoint. This prevents mobs from making a
+        // valid corridor look like a wall/unreachable route.
+        lureNoWayStaticRouteResolutions: 0,
+        lureNoWayStaticRouteRetries: 0,
+        lureNoWayStaticRouteRetryIndex: -1,
+        lureNoWayStaticRouteRetryKey: null,
+        lureNoWayStaticRouteLastVisited: 0,
+        lureNoWayStaticRouteLastLength: 0,
+        lureNoWayStaticRouteBlockerId: null,
+        lureNoWayStaticRouteBlockerName: null,
+
+        // v1.5.33: one exact player->waypoint static-route cache. This avoids
+        // rebuilding the same bounded BFS for blocker detection, NO_WAY
+        // arbitration and detour construction during the same movement frame.
+        lureStaticRouteCacheKey: null,
+        lureStaticRouteCacheResult: null,
+        lureStaticRouteCacheExpiresAt: 0,
+        lureStaticRouteCacheHits: 0,
+        lureStaticRouteCacheMisses: 0,
+        lureStaticRouteCacheBuilds: 0,
+        lureStaticRouteCacheInvalidations: 0,
+        lureStaticRouteCacheLastReason: null,
+        lureStaticRouteCacheLastVisited: 0,
+        lureStaticRouteCacheLastLength: 0,
 
         // v1.5.16: movement shaping for the last low-HP lure mob.
         lureLastMobMoveActive: false,
@@ -11049,9 +12604,29 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         temporaryBlockerWaitMs: 2500,
 
         // Lure-only blocker handling is intentionally much faster than normal
-        // stuck recovery. Detours are one controlled tile at a time.
+        // stuck recovery. v1.5.30 builds a small live bypass path rather than
+        // re-picking one adjacent sidestep every tick.
         lureBlockerDetourCooldownMs: 550,
+        lureDetourSearchRadius: 8,
+        lureDetourSearchMaxNodes: 500,
+        lureDetourPlanMaxAgeMs: 6000,
         lureBlockerForgetMs: 1200,
+        lureBlockerMaxWaitMs: 2500,
+
+        // Repeated A-B-A-B blockers with no real waypoint progress become an
+        // escape-clear state instead of another sidestep.
+        lureBlockerDeadlockWindowMs: 3500,
+        lureBlockerDeadlockMinEvents: 5,
+        lureBlockerDeadlockMinSwitches: 3,
+        lureBlockerDeadlockMaxPositions: 3,
+        lureBlockerDeadlockProgressTiles: 2,
+
+        // Short grace after an intentional lure movement event. This is longer
+        // than the ordinary 2s stuck timer but short enough that genuine route
+        // failures still fall back to normal recovery after lure logic releases.
+        lureIntentionalRecoveryGraceMs: 3500,
+
+        lureCrowdMaxHoldMs: 3500,
         lureCrowdRadius: 3,
         lureCrowdMinMobs: 2,
         lureCrowdClearGraceMs: 500,
@@ -11059,6 +12634,13 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         // Long enough to cross one normal CaveBot tick (500ms) and observe the
         // updated creature geometry, short enough not to hide a real bad route.
         lureNoWayArbitrationMs: 1100,
+        lureNoWayStaticRetryLimit: 2,
+        lureNoWayStaticSearchNodes: 3200,
+        lureNoWayStaticSearchMargin: 16,
+
+        // Static geometry is stable enough to reuse briefly; live creature
+        // occupancy is always scanned separately and is never cached.
+        lureStaticRouteCacheMs: 750,
 
         // Slow mode intentionally moves about half speed: one CaveBot movement
         // window followed by one hold window. Values are bounded around the
@@ -11079,11 +12661,32 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     config.nativePathWatchdogMs = Math.max(5000, Math.trunc(Number(config.nativePathWatchdogMs) || 5000));
     config.noWayAvoidMs = Math.max(1000, Math.trunc(Number(config.noWayAvoidMs) || 10000));
     config.lureBlockerDetourCooldownMs = Math.max(250, Math.min(2000, Math.trunc(Number(config.lureBlockerDetourCooldownMs) || 550)));
+    config.lureDetourSearchRadius = Math.max(3, Math.min(14, Math.trunc(Number(config.lureDetourSearchRadius) || 8)));
+    config.lureDetourSearchMaxNodes = Math.max(100, Math.min(2000, Math.trunc(Number(config.lureDetourSearchMaxNodes) || 500)));
+    config.lureDetourPlanMaxAgeMs = Math.max(1500, Math.min(12000, Math.trunc(Number(config.lureDetourPlanMaxAgeMs) || 6000)));
     config.lureBlockerForgetMs = Math.max(500, Math.min(5000, Math.trunc(Number(config.lureBlockerForgetMs) || 1200)));
+    config.lureBlockerMaxWaitMs = Math.max(1000, Math.min(8000, Math.trunc(Number(config.lureBlockerMaxWaitMs) || 2500)));
+    config.lureBlockerDeadlockWindowMs = Math.max(1500, Math.min(8000, Math.trunc(Number(config.lureBlockerDeadlockWindowMs) || 3500)));
+    config.lureBlockerDeadlockMinEvents = Math.max(4, Math.min(12, Math.trunc(Number(config.lureBlockerDeadlockMinEvents) || 5)));
+    config.lureBlockerDeadlockMinSwitches = Math.max(2, Math.min(10, Math.trunc(Number(config.lureBlockerDeadlockMinSwitches) || 3)));
+    config.lureBlockerDeadlockMaxPositions = Math.max(1, Math.min(6, Math.trunc(Number(config.lureBlockerDeadlockMaxPositions) || 3)));
+    config.lureBlockerDeadlockProgressTiles = Math.max(1, Math.min(5, Math.trunc(Number(config.lureBlockerDeadlockProgressTiles) || 2)));
+    config.lureIntentionalRecoveryGraceMs = Math.max(
+        1500,
+        Math.min(8000, Math.trunc(Number(config.lureIntentionalRecoveryGraceMs) || 3500))
+    );
+    config.lureCrowdMaxHoldMs = Math.max(1500, Math.min(10000, Math.trunc(Number(config.lureCrowdMaxHoldMs) || 3500)));
     config.lureCrowdRadius = Math.max(2, Math.min(5, Math.trunc(Number(config.lureCrowdRadius) || 3)));
     config.lureCrowdMinMobs = Math.max(2, Math.min(6, Math.trunc(Number(config.lureCrowdMinMobs) || 2)));
     config.lureCrowdClearGraceMs = Math.max(100, Math.min(2000, Math.trunc(Number(config.lureCrowdClearGraceMs) || 500)));
     config.lureNoWayArbitrationMs = Math.max(600, Math.min(2500, Math.trunc(Number(config.lureNoWayArbitrationMs) || 1100)));
+    config.lureNoWayStaticRetryLimit = Math.max(0, Math.min(5, Math.trunc(Number(config.lureNoWayStaticRetryLimit) || 2)));
+    config.lureNoWayStaticSearchNodes = Math.max(500, Math.min(8000, Math.trunc(Number(config.lureNoWayStaticSearchNodes) || 3200)));
+    config.lureNoWayStaticSearchMargin = Math.max(6, Math.min(30, Math.trunc(Number(config.lureNoWayStaticSearchMargin) || 16)));
+    config.lureStaticRouteCacheMs = Math.max(
+        100,
+        Math.min(2000, Math.trunc(Number(config.lureStaticRouteCacheMs) || 750))
+    );
     config.lureLastMobSlowRunMs = Math.max(350, Math.min(2000, Math.trunc(Number(config.lureLastMobSlowRunMs) || 500)));
     config.lureLastMobSlowHoldMs = Math.max(350, Math.min(2500, Math.trunc(Number(config.lureLastMobSlowHoldMs) || 500)));
     config.recoveryObstacleMemoryMs = Math.max(1000, Math.trunc(Number(config.recoveryObstacleMemoryMs) || 10000));
@@ -11107,6 +12710,45 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             ? Math.max(3, Math.min(10, Math.trunc(travel))) : 4;
     }
     normalizeCircuitConfig();
+
+    // v1.5.32: Cave movement cancellation must be module-scoped because lure
+    // detour-plan helpers live outside tick(). The previous stopMovement()
+    // helper was declared inside tick(), so followLureDetourPlan() could not
+    // see it and threw "stopMovement is not defined" at runtime.
+    function stopCaveMovementNow() {
+        // Cancel any queued CaveBot manual step.
+        state.fallbackMoveRequestId++;
+
+        if (state.fallbackMoveTimerId != null) {
+            window.clearTimeout(state.fallbackMoveTimerId);
+            state.fallbackMoveTimerId = null;
+        }
+
+        const pf = window.gameClient?.world?.pathfinder;
+        if (pf) {
+            try {
+                pf.setPathfindCache?.(null);
+            } catch (e) {}
+
+            pf.__isAutoWalking = false;
+            pf.__finalDestination = null;
+            pf.__hybridPath = null;
+        }
+
+        const player = window.gameClient?.player;
+        if (player?.__preWalks)
+            player.__preWalks.length = 0;
+
+        try {
+            if (window.gameClient?.send)
+                window.gameClient.send(new StopWalkPacket());
+        } catch (e) {}
+
+        state.lastWaypointTarget = null;
+        state.pathAttemptStart = 0;
+        state.lastDistanceToWaypoint = null;
+        state.lastPathAt = 0;
+    }
 
     // ---- PRESET MANAGEMENT ----
     function normalizePresetName(value) {
@@ -11336,6 +12978,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         state.pendingTransitionSource = null;
         resetRecoveryContext("preset changed");
         state.routeRevision++;
+        clearLureStaticRouteCache("preset changed");
         setActivePresetName(preset.name);
         persistLegacyActivePreset();
         return preset;
@@ -11356,6 +12999,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
     function persistRoute() {
         state.routeRevision++;
+        clearLureStaticRouteCache("route changed");
         persistActivePreset();
     }
 
@@ -11487,16 +13131,425 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         return state.lureBlockerId;
     }
 
+    function clearLureBlockerDeadlock(
+        reason = null,
+        now = Date.now(),
+        clearHistory = true
+    ) {
+        if (state.lureBlockerDeadlockActive)
+            state.lureBlockerDeadlockClears++;
+
+        state.lureBlockerDeadlockActive = false;
+        state.lureBlockerDeadlockSince = 0;
+        state.lureBlockerDeadlockIds = [];
+        state.lureBlockerDeadlockNames = [];
+        state.lureBlockerDeadlockReason = reason;
+
+        if (clearHistory) {
+            state.lureBlockerPatternEvents = [];
+            state.lureBlockerPatternWaypointKey = null;
+        }
+    }
+
+    function isLureBlockerDeadlocked() {
+        if (!bot.attack?.isLureActive?.()) {
+            if (
+                state.lureBlockerDeadlockActive ||
+                (state.lureBlockerPatternEvents?.length || 0) > 0
+            ) {
+                clearLureBlockerDeadlock("lure inactive");
+            }
+            return false;
+        }
+
+        return !!state.lureBlockerDeadlockActive;
+    }
+
+    function chooseLureDeadlockClearTarget(ids, fallbackCreature = null) {
+        const idSet = new Set(
+            Array.from(ids || [])
+                .map(id => Number(id))
+                .filter(Number.isFinite)
+        );
+
+        // Prefer the mob Targeting already owns so deadlock detection does not
+        // introduce another unnecessary target flip.
+        const current = bot.attack?.getCurrentTarget?.();
+        if (
+            current?.id != null &&
+            idSet.has(Number(current.id))
+        ) {
+            const hp = Number(current.state?.health ?? current.health);
+            if (!Number.isFinite(hp) || hp > 0)
+                return current;
+        }
+
+        if (
+            fallbackCreature?.id != null &&
+            idSet.has(Number(fallbackCreature.id))
+        ) {
+            const hp = Number(
+                fallbackCreature.state?.health ??
+                fallbackCreature.health
+            );
+            if (!Number.isFinite(hp) || hp > 0)
+                return fallbackCreature;
+        }
+
+        return getEmergencyClearCreatureFromIds(Array.from(idSet));
+    }
+
+    function recordLureBlockerPattern(
+        position,
+        waypoint,
+        creature,
+        action,
+        now = Date.now()
+    ) {
+        if (
+            !position ||
+            !waypoint ||
+            !creature?.id ||
+            !bot.attack?.isLureActive?.()
+        ) {
+            return false;
+        }
+
+        const waypointKey = getWaypointKey(waypoint);
+        if (!waypointKey)
+            return false;
+
+        if (
+            state.lureBlockerPatternWaypointKey &&
+            state.lureBlockerPatternWaypointKey !== waypointKey
+        ) {
+            clearLureBlockerDeadlock("lure waypoint changed", now);
+        }
+        state.lureBlockerPatternWaypointKey = waypointKey;
+
+        const windowMs = Math.max(
+            1500,
+            Math.min(
+                8000,
+                Math.trunc(
+                    Number(config.lureBlockerDeadlockWindowMs) || 3500
+                )
+            )
+        );
+
+        const distance = getDistanceToWaypoint(position, waypoint);
+        state.lureBlockerPatternEvents.push({
+            at: now,
+            id: Number(creature.id),
+            name: creature.name || "Mob",
+            positionKey: getPositionKey(position),
+            distance: Number.isFinite(distance) ? distance : null,
+            action: action || "block"
+        });
+
+        state.lureBlockerPatternEvents =
+            state.lureBlockerPatternEvents
+                .filter(event => now - Number(event.at || 0) <= windowMs)
+                .slice(-16);
+
+        if (state.lureBlockerDeadlockActive)
+            return true;
+
+        const events = state.lureBlockerPatternEvents;
+        const minEvents = Math.max(
+            4,
+            Math.min(
+                12,
+                Math.trunc(
+                    Number(config.lureBlockerDeadlockMinEvents) || 5
+                )
+            )
+        );
+        if (events.length < minEvents)
+            return false;
+
+        const blockerIds = new Set(
+            events.map(event => event.id)
+        );
+
+        let switches = 0;
+        for (let i = 1; i < events.length; i++) {
+            if (events[i].id !== events[i - 1].id)
+                switches++;
+        }
+
+        const minSwitches = Math.max(
+            2,
+            Math.min(
+                10,
+                Math.trunc(
+                    Number(config.lureBlockerDeadlockMinSwitches) || 3
+                )
+            )
+        );
+
+        const sameBlockerDetourEvents = events.filter(
+            event =>
+                event.action === "detour" &&
+                blockerIds.size === 1
+        ).length;
+        const singleBlockerLoop =
+            blockerIds.size === 1 &&
+            sameBlockerDetourEvents >= minEvents;
+
+        if (
+            blockerIds.size < 2 &&
+            !singleBlockerLoop
+        ) {
+            return false;
+        }
+
+        if (
+            blockerIds.size >= 2 &&
+            switches < minSwitches
+        ) {
+            return false;
+        }
+
+        const positionKeys = new Set(
+            events.map(event => event.positionKey).filter(Boolean)
+        );
+        const maxPositions = Math.max(
+            1,
+            Math.min(
+                6,
+                Math.trunc(
+                    Number(config.lureBlockerDeadlockMaxPositions) || 3
+                )
+            )
+        );
+        if (positionKeys.size > maxPositions)
+            return false;
+
+        const distances = events
+            .map(event => Number(event.distance))
+            .filter(Number.isFinite);
+
+        if (distances.length >= 2) {
+            const firstDistance = distances[0];
+            const bestDistance = Math.min(...distances);
+            const progressNeeded = Math.max(
+                1,
+                Math.min(
+                    5,
+                    Math.trunc(
+                        Number(config.lureBlockerDeadlockProgressTiles) || 2
+                    )
+                )
+            );
+
+            // Real forward travel wins: don't mistake normal routing around
+            // moving monsters for a deadlock.
+            if (firstDistance - bestDistance >= progressNeeded)
+                return false;
+        }
+
+        const ids = Array.from(blockerIds);
+        const names = ids.map(id => {
+            const event = [...events]
+                .reverse()
+                .find(item => item.id === id);
+            return event?.name || "Mob";
+        });
+
+        state.lureBlockerDeadlockActive = true;
+        state.lureBlockerDeadlockSince = now;
+        state.lureBlockerDeadlockIds = ids;
+        state.lureBlockerDeadlockNames = names;
+        state.lureBlockerDeadlockReason =
+            singleBlockerLoop
+                ? (
+                    `${events.length} repeated detours around one blocker / ` +
+                    `${positionKeys.size || 1} player tiles`
+                )
+                : (
+                    `${events.length} blocker events / ${switches} swaps / ` +
+                    `${positionKeys.size || 1} player tiles`
+                );
+        state.lureBlockerDeadlockActivations++;
+        if (singleBlockerLoop)
+            state.lureBlockerSingleLoopActivations++;
+
+        const clearTarget = chooseLureDeadlockClearTarget(
+            ids,
+            creature
+        );
+        if (clearTarget) {
+            armLureEmergencyClear(
+                clearTarget,
+                `lure blocker deadlock: ${state.lureBlockerDeadlockReason}`,
+                now
+            );
+        }
+
+        bot.log(
+            "Cave: lure blocker deadlock detected – stopping detour loop",
+            {
+                blockerIds: ids,
+                blockerNames: names,
+                events: events.length,
+                switches,
+                playerTiles: positionKeys.size || 1,
+                clearTargetId: clearTarget?.id ?? null,
+                clearTargetName: clearTarget?.name || null
+            }
+        );
+
+        return true;
+    }
+
+    function ensureLureDeadlockClearTarget(
+        blockerCreature,
+        now = Date.now()
+    ) {
+        if (!isLureBlockerDeadlocked())
+            return false;
+
+        if (getLureEmergencyClearId() != null)
+            return true;
+
+        const ids = new Set(
+            (state.lureBlockerDeadlockIds || []).map(Number)
+        );
+        if (blockerCreature?.id != null)
+            ids.add(Number(blockerCreature.id));
+
+        state.lureBlockerDeadlockIds = Array.from(ids);
+
+        const clearTarget = chooseLureDeadlockClearTarget(
+            state.lureBlockerDeadlockIds,
+            blockerCreature
+        );
+        if (!clearTarget)
+            return false;
+
+        return armLureEmergencyClear(
+            clearTarget,
+            "continue lure blocker deadlock clear",
+            now
+        );
+    }
+
+    function getLureDeadlockInfo() {
+        const active = isLureBlockerDeadlocked();
+        return {
+            active,
+            since: active ? state.lureBlockerDeadlockSince : 0,
+            blockerIds: active
+                ? Array.from(state.lureBlockerDeadlockIds || [])
+                : [],
+            blockerNames: active
+                ? Array.from(state.lureBlockerDeadlockNames || [])
+                : [],
+            reason: active ? state.lureBlockerDeadlockReason : null,
+            activations: state.lureBlockerDeadlockActivations || 0,
+            clears: state.lureBlockerDeadlockClears || 0
+        };
+    }
+
+    function clearLureEmergencyClear(reason = null, now = Date.now()) {
+        const wasActive = state.lureEmergencyClearId != null;
+        if (wasActive)
+            state.lureEmergencyClearCompletions++;
+
+        state.lureEmergencyClearId = null;
+        state.lureEmergencyClearName = null;
+        state.lureEmergencyClearSince = 0;
+        state.lureEmergencyClearReason = reason;
+        state.lureEmergencyClearLastAt = now;
+    }
+
+    function armLureEmergencyClear(creature, reason, now = Date.now()) {
+        if (!creature?.id)
+            return false;
+
+        const same = state.lureEmergencyClearId === creature.id;
+        if (!same) {
+            state.lureEmergencyClearId = creature.id;
+            state.lureEmergencyClearName = creature.name || "Mob";
+            state.lureEmergencyClearSince = now;
+            state.lureEmergencyClearActivations++;
+        }
+        state.lureEmergencyClearReason = reason || "lure route hard-blocked";
+        state.lureEmergencyClearLastAt = now;
+
+        if (!same) {
+            bot.log("Cave: lure escape fail-safe – clearing blocker", {
+                blockerId: creature.id,
+                blockerName: creature.name || "Mob",
+                reason: state.lureEmergencyClearReason
+            });
+        }
+        return true;
+    }
+
+    function getLureEmergencyClearId() {
+        if (!bot.attack?.isLureActive?.()) {
+            if (state.lureEmergencyClearId != null)
+                clearLureEmergencyClear("lure inactive");
+            return null;
+        }
+
+        const id = state.lureEmergencyClearId;
+        if (id == null)
+            return null;
+
+        const creature = window.gameClient?.world?.activeCreatures?.[id] || null;
+        const health = Number(creature?.state?.health ?? creature?.health);
+        if (!creature || (Number.isFinite(health) && health <= 0)) {
+            clearLureEmergencyClear("emergency blocker gone");
+            return null;
+        }
+        return id;
+    }
+
+    function getLureEmergencyClearInfo() {
+        const id = getLureEmergencyClearId();
+        return {
+            active: id != null,
+            id,
+            name: id != null ? state.lureEmergencyClearName : null,
+            since: id != null ? state.lureEmergencyClearSince : 0,
+            reason: id != null ? state.lureEmergencyClearReason : null
+        };
+    }
+
+    function getEmergencyClearCreatureFromIds(ids) {
+        const playerPos = normalizePosition(bot.getPlayerPosition());
+        const creatures = window.gameClient?.world?.activeCreatures || {};
+        const candidates = [];
+
+        for (const rawId of ids || []) {
+            const id = Number(rawId);
+            const creature = creatures[id] || creatures[rawId] || null;
+            if (!creature)
+                continue;
+            const health = Number(creature.state?.health ?? creature.health);
+            if (Number.isFinite(health) && health <= 0)
+                continue;
+            const pos = normalizePosition(creature.getPosition?.() || creature.__position);
+            const distance = playerPos && pos && playerPos.z === pos.z
+                ? Math.max(Math.abs(pos.x - playerPos.x), Math.abs(pos.y - playerPos.y))
+                : Number.POSITIVE_INFINITY;
+            candidates.push({ creature, distance });
+        }
+
+        candidates.sort((a, b) => {
+            if (a.distance !== b.distance)
+                return a.distance - b.distance;
+            return Number(a.creature?.id || 0) - Number(b.creature?.id || 0);
+        });
+        return candidates[0]?.creature || null;
+    }
+
     function getNearbyLureMobsForCave(position) {
         if (!position || !bot.attack?.isLureActive?.())
             return [];
-
-        const creatures = window.gameClient?.world?.activeCreatures || {};
-        const player = window.gameClient?.player;
-        const monsterType =
-            (typeof CONST !== "undefined" && CONST.TYPES)
-                ? CONST.TYPES.MONSTER
-                : undefined;
 
         const configuredRadius = Math.max(
             1,
@@ -11504,7 +13557,86 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         );
         const radius = Math.min(
             configuredRadius,
-            Math.max(2, Math.min(5, Math.trunc(Number(config.lureCrowdRadius) || 3)))
+            Math.max(
+                2,
+                Math.min(
+                    5,
+                    Math.trunc(Number(config.lureCrowdRadius) || 3)
+                )
+            )
+        );
+
+        const snapshot =
+            bot.attack?.getLureVisibleMonsterSnapshot?.();
+
+        // Normal path: use the exact pack membership Targeting already uses:
+        // native visibility, lure radius, ignored names, same floor, alive,
+        // native monster type and own-summon exclusion.
+        if (Array.isArray(snapshot)) {
+            const creatures =
+                window.gameClient?.world?.activeCreatures || {};
+            const result = [];
+
+            for (const item of snapshot) {
+                if (
+                    item?.id == null ||
+                    item.z !== position.z
+                ) {
+                    continue;
+                }
+
+                const distance = Math.max(
+                    Math.abs(Number(item.x) - position.x),
+                    Math.abs(Number(item.y) - position.y)
+                );
+                if (!Number.isFinite(distance) || distance > radius)
+                    continue;
+
+                const creature =
+                    creatures[item.id] ||
+                    creatures[String(item.id)] ||
+                    null;
+                if (!creature)
+                    continue;
+
+                result.push({
+                    creature,
+                    position: {
+                        x: Number(item.x),
+                        y: Number(item.y),
+                        z: Number(item.z)
+                    },
+                    distance
+                });
+            }
+
+            result.sort((a, b) => {
+                if (a.distance !== b.distance)
+                    return a.distance - b.distance;
+                return Number(a.creature?.id || 0) -
+                    Number(b.creature?.id || 0);
+            });
+
+            state.lureCrowdPackSnapshotCount = result.length;
+            return result;
+        }
+
+        // Defensive compatibility fallback only. In this build the snapshot API
+        // always exists, but keep CaveBot usable if modules are hot-reloaded in
+        // an unusual order.
+        state.lureCrowdSnapshotFallbacks++;
+
+        const creatures =
+            window.gameClient?.world?.activeCreatures || {};
+        const player = window.gameClient?.player;
+        const monsterType =
+            (typeof CONST !== "undefined" && CONST.TYPES)
+                ? CONST.TYPES.MONSTER
+                : undefined;
+        const ignoredNames = new Set(
+            (bot.attack?.config?.ignoredTargetNames || [])
+                .map(name => String(name || "").trim().toLowerCase())
+                .filter(Boolean)
         );
 
         const result = [];
@@ -11512,16 +13644,38 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             const creature = creatures[id];
             if (!creature || creature.id === player?.id)
                 continue;
-            if (monsterType !== undefined && creature.type !== monsterType)
+            if (
+                monsterType !== undefined &&
+                creature.type !== monsterType
+            ) {
                 continue;
+            }
             if (creature.masterId === player?.id)
                 continue;
+            if (
+                ignoredNames.has(
+                    String(creature.name || "").trim().toLowerCase()
+                )
+            ) {
+                continue;
+            }
 
-            const health = Number(creature.state?.health ?? creature.health);
+            const health = Number(
+                creature.state?.health ?? creature.health
+            );
             if (Number.isFinite(health) && health <= 0)
                 continue;
 
-            const pos = normalizePosition(creature.getPosition?.() || creature.__position);
+            if (
+                typeof player?.canSeeSmall === "function" &&
+                !player.canSeeSmall(creature)
+            ) {
+                continue;
+            }
+
+            const pos = normalizePosition(
+                creature.getPosition?.() || creature.__position
+            );
             if (!pos || pos.z !== position.z)
                 continue;
 
@@ -11529,21 +13683,423 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 Math.abs(pos.x - position.x),
                 Math.abs(pos.y - position.y)
             );
-            if (distance <= radius) {
-                result.push({
-                    creature,
-                    position: pos,
-                    distance
-                });
-            }
+            if (distance > radius)
+                continue;
+
+            result.push({
+                creature,
+                position: pos,
+                distance
+            });
         }
 
         result.sort((a, b) => {
             if (a.distance !== b.distance)
                 return a.distance - b.distance;
-            return Number(a.creature?.id || 0) - Number(b.creature?.id || 0);
+            return Number(a.creature?.id || 0) -
+                Number(b.creature?.id || 0);
         });
+
+        state.lureCrowdPackSnapshotCount = result.length;
         return result;
+    }
+
+    function isStaticLureStepValid(from, to) {
+        if (!from || !to || from.z !== to.z)
+            return false;
+
+        if (!isTileWalkable(to.x, to.y, to.z, true))
+            return false;
+
+        const tile = getTileAt(to);
+        if (tile && isFloorChangeTile(tile))
+            return false;
+
+        const dx = to.x - from.x;
+        const dy = to.y - from.y;
+
+        // Never cut diagonally through a wall corner. Both orthogonal side
+        // tiles must be statically walkable for a diagonal step to be legal.
+        if (dx !== 0 && dy !== 0) {
+            const sideA = { x: from.x + dx, y: from.y, z: from.z };
+            const sideB = { x: from.x, y: from.y + dy, z: from.z };
+
+            if (
+                !isTileWalkable(sideA.x, sideA.y, sideA.z, true) ||
+                !isTileWalkable(sideB.x, sideB.y, sideB.z, true)
+            ) {
+                return false;
+            }
+
+            const tileA = getTileAt(sideA);
+            const tileB = getTileAt(sideB);
+            if (
+                (tileA && isFloorChangeTile(tileA)) ||
+                (tileB && isFloorChangeTile(tileB))
+            ) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    function cloneStaticLurePathResult(result) {
+        if (!result) {
+            return {
+                found: false,
+                path: [],
+                visited: 0,
+                reason: "missing static route result"
+            };
+        }
+
+        return {
+            found: result.found === true,
+            path: Array.isArray(result.path)
+                ? result.path.map(pos => ({
+                    x: pos.x,
+                    y: pos.y,
+                    z: pos.z
+                }))
+                : [],
+            visited: Number(result.visited) || 0,
+            reason: result.reason || null
+        };
+    }
+
+    function clearLureStaticRouteCache(reason = null) {
+        if (
+            state.lureStaticRouteCacheKey != null ||
+            state.lureStaticRouteCacheResult != null
+        ) {
+            state.lureStaticRouteCacheInvalidations++;
+        }
+
+        state.lureStaticRouteCacheKey = null;
+        state.lureStaticRouteCacheResult = null;
+        state.lureStaticRouteCacheExpiresAt = 0;
+        state.lureStaticRouteCacheLastReason = reason;
+    }
+
+    function getLureStaticRouteCacheKey(position, waypoint) {
+        const start = normalizePosition(position);
+        const goal = normalizePosition(waypoint);
+        if (!start || !goal)
+            return null;
+
+        const maxNodes = Math.max(
+            500,
+            Math.min(
+                8000,
+                Math.trunc(
+                    Number(config.lureNoWayStaticSearchNodes) || 3200
+                )
+            )
+        );
+        const margin = Math.max(
+            6,
+            Math.min(
+                30,
+                Math.trunc(
+                    Number(config.lureNoWayStaticSearchMargin) || 16
+                )
+            )
+        );
+
+        return [
+            state.routeRevision || 0,
+            `${start.x},${start.y},${start.z}`,
+            `${goal.x},${goal.y},${goal.z}`,
+            maxNodes,
+            margin
+        ].join("|");
+    }
+
+    function findStaticLurePath(
+        position,
+        waypoint,
+        now = Date.now()
+    ) {
+        const key = getLureStaticRouteCacheKey(
+            position,
+            waypoint
+        );
+
+        if (!key) {
+            state.lureStaticRouteCacheMisses++;
+            const result = buildStaticLurePathUncached(
+                position,
+                waypoint
+            );
+            state.lureStaticRouteCacheBuilds++;
+            state.lureStaticRouteCacheLastVisited =
+                Number(result.visited) || 0;
+            state.lureStaticRouteCacheLastLength =
+                Array.isArray(result.path)
+                    ? result.path.length
+                    : 0;
+            return result;
+        }
+
+        const cacheMs = Math.max(
+            100,
+            Math.min(
+                2000,
+                Math.trunc(
+                    Number(config.lureStaticRouteCacheMs) || 750
+                )
+            )
+        );
+
+        if (
+            state.lureStaticRouteCacheKey === key &&
+            state.lureStaticRouteCacheResult &&
+            now <= state.lureStaticRouteCacheExpiresAt
+        ) {
+            state.lureStaticRouteCacheHits++;
+            return cloneStaticLurePathResult(
+                state.lureStaticRouteCacheResult
+            );
+        }
+
+        state.lureStaticRouteCacheMisses++;
+
+        const result = buildStaticLurePathUncached(
+            position,
+            waypoint
+        );
+        state.lureStaticRouteCacheBuilds++;
+        state.lureStaticRouteCacheLastVisited =
+            Number(result.visited) || 0;
+        state.lureStaticRouteCacheLastLength =
+            Array.isArray(result.path)
+                ? result.path.length
+                : 0;
+
+        state.lureStaticRouteCacheKey = key;
+        state.lureStaticRouteCacheResult =
+            cloneStaticLurePathResult(result);
+        state.lureStaticRouteCacheExpiresAt =
+            now + cacheMs;
+        state.lureStaticRouteCacheLastReason =
+            "fresh static route build";
+
+        return result;
+    }
+
+    function buildStaticLurePathUncached(position, waypoint) {
+        const start = normalizePosition(position);
+        const goal = normalizePosition(waypoint);
+        if (!start || !goal || start.z !== goal.z) {
+            return {
+                found: false,
+                path: [],
+                visited: 0,
+                reason: "different floor"
+            };
+        }
+
+        if (
+            start.x === goal.x &&
+            start.y === goal.y
+        ) {
+            return {
+                found: true,
+                path: [start],
+                visited: 1,
+                reason: "already there"
+            };
+        }
+
+        if (!isTileWalkable(goal.x, goal.y, goal.z, true)) {
+            return {
+                found: false,
+                path: [],
+                visited: 0,
+                reason: "destination not statically walkable"
+            };
+        }
+
+        const maxNodes = Math.max(
+            500,
+            Math.min(
+                8000,
+                Math.trunc(Number(config.lureNoWayStaticSearchNodes) || 3200)
+            )
+        );
+        const margin = Math.max(
+            6,
+            Math.min(
+                30,
+                Math.trunc(Number(config.lureNoWayStaticSearchMargin) || 16)
+            )
+        );
+
+        const minX = Math.min(start.x, goal.x) - margin;
+        const maxX = Math.max(start.x, goal.x) + margin;
+        const minY = Math.min(start.y, goal.y) - margin;
+        const maxY = Math.max(start.y, goal.y) + margin;
+
+        const keyOf = (p) => `${p.x},${p.y},${p.z}`;
+        const startKey = keyOf(start);
+        const goalKey = keyOf(goal);
+
+        const queue = [start];
+        let head = 0;
+        const parent = new Map();
+        const positions = new Map();
+        const seen = new Set([startKey]);
+        positions.set(startKey, start);
+
+        const steps = [
+            { dx: 1, dy: 0 }, { dx: -1, dy: 0 },
+            { dx: 0, dy: 1 }, { dx: 0, dy: -1 },
+            { dx: 1, dy: 1 }, { dx: 1, dy: -1 },
+            { dx: -1, dy: 1 }, { dx: -1, dy: -1 }
+        ];
+
+        while (head < queue.length && seen.size <= maxNodes) {
+            const current = queue[head++];
+
+            // Explore steps that improve Chebyshev distance first. This is
+            // still complete inside the bounded search, but finds corridor
+            // routes quickly and avoids wasting work behind the player.
+            const ordered = steps
+                .map(step => {
+                    const next = {
+                        x: current.x + step.dx,
+                        y: current.y + step.dy,
+                        z: current.z
+                    };
+                    return {
+                        step,
+                        next,
+                        h: Math.max(
+                            Math.abs(next.x - goal.x),
+                            Math.abs(next.y - goal.y)
+                        )
+                    };
+                })
+                .sort((a, b) => a.h - b.h);
+
+            for (const item of ordered) {
+                const next = item.next;
+                if (
+                    next.x < minX || next.x > maxX ||
+                    next.y < minY || next.y > maxY
+                ) {
+                    continue;
+                }
+
+                const key = keyOf(next);
+                if (seen.has(key))
+                    continue;
+
+                if (!isStaticLureStepValid(current, next))
+                    continue;
+
+                seen.add(key);
+                parent.set(key, keyOf(current));
+                positions.set(key, next);
+
+                if (key === goalKey) {
+                    const path = [];
+                    let cursor = goalKey;
+
+                    while (cursor) {
+                        const pos = positions.get(cursor);
+                        if (pos)
+                            path.push(pos);
+                        if (cursor === startKey)
+                            break;
+                        cursor = parent.get(cursor) || null;
+                    }
+
+                    path.reverse();
+                    return {
+                        found: true,
+                        path,
+                        visited: seen.size,
+                        reason: "static route found"
+                    };
+                }
+
+                queue.push(next);
+            }
+        }
+
+        return {
+            found: false,
+            path: [],
+            visited: seen.size,
+            reason:
+                seen.size > maxNodes
+                    ? "static search node limit"
+                    : "no static route"
+        };
+    }
+
+    function getFirstCreatureOnStaticPath(path, maxSteps = 10) {
+        if (!Array.isArray(path) || path.length < 2)
+            return null;
+
+        const limit = Math.min(
+            path.length,
+            Math.max(2, Math.trunc(Number(maxSteps) || 10) + 1)
+        );
+
+        for (let i = 1; i < limit; i++) {
+            const pos = path[i];
+            const creature = getCreatureBlockingTile(pos.x, pos.y, pos.z);
+            if (creature) {
+                return {
+                    creature,
+                    position: pos,
+                    pathIndex: i
+                };
+            }
+        }
+
+        return null;
+    }
+
+    function hasStaticLureContinuation(position, waypoint) {
+        if (!position || !waypoint)
+            return false;
+
+        const currentDistance = Math.max(
+            Math.abs(position.x - waypoint.x),
+            Math.abs(position.y - waypoint.y)
+        );
+
+        const steps = [
+            { dx: 1, dy: 0 }, { dx: -1, dy: 0 },
+            { dx: 0, dy: 1 }, { dx: 0, dy: -1 },
+            { dx: 1, dy: 1 }, { dx: 1, dy: -1 },
+            { dx: -1, dy: 1 }, { dx: -1, dy: -1 }
+        ];
+
+        for (const step of steps) {
+            const next = {
+                x: position.x + step.dx,
+                y: position.y + step.dy,
+                z: position.z
+            };
+
+            if (!isStaticLureStepValid(position, next))
+                continue;
+
+            const nextDistance = Math.max(
+                Math.abs(next.x - waypoint.x),
+                Math.abs(next.y - waypoint.y)
+            );
+
+            if (nextDistance <= currentDistance)
+                return true;
+        }
+
+        return false;
     }
 
     function getLocallyUsefulLureRouteTiles(position, waypoint) {
@@ -11566,9 +14122,9 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             const y = position.y + step.dy;
             const z = position.z;
 
-            // Ignore creatures for the static-map test. The point is to prove
-            // there IS a valid local lane and that mobs are what currently seal it.
-            if (!isTileWalkable(x, y, z, true))
+            // Ignore creatures for the static-map test, but still enforce
+            // real wall/corner geometry.
+            if (!isStaticLureStepValid(position, { x, y, z }))
                 continue;
 
             const tile = getTileAt({ x, y, z });
@@ -11606,6 +14162,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         state.lureCrowdBlockedSince = 0;
         state.lureCrowdLastSeenAt = 0;
         state.lureCrowdReason = reason;
+        state.lureCrowdActualBlockerCount = 0;
+        state.lureCrowdUsefulTileCount = 0;
 
         if (wasBlocked) {
             state.lastWaypointTarget = null;
@@ -11643,29 +14201,77 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         if (!usefulTiles.length)
             return null;
 
-        const creatureBlocked = usefulTiles.filter(tile => !!tile.blocker);
+        state.lureCrowdUsefulTileCount = usefulTiles.length;
+
+        const packIds = new Set(
+            nearby
+                .map(item => Number(item.creature?.id))
+                .filter(Number.isFinite)
+        );
         const openUseful = usefulTiles.filter(tile => !tile.occupied);
 
-        // Crowd-blocked means a static lane exists, at least one mob occupies it,
-        // and there is no currently-open useful local lane.
-        if (!creatureBlocked.length || openUseful.length)
+        // If any useful lane is open, this is not crowd congestion.
+        if (openUseful.length) {
+            state.lureCrowdActualBlockerCount = 0;
             return null;
+        }
 
-        const ids = [];
-        const names = [];
-        for (const item of nearby) {
-            if (item.creature?.id == null)
+        const packBlockedTiles = [];
+        const mixedBlockedTiles = [];
+
+        for (const tile of usefulTiles) {
+            const blockerId = Number(tile.blocker?.id);
+
+            if (
+                Number.isFinite(blockerId) &&
+                packIds.has(blockerId)
+            ) {
+                packBlockedTiles.push(tile);
+            } else if (tile.occupied) {
+                mixedBlockedTiles.push(tile);
+            }
+        }
+
+        // If a player/NPC/ignored/out-of-pack creature is part of the seal,
+        // don't classify the whole situation as lure-pack congestion. Let the
+        // ordinary blocker/recovery logic handle the real obstruction.
+        if (mixedBlockedTiles.length) {
+            state.lureCrowdMixedBlockRejects++;
+            state.lureCrowdActualBlockerCount = 0;
+            return null;
+        }
+
+        const blockerMap = new Map();
+        for (const tile of packBlockedTiles) {
+            const blocker = tile.blocker;
+            if (blocker?.id == null)
                 continue;
-            ids.push(item.creature.id);
-            names.push(item.creature.name || "Mob");
+
+            blockerMap.set(Number(blocker.id), {
+                id: blocker.id,
+                name: blocker.name || "Mob"
+            });
+        }
+
+        const actualBlockers = Array.from(blockerMap.values());
+        state.lureCrowdActualBlockerCount = actualBlockers.length;
+
+        // A one-mob seal belongs to the single-blocker fail-safe. Crowd
+        // congestion is specifically a multi-mob pack condition.
+        if (actualBlockers.length < minMobs) {
+            if (packBlockedTiles.length)
+                state.lureCrowdNonPackRejects++;
+            return null;
         }
 
         return {
-            blockerIds: ids,
-            blockerNames: names,
+            blockerIds: actualBlockers.map(item => item.id),
+            blockerNames: actualBlockers.map(item => item.name),
             reason:
-                `${nearby.length} lure mobs sealing ${usefulTiles.length} local route tile` +
-                `${usefulTiles.length === 1 ? "" : "s"}`
+                `${actualBlockers.length} actual lure route blockers sealing ` +
+                `${usefulTiles.length} local route tile` +
+                `${usefulTiles.length === 1 ? "" : "s"} ` +
+                `(pack ${nearby.length})`
         };
     }
 
@@ -11718,14 +14324,15 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         if (!bot.attack?.isLureActive?.())
             return [];
 
+        const emergencyId = getLureEmergencyClearId();
         const ids = new Set();
         const single = getLureBlockerId();
-        if (single != null)
+        if (single != null && single !== emergencyId)
             ids.add(single);
 
         if (state.lureCrowdBlocked) {
             for (const id of state.lureCrowdBlockerIds || []) {
-                if (id != null)
+                if (id != null && id !== emergencyId)
                     ids.add(id);
             }
         }
@@ -11891,23 +14498,164 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         if (now < state.lureNoWayPendingUntil)
             return "hold";
 
-        // The grace window expired and the pack did not explain the failure.
-        // Only now is this a real NO_WAY for route-health/recovery purposes.
+        // The grace window expired. Before abandoning the waypoint, verify
+        // whether a wall-valid route exists when creature occupancy is ignored.
+        // If it does, this is NOT evidence that the waypoint is unreachable.
+        const staticRoute = findStaticLurePath(
+            position,
+            waypoint,
+            now
+        );
+        state.lureNoWayStaticRouteLastVisited =
+            Number(staticRoute.visited || 0);
+        state.lureNoWayStaticRouteLastLength =
+            Array.isArray(staticRoute.path)
+                ? staticRoute.path.length
+                : 0;
+
+        if (staticRoute.found) {
+            state.lureNoWayStaticRouteResolutions++;
+
+            const pathBlocker = getFirstCreatureOnStaticPath(
+                staticRoute.path,
+                12
+            );
+
+            if (pathBlocker?.creature) {
+                state.lureNoWayStaticRouteBlockerId =
+                    pathBlocker.creature.id ?? null;
+                state.lureNoWayStaticRouteBlockerName =
+                    pathBlocker.creature.name || "Mob";
+
+                // Feed the ACTUAL static-route blocker into the existing lure
+                // blocker pipeline instead of guessing toward the waypoint.
+                markLureRouteBlocker(
+                    pathBlocker.creature,
+                    "mob occupying verified static lure route",
+                    now
+                );
+
+                clearLureNoWayArbitration(
+                    "static route exists; creature blocker found",
+                    now
+                );
+
+                bot.log(
+                    "Cave: NO_WAY was dynamic – verified map route is open behind mob",
+                    {
+                        waypoint: state.currentIndex + 1,
+                        blockerId: pathBlocker.creature.id,
+                        blockerName: pathBlocker.creature.name || "Mob",
+                        pathStep: pathBlocker.pathIndex,
+                        staticPathLength: staticRoute.path.length
+                    }
+                );
+
+                state.lastPathAt = 0;
+                state.lastProgressAt = now;
+                state.stuckCount = 0;
+                state.stuckRecoveryAttempts = 0;
+                return "dynamic";
+            }
+
+            const waypointKey = getWaypointKey(waypoint);
+            const sameRetry =
+                state.lureNoWayStaticRouteRetryIndex === state.currentIndex &&
+                state.lureNoWayStaticRouteRetryKey === waypointKey;
+
+            if (!sameRetry) {
+                state.lureNoWayStaticRouteRetries = 0;
+                state.lureNoWayStaticRouteRetryIndex = state.currentIndex;
+                state.lureNoWayStaticRouteRetryKey = waypointKey;
+            }
+
+            state.lureNoWayStaticRouteRetries++;
+            const retryLimit = Math.max(
+                0,
+                Math.min(
+                    5,
+                    Math.trunc(Number(config.lureNoWayStaticRetryLimit) || 2)
+                )
+            );
+
+            if (state.lureNoWayStaticRouteRetries <= retryLimit) {
+                clearLureNoWayArbitration(
+                    "static route exists; forcing clean repath",
+                    now
+                );
+
+                bot.log(
+                    "Cave: NO_WAY ignored – static route still exists, retrying clean path",
+                    {
+                        waypoint: state.currentIndex + 1,
+                        retry: state.lureNoWayStaticRouteRetries,
+                        retryLimit,
+                        staticPathLength: staticRoute.path.length
+                    }
+                );
+
+                state.lastWaypointTarget = null;
+                state.lastPathAt = 0;
+                state.pathAttemptStart = 0;
+                state.lastProgressAt = now;
+                state.stuckCount = 0;
+                state.stuckRecoveryAttempts = 0;
+                return "static-repath";
+            }
+        }
+
+        // Only escalate when the bounded static-map check cannot validate a
+        // route, or repeated clean-repath attempts still fail with no creature
+        // occupying the verified route.
         state.lureNoWayEscalations++;
-        clearLureNoWayArbitration("escalated to real NO_WAY", now);
+        clearLureNoWayArbitration(
+            staticRoute.found
+                ? "static route repeatedly failed native pathing"
+                : `static route unavailable: ${staticRoute.reason}`,
+            now
+        );
         const circuitTripped = forceNativeNoWayRecovery(
             now,
             waypoint,
-            "after lure congestion arbitration"
+            staticRoute.found
+                ? "after verified static-route retries"
+                : "after static map route failure"
         );
         return circuitTripped ? "circuit" : "escalated";
     }
 
-    function findImmediateLureRouteBlocker(position, waypoint) {
+    function findImmediateLureRouteBlocker(
+        position,
+        waypoint,
+        now = Date.now()
+    ) {
         if (!position || !isOrdinaryLureWaypoint(waypoint))
             return null;
         if (position.z !== waypoint.z)
             return null;
+
+        const staticRoute = findStaticLurePath(
+            position,
+            waypoint,
+            now
+        );
+        if (staticRoute.found) {
+            const pathBlocker = getFirstCreatureOnStaticPath(
+                staticRoute.path,
+                8
+            );
+            if (pathBlocker?.creature) {
+                return {
+                    creature: pathBlocker.creature,
+                    position: pathBlocker.position,
+                    waypointTile:
+                        pathBlocker.position.x === waypoint.x &&
+                        pathBlocker.position.y === waypoint.y,
+                    pathDerived: true,
+                    pathIndex: pathBlocker.pathIndex
+                };
+            }
+        }
 
         const dx = Math.sign(waypoint.x - position.x);
         const dy = Math.sign(waypoint.y - position.y);
@@ -11953,69 +14701,412 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         return null;
     }
 
-    function findLureBlockerDetourStep(position, waypoint, blockerPosition) {
+    function clearLureDetourPlan(reason = null) {
+        if (
+            Array.isArray(state.lureDetourPlan) &&
+            state.lureDetourPlan.length
+        ) {
+            state.lureDetourPlanInvalidations++;
+        }
+
+        state.lureDetourPlan = [];
+        state.lureDetourPlanWaypointKey = null;
+        state.lureDetourPlanBlockerId = null;
+        state.lureDetourPlanCreatedAt = 0;
+        state.lureDetourPlanRejoinKey = null;
+        state.lureDetourPlanLastStepAt = 0;
+        state.lureDetourPlanLastReason = reason;
+    }
+
+    function isLiveLureDetourStepValid(from, to) {
+        if (!from || !to || from.z !== to.z)
+            return false;
+
+        if (bot.blacklist?.isBlacklisted(to.x, to.y, to.z))
+            return false;
+
+        // Live bypass planning respects creatures. Static geometry validation
+        // is separate so walls/corners can never be cut diagonally.
+        if (!isTileWalkable(to.x, to.y, to.z, false))
+            return false;
+        if (!isStaticLureStepValid(from, to))
+            return false;
+
+        const tile = getTileAt(to);
+        if (tile && isFloorChangeTile(tile))
+            return false;
+
+        return true;
+    }
+
+    function buildLureBlockerDetourPlan(
+        position,
+        waypoint,
+        blockerPosition,
+        blockerId = null,
+        now = Date.now()
+    ) {
         if (!position || !waypoint || !blockerPosition)
             return null;
+        if (position.z !== waypoint.z)
+            return null;
 
-        const toWpX = waypoint.x - position.x;
-        const toWpY = waypoint.y - position.y;
-        const candidates = [
+        const staticRoute = findStaticLurePath(
+            position,
+            waypoint,
+            now
+        );
+        if (!staticRoute.found || !Array.isArray(staticRoute.path)) {
+            state.lureDetourPlanFailures++;
+            clearLureDetourPlan("no static route for bypass");
+            return null;
+        }
+
+        const keyOf = (p) => `${p.x},${p.y},${p.z}`;
+        const startKey = keyOf(position);
+        const waypointKey = getWaypointKey(waypoint);
+        const blockerKey = keyOf(blockerPosition);
+
+        let blockerIndex = staticRoute.path.findIndex(
+            pos => keyOf(pos) === blockerKey
+        );
+
+        // If the immediate detector found a creature slightly off the exact
+        // reconstructed static path, use the first occupied route tile matching
+        // the same creature as the bypass boundary.
+        if (blockerIndex < 0 && blockerId != null) {
+            blockerIndex = staticRoute.path.findIndex(pos => {
+                const creature = getCreatureBlockingTile(
+                    pos.x,
+                    pos.y,
+                    pos.z
+                );
+                return creature?.id === blockerId;
+            });
+        }
+
+        if (blockerIndex < 1) {
+            state.lureDetourPlanFailures++;
+            clearLureDetourPlan("blocker not found on static route");
+            return null;
+        }
+
+        const routeIndexByKey = new Map();
+        for (let i = blockerIndex + 1; i < staticRoute.path.length; i++) {
+            routeIndexByKey.set(keyOf(staticRoute.path[i]), i);
+        }
+
+        if (!routeIndexByKey.size) {
+            state.lureDetourPlanFailures++;
+            clearLureDetourPlan("no route tile beyond blocker");
+            return null;
+        }
+
+        const radius = Math.max(
+            3,
+            Math.min(
+                14,
+                Math.trunc(Number(config.lureDetourSearchRadius) || 8)
+            )
+        );
+        const maxNodes = Math.max(
+            100,
+            Math.min(
+                2000,
+                Math.trunc(Number(config.lureDetourSearchMaxNodes) || 500)
+            )
+        );
+
+        const queue = [position];
+        let head = 0;
+        const seen = new Set([startKey]);
+        const parent = new Map();
+        const positions = new Map([[startKey, position]]);
+
+        const steps = [
             { dx: 1, dy: 0 }, { dx: -1, dy: 0 },
             { dx: 0, dy: 1 }, { dx: 0, dy: -1 },
             { dx: 1, dy: 1 }, { dx: 1, dy: -1 },
             { dx: -1, dy: 1 }, { dx: -1, dy: -1 }
         ];
 
-        const scored = [];
-        for (const c of candidates) {
-            const x = position.x + c.dx;
-            const y = position.y + c.dy;
-            const z = position.z;
+        let goalKey = null;
 
-            if (x === blockerPosition.x && y === blockerPosition.y)
-                continue;
-            if (bot.blacklist?.isBlacklisted(x, y, z))
-                continue;
+        while (
+            head < queue.length &&
+            seen.size <= maxNodes
+        ) {
+            const current = queue[head++];
+            const currentKey = keyOf(current);
 
-            // Unlike normal recovery, a lure detour must be genuinely empty:
-            // stepping toward another creature only creates a second blocker.
-            if (!isTileWalkable(x, y, z, false))
-                continue;
+            if (
+                currentKey !== startKey &&
+                routeIndexByKey.has(currentKey)
+            ) {
+                goalKey = currentKey;
+                break;
+            }
 
-            const tile = getTileAt({ x, y, z });
-            if (tile && isFloorChangeTile(tile))
-                continue;
+            const ordered = steps
+                .map(step => {
+                    const next = {
+                        x: current.x + step.dx,
+                        y: current.y + step.dy,
+                        z: current.z
+                    };
 
-            const distToWaypoint = Math.max(
-                Math.abs(x - waypoint.x),
-                Math.abs(y - waypoint.y)
-            );
-            const dot = c.dx * toWpX + c.dy * toWpY;
-            const blockerDistance = Math.max(
-                Math.abs(x - blockerPosition.x),
-                Math.abs(y - blockerPosition.y)
-            );
+                    const routeIndex =
+                        routeIndexByKey.get(keyOf(next));
+                    const toWaypoint = Math.max(
+                        Math.abs(next.x - waypoint.x),
+                        Math.abs(next.y - waypoint.y)
+                    );
 
-            // Prefer lateral/forward bypasses. Backward is allowed only as a
-            // fallback in a narrow corridor to pull the monster off the lane.
-            const backwardPenalty = dot < 0 ? 2.25 : 0;
-            const lateralPenalty = dot === 0 ? 0.20 : 0;
-            const diagonalPenalty = (c.dx !== 0 && c.dy !== 0) ? 0.15 : 0;
-            const blockerPenalty = blockerDistance <= 1 ? 0.45 : 0;
+                    return {
+                        next,
+                        // Prefer a genuine rejoin tile, then tiles that move us
+                        // closer to the waypoint. Backward movement remains
+                        // legal if a wall requires going around the other side.
+                        priority:
+                            (routeIndex !== undefined ? -10000 : 0) +
+                            toWaypoint
+                    };
+                })
+                .sort((a, b) => a.priority - b.priority);
 
-            scored.push({
-                x, y, z,
-                score:
-                    distToWaypoint +
-                    backwardPenalty +
-                    lateralPenalty +
-                    diagonalPenalty +
-                    blockerPenalty
-            });
+            for (const item of ordered) {
+                const next = item.next;
+                const key = keyOf(next);
+
+                if (seen.has(key))
+                    continue;
+
+                if (
+                    Math.max(
+                        Math.abs(next.x - position.x),
+                        Math.abs(next.y - position.y)
+                    ) > radius
+                ) {
+                    continue;
+                }
+
+                if (!isLiveLureDetourStepValid(current, next))
+                    continue;
+
+                seen.add(key);
+                parent.set(key, currentKey);
+                positions.set(key, next);
+                queue.push(next);
+            }
         }
 
-        scored.sort((a, b) => a.score - b.score);
-        return scored[0] || null;
+        if (!goalKey) {
+            state.lureDetourPlanFailures++;
+            clearLureDetourPlan(
+                "no live bypass can rejoin static route"
+            );
+            return null;
+        }
+
+        const path = [];
+        let cursor = goalKey;
+        while (cursor) {
+            const pos = positions.get(cursor);
+            if (pos)
+                path.push(pos);
+
+            if (cursor === startKey)
+                break;
+
+            cursor = parent.get(cursor) || null;
+        }
+        path.reverse();
+
+        if (
+            path.length < 2 ||
+            keyOf(path[0]) !== startKey
+        ) {
+            state.lureDetourPlanFailures++;
+            clearLureDetourPlan("invalid reconstructed bypass");
+            return null;
+        }
+
+        state.lureDetourPlan = path.map(pos => ({
+            x: pos.x,
+            y: pos.y,
+            z: pos.z
+        }));
+        state.lureDetourPlanWaypointKey = waypointKey;
+        state.lureDetourPlanBlockerId = blockerId ?? null;
+        state.lureDetourPlanCreatedAt = now;
+        state.lureDetourPlanRejoinKey = goalKey;
+        state.lureDetourPlanLastStepAt = 0;
+        state.lureDetourPlanLastReason =
+            `rejoin after blocker at static route #${blockerIndex}`;
+        state.lureDetourPlanBuilds++;
+
+        return state.lureDetourPlan[1] || null;
+    }
+
+    function getNextLureDetourPlanStep(
+        position,
+        waypoint,
+        now = Date.now()
+    ) {
+        const plan = state.lureDetourPlan;
+        if (!Array.isArray(plan) || plan.length < 2)
+            return null;
+
+        if (!bot.attack?.isLureActive?.()) {
+            clearLureDetourPlan("lure inactive");
+            return null;
+        }
+
+        const waypointKey = getWaypointKey(waypoint);
+        if (
+            !waypointKey ||
+            waypointKey !== state.lureDetourPlanWaypointKey
+        ) {
+            clearLureDetourPlan("waypoint changed");
+            return null;
+        }
+
+        const maxAgeMs = Math.max(
+            1500,
+            Math.min(
+                12000,
+                Math.trunc(Number(config.lureDetourPlanMaxAgeMs) || 6000)
+            )
+        );
+        if (
+            state.lureDetourPlanCreatedAt &&
+            now - state.lureDetourPlanCreatedAt > maxAgeMs
+        ) {
+            clearLureDetourPlan("detour plan expired");
+            return null;
+        }
+
+        const keyOf = (p) => `${p.x},${p.y},${p.z}`;
+        const currentKey = keyOf(position);
+        const index = plan.findIndex(
+            pos => keyOf(pos) === currentKey
+        );
+
+        if (index < 0) {
+            // Movement can still be settling for one CaveBot tick after a step
+            // was issued. Don't instantly replace the entire route in that gap.
+            if (
+                state.lureDetourPlanLastStepAt &&
+                now - state.lureDetourPlanLastStepAt < 900
+            ) {
+                return { waiting: true };
+            }
+
+            clearLureDetourPlan(
+                "player left planned bypass"
+            );
+            return null;
+        }
+
+        if (index >= plan.length - 1) {
+            clearLureDetourPlan(
+                "rejoined static route"
+            );
+            return null;
+        }
+
+        const next = plan[index + 1];
+
+        if (!isLiveLureDetourStepValid(position, next)) {
+            clearLureDetourPlan(
+                "planned bypass step became blocked"
+            );
+            return null;
+        }
+
+        return {
+            x: next.x,
+            y: next.y,
+            z: next.z,
+            planStep: index + 1,
+            planLength: plan.length - 1,
+            rejoinKey: state.lureDetourPlanRejoinKey
+        };
+    }
+
+    function followLureDetourPlan(
+        position,
+        waypoint,
+        now = Date.now()
+    ) {
+        const next = getNextLureDetourPlanStep(
+            position,
+            waypoint,
+            now
+        );
+
+        if (!next)
+            return false;
+
+        if (next.waiting) {
+            noteIntentionalLureNavigation(
+                "waiting for lure detour step",
+                now
+            );
+            return true;
+        }
+
+        state.lureDetourPlanLastStepAt = now;
+        state.lureDetourPlanSteps++;
+        noteIntentionalLureNavigation(
+            "following lure blocker bypass route",
+            now
+        );
+
+        state.lastProgressAt = now;
+        state.lastPathAt = 0;
+        state.lastWaypointTarget = null;
+        state.pathAttemptStart = 0;
+        state.stuckCount = 0;
+        state.stuckRecoveryAttempts = 0;
+        state.recoverySideStepAttempts = 0;
+        state.recoveryBlockerWaitAt = 0;
+        state.recoveryBlockerWaitKey = null;
+
+        stopCaveMovementNow();
+
+        bot.log(
+            "Cave: lure blocker – following bypass route",
+            {
+                step: next.planStep,
+                steps: next.planLength,
+                next: {
+                    x: next.x,
+                    y: next.y,
+                    z: next.z
+                },
+                rejoin: next.rejoinKey
+            }
+        );
+
+        goToPosition(next);
+        return true;
+    }
+
+    function findLureBlockerDetourStep(
+        position,
+        waypoint,
+        blockerPosition,
+        blockerId = null,
+        now = Date.now()
+    ) {
+        return buildLureBlockerDetourPlan(
+            position,
+            waypoint,
+            blockerPosition,
+            blockerId,
+            now
+        );
     }
 
     function getDirection(dx, dy) {
@@ -13140,7 +16231,37 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                     const ny = current.y + a.dy;
                     if (!a.dx && !a.dy) continue;
                     if (bot.blacklist?.isBlacklisted(nx, ny, current.z)) continue;
-                    if (!isTileWalkable(nx, ny, current.z, true)) continue;
+
+                    const lureActive =
+                        bot.attack?.isLureActive?.() === true;
+                    if (
+                        !isTileWalkable(
+                            nx,
+                            ny,
+                            current.z,
+                            !lureActive
+                        )
+                    ) {
+                        continue;
+                    }
+
+                    if (
+                        !isStaticLureStepValid(
+                            current,
+                            { x: nx, y: ny, z: current.z }
+                        )
+                    ) {
+                        continue;
+                    }
+
+                    const fallbackTile = getTileAt({
+                        x: nx,
+                        y: ny,
+                        z: current.z
+                    });
+                    if (fallbackTile && isFloorChangeTile(fallbackTile))
+                        continue;
+
                     const dir = getDirection(a.dx, a.dy);
                     if (dir !== null && window.gameClient?.keyboard) {
                         window.gameClient.keyboard.handleMoveKey(dir);
@@ -14263,6 +17384,36 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         return null;
     }
 
+    function noteIntentionalLureNavigation(
+        reason,
+        now = Date.now()
+    ) {
+        state.lureIntentionalNavAt = now;
+        state.lureIntentionalNavReason = reason || "lure movement";
+    }
+
+    function isIntentionalLureRecoveryGraceActive(
+        now = Date.now()
+    ) {
+        if (!bot.attack?.isLureActive?.())
+            return false;
+
+        const graceMs = Math.max(
+            1500,
+            Math.min(
+                8000,
+                Math.trunc(
+                    Number(config.lureIntentionalRecoveryGraceMs) || 3500
+                )
+            )
+        );
+
+        return (
+            state.lureIntentionalNavAt > 0 &&
+            now - state.lureIntentionalNavAt <= graceMs
+        );
+    }
+
     function resetLureLastMobMovement(reason = null) {
         if (state.lureLastMobMoveActive)
             state.lureLastMobMoveResets++;
@@ -14289,10 +17440,18 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 350,
                 Number(config.lureLastMobSlowRunMs) || 500
             );
+            noteIntentionalLureNavigation(
+                `last-mob ${mode} movement started`,
+                now
+            );
         }
 
         if (mode === "kill") {
             state.lureLastMobKillHolds++;
+            noteIntentionalLureNavigation(
+                "last-mob kill hold",
+                now
+            );
             return {
                 active: true,
                 hold: true,
@@ -14316,6 +17475,10 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 state.lureLastMobMovePhase = "hold";
                 state.lureLastMobMovePhaseUntil = now + holdMs;
                 state.lureLastMobSlowHolds++;
+                noteIntentionalLureNavigation(
+                    "last-mob slow hold",
+                    now
+                );
                 return {
                     active: true,
                     hold: true,
@@ -14338,6 +17501,10 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             state.lureLastMobMovePhase = "run";
             state.lureLastMobMovePhaseUntil = now + runMs;
             state.lureLastMobSlowRuns++;
+            noteIntentionalLureNavigation(
+                "last-mob slow run resumed",
+                now
+            );
             return {
                 active: true,
                 hold: false,
@@ -14446,33 +17613,10 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         }
 
         // ---- stopMovement helper ----
+        // Tick-local compatibility wrapper. The real implementation is
+        // module-scoped so lure route helpers can safely call it too.
         function stopMovement() {
-            // Combat owns movement now: cancel any queued CaveBot manual step.
-            state.fallbackMoveRequestId++;
-            if (state.fallbackMoveTimerId != null) {
-                window.clearTimeout(state.fallbackMoveTimerId);
-                state.fallbackMoveTimerId = null;
-            }
-            const pf = window.gameClient?.world?.pathfinder;
-            if (pf) {
-                pf.setPathfindCache(null);
-                pf.__isAutoWalking = false;
-                pf.__finalDestination = null;
-                pf.__hybridPath = null;
-            }
-            const player = window.gameClient?.player;
-            if (player && player.__preWalks) {
-                player.__preWalks.length = 0;
-            }
-            try {
-                if (window.gameClient && window.gameClient.send) {
-                    window.gameClient.send(new StopWalkPacket());
-                }
-            } catch (e) {}
-            state.lastWaypointTarget = null;
-            state.pathAttemptStart = 0;
-            state.lastDistanceToWaypoint = null;
-            state.lastPathAt = 0;
+            stopCaveMovementNow();
         }
 
         // ---- Combat pause ----
@@ -14578,13 +17722,41 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         // until that mob catches back up. This prevents outrunning the pack.
         const lureLeashHeld = bot.attack?.isLureMovementHeld?.() === true;
         if (lureLeashHeld) {
+            const holdNow = Date.now();
+
+            noteIntentionalLureNavigation(
+                "screen leash holding",
+                holdNow
+            );
+            clearLureDetourPlan("screen leash owns movement");
             clearLureRouteBlocker("screen leash holding");
+
+            // Screen leash intentionally owns movement. Do not let a crowd
+            // decision or asynchronous NO_WAY from the previous movement frame
+            // survive the hold and fire after the pack catches up.
+            let clearedStaleNav = false;
+            if (state.lureCrowdBlocked) {
+                clearLureCrowdBlock(
+                    "screen leash owns movement",
+                    holdNow
+                );
+                clearedStaleNav = true;
+            }
+            if (state.lureNoWayPending) {
+                clearLureNoWayArbitration(
+                    "screen leash owns movement",
+                    holdNow
+                );
+                clearedStaleNav = true;
+            }
+            if (clearedStaleNav)
+                state.lureLeashStaleNavClears++;
+
             if (!state.lureLeashPaused) {
                 state.lureLeashPaused = true;
                 state.lureLeashPauseCount++;
                 stopMovement();
 
-                const holdNow = Date.now();
                 const holdPos = normalizePosition(bot.getPlayerPosition());
                 const holdWp = getCurrentWaypoint();
                 resetWaypointProgressTracking(holdWp, holdPos, holdNow);
@@ -14603,6 +17775,10 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             state.lureLeashResumeCount++;
 
             const resumeNow = Date.now();
+            noteIntentionalLureNavigation(
+                "screen leash resumed",
+                resumeNow
+            );
             const resumePos = normalizePosition(bot.getPlayerPosition());
             const resumeWp = getCurrentWaypoint();
             resetWaypointProgressTracking(resumeWp, resumePos, resumeNow);
@@ -14731,8 +17907,43 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             if (bot.attack?.isLureActive?.() && isOrdinaryLureWaypoint(waypoint)) {
                 if (updateLureCrowdBlock(position, waypoint, now)) {
                     state.lureCrowdHoldTicks++;
+                    noteIntentionalLureNavigation(
+                        "lure crowd congestion hold",
+                        now
+                    );
 
+                    clearLureDetourPlan(
+                        "crowd congestion owns blocker handling"
+                    );
+                    clearLureBlockerDeadlock(
+                        "crowd congestion owns blocker handling",
+                        now
+                    );
                     clearLureRouteBlocker("crowd congestion owns blocker handling");
+
+                    const crowdHeldForMs = state.lureCrowdBlockedSince
+                        ? Math.max(0, now - state.lureCrowdBlockedSince)
+                        : 0;
+                    const crowdMaxHoldMs = Math.max(
+                        1500,
+                        Number(config.lureCrowdMaxHoldMs) || 3500
+                    );
+                    if (
+                        crowdHeldForMs >= crowdMaxHoldMs &&
+                        getLureEmergencyClearId() == null
+                    ) {
+                        const emergency = getEmergencyClearCreatureFromIds(
+                            state.lureCrowdBlockerIds
+                        );
+                        if (emergency) {
+                            armLureEmergencyClear(
+                                emergency,
+                                `crowd sealed corridor for ${crowdHeldForMs}ms`,
+                                now
+                            );
+                        }
+                    }
+
                     stopMovement();
 
                     // Rebase all movement watchdogs every hold tick. This makes
@@ -14765,18 +17976,116 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             }
 
             // ---- LURE ROUTE BLOCKER BYPASS ----
+            // v1.5.30: once a bypass is chosen, follow the full short plan to
+            // its rejoin tile. Do not re-decide north/south every 500ms.
+            if (
+                bot.attack?.isLureActive?.() &&
+                isOrdinaryLureWaypoint(waypoint) &&
+                Array.isArray(state.lureDetourPlan) &&
+                state.lureDetourPlan.length > 1
+            ) {
+                if (followLureDetourPlan(position, waypoint, now)) {
+                    scheduleNextTick();
+                    return;
+                }
+            }
+
             // During attack-through lure, never wait through normal CaveBot's
             // multi-second temporary-blocker recovery while attacking the mob.
             // Detect the blocker immediately, tell Targeting not to attack that
             // exact monster, and route around it one tile at a time.
             if (bot.attack?.isLureActive?.() && isOrdinaryLureWaypoint(waypoint)) {
-                const blocker = findImmediateLureRouteBlocker(position, waypoint);
+                const blocker = findImmediateLureRouteBlocker(
+                    position,
+                    waypoint,
+                    now
+                );
 
                 if (blocker) {
                     const reason = blocker.waypointTile
                         ? "mob occupying lure waypoint"
                         : "mob blocking next lure step";
                     markLureRouteBlocker(blocker.creature, reason, now);
+
+                    const lastMobInfo =
+                        bot.attack?.getLureLastMobInfo?.();
+                    if (
+                        lastMobInfo?.active &&
+                        lastMobInfo.id != null &&
+                        blocker.creature?.id === lastMobInfo.id
+                    ) {
+                        state.lureLastMobBlockerHolds =
+                            (state.lureLastMobBlockerHolds || 0) + 1;
+                        clearLureDetourPlan(
+                            "last mob owns blocker handling"
+                        );
+
+                        noteIntentionalLureNavigation(
+                            "last mob physically blocking lure route",
+                            now
+                        );
+
+                        // The last-mob target is already explicitly exempted
+                        // from lure-blocker attack suppression. Do not sidestep
+                        // around the creature we are trying to finish.
+                        state.lastProgressAt = now;
+                        state.lastPathAt = now;
+                        state.lastWaypointTarget = null;
+                        state.pathAttemptStart = now;
+                        state.stuckCount = 0;
+                        state.stuckRecoveryAttempts = 0;
+                        state.recoverySideStepAttempts = 0;
+                        state.recoveryBlockerWaitAt = 0;
+                        state.recoveryBlockerWaitKey = null;
+                        state.recoveryBestDistance =
+                            getDistanceToWaypoint(position, waypoint);
+                        state.recoveryNoProgressAt = now;
+                        state.nativePathWatchAt = now;
+                        state.nativePathWatchBestDistance =
+                            state.recoveryBestDistance;
+                        state._stuckLogged = false;
+
+                        stopMovement();
+                        scheduleNextTick();
+                        return;
+                    }
+
+                    const emergencyId = getLureEmergencyClearId();
+                    if (
+                        emergencyId != null &&
+                        emergencyId !== blocker.creature.id &&
+                        !isLureBlockerDeadlocked()
+                    ) {
+                        clearLureEmergencyClear("route blocker changed", now);
+                    }
+
+                    if (isLureBlockerDeadlocked()) {
+                        clearLureDetourPlan(
+                            "deadlock clear owns blocker handling"
+                        );
+                        noteIntentionalLureNavigation(
+                            "lure blocker deadlock clear",
+                            now
+                        );
+                        ensureLureDeadlockClearTarget(
+                            blocker.creature,
+                            now
+                        );
+
+                        state.lastProgressAt = now;
+                        state.lastPathAt = now;
+                        state.lastWaypointTarget = null;
+                        state.pathAttemptStart = now;
+                        state.stuckCount = 0;
+                        state.stuckRecoveryAttempts = 0;
+                        state.recoverySideStepAttempts = 0;
+                        state.recoveryBlockerWaitAt = 0;
+                        state.recoveryBlockerWaitKey = null;
+                        stopMovement();
+
+                        scheduleNextTick();
+                        return;
+                    }
 
                     // If we're already beside an ordinary waypoint whose exact
                     // tile is occupied, reaching that exact tile adds no route
@@ -14789,6 +18098,9 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                         );
                         if (distance <= 1) {
                             const oldIndex = state.currentIndex;
+                            clearLureDetourPlan(
+                                "advancing occupied lure waypoint"
+                            );
                             const nextWp = advanceWaypoint();
                             state.lureBlockedWaypointSkips++;
                             state.lastWaypointTarget = null;
@@ -14815,6 +18127,28 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                         }
                     }
 
+                    if (getLureEmergencyClearId() === blocker.creature.id) {
+                        clearLureDetourPlan(
+                            "emergency clear owns blocker handling"
+                        );
+                        noteIntentionalLureNavigation(
+                            "lure emergency blocker clear",
+                            now
+                        );
+                        state.lastProgressAt = now;
+                        state.lastPathAt = now;
+                        state.lastWaypointTarget = null;
+                        state.pathAttemptStart = now;
+                        state.stuckCount = 0;
+                        state.stuckRecoveryAttempts = 0;
+                        state.recoverySideStepAttempts = 0;
+                        state.recoveryBlockerWaitAt = 0;
+                        state.recoveryBlockerWaitKey = null;
+                        stopMovement();
+                        scheduleNextTick();
+                        return;
+                    }
+
                     const detourCooldownMs = Math.max(
                         250,
                         Number(config.lureBlockerDetourCooldownMs) || 550
@@ -14822,12 +18156,50 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                     const canDetour =
                         now - state.lureBlockerDetourAt >= detourCooldownMs;
                     const detour = canDetour
-                        ? findLureBlockerDetourStep(position, waypoint, blocker.position)
+                        ? findLureBlockerDetourStep(
+                            position,
+                            waypoint,
+                            blocker.position,
+                            blocker.creature.id,
+                            now
+                        )
                         : null;
 
                     if (detour) {
                         state.lureBlockerDetourAt = now;
                         state.lureBlockerDetours++;
+                        noteIntentionalLureNavigation(
+                            "lure blocker detour",
+                            now
+                        );
+
+                        if (
+                            recordLureBlockerPattern(
+                                position,
+                                waypoint,
+                                blocker.creature,
+                                "detour",
+                                now
+                            )
+                        ) {
+                            ensureLureDeadlockClearTarget(
+                                blocker.creature,
+                                now
+                            );
+                            state.lastProgressAt = now;
+                            state.lastPathAt = now;
+                            state.lastWaypointTarget = null;
+                            state.pathAttemptStart = now;
+                            state.stuckCount = 0;
+                            state.stuckRecoveryAttempts = 0;
+                            state.recoverySideStepAttempts = 0;
+                            state.recoveryBlockerWaitAt = 0;
+                            state.recoveryBlockerWaitKey = null;
+                            stopMovement();
+                            scheduleNextTick();
+                            return;
+                        }
+
                         state.lastProgressAt = now;
                         state.lastPathAt = 0;
                         state.lastWaypointTarget = null;
@@ -14842,39 +18214,131 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                         // bypass. The next normal tick repaths to the waypoint.
                         stopMovement();
 
-                        bot.log("Cave: lure blocker – immediate detour", {
-                            blockerId: blocker.creature.id,
-                            blockerName: blocker.creature.name || "Mob",
-                            detour
-                        });
+                        bot.log(
+                            "Cave: lure blocker – bypass route selected",
+                            {
+                                blockerId: blocker.creature.id,
+                                blockerName:
+                                    blocker.creature.name || "Mob",
+                                firstStep: {
+                                    x: detour.x,
+                                    y: detour.y,
+                                    z: detour.z
+                                },
+                                plannedSteps:
+                                    Math.max(
+                                        0,
+                                        (state.lureDetourPlan?.length || 1) - 1
+                                    ),
+                                rejoin:
+                                    state.lureDetourPlanRejoinKey
+                            }
+                        );
 
+                        state.lureDetourPlanLastStepAt = now;
+                        state.lureDetourPlanSteps++;
                         goToPosition(detour);
                         scheduleNextTick();
                         return;
                     }
 
-                    // No safe lateral tile (often a one-tile corridor). Stop
-                    // advancing, but Targeting now excludes this blocker, so we
-                    // wait for/pull the mob instead of standing still killing it.
+                    // No safe lateral tile (often a corner/one-tile corridor).
+                    // Preserve briefly; if the same mob still seals the only route,
+                    // escape safety wins and Targeting is allowed to kill it.
                     state.lureBlockerWaits++;
+                    noteIntentionalLureNavigation(
+                        "lure blocker wait",
+                        now
+                    );
+
+                    if (
+                        recordLureBlockerPattern(
+                            position,
+                            waypoint,
+                            blocker.creature,
+                            "wait",
+                            now
+                        )
+                    ) {
+                        ensureLureDeadlockClearTarget(
+                            blocker.creature,
+                            now
+                        );
+                        state.lastProgressAt = now;
+                        state.lastPathAt = now;
+                        state.lastWaypointTarget = null;
+                        state.pathAttemptStart = now;
+                        state.stuckCount = 0;
+                        state.stuckRecoveryAttempts = 0;
+                        state.recoverySideStepAttempts = 0;
+                        state.recoveryBlockerWaitAt = 0;
+                        state.recoveryBlockerWaitKey = null;
+                        stopMovement();
+                        scheduleNextTick();
+                        return;
+                    }
+
+                    const blockedForMs = state.lureBlockerSince
+                        ? Math.max(0, now - state.lureBlockerSince)
+                        : 0;
+                    const maxWaitMs = Math.max(
+                        1000,
+                        Number(config.lureBlockerMaxWaitMs) || 2500
+                    );
+                    if (blockedForMs >= maxWaitMs) {
+                        armLureEmergencyClear(
+                            blocker.creature,
+                            `same blocker sealed route for ${blockedForMs}ms`,
+                            now
+                        );
+                    }
+
                     state.lastProgressAt = now;
-                    state.lastPathAt = 0;
+                    state.lastPathAt = now;
                     state.lastWaypointTarget = null;
-                    state.pathAttemptStart = 0;
+                    state.pathAttemptStart = now;
+                    state.stuckCount = 0;
+                    state.stuckRecoveryAttempts = 0;
+                    state.recoverySideStepAttempts = 0;
+                    state.recoveryBlockerWaitAt = 0;
+                    state.recoveryBlockerWaitKey = null;
                     stopMovement();
 
-                    bot.log("Cave: lure blocker – waiting for mob to clear route", {
-                        blockerId: blocker.creature.id,
-                        blockerName: blocker.creature.name || "Mob"
-                    });
+                    if (
+                        now - state.lureBlockerLastWaitLogAt >= 2500 &&
+                        getLureEmergencyClearId() == null
+                    ) {
+                        state.lureBlockerLastWaitLogAt = now;
+                        bot.log(
+                            "Cave: lure blocker – waiting briefly for mob to clear route",
+                            {
+                                blockerId: blocker.creature.id,
+                                blockerName: blocker.creature.name || "Mob",
+                                blockedForMs,
+                                maxWaitMs
+                            }
+                        );
+                    }
 
                     scheduleNextTick();
                     return;
                 }
 
                 clearLureRouteBlocker("route clear");
+                if (
+                    Array.isArray(state.lureDetourPlan) &&
+                    state.lureDetourPlan.length
+                ) {
+                    clearLureDetourPlan("route opened");
+                }
+                clearLureBlockerDeadlock("route opened", now);
+                if (getLureEmergencyClearId() != null)
+                    clearLureEmergencyClear("route opened", now);
             } else if (!bot.attack?.isLureActive?.()) {
+                clearLureDetourPlan("lure inactive");
                 clearLureRouteBlocker("lure inactive");
+                clearLureBlockerDeadlock("lure inactive", now);
+                clearLureEmergencyClear("lure inactive", now);
             }
 
             // ---- STAND WAYPOINT ----
@@ -15972,7 +19436,36 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             }
 
             const stuckTimeout = config.stuckTimeoutMs || 2000;
-            const stalledFor = now - state.lastProgressAt;
+            let stalledFor = now - state.lastProgressAt;
+
+            // Lure-specific movement deliberately contains holds, one-tile
+            // detours and slow-pull pacing. Those events must not immediately
+            // fall through into the generic CaveBot stuck recovery state.
+            if (
+                !madeProgress &&
+                stalledFor > stuckTimeout &&
+                isIntentionalLureRecoveryGraceActive(now)
+            ) {
+                state.lureIntentionalRecoverySuppressions++;
+                state.lureIntentionalRecoveryLastAt = now;
+
+                state.lastProgressAt = now;
+                state.lastRecoveryAt = 0;
+                state.stuckCount = 0;
+                state.stuckRecoveryAttempts = 0;
+                state.recoverySideStepAttempts = 0;
+                state.recoveryBlockerWaitAt = 0;
+                state.recoveryBlockerWaitKey = null;
+                state.recoveryBestDistance =
+                    currentProgressDistance;
+                state.recoveryNoProgressAt = now;
+                state.nativePathWatchAt = now;
+                state.nativePathWatchBestDistance =
+                    currentProgressDistance;
+                state._stuckLogged = false;
+
+                stalledFor = 0;
+            }
 
             if (!madeProgress && stalledFor > stuckTimeout) {
                 const currentWp = getCurrentWaypoint();
@@ -16659,9 +20152,42 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         state.lureBlockerReason = null;
         state.lureBlockerDetourAt = 0;
         state.lureBlockerDetours = 0;
+        state.lureDetourPlan = [];
+        state.lureDetourPlanWaypointKey = null;
+        state.lureDetourPlanBlockerId = null;
+        state.lureDetourPlanCreatedAt = 0;
+        state.lureDetourPlanRejoinKey = null;
+        state.lureDetourPlanBuilds = 0;
+        state.lureDetourPlanSteps = 0;
+        state.lureDetourPlanInvalidations = 0;
+        state.lureDetourPlanFailures = 0;
+        state.lureDetourPlanLastReason = null;
+        state.lureDetourPlanLastStepAt = 0;
         state.lureBlockerWaits = 0;
         state.lureBlockedWaypointSkips = 0;
         state.lureBlockerClears = 0;
+        state.lureBlockerLastWaitLogAt = 0;
+        state.lureBlockerPatternEvents = [];
+        state.lureBlockerPatternWaypointKey = null;
+        state.lureBlockerDeadlockActive = false;
+        state.lureBlockerDeadlockSince = 0;
+        state.lureBlockerDeadlockIds = [];
+        state.lureBlockerDeadlockNames = [];
+        state.lureBlockerDeadlockReason = null;
+        state.lureBlockerDeadlockActivations = 0;
+        state.lureBlockerDeadlockClears = 0;
+        state.lureBlockerSingleLoopActivations = 0;
+        state.lureIntentionalNavAt = 0;
+        state.lureIntentionalNavReason = null;
+        state.lureIntentionalRecoverySuppressions = 0;
+        state.lureIntentionalRecoveryLastAt = 0;
+        state.lureEmergencyClearId = null;
+        state.lureEmergencyClearName = null;
+        state.lureEmergencyClearSince = 0;
+        state.lureEmergencyClearReason = null;
+        state.lureEmergencyClearActivations = 0;
+        state.lureEmergencyClearCompletions = 0;
+        state.lureEmergencyClearLastAt = 0;
         state.lureCrowdBlocked = false;
         state.lureCrowdBlockerIds = [];
         state.lureCrowdBlockerNames = [];
@@ -16672,6 +20198,13 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         state.lureCrowdClears = 0;
         state.lureCrowdHoldTicks = 0;
         state.lureCrowdNoWaySuppressions = 0;
+        state.lureCrowdPackSnapshotCount = 0;
+        state.lureCrowdActualBlockerCount = 0;
+        state.lureCrowdUsefulTileCount = 0;
+        state.lureCrowdMixedBlockRejects = 0;
+        state.lureCrowdNonPackRejects = 0;
+        state.lureCrowdSnapshotFallbacks = 0;
+        state.lureLeashStaleNavClears = 0;
         state.lureNoWayPending = false;
         state.lureNoWayPendingUntil = 0;
         state.lureNoWayPendingAt = 0;
@@ -16684,6 +20217,24 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         state.lureNoWayEscalations = 0;
         state.lureNoWayLastResolution = null;
         state.lureNoWayLastResolutionAt = 0;
+        state.lureNoWayStaticRouteResolutions = 0;
+        state.lureNoWayStaticRouteRetries = 0;
+        state.lureNoWayStaticRouteRetryIndex = -1;
+        state.lureNoWayStaticRouteRetryKey = null;
+        state.lureNoWayStaticRouteLastVisited = 0;
+        state.lureNoWayStaticRouteLastLength = 0;
+        state.lureNoWayStaticRouteBlockerId = null;
+        state.lureNoWayStaticRouteBlockerName = null;
+        state.lureStaticRouteCacheKey = null;
+        state.lureStaticRouteCacheResult = null;
+        state.lureStaticRouteCacheExpiresAt = 0;
+        state.lureStaticRouteCacheHits = 0;
+        state.lureStaticRouteCacheMisses = 0;
+        state.lureStaticRouteCacheBuilds = 0;
+        state.lureStaticRouteCacheInvalidations = 0;
+        state.lureStaticRouteCacheLastReason = null;
+        state.lureStaticRouteCacheLastVisited = 0;
+        state.lureStaticRouteCacheLastLength = 0;
         state.lureLastMobMoveActive = false;
         state.lureLastMobMoveMode = null;
         state.lureLastMobMovePhase = "run";
@@ -16692,6 +20243,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         state.lureLastMobSlowHolds = 0;
         state.lureLastMobKillHolds = 0;
         state.lureLastMobMoveResets = 0;
+        state.lureLastMobBlockerHolds = 0;
         state.positionUnavailable = false;
         state.pathAttemptStart = 0;
         state.noWayLastSeenAt = 0;
@@ -16737,7 +20289,11 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         }
         state.pausedForCombat = false;
         state.lureLeashPaused = false;
+        clearLureDetourPlan("CaveBot stopped");
+        clearLureStaticRouteCache("CaveBot stopped");
         clearLureRouteBlocker("CaveBot stopped");
+        clearLureBlockerDeadlock("CaveBot stopped");
+        clearLureEmergencyClear("CaveBot stopped");
         clearLureCrowdBlock("CaveBot stopped");
         clearLureNoWayArbitration("CaveBot stopped");
         resetLureLastMobMovement("CaveBot stopped");
@@ -17003,9 +20559,52 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             lureBlockerReason: state.lureBlockerReason,
             lureBlockerSince: state.lureBlockerSince || 0,
             lureBlockerDetours: state.lureBlockerDetours || 0,
+            lureDetourPlanActive:
+                Array.isArray(state.lureDetourPlan) &&
+                state.lureDetourPlan.length > 1,
+            lureDetourPlanLength:
+                Math.max(
+                    0,
+                    (state.lureDetourPlan?.length || 1) - 1
+                ),
+            lureDetourPlanWaypointKey:
+                state.lureDetourPlanWaypointKey,
+            lureDetourPlanBlockerId:
+                state.lureDetourPlanBlockerId,
+            lureDetourPlanRejoinKey:
+                state.lureDetourPlanRejoinKey,
+            lureDetourPlanBuilds:
+                state.lureDetourPlanBuilds || 0,
+            lureDetourPlanSteps:
+                state.lureDetourPlanSteps || 0,
+            lureDetourPlanInvalidations:
+                state.lureDetourPlanInvalidations || 0,
+            lureDetourPlanFailures:
+                state.lureDetourPlanFailures || 0,
+            lureDetourPlanLastReason:
+                state.lureDetourPlanLastReason,
             lureBlockerWaits: state.lureBlockerWaits || 0,
             lureBlockedWaypointSkips: state.lureBlockedWaypointSkips || 0,
             lureBlockerClears: state.lureBlockerClears || 0,
+            lureBlockerPatternEventCount:
+                state.lureBlockerPatternEvents?.length || 0,
+            lureBlockerDeadlock: getLureDeadlockInfo(),
+            lureBlockerSingleLoopActivations:
+                state.lureBlockerSingleLoopActivations || 0,
+            lureIntentionalNavAt:
+                state.lureIntentionalNavAt || 0,
+            lureIntentionalNavReason:
+                state.lureIntentionalNavReason,
+            lureIntentionalRecoverySuppressions:
+                state.lureIntentionalRecoverySuppressions || 0,
+            lureIntentionalRecoveryLastAt:
+                state.lureIntentionalRecoveryLastAt || 0,
+            lureEmergencyClearId: getLureEmergencyClearId(),
+            lureEmergencyClearName: state.lureEmergencyClearName,
+            lureEmergencyClearSince: state.lureEmergencyClearSince || 0,
+            lureEmergencyClearReason: state.lureEmergencyClearReason,
+            lureEmergencyClearActivations: state.lureEmergencyClearActivations || 0,
+            lureEmergencyClearCompletions: state.lureEmergencyClearCompletions || 0,
             lureCrowdBlocked: isLureCrowdBlocked(),
             lureCrowdBlockerIds: Array.from(state.lureCrowdBlockerIds || []),
             lureCrowdBlockerNames: Array.from(state.lureCrowdBlockerNames || []),
@@ -17015,6 +20614,20 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             lureCrowdClears: state.lureCrowdClears || 0,
             lureCrowdHoldTicks: state.lureCrowdHoldTicks || 0,
             lureCrowdNoWaySuppressions: state.lureCrowdNoWaySuppressions || 0,
+            lureCrowdPackSnapshotCount:
+                state.lureCrowdPackSnapshotCount || 0,
+            lureCrowdActualBlockerCount:
+                state.lureCrowdActualBlockerCount || 0,
+            lureCrowdUsefulTileCount:
+                state.lureCrowdUsefulTileCount || 0,
+            lureCrowdMixedBlockRejects:
+                state.lureCrowdMixedBlockRejects || 0,
+            lureCrowdNonPackRejects:
+                state.lureCrowdNonPackRejects || 0,
+            lureCrowdSnapshotFallbacks:
+                state.lureCrowdSnapshotFallbacks || 0,
+            lureLeashStaleNavClears:
+                state.lureLeashStaleNavClears || 0,
             lureNoWayPending: state.lureNoWayPending,
             lureNoWayPendingUntil: state.lureNoWayPendingUntil || 0,
             lureNoWayPendingIndex: state.lureNoWayPendingIndex,
@@ -17025,6 +20638,29 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             lureNoWayEscalations: state.lureNoWayEscalations || 0,
             lureNoWayLastResolution: state.lureNoWayLastResolution,
             lureNoWayLastResolutionAt: state.lureNoWayLastResolutionAt || 0,
+            lureNoWayStaticRouteResolutions: state.lureNoWayStaticRouteResolutions || 0,
+            lureNoWayStaticRouteRetries: state.lureNoWayStaticRouteRetries || 0,
+            lureNoWayStaticRouteLastVisited: state.lureNoWayStaticRouteLastVisited || 0,
+            lureNoWayStaticRouteLastLength: state.lureNoWayStaticRouteLastLength || 0,
+            lureNoWayStaticRouteBlockerId: state.lureNoWayStaticRouteBlockerId,
+            lureNoWayStaticRouteBlockerName: state.lureNoWayStaticRouteBlockerName,
+            lureStaticRouteCacheActive:
+                !!state.lureStaticRouteCacheResult &&
+                Date.now() <= (state.lureStaticRouteCacheExpiresAt || 0),
+            lureStaticRouteCacheHits:
+                state.lureStaticRouteCacheHits || 0,
+            lureStaticRouteCacheMisses:
+                state.lureStaticRouteCacheMisses || 0,
+            lureStaticRouteCacheBuilds:
+                state.lureStaticRouteCacheBuilds || 0,
+            lureStaticRouteCacheInvalidations:
+                state.lureStaticRouteCacheInvalidations || 0,
+            lureStaticRouteCacheLastReason:
+                state.lureStaticRouteCacheLastReason,
+            lureStaticRouteCacheLastVisited:
+                state.lureStaticRouteCacheLastVisited || 0,
+            lureStaticRouteCacheLastLength:
+                state.lureStaticRouteCacheLastLength || 0,
             lureLastMobMoveActive: state.lureLastMobMoveActive,
             lureLastMobMoveMode: state.lureLastMobMoveMode,
             lureLastMobMovePhase: state.lureLastMobMovePhase,
@@ -17032,6 +20668,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             lureLastMobSlowHolds: state.lureLastMobSlowHolds || 0,
             lureLastMobKillHolds: state.lureLastMobKillHolds || 0,
             lureLastMobMoveResets: state.lureLastMobMoveResets || 0,
+            lureLastMobBlockerHolds:
+                state.lureLastMobBlockerHolds || 0,
             movement: getMovementSummary(),
             telemetry: {
                 ...state.telemetry,
@@ -17056,9 +20694,53 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             250,
             Math.min(2000, Math.trunc(Number(config.lureBlockerDetourCooldownMs) || 550))
         );
+        config.lureDetourSearchRadius = Math.max(
+            3,
+            Math.min(14, Math.trunc(Number(config.lureDetourSearchRadius) || 8))
+        );
+        config.lureDetourSearchMaxNodes = Math.max(
+            100,
+            Math.min(2000, Math.trunc(Number(config.lureDetourSearchMaxNodes) || 500))
+        );
+        config.lureDetourPlanMaxAgeMs = Math.max(
+            1500,
+            Math.min(12000, Math.trunc(Number(config.lureDetourPlanMaxAgeMs) || 6000))
+        );
         config.lureBlockerForgetMs = Math.max(
             500,
             Math.min(5000, Math.trunc(Number(config.lureBlockerForgetMs) || 1200))
+        );
+        config.lureBlockerMaxWaitMs = Math.max(
+            1000,
+            Math.min(8000, Math.trunc(Number(config.lureBlockerMaxWaitMs) || 2500))
+        );
+        config.lureBlockerDeadlockWindowMs = Math.max(
+            1500,
+            Math.min(8000, Math.trunc(Number(config.lureBlockerDeadlockWindowMs) || 3500))
+        );
+        config.lureBlockerDeadlockMinEvents = Math.max(
+            4,
+            Math.min(12, Math.trunc(Number(config.lureBlockerDeadlockMinEvents) || 5))
+        );
+        config.lureBlockerDeadlockMinSwitches = Math.max(
+            2,
+            Math.min(10, Math.trunc(Number(config.lureBlockerDeadlockMinSwitches) || 3))
+        );
+        config.lureBlockerDeadlockMaxPositions = Math.max(
+            1,
+            Math.min(6, Math.trunc(Number(config.lureBlockerDeadlockMaxPositions) || 3))
+        );
+        config.lureBlockerDeadlockProgressTiles = Math.max(
+            1,
+            Math.min(5, Math.trunc(Number(config.lureBlockerDeadlockProgressTiles) || 2))
+        );
+        config.lureIntentionalRecoveryGraceMs = Math.max(
+            1500,
+            Math.min(8000, Math.trunc(Number(config.lureIntentionalRecoveryGraceMs) || 3500))
+        );
+        config.lureCrowdMaxHoldMs = Math.max(
+            1500,
+            Math.min(10000, Math.trunc(Number(config.lureCrowdMaxHoldMs) || 3500))
         );
         config.lureCrowdRadius = Math.max(
             2,
@@ -17076,6 +20758,22 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             600,
             Math.min(2500, Math.trunc(Number(config.lureNoWayArbitrationMs) || 1100))
         );
+        config.lureNoWayStaticRetryLimit = Math.max(
+            0,
+            Math.min(5, Math.trunc(Number(config.lureNoWayStaticRetryLimit) || 2))
+        );
+        config.lureNoWayStaticSearchNodes = Math.max(
+            500,
+            Math.min(8000, Math.trunc(Number(config.lureNoWayStaticSearchNodes) || 3200))
+        );
+        config.lureNoWayStaticSearchMargin = Math.max(
+            6,
+            Math.min(30, Math.trunc(Number(config.lureNoWayStaticSearchMargin) || 16))
+        );
+        config.lureStaticRouteCacheMs = Math.max(
+            100,
+            Math.min(2000, Math.trunc(Number(config.lureStaticRouteCacheMs) || 750))
+        );
         config.lureLastMobSlowRunMs = Math.max(
             350,
             Math.min(2000, Math.trunc(Number(config.lureLastMobSlowRunMs) || 500))
@@ -17090,6 +20788,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         const penalty = Number(config.recoveryHealthPenalty);
         config.recoveryHealthPenalty = Number.isFinite(penalty)
             ? Math.max(0, Math.min(10, penalty)) : 0.75;
+        clearLureStaticRouteCache("CaveBot config updated");
         persistConfig();
         bot.log("cave config updated", {
             ...config
@@ -17267,6 +20966,10 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         getCurrentWaypoint,
         getLureBlockerId,
         getLureBlockedCreatureIds,
+        getLureEmergencyClearId,
+        getLureEmergencyClearInfo,
+        getLureDeadlockInfo,
+        isLureBlockerDeadlocked,
         isLureCrowdBlocked,
         createPreset,
         savePreset,
@@ -19093,7 +22796,26 @@ window.__minibiaBotBundle.installExoriModule = function installExoriModule(bot) 
     const state = {
         running: false,
         timerId: null,
+
+        // v1.5.24: Exori cooldown is server/native-hotbar driven. Sending spell
+        // words is only an attempt; a successful cast is confirmed when the
+        // spellbook receives the Exori SID cooldown from SPELL_CAST.
+        lastAttemptAt: 0,
         lastCastAt: 0,
+        lastConfirmedAt: 0,
+        confirmedCasts: 0,
+        spellSid: null,
+        spellWordsKey: null,
+        nativeCooldownKnown: false,
+        nativeCooldownActive: false,
+        nativeSpellCooldownActive: false,
+        nativeGlobalCooldownActive: false,
+        nativeCooldownRemainingMs: 0,
+        nativeCooldownBucket: null,
+        retryGuardBlocks: 0,
+        nativeCooldownBlocks: 0,
+        unresolvedSpellTicks: 0,
+
         lastBlockedReason: null,
         targetingBlockedTicks: 0,
     };
@@ -19102,7 +22824,12 @@ window.__minibiaBotBundle.installExoriModule = function installExoriModule(bot) 
         enabled: false,
         spellWords: "exori",
         manaCost: 150,
+
+        // Legacy-only stored value. v1.5.24 no longer uses this as a cast
+        // cooldown; the native spellbook cooldown map is authoritative.
         cooldownMs: 5000,
+        retryGuardMs: 350,
+
         monsterCount: 3,
         range: 1,
         playerProximityCheck: false,
@@ -19115,6 +22842,7 @@ window.__minibiaBotBundle.installExoriModule = function installExoriModule(bot) 
             spellWords: config.spellWords,
             manaCost: config.manaCost,
             cooldownMs: config.cooldownMs,
+            retryGuardMs: config.retryGuardMs,
             monsterCount: config.monsterCount,
             range: config.range,
             playerProximityCheck: config.playerProximityCheck,
@@ -19126,6 +22854,188 @@ window.__minibiaBotBundle.installExoriModule = function installExoriModule(bot) 
         // Exori is a Targeting sub-feature. Its own checkbox "arms" it, but
         // actual casting is allowed only while Targeting is running.
         return bot.attack?.isRunning?.() === true;
+    }
+
+    function isLureDeadlockClearActive() {
+        if (bot.attack?.isLureActive?.() !== true)
+            return false;
+        return bot.cave?.isLureBlockerDeadlocked?.() === true;
+    }
+
+    function isPreferredAccessClearActive() {
+        return bot.attack?.isPreferredAccessBlocked?.() === true;
+    }
+
+    function normalizeSpellWords(words) {
+        return String(words || "").trim().toLowerCase();
+    }
+
+    function resolveSpellSid() {
+        const wordsKey = normalizeSpellWords(config.spellWords);
+        if (!wordsKey) {
+            state.spellSid = null;
+            state.spellWordsKey = wordsKey;
+            return null;
+        }
+
+        if (
+            state.spellWordsKey === wordsKey &&
+            Number.isFinite(Number(state.spellSid))
+        ) {
+            return Number(state.spellSid);
+        }
+
+        let sid = null;
+        const iface = window.gameClient?.interface;
+        const spells = iface?.SPELLS;
+
+        // This is the same spell definition table the native hotbar uses.
+        if (spells && typeof spells.forEach === "function") {
+            spells.forEach((spell, spellSid) => {
+                if (
+                    sid == null &&
+                    normalizeSpellWords(spell?.words) === wordsKey
+                ) {
+                    sid = Number(spellSid);
+                }
+            });
+        }
+
+        // Fallback through configured hotbar spell slots if the SPELLS map is
+        // temporarily unavailable during startup/reconnect.
+        if (sid == null) {
+            const hm = iface?.hotbarManager;
+            const slots = hm?.slots;
+            if (Array.isArray(slots)) {
+                for (const slot of slots) {
+                    const slotSid = Number(slot?.spell?.sid);
+                    if (!Number.isFinite(slotSid))
+                        continue;
+
+                    const spell = iface?.getSpell?.(slotSid);
+                    if (
+                        normalizeSpellWords(spell?.words) === wordsKey
+                    ) {
+                        sid = slotSid;
+                        break;
+                    }
+                }
+            }
+        }
+
+        state.spellSid = Number.isFinite(Number(sid))
+            ? Number(sid)
+            : null;
+        state.spellWordsKey = wordsKey;
+        return state.spellSid;
+    }
+
+    function getCooldownEventRemainingMs(event) {
+        if (!event)
+            return 0;
+
+        try {
+            if (typeof event.remainingMillis === "function")
+                return Math.max(0, Number(event.remainingMillis()) || 0);
+
+            if (typeof event.remainingSeconds === "function")
+                return Math.max(0, (Number(event.remainingSeconds()) || 0) * 1000);
+        } catch (e) {}
+
+        // The native hotbar gates on Map.has(), not on a client-side timer.
+        // If the event exists but doesn't expose remaining time, report active
+        // with an unknown duration rather than inventing one.
+        return 0;
+    }
+
+    function getNativeSpellCooldownState() {
+        const player = window.gameClient?.player;
+        const spellbook = player?.spellbook;
+        const sid = resolveSpellSid();
+
+        if (
+            !spellbook ||
+            !(spellbook.cooldowns instanceof Map) ||
+            !Number.isFinite(Number(sid))
+        ) {
+            state.nativeCooldownKnown = false;
+            state.nativeCooldownActive = false;
+            state.nativeSpellCooldownActive = false;
+            state.nativeGlobalCooldownActive = false;
+            state.nativeCooldownRemainingMs = 0;
+            state.nativeCooldownBucket = null;
+            if (!Number.isFinite(Number(sid)))
+                state.unresolvedSpellTicks++;
+
+            return {
+                known: false,
+                sid: Number.isFinite(Number(sid)) ? Number(sid) : null,
+                active: false,
+                spellActive: false,
+                globalActive: false,
+                remainingMs: 0,
+                bucket: null,
+            };
+        }
+
+        // Spellbook.__bucketFor() is the authoritative bucket selector in the
+        // game client. Exori (SID 23) resolves to the attack/global bucket.
+        const bucket =
+            typeof spellbook.__bucketFor === "function"
+                ? spellbook.__bucketFor(Number(sid))
+                : spellbook.GLOBAL_COOLDOWN;
+
+        // Same gating model as the native hotbar: presence in cooldowns means
+        // the server has locked either the spell SID or its global bucket.
+        const spellActive = spellbook.cooldowns.has(Number(sid));
+        const globalActive =
+            bucket != null &&
+            spellbook.cooldowns.has(bucket);
+        const spellEvent = spellActive
+            ? spellbook.cooldowns.get(Number(sid))
+            : null;
+        const globalEvent = globalActive
+            ? spellbook.cooldowns.get(bucket)
+            : null;
+
+        const remainingMs = Math.max(
+            getCooldownEventRemainingMs(spellEvent),
+            getCooldownEventRemainingMs(globalEvent)
+        );
+        const active = spellActive || globalActive;
+
+        state.nativeCooldownKnown = true;
+        state.nativeCooldownActive = active;
+        state.nativeSpellCooldownActive = spellActive;
+        state.nativeGlobalCooldownActive = globalActive;
+        state.nativeCooldownRemainingMs = remainingMs;
+        state.nativeCooldownBucket = bucket ?? null;
+
+        // A per-spell cooldown is server confirmation that THIS spell cast.
+        // Do not treat a global bucket caused by some other attack spell as an
+        // Exori confirmation.
+        if (
+            spellActive &&
+            state.lastAttemptAt > state.lastConfirmedAt
+        ) {
+            state.lastConfirmedAt = Date.now();
+            state.lastCastAt = state.lastConfirmedAt;
+            state.confirmedCasts++;
+        }
+
+        return {
+            known: true,
+            sid: Number(sid),
+            active,
+            spellActive,
+            globalActive,
+            remainingMs,
+            bucket: bucket ?? null,
+        };
+    }
+
+    function isNativeSpellCooldownActive() {
+        return getNativeSpellCooldownState().active;
     }
 
     // Only scan other players when enabled; X-Ray already excludes our own character.
@@ -19176,12 +23086,35 @@ window.__minibiaBotBundle.installExoriModule = function installExoriModule(bot) 
             state.lastBlockedReason = "protection zone";
             return false;
         }
-        if (bot.attack?.isLureActive?.()) {
+        const preferredAccessClear = isPreferredAccessClearActive();
+        const lureDeadlockClear = isLureDeadlockClearActive();
+
+        if (
+            bot.attack?.isLureActive?.() &&
+            !preferredAccessClear &&
+            !lureDeadlockClear
+        ) {
             state.lastBlockedReason = "luring";
             return false;
         }
-        if (now - state.lastCastAt < config.cooldownMs) {
-            state.lastBlockedReason = "cooldown";
+        const nativeCooldown = getNativeSpellCooldownState();
+        if (nativeCooldown.active) {
+            state.lastBlockedReason = nativeCooldown.spellActive
+                ? "spell cooldown"
+                : "global cooldown";
+            state.nativeCooldownBlocks++;
+            return false;
+        }
+
+        // Only prevent duplicate packets while waiting for the server to
+        // acknowledge/reject the previous attempt. This is NOT a cast cooldown.
+        const retryGuardMs = Math.max(
+            150,
+            Math.min(1000, Number(config.retryGuardMs) || 350)
+        );
+        if (now - state.lastAttemptAt < retryGuardMs) {
+            state.lastBlockedReason = "retry guard";
+            state.retryGuardBlocks++;
             return false;
         }
         if (hasPlayerTooClose()) {
@@ -19194,8 +23127,20 @@ window.__minibiaBotBundle.installExoriModule = function installExoriModule(bot) 
             return false;
         }
         const nearby = getMonstersInRange();
-        if (nearby.length < config.monsterCount) {
-            state.lastBlockedReason = "not enough monsters";
+        const forcedTwoMobClear =
+            preferredAccessClear || lureDeadlockClear;
+        const requiredCount = forcedTwoMobClear
+            ? Math.min(Math.max(1, Number(config.monsterCount) || 3), 2)
+            : Math.max(1, Number(config.monsterCount) || 3);
+
+        if (nearby.length < requiredCount) {
+            state.lastBlockedReason = preferredAccessClear
+                ? "not enough monsters for preferred access clear"
+                : (
+                    lureDeadlockClear
+                        ? "not enough monsters for lure deadlock clear"
+                        : "not enough monsters"
+                );
             return false;
         }
         state.lastBlockedReason = null;
@@ -19214,7 +23159,14 @@ window.__minibiaBotBundle.installExoriModule = function installExoriModule(bot) 
             state.lastBlockedReason = "protection zone";
             return false;
         }
-        if (bot.attack?.isLureActive?.()) {
+        const preferredAccessClear = isPreferredAccessClearActive();
+        const lureDeadlockClear = isLureDeadlockClearActive();
+
+        if (
+            bot.attack?.isLureActive?.() &&
+            !preferredAccessClear &&
+            !lureDeadlockClear
+        ) {
             state.lastBlockedReason = "luring";
             return false;
         }
@@ -19223,8 +23175,21 @@ window.__minibiaBotBundle.installExoriModule = function installExoriModule(bot) 
         const sent = bot.actions.runShared('exori',
             bot.actions.priorities.COMBAT, () => bot.sendChat(config.spellWords));
         if (sent) {
-            state.lastCastAt = now;
-            bot.log(`Exori cast (${getMonstersInRange().length} monsters nearby, mana ${bot.mana()})`);
+            state.lastAttemptAt = now;
+            const accessClear = isPreferredAccessClearActive();
+            const deadlockClear = isLureDeadlockClearActive();
+            const label = accessClear
+                ? "Exori access-clear requested"
+                : (
+                    deadlockClear
+                        ? "Exori lure-deadlock clear requested"
+                        : "Exori requested"
+                );
+
+            bot.log(
+                `${label} ` +
+                `(${getMonstersInRange().length} monsters nearby, mana ${bot.mana()})`
+            );
         }
         return sent;
     }
@@ -19244,7 +23209,7 @@ window.__minibiaBotBundle.installExoriModule = function installExoriModule(bot) 
     function scheduleNextTick() {
         if (!state.running)
             return;
-        state.timerId = setTimeout(tick, 500);
+        state.timerId = setTimeout(tick, 250);
     }
 
     function start() {
@@ -19253,7 +23218,19 @@ window.__minibiaBotBundle.installExoriModule = function installExoriModule(bot) 
         config.enabled = true;
         persistConfig();
         state.running = true;
+        state.lastAttemptAt = 0;
         state.lastCastAt = 0;
+        state.lastConfirmedAt = 0;
+        state.confirmedCasts = 0;
+        state.nativeCooldownKnown = false;
+        state.nativeCooldownActive = false;
+        state.nativeSpellCooldownActive = false;
+        state.nativeGlobalCooldownActive = false;
+        state.nativeCooldownRemainingMs = 0;
+        state.retryGuardBlocks = 0;
+        state.nativeCooldownBlocks = 0;
+        state.unresolvedSpellTicks = 0;
+        resolveSpellSid();
         bot.log(isTargetingRunning()
             ? "Exori enabled"
             : "Exori armed (waiting for Targeting)");
@@ -19281,8 +23258,13 @@ window.__minibiaBotBundle.installExoriModule = function installExoriModule(bot) 
         const targetingRunning = isTargetingRunning();
         const nearby = getMonstersInRange();
         const mana = bot.mana();
+        const nativeCooldown = getNativeSpellCooldownState();
         const ready = canCast(now);
-        const cooldownRemaining = Math.max(0, config.cooldownMs - (now - state.lastCastAt));
+        const retryGuardRemaining = Math.max(
+            0,
+            Math.max(150, Math.min(1000, Number(config.retryGuardMs) || 350)) -
+                (now - state.lastAttemptAt)
+        );
         return {
             // "running" means Exori is actually allowed to operate now.
             running: state.running && config.enabled && targetingRunning,
@@ -19293,18 +23275,53 @@ window.__minibiaBotBundle.installExoriModule = function installExoriModule(bot) 
             },
             monstersInRange: nearby.length,
             mana: mana,
+            preferredAccessClear: isPreferredAccessClearActive(),
+            lureDeadlockClear: isLureDeadlockClearActive(),
             ready: ready,
-            cooldownRemaining: cooldownRemaining,
+
+            // Backward-compatible field name, now reports the native server
+            // spell/global cooldown instead of a client-side 5s timer.
+            cooldownRemaining: nativeCooldown.remainingMs,
+            cooldownMode: "native-hotbar",
+            spellSid: nativeCooldown.sid,
+            nativeCooldownKnown: nativeCooldown.known,
+            nativeCooldownActive: nativeCooldown.active,
+            nativeSpellCooldownActive: nativeCooldown.spellActive,
+            nativeGlobalCooldownActive: nativeCooldown.globalActive,
+            nativeCooldownBucket: nativeCooldown.bucket,
+            retryGuardRemaining: retryGuardRemaining,
+
+            lastAttemptAt: state.lastAttemptAt,
             lastCastAt: state.lastCastAt,
+            lastConfirmedAt: state.lastConfirmedAt,
+            confirmedCasts: state.confirmedCasts,
+            retryGuardBlocks: state.retryGuardBlocks,
+            nativeCooldownBlocks: state.nativeCooldownBlocks,
+            unresolvedSpellTicks: state.unresolvedSpellTicks,
             lastBlockedReason: state.lastBlockedReason,
             targetingBlockedTicks: state.targetingBlockedTicks,
         };
     }
 
     function updateConfig(next) {
+        const spellWordsChanged =
+            next?.spellWords !== undefined &&
+            normalizeSpellWords(next.spellWords) !== normalizeSpellWords(config.spellWords);
+
         Object.assign(config, next);
         config.playerProximityCheck = config.playerProximityCheck === true;
         config.playerProximityDistance = Math.max(1, Math.min(10, Number(config.playerProximityDistance) || 3));
+        config.retryGuardMs = Math.max(
+            150,
+            Math.min(1000, Number(config.retryGuardMs) || 350)
+        );
+
+        if (spellWordsChanged) {
+            state.spellSid = null;
+            state.spellWordsKey = null;
+            resolveSpellSid();
+        }
+
         persistConfig();
         return {
             ...config
@@ -19319,6 +23336,7 @@ window.__minibiaBotBundle.installExoriModule = function installExoriModule(bot) 
         stop,
         status,
         updateConfig,
+        getNativeSpellCooldownState,
         config,
     };
 };
@@ -25013,7 +29031,20 @@ function upgradeSectionHeaders(panel) {
                 const wp = status.lureWaypointIndex != null
                     ? ` → WP ${status.lureWaypointIndex + 1}`
                     : "";
-                if (status.lurePreferredPending) {
+                if (status.preferredAccessBlocked) {
+                    const pref = status.preferredAccess?.preferredName
+                        ? ` • ${status.preferredAccess.preferredName}`
+                        : "";
+                    const blockers = status.preferredAccess?.blockerIds?.length || 0;
+                    inputs.lureStatus.textContent =
+                        `Clearing ${blockers} blocker${blockers === 1 ? "" : "s"} for preferred${pref}`;
+                } else if (status.lureEmergencyClear?.active) {
+                    const name = status.lureEmergencyClear.name
+                        ? ` • ${status.lureEmergencyClear.name}`
+                        : "";
+                    inputs.lureStatus.textContent =
+                        `Escape clear${name} • route blocked`;
+                } else if (status.lurePreferredPending) {
                     const name = status.lurePreferredTrackedName
                         ? ` • ${status.lurePreferredTrackedName}`
                         : "";
@@ -25021,7 +29052,7 @@ function upgradeSectionHeaders(panel) {
                         ? ` ${Math.round(Number(status.lurePreferredTrackedDistance))}t`
                         : "";
                     inputs.lureStatus.textContent =
-                        `Preferred ahead${dist}${name} • preserving pack`;
+                        `Preferred ahead${dist}${name} • soft attacking pack`;
                 } else if (status.lureLastMobActive) {
                     const hp = Number.isFinite(Number(status.lureLastMobHealthPct))
                         ? Math.round(Number(status.lureLastMobHealthPct))
