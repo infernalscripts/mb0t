@@ -550,6 +550,8 @@ window.__minibiaBotBundle.createBot = function createBot() {
     // ---- FLUID-AWARE SERVER ITEM COUNT OBSERVER ----
 const itemCountState = {
     manager: null,
+    // Server counts belong to the current player, not the page lifetime.
+    player: null,
     originalUpdate: null,
     wrappedUpdate: null,
     counts: new Map(),       // "itemId:fluidType" -> { itemId, fluidType, count, at }
@@ -562,7 +564,18 @@ function getItemCountKey(itemId, fluidType = 0) {
     return Number.isFinite(id) && id > 0 ? `${id}:${fluid}` : null;
 }
 
+function syncItemCountPlayer() {
+    const player = window.gameClient?.player || null;
+    if (itemCountState.player !== player) {
+        itemCountState.counts.clear();
+        itemCountState.player = player;
+    }
+    return player;
+}
+
 function recordItemCount(itemId, fluidType, count) {
+    // Ignore a late inventory update while no character is available.
+    if (!syncItemCountPlayer()) return false;
     const key = getItemCountKey(itemId, fluidType);
     const numericCount = Number(count);
     if (!key || !Number.isFinite(numericCount)) return false;
@@ -591,6 +604,7 @@ function uninstallItemCountObserver() {
 }
 
 function installItemCountObserver() {
+    syncItemCountPlayer();
     const manager = window.gameClient?.interface?.hotbarManager;
     if (!manager || typeof manager.updateItemCount !== "function") return false;
     if (itemCountState.manager === manager && manager.updateItemCount === itemCountState.wrappedUpdate) {
@@ -599,7 +613,10 @@ function installItemCountObserver() {
     uninstallItemCountObserver();
     const original = manager.updateItemCount;
     const wrapped = function wrappedMinibiaBotItemCount(itemId, fluidType, count) {
-        recordItemCount(itemId, fluidType, count);
+        // A replaced client's old manager must not repopulate the new
+        // character's cache with late packets from the prior connection.
+        if (window.gameClient?.interface?.hotbarManager === manager)
+            recordItemCount(itemId, fluidType, count);
         return original.apply(this, arguments);
     };
     itemCountState.manager = manager;
@@ -633,6 +650,7 @@ function requestItemCounts(items = []) {
 }
 
 function getItemCountReading(itemId, fluidType = 0) {
+    if (!syncItemCountPlayer()) return null;
     const key = getItemCountKey(itemId, fluidType);
     return key ? itemCountState.counts.get(key) || null : null;
 }
@@ -649,6 +667,8 @@ addCleanup(() => {
         itemCountInstallTimer = null;
     }
     uninstallItemCountObserver();
+    itemCountState.counts.clear();
+    itemCountState.player = null;
     itemCountState.listeners.clear();
 });
     
@@ -695,10 +715,61 @@ addCleanup(() => {
         findBySid(sid) { return itemsApi.find({ sid }); },
     };
 
-    // Lightweight cross-module action mutex. It is deliberately not a queue:
-    // an expired/blocked action should not make a later action wait behind it.
+    // Named locks remain available for legacy per-action cooldowns. Shared actions
+    // additionally coordinate hotbar/chat/item packets across participating modules.
+    // No queued actions, packet interception, extra timers or long-lived histories.
     const actionLocks = new Map();
+    const sharedAction = { owner: null, until: 0, halted: false, urgentCheck: null };
+    const actionPriorities = Object.freeze({
+        HEAL: 100, DEFENSE: 90, SUPPORT: 70, COMBAT: 40, UTILITY: 20
+    });
     const actionsApi = {
+        priorities: actionPriorities,
+        setUrgentCheck(fn) {
+            sharedAction.urgentCheck = typeof fn === 'function' ? fn : null;
+        },
+        tryAcquireShared(name, priority = actionPriorities.UTILITY, spacingMs = 100) {
+            if (sharedAction.halted || sharedAction.owner !== null) return null;
+            const now = performance.now();
+            // Healing can bypass the small post-action spacing, never an active send.
+            if (priority < actionPriorities.HEAL && now < sharedAction.until) return null;
+            if (priority < actionPriorities.HEAL && sharedAction.urgentCheck) {
+                try { if (sharedAction.urgentCheck()) return null; }
+                catch (e) { return null; } // Fail closed for lower-priority actions.
+            }
+            const token = Symbol(String(name || 'shared'));
+            sharedAction.owner = token;
+            let released = false;
+            return (committed = false) => {
+                if (released) return;
+                released = true;
+                if (sharedAction.owner !== token) return;
+                sharedAction.owner = null;
+                if (committed) {
+                    const gap = Number(spacingMs);
+                    sharedAction.until = performance.now() +
+                        (Number.isFinite(gap) ? Math.max(0, Math.min(250, gap)) : 100);
+                }
+            };
+        },
+        runShared(name, priority, action, spacingMs = 100) {
+            const release = actionsApi.tryAcquireShared(name, priority, spacingMs);
+            if (!release) return false;
+            let committed = false;
+            try {
+                committed = !!action();
+                return committed;
+            } finally { release(committed); }
+        },
+        halt() {
+            // An emergency logout must not wait for non-emergency actions.
+            sharedAction.halted = true;
+            sharedAction.owner = null;
+            sharedAction.until = 0;
+            sharedAction.urgentCheck = null;
+            actionLocks.clear();
+        },
+        isHalted() { return sharedAction.halted; },
         tryAcquire(name, ttlMs = 1500) {
             const key = String(name || "default");
             const now = performance.now();
@@ -721,12 +792,18 @@ addCleanup(() => {
             }
             return true;
         },
-        clear() { actionLocks.clear(); },
+        clear() {
+            actionLocks.clear();
+            sharedAction.owner = null;
+            sharedAction.until = 0;
+            sharedAction.urgentCheck = null;
+            sharedAction.halted = false;
+        },
     };
 
     // ---- PUBLIC API ----
     return {
-        version: "1.4.33",
+        version: "1.5.18",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -771,6 +848,7 @@ addCleanup(() => {
                 this.ui.destroy();
             stopReconnectWatcher();
             destroyAlarmAudio();
+            this.actions?.clear?.();
             runCleanups();
         },
 
@@ -3490,7 +3568,8 @@ window.__minibiaBotBundle.installRuneModule = function installRuneModule(bot) {
     function tryMakeRune() {
         if (!canMakeRune())
             return false;
-        const sent = bot.sendChat(config.runeSpellWords);
+        const sent = bot.actions.runShared('rune-crafting',
+            bot.actions.priorities.UTILITY, () => bot.sendChat(config.runeSpellWords));
         if (sent)
             state.lastRuneAt = Date.now();
         return sent;
@@ -3648,6 +3727,11 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
         pendingAttempt: {},
         manualCooldownUntil: {},
         lastParalyzeAt: 0,
+        hadPlayerSnapshot: false,
+        playerRef: null,
+        // Maximum 12 slots. These counters are in-memory diagnostics only.
+        unconfirmedBySlot: {},
+        lastUnconfirmedNoticeAt: {},
     };
 
     const config = Object.assign({
@@ -3698,6 +3782,10 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
             healRules: config.healRules,
             skipOnCooldown: config.skipOnCooldown,
             debugCooldown: config.debugCooldown,
+            paralyzeEnabled: config.paralyzeEnabled,
+            paralyzeSpellWords: config.paralyzeSpellWords,
+            paralyzeMinHpPercent: config.paralyzeMinHpPercent,
+            paralyzeCooldownMs: config.paralyzeCooldownMs,
         });
     }
 
@@ -3750,12 +3838,34 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
         return false;
     }
 
+    function expectedHealResource(rule) {
+        // Healing rules express their purpose through HP/MP ranges, not a type
+        // field. Only a restricted range is enough to infer one resource.
+        // Ambiguous/dual-purpose rules preserve the old either-stat behavior.
+        const hp = Number(rule?.maxHpPercent ?? 100) < 100 ||
+            Number(rule?.minHpPercent ?? 0) > 0;
+        const mana = Number(rule?.maxManaPercent ?? 100) < 100 ||
+            Number(rule?.minManaPercent ?? 0) > 0;
+        return hp !== mana ? (hp ? 'hp' : 'mana') : 'either';
+    }
+
     function didSucceed(stats, attempt) {
-        if (!stats || !attempt)
-            return false;
-        var hpUp = stats.hp ? stats.hp.current > attempt.hpBefore : false;
-        var manaUp = stats.mana ? stats.mana.current > attempt.manaBefore : false;
+        if (!stats || !attempt) return false;
+        const hpUp = !!stats.hp && stats.hp.current > attempt.hpBefore;
+        const manaUp = !!stats.mana && stats.mana.current > attempt.manaBefore;
+        if (attempt.expectedResource === 'hp') return hpUp;
+        if (attempt.expectedResource === 'mana') return manaUp;
         return hpUp || manaUp;
+    }
+
+    function resetHealSession() {
+        state.pendingAttempt = {};
+        state.lastHealAt = {};
+        state.lastAttemptAt = {};
+        state.manualCooldownUntil = {};
+        state.unconfirmedBySlot = {};
+        state.lastUnconfirmedNoticeAt = {};
+        state.lastParalyzeAt = 0;
     }
 
     function resolvePending(stats, now) {
@@ -3767,8 +3877,18 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
                 continue;
             if (didSucceed(stats, a)) {
                 state.lastHealAt[slotKey] = a.attemptedAt;
+                state.unconfirmedBySlot[slotKey] = 0;
                 state.pendingAttempt[slotKey] = null;
             } else if (now - a.attemptedAt >= (config.healConfirmMs || 250)) {
+                // Not a proven failure: damage, regeneration and delayed server
+                // updates can obscure the result. Never suppress future heals.
+                const misses = Math.min(3, (state.unconfirmedBySlot[slotKey] || 0) + 1);
+                state.unconfirmedBySlot[slotKey] = misses;
+                const lastNotice = state.lastUnconfirmedNoticeAt[slotKey] || 0;
+                if (misses >= 3 && (!lastNotice || now - lastNotice >= 60000)) {
+                    state.lastUnconfirmedNoticeAt[slotKey] = now;
+                    bot.log(`[Heal] Slot ${slotKey}: 3 consecutive attempts without a confirmed ${a.expectedResource === 'either' ? 'HP/MP' : a.expectedResource.toUpperCase()} increase. Check supplies, hotbar and cooldowns.`);
+                }
                 state.pendingAttempt[slotKey] = null;
             }
         }
@@ -3831,7 +3951,7 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
         }
 
         // Item (rune or fluid)
-        if (slot.item !== null) {
+        if (slot.item != null) {
             var def = gameClient.itemDefinitionsByCid ? gameClient.itemDefinitionsByCid[slot.item.id] : null;
             if (!def) {
                 if (config.debugCooldown)
@@ -3867,7 +3987,7 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
         }
 
         // Spell
-        if (slot.spell !== null) {
+        if (slot.spell != null) {
             var spellbook = gameClient.player ? gameClient.player.spellbook : null;
             if (!spellbook) {
                 if (config.debugCooldown)
@@ -3958,9 +4078,9 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
         var hp = getHpPercent(stats);
         var mana = getManaPercent(stats);
         var minHp = Number(rule.minHpPercent) || 0;
-        var maxHp = Number(rule.maxHpPercent) || 100;
+        var maxHp = Number(rule.maxHpPercent ?? 100);
         var minMana = Number(rule.minManaPercent) || 0;
-        var maxMana = Number(rule.maxManaPercent) || 100;
+        var maxMana = Number(rule.maxManaPercent ?? 100);
 
         if (hp < minHp || hp > maxHp)
             return false;
@@ -3996,24 +4116,38 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
         return true;
     }
 
+    // Pure readiness probe for the shared action gate. Do not create pending
+    // attempts or block other modules while a heal is on cooldown/awaiting ack.
+    function needsPriorityAction() {
+        if (!state.running || !config.enabled || hasPending()) return false;
+        const stats = readStats();
+        if (!stats.hp || !stats.mana || stats.hp.current <= 0) return false;
+        const now = Date.now();
+        for (const rule of config.healRules || []) {
+            if (rule?.slot && canUseRule(rule, now, stats)) return true;
+        }
+        return false;
+    }
+    bot.actions?.setUrgentCheck?.(needsPriorityAction);
+
     function triggerRule(rule, now, stats) {
         if (!canUseRule(rule, now, stats))
             return false;
         var slot = normalizeHotbarSlot(rule.slot);
         var key = String(slot);
 
-        // Set manual cooldown to prevent spam (fallback)
-        state.manualCooldownUntil[key] = now + config.healCooldownMs;
-
         if (rule.spellWords && rule.spellWords.trim()) {
-            var sent = bot.sendChat(rule.spellWords.trim());
+            var sent = bot.actions.runShared('self-heal-spell',
+                bot.actions.priorities.HEAL, () => bot.sendChat(rule.spellWords.trim()));
             if (sent) {
+                state.manualCooldownUntil[key] = now + config.healCooldownMs;
                 state.lastAttemptAt[key] = now;
                 state.pendingAttempt[key] = {
                     attemptedAt: now,
                     slot: slot,
                     hpBefore: stats.hp.current,
-                    manaBefore: stats.mana.current
+                    manaBefore: stats.mana.current,
+                    expectedResource: expectedHealResource(rule)
                 };
                 if (config.debugCooldown)
                     bot.log("[Heal] Sent spell: " + rule.spellWords);
@@ -4021,14 +4155,17 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
             return sent;
         }
 
-        var clicked = bot.clickHotbar(slot - 1);
+        var clicked = bot.actions.runShared('self-heal-hotbar',
+            bot.actions.priorities.HEAL, () => bot.clickHotbar(slot - 1));
         if (clicked) {
+            state.manualCooldownUntil[key] = now + config.healCooldownMs;
             state.lastAttemptAt[key] = now;
             state.pendingAttempt[key] = {
                 attemptedAt: now,
                 slot: slot,
                 hpBefore: stats.hp.current,
-                manaBefore: stats.mana.current
+                manaBefore: stats.mana.current,
+                expectedResource: expectedHealResource(rule)
             };
             if (config.debugCooldown)
                 bot.log("[Heal] Clicked hotbar slot " + slot);
@@ -4053,7 +4190,8 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
         const words = String(config.paralyzeSpellWords).trim();
         if (config.skipOnCooldown && isSpellWordOnCooldown(words))
             return false;
-        const sent = bot.sendChat(words);
+        const sent = bot.actions.runShared('clear-paralyze',
+            bot.actions.priorities.DEFENSE, () => bot.sendChat(words));
         if (sent) {
             state.lastParalyzeAt = now;
             if (config.debugCooldown)
@@ -4067,12 +4205,26 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
             return false;
         var now = Date.now();
         var stats = readStats();
-        resolvePending(stats, now);
-        if (tryClearParalyze(stats, now))
-            return true;
-        if (hasPending())
+        // A disappearing player snapshot is not a failed heal. Drop the prior
+        // character's pending attempts/cooldowns once, not every 50 ms tick.
+        const player = window.gameClient?.player || null;
+        if (!player || !stats.hp || !stats.mana || !stats.hp.max || !stats.mana.max ||
+            stats.hp.current <= 0) {
+            if (state.hadPlayerSnapshot || state.playerRef) resetHealSession();
+            state.hadPlayerSnapshot = false;
+            state.playerRef = null;
             return false;
-
+        }
+        // A reconnect can replace the player object between two 50 ms ticks,
+        // without ever yielding a missing snapshot. Never attribute a new
+        // character's HP/MP or cooldowns to the old character's heal attempt.
+        if (state.playerRef && state.playerRef !== player) resetHealSession();
+        state.playerRef = player;
+        state.hadPlayerSnapshot = true;
+        resolvePending(stats, now);
+        // Self-healing always gets first chance. Clearing paralyze must not
+        // spend an available action/cooldown ahead of a ready heal rule.
+        if (hasPending()) return false;
         for (var i = 0; i < config.healRules.length; i++) {
             var rule = config.healRules[i];
             if (!rule || !rule.slot)
@@ -4080,7 +4232,9 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
             if (triggerRule(rule, now, stats))
                 return true;
         }
-        return false;
+        // Defensive clearing runs only when no heal was dispatched. Preserve
+        // its configured HP floor and spell/exhaustion cooldown checks.
+        return tryClearParalyze(stats, now);
     }
 
     function scheduleNextTick() {
@@ -4127,6 +4281,9 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
         if (state.timerId)
             clearTimeout(state.timerId);
         state.timerId = null;
+        state.hadPlayerSnapshot = false;
+        state.playerRef = null;
+        resetHealSession();
         if (persist) {
             config.enabled = false;
             persistConfig();
@@ -4158,6 +4315,8 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
             manaPercent: getManaPercent(stats),
             lastHealAt: state.lastHealAt,
             pendingAttempt: state.pendingAttempt,
+            // At most 12 counters; does not grow with session length.
+            unconfirmedBySlot: { ...state.unconfirmedBySlot },
         };
     }
 
@@ -4169,9 +4328,9 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
                     spellWords: String(r.spellWords || "").trim(),
                     manaCost: Math.max(0, Number(r.manaCost) || 0),
                     minHpPercent: Math.max(0, Math.min(100, Number(r.minHpPercent) || 0)),
-                    maxHpPercent: Math.max(0, Math.min(100, Number(r.maxHpPercent) || 100)),
+                    maxHpPercent: Math.max(0, Math.min(100, Number(r.maxHpPercent ?? 100))),
                     minManaPercent: Math.max(0, Math.min(100, Number(r.minManaPercent) || 0)),
-                    maxManaPercent: Math.max(0, Math.min(100, Number(r.maxManaPercent) || 100)),
+                    maxManaPercent: Math.max(0, Math.min(100, Number(r.maxManaPercent ?? 100))),
                 };
             });
         }
@@ -4273,7 +4432,8 @@ window.__minibiaBotBundle.installAutoInvisibleModule = function installAutoInvis
     function tryCastInvisible(now = Date.now()) {
         if (!config.enabled || !canCastInvisible(now))
             return false;
-        const sent = bot.sendChat(config.spellWords);
+        const sent = bot.actions.runShared('invisibility',
+            bot.actions.priorities.DEFENSE, () => bot.sendChat(config.spellWords));
         if (sent)
             state.lastCastAt = now;
         return sent;
@@ -4483,7 +4643,8 @@ window.__minibiaBotBundle.installAutoMagicShieldModule = function installAutoMag
     function tryCastMagicShield(now = Date.now()) {
         if (!config.enabled || !canCastMagicShield(now))
             return false;
-        const sent = bot.sendChat(config.spellWords);
+        const sent = bot.actions.runShared('magic-shield',
+            bot.actions.priorities.DEFENSE, () => bot.sendChat(config.spellWords));
         if (sent) {
             state.lastCastAt = now;
             state.assumedActiveUntil = now + MAGIC_SHIELD_FALLBACK_DURATION_MS;
@@ -4649,12 +4810,212 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         lastMoveAt: 0,
         lastProgressAt: 0,
         lastTargetHealth: null,
+        lastTargetHealthPercent: null,
+        lastDamageAt: 0,
+        lastApproachCost: null,
+        lastTargetPos: null,
+        lastChaseProgressReason: null,
+        finishTargetBlocks: 0,
         stuckStartAt: 0,
         lastKiteWaypoint: null,
         kiteTargetKey: null,
         kiteOriginalIndex: null,
         lastDiagonalCorrection: 0,
         diagonalAttempted: false,
+        // v1.4.85: target stickiness / session / movement ownership.
+        targetSelectedAt: 0,
+        lastTargetChangeAt: 0,
+        lastRetargetAt: 0,
+        lastSelectedTargetId: null,
+        // v1.4.92: challenger confirmation prevents moving monsters with
+        // near-identical route scores from making targeting oscillate.
+        retargetCandidateId: null,
+        retargetCandidateSince: 0,
+        retargetCandidateAdvantage: 0,
+        lastRetargetReason: null,
+        // v1.4.90: fast, gapless handoff after death/removal/skip.
+        lastTargetLossAt: 0,
+        lastTargetLossId: null,
+        lastTargetHandoffAt: 0,
+        lastInvalidTargetAt: 0,
+        lastInvalidTargetReason: null,
+        canonicalTargetRefreshes: 0,
+        canonicalFollowRefreshes: 0,
+        candidateSnapshotAt: 0,
+        candidateSnapshot: null,
+        candidateSnapshotBuilds: 0,
+        candidateSnapshotHits: 0,
+        lastCandidateBuildMs: 0,
+        lastCandidateCount: 0,
+        lastCandidateScoreEvaluations: 0,
+        approachPathSearches: 0,
+        approachAlternativeProbes: 0,
+        approachBetterSelections: 0,
+
+        // v1.5.01: hard protection-zone guard. Native tile state is primary;
+        // status icon and cancel-message detection are independent fallbacks.
+        protectionZoneBlocked: false,
+        protectionZoneBlockedSince: 0,
+        protectionZoneBlockReason: null,
+        protectionZoneBlockedTicks: 0,
+        protectionZonePreventedTargets: 0,
+        protectionZoneAutoTargetClears: 0,
+        protectionZoneCancelBlockedUntil: 0,
+        protectionZoneLastCancelText: "",
+        protectionZoneLastCancelAt: 0,
+
+        // v1.5.02: server TargetPacket acknowledgement tracking.
+        targetAckHookOwner: null,
+        targetAckOriginal: null,
+        targetAckWrapper: null,
+        pendingTargetId: null,
+        pendingTargetSentAt: 0,
+        targetAckCount: 0,
+        targetRejectCount: 0,
+        targetAckTimeoutCount: 0,
+        targetServerOverrideCount: 0,
+        lastTargetAckAt: 0,
+        lastTargetAckId: null,
+        lastTargetAckLatencyMs: null,
+        lastTargetRejectAt: 0,
+        lastTargetRejectId: null,
+        lastTargetAckTimeoutAt: 0,
+        lastServerTargetAt: 0,
+        lastServerTargetId: null,
+
+        // v1.5.03: event-driven cancel-message capture + adaptive target
+        // rejection backoff. DOM polling remains only as a fallback.
+        cancelHookOwner: null,
+        cancelHookOriginal: null,
+        cancelHookWrapper: null,
+        cancelMessageEvents: 0,
+        protectionZoneCancelHookHits: 0,
+        targetCancelRejectCount: 0,
+        rejectedTargetBackoff: new Map(),
+        lastTargetRejectReason: null,
+        lastTargetRejectBackoffMs: 0,
+        rejectedAutoTargetLocalClears: 0,
+        lastRejectedAutoTargetClearAt: 0,
+
+        // v1.5.05: one normalized Anti-KS player snapshot per attack tick.
+        antiKSSnapshotAt: 0,
+        antiKSSnapshot: null,
+        antiKSSnapshotBuilds: 0,
+        antiKSSnapshotHits: 0,
+        antiKSLastOtherPlayerCount: 0,
+        antiKSLastBlockedTargetId: null,
+        antiKSLastBlockedPlayerId: null,
+        antiKSLastBlockedPlayerName: null,
+        antiKSLastBlockedDistance: null,
+        antiKSLastBlockedAt: 0,
+
+        // v1.5.06: engaged-target lookup now uses activeCreatures directly
+        // instead of scanning/sorting the full visible monster list.
+        engagedDirectLookupHits: 0,
+        engagedDirectLookupMisses: 0,
+        staleEngagedFollowClears: 0,
+
+        // v1.5.07: lure mode keeps CaveBot moving toward its next/current
+        // waypoint until enough on-screen mobs have been gathered.
+        lureActive: false,
+        lureMobCount: 0,
+        lurePreferredVisible: false,
+
+        // v1.5.18: preferred targets have a two-stage lure handoff:
+        // tracked -> actionable. Merely detecting a preferred mob outside the
+        // real attackable area no longer drops lure into ordinary combat.
+        lurePreferredPending: false,
+        lurePreferredTrackedId: null,
+        lurePreferredTrackedName: null,
+        lurePreferredTrackedDistance: null,
+        lurePreferredActionableId: null,
+        lurePreferredPendingSince: 0,
+        lurePreferredLastSeenAt: 0,
+        lurePreferredPendingActivations: 0,
+        lurePreferredSuppressedTargets: 0,
+        lurePreferredHandoffs: 0,
+        lurePreferredLastReason: null,
+
+        lureReason: null,
+        lureWaypointIndex: null,
+        lureWaypoint: null,
+        lureStartedAt: 0,
+        lureActivations: 0,
+        lureTargetReleases: 0,
+        lureThresholdReachedAt: 0,
+        lureAttackTicks: 0,
+        lureTargetsAcquired: 0,
+        lureRunesUsed: 0,
+        lureOutOfRangeClears: 0,
+
+        // v1.5.13: smart lure preserves the pack while attack-through is
+        // active. It spreads damage toward healthier/non-trailing mobs and
+        // rotates away from low-HP mobs when a better lure target exists.
+        lureSmartSwitches: 0,
+        lureLastSmartSwitchAt: 0,
+        lureLastSmartFromId: null,
+        lureLastSmartToId: null,
+        lureLastSmartReason: null,
+        lureRunePreserveSkips: 0,
+        lureSmartTargetScore: null,
+        lureSmartTargetHealthPct: null,
+
+        // v1.5.15: predictive pack leash. Track distance trend for each lure
+        // mob so CaveBot can stop before a trailing mob reaches the hard edge.
+        lureMotionHistory: new Map(),
+        lurePredictiveHolds: 0,
+        lurePredictiveLastMobId: null,
+        lurePredictiveLastMobName: null,
+        lurePredictiveLastAt: 0,
+        lurePredictiveLastAwaySteps: 0,
+
+        // v1.5.16: when exactly one lure mob remains and is already very low
+        // HP, stop "preserving" it forever. Either finish it in place or let
+        // CaveBot move in short bursts while attacks continue.
+        lureLastMobActive: false,
+        lureLastMobMode: null,
+        lureLastMobId: null,
+        lureLastMobName: null,
+        lureLastMobHealthPct: null,
+        lureLastMobStartedAt: 0,
+        lureLastMobActivations: 0,
+        lureLastMobFinishes: 0,
+        lureLastMobRuneBursts: 0,
+
+        // v1.5.09: screen leash. CaveBot pauses forward movement when a mob
+        // being pulled falls toward the trailing edge of the native viewport.
+        lureMovementHeld: false,
+        lureLeashMobId: null,
+        lureLeashMobName: null,
+        lureLeashScreenX: null,
+        lureLeashScreenY: null,
+        lureLeashTileDistance: null,
+        lureLeashStartedAt: 0,
+        lureLeashLastSeenAt: 0,
+        lureLeashActivations: 0,
+        lureLeashResumes: 0,
+        lureLeashLostTimeouts: 0,
+        lureLeashReason: null,
+
+        // v1.4.97: distinguish mb0t-selected targets from a monster the user
+        // clicked manually so optional retargeting can respect user intent.
+        autoTargetId: null,
+        lastObservedTargetId: null,
+        manualTargetId: null,
+        manualTargetSince: 0,
+        manualTargetProtectUntil: 0,
+        manualTargetDetections: 0,
+        lastTargetOwner: null,
+        playerSessionRef: null,
+        playerSessionSeen: false,
+        movementOwner: null,
+        movementOwnedUntil: 0,
+        // v1.4.86: native rune cooldown + server-side inventory count.
+        lastRuneCountRequestAt: 0,
+        lastRuneMissingWarningAt: 0,
+        runeCountItemId: 0,
+        runeCountFluidType: 0,
+        unsubscribeRuneCounts: null,
     };
 
     const storedConfig = bot.storage.get(configStorageKey, {}) || {};
@@ -4679,10 +5040,117 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         kiteStuckCount: 0,
         unreachableStart: 0,
         keepDiagonal: false,
+        // Keep a target briefly before ordinary distance-based retargeting. A
+        // preferred target can still pre-empt immediately.
+        targetStickMs: 1800,
+        retargetCooldownMs: 1200,
+        retargetDistanceAdvantage: 2,
+        // A non-preferred challenger must remain meaningfully better for this
+        // long before an ordinary retarget. Preferred targets still pre-empt.
+        retargetConfirmMs: 450,
+        // Finish a low-HP monster if we're actively damaging it. This only
+        // suppresses ordinary route/distance retargets; preferred targets and
+        // forced death/unreachable/invalid handoffs still pre-empt immediately.
+        finishTargetHealthPct: 30,
+        finishTargetDamageGraceMs: 2500,
+        manualTargetHoldMs: 3000,
+        targetAckTimeoutMs: 1200,
+        lureMode: false,
+        lureMobThreshold: 3,
+        // Only creatures inside this Chebyshev tile radius participate in
+        // lure counting, preferred detection, attack-through and pack leash.
+        lureRadius: 5,
+
+        // Smart Lure only affects attack-through while mob count is below the
+        // lure threshold. Normal combat keeps the existing finish-the-kill
+        // behavior. Preserve HP is a soft floor: rotate only if a healthier
+        // alternative exists, rather than refusing to attack completely.
+        lureSmartTargeting: true,
+        lurePreserveHpPct: 30,
+        lureSmartSwitchCooldownMs: 900,
+        lureSmartHealthAdvantagePct: 12,
+
+        // Predictive leash is part of Smart Lure. Two real distance increases
+        // inside this window are treated as a mob actively losing ground.
+        lurePredictiveLeash: true,
+        lurePredictiveAwaySteps: 2,
+        lurePredictiveWindowMs: 1800,
+
+        // Last low-HP lure mob exception. "slow" keeps attacking while CaveBot
+        // alternates movement/hold pulses; "kill" holds CaveBot until it dies.
+        lureLastMobHpPct: 20,
+        lureLastMobMode: "slow",
+
+        // A preferred mob can be tracked just beyond the strict attackable
+        // screen/range so lure movement can continue toward it without
+        // killing the ordinary pack first.
+        lurePreferredTrackRadius: 12,
+        lurePreferredLostGraceMs: 1200,
+
+        // Native small-screen bounds are <8 x <6 projected tiles. Pause route
+        // movement before a trailing mob reaches that hard edge, then resume
+        // only after it catches up into the inner band (hysteresis).
+        lureLeashEdgeX: 6,
+        lureLeashEdgeY: 4,
+        lureLeashResumeX: 4,
+        lureLeashResumeY: 3,
+        lureLeashLostGraceMs: 1800,
+
+        // Normal acquisition is still guarded by targetCooldownMs, but after
+        // a target is lost/cleared we can acquire the next monster quickly.
+        fastReacquireMs: 150,
+        runeCountRefreshMs: 5000,
+        runeCountFreshMs: 12000,
     },
             storedConfig);
     if (config.targetHotbarSlot == null && storedConfig.hotbarSlot != null) {
         config.targetHotbarSlot = storedConfig.hotbarSlot;
+    }
+
+    // Defensive normalization for the retarget guard. These are intentionally
+    // conservative and do not alter how the initial target is selected.
+    {
+        const stick = Number(config.targetStickMs);
+        const cooldown = Number(config.retargetCooldownMs);
+        const advantage = Number(config.retargetDistanceAdvantage);
+        config.targetStickMs = Number.isFinite(stick) ? Math.max(0, Math.min(10000, stick)) : 1800;
+        config.retargetCooldownMs = Number.isFinite(cooldown) ? Math.max(0, Math.min(10000, cooldown)) : 1200;
+        config.retargetDistanceAdvantage = Number.isFinite(advantage) ? Math.max(1, Math.min(10, Math.trunc(advantage))) : 2;
+        config.retargetConfirmMs = Math.max(100, Math.min(2000, Number(config.retargetConfirmMs) || 450));
+        config.finishTargetHealthPct = Math.max(1, Math.min(90, Number(config.finishTargetHealthPct) || 30));
+        config.finishTargetDamageGraceMs = Math.max(500, Math.min(10000, Number(config.finishTargetDamageGraceMs) || 2500));
+        config.manualTargetHoldMs = Math.max(500, Math.min(10000, Number(config.manualTargetHoldMs) || 3000));
+        config.targetAckTimeoutMs = Math.max(400, Math.min(3000, Number(config.targetAckTimeoutMs) || 1200));
+        config.lureMode = !!config.lureMode;
+        config.lureMobThreshold = Math.max(1, Math.min(20, Math.trunc(Number(config.lureMobThreshold) || 3)));
+        config.lureRadius = Math.max(1, Math.min(8, Math.trunc(Number(config.lureRadius) || 5)));
+        config.lureSmartTargeting = config.lureSmartTargeting !== false;
+        config.lurePreserveHpPct = Math.max(5, Math.min(90, Number(config.lurePreserveHpPct) || 30));
+        config.lureSmartSwitchCooldownMs = Math.max(300, Math.min(3000, Number(config.lureSmartSwitchCooldownMs) || 900));
+        config.lureSmartHealthAdvantagePct = Math.max(5, Math.min(50, Number(config.lureSmartHealthAdvantagePct) || 12));
+        config.lurePredictiveLeash = config.lurePredictiveLeash !== false;
+        config.lurePredictiveAwaySteps = Math.max(1, Math.min(4, Math.trunc(Number(config.lurePredictiveAwaySteps) || 2)));
+        config.lurePredictiveWindowMs = Math.max(600, Math.min(4000, Number(config.lurePredictiveWindowMs) || 1800));
+        config.lureLastMobHpPct = Math.max(5, Math.min(90, Number(config.lureLastMobHpPct) || 20));
+        config.lureLastMobMode = String(config.lureLastMobMode || "slow").toLowerCase() === "kill"
+            ? "kill"
+            : "slow";
+        config.lurePreferredTrackRadius = Math.max(
+            6,
+            Math.min(20, Math.trunc(Number(config.lurePreferredTrackRadius) || 12))
+        );
+        config.lurePreferredLostGraceMs = Math.max(
+            300,
+            Math.min(3000, Number(config.lurePreferredLostGraceMs) || 1200)
+        );
+        config.lureLeashEdgeX = Math.max(3, Math.min(7, Number(config.lureLeashEdgeX) || 6));
+        config.lureLeashEdgeY = Math.max(2, Math.min(5, Number(config.lureLeashEdgeY) || 4));
+        config.lureLeashResumeX = Math.max(2, Math.min(config.lureLeashEdgeX - 1, Number(config.lureLeashResumeX) || 4));
+        config.lureLeashResumeY = Math.max(1, Math.min(config.lureLeashEdgeY - 1, Number(config.lureLeashResumeY) || 3));
+        config.lureLeashLostGraceMs = Math.max(500, Math.min(5000, Number(config.lureLeashLostGraceMs) || 1800));
+        config.fastReacquireMs = Math.max(50, Math.min(500, Number(config.fastReacquireMs) || 150));
+        config.runeCountRefreshMs = Math.max(2000, Math.min(30000, Number(config.runeCountRefreshMs) || 5000));
+        config.runeCountFreshMs = Math.max(config.runeCountRefreshMs, Math.min(60000, Number(config.runeCountFreshMs) || 12000));
     }
 
     // ---- Constants for floor-change detection (copied from cave module) ----
@@ -4999,51 +5467,114 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
     // ---- REACHABILITY CACHE ----
     const reachCache = new Map();
-    function isTargetReachable(target) {
-        if (!target)
-            return false;
-        const key = target.id;
-        const now = Date.now();
-        if (reachCache.has(key) && reachCache.get(key).expires > now) {
-            return reachCache.get(key).reachable;
+
+    function setReachCache(key, value, now = Date.now()) {
+        // Remove expired entries opportunistically and keep a hard cap. This
+        // prevents creature IDs from accumulating over multi-hour hunts.
+        for (const [cachedId, cached] of reachCache) {
+            if (!cached || cached.expires <= now)
+                reachCache.delete(cachedId);
         }
+        reachCache.set(key, value);
+        while (reachCache.size > 128) {
+            const oldestId = reachCache.keys().next().value;
+            if (oldestId === undefined) break;
+            reachCache.delete(oldestId);
+        }
+    }
+
+    function getTargetApproachInfo(target) {
+        if (!target)
+            return {
+                reachable: false,
+                pathSteps: Number.POSITIVE_INFINITY,
+                pathCost: Number.POSITIVE_INFINITY
+            };
+
+        const now = Date.now();
         const playerPos = normalizePosition(bot.getPlayerPosition());
         const targetPos = normalizePosition(target.getPosition?.() || target.__position);
-        if (!playerPos || !targetPos || playerPos.z !== targetPos.z)
-            return false;
-        // Quick distance check – if too far, don't bother
+        if (!playerPos || !targetPos || playerPos.z !== targetPos.z) {
+            return {
+                reachable: false,
+                pathSteps: Number.POSITIVE_INFINITY,
+                pathCost: Number.POSITIVE_INFINITY
+            };
+        }
+
         const dist = getTileDistance(playerPos, targetPos);
         const maxDist = Math.max(1, Number(config.maxTargetDistance) || 5);
         if (dist > maxDist + 2) {
-            reachCache.set(key, {
+            return {
                 reachable: false,
-                expires: now + 5000
-            });
-            return false;
+                pathSteps: Number.POSITIVE_INFINITY,
+                pathCost: Number.POSITIVE_INFINITY
+            };
         }
-        let reachable = false;
+
+        // No walking is required when the monster is already adjacent.
+        if (dist <= 1) {
+            return {
+                reachable: true,
+                pathSteps: 0,
+                pathCost: 0,
+                geometricDistance: dist
+            };
+        }
+
+        // Position-sensitive cache: moving monsters get fresh route data.
+        const cacheKey = [
+            target.id,
+            playerPos.x, playerPos.y, playerPos.z,
+            targetPos.x, targetPos.y, targetPos.z
+        ].join(":");
+        const cached = reachCache.get(cacheKey);
+        if (cached && cached.expires > now)
+            return cached;
+
+        // Geometric fallback keeps targeting fail-open during transient
+        // pathfinder/chunk races.
+        let result = {
+            reachable: true,
+            pathSteps: Math.max(0, dist - 1),
+            pathCost: Math.max(0, dist - 1) * 100,
+            geometricDistance: dist,
+            expires: now + 900
+        };
+
         try {
-            const from = new Position(playerPos.x, playerPos.y, playerPos.z);
-            const to = new Position(targetPos.x, targetPos.y, targetPos.z);
             const pf = window.gameClient?.world?.pathfinder;
-            if (pf && typeof pf.search === 'function') {
-                const startTile = pf.getTileFromWorldPosition(from);
-                const endTile = pf.getTileFromWorldPosition(to);
-                if (startTile && endTile) {
-                    const path = pf.search(startTile, endTile);
-                    reachable = Array.isArray(path) && path.length > 0;
+            if (pf && typeof pf.search === "function") {
+                const approach = findReachableAdjacentPath(targetPos, playerPos);
+                if (approach) {
+                    result = {
+                        reachable: true,
+                        pathSteps: approach.pathSteps,
+                        pathCost: approach.pathCost,
+                        geometricDistance: dist,
+                        approachPosition: approach.position,
+                        expires: now + 900
+                    };
+                } else {
+                    result = {
+                        reachable: false,
+                        pathSteps: Number.POSITIVE_INFINITY,
+                        pathCost: Number.POSITIVE_INFINITY,
+                        geometricDistance: dist,
+                        expires: now + 900
+                    };
                 }
             }
         } catch (e) {
-            // On error, assume reachable to avoid false skips
-            reachable = true;
+            // Keep the geometric fallback.
         }
-        // Cache for 3 seconds (adjustable)
-        reachCache.set(key, {
-            reachable,
-            expires: now + 3000
-        });
-        return reachable;
+
+        setReachCache(cacheKey, result, now);
+        return result;
+    }
+
+    function isTargetReachable(target) {
+        return !!getTargetApproachInfo(target).reachable;
     }
 
     // ---- Kite: move backward along cave route, or away from target ----
@@ -5251,11 +5782,73 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             return false;
         const now = Date.now();
 
+        // v1.5.01: stop before target selection, chase, kite, or rune work.
+        // This is proactive (native tile/icon) with server cancel-message
+        // fallback, so TargetPacket(target.id) is normally never attempted in PZ.
+        if (suspendTargetingForProtectionZone(now))
+            return false;
+
+        // v1.5.08: below the requested on-screen mob count, keep attacking
+        // ordinary mobs while CaveBot continues pulling toward the waypoint.
+        // Targeting is forbidden from owning movement in this branch.
+        if (syncLureMode(now))
+            return tryLureAttack(now);
+
+        let tickCandidates = null;
+        const getTickCandidates = () => {
+            if (!tickCandidates)
+                tickCandidates = getMonsterCandidates(now);
+            return tickCandidates;
+        };
+
         // 1) Clear target if too far
         if (resetTargetIfTooFar(now))
             return true;
 
         syncCombatState(now);
+
+        // v1.4.90: the game keeps a dead creature around briefly for its death
+        // fade, so __target can still point at a 0-HP monster. Switch away
+        // immediately instead of wasting chase/rune time on the corpse.
+        const deadTarget = getCurrentTarget();
+        const deadHealth = deadTarget?.state?.health ?? deadTarget?.health ?? null;
+        if (deadTarget && Number.isFinite(Number(deadHealth)) && Number(deadHealth) <= 0) {
+            handoffTarget(deadTarget, "target defeated", now, 300);
+            return true;
+        }
+
+        // v1.4.93: validate the live target before chase/kite/runes. This
+        // catches floor changes, despawns, stale/non-monster targets, own
+        // summons, and targets that left the native small-screen view.
+        // Reachability is intentionally handled later with its grace timer.
+        const liveTarget = getCurrentTarget();
+        if (liveTarget) {
+            const liveInfo = isTargetValidAndOnScreen(liveTarget, {
+                returnDetails: true,
+                maxDx: 8,
+                maxDy: 6,
+                skipReachability: true
+            });
+            if (!liveInfo.valid) {
+                state.lastInvalidTargetAt = now;
+                state.lastInvalidTargetReason = liveInfo.reason;
+                const invalidSkipMs =
+                    liveInfo.reason === "not in activeCreatures" || liveInfo.reason === "dead target"
+                        ? 300
+                        : 1200;
+                handoffTarget(liveTarget, `invalid current target: ${liveInfo.reason}`, now, invalidSkipMs);
+                return true;
+            }
+        }
+
+        // v1.4.88: Anti-KS must protect an already-engaged target too. A
+        // player can enter the area after selection; release the target before
+        // chase/kite/rune actions rather than waiting for the next retarget.
+        const antiKSTarget = getEngagedTarget();
+        if (antiKSTarget && releaseTargetForAntiKS(antiKSTarget, now)) {
+            state.unreachableStart = 0;
+            return false;
+        }
 
         // 2) Movement
         if (config.kiteMode && getEngagedTarget()) {
@@ -5277,13 +5870,18 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             state.lastProgressAt = 0;
             state.lastDistance = undefined;
             state.lastTargetHealth = null;
+            state.lastTargetHealthPercent = null;
+            state.lastDamageAt = 0;
+            state.lastApproachCost = null;
+            state.lastTargetPos = null;
+            state.lastChaseProgressReason = null;
             state.unreachableStart = 0;
             return triggerAttack(now);
         }
         const playerPos = normalizePosition(bot.getPlayerPosition());
         const targetPos = normalizePosition(current.getPosition?.() || current.__position);
         if (!playerPos || !targetPos) {
-            skipTarget(current, "missing position", now, 3000);
+            handoffTarget(current, "missing position", now, 3000);
             state.unreachableStart = 0;
             return false;
         }
@@ -5293,14 +5891,14 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
         // ★ NEW: For melee mode without client chase, skip target as soon as it's out of melee range
         if (config.meleeMode && !config.useClientChase && dist > maxDist) {
-            skipTarget(current, "melee target out of range (no chase)", now, 500);
+            handoffTarget(current, "melee target out of range (no chase)", now, 500);
             state.unreachableStart = 0;
             return false;
         }
 
         // Skip only if clearly out of range (maxDist + 1)
         if (dist > maxDist + 1) {
-            skipTarget(current, "target too far (distance check)", now, 2000);
+            handoffTarget(current, "target too far (distance check)", now, 2000);
             state.unreachableStart = 0;
             return false;
         }
@@ -5310,7 +5908,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             if (!state.unreachableStart)
                 state.unreachableStart = now;
             if (now - state.unreachableStart > 3000) {
-                skipTarget(current, "unreachable (wall)", now, 2000);
+                handoffTarget(current, "unreachable (wall)", now, 2000);
                 state.unreachableStart = 0;
                 return false;
             }
@@ -5320,86 +5918,237 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             state.unreachableStart = 0;
         }
 
-        // 4) Stuck detection – but only if there is another monster to switch to
+        // 4) Unified stuck/progress detection. This is the only subsystem that
+        // decides to abandon a valid melee target for "no progress".
         const health = current.state?.health ?? current.health ?? null;
+        const healthPercent = getCreatureHealthPercent(current);
+        const approachInfo = getTargetApproachInfo(current);
+        const approachCost = Number.isFinite(approachInfo?.pathCost)
+            ? approachInfo.pathCost
+            : null;
+        const currentTargetPos = normalizePosition(current.getPosition?.() || current.__position);
         let progress = false;
+        let progressReason = null;
 
         // Initialize tracking for new target
         if (state.lastDistance === undefined || state.engagedTargetId !== current.id) {
             state.lastDistance = dist;
             state.lastProgressAt = now;
             state.lastTargetHealth = health;
+            state.lastTargetHealthPercent = healthPercent;
+            state.lastDamageAt = 0;
+            state.lastApproachCost = approachCost;
+            state.lastTargetPos = currentTargetPos ? { ...currentTargetPos } : null;
+            state.lastChaseProgressReason = "target acquired";
             state.engagedTargetId = current.id;
-            state.lastPlayerPos = playerPos;
+            state.lastPlayerPos = playerPos ? { ...playerPos } : null;
         } else {
-            // Progress: distance decreased, health dropped, or player moved
-            if (dist < state.lastDistance - 0.5)
+            // Getting physically closer is direct chase progress.
+            if (dist < state.lastDistance - 0.5) {
                 progress = true;
-            if (health !== null && state.lastTargetHealth !== null && health < state.lastTargetHealth - 1)
+                progressReason = "distance decreased";
+            }
+
+            // Around walls/corners raw tile distance may stay flat while the
+            // actual route becomes shorter. The A* path cost is a better signal.
+            if (
+                approachCost !== null &&
+                Number.isFinite(state.lastApproachCost) &&
+                approachCost < state.lastApproachCost - 25
+            ) {
                 progress = true;
-            if (playerPos.x !== state.lastPlayerPos.x || playerPos.y !== state.lastPlayerPos.y) {
+                progressReason = "approach path improved";
+            }
+
+            // If both the monster and the player moved since the previous tick,
+            // mb0t is actively pursuing a moving target even when the gap stays
+            // constant. This avoids false "stuck" switches during normal chase.
+            const playerMoved =
+                !!playerPos &&
+                !!state.lastPlayerPos &&
+                (
+                    playerPos.x !== state.lastPlayerPos.x ||
+                    playerPos.y !== state.lastPlayerPos.y ||
+                    playerPos.z !== state.lastPlayerPos.z
+                );
+            const targetMoved =
+                !!currentTargetPos &&
+                !!state.lastTargetPos &&
+                (
+                    currentTargetPos.x !== state.lastTargetPos.x ||
+                    currentTargetPos.y !== state.lastTargetPos.y ||
+                    currentTargetPos.z !== state.lastTargetPos.z
+                );
+            if (playerMoved && targetMoved) {
                 progress = true;
+                progressReason = "moving-target pursuit";
+            }
+
+            // A real HP decrease is the strongest evidence that combat is
+            // progressing. Fractional/small damage updates count too.
+            const tookDamage =
+                health !== null &&
+                state.lastTargetHealth !== null &&
+                Number.isFinite(Number(health)) &&
+                Number.isFinite(Number(state.lastTargetHealth)) &&
+                Number(health) < Number(state.lastTargetHealth);
+            if (tookDamage) {
+                progress = true;
+                progressReason = "target damaged";
+                state.lastDamageAt = now;
             }
 
             if (progress) {
                 state.lastProgressAt = now;
+                state.lastChaseProgressReason = progressReason;
             }
 
-            // Update stored values
+            // Update stored values for the next tick.
             state.lastDistance = dist;
             state.lastTargetHealth = health;
-            state.lastPlayerPos = playerPos;
+            state.lastTargetHealthPercent = healthPercent;
+            state.lastApproachCost = approachCost;
+            state.lastTargetPos = currentTargetPos ? { ...currentTargetPos } : null;
+            state.lastPlayerPos = playerPos ? { ...playerPos } : null;
 
-            // Stuck timeout: 4 seconds
             const timeStuck = now - state.lastProgressAt;
 
-            // Only skip if we've been stuck for >4s AND there is another visible monster
+            // Only switch after 6s without meaningful progress AND when a real
+            // alternative exists. Otherwise keep the current target and restart
+            // the observation window instead of clearing/reacquiring it.
             if (timeStuck > 6000) {
-                const candidates = getMonsterCandidates(now);
+                const candidates = getTickCandidates();
                 const hasAlternative = candidates.some(m => m.id !== current.id);
                 if (hasAlternative) {
-                    skipTarget(current, "no progress for 4s, alternative exists", now, 2000);
+                    handoffTarget(current, "no meaningful progress for 6s, alternative exists", now, 2000, candidates);
                     state.unreachableStart = 0;
-                    return false;
+                    return true;
                 } else {
                     state.lastProgressAt = now;
+                    state.lastChaseProgressReason = "no alternative; retained target";
                     bot.log("No alternative target – sticking to", current.name);
                 }
             }
         }
 
         // 5) Optional: switch to a better target
-        const candidates = getMonsterCandidates(now);
+        const candidates = getTickCandidates();
         if (candidates.length) {
             const best = candidates[0];
             const currentInfo = isTargetValidAndOnScreen(current, {
                 returnDetails: true,
-                maxDx: 7,
-                maxDy: 5,
+                maxDx: 8,
+                maxDy: 6,
                 skipReachability: true
             });
             const bestInfo = isTargetValidAndOnScreen(best, {
                 returnDetails: true,
-                maxDx: 7,
-                maxDy: 5,
+                maxDx: 8,
+                maxDy: 6,
                 skipReachability: true
             });
 
             if (bestInfo.valid && currentInfo.valid) {
-                const currentDist = currentInfo.distance;
-                const bestDist = bestInfo.distance;
+                if (isSameCreature(current, best)) {
+                    resetRetargetCandidate();
+                } else {
+                    // Preferred targets retain immediate pre-emption. Ordinary
+                    // retargeting is preference-neutral and compares the same
+                    // route/distance score that selected "best" in the first
+                    // place, fixing the old route-score vs tile-distance split.
+                    const preferredUpgrade = bestInfo.preferred && !currentInfo.preferred;
+                    const currentScore = getCreatureRetargetScore(current);
+                    const bestScore = getCreatureRetargetScore(best);
+                    const scoreAdvantage =
+                        Number.isFinite(currentScore) && Number.isFinite(bestScore)
+                            ? currentScore - bestScore
+                            : 0;
 
-                // Switch if:
-                // 1) best is preferred and current isn't, OR
-                // 2) best is at least 1 tile closer (was +3), OR
-                // 3) best is adjacent (<=1) and current is not adjacent (>1)
-                if ((bestInfo.preferred && !currentInfo.preferred) ||
-                    (bestDist !== undefined && currentDist !== undefined && (bestDist + 1) < currentDist) ||
-                    (bestDist !== undefined && bestDist <= 1 && currentDist > 1)) {
-                    skipTarget(current, "switching to better target", now, 500);
-                    state.unreachableStart = 0;
-                    return false;
+                    const heldForMs = state.targetSelectedAt ? now - state.targetSelectedAt : 0;
+                    const stickMs = Math.max(0, Number(config.targetStickMs) || 0);
+                    const retargetCooldownMs = Math.max(0, Number(config.retargetCooldownMs) || 0);
+                    const confirmMs = Math.max(100, Number(config.retargetConfirmMs) || 450);
+
+                    // Existing "distance advantage" remains backward-compatible:
+                    // one tile maps to 100 path-cost points, matching the game's
+                    // minimum A* ground cost. Default 2 therefore requires about
+                    // two cardinal steps of real route improvement.
+                    const distanceAdvantage = Math.max(1, Number(config.retargetDistanceAdvantage) || 2);
+                    const scoreThreshold = distanceAdvantage * 100;
+                    const clearlyBetter = scoreAdvantage >= scoreThreshold;
+                    const challengerHeldMs = clearlyBetter
+                        ? trackRetargetCandidate(best, scoreAdvantage, now)
+                        : (resetRetargetCandidate(), 0);
+
+                    const currentHealthPct = getCreatureHealthPercent(current);
+                    const finishHealthPct = Math.max(1, Math.min(90, Number(config.finishTargetHealthPct) || 30));
+                    const finishDamageGraceMs = Math.max(500, Number(config.finishTargetDamageGraceMs) || 2500);
+                    const damageAgeMs = state.lastDamageAt
+                        ? Math.max(0, now - state.lastDamageAt)
+                        : Number.POSITIVE_INFINITY;
+
+                    // If we're already actively burning down a low-HP target,
+                    // finish it instead of changing targets for a merely better
+                    // route. Preferred targets remain immediate; forced invalid,
+                    // unreachable and stuck handoffs occur before this gate.
+                    const finishTargetProtected =
+                        !preferredUpgrade &&
+                        Number.isFinite(currentHealthPct) &&
+                        currentHealthPct > 0 &&
+                        currentHealthPct <= finishHealthPct &&
+                        damageAgeMs <= finishDamageGraceMs;
+
+                    const manualTargetProtected = isManualTargetProtected(current, now);
+
+                    if (finishTargetProtected) {
+                        state.finishTargetBlocks++;
+                        resetRetargetCandidate();
+                    }
+                    if (manualTargetProtected) {
+                        // A deliberate manual monster selection temporarily
+                        // outranks both ordinary and preferred optional switches.
+                        resetRetargetCandidate();
+                    }
+
+                    const ordinaryRetargetReady =
+                        !manualTargetProtected &&
+                        !finishTargetProtected &&
+                        heldForMs >= stickMs &&
+                        now - state.lastRetargetAt >= retargetCooldownMs &&
+                        challengerHeldMs >= confirmMs;
+
+                    if (!manualTargetProtected && (preferredUpgrade || (ordinaryRetargetReady && clearlyBetter))) {
+                        const reason = preferredUpgrade
+                            ? "switching to preferred target"
+                            : (config.meleeMode && !config.kiteMode
+                                ? "switching to better approach route"
+                                : "switching to clearly closer target");
+                        if (setCurrentTarget(best)) {
+                            state.lastRetargetAt = now;
+                            state.lastRetargetReason = reason;
+                            state.lastTargetHotkeyAt = now;
+                            state.unreachableStart = 0;
+                            resetRetargetCandidate();
+                            markCombatActive(now);
+                            bot.log("retargeted auto attack", {
+                                fromId: current.id,
+                                fromName: current.name || "Mob",
+                                toId: best.id,
+                                toName: best.name || "Mob",
+                                reason,
+                                scoreAdvantage,
+                                scoreThreshold,
+                                challengerHeldMs,
+                                currentHealthPct,
+                                damageAgeMs,
+                                previousTargetOwner: state.lastTargetOwner,
+                            });
+                            return true;
+                        }
+                    }
                 }
+            } else {
+                resetRetargetCandidate();
             }
         }
 
@@ -5407,9 +6156,12 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         if (getCurrentTarget()) {
             if (config.runeHotbarSlot && triggerRune(now))
                 return true;
-            return triggerAttack(now);
+
+            // TargetPacket acquisition is already complete. triggerAttack()
+            // only acquires a target and can never do work while one exists.
+            return false;
         } else {
-            return triggerAttack(now);
+            return triggerAttack(now, getTickCandidates());
         }
     }
 
@@ -5474,6 +6226,53 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         return bonus + distance;
     }
 
+    function getCreatureHealthPercent(creature) {
+        if (!creature)
+            return null;
+
+        try {
+            if (typeof creature.getHealthPercentage === "function") {
+                const value = Number(creature.getHealthPercentage());
+                if (Number.isFinite(value))
+                    return Math.max(0, Math.min(100, value));
+            }
+        } catch (e) { /* fall through */ }
+
+        const health = Number(creature.state?.health ?? creature.health);
+        const maxHealth = Number(creature.maxHealth ?? creature.state?.maxHealth);
+        if (Number.isFinite(health) && Number.isFinite(maxHealth) && maxHealth > 0)
+            return Math.max(0, Math.min(100, (health / maxHealth) * 100));
+        return null;
+    }
+
+    function getCreatureRetargetScore(creature) {
+        const distance = getCreatureDistanceFromPlayer(creature);
+
+        // Ranged/kite modes do not need an approach path, so preserve the
+        // historical distance scale (100 points per tile).
+        if (!config.meleeMode || config.kiteMode)
+            return Number.isFinite(distance) ? distance * 100 : 100000;
+
+        const approach = getTargetApproachInfo(creature);
+        if (!approach.reachable)
+            return 100000;
+
+        return Number.isFinite(approach.pathCost)
+            ? approach.pathCost
+            : (Number.isFinite(approach.pathSteps) ? approach.pathSteps * 100 : 100000);
+    }
+
+    function getCreatureSelectionScore(creature) {
+        const distance = getCreatureDistanceFromPlayer(creature);
+        const preferred = isPreferredCreature(creature);
+        const preferredBonus = preferred ? -1000000 : 0;
+        const routeScore = getCreatureRetargetScore(creature);
+
+        // Keep geometric distance as only a tiny deterministic tiebreaker.
+        const distanceTie = Number.isFinite(distance) ? distance : 1000;
+        return preferredBonus + routeScore + distanceTie;
+    }
+
     function sortMonstersByPriority(monsters) {
         return [...monsters].sort((a, b) => {
             const sa = getCreaturePriorityScore(a);
@@ -5484,11 +6283,1428 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         });
     }
 
-    function getNearbyMonsters() {
-        const monsters = bot.xray?.getVisibleMonsters?.({
-            sameFloorOnly: true
-        }) || [];
-        return sortMonstersByPriority(monsters);
+    function isNativeVisibleMonster(creature) {
+        const client = window.gameClient;
+        const player = client?.player;
+        const world = client?.world;
+        if (!creature || !player || !world)
+            return false;
+        if (creature === player || creature.id === player.id)
+            return false;
+
+        // Match the game's own monster-targeting hotkeys instead of treating
+        // every non-player creature (NPCs included) as a monster.
+        const monsterType = (typeof CONST !== "undefined" && CONST.TYPES)
+            ? CONST.TYPES.MONSTER
+            : undefined;
+        if (monsterType !== undefined && creature.type !== monsterType)
+            return false;
+        if (monsterType === undefined && creature.type === 0)
+            return false;
+
+        // Never auto-target our own summon, matching the native hotbar logic.
+        if (creature.masterId === player.id)
+            return false;
+
+        const playerPos = player.getPosition?.();
+        const creaturePos = creature.getPosition?.() || creature.__position;
+        if (!playerPos || !creaturePos || creaturePos.z !== playerPos.z)
+            return false;
+
+        if (creature.state && typeof creature.state.health === "number" &&
+                creature.state.health <= 0)
+            return false;
+
+        if (world.activeCreatures && creature.id != null &&
+                !Object.prototype.hasOwnProperty.call(world.activeCreatures, creature.id))
+            return false;
+
+        // The client already owns the authoritative 15x11 visibility test.
+        if (typeof player.canSeeSmall === "function")
+            return !!player.canSeeSmall(creature);
+
+        // Compatibility fallback for older clients.
+        try {
+            const pp = playerPos.projected();
+            const cp = creaturePos.projected();
+            return Math.abs(pp.x - cp.x) < 8 && Math.abs(pp.y - cp.y) < 6;
+        } catch {
+            return false;
+        }
+    }
+
+    function getNearbyMonsters(sortByDistance = true) {
+        const creatures = Object.values(window.gameClient?.world?.activeCreatures || {});
+        const monsters = creatures.filter(isNativeVisibleMonster);
+        return sortByDistance ? sortMonstersByPriority(monsters) : monsters;
+    }
+
+    function getLureVisibleMonsters() {
+        const ignoredNames = new Set(
+            (config.ignoredTargetNames || [])
+                .map(name => normalizeCreatureName(name))
+                .filter(Boolean)
+        );
+        const me = normalizePosition(bot.getPlayerPosition());
+        const radius = Math.max(
+            1,
+            Math.min(8, Math.trunc(Number(config.lureRadius) || 5))
+        );
+
+        if (!me)
+            return [];
+
+        // v1.5.11: Lure has its own radius, independent of Max Target Dist.
+        // Only mobs inside this Chebyshev tile radius participate in any lure
+        // decisions. Native visibility is still required by getNearbyMonsters.
+        return getNearbyMonsters(false).filter(monster => {
+            if (ignoredNames.has(normalizeCreatureName(monster?.name)))
+                return false;
+
+            const pos = normalizePosition(monster?.getPosition?.() || monster?.__position);
+            if (!pos || pos.z !== me.z)
+                return false;
+
+            return getTileDistance(me, pos) <= radius;
+        });
+    }
+
+    function isStrictPreferredScreenVisible(creature) {
+        if (!isNativeVisibleMonster(creature))
+            return false;
+
+        const player = window.gameClient?.player;
+        const playerPos = player?.getPosition?.();
+        const creaturePos = creature?.getPosition?.() || creature?.__position;
+        if (!player || !playerPos || !creaturePos || playerPos.z !== creaturePos.z)
+            return false;
+
+        // Do not rely on canSeeSmall alone for preferred-lure handoff. Require
+        // the explicit native 15x11 projected viewport too, so an active/known
+        // preferred mob outside the actual screen cannot cancel lure.
+        try {
+            const pp = playerPos.projected();
+            const cp = creaturePos.projected();
+            return Math.abs(pp.x - cp.x) < 8 && Math.abs(pp.y - cp.y) < 6;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function getTrackedPreferredLureTarget(now = Date.now()) {
+        if (!getPreferredTargetNames().length)
+            return null;
+
+        const player = window.gameClient?.player;
+        const me = normalizePosition(bot.getPlayerPosition());
+        const creatures = window.gameClient?.world?.activeCreatures || {};
+        if (!player || !me)
+            return null;
+
+        const monsterType =
+            (typeof CONST !== "undefined" && CONST.TYPES)
+                ? CONST.TYPES.MONSTER
+                : undefined;
+        const radius = Math.max(
+            Math.max(1, Number(config.lureRadius) || 5),
+            Math.max(1, Number(config.maxTargetDistance) || 5),
+            Math.max(6, Math.min(20, Math.trunc(Number(config.lurePreferredTrackRadius) || 12)))
+        );
+
+        const tracked = [];
+        for (const id in creatures) {
+            const creature = creatures[id];
+            if (!creature || creature.id === player.id)
+                continue;
+            if (monsterType !== undefined && creature.type !== monsterType)
+                continue;
+            if (creature.masterId === player.id)
+                continue;
+            if (!isPreferredCreature(creature))
+                continue;
+
+            const health = Number(creature.state?.health ?? creature.health);
+            if (Number.isFinite(health) && health <= 0)
+                continue;
+
+            const pos = normalizePosition(creature.getPosition?.() || creature.__position);
+            if (!pos || pos.z !== me.z)
+                continue;
+
+            const distance = getTileDistance(me, pos);
+            if (distance > radius)
+                continue;
+
+            tracked.push({ creature, distance });
+        }
+
+        tracked.sort((a, b) => {
+            if (a.distance !== b.distance)
+                return a.distance - b.distance;
+            return Number(a.creature?.id || 0) - Number(b.creature?.id || 0);
+        });
+
+        return tracked[0] || null;
+    }
+
+    function getActionablePreferredLureTarget(now = Date.now()) {
+        if (!getPreferredTargetNames().length)
+            return null;
+
+        const me = normalizePosition(bot.getPlayerPosition());
+        if (!me)
+            return null;
+
+        const ignoredNames = new Set(
+            (config.ignoredTargetNames || [])
+                .map(name => normalizeCreatureName(name))
+                .filter(Boolean)
+        );
+        const maxDist = Math.max(1, Number(config.maxTargetDistance) || 5);
+        const antiKS = getAntiKSContext(now);
+
+        const candidates = getNearbyMonsters(false)
+            .filter(monster => {
+                if (!isPreferredCreature(monster))
+                    return false;
+                if (ignoredNames.has(normalizeCreatureName(monster?.name)))
+                    return false;
+                if (!isStrictPreferredScreenVisible(monster))
+                    return false;
+
+                const pos = normalizePosition(monster.getPosition?.() || monster.__position);
+                if (!pos || pos.z !== me.z)
+                    return false;
+
+                if (getTileDistance(me, pos) > maxDist)
+                    return false;
+
+                // This is the key difference from the old preferredVisible
+                // check: preferred only takes over when normal Targeting can
+                // actually select/chase it now.
+                const info = isTargetValidAndOnScreen(monster, {
+                    returnDetails: true,
+                    maxDx: 8,
+                    maxDy: 6
+                });
+                if (!info.valid)
+                    return false;
+
+                if (getAntiKSBlockReason(monster, antiKS, now))
+                    return false;
+
+                return true;
+            })
+            .map(monster => ({
+                monster,
+                score: getCreatureSelectionScore(monster)
+            }))
+            .sort((a, b) => {
+                if (a.score !== b.score)
+                    return a.score - b.score;
+                return Number(a.monster?.id || 0) - Number(b.monster?.id || 0);
+            });
+
+        return candidates[0]?.monster || null;
+    }
+
+    function clearLurePreferredPending(reason = null) {
+        state.lurePreferredPending = false;
+        state.lurePreferredTrackedId = null;
+        state.lurePreferredTrackedName = null;
+        state.lurePreferredTrackedDistance = null;
+        state.lurePreferredPendingSince = 0;
+        state.lurePreferredLastReason = reason;
+    }
+
+    function clearLureMovementHold(reason = null, now = Date.now()) {
+        if (state.lureMovementHeld)
+            state.lureLeashResumes++;
+
+        state.lureMovementHeld = false;
+        state.lureLeashMobId = null;
+        state.lureLeashMobName = null;
+        state.lureLeashScreenX = null;
+        state.lureLeashScreenY = null;
+        state.lureLeashTileDistance = null;
+        state.lureLeashStartedAt = 0;
+        state.lureLeashLastSeenAt = 0;
+        state.lureLeashReason = reason;
+    }
+
+    function clearLureState(reason = null, now = Date.now()) {
+        if (state.lureActive && reason === "threshold reached")
+            state.lureThresholdReachedAt = now;
+
+        clearLureMovementHold(reason, now);
+        clearLureLastMobState(reason);
+        state.lureMotionHistory.clear();
+        state.lureActive = false;
+        state.lureReason = reason;
+        state.lureWaypointIndex = null;
+        state.lureWaypoint = null;
+        state.lureStartedAt = 0;
+    }
+
+    function getLureContext(now = Date.now()) {
+        const threshold = Math.max(
+            1,
+            Math.min(20, Math.trunc(Number(config.lureMobThreshold) || 3))
+        );
+        const visibleMonsters = getLureVisibleMonsters();
+        const current = getCurrentTarget();
+
+        const actionablePreferred = getActionablePreferredLureTarget(now);
+        const trackedPreferredEntry =
+            actionablePreferred
+                ? {
+                    creature: actionablePreferred,
+                    distance: getCreatureDistanceFromPlayer(actionablePreferred)
+                }
+                : getTrackedPreferredLureTarget(now);
+
+        const trackedPreferred = trackedPreferredEntry?.creature || null;
+        const trackedDistance = Number(trackedPreferredEntry?.distance);
+        const preferredActionable = !!actionablePreferred;
+
+        if (trackedPreferred) {
+            state.lurePreferredLastSeenAt = now;
+            state.lurePreferredTrackedId = trackedPreferred.id ?? null;
+            state.lurePreferredTrackedName = trackedPreferred.name || "Preferred";
+            state.lurePreferredTrackedDistance =
+                Number.isFinite(trackedDistance) ? trackedDistance : null;
+        }
+
+        const lostGraceMs = Math.max(
+            300,
+            Math.min(3000, Number(config.lurePreferredLostGraceMs) || 1200)
+        );
+        const preferredGracePending =
+            !trackedPreferred &&
+            state.lurePreferredPending &&
+            state.lurePreferredLastSeenAt > 0 &&
+            now - state.lurePreferredLastSeenAt <= lostGraceMs;
+
+        state.lurePreferredVisible = preferredActionable;
+        state.lurePreferredActionableId = actionablePreferred?.id ?? null;
+
+        if (!config.lureMode) {
+            return {
+                active: false,
+                reason: "disabled",
+                threshold,
+                visibleMonsters,
+                preferredVisible: preferredActionable,
+                preferredActionableTarget: actionablePreferred,
+                preferredTrackedTarget: trackedPreferred
+            };
+        }
+
+        // Respect a deliberate user-selected monster.
+        if (current && state.lastTargetOwner === "manual") {
+            return {
+                active: false,
+                reason: "manual target",
+                threshold,
+                visibleMonsters,
+                preferredVisible: preferredActionable,
+                preferredActionableTarget: actionablePreferred,
+                preferredTrackedTarget: trackedPreferred
+            };
+        }
+
+        // Preferred only exits lure when it passes the SAME real checks normal
+        // targeting needs: strict screen, max distance, reachability, Anti-KS.
+        if (actionablePreferred) {
+            return {
+                active: false,
+                reason: "preferred mob actionable",
+                threshold,
+                visibleMonsters,
+                preferredVisible: true,
+                preferredActionableTarget: actionablePreferred,
+                preferredTrackedTarget: trackedPreferred
+            };
+        }
+
+        const caveStatus = bot.cave?.status?.();
+        const waypoint = bot.cave?.getCurrentWaypoint?.() || null;
+
+        // Do not suppress combat if there is no CaveBot movement available to
+        // continue bringing us toward a tracked preferred target.
+        if (!caveStatus?.running) {
+            return {
+                active: false,
+                reason: "CaveBot not running",
+                threshold,
+                visibleMonsters,
+                preferredVisible: false,
+                preferredActionableTarget: null,
+                preferredTrackedTarget: trackedPreferred
+            };
+        }
+
+        if (
+            !waypoint ||
+            !Number.isFinite(Number(waypoint.x)) ||
+            !Number.isFinite(Number(waypoint.y)) ||
+            !Number.isFinite(Number(waypoint.z))
+        ) {
+            return {
+                active: false,
+                reason: "no movement waypoint",
+                threshold,
+                visibleMonsters,
+                preferredVisible: false,
+                preferredActionableTarget: null,
+                preferredTrackedTarget: trackedPreferred
+            };
+        }
+
+        // A known preferred mob that is not yet actionable gets first priority
+        // over ordinary lure combat. Keep CaveBot moving and protect the lure
+        // pack until the preferred target enters the real engage envelope.
+        if (trackedPreferred || preferredGracePending) {
+            return {
+                active: true,
+                reason: trackedPreferred
+                    ? "preferred mob pending"
+                    : "preferred mob pending grace",
+                threshold,
+                visibleMonsters,
+                preferredVisible: false,
+                preferredPending: true,
+                preferredActionableTarget: null,
+                preferredTrackedTarget: trackedPreferred,
+                preferredTrackedDistance:
+                    trackedPreferred
+                        ? (Number.isFinite(trackedDistance) ? trackedDistance : null)
+                        : state.lurePreferredTrackedDistance,
+                caveStatus,
+                waypoint,
+                waypointIndex: Number.isFinite(Number(caveStatus.currentIndex))
+                    ? Number(caveStatus.currentIndex)
+                    : null
+            };
+        }
+
+        // "Less than X" lures; X or more fights. This check deliberately comes
+        // AFTER preferred-pending so a tracked preferred mob cannot cause us to
+        // stop and kill the ordinary pack before reaching it.
+        if (visibleMonsters.length >= threshold) {
+            return {
+                active: false,
+                reason: "threshold reached",
+                threshold,
+                visibleMonsters,
+                preferredVisible: false,
+                preferredActionableTarget: null,
+                preferredTrackedTarget: null
+            };
+        }
+
+        return {
+            active: true,
+            reason: "gathering mobs",
+            threshold,
+            visibleMonsters,
+            preferredVisible: false,
+            preferredPending: false,
+            preferredActionableTarget: null,
+            preferredTrackedTarget: null,
+            caveStatus,
+            waypoint,
+            waypointIndex: Number.isFinite(Number(caveStatus.currentIndex))
+                ? Number(caveStatus.currentIndex)
+                : null
+        };
+    }
+
+    function getLureProjectedOffset(monster, playerPos = null) {
+        const player = window.gameClient?.player;
+        const me = playerPos || normalizePosition(bot.getPlayerPosition());
+        const mobPos = normalizePosition(monster?.getPosition?.() || monster?.__position);
+        if (!player || !me || !mobPos || me.z !== mobPos.z)
+            return null;
+
+        try {
+            const pp = (player.getPosition?.() || me).projected();
+            const mpRaw = monster?.getPosition?.() || monster?.__position || mobPos;
+            const mp = typeof mpRaw.projected === "function"
+                ? mpRaw.projected()
+                : new Position(mobPos.x, mobPos.y, mobPos.z).projected();
+
+            if (![pp?.x, pp?.y, mp?.x, mp?.y].every(Number.isFinite))
+                return null;
+
+            return {
+                x: mp.x - pp.x,
+                y: mp.y - pp.y,
+                absX: Math.abs(mp.x - pp.x),
+                absY: Math.abs(mp.y - pp.y),
+                mobPos
+            };
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function isMobTrailingWaypoint(monster, waypoint, playerPos = null) {
+        const me = playerPos || normalizePosition(bot.getPlayerPosition());
+        const mobPos = normalizePosition(monster?.getPosition?.() || monster?.__position);
+        if (!me || !mobPos || !waypoint || me.z !== mobPos.z)
+            return false;
+
+        const toWaypointX = Number(waypoint.x) - me.x;
+        const toWaypointY = Number(waypoint.y) - me.y;
+        const toMobX = mobPos.x - me.x;
+        const toMobY = mobPos.y - me.y;
+
+        // If CaveBot is already standing exactly on the waypoint, there is no
+        // forward direction to outrun the mob in.
+        if (toWaypointX === 0 && toWaypointY === 0)
+            return false;
+
+        // Negative dot product = mob is behind us relative to route direction.
+        // Include a tiny perpendicular tolerance so a pack drifting sideways
+        // near the rear half is also protected from falling off-screen.
+        const dot = toWaypointX * toMobX + toWaypointY * toMobY;
+        return dot <= 0;
+    }
+
+    function pruneLureMotionHistory(now = Date.now()) {
+        for (const [id, sample] of state.lureMotionHistory.entries()) {
+            if (!sample || now - Number(sample.lastSeenAt || 0) > 5000)
+                state.lureMotionHistory.delete(id);
+        }
+
+        while (state.lureMotionHistory.size > 64) {
+            const oldestId = state.lureMotionHistory.keys().next().value;
+            if (oldestId === undefined)
+                break;
+            state.lureMotionHistory.delete(oldestId);
+        }
+    }
+
+    function resetLureMotionSample(monsterId) {
+        if (monsterId == null)
+            return;
+        state.lureMotionHistory.delete(monsterId);
+    }
+
+    function updateLureMotionSample(monster, tileDistance, trailing, now = Date.now()) {
+        const id = monster?.id;
+        if (id == null || !Number.isFinite(tileDistance))
+            return { awaySteps: 0, movingAway: false, delta: 0 };
+
+        const windowMs = Math.max(
+            600,
+            Math.min(4000, Number(config.lurePredictiveWindowMs) || 1800)
+        );
+        const previous = state.lureMotionHistory.get(id) || null;
+
+        let awaySteps = 0;
+        let firstAwayAt = 0;
+        let delta = 0;
+
+        if (previous && now - Number(previous.lastSeenAt || 0) <= windowMs) {
+            delta = tileDistance - Number(previous.distance || 0);
+
+            if (!trailing || delta < 0) {
+                // Catching up or no longer behind us: reset immediately.
+                awaySteps = 0;
+                firstAwayAt = 0;
+            } else if (delta > 0) {
+                const priorFirst = Number(previous.firstAwayAt || 0);
+                const sameEpisode =
+                    priorFirst > 0 &&
+                    now - priorFirst <= windowMs;
+
+                awaySteps = sameEpisode
+                    ? Math.min(8, Number(previous.awaySteps || 0) + 1)
+                    : 1;
+                firstAwayAt = sameEpisode ? priorFirst : now;
+            } else {
+                // Same distance between movement events: preserve the trend,
+                // but do not manufacture extra "away" samples every 150 ms.
+                const priorFirst = Number(previous.firstAwayAt || 0);
+                if (priorFirst > 0 && now - priorFirst <= windowMs) {
+                    awaySteps = Number(previous.awaySteps || 0);
+                    firstAwayAt = priorFirst;
+                }
+            }
+        }
+
+        state.lureMotionHistory.set(id, {
+            distance: tileDistance,
+            trailing: !!trailing,
+            awaySteps,
+            firstAwayAt,
+            lastSeenAt: now
+        });
+
+        return {
+            awaySteps,
+            movingAway: trailing && awaySteps > 0,
+            delta
+        };
+    }
+
+    function clearLureLastMobState(reason = null) {
+        state.lureLastMobActive = false;
+        state.lureLastMobMode = null;
+        state.lureLastMobId = null;
+        state.lureLastMobName = null;
+        state.lureLastMobHealthPct = null;
+        state.lureLastMobStartedAt = 0;
+    }
+
+    function updateLureLastMobState(context, now = Date.now()) {
+        if (!context?.active) {
+            clearLureLastMobState("lure inactive");
+            return null;
+        }
+
+        const monsters = Array.isArray(context.visibleMonsters)
+            ? context.visibleMonsters
+            : getLureVisibleMonsters();
+
+        if (monsters.length !== 1) {
+            clearLureLastMobState("not exactly one mob");
+            return null;
+        }
+
+        const monster = monsters[0];
+        const healthPct = getCreatureHealthPercent(monster);
+        const threshold = Math.max(
+            5,
+            Math.min(90, Number(config.lureLastMobHpPct) || 20)
+        );
+
+        if (!Number.isFinite(healthPct) || healthPct > threshold) {
+            clearLureLastMobState("last mob above threshold");
+            return null;
+        }
+
+        const mode =
+            String(config.lureLastMobMode || "slow").toLowerCase() === "kill"
+                ? "kill"
+                : "slow";
+
+        const changedMob =
+            !state.lureLastMobActive ||
+            state.lureLastMobId !== monster.id ||
+            state.lureLastMobMode !== mode;
+
+        if (changedMob) {
+            state.lureLastMobActivations++;
+            state.lureLastMobStartedAt = now;
+            bot.log("Lure last-mob exception active", {
+                id: monster.id,
+                name: monster.name || "Mob",
+                healthPct,
+                threshold,
+                mode
+            });
+        }
+
+        state.lureLastMobActive = true;
+        state.lureLastMobMode = mode;
+        state.lureLastMobId = monster.id ?? null;
+        state.lureLastMobName = monster.name || "Mob";
+        state.lureLastMobHealthPct = healthPct;
+
+        return {
+            active: true,
+            mode,
+            monster,
+            id: state.lureLastMobId,
+            name: state.lureLastMobName,
+            healthPct,
+            threshold,
+            startedAt: state.lureLastMobStartedAt
+        };
+    }
+
+    function getLureLastMobInfo() {
+        if (!isLureActive() || !state.lureLastMobActive)
+            return {
+                active: false,
+                mode: String(config.lureLastMobMode || "slow").toLowerCase() === "kill"
+                    ? "kill"
+                    : "slow",
+                threshold: Math.max(
+                    5,
+                    Math.min(90, Number(config.lureLastMobHpPct) || 20)
+                )
+            };
+
+        return {
+            active: true,
+            mode: state.lureLastMobMode || "slow",
+            id: state.lureLastMobId,
+            name: state.lureLastMobName,
+            healthPct: state.lureLastMobHealthPct,
+            threshold: Math.max(
+                5,
+                Math.min(90, Number(config.lureLastMobHpPct) || 20)
+            ),
+            startedAt: state.lureLastMobStartedAt
+        };
+    }
+
+    function updateLureScreenLeash(context, now = Date.now()) {
+        if (!context?.active || !context.waypoint) {
+            clearLureMovementHold("lure inactive", now);
+            return false;
+        }
+
+        const playerPos = normalizePosition(bot.getPlayerPosition());
+        if (!playerPos) {
+            clearLureMovementHold("player position unavailable", now);
+            return false;
+        }
+
+        const edgeX = Math.max(3, Number(config.lureLeashEdgeX) || 6);
+        const edgeY = Math.max(2, Number(config.lureLeashEdgeY) || 4);
+        const resumeX = Math.max(2, Math.min(edgeX - 1, Number(config.lureLeashResumeX) || 4));
+        const resumeY = Math.max(1, Math.min(edgeY - 1, Number(config.lureLeashResumeY) || 3));
+        const lostGraceMs = Math.max(500, Number(config.lureLeashLostGraceMs) || 1800);
+        const lureRadius = Math.max(
+            1,
+            Math.min(8, Math.trunc(Number(config.lureRadius) || 5))
+        );
+        const leashRadiusEdge = Math.max(1, lureRadius - 1);
+        const leashRadiusResume = Math.max(1, lureRadius - 2);
+        const predictiveMinDistance = Math.max(2, lureRadius - 2);
+        const predictiveAwaySteps = Math.max(
+            1,
+            Math.min(4, Math.trunc(Number(config.lurePredictiveAwaySteps) || 2))
+        );
+        const predictiveEnabled =
+            config.lureSmartTargeting !== false &&
+            config.lurePredictiveLeash !== false;
+
+        pruneLureMotionHistory(now);
+
+        const visible = Array.isArray(context.visibleMonsters)
+            ? context.visibleMonsters
+            : getLureVisibleMonsters();
+
+        let danger = null;
+        let heldCreature = null;
+
+        // If already holding, keep watching the same lagging mob even if it
+        // briefly crosses the exact canSeeSmall boundary.
+        if (state.lureMovementHeld && state.lureLeashMobId != null) {
+            heldCreature =
+                window.gameClient?.world?.activeCreatures?.[state.lureLeashMobId] || null;
+        }
+
+        for (const monster of visible) {
+            const offset = getLureProjectedOffset(monster, playerPos);
+            if (!offset)
+                continue;
+
+            const trailing = isMobTrailingWaypoint(
+                monster,
+                context.waypoint,
+                playerPos
+            );
+            const tileDistance = getTileDistance(playerPos, offset.mobPos);
+            const motion = updateLureMotionSample(
+                monster,
+                tileDistance,
+                trailing,
+                now
+            );
+
+            if (!trailing)
+                continue;
+
+            const hardDanger =
+                offset.absX >= edgeX ||
+                offset.absY >= edgeY ||
+                tileDistance >= leashRadiusEdge;
+
+            const predictiveDanger =
+                predictiveEnabled &&
+                tileDistance >= predictiveMinDistance &&
+                motion.awaySteps >= predictiveAwaySteps;
+
+            if (!hardDanger && !predictiveDanger)
+                continue;
+
+            const edgePressure = Math.max(
+                offset.absX / edgeX,
+                offset.absY / edgeY,
+                tileDistance / Math.max(1, leashRadiusEdge),
+                predictiveDanger
+                    ? 0.90 + motion.awaySteps * 0.06
+                    : 0
+            );
+
+            if (!danger || edgePressure > danger.pressure) {
+                danger = {
+                    monster,
+                    offset,
+                    tileDistance,
+                    pressure: edgePressure,
+                    predictive: predictiveDanger && !hardDanger,
+                    awaySteps: motion.awaySteps
+                };
+            }
+        }
+
+        if (!state.lureMovementHeld) {
+            if (!danger)
+                return false;
+
+            state.lureMovementHeld = true;
+            state.lureLeashMobId = danger.monster.id ?? null;
+            state.lureLeashMobName = danger.monster.name || "Mob";
+            state.lureLeashScreenX = danger.offset.absX;
+            state.lureLeashScreenY = danger.offset.absY;
+            state.lureLeashTileDistance = danger.tileDistance;
+            state.lureLeashStartedAt = now;
+            state.lureLeashLastSeenAt = now;
+            state.lureLeashReason = danger.predictive
+                ? "trailing mob losing ground"
+                : "trailing mob near screen edge";
+            state.lureLeashActivations++;
+
+            if (danger.predictive) {
+                state.lurePredictiveHolds++;
+                state.lurePredictiveLastMobId = danger.monster.id ?? null;
+                state.lurePredictiveLastMobName = danger.monster.name || "Mob";
+                state.lurePredictiveLastAt = now;
+                state.lurePredictiveLastAwaySteps = danger.awaySteps || 0;
+            }
+
+            bot.log(
+                danger.predictive
+                    ? "Lure predictive leash holding movement"
+                    : "Lure screen leash holding movement",
+                {
+                mobId: state.lureLeashMobId,
+                mobName: state.lureLeashMobName,
+                screenX: state.lureLeashScreenX,
+                screenY: state.lureLeashScreenY,
+                tileDistance: state.lureLeashTileDistance,
+                lureRadius,
+                predictive: !!danger.predictive,
+                awaySteps: danger.awaySteps || 0,
+                waypointIndex: context.waypointIndex
+                }
+            );
+            return true;
+        }
+
+        // Prefer the originally-held mob for hysteresis. If it is gone, fall
+        // back to whichever trailing mob is currently under the most pressure.
+        let watched = visible.find(m => m?.id === state.lureLeashMobId) ||
+            heldCreature ||
+            danger?.monster ||
+            null;
+
+        if (watched) {
+            const offset = getLureProjectedOffset(watched, playerPos);
+            const health = Number(watched.state?.health ?? watched.health);
+            const alive = !Number.isFinite(health) || health > 0;
+
+            if (offset && alive) {
+                state.lureLeashLastSeenAt = now;
+                state.lureLeashScreenX = offset.absX;
+                state.lureLeashScreenY = offset.absY;
+                state.lureLeashTileDistance = getTileDistance(playerPos, offset.mobPos);
+                const stillTrailing = isMobTrailingWaypoint(
+                    watched,
+                    context.waypoint,
+                    playerPos
+                );
+                const watchedMotion = updateLureMotionSample(
+                    watched,
+                    state.lureLeashTileDistance,
+                    stillTrailing,
+                    now
+                );
+
+                // Stay held until the lagging mob is comfortably back inside
+                // the inner band. This hysteresis prevents stop/start jitter.
+                const caughtUp =
+                    !stillTrailing ||
+                    (
+                        offset.absX <= resumeX &&
+                        offset.absY <= resumeY &&
+                        state.lureLeashTileDistance <= leashRadiusResume &&
+                        !watchedMotion.movingAway
+                    );
+
+                if (caughtUp) {
+                    const heldForMs = state.lureLeashStartedAt
+                        ? Math.max(0, now - state.lureLeashStartedAt)
+                        : 0;
+                    const mobName = state.lureLeashMobName;
+                    const watchedId = watched?.id;
+                    resetLureMotionSample(watchedId);
+                    clearLureMovementHold("pack caught up", now);
+                    bot.log("Lure screen leash resumed movement", {
+                        mobName,
+                        heldForMs
+                    });
+                    return false;
+                }
+
+                return true;
+            }
+
+            // Dead/removed mobs must never pin the route.
+            if (!alive || !window.gameClient?.world?.activeCreatures?.[watched.id]) {
+                clearLureMovementHold("leash mob gone", now);
+                return false;
+            }
+        }
+
+        // If the mob crossed just outside the viewport, remain stopped for a
+        // short grace period. A following monster will usually walk back into
+        // view while the player is stationary.
+        const unseenForMs = state.lureLeashLastSeenAt
+            ? Math.max(0, now - state.lureLeashLastSeenAt)
+            : Number.POSITIVE_INFINITY;
+
+        if (unseenForMs <= lostGraceMs) {
+            state.lureLeashReason = "waiting for off-screen lure mob";
+            return true;
+        }
+
+        state.lureLeashLostTimeouts++;
+        clearLureMovementHold("lost lure mob timeout", now);
+        return false;
+    }
+
+    function syncLureMode(now = Date.now()) {
+        const context = getLureContext(now);
+
+        if (!context.active) {
+            const wasActive = state.lureActive;
+            const preferredTarget = context.preferredActionableTarget || null;
+            clearLureState(context.reason, now);
+
+            // Preferred handoff is now atomic: once the preferred mob becomes
+            // truly actionable, select it immediately instead of giving normal
+            // targeting a frame where it can keep/finish an ordinary lure mob.
+            if (preferredTarget) {
+                const current = getCurrentTarget();
+                if (!current || current.id !== preferredTarget.id) {
+                    if (current && state.autoTargetId === current.id)
+                        clearCurrentFollowTarget();
+
+                    if (setCurrentTarget(preferredTarget)) {
+                        state.lurePreferredHandoffs++;
+                        state.lurePreferredActionableId = preferredTarget.id;
+                        state.lurePreferredLastReason = "preferred became actionable";
+                        bot.log("Lure handed off to actionable preferred mob", {
+                            id: preferredTarget.id,
+                            name: preferredTarget.name || "Preferred"
+                        });
+                    }
+                }
+            }
+
+            // When the pull is ready, arm the fast-reacquire path so fighting
+            // starts on the same/next attack tick instead of waiting 1.2s.
+            if (wasActive && context.reason === "threshold reached")
+                state.lastTargetLossAt = now;
+
+            return false;
+        }
+
+        if (!state.lureActive) {
+            state.lureActive = true;
+            state.lureStartedAt = now;
+            state.lureActivations++;
+            bot.log("Lure mode active", {
+                mobs: context.visibleMonsters.length,
+                threshold: context.threshold,
+                waypointIndex: context.waypointIndex,
+                waypoint: context.waypoint
+            });
+        }
+
+        state.lureReason = context.reason;
+        state.lureWaypointIndex = context.waypointIndex;
+        state.lureWaypoint = {
+            x: Number(context.waypoint.x),
+            y: Number(context.waypoint.y),
+            z: Number(context.waypoint.z)
+        };
+
+        const preferredPending = context.preferredPending === true;
+        if (preferredPending) {
+            if (!state.lurePreferredPending) {
+                state.lurePreferredPending = true;
+                state.lurePreferredPendingSince = now;
+                state.lurePreferredPendingActivations++;
+            }
+
+            state.lurePreferredLastReason = context.reason;
+            if (context.preferredTrackedTarget) {
+                state.lurePreferredTrackedId = context.preferredTrackedTarget.id ?? null;
+                state.lurePreferredTrackedName =
+                    context.preferredTrackedTarget.name || "Preferred";
+                state.lurePreferredTrackedDistance =
+                    Number.isFinite(Number(context.preferredTrackedDistance))
+                        ? Number(context.preferredTrackedDistance)
+                        : null;
+            }
+
+            // Never keep chewing on an ordinary auto-target while a preferred
+            // mob is known but not yet engageable. CaveBot should keep moving.
+            const current = getCurrentTarget();
+            if (
+                current &&
+                state.autoTargetId === current.id &&
+                !isPreferredCreature(current)
+            ) {
+                state.lastTargetLossAt = now;
+                state.lastTargetLossId = current.id;
+                clearCurrentFollowTarget();
+                clearCurrentTarget();
+                clearEngagedTarget();
+                state.lurePreferredSuppressedTargets++;
+            }
+
+            clearLureLastMobState("preferred pending");
+        } else {
+            clearLurePreferredPending(context.reason);
+            updateLureLastMobState(context, now);
+        }
+        updateLureScreenLeash(context, now);
+
+        // v1.5.08: Lure no longer clears Auto Attack's target. Keep attacking
+        // while moving, but never allow Targeting to chase/kite or own movement.
+        // CaveBot remains the sole movement owner during the pull.
+        setClientChaseMode(false);
+        state._chaseEnabledForDistance = false;
+        state.movementOwner = null;
+        state.movementOwnedUntil = 0;
+        resetRetargetCandidate();
+
+        return true;
+    }
+
+    function getLureAttackCandidates(now = Date.now()) {
+        pruneSkippedTargets(now);
+
+        const me = normalizePosition(bot.getPlayerPosition());
+        if (!me)
+            return [];
+
+        const maxDist = Math.min(
+            Math.max(1, Number(config.maxTargetDistance) || 5),
+            Math.max(1, Math.min(8, Math.trunc(Number(config.lureRadius) || 5)))
+        );
+        const antiKS = getAntiKSContext(now);
+
+        const lureBlockedIds = new Set(
+            bot.cave?.getLureBlockedCreatureIds?.() ||
+            (bot.cave?.getLureBlockerId?.() != null
+                ? [bot.cave.getLureBlockerId()]
+                : [])
+        );
+
+        const candidates = getLureVisibleMonsters()
+            .filter(monster => {
+                // v1.5.14: keep route/corridor blockers alive while CaveBot is
+                // intentionally waiting for the local lane to open.
+                if (
+                    lureBlockedIds.has(monster?.id) &&
+                    !(
+                        state.lureLastMobActive &&
+                        state.lureLastMobId != null &&
+                        monster?.id === state.lureLastMobId
+                    )
+                )
+                    return false;
+
+                if ((state.skippedTargetIds.get(monster?.id) || 0) > now)
+                    return false;
+
+                const info = isTargetValidAndOnScreen(monster, {
+                    returnDetails: true,
+                    maxDx: 8,
+                    maxDy: 6,
+                    // During lure we are NOT pathing toward the monster, so
+                    // path reachability must not suppress a valid passing hit.
+                    skipReachability: true
+                });
+                if (!info.valid)
+                    return false;
+
+                const pos = normalizePosition(monster.getPosition?.() || monster.__position);
+                if (!pos || pos.z !== me.z)
+                    return false;
+
+                const dist = getTileDistance(me, pos);
+                if (dist > maxDist)
+                    return false;
+
+                if (getAntiKSBlockReason(monster, antiKS, now))
+                    return false;
+
+                return true;
+            });
+
+        if (!config.lureSmartTargeting) {
+            return candidates.sort((a, b) => {
+                const da = getCreatureDistanceFromPlayer(a);
+                const db = getCreatureDistanceFromPlayer(b);
+                if (da !== db)
+                    return da - db;
+                return Number(a?.id || 0) - Number(b?.id || 0);
+            });
+        }
+
+        const preserveHp = Math.max(
+            5,
+            Math.min(90, Number(config.lurePreserveHpPct) || 30)
+        );
+        const waypoint = state.lureWaypoint;
+        const leashMobId = state.lureLeashMobId;
+
+        const scored = candidates.map(monster => {
+            const healthPct = getCreatureHealthPercent(monster);
+            const distance = getCreatureDistanceFromPlayer(monster);
+            const trailing = waypoint
+                ? isMobTrailingWaypoint(monster, waypoint, me)
+                : false;
+            const leashMob = leashMobId != null && monster?.id === leashMobId;
+
+            // Lower score is better. Health dominates only while luring:
+            // preserve low-HP pack members, prefer healthy mobs, and avoid
+            // focusing the exact mob that is already struggling to keep up.
+            const lowHpPenalty =
+                Number.isFinite(healthPct) && healthPct <= preserveHp
+                    ? 5000 + (preserveHp - healthPct) * 80
+                    : 0;
+            const healthSpreadPenalty =
+                Number.isFinite(healthPct)
+                    ? (100 - healthPct) * 18
+                    : 450;
+            const trailingPenalty = trailing ? 900 : 0;
+            const leashPenalty = leashMob ? 1800 : 0;
+            const distancePenalty =
+                Number.isFinite(distance)
+                    ? distance * 35
+                    : 1000;
+
+            return {
+                monster,
+                healthPct,
+                trailing,
+                leashMob,
+                score:
+                    lowHpPenalty +
+                    healthSpreadPenalty +
+                    trailingPenalty +
+                    leashPenalty +
+                    distancePenalty
+            };
+        });
+
+        scored.sort((a, b) => {
+            if (a.score !== b.score)
+                return a.score - b.score;
+            const ah = Number.isFinite(a.healthPct) ? a.healthPct : -1;
+            const bh = Number.isFinite(b.healthPct) ? b.healthPct : -1;
+            if (ah !== bh)
+                return bh - ah;
+            return Number(a.monster?.id || 0) - Number(b.monster?.id || 0);
+        });
+
+        if (scored.length) {
+            state.lureSmartTargetScore = scored[0].score;
+            state.lureSmartTargetHealthPct =
+                Number.isFinite(scored[0].healthPct)
+                    ? scored[0].healthPct
+                    : null;
+        } else {
+            state.lureSmartTargetScore = null;
+            state.lureSmartTargetHealthPct = null;
+        }
+
+        return scored.map(entry => entry.monster);
+    }
+
+    function maybeRotateSmartLureTarget(current, now = Date.now()) {
+        if (!current || !config.lureSmartTargeting)
+            return current;
+
+        // With exactly one low-HP mob left, preservation has served its purpose.
+        // Keep this target and finish it instead of looking for a replacement.
+        if (
+            state.lureLastMobActive &&
+            state.lureLastMobId != null &&
+            current.id === state.lureLastMobId
+        ) {
+            return current;
+        }
+
+        const currentHp = getCreatureHealthPercent(current);
+        const preserveHp = Math.max(
+            5,
+            Math.min(90, Number(config.lurePreserveHpPct) || 30)
+        );
+
+        if (!Number.isFinite(currentHp) || currentHp > preserveHp)
+            return current;
+
+        const cooldownMs = Math.max(
+            300,
+            Number(config.lureSmartSwitchCooldownMs) || 900
+        );
+        if (now - state.lureLastSmartSwitchAt < cooldownMs)
+            return current;
+
+        const healthAdvantage = Math.max(
+            5,
+            Number(config.lureSmartHealthAdvantagePct) || 12
+        );
+        const candidates = getLureAttackCandidates(now)
+            .filter(monster => monster?.id !== current.id);
+
+        if (!candidates.length)
+            return current;
+
+        let replacement = null;
+        let replacementHp = null;
+        for (const candidate of candidates) {
+            const hp = getCreatureHealthPercent(candidate);
+            if (!Number.isFinite(hp))
+                continue;
+            if (hp >= currentHp + healthAdvantage && hp > preserveHp) {
+                replacement = candidate;
+                replacementHp = hp;
+                break;
+            }
+        }
+
+        if (!replacement)
+            return current;
+
+        if (!setCurrentTarget(replacement))
+            return current;
+
+        state.lureSmartSwitches++;
+        state.lureLastSmartSwitchAt = now;
+        state.lureLastSmartFromId = current.id;
+        state.lureLastSmartToId = replacement.id;
+        state.lureLastSmartReason =
+            `preserve ${current.name || "mob"} ${Math.round(currentHp)}% -> ` +
+            `${replacement.name || "mob"} ${Math.round(replacementHp)}%`;
+
+        bot.log("Smart Lure rotated target", {
+            fromId: current.id,
+            fromName: current.name || "Mob",
+            fromHealthPct: currentHp,
+            toId: replacement.id,
+            toName: replacement.name || "Mob",
+            toHealthPct: replacementHp,
+            preserveHp
+        });
+
+        return getCurrentTarget() || replacement;
+    }
+
+    function clearLureCombatTarget(target, now = Date.now(), reason = "lure target invalid") {
+        if (!target)
+            return false;
+
+        if (isSameCreature(getCurrentFollowTarget(), target))
+            clearCurrentFollowTarget();
+
+        if (isSameCreature(getCurrentTarget(), target)) {
+            state.lastTargetLossAt = now;
+            state.lastTargetLossId = target.id;
+            clearCurrentTarget();
+        }
+
+        if (state.engagedTargetId === target.id)
+            clearEngagedTarget();
+
+        bot.log("Lure target released", {
+            id: target.id,
+            name: target.name || "Mob",
+            reason
+        });
+        return true;
+    }
+
+    function tryLureAttack(now = Date.now()) {
+        state.lureAttackTicks++;
+
+        // A tracked-but-not-actionable preferred mob keeps lure movement alive,
+        // but ordinary lure combat is intentionally suppressed until the
+        // preferred mob enters the real engage envelope.
+        if (state.lurePreferredPending) {
+            const current = getCurrentTarget();
+            if (
+                current &&
+                state.autoTargetId === current.id &&
+                !isPreferredCreature(current)
+            ) {
+                clearLureCombatTarget(
+                    current,
+                    now,
+                    "preferred mob pending"
+                );
+                state.lurePreferredSuppressedTargets++;
+            }
+            return false;
+        }
+
+        // Reassert movement separation every lure attack tick. This prevents a
+        // live Client Chase toggle or combat helper from stealing the route.
+        setClientChaseMode(false);
+        state._chaseEnabledForDistance = false;
+        state.movementOwner = null;
+        state.movementOwnedUntil = 0;
+
+        let current = getCurrentTarget();
+
+        const lureBlockedIds = new Set(
+            bot.cave?.getLureBlockedCreatureIds?.() ||
+            (bot.cave?.getLureBlockerId?.() != null
+                ? [bot.cave.getLureBlockerId()]
+                : [])
+        );
+        if (
+            current &&
+            lureBlockedIds.has(current.id) &&
+            !(
+                state.lureLastMobActive &&
+                state.lureLastMobId != null &&
+                current.id === state.lureLastMobId
+            )
+        ) {
+            clearLureCombatTarget(
+                current,
+                now,
+                bot.cave?.isLureCrowdBlocked?.()
+                    ? "lure pack blocking corridor"
+                    : "mob blocking lure route"
+            );
+            current = null;
+        }
+
+        if (current) {
+            const health = Number(current.state?.health ?? current.health);
+            if (Number.isFinite(health) && health <= 0) {
+                if (
+                    state.lureLastMobActive &&
+                    state.lureLastMobId != null &&
+                    current.id === state.lureLastMobId
+                ) {
+                    state.lureLastMobFinishes++;
+                    clearLureLastMobState("last mob defeated");
+                }
+
+                clearLureCombatTarget(current, now, "target defeated");
+                current = null;
+            }
+        }
+
+        if (current) {
+            const info = isTargetValidAndOnScreen(current, {
+                returnDetails: true,
+                maxDx: 8,
+                maxDy: 6,
+                skipReachability: true
+            });
+
+            if (!info.valid) {
+                clearLureCombatTarget(current, now, `invalid lure target: ${info.reason}`);
+                current = null;
+            }
+        }
+
+        if (current) {
+            if (releaseTargetForAntiKS(current, now)) {
+                current = null;
+            }
+        }
+
+        if (current) {
+            const playerPos = normalizePosition(bot.getPlayerPosition());
+            const targetPos = normalizePosition(current.getPosition?.() || current.__position);
+            const maxDist = Math.max(1, Number(config.maxTargetDistance) || 5);
+            const dist = playerPos && targetPos && playerPos.z === targetPos.z
+                ? getTileDistance(playerPos, targetPos)
+                : Number.POSITIVE_INFINITY;
+
+            // Do not turn around/chase a mob that fell behind the pull.
+            if (!Number.isFinite(dist) || dist > maxDist) {
+                clearLureCombatTarget(current, now, "fell outside lure attack range");
+                state.lureOutOfRangeClears++;
+                current = null;
+            }
+        }
+
+        if (!current) {
+            const candidates = getLureAttackCandidates(now);
+            const before = getCurrentTarget();
+            if (!before && triggerAttack(now, candidates)) {
+                state.lureTargetsAcquired++;
+                return true;
+            }
+            return false;
+        }
+
+        current = maybeRotateSmartLureTarget(current, now);
+
+        // Single-target attack rune is allowed while pulling, except Smart
+        // Lure avoids spending burst damage on a mob at/below the preserve HP
+        // floor. Basic auto-attacks still continue, so lure never becomes idle.
+        const currentHp = getCreatureHealthPercent(current);
+        const preserveHp = Math.max(
+            5,
+            Math.min(90, Number(config.lurePreserveHpPct) || 30)
+        );
+        const lastMobException =
+            state.lureLastMobActive &&
+            state.lureLastMobId != null &&
+            current?.id === state.lureLastMobId;
+
+        const preserveRune =
+            !!config.lureSmartTargeting &&
+            !lastMobException &&
+            Number.isFinite(currentHp) &&
+            currentHp <= preserveHp;
+
+        if (config.runeHotbarSlot && !preserveRune && triggerRune(now)) {
+            state.lureRunesUsed++;
+            if (lastMobException)
+                state.lureLastMobRuneBursts++;
+            return true;
+        }
+
+        if (config.runeHotbarSlot && preserveRune)
+            state.lureRunePreserveSkips++;
+
+        // Keeping the target selected is enough for normal auto-attack; do not
+        // run melee chase, kite, stuck recovery, or route-based retargeting.
+        return false;
+    }
+
+    function isLureActive() {
+        return !!state.running &&
+            !!config.enabled &&
+            !!config.lureMode &&
+            !!state.lureActive;
+    }
+
+    function isLureMovementHeld() {
+        return isLureActive() && !!state.lureMovementHeld;
     }
 
     // ---- POSITION HELPERS ----
@@ -5536,25 +7752,744 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function findNearbyMonster(creature) {
-        if (!creature)
+        if (!creature?.id)
             return null;
-        const nearby = getNearbyMonsters();
-        return nearby.find(m => isSameCreature(m, creature)) || null;
+
+        const active = window.gameClient?.world?.activeCreatures;
+        const canonical = active?.[creature.id] || null;
+        if (canonical && isNativeVisibleMonster(canonical)) {
+            state.engagedDirectLookupHits++;
+            return canonical;
+        }
+
+        // Compatibility fallback for a creature that is still the exact active
+        // object in clients where activeCreatures is temporarily unavailable.
+        if (!active && isNativeVisibleMonster(creature)) {
+            state.engagedDirectLookupHits++;
+            return creature;
+        }
+
+        state.engagedDirectLookupMisses++;
+        return null;
     }
 
     function findNearbyMonsterById(id) {
         if (id == null)
             return null;
-        return getNearbyMonsters().find(m => m?.id === id) || null;
+
+        const active = window.gameClient?.world?.activeCreatures;
+        const creature = active?.[id] || null;
+        if (creature && isNativeVisibleMonster(creature)) {
+            state.engagedDirectLookupHits++;
+            return creature;
+        }
+
+        state.engagedDirectLookupMisses++;
+        return null;
+    }
+
+    // ---- TARGET REJECTION BACKOFF ----
+    function pruneRejectedTargetBackoff(now = Date.now()) {
+        for (const [id, entry] of state.rejectedTargetBackoff.entries()) {
+            if (!entry || now - Number(entry.lastAt || 0) > 30000) {
+                state.rejectedTargetBackoff.delete(id);
+            }
+        }
+        while (state.rejectedTargetBackoff.size > 64) {
+            const oldestId = state.rejectedTargetBackoff.keys().next().value;
+            if (oldestId === undefined) break;
+            state.rejectedTargetBackoff.delete(oldestId);
+        }
+    }
+
+    function noteTargetRejected(targetId, reason, now = Date.now()) {
+        const id = Number(targetId) || 0;
+        if (!id)
+            return 0;
+
+        pruneRejectedTargetBackoff(now);
+
+        const previous = state.rejectedTargetBackoff.get(id);
+        const sameEpisode = previous && now - Number(previous.lastAt || 0) <= 10000;
+        const count = sameEpisode
+            ? Math.min(6, Number(previous.count || 0) + 1)
+            : 1;
+
+        // First rejection matches the old behaviour closely. Repeated explicit
+        // rejections back off progressively so mb0t does not hammer a monster
+        // the server currently refuses.
+        const skipMs = Math.min(5000, Math.round(750 * Math.pow(2, count - 1)));
+        state.rejectedTargetBackoff.set(id, {
+            count,
+            lastAt: now,
+            until: now + skipMs,
+            reason: String(reason || "server target rejection")
+        });
+
+        const existingSkipUntil = Number(state.skippedTargetIds.get(id) || 0);
+        state.skippedTargetIds.set(id, Math.max(existingSkipUntil, now + skipMs));
+        invalidateCandidateSnapshot();
+
+        state.targetRejectCount++;
+        state.lastTargetRejectAt = now;
+        state.lastTargetRejectId = id;
+        state.lastTargetRejectReason = String(reason || "server target rejection");
+        state.lastTargetRejectBackoffMs = skipMs;
+        state.lastTargetLossAt = now;
+        state.lastTargetLossId = id;
+        return skipMs;
+    }
+
+    function recoverRejectedAutoTarget(targetId, reason, now = Date.now()) {
+        const id = Number(targetId) || 0;
+        if (!id || state.autoTargetId !== id)
+            return false;
+
+        const player = window.gameClient?.player;
+        if (!player)
+            return false;
+
+        // A cancel message can reject the server-side attack without a matching
+        // SetTarget(0). In that case mb0t's optimistic local setTarget() can
+        // remain highlighted forever. Clear only local target state here:
+        // the server already rejected the request, so another TargetPacket(0)
+        // would be redundant.
+        const rawTarget = player.__target || null;
+        if (rawTarget?.id === id) {
+            try {
+                player.setTarget(null);
+            } catch (e) { /* ignore UI cleanup races */ }
+        }
+
+        // Follow/chase may have been started after optimistic target selection.
+        // Follow has real server state, so clear it only when it belongs to the
+        // same rejected monster.
+        const rawFollow = player.__followTarget || null;
+        if (rawFollow?.id === id) {
+            clearCurrentFollowTarget();
+        }
+
+        if (state.engagedTargetId === id) {
+            state.engagedTargetId = null;
+            state.combatStartedAt = 0;
+            state.lastSelectedTargetId = null;
+            state.targetSelectedAt = 0;
+            state.lastChaseDestinationKey = null;
+            state.kiteWaypointIndex = null;
+            state.lastProgressAt = 0;
+            state.lastDistance = undefined;
+            state.lastTargetHealth = null;
+            state.lastTargetHealthPercent = null;
+            state.lastDamageAt = 0;
+            state.lastApproachCost = null;
+            state.lastTargetPos = null;
+            state.lastChaseProgressReason = null;
+            state.lastPlayerPos = null;
+            state.unreachableStart = 0;
+            state.meleeStuckAt = 0;
+            state.meleeLastDist = undefined;
+            state.meleeProgressAt = 0;
+            resetFollowProgress();
+        }
+
+        state.autoTargetId = null;
+        state.lastObservedTargetId = null;
+        clearManualTargetOwnership();
+        state.lastTargetOwner = null;
+        state.lastTargetLossAt = now;
+        state.lastTargetLossId = id;
+        state.movementOwner = null;
+        state.movementOwnedUntil = 0;
+        resetRetargetCandidate();
+        invalidateCandidateSnapshot();
+
+        state.rejectedAutoTargetLocalClears++;
+        state.lastRejectedAutoTargetClearAt = now;
+
+        bot.log("cleared rejected auto target locally", {
+            id,
+            reason: String(reason || "server rejected target")
+        });
+        return true;
+    }
+
+    // ---- SERVER TARGET ACKNOWLEDGEMENT ----
+    function resetPendingTargetAck() {
+        state.pendingTargetId = null;
+        state.pendingTargetSentAt = 0;
+    }
+
+    function markPendingTargetAck(targetId, now = Date.now()) {
+        state.pendingTargetId = targetId;
+        state.pendingTargetSentAt = now;
+    }
+
+    function checkTargetAckTimeout(now = Date.now()) {
+        if (state.pendingTargetId == null || !state.pendingTargetSentAt)
+            return false;
+
+        const timeoutMs = Math.max(400, Number(config.targetAckTimeoutMs) || 1200);
+        if (now - state.pendingTargetSentAt < timeoutMs)
+            return false;
+
+        state.targetAckTimeoutCount++;
+        state.lastTargetAckTimeoutAt = now;
+
+        // Do not clear or retarget purely because an acknowledgement was not
+        // observed. The server may omit/merge acknowledgements under latency,
+        // while the current target can still be functioning perfectly.
+        resetPendingTargetAck();
+        return true;
+    }
+
+    function handleServerTargetAck(id, now = Date.now()) {
+        const serverId = Number(id) || 0;
+        state.lastServerTargetId = serverId;
+        state.lastServerTargetAt = now;
+
+        if (state.pendingTargetId == null)
+            return;
+
+        const pendingId = state.pendingTargetId;
+        const sentAt = state.pendingTargetSentAt;
+        const latencyMs = sentAt ? Math.max(0, now - sentAt) : null;
+
+        if (serverId === pendingId) {
+            state.targetAckCount++;
+            state.lastTargetAckAt = now;
+            state.lastTargetAckId = serverId;
+            state.lastTargetAckLatencyMs = latencyMs;
+            resetPendingTargetAck();
+            return;
+        }
+
+        if (serverId === 0) {
+            const active = window.gameClient?.world?.activeCreatures;
+            const creature = active?.[pendingId] || null;
+            const health = Number(creature?.state?.health ?? creature?.health);
+            const stillAlive =
+                !!creature &&
+                (!Number.isFinite(health) || health > 0);
+
+            if (stillAlive) {
+                const reason = "server cleared newly requested live target";
+                noteTargetRejected(pendingId, reason, now);
+                recoverRejectedAutoTarget(pendingId, reason, now);
+            }
+
+            resetPendingTargetAck();
+            return;
+        }
+
+        // Server selected a different target than the one mb0t just requested.
+        // Treat that as an override, not a rejection: a manual click or another
+        // game subsystem may legitimately have won the race.
+        state.targetServerOverrideCount++;
+        resetPendingTargetAck();
+    }
+
+    function detachTargetAckHook() {
+        const owner = state.targetAckHookOwner;
+        const wrapper = state.targetAckWrapper;
+        const original = state.targetAckOriginal;
+
+        if (owner && wrapper && original && owner.handleSetTarget === wrapper) {
+            try {
+                owner.handleSetTarget = original;
+            } catch (e) { /* ignore cleanup races */ }
+        }
+
+        state.targetAckHookOwner = null;
+        state.targetAckOriginal = null;
+        state.targetAckWrapper = null;
+    }
+
+    function ensureTargetAckHook() {
+        const handler = window.gameClient?.networkManager?.packetHandler;
+        if (!handler || typeof handler.handleSetTarget !== "function")
+            return false;
+
+        if (
+            state.targetAckHookOwner === handler &&
+            state.targetAckWrapper &&
+            handler.handleSetTarget === state.targetAckWrapper
+        ) {
+            return true;
+        }
+
+        // Reconnects can replace PacketHandler. Restore our previous owner if
+        // it still exists before installing on the new instance.
+        detachTargetAckHook();
+
+        const original = handler.handleSetTarget;
+        const wrapper = function (id) {
+            const result = original.call(this, id);
+            try {
+                if (state.running)
+                    handleServerTargetAck(id, Date.now());
+            } catch (e) {
+                // Ack telemetry must never interfere with packet processing.
+            }
+            return result;
+        };
+
+        state.targetAckHookOwner = handler;
+        state.targetAckOriginal = original;
+        state.targetAckWrapper = wrapper;
+        handler.handleSetTarget = wrapper;
+        return true;
+    }
+
+    // ---- CANCEL MESSAGE HOOK ----
+    function isTargetSpecificAttackCancelText(value) {
+        const text = String(value || "").trim().toLowerCase();
+        if (!text)
+            return false;
+        return text.includes("cannot attack this creature") ||
+            text.includes("can't attack this creature") ||
+            text.includes("may not attack this creature") ||
+            text.includes("cannot attack that creature") ||
+            text.includes("may not attack that creature");
+    }
+
+    function handleTargetingCancelMessage(message, now = Date.now()) {
+        const value = String(message || "").trim();
+        if (!value)
+            return;
+
+        state.cancelMessageEvents++;
+
+        if (isProtectionZoneAttackCancelText(value)) {
+            state.protectionZoneCancelHookHits++;
+            state.protectionZoneLastCancelText = value;
+            state.protectionZoneLastCancelAt = now;
+            state.protectionZoneCancelBlockedUntil = Math.max(
+                state.protectionZoneCancelBlockedUntil,
+                now + 1500
+            );
+            return;
+        }
+
+        // Only bind a target-specific rejection to a target request that is
+        // actually awaiting server acknowledgement. This avoids attributing
+        // unrelated user actions/cancel messages to Auto Attack.
+        if (isTargetSpecificAttackCancelText(value) && state.pendingTargetId != null) {
+            const rejectedId = state.pendingTargetId;
+            const reason = `cancel message: ${value}`;
+            noteTargetRejected(rejectedId, reason, now);
+            state.targetCancelRejectCount++;
+
+            // Cancel pending acknowledgement before local cleanup so an
+            // intentional follow/target clear cannot be misclassified later.
+            resetPendingTargetAck();
+            recoverRejectedAutoTarget(rejectedId, reason, now);
+        }
+    }
+
+    function detachCancelMessageHook() {
+        const owner = state.cancelHookOwner;
+        const wrapper = state.cancelHookWrapper;
+        const original = state.cancelHookOriginal;
+
+        if (owner && wrapper && original && owner.setCancelMessage === wrapper) {
+            try {
+                owner.setCancelMessage = original;
+            } catch (e) { /* ignore cleanup races */ }
+        }
+
+        state.cancelHookOwner = null;
+        state.cancelHookOriginal = null;
+        state.cancelHookWrapper = null;
+    }
+
+    function ensureCancelMessageHook() {
+        const manager = window.gameClient?.interface?.notificationManager;
+        if (!manager || typeof manager.setCancelMessage !== "function")
+            return false;
+
+        if (
+            state.cancelHookOwner === manager &&
+            state.cancelHookWrapper &&
+            manager.setCancelMessage === state.cancelHookWrapper
+        ) {
+            return true;
+        }
+
+        detachCancelMessageHook();
+
+        const original = manager.setCancelMessage;
+        const wrapper = function (message) {
+            const result = original.call(this, message);
+            try {
+                if (state.running)
+                    handleTargetingCancelMessage(message, Date.now());
+            } catch (e) {
+                // Detection must never interfere with normal notifications.
+            }
+            return result;
+        };
+
+        state.cancelHookOwner = manager;
+        state.cancelHookOriginal = original;
+        state.cancelHookWrapper = wrapper;
+        manager.setCancelMessage = wrapper;
+        return true;
+    }
+
+    // ---- PROTECTION ZONE GUARD ----
+    function isProtectionZoneAttackCancelText(value) {
+        const text = String(value || "").trim().toLowerCase();
+        if (!text || !text.includes("protection zone") || !text.includes("attack"))
+            return false;
+        return text.includes("cannot") ||
+            text.includes("can't") ||
+            text.includes("may not") ||
+            text.includes("not attack");
+    }
+
+    function readProtectionZoneCancelFallback(now = Date.now()) {
+        if (now < state.protectionZoneCancelBlockedUntil)
+            return true;
+
+        // With the NotificationManager hook installed, new cancel messages are
+        // captured synchronously. Keep DOM inspection only for startup/reconnect
+        // windows where the manager does not exist yet.
+        if (
+            state.cancelHookOwner &&
+            state.cancelHookWrapper &&
+            state.cancelHookOwner.setCancelMessage === state.cancelHookWrapper
+        ) {
+            return false;
+        }
+
+        const elements = [
+            document.getElementById("cancelmessage"),
+            document.getElementById("notification")
+        ].filter(Boolean);
+
+        let matchedText = "";
+        for (const element of elements) {
+            const value = String(element.textContent || "").trim();
+            if (isProtectionZoneAttackCancelText(value)) {
+                matchedText = value;
+                break;
+            }
+        }
+
+        // Reset the baseline after the DOM message disappears. If the same
+        // server rejection appears later it is then treated as a fresh event.
+        if (!matchedText) {
+            state.protectionZoneLastCancelText = "";
+            return now < state.protectionZoneCancelBlockedUntil;
+        }
+
+        if (matchedText !== state.protectionZoneLastCancelText) {
+            state.protectionZoneLastCancelText = matchedText;
+            state.protectionZoneLastCancelAt = now;
+            // Short fallback backoff. The proactive native/icon checks normally
+            // keep this path unused; this only suppresses packet spam if the
+            // server rejects a target during an enter-PZ race.
+            state.protectionZoneCancelBlockedUntil = Math.max(
+                state.protectionZoneCancelBlockedUntil,
+                now + 1500
+            );
+        }
+        return now < state.protectionZoneCancelBlockedUntil;
+    }
+
+    function getProtectionZoneBlockInfo(now = Date.now()) {
+        const player = window.gameClient?.player;
+        if (!player)
+            return { blocked: false, reason: null };
+
+        // 1) Authoritative client helper from the game source.
+        try {
+            if (typeof player.isInProtectionZone === "function" && player.isInProtectionZone()) {
+                return { blocked: true, reason: "native player protection-zone state" };
+            }
+        } catch (e) { /* try lower-level fallbacks */ }
+
+        // 2) Current tile flag. Tile.isProtectionZone() is flags bit 1.
+        try {
+            const tile = player.getTile?.();
+            if (tile?.isProtectionZone?.()) {
+                return { blocked: true, reason: "current tile protection-zone flag" };
+            }
+            if (tile && ((Number(tile.flags) || 0) & 1) !== 0) {
+                return { blocked: true, reason: "current tile PZ flag" };
+            }
+        } catch (e) { /* continue */ }
+
+        // 3) Visible status condition icon supplied by StatusBar condition 5.
+        try {
+            const icons = document.querySelectorAll("#status-bar > img, #status-bar img");
+            for (const icon of icons) {
+                const src = String(icon.getAttribute("src") || icon.src || "").toLowerCase();
+                const title = String(icon.getAttribute("title") || icon.title || "").toLowerCase();
+                if (
+                    src.includes("/png/status/status-protection-zone.png") ||
+                    title.includes("you are in a protection zone")
+                ) {
+                    return { blocked: true, reason: "protection-zone status icon" };
+                }
+            }
+        } catch (e) { /* continue */ }
+
+        // 4) Server cancel-message fallback:
+        // "You cannot attack while in a protection zone."
+        // "You may not attack from within protection zone."
+        if (readProtectionZoneCancelFallback(now)) {
+            return {
+                blocked: true,
+                reason: "server protection-zone attack rejection"
+            };
+        }
+
+        return { blocked: false, reason: null };
+    }
+
+    function updateProtectionZoneState(now = Date.now()) {
+        const info = getProtectionZoneBlockInfo(now);
+
+        if (info.blocked) {
+            if (!state.protectionZoneBlocked) {
+                state.protectionZoneBlocked = true;
+                state.protectionZoneBlockedSince = now;
+                bot.log("Targeting paused in protection zone", {
+                    reason: info.reason
+                });
+            }
+            state.protectionZoneBlockReason = info.reason;
+            return info;
+        }
+
+        if (state.protectionZoneBlocked) {
+            const blockedForMs = state.protectionZoneBlockedSince
+                ? Math.max(0, now - state.protectionZoneBlockedSince)
+                : 0;
+            state.protectionZoneBlocked = false;
+            state.protectionZoneBlockedSince = 0;
+            state.protectionZoneBlockReason = null;
+            invalidateCandidateSnapshot();
+            bot.log("Targeting resumed outside protection zone", {
+                blockedForMs
+            });
+        }
+        return info;
+    }
+
+    function isProtectionZoneBlocked(now = Date.now()) {
+        return updateProtectionZoneState(now).blocked;
+    }
+
+    function suspendTargetingForProtectionZone(now = Date.now()) {
+        const info = updateProtectionZoneState(now);
+        if (!info.blocked)
+            return false;
+
+        state.protectionZoneBlockedTicks++;
+        state.unreachableStart = 0;
+        resetRetargetCandidate();
+        invalidateCandidateSnapshot();
+
+        // Never chase/kite/cast while the target packet is PZ-blocked.
+        setClientChaseMode(false);
+        state._chaseEnabledForDistance = false;
+        state.movementOwner = null;
+        state.movementOwnedUntil = 0;
+
+        // If mb0t owns the current target, release it once so CaveBot and other
+        // movement modules do not remain paused by a stale combat target while
+        // standing in PZ. A manually selected target is left untouched.
+        const current = getCurrentTarget();
+        if (current && state.autoTargetId === current.id) {
+            state.lastTargetLossAt = now;
+            state.lastTargetLossId = current.id;
+            clearCurrentFollowTarget();
+            if (clearCurrentTarget())
+                state.protectionZoneAutoTargetClears++;
+            clearEngagedTarget();
+        }
+
+        return true;
     }
 
     // ---- TARGET / FOLLOW ----
+    function clearManualTargetOwnership() {
+        state.manualTargetId = null;
+        state.manualTargetSince = 0;
+        state.manualTargetProtectUntil = 0;
+    }
+
+    function markAutoTargetOwnership(target) {
+        if (!target?.id)
+            return;
+        state.autoTargetId = target.id;
+        state.lastObservedTargetId = target.id;
+        clearManualTargetOwnership();
+        state.lastTargetOwner = "auto";
+    }
+
+    function observeTargetOwnership(current, now = Date.now()) {
+        if (!current) {
+            if (state.lastObservedTargetId != null)
+                state.lastObservedTargetId = null;
+            if (state.autoTargetId != null)
+                state.autoTargetId = null;
+            clearManualTargetOwnership();
+            state.lastTargetOwner = null;
+            return;
+        }
+
+        if (state.lastObservedTargetId === current.id)
+            return;
+
+        state.lastObservedTargetId = current.id;
+
+        // A target id that mb0t did not just set itself came from outside the
+        // Auto Attack selector (normally a direct user click / battle-list
+        // selection). Give that selection a short optional-retarget hold.
+        if (state.autoTargetId !== current.id) {
+            state.manualTargetId = current.id;
+            state.manualTargetSince = now;
+            state.manualTargetProtectUntil =
+                now + Math.max(500, Number(config.manualTargetHoldMs) || 3000);
+            state.manualTargetDetections++;
+            state.lastTargetOwner = "manual";
+            resetRetargetCandidate();
+        } else {
+            state.lastTargetOwner = "auto";
+        }
+    }
+
+    function isManualTargetProtected(target, now = Date.now()) {
+        return !!target?.id &&
+            state.manualTargetId === target.id &&
+            now < state.manualTargetProtectUntil;
+    }
+
+    function getCanonicalActiveCreature(creature) {
+        if (!creature?.id)
+            return creature || null;
+        const active = window.gameClient?.world?.activeCreatures;
+        if (!active)
+            return creature;
+        const canonical = active[creature.id] || null;
+        return canonical || creature;
+    }
+
     function getCurrentTarget() {
-        return window.gameClient?.player?.__target || null;
+        const player = window.gameClient?.player;
+        const current = player?.__target || null;
+        if (!current) {
+            observeTargetOwnership(null);
+            return null;
+        }
+
+        observeTargetOwnership(current);
+
+        // The game can replace a Creature object while preserving its id
+        // during chunk/self-heal replays. Always operate on the canonical
+        // activeCreatures instance so health/position/visibility stay fresh.
+        const canonical = getCanonicalActiveCreature(current);
+        if (canonical && canonical !== current && canonical.id === current.id) {
+            try {
+                player.setTarget(canonical);
+                state.canonicalTargetRefreshes++;
+                // Same id, same owner; only the Creature object changed.
+                state.lastObservedTargetId = canonical.id;
+                return canonical;
+            } catch (e) {
+                return current;
+            }
+        }
+        return current;
     }
 
     function getCurrentFollowTarget() {
-        return window.gameClient?.player?.__followTarget || null;
+        const player = window.gameClient?.player;
+        const current = player?.__followTarget || null;
+        if (!current)
+            return null;
+
+        const canonical = getCanonicalActiveCreature(current);
+        if (canonical && canonical !== current && canonical.id === current.id) {
+            try {
+                // Player.setFollowTarget is local-only, so this refresh does
+                // not send an extra FollowPacket to the server.
+                player.setFollowTarget(canonical);
+                state.canonicalFollowRefreshes++;
+                return canonical;
+            } catch (e) {
+                return current;
+            }
+        }
+        return current;
+    }
+
+    function resetRetargetCandidate() {
+        state.retargetCandidateId = null;
+        state.retargetCandidateSince = 0;
+        state.retargetCandidateAdvantage = 0;
+    }
+
+    function trackRetargetCandidate(target, advantage, now = Date.now()) {
+        if (!target?.id) {
+            resetRetargetCandidate();
+            return 0;
+        }
+        if (state.retargetCandidateId !== target.id) {
+            state.retargetCandidateId = target.id;
+            state.retargetCandidateSince = now;
+        }
+        state.retargetCandidateAdvantage = Number.isFinite(advantage) ? advantage : 0;
+        return Math.max(0, now - state.retargetCandidateSince);
+    }
+
+    function noteTargetEngagement(target, now = Date.now()) {
+        if (!target?.id)
+            return;
+        if (state.lastSelectedTargetId !== target.id) {
+            state.lastSelectedTargetId = target.id;
+            state.targetSelectedAt = now;
+            state.lastTargetChangeAt = now;
+            resetRetargetCandidate();
+        }
+    }
+
+    function refreshMovementOwnership(now = Date.now()) {
+        if (!state.running || !config.enabled)
+            return false;
+        const current = getCurrentTarget();
+        const follow = getCurrentFollowTarget();
+        const engaged = current ||
+            (follow && state.engagedTargetId != null && follow.id === state.engagedTargetId ? follow : null) ||
+            (state.engagedTargetId != null ? findNearbyMonsterById(state.engagedTargetId) : null);
+        if (!engaged)
+            return state.movementOwnedUntil > now;
+        if (config.kiteMode || config.meleeMode) {
+            state.movementOwner = config.kiteMode ? "kite" : (config.useClientChase ? "melee-chase" : "melee");
+            // Small grace window prevents CaveBot taking movement on the same
+            // frame that the client is finishing a combat chase step.
+            state.movementOwnedUntil = now + 400;
+            return true;
+        }
+        return state.movementOwnedUntil > now;
+    }
+
+    function isMovementOwned(now = Date.now()) {
+        if (!state.running || !config.enabled)
+            return false;
+        if (isLureActive()) {
+            state.movementOwner = null;
+            state.movementOwnedUntil = 0;
+            return false;
+        }
+        if (refreshMovementOwnership(now))
+            return true;
+        state.movementOwner = null;
+        state.movementOwnedUntil = 0;
+        return false;
     }
 
     function pruneSkippedTargets(now = Date.now()) {
@@ -5571,14 +8506,224 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         state.lastFollowStallAt = 0;
     }
 
+    function resetAttackSessionState(reason = "session changed") {
+        // Kite mode temporarily moves CaveBot's route index backwards. Never
+        // strand the route at that temporary retreat index across reconnects.
+        if (state.kiteOriginalIndex !== null) {
+            try { restoreKiteIndex(); } catch (error) {
+                state.kiteOriginalIndex = null;
+                state.kiteWaypointIndex = null;
+            }
+        }
+        state.engagedTargetId = null;
+        state.combatStartedAt = 0;
+        state.lastTargetHotkeyAt = 0;
+        state.lastRuneHotkeyAt = 0;
+        state.lastRuneCountRequestAt = 0;
+        state.lastRuneMissingWarningAt = 0;
+        state.runeCountItemId = 0;
+        state.runeCountFluidType = 0;
+        state.lastChaseAt = 0;
+        state.lastChaseDestinationKey = null;
+        state.lastSelectedTargetId = null;
+        state.targetSelectedAt = 0;
+        state.lastTargetChangeAt = 0;
+        state.lastRetargetAt = 0;
+        resetRetargetCandidate();
+        state.lastRetargetReason = null;
+        state.lastTargetLossAt = 0;
+        state.lastTargetLossId = null;
+        state.lastTargetHandoffAt = 0;
+        state.lastInvalidTargetAt = 0;
+        state.lastInvalidTargetReason = null;
+        state.canonicalTargetRefreshes = 0;
+        state.canonicalFollowRefreshes = 0;
+        state.candidateSnapshotAt = 0;
+        state.candidateSnapshot = null;
+        state.candidateSnapshotBuilds = 0;
+        state.candidateSnapshotHits = 0;
+        state.lastCandidateBuildMs = 0;
+        state.lastCandidateCount = 0;
+        state.lastCandidateScoreEvaluations = 0;
+        state.approachPathSearches = 0;
+        state.approachAlternativeProbes = 0;
+        state.approachBetterSelections = 0;
+        state.protectionZoneBlocked = false;
+        state.protectionZoneBlockedSince = 0;
+        state.protectionZoneBlockReason = null;
+        state.protectionZoneBlockedTicks = 0;
+        state.protectionZonePreventedTargets = 0;
+        state.protectionZoneAutoTargetClears = 0;
+        state.protectionZoneCancelBlockedUntil = 0;
+        state.protectionZoneLastCancelText = "";
+        state.protectionZoneLastCancelAt = 0;
+        state.pendingTargetId = null;
+        state.pendingTargetSentAt = 0;
+        state.targetAckCount = 0;
+        state.targetRejectCount = 0;
+        state.targetAckTimeoutCount = 0;
+        state.targetServerOverrideCount = 0;
+        state.lastTargetAckAt = 0;
+        state.lastTargetAckId = null;
+        state.lastTargetAckLatencyMs = null;
+        state.lastTargetRejectAt = 0;
+        state.lastTargetRejectId = null;
+        state.lastTargetAckTimeoutAt = 0;
+        state.lastServerTargetAt = 0;
+        state.lastServerTargetId = null;
+        state.cancelMessageEvents = 0;
+        state.protectionZoneCancelHookHits = 0;
+        state.targetCancelRejectCount = 0;
+        state.rejectedTargetBackoff.clear();
+        state.lastTargetRejectReason = null;
+        state.lastTargetRejectBackoffMs = 0;
+        state.rejectedAutoTargetLocalClears = 0;
+        state.lastRejectedAutoTargetClearAt = 0;
+        state.antiKSSnapshotAt = 0;
+        state.antiKSSnapshot = null;
+        state.antiKSSnapshotBuilds = 0;
+        state.antiKSSnapshotHits = 0;
+        state.antiKSLastOtherPlayerCount = 0;
+        state.antiKSLastBlockedTargetId = null;
+        state.antiKSLastBlockedPlayerId = null;
+        state.antiKSLastBlockedPlayerName = null;
+        state.antiKSLastBlockedDistance = null;
+        state.antiKSLastBlockedAt = 0;
+        state.engagedDirectLookupHits = 0;
+        state.engagedDirectLookupMisses = 0;
+        state.staleEngagedFollowClears = 0;
+        state.lureActive = false;
+        state.lureMobCount = 0;
+        state.lurePreferredVisible = false;
+        state.lurePreferredPending = false;
+        state.lurePreferredTrackedId = null;
+        state.lurePreferredTrackedName = null;
+        state.lurePreferredTrackedDistance = null;
+        state.lurePreferredActionableId = null;
+        state.lurePreferredPendingSince = 0;
+        state.lurePreferredLastSeenAt = 0;
+        state.lurePreferredPendingActivations = 0;
+        state.lurePreferredSuppressedTargets = 0;
+        state.lurePreferredHandoffs = 0;
+        state.lurePreferredLastReason = null;
+        state.lureReason = null;
+        state.lureWaypointIndex = null;
+        state.lureWaypoint = null;
+        state.lureStartedAt = 0;
+        state.lureActivations = 0;
+        state.lureTargetReleases = 0;
+        state.lureThresholdReachedAt = 0;
+        state.lureAttackTicks = 0;
+        state.lureTargetsAcquired = 0;
+        state.lureRunesUsed = 0;
+        state.lureOutOfRangeClears = 0;
+        state.lureSmartSwitches = 0;
+        state.lureLastSmartSwitchAt = 0;
+        state.lureLastSmartFromId = null;
+        state.lureLastSmartToId = null;
+        state.lureLastSmartReason = null;
+        state.lureRunePreserveSkips = 0;
+        state.lureSmartTargetScore = null;
+        state.lureSmartTargetHealthPct = null;
+        state.lureMotionHistory.clear();
+        state.lurePredictiveHolds = 0;
+        state.lurePredictiveLastMobId = null;
+        state.lurePredictiveLastMobName = null;
+        state.lurePredictiveLastAt = 0;
+        state.lurePredictiveLastAwaySteps = 0;
+        state.lureLastMobActive = false;
+        state.lureLastMobMode = null;
+        state.lureLastMobId = null;
+        state.lureLastMobName = null;
+        state.lureLastMobHealthPct = null;
+        state.lureLastMobStartedAt = 0;
+        state.lureLastMobActivations = 0;
+        state.lureLastMobFinishes = 0;
+        state.lureLastMobRuneBursts = 0;
+        state.lureMovementHeld = false;
+        state.lureLeashMobId = null;
+        state.lureLeashMobName = null;
+        state.lureLeashScreenX = null;
+        state.lureLeashScreenY = null;
+        state.lureLeashTileDistance = null;
+        state.lureLeashStartedAt = 0;
+        state.lureLeashLastSeenAt = 0;
+        state.lureLeashActivations = 0;
+        state.lureLeashResumes = 0;
+        state.lureLeashLostTimeouts = 0;
+        state.lureLeashReason = null;
+        state.autoTargetId = null;
+        state.lastObservedTargetId = null;
+        state.manualTargetId = null;
+        state.manualTargetSince = 0;
+        state.manualTargetProtectUntil = 0;
+        state.manualTargetDetections = 0;
+        state.lastTargetOwner = null;
+        state.lastDistance = undefined;
+        state.lastTargetHealth = null;
+        state.lastTargetHealthPercent = null;
+        state.lastDamageAt = 0;
+        state.lastApproachCost = null;
+        state.lastTargetPos = null;
+        state.lastChaseProgressReason = null;
+        state.finishTargetBlocks = 0;
+        state.lastPlayerPos = null;
+        state.lastProgressAt = 0;
+        state.unreachableStart = 0;
+        state.meleeStuckAt = 0;
+        state.meleeLastDist = Infinity;
+        state.meleeProgressAt = 0;
+        state.kiteWaypointIndex = null;
+        state.kiteOriginalIndex = null;
+        state._chaseEnabledForDistance = false;
+        state.movementOwner = null;
+        state.movementOwnedUntil = 0;
+        state.skippedTargetIds.clear();
+        reachCache.clear();
+        resetFollowProgress();
+        bot.log(`auto attack runtime reset (${reason})`);
+    }
+
+    function syncPlayerSession() {
+        const player = window.gameClient?.player || null;
+        if (!player) {
+            if (state.playerSessionRef !== null) {
+                resetAttackSessionState("player unavailable");
+                state.playerSessionRef = null;
+            }
+            return false;
+        }
+
+        if (!state.playerSessionSeen) {
+            state.playerSessionSeen = true;
+            state.playerSessionRef = player;
+            return true;
+        }
+
+        if (state.playerSessionRef !== player) {
+            resetAttackSessionState(state.playerSessionRef ? "player replaced" : "player restored");
+            state.playerSessionRef = player;
+            if (config.useClientChase)
+                setClientChaseMode(2);
+        }
+        return true;
+    }
+
     function clearEngagedTarget() {
         state.engagedTargetId = null;
         state.combatStartedAt = 0;
+        state.lastSelectedTargetId = null;
+        state.targetSelectedAt = 0;
         state.lastChaseDestinationKey = null;
         state.kiteWaypointIndex = null;
         state.lastProgressAt = 0;
         state.lastDistance = undefined;
         state.lastTargetHealth = null;
+        state.lastTargetHealthPercent = null;
+        state.lastDamageAt = 0;
+        state.lastApproachCost = null;
+        state.lastTargetPos = null;
+        state.lastChaseProgressReason = null;
         state.diagonalAttempted = false;
         state.lastDiagonalCorrection = 0;
         // ---- ALSO RESET MELEE STUCK TRACKING ----
@@ -5619,8 +8764,13 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             return false;
         if (!getCurrentTarget())
             return false;
+        resetPendingTargetAck();
         window.gameClient.player.setTarget(null);
         window.gameClient.send(new TargetPacket(0));
+        state.autoTargetId = null;
+        state.lastObservedTargetId = null;
+        clearManualTargetOwnership();
+        state.lastTargetOwner = null;
         return true;
     }
 
@@ -5636,6 +8786,12 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     function isCombatActive() {
         if (!config.enabled || !state.running)
             return false;
+
+        // Lure may keep a monster selected for attacks, but CaveBot must not
+        // interpret that target as a movement/combat pause.
+        if (isLureActive())
+            return false;
+
         return !!getEngagedTarget();
     }
 
@@ -5652,14 +8808,25 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         const current = getCurrentTarget();
         if (current) {
             state.engagedTargetId = current.id;
+            noteTargetEngagement(current);
             return current;
         }
         if (state.engagedTargetId == null)
             return null;
         const follow = getCurrentFollowTarget();
         if (follow && follow.id === state.engagedTargetId) {
-            return findNearbyMonster(follow) || follow;
+            const nearbyFollow = findNearbyMonster(follow);
+            if (nearbyFollow)
+                return nearbyFollow;
+
+            // The old code returned `follow` here even when the creature was
+            // dead, off-screen, removed from activeCreatures, or otherwise no
+            // longer a valid visible monster. That could keep combat state and
+            // movement ownership alive on a stale follow object.
+            state.staleEngagedFollowClears++;
+            clearCurrentFollowTarget();
         }
+
         const nearby = findNearbyMonsterById(state.engagedTargetId);
         if (nearby)
             return nearby;
@@ -5737,6 +8904,20 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             });
         }
 
+        const monsterType = (typeof CONST !== "undefined" && CONST.TYPES)
+            ? CONST.TYPES.MONSTER
+            : undefined;
+        if (monsterType !== undefined && target.type !== monsterType) {
+            return result(false, {
+                reason: "not a monster"
+            });
+        }
+        if (target.masterId === player.id) {
+            return result(false, {
+                reason: "own summon"
+            });
+        }
+
         let dx,
         dy,
         distance = Number.POSITIVE_INFINITY;
@@ -5752,7 +8933,9 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             });
         }
 
-        const visible = dx < maxDx && dy < maxDy;
+        const visible = typeof player.canSeeSmall === "function"
+            ? !!player.canSeeSmall(target)
+            : (dx < maxDx && dy < maxDy);
         if (!visible) {
             return result(false, {
                 reason: `off screen dx=${dx} dy=${dy}`,
@@ -5784,14 +8967,21 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function setCurrentTarget(target) {
+        const now = Date.now();
+        if (isProtectionZoneBlocked(now)) {
+            state.protectionZonePreventedTargets++;
+            return false;
+        }
+
+        target = getCanonicalActiveCreature(target);
         if (!target || !window.gameClient?.player || typeof window.gameClient.send !== "function")
             return false;
         if (typeof TargetPacket !== "function")
             return false;
         const info = isTargetValidAndOnScreen(target, {
             returnDetails: true,
-            maxDx: 7,
-            maxDy: 5
+            maxDx: 8,
+            maxDy: 6
         });
         if (!info.valid) {
             console.log("[target] rejected", {
@@ -5806,8 +8996,13 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             return false;
         }
         window.gameClient.player.setTarget(target);
+        markPendingTargetAck(target.id, now);
         window.gameClient.send(new TargetPacket(target.id));
+        markAutoTargetOwnership(target);
         state.engagedTargetId = target.id;
+        noteTargetEngagement(target, Date.now());
+        state.lastTargetLossAt = 0;
+        state.lastTargetLossId = null;
 
         // ---- RESET ALL STUCK TRACKING FOR THIS NEW TARGET ----
         state.meleeStuckAt = 0;
@@ -5815,6 +9010,11 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         state.meleeProgressAt = 0;
         state.lastDistance = undefined;
         state.lastTargetHealth = null;
+        state.lastTargetHealthPercent = null;
+        state.lastDamageAt = 0;
+        state.lastApproachCost = null;
+        state.lastTargetPos = null;
+        state.lastChaseProgressReason = null;
         state.lastPlayerPos = null;
         state.lastProgressAt = 0;
         state.unreachableStart = 0;
@@ -5839,8 +9039,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             };
         const info = isTargetValidAndOnScreen(target, {
             returnDetails: true,
-            maxDx: 7,
-            maxDy: 5
+            maxDx: 8,
+            maxDy: 6
         });
         if (!info.valid)
             return {
@@ -5864,8 +9064,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             return false;
         const info = isTargetValidAndOnScreen(target, {
             returnDetails: true,
-            maxDx: 7,
-            maxDy: 5
+            maxDx: 8,
+            maxDy: 6
         });
         if (!info.valid) {
             console.log("[follow] rejected invalid follow target", {
@@ -5884,14 +9084,41 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         return true;
     }
 
-    // ---- SKIP LOGIC ----
+    // ---- SKIP / HANDOFF LOGIC ----
+    function invalidateCandidateSnapshot() {
+        state.candidateSnapshotAt = 0;
+        state.candidateSnapshot = null;
+    }
+
+    function rememberSkippedTarget(target, now = Date.now(), skipMs = 500) {
+        if (!target?.id)
+            return false;
+        const until = now + Math.max(250, Number(skipMs) || 0);
+        state.skippedTargetIds.set(target.id, until);
+        invalidateCandidateSnapshot();
+        // Monster IDs can churn during very long hunts. Keep the temporary skip
+        // cache bounded so old IDs cannot accumulate indefinitely.
+        while (state.skippedTargetIds.size > 64) {
+            const oldestId = state.skippedTargetIds.keys().next().value;
+            if (oldestId === undefined) break;
+            state.skippedTargetIds.delete(oldestId);
+        }
+        return true;
+    }
+
+    function noteTargetLoss(target, now = Date.now()) {
+        state.lastTargetLossAt = now;
+        state.lastTargetLossId = target?.id ?? state.engagedTargetId ?? null;
+    }
+
     function skipTarget(target, reason, now = Date.now(), skipMs = 500) {
         if (!target?.id)
             return false;
-        const until = now + Math.max(500, Number(skipMs) || 0);
-        state.skippedTargetIds.set(target.id, until);
+        rememberSkippedTarget(target, now, skipMs);
         const clearedTarget = isSameCreature(getCurrentTarget(), target) ? clearCurrentTarget() : false;
         const clearedFollow = isSameCreature(getCurrentFollowTarget(), target) ? clearCurrentFollowTarget() : false;
+        if (clearedTarget || state.engagedTargetId === target.id)
+            noteTargetLoss(target, now);
         if (state.engagedTargetId === target.id)
             clearEngagedTarget();
         else if (state.lastFollowTargetId === target.id)
@@ -5900,7 +9127,66 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             id: target.id,
             name: target.name || "Mob",
             reason,
-            skippedForMs: Math.max(500, Number(skipMs) || 0),
+            skippedForMs: Math.max(250, Number(skipMs) || 0),
+            clearedTarget,
+            clearedFollow,
+        });
+        return true;
+    }
+
+    function handoffTarget(target, reason, now = Date.now(), skipMs = 500, candidateSnapshot = null) {
+        if (!target?.id)
+            return false;
+
+        // Exclude the old target BEFORE selecting a replacement, but keep the
+        // current target live until the replacement is ready. This avoids the
+        // old A -> no target -> B gap and its extra TargetPacket(0).
+        //
+        // If tryAttack already built this tick's candidate list, reuse it.
+        // The old target is explicitly excluded below, so rebuilding purely
+        // because we just skipped that target would be redundant.
+        rememberSkippedTarget(target, now, skipMs);
+        const candidates = Array.isArray(candidateSnapshot)
+            ? candidateSnapshot
+            : getMonsterCandidates(now);
+        const next = candidates.find(candidate => !isSameCreature(candidate, target)) || null;
+
+        if (next && setCurrentTarget(next)) {
+            if (isSameCreature(getCurrentFollowTarget(), target))
+                clearCurrentFollowTarget();
+            state.lastRetargetAt = now;
+            state.lastRetargetReason = reason;
+            resetRetargetCandidate();
+            state.lastTargetHotkeyAt = now;
+            state.lastTargetHandoffAt = now;
+            state.unreachableStart = 0;
+            markCombatActive(now);
+            bot.log("handed off auto attack target", {
+                fromId: target.id,
+                fromName: target.name || "Mob",
+                toId: next.id,
+                toName: next.name || "Mob",
+                reason,
+            });
+            return true;
+        }
+
+        // No valid replacement exists right now: fall back to a normal clear,
+        // then arm the fast-reacquire window for a monster that appears shortly.
+        const clearedTarget = isSameCreature(getCurrentTarget(), target) ? clearCurrentTarget() : false;
+        const clearedFollow = isSameCreature(getCurrentFollowTarget(), target) ? clearCurrentFollowTarget() : false;
+        if (clearedTarget || state.engagedTargetId === target.id)
+            noteTargetLoss(target, now);
+        if (state.engagedTargetId === target.id)
+            clearEngagedTarget();
+        else if (state.lastFollowTargetId === target.id)
+            resetFollowProgress();
+
+        bot.log("skipping auto attack target", {
+            id: target.id,
+            name: target.name || "Mob",
+            reason,
+            skippedForMs: Math.max(250, Number(skipMs) || 0),
             clearedTarget,
             clearedFollow,
         });
@@ -5912,52 +9198,184 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         return !!target?.id && (state.skippedTargetIds.get(target.id) || 0) > now;
     }
 
-    // ---- MONSTER CANDIDATES (with Anti-KS) ----
-    function getMonsterCandidates(now = Date.now()) {
-        pruneSkippedTargets(now);
+    // ---- ANTI-KS / MONSTER CANDIDATES ----
+    function invalidateAntiKSSnapshot() {
+        state.antiKSSnapshotAt = 0;
+        state.antiKSSnapshot = null;
+    }
 
-        const me = bot.getPlayerPosition();
-        if (!me)
-            return [];
+    function getAntiKSContext(now = Date.now()) {
+        if (!config.antiKSEnabled)
+            return { enabled: false, otherPlayers: [] };
 
-        // --- BUILD IGNORED SET (Normalized) ---
-        const ignoredNames = new Set(
-                (config.ignoredTargetNames || [])
-                .map(n => normalizeCreatureName(n))
-                .filter(Boolean));
+        // Every Anti-KS decision made with the same attack-tick timestamp sees
+        // the exact same player positions/trust snapshot. This avoids a target
+        // passing candidate filtering and then being rejected a few function
+        // calls later because X-Ray/player position was re-read mid-tick.
+        if (state.antiKSSnapshotAt === now && state.antiKSSnapshot) {
+            state.antiKSSnapshotHits++;
+            return state.antiKSSnapshot;
+        }
 
         const visiblePlayers = bot.xray?.getVisiblePlayers?.({
             sameFloorOnly: true
         }) || [];
         const myId = window.gameClient?.player?.id;
 
-        // Trusted players (from Panic)
-        const trustedNames = bot.panic?.getTrustedNames?.() || [];
-        const trustedSet = new Set(trustedNames);
+        // Panic exposes normalized trusted names, but normalize again here so
+        // Anti-KS remains correct if that implementation ever changes.
+        const trustedSet = new Set((bot.panic?.getTrustedNames?.() || [])
+                .map(name => normalizeCreatureName(name))
+                .filter(Boolean));
 
-        // Filter out trusted players
-        const otherPlayers = visiblePlayers.filter(p => {
-            if (p.id === myId)
-                return false;
-            const name = normalizeCreatureName(p.name);
-            return !trustedSet.has(name);
-        });
+        const otherPlayers = [];
+        for (const player of visiblePlayers) {
+            if (!player || player.id === myId)
+                continue;
 
-        const hasOtherPlayers = otherPlayers.length > 0 && config.antiKSEnabled;
+            const normalizedName = normalizeCreatureName(player.name);
+            if (trustedSet.has(normalizedName))
+                continue;
+
+            const position = normalizePosition(player.getPosition?.() || player.__position);
+            if (!position)
+                continue;
+
+            otherPlayers.push({
+                id: player.id,
+                name: player.name || "Player",
+                normalizedName,
+                position
+            });
+        }
+
+        const snapshot = {
+            enabled: true,
+            otherPlayers
+        };
+        state.antiKSSnapshotAt = now;
+        state.antiKSSnapshot = snapshot;
+        state.antiKSSnapshotBuilds++;
+        state.antiKSLastOtherPlayerCount = otherPlayers.length;
+        return snapshot;
+    }
+
+    function getAntiKSBlockReason(target, context = null, now = Date.now()) {
+        if (!config.antiKSEnabled || !target)
+            return null;
+
+        const antiKS = context || getAntiKSContext(now);
+        if (!antiKS.enabled || !antiKS.otherPlayers.length)
+            return null;
+
+        const me = normalizePosition(bot.getPlayerPosition());
+        const targetPos = normalizePosition(target.getPosition?.() || target.__position);
+        if (!me || !targetPos || me.z !== targetPos.z)
+            return null;
+
+        const selfRange = Math.max(1, Number(config.antiKSSelfRange) || 2);
+        const otherRange = Math.max(1, Number(config.antiKSOtherRange) || 2);
+        const selfDist = getTileDistance(me, targetPos);
+
+        if (selfDist > selfRange) {
+            state.antiKSLastBlockedTargetId = target.id ?? null;
+            state.antiKSLastBlockedPlayerId = null;
+            state.antiKSLastBlockedPlayerName = null;
+            state.antiKSLastBlockedDistance = selfDist;
+            state.antiKSLastBlockedAt = now;
+            return `Anti-KS self range (${selfDist} > ${selfRange})`;
+        }
+
+        let nearest = null;
+        for (const player of antiKS.otherPlayers) {
+            const pPos = player.position;
+            if (!pPos || pPos.z !== targetPos.z)
+                continue;
+
+            const playerDist = getTileDistance(pPos, targetPos);
+            if (!nearest || playerDist < nearest.distance) {
+                nearest = {
+                    id: player.id,
+                    name: player.name,
+                    distance: playerDist
+                };
+            }
+        }
+
+        if (nearest && nearest.distance <= otherRange) {
+            state.antiKSLastBlockedTargetId = target.id ?? null;
+            state.antiKSLastBlockedPlayerId = nearest.id ?? null;
+            state.antiKSLastBlockedPlayerName = nearest.name || null;
+            state.antiKSLastBlockedDistance = nearest.distance;
+            state.antiKSLastBlockedAt = now;
+            return `Anti-KS ${nearest.name} near target (${nearest.distance} <= ${otherRange})`;
+        }
+
+        return null;
+    }
+
+    function releaseTargetForAntiKS(target, now = Date.now(), context = null) {
+        const reason = getAntiKSBlockReason(target, context, now);
+        if (!reason)
+            return false;
+        handoffTarget(target, reason, now, 5000);
+        return true;
+    }
+
+    function getMonsterCandidates(now = Date.now()) {
+        // v1.4.94: reuse candidate work only inside the exact same attack tick.
+        // There is intentionally no cross-tick cache: monster movement,
+        // Anti-KS proximity, visibility and path quality stay fully live.
+        if (state.candidateSnapshotAt === now && Array.isArray(state.candidateSnapshot)) {
+            state.candidateSnapshotHits++;
+            return state.candidateSnapshot;
+        }
+
+        const buildStartedAt =
+            (typeof performance !== "undefined" && typeof performance.now === "function")
+                ? performance.now()
+                : Date.now();
+
+        pruneSkippedTargets(now);
+
+        const me = bot.getPlayerPosition();
+        if (!me) {
+            state.candidateSnapshotAt = now;
+            state.candidateSnapshot = [];
+            state.candidateSnapshotBuilds++;
+            state.lastCandidateBuildMs = 0;
+            state.lastCandidateCount = 0;
+            state.lastCandidateScoreEvaluations = 0;
+            return state.candidateSnapshot;
+        }
+
+        // --- BUILD IGNORED SET (Normalized) ---
+        const ignoredNames = new Set(
+                (config.ignoredTargetNames || [])
+                .map(n => normalizeCreatureName(n))
+                .filter(Boolean));
+        const antiKS = getAntiKSContext(now);
         const maxDist = Math.max(1, Number(config.maxTargetDistance) || 5);
+        const skipped = state.skippedTargetIds;
 
-        return getNearbyMonsters()
-        .filter((monster) => !isTargetSkipped(monster, now))
+        // getNearbyMonsters(false) avoids an initial nearest-distance sort;
+        // this list is sorted exactly once below using the real selection score.
+        const scoredCandidates = getNearbyMonsters(false)
         .filter((monster) => {
-            // --- IGNORED CHECK: Skip blacklisted monsters ---
+            // pruneSkippedTargets() already ran once above. Calling
+            // isTargetSkipped() here used to prune the same map again for every
+            // visible monster.
+            if ((skipped.get(monster?.id) || 0) > now)
+                return false;
+
             const monsterName = normalizeCreatureName(monster.name);
             if (ignoredNames.has(monsterName))
                 return false;
 
             const info = isTargetValidAndOnScreen(monster, {
                 returnDetails: true,
-                maxDx: 7,
-                maxDy: 5
+                maxDx: 8,
+                maxDy: 6
             });
             if (!info.valid)
                 return false;
@@ -5969,44 +9387,50 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             if (dist > maxDist)
                 return false;
 
-            if (hasOtherPlayers) {
-                const selfRange = config.antiKSSelfRange ?? 2;
-                const otherRange = config.antiKSOtherRange ?? 2;
-
-                if (dist > selfRange)
-                    return false;
-
-                for (const player of otherPlayers) {
-                    const pPos = player.getPosition?.() || player.__position;
-                    if (!pPos)
-                        continue;
-                    const dx = Math.abs(pPos.x - monsterPos.x);
-                    const dy = Math.abs(pPos.y - monsterPos.y);
-                    if (dx <= otherRange && dy <= otherRange)
-                        return false;
-                }
-            }
+            if (getAntiKSBlockReason(monster, antiKS, now))
+                return false;
             return true;
         })
+        .map((monster) => ({
+            monster,
+            // v1.4.98: score once. Array.sort may invoke its comparator many
+            // times, and getCreatureSelectionScore() can touch distance and
+            // approach-path caches on every call.
+            score: getCreatureSelectionScore(monster)
+        }));
+
+        const candidates = scoredCandidates
         .sort((left, right) => {
-            const leftScore = getCreaturePriorityScore(left);
-            const rightScore = getCreaturePriorityScore(right);
-            if (leftScore !== rightScore)
-                return leftScore - rightScore;
-            return Number(left?.id || 0) - Number(right?.id || 0);
-        });
+            if (left.score !== right.score)
+                return left.score - right.score;
+            return Number(left.monster?.id || 0) - Number(right.monster?.id || 0);
+        })
+        .map(entry => entry.monster);
+
+        const buildFinishedAt =
+            (typeof performance !== "undefined" && typeof performance.now === "function")
+                ? performance.now()
+                : Date.now();
+
+        state.candidateSnapshotAt = now;
+        state.candidateSnapshot = candidates;
+        state.candidateSnapshotBuilds++;
+        state.lastCandidateBuildMs = Math.max(0, buildFinishedAt - buildStartedAt);
+        state.lastCandidateCount = candidates.length;
+        state.lastCandidateScoreEvaluations = scoredCandidates.length;
+        return candidates;
     }
 
     // ---- GIVE UP / DISTANCE ----
     function resetTargetIfTooFar(now = Date.now()) {
         const current = getCurrentTarget();
         if (current && shouldGiveUpTarget(current)) {
-            skipTarget(current, "target too far", now, 5000);
+            handoffTarget(current, "target too far", now, 5000);
             return true;
         }
         const engaged = getEngagedTarget();
         if (engaged && shouldGiveUpTarget(engaged)) {
-            skipTarget(engaged, "engaged target too far", now, 5000);
+            handoffTarget(engaged, "engaged target too far", now, 5000);
             return true;
         }
         return false;
@@ -6037,7 +9461,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         return window.gameClient?.world?.getTileFromWorldPosition?.(new Position(position.x, position.y, position.z)) || null;
     }
 
-    function findReachableAdjacentPosition(targetPos, playerPos) {
+    function findReachableAdjacentPath(targetPos, playerPos) {
         if (!targetPos || !playerPos)
             return null;
         const offsets = [{
@@ -6075,6 +9499,11 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         const startTile = getTileFromPosition(playerPos);
         if (!pf || !startTile || typeof pf.search !== "function")
             return null;
+
+        let best = null;
+        let successfulProbesAfterFirst = 0;
+        const extraSuccessfulProbeBudget = 2;
+
         for (const offset of offsets) {
             const candidate = {
                 x: targetPos.x + offset.x,
@@ -6086,16 +9515,59 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 continue;
             if (isFloorChangeTile(tile))
                 continue; // ★ skip floor-change tiles
-            if (candidate.x === playerPos.x && candidate.y === playerPos.y)
-                return candidate;
-            try {
-                const path = pf.search(startTile, tile);
-                if (Array.isArray(path) && path.length > 0)
-                    return candidate;
-            } catch (e) { /* ignore */
+
+            if (candidate.x === playerPos.x && candidate.y === playerPos.y) {
+                return {
+                    position: candidate,
+                    pathSteps: 0,
+                    pathCost: 0
+                };
             }
+
+            try {
+                state.approachPathSearches++;
+                const path = pf.search(startTile, tile);
+                if (!Array.isArray(path) || path.length <= 0)
+                    continue;
+
+                const rawCost = Number(tile.__g);
+                const route = {
+                    position: candidate,
+                    pathSteps: path.length,
+                    pathCost: Number.isFinite(rawCost) && rawCost >= 0
+                        ? rawCost
+                        : path.length * 100
+                };
+
+                if (!best) {
+                    best = route;
+                    continue;
+                }
+
+                state.approachAlternativeProbes++;
+                successfulProbesAfterFirst++;
+
+                const cheaper =
+                    route.pathCost < best.pathCost ||
+                    (route.pathCost === best.pathCost && route.pathSteps < best.pathSteps);
+                if (cheaper) {
+                    best = route;
+                    state.approachBetterSelections++;
+                }
+
+                // v1.5.00: the old code returned the very first reachable
+                // adjacent square. Probe only two additional *successful*
+                // routes, which catches common corner/furniture cases without
+                // turning every target into eight successful A* searches.
+                if (successfulProbesAfterFirst >= extraSuccessfulProbeBudget)
+                    break;
+            } catch (e) { /* ignore */ }
         }
-        return null;
+        return best;
+    }
+
+    function findReachableAdjacentPosition(targetPos, playerPos) {
+        return findReachableAdjacentPath(targetPos, playerPos)?.position || null;
     }
 
     function syncMeleeChase(now = Date.now()) {
@@ -6113,12 +9585,13 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
         const info = isTargetValidAndOnScreen(target, {
             returnDetails: true,
-            maxDx: 7,
-            maxDy: 5
+            maxDx: 8,
+            maxDy: 6
         });
         if (!info.valid) {
-            if (state.engagedTargetId === target.id)
-                clearEngagedTarget();
+            state.lastInvalidTargetAt = now;
+            state.lastInvalidTargetReason = info.reason;
+            handoffTarget(target, `invalid melee target: ${info.reason}`, now, 1200);
             return false;
         }
 
@@ -6126,21 +9599,22 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         const maxDist = Math.max(1, Number(config.maxTargetDistance) || 5);
 
         if (dist > maxDist) {
-            skipTarget(target, "too far for melee", now, 3000);
+            handoffTarget(target, "too far for melee", now, 3000);
             return false;
         }
 
         // ---- Manage client chase mode based on distance ----
+        // v1.4.93 fixes an old inverted condition that could enable chase
+        // when "Client Chase" was disabled. Keep the server/client stance
+        // synchronized with the actual setting and current melee distance.
         const shouldChase = dist > 1;
-        if (shouldChase && !config.useClientChase) {
-            setClientChaseMode(2);
-            if (state._chaseEnabledForDistance === undefined) {
-                state._chaseEnabledForDistance = true;
-            }
-        } else if (!shouldChase && state._chaseEnabledForDistance) {
-            setClientChaseMode(0);
-            state._chaseEnabledForDistance = false;
+        const chaseSelector = window.gameClient?.interface?.fightModeSelector;
+        const desiredChaseMode = config.useClientChase && shouldChase ? 2 : 0;
+        const currentChaseMode = Number(chaseSelector?.currentChaseMode);
+        if (!Number.isFinite(currentChaseMode) || currentChaseMode !== desiredChaseMode) {
+            setClientChaseMode(desiredChaseMode === 2);
         }
+        state._chaseEnabledForDistance = desiredChaseMode === 2;
 
         // ---- If adjacent ----
         if (dist <= 1) {
@@ -6199,60 +9673,24 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         }
 
         // ---- Target is more than 1 tile away: chase using client chase ----
-        // Anti‑KS (unchanged)
-        const visiblePlayers = bot.xray?.getVisiblePlayers?.({
-            sameFloorOnly: true
-        }) || [];
-        const myId = window.gameClient?.player?.id;
-        const trustedNames = bot.panic?.getTrustedNames?.() || [];
-        const trustedSet = new Set(trustedNames);
-        const otherPlayers = visiblePlayers.filter(p => {
-            if (p.id === myId)
-                return false;
-            const name = normalizeCreatureName(p.name);
-            return !trustedSet.has(name);
-        });
-        const hasOtherPlayers = otherPlayers.length > 0 && config.antiKSEnabled;
+        // Anti-KS is continuously revalidated for every combat mode in
+        // tryAttack(). Keep this local guard as a final check immediately
+        // before chase ownership is maintained.
+        if (releaseTargetForAntiKS(target, now))
+            return false;
 
-        if (hasOtherPlayers) {
-            const selfRange = config.antiKSSelfRange ?? 2;
-            const otherRange = config.antiKSOtherRange ?? 2;
-            if (dist > selfRange) {
-                skipTarget(target, "melee anti‑KS self range", now, 5000);
-                return false;
-            }
-            for (const player of otherPlayers) {
-                const pPos = player.getPosition?.() || player.__position;
-                if (!pPos)
-                    continue;
-                const dx = Math.abs(pPos.x - targetPos.x);
-                const dy = Math.abs(pPos.y - targetPos.y);
-                if (dx <= otherRange && dy <= otherRange) {
-                    skipTarget(target, "melee anti‑KS other range", now, 5000);
-                    return false;
-                }
-            }
-        }
-
-        // Stuck detection – ensure we reset stuck timer when switching targets
-        if (state.engagedTargetId !== target.id) {
+        // v1.4.96: do not run a second independent stuck/retarget system here.
+        // getEngagedTarget() has already synchronized engagedTargetId, so the
+        // old "engagedTargetId !== target.id" initializer could never fire.
+        // The main tryAttack progress detector below now owns stuck decisions
+        // and only switches when a valid alternative actually exists.
+        if (!Number.isFinite(state.meleeLastDist) || dist < state.meleeLastDist) {
             state.meleeLastDist = dist;
             state.meleeProgressAt = now;
-            state.meleeStuckAt = 0; // <--- RESET
         } else {
-            if (dist < state.meleeLastDist) {
-                state.meleeLastDist = dist;
-                state.meleeProgressAt = now;
-                state.meleeStuckAt = 0; // <--- RESET
-            } else {
-                if (!state.meleeStuckAt)
-                    state.meleeStuckAt = now;
-                if (now - state.meleeStuckAt > 6000) {
-                    skipTarget(target, "melee stuck (no progress)", now, 3000);
-                    return false;
-                }
-            }
+            state.meleeLastDist = dist;
         }
+        state.meleeStuckAt = 0;
 
         return false;
     }
@@ -6423,20 +9861,36 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     // ---- ATTACK / RUNE ACTIONS ----
-    function canAttack(now = Date.now()) {
-        const slot = normalizeHotbarSlot(config.targetHotbarSlot);
-        if (!slot)
+    function canAttack(now = Date.now(), candidates = null) {
+        if (isProtectionZoneBlocked(now)) {
+            state.protectionZonePreventedTargets++;
             return false;
-        if (now - state.lastTargetHotkeyAt < Math.max(0, Number(config.targetCooldownMs) || 0))
+        }
+
+        // Targeting is sent directly with TargetPacket; the configured target
+        // hotbar slot is retained for UI/backward compatibility but must not
+        // disable acquisition when that slot is empty or invalid.
+        const normalCooldown = Math.max(0, Number(config.targetCooldownMs) || 0);
+        const recentlyLostTarget =
+            state.lastTargetLossAt > 0 &&
+            now - state.lastTargetLossAt <= 2500;
+        const effectiveCooldown = recentlyLostTarget
+            ? Math.min(normalCooldown, config.fastReacquireMs)
+            : normalCooldown;
+        if (now - state.lastTargetHotkeyAt < effectiveCooldown)
             return false;
-        const candidates = getMonsterCandidates(now);
-        return candidates.length > 0 && !getCurrentTarget();
+        const list = candidates || getMonsterCandidates(now);
+        return list.length > 0 && !getCurrentTarget();
     }
 
-    function triggerAttack(now = Date.now()) {
-        if (!canAttack(now))
+    function triggerAttack(now = Date.now(), candidateSnapshot = null) {
+        // Build the candidate set once. A caller that already evaluated this
+        // tick may pass the exact same list.
+        const candidates = Array.isArray(candidateSnapshot)
+            ? candidateSnapshot
+            : getMonsterCandidates(now);
+        if (!canAttack(now, candidates))
             return false;
-        const candidates = getMonsterCandidates(now);
         if (!candidates.length)
             return false;
         const best = candidates[0];
@@ -6461,13 +9915,119 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         return false;
     }
 
+    function getAttackRuneSlotInfo() {
+        const slotNumber = normalizeHotbarSlot(config.runeHotbarSlot);
+        if (!slotNumber) return null;
+        const hm = window.gameClient?.interface?.hotbarManager;
+        const slot = hm?.slots?.[slotNumber - 1] || null;
+        const item = slot?.item || null;
+        if (!hm || !slot || !item) return { slotNumber, hm, slot, item: null, def: null, isRune: false };
+        const def = window.gameClient?.itemDefinitionsByCid?.[Number(item.id)] || null;
+        return {
+            slotNumber,
+            hm,
+            slot,
+            item,
+            def,
+            isRune: def?.properties?.type === "rune",
+        };
+    }
+
+    function getAttackRuneCountState(now = Date.now(), request = true) {
+        const info = getAttackRuneSlotInfo();
+        const itemId = Number(info?.item?.id || 0);
+        const fluidType = Math.max(0, Math.trunc(Number(info?.item?.fluidType) || 0));
+        if (!itemId) {
+            state.runeCountItemId = 0;
+            state.runeCountFluidType = 0;
+            return { itemId: 0, fluidType: 0, known: false, fresh: false, count: null, at: 0 };
+        }
+
+        // If the user changed the hotbar binding, forget the previous request
+        // cadence so the new item is queried immediately.
+        if (state.runeCountItemId !== itemId || state.runeCountFluidType !== fluidType) {
+            state.runeCountItemId = itemId;
+            state.runeCountFluidType = fluidType;
+            state.lastRuneCountRequestAt = 0;
+        }
+
+        if (request && typeof bot.requestItemCounts === "function" &&
+                now - state.lastRuneCountRequestAt >= config.runeCountRefreshMs) {
+            if (bot.requestItemCounts([{ id: itemId, fluidType }])) {
+                state.lastRuneCountRequestAt = now;
+            }
+        }
+
+        const reading = typeof bot.getItemCountReading === "function"
+            ? bot.getItemCountReading(itemId, fluidType)
+            : null;
+        if (!reading) return { itemId, fluidType, known: false, fresh: false, count: null, at: 0 };
+        const at = Number(reading.at || 0);
+        const age = Math.max(0, now - at);
+        return {
+            itemId,
+            fluidType,
+            known: true,
+            fresh: age <= config.runeCountFreshMs,
+            count: Math.max(0, Math.trunc(Number(reading.count) || 0)),
+            at,
+        };
+    }
+
+    function getAttackRuneCooldownRemainingMs(nowPerf = performance.now()) {
+        const info = getAttackRuneSlotInfo();
+        if (!info?.isRune || typeof info.hm?.__getRuneEffectiveCooldown !== "function") return 0;
+        // Attack runes use the aggressive rune cooldown bucket. Respect the
+        // definition when available rather than assuming every hotbar item is
+        // aggressive.
+        const aggressive = info.def?.properties?.aggressive !== false;
+        try {
+            const cd = info.hm.__getRuneEffectiveCooldown(aggressive);
+            return cd?.until > nowPerf ? Math.max(0, cd.until - nowPerf) : 0;
+        } catch (e) {
+            return 0;
+        }
+    }
+
+    function attachAttackRuneCountListener() {
+        if (state.unsubscribeRuneCounts || typeof bot.subscribeItemCounts !== "function") return;
+        state.unsubscribeRuneCounts = bot.subscribeItemCounts((reading) => {
+            if (!state.running || !reading) return;
+            if (Number(reading.itemId) !== Number(state.runeCountItemId)) return;
+            if (Math.max(0, Math.trunc(Number(reading.fluidType) || 0)) !== Number(state.runeCountFluidType || 0)) return;
+            try { bot.ui?.refreshAutoAttackStatus?.(); } catch (e) {}
+        });
+    }
+
+    function detachAttackRuneCountListener() {
+        if (!state.unsubscribeRuneCounts) return;
+        try { state.unsubscribeRuneCounts(); } catch (e) {}
+        state.unsubscribeRuneCounts = null;
+    }
+
     function canUseRune(now = Date.now()) {
+        if (isProtectionZoneBlocked(now))
+            return false;
+
         const slot = normalizeHotbarSlot(config.runeHotbarSlot);
-        if (!slot || !getCurrentTarget())
+        const target = getCurrentTarget();
+        if (!slot || !target)
+            return false;
+
+        const targetInfo = isTargetValidAndOnScreen(target, {
+            returnDetails: true,
+            maxDx: 8,
+            maxDy: 6,
+            skipReachability: true
+        });
+        if (!targetInfo.valid)
+            return false;
+
+        if (releaseTargetForAntiKS(target, now))
             return false;
 
         const playerPos = normalizePosition(bot.getPlayerPosition());
-        const targetPos = normalizePosition(getCurrentTarget().getPosition?.() || getCurrentTarget().__position);
+        const targetPos = normalizePosition(target.getPosition?.() || target.__position);
         if (!playerPos || !targetPos)
             return false;
 
@@ -6476,8 +10036,22 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         if (dist > maxDist)
             return false;
 
+        // Keep the old local guard as a minimum anti-spam delay, but also obey
+        // the client's authoritative rune cooldown when the selected hotbar
+        // slot is actually bound to a rune.
         if (now - state.lastRuneHotkeyAt < Math.max(0, Number(config.runeCooldownMs) || 0))
             return false;
+        if (getAttackRuneCooldownRemainingMs() > 0)
+            return false;
+
+        const countState = getAttackRuneCountState(now, true);
+        if (countState.itemId && countState.fresh && countState.count === 0) {
+            if (!state.lastRuneMissingWarningAt || now - state.lastRuneMissingWarningAt >= 60000) {
+                state.lastRuneMissingWarningAt = now;
+                bot.log("Targeting: attack rune count is 0", { itemId: countState.itemId, hotbarSlot: slot });
+            }
+            return false;
+        }
         return true;
     }
 
@@ -6494,9 +10068,14 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         }
 
         const slot = normalizeHotbarSlot(config.runeHotbarSlot);
-        const clicked = bot.clickHotbar(slot - 1);
+        const clicked = bot.actions.runShared('attack-rune',
+            bot.actions.priorities.COMBAT, () => bot.clickHotbar(slot - 1));
         if (clicked) {
             state.lastRuneHotkeyAt = now;
+            // Ask for a fresh full-inventory count on the next combat tick. The
+            // request is sent after the use packet, so the server can report
+            // the post-use supply without introducing another timer.
+            state.lastRuneCountRequestAt = 0;
             markCombatActive(now);
             //bot.log("used auto attack rune hotkey", { slot, target: getCurrentTarget()?.name || "Mob" });
         }
@@ -6514,7 +10093,15 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         if (!state.running)
             return;
         try {
+            if (!syncPlayerSession())
+                return;
+            ensureTargetAckHook();
+            ensureCancelMessageHook();
+            const tickNow = Date.now();
+            checkTargetAckTimeout(tickNow);
+            pruneRejectedTargetBackoff(tickNow);
             tryAttack();
+            refreshMovementOwnership(Date.now());
         } catch (e) {
             bot.log("auto attack tick failed", e?.message || e);
         } finally {
@@ -6532,6 +10119,11 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             return false;
         }
         state.running = true;
+        syncPlayerSession();
+        ensureTargetAckHook();
+        ensureCancelMessageHook();
+        attachAttackRuneCountListener();
+        getAttackRuneCountState(Date.now(), true);
         // Apply chase mode if enabled
         if (config.useClientChase) {
             setClientChaseMode(2);
@@ -6546,6 +10138,11 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     function stop(options = {}) {
         const shouldPersist = options.persistEnabled !== false;
         state.running = false;
+        detachTargetAckHook();
+        detachCancelMessageHook();
+        resetPendingTargetAck();
+        state.rejectedTargetBackoff.clear();
+        detachAttackRuneCountListener();
         if (state.timerId != null) {
             window.clearTimeout(state.timerId);
             state.timerId = null;
@@ -6569,15 +10166,165 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         clearCurrentFollowTarget();
         state.kiteWaypointIndex = null;
         state.skippedTargetIds.clear();
+        reachCache.clear();
+        state.movementOwner = null;
+        state.movementOwnedUntil = 0;
+        state.lastSelectedTargetId = null;
+        state.targetSelectedAt = 0;
+        resetRetargetCandidate();
+        state.lastRetargetReason = null;
+        state.lastTargetLossAt = 0;
+        state.lastTargetLossId = null;
+        state.lastTargetHandoffAt = 0;
+        state.lastInvalidTargetAt = 0;
+        state.lastInvalidTargetReason = null;
+        state.canonicalTargetRefreshes = 0;
+        state.canonicalFollowRefreshes = 0;
+        state.candidateSnapshotAt = 0;
+        state.candidateSnapshot = null;
+        state.candidateSnapshotBuilds = 0;
+        state.candidateSnapshotHits = 0;
+        state.lastCandidateBuildMs = 0;
+        state.lastCandidateCount = 0;
+        state.lastCandidateScoreEvaluations = 0;
+        state.approachPathSearches = 0;
+        state.approachAlternativeProbes = 0;
+        state.approachBetterSelections = 0;
+        state.protectionZoneBlocked = false;
+        state.protectionZoneBlockedSince = 0;
+        state.protectionZoneBlockReason = null;
+        state.protectionZoneBlockedTicks = 0;
+        state.protectionZonePreventedTargets = 0;
+        state.protectionZoneAutoTargetClears = 0;
+        state.protectionZoneCancelBlockedUntil = 0;
+        state.protectionZoneLastCancelText = "";
+        state.protectionZoneLastCancelAt = 0;
+        state.targetAckCount = 0;
+        state.targetRejectCount = 0;
+        state.targetAckTimeoutCount = 0;
+        state.targetServerOverrideCount = 0;
+        state.lastTargetAckAt = 0;
+        state.lastTargetAckId = null;
+        state.lastTargetAckLatencyMs = null;
+        state.lastTargetRejectAt = 0;
+        state.lastTargetRejectId = null;
+        state.lastTargetAckTimeoutAt = 0;
+        state.lastServerTargetAt = 0;
+        state.lastServerTargetId = null;
+        state.cancelMessageEvents = 0;
+        state.protectionZoneCancelHookHits = 0;
+        state.targetCancelRejectCount = 0;
+        state.rejectedTargetBackoff.clear();
+        state.lastTargetRejectReason = null;
+        state.lastTargetRejectBackoffMs = 0;
+        state.rejectedAutoTargetLocalClears = 0;
+        state.lastRejectedAutoTargetClearAt = 0;
+        state.antiKSSnapshotAt = 0;
+        state.antiKSSnapshot = null;
+        state.antiKSSnapshotBuilds = 0;
+        state.antiKSSnapshotHits = 0;
+        state.antiKSLastOtherPlayerCount = 0;
+        state.antiKSLastBlockedTargetId = null;
+        state.antiKSLastBlockedPlayerId = null;
+        state.antiKSLastBlockedPlayerName = null;
+        state.antiKSLastBlockedDistance = null;
+        state.antiKSLastBlockedAt = 0;
+        state.engagedDirectLookupHits = 0;
+        state.engagedDirectLookupMisses = 0;
+        state.staleEngagedFollowClears = 0;
+        state.lureActive = false;
+        state.lureMobCount = 0;
+        state.lurePreferredVisible = false;
+        state.lurePreferredPending = false;
+        state.lurePreferredTrackedId = null;
+        state.lurePreferredTrackedName = null;
+        state.lurePreferredTrackedDistance = null;
+        state.lurePreferredActionableId = null;
+        state.lurePreferredPendingSince = 0;
+        state.lurePreferredLastSeenAt = 0;
+        state.lurePreferredPendingActivations = 0;
+        state.lurePreferredSuppressedTargets = 0;
+        state.lurePreferredHandoffs = 0;
+        state.lurePreferredLastReason = null;
+        state.lureReason = null;
+        state.lureWaypointIndex = null;
+        state.lureWaypoint = null;
+        state.lureStartedAt = 0;
+        state.lureActivations = 0;
+        state.lureTargetReleases = 0;
+        state.lureThresholdReachedAt = 0;
+        state.lureAttackTicks = 0;
+        state.lureTargetsAcquired = 0;
+        state.lureRunesUsed = 0;
+        state.lureOutOfRangeClears = 0;
+        state.lureSmartSwitches = 0;
+        state.lureLastSmartSwitchAt = 0;
+        state.lureLastSmartFromId = null;
+        state.lureLastSmartToId = null;
+        state.lureLastSmartReason = null;
+        state.lureRunePreserveSkips = 0;
+        state.lureSmartTargetScore = null;
+        state.lureSmartTargetHealthPct = null;
+        state.lureMotionHistory.clear();
+        state.lurePredictiveHolds = 0;
+        state.lurePredictiveLastMobId = null;
+        state.lurePredictiveLastMobName = null;
+        state.lurePredictiveLastAt = 0;
+        state.lurePredictiveLastAwaySteps = 0;
+        state.lureLastMobActive = false;
+        state.lureLastMobMode = null;
+        state.lureLastMobId = null;
+        state.lureLastMobName = null;
+        state.lureLastMobHealthPct = null;
+        state.lureLastMobStartedAt = 0;
+        state.lureLastMobActivations = 0;
+        state.lureLastMobFinishes = 0;
+        state.lureLastMobRuneBursts = 0;
+        state.lureMovementHeld = false;
+        state.lureLeashMobId = null;
+        state.lureLeashMobName = null;
+        state.lureLeashScreenX = null;
+        state.lureLeashScreenY = null;
+        state.lureLeashTileDistance = null;
+        state.lureLeashStartedAt = 0;
+        state.lureLeashLastSeenAt = 0;
+        state.lureLeashActivations = 0;
+        state.lureLeashResumes = 0;
+        state.lureLeashLostTimeouts = 0;
+        state.lureLeashReason = null;
+        state.autoTargetId = null;
+        state.lastObservedTargetId = null;
+        state.manualTargetId = null;
+        state.manualTargetSince = 0;
+        state.manualTargetProtectUntil = 0;
+        state.manualTargetDetections = 0;
+        state.lastTargetOwner = null;
+        state.playerSessionRef = null;
+        state.playerSessionSeen = false;
+        state.lastRuneCountRequestAt = 0;
+        state.lastRuneMissingWarningAt = 0;
+        state.runeCountItemId = 0;
+        state.runeCountFluidType = 0;
         bot.log("auto attack stopped");
         return true;
     }
 
     function status() {
-        const combatActive = syncCombatState(Date.now());
-        state.lastProgressAt = 0;
-        state.lastDistance = undefined;
-        state.lastTargetHealth = null;
+        const now = Date.now();
+        const combatActive = syncCombatState(now);
+        const runeCount = getAttackRuneCountState(now, state.running);
+        const runeCooldownRemainingMs = getAttackRuneCooldownRemainingMs();
+        const currentTarget = getCurrentTarget();
+        const currentApproach = currentTarget ? getTargetApproachInfo(currentTarget) : null;
+        const currentHealthPct = currentTarget ? getCreatureHealthPercent(currentTarget) : null;
+        const damageAgeMs = state.lastDamageAt ? Math.max(0, now - state.lastDamageAt) : null;
+        const pzInfo = getProtectionZoneBlockInfo(now);
+        const finishTargetProtected =
+            Number.isFinite(currentHealthPct) &&
+            currentHealthPct > 0 &&
+            currentHealthPct <= Math.max(1, Math.min(90, Number(config.finishTargetHealthPct) || 30)) &&
+            damageAgeMs !== null &&
+            damageAgeMs <= Math.max(500, Number(config.finishTargetDamageGraceMs) || 2500);
         return {
             running: state.running,
             config: {
@@ -6585,17 +10332,199 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             },
             lastTargetHotkeyAt: state.lastTargetHotkeyAt,
             lastRuneHotkeyAt: state.lastRuneHotkeyAt,
+            runeItemId: runeCount.itemId || null,
+            runeItemCount: runeCount.known ? runeCount.count : null,
+            runeItemCountFresh: runeCount.fresh,
+            runeCooldownRemainingMs,
             engagedTargetId: state.engagedTargetId,
             combatActive,
             combatStartedAt: state.combatStartedAt || 0,
             combatDurationMs: state.combatStartedAt ? Math.max(0, Date.now() - state.combatStartedAt) : 0,
             targetCount: getCombatTargetCount(),
             lastChaseAt: state.lastChaseAt,
-            currentTarget: getCurrentTarget() ? {
-                id: getCurrentTarget().id,
-                name: getCurrentTarget().name,
-                type: getCurrentTarget().type,
-                position: getCurrentTarget().__position || null,
+            targetSelectedAt: state.targetSelectedAt || 0,
+            targetHeldMs: state.targetSelectedAt ? Math.max(0, Date.now() - state.targetSelectedAt) : 0,
+            lastRetargetAt: state.lastRetargetAt || 0,
+            lastRetargetReason: state.lastRetargetReason,
+            retargetCandidateId: state.retargetCandidateId,
+            retargetCandidateHeldMs: state.retargetCandidateSince
+                ? Math.max(0, now - state.retargetCandidateSince)
+                : 0,
+            retargetCandidateAdvantage: state.retargetCandidateAdvantage || 0,
+            lastDamageAt: state.lastDamageAt || 0,
+            lastDamageAgeMs: damageAgeMs,
+            lastApproachCost: Number.isFinite(state.lastApproachCost) ? state.lastApproachCost : null,
+            lastChaseProgressReason: state.lastChaseProgressReason,
+            chaseProgressAgeMs: state.lastProgressAt ? Math.max(0, now - state.lastProgressAt) : null,
+            finishTargetProtected,
+            finishTargetBlocks: state.finishTargetBlocks || 0,
+            lastTargetLossAt: state.lastTargetLossAt || 0,
+            lastTargetLossId: state.lastTargetLossId,
+            lastTargetHandoffAt: state.lastTargetHandoffAt || 0,
+            lastInvalidTargetAt: state.lastInvalidTargetAt || 0,
+            lastInvalidTargetReason: state.lastInvalidTargetReason,
+            canonicalTargetRefreshes: state.canonicalTargetRefreshes || 0,
+            canonicalFollowRefreshes: state.canonicalFollowRefreshes || 0,
+            candidateSnapshotBuilds: state.candidateSnapshotBuilds || 0,
+            candidateSnapshotHits: state.candidateSnapshotHits || 0,
+            lastCandidateBuildMs: Number(state.lastCandidateBuildMs || 0),
+            lastCandidateCount: state.lastCandidateCount || 0,
+            lastCandidateScoreEvaluations: state.lastCandidateScoreEvaluations || 0,
+            approachPathSearches: state.approachPathSearches || 0,
+            approachAlternativeProbes: state.approachAlternativeProbes || 0,
+            approachBetterSelections: state.approachBetterSelections || 0,
+            protectionZoneBlocked: !!pzInfo.blocked,
+            protectionZoneBlockReason: pzInfo.reason || state.protectionZoneBlockReason,
+            protectionZoneBlockedSince: state.protectionZoneBlockedSince || 0,
+            protectionZoneBlockedForMs:
+                state.protectionZoneBlockedSince
+                    ? Math.max(0, now - state.protectionZoneBlockedSince)
+                    : 0,
+            protectionZoneBlockedTicks: state.protectionZoneBlockedTicks || 0,
+            protectionZonePreventedTargets: state.protectionZonePreventedTargets || 0,
+            protectionZoneAutoTargetClears: state.protectionZoneAutoTargetClears || 0,
+            protectionZoneLastCancelText: state.protectionZoneLastCancelText,
+            protectionZoneLastCancelAt: state.protectionZoneLastCancelAt || 0,
+            pendingTargetAckId: state.pendingTargetId,
+            pendingTargetAckAgeMs:
+                state.pendingTargetId != null && state.pendingTargetSentAt
+                    ? Math.max(0, now - state.pendingTargetSentAt)
+                    : 0,
+            targetAckCount: state.targetAckCount || 0,
+            targetRejectCount: state.targetRejectCount || 0,
+            targetAckTimeoutCount: state.targetAckTimeoutCount || 0,
+            targetServerOverrideCount: state.targetServerOverrideCount || 0,
+            lastTargetAckAt: state.lastTargetAckAt || 0,
+            lastTargetAckId: state.lastTargetAckId,
+            lastTargetAckLatencyMs: state.lastTargetAckLatencyMs,
+            lastTargetRejectAt: state.lastTargetRejectAt || 0,
+            lastTargetRejectId: state.lastTargetRejectId,
+            lastTargetAckTimeoutAt: state.lastTargetAckTimeoutAt || 0,
+            lastServerTargetAt: state.lastServerTargetAt || 0,
+            lastServerTargetId: state.lastServerTargetId,
+            cancelMessageHookActive:
+                !!state.cancelHookOwner &&
+                !!state.cancelHookWrapper &&
+                state.cancelHookOwner.setCancelMessage === state.cancelHookWrapper,
+            cancelMessageEvents: state.cancelMessageEvents || 0,
+            protectionZoneCancelHookHits: state.protectionZoneCancelHookHits || 0,
+            targetCancelRejectCount: state.targetCancelRejectCount || 0,
+            rejectedTargetBackoffCount: state.rejectedTargetBackoff.size,
+            lastTargetRejectReason: state.lastTargetRejectReason,
+            lastTargetRejectBackoffMs: state.lastTargetRejectBackoffMs || 0,
+            rejectedAutoTargetLocalClears: state.rejectedAutoTargetLocalClears || 0,
+            lastRejectedAutoTargetClearAt: state.lastRejectedAutoTargetClearAt || 0,
+            antiKSSnapshotBuilds: state.antiKSSnapshotBuilds || 0,
+            antiKSSnapshotHits: state.antiKSSnapshotHits || 0,
+            antiKSOtherPlayerCount: state.antiKSLastOtherPlayerCount || 0,
+            antiKSLastBlockedTargetId: state.antiKSLastBlockedTargetId,
+            antiKSLastBlockedPlayerId: state.antiKSLastBlockedPlayerId,
+            antiKSLastBlockedPlayerName: state.antiKSLastBlockedPlayerName,
+            antiKSLastBlockedDistance: state.antiKSLastBlockedDistance,
+            antiKSLastBlockedAt: state.antiKSLastBlockedAt || 0,
+            engagedDirectLookupHits: state.engagedDirectLookupHits || 0,
+            engagedDirectLookupMisses: state.engagedDirectLookupMisses || 0,
+            staleEngagedFollowClears: state.staleEngagedFollowClears || 0,
+            lureActive: isLureActive(),
+            lureMobCount: state.lureMobCount || 0,
+            lureMobThreshold: Math.max(1, Number(config.lureMobThreshold) || 3),
+            lureRadius: Math.max(1, Math.min(8, Math.trunc(Number(config.lureRadius) || 5))),
+            lureSmartTargeting: config.lureSmartTargeting !== false,
+            lurePreserveHpPct: Math.max(5, Math.min(90, Number(config.lurePreserveHpPct) || 30)),
+            lurePreferredVisible: !!state.lurePreferredVisible,
+            lurePreferredPending: !!state.lurePreferredPending,
+            lurePreferredTrackedId: state.lurePreferredTrackedId,
+            lurePreferredTrackedName: state.lurePreferredTrackedName,
+            lurePreferredTrackedDistance: state.lurePreferredTrackedDistance,
+            lurePreferredActionableId: state.lurePreferredActionableId,
+            lurePreferredPendingSince: state.lurePreferredPendingSince || 0,
+            lurePreferredLastSeenAt: state.lurePreferredLastSeenAt || 0,
+            lurePreferredPendingActivations: state.lurePreferredPendingActivations || 0,
+            lurePreferredSuppressedTargets: state.lurePreferredSuppressedTargets || 0,
+            lurePreferredHandoffs: state.lurePreferredHandoffs || 0,
+            lurePreferredLastReason: state.lurePreferredLastReason,
+            lureReason: state.lureReason,
+            lureWaypointIndex: state.lureWaypointIndex,
+            lureWaypoint: state.lureWaypoint,
+            lureStartedAt: state.lureStartedAt || 0,
+            lureDurationMs: state.lureStartedAt ? Math.max(0, now - state.lureStartedAt) : 0,
+            lureActivations: state.lureActivations || 0,
+            lureTargetReleases: state.lureTargetReleases || 0,
+            lureThresholdReachedAt: state.lureThresholdReachedAt || 0,
+            lureAttackTicks: state.lureAttackTicks || 0,
+            lureTargetsAcquired: state.lureTargetsAcquired || 0,
+            lureRunesUsed: state.lureRunesUsed || 0,
+            lureOutOfRangeClears: state.lureOutOfRangeClears || 0,
+            lureSmartSwitches: state.lureSmartSwitches || 0,
+            lureLastSmartSwitchAt: state.lureLastSmartSwitchAt || 0,
+            lureLastSmartFromId: state.lureLastSmartFromId,
+            lureLastSmartToId: state.lureLastSmartToId,
+            lureLastSmartReason: state.lureLastSmartReason,
+            lureRunePreserveSkips: state.lureRunePreserveSkips || 0,
+            lureSmartTargetScore: state.lureSmartTargetScore,
+            lureSmartTargetHealthPct: state.lureSmartTargetHealthPct,
+            lurePredictiveLeash:
+                config.lureSmartTargeting !== false &&
+                config.lurePredictiveLeash !== false,
+            lurePredictiveHolds: state.lurePredictiveHolds || 0,
+            lurePredictiveLastMobId: state.lurePredictiveLastMobId,
+            lurePredictiveLastMobName: state.lurePredictiveLastMobName,
+            lurePredictiveLastAt: state.lurePredictiveLastAt || 0,
+            lurePredictiveLastAwaySteps: state.lurePredictiveLastAwaySteps || 0,
+            lureMotionTrackedMobs: state.lureMotionHistory.size,
+            lureLastMobActive: !!state.lureLastMobActive,
+            lureLastMobMode: state.lureLastMobMode || config.lureLastMobMode || "slow",
+            lureLastMobHpPct: Math.max(5, Math.min(90, Number(config.lureLastMobHpPct) || 20)),
+            lureLastMobId: state.lureLastMobId,
+            lureLastMobName: state.lureLastMobName,
+            lureLastMobHealthPct: state.lureLastMobHealthPct,
+            lureLastMobStartedAt: state.lureLastMobStartedAt || 0,
+            lureLastMobActivations: state.lureLastMobActivations || 0,
+            lureLastMobFinishes: state.lureLastMobFinishes || 0,
+            lureLastMobRuneBursts: state.lureLastMobRuneBursts || 0,
+            lureCrowdBlocked: bot.cave?.isLureCrowdBlocked?.() === true,
+            lureCrowdBlockerCount:
+                bot.cave?.getLureBlockedCreatureIds?.()?.length || 0,
+            lureMovementHeld: isLureMovementHeld(),
+            lureLeashMobId: state.lureLeashMobId,
+            lureLeashMobName: state.lureLeashMobName,
+            lureLeashScreenX: state.lureLeashScreenX,
+            lureLeashScreenY: state.lureLeashScreenY,
+            lureLeashTileDistance: state.lureLeashTileDistance,
+            lureLeashReason: state.lureLeashReason,
+            lureLeashStartedAt: state.lureLeashStartedAt || 0,
+            lureLeashHeldForMs:
+                state.lureLeashStartedAt
+                    ? Math.max(0, now - state.lureLeashStartedAt)
+                    : 0,
+            lureLeashActivations: state.lureLeashActivations || 0,
+            lureLeashResumes: state.lureLeashResumes || 0,
+            lureLeashLostTimeouts: state.lureLeashLostTimeouts || 0,
+            targetOwner: state.lastTargetOwner,
+            autoTargetId: state.autoTargetId,
+            manualTargetId: state.manualTargetId,
+            manualTargetSince: state.manualTargetSince || 0,
+            manualTargetProtected: !!currentTarget && isManualTargetProtected(currentTarget, now),
+            manualTargetProtectionRemainingMs:
+                currentTarget && isManualTargetProtected(currentTarget, now)
+                    ? Math.max(0, state.manualTargetProtectUntil - now)
+                    : 0,
+            manualTargetDetections: state.manualTargetDetections || 0,
+            clientChaseMode: Number(window.gameClient?.interface?.fightModeSelector?.currentChaseMode ?? 0),
+            movementOwned: isMovementOwned(Date.now()),
+            movementOwner: state.movementOwner,
+            currentTarget: currentTarget ? {
+                id: currentTarget.id,
+                name: currentTarget.name,
+                type: currentTarget.type,
+                position: currentTarget.__position || null,
+                healthPercent: Number.isFinite(currentHealthPct) ? currentHealthPct : null,
+                pathSteps: Number.isFinite(currentApproach?.pathSteps)
+                    ? currentApproach.pathSteps
+                    : null,
+                pathCost: Number.isFinite(currentApproach?.pathCost)
+                    ? currentApproach.pathCost
+                    : null,
             }
              : null,
             nearbyMonsters: getNearbyMonsters().map(c => ({
@@ -6608,6 +10537,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function updateConfig(nextConfig = {}) {
+        const chaseSettingChanged = nextConfig.useClientChase !== undefined;
+        if (nextConfig.useClientChase !== undefined) {
+            nextConfig.useClientChase = !!nextConfig.useClientChase;
+        }
         if (nextConfig.targetHotbarSlot !== undefined) {
             nextConfig.targetHotbarSlot = normalizeHotbarSlot(nextConfig.targetHotbarSlot) ?? config.targetHotbarSlot;
         }
@@ -6626,6 +10559,147 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         if (nextConfig.antiKSOtherRange !== undefined) {
             nextConfig.antiKSOtherRange = Math.max(1, Math.trunc(Number(nextConfig.antiKSOtherRange) || 2));
         }
+        if (nextConfig.targetStickMs !== undefined) {
+            const value = Number(nextConfig.targetStickMs);
+            nextConfig.targetStickMs = Number.isFinite(value) ? Math.max(0, Math.min(10000, value)) : config.targetStickMs;
+        }
+        if (nextConfig.retargetCooldownMs !== undefined) {
+            const value = Number(nextConfig.retargetCooldownMs);
+            nextConfig.retargetCooldownMs = Number.isFinite(value) ? Math.max(0, Math.min(10000, value)) : config.retargetCooldownMs;
+        }
+        if (nextConfig.retargetDistanceAdvantage !== undefined) {
+            const value = Number(nextConfig.retargetDistanceAdvantage);
+            nextConfig.retargetDistanceAdvantage = Number.isFinite(value) ? Math.max(1, Math.min(10, Math.trunc(value))) : config.retargetDistanceAdvantage;
+        }
+        if (nextConfig.retargetConfirmMs !== undefined) {
+            const value = Number(nextConfig.retargetConfirmMs);
+            nextConfig.retargetConfirmMs = Number.isFinite(value) ? Math.max(100, Math.min(2000, value)) : config.retargetConfirmMs;
+        }
+        if (nextConfig.finishTargetHealthPct !== undefined) {
+            const value = Number(nextConfig.finishTargetHealthPct);
+            nextConfig.finishTargetHealthPct = Number.isFinite(value) ? Math.max(1, Math.min(90, value)) : config.finishTargetHealthPct;
+        }
+        if (nextConfig.finishTargetDamageGraceMs !== undefined) {
+            const value = Number(nextConfig.finishTargetDamageGraceMs);
+            nextConfig.finishTargetDamageGraceMs = Number.isFinite(value) ? Math.max(500, Math.min(10000, value)) : config.finishTargetDamageGraceMs;
+        }
+        if (nextConfig.manualTargetHoldMs !== undefined) {
+            const value = Number(nextConfig.manualTargetHoldMs);
+            nextConfig.manualTargetHoldMs = Number.isFinite(value) ? Math.max(500, Math.min(10000, value)) : config.manualTargetHoldMs;
+        }
+        if (nextConfig.targetAckTimeoutMs !== undefined) {
+            const value = Number(nextConfig.targetAckTimeoutMs);
+            nextConfig.targetAckTimeoutMs = Number.isFinite(value) ? Math.max(400, Math.min(3000, value)) : config.targetAckTimeoutMs;
+        }
+        if (nextConfig.lureMode !== undefined) {
+            nextConfig.lureMode = !!nextConfig.lureMode;
+        }
+        if (nextConfig.lureMobThreshold !== undefined) {
+            const value = Number(nextConfig.lureMobThreshold);
+            nextConfig.lureMobThreshold = Number.isFinite(value)
+                ? Math.max(1, Math.min(20, Math.trunc(value)))
+                : config.lureMobThreshold;
+        }
+        if (nextConfig.lureRadius !== undefined) {
+            const value = Number(nextConfig.lureRadius);
+            nextConfig.lureRadius = Number.isFinite(value)
+                ? Math.max(1, Math.min(8, Math.trunc(value)))
+                : config.lureRadius;
+        }
+        if (nextConfig.lureSmartTargeting !== undefined) {
+            nextConfig.lureSmartTargeting = !!nextConfig.lureSmartTargeting;
+        }
+        if (nextConfig.lurePreserveHpPct !== undefined) {
+            const value = Number(nextConfig.lurePreserveHpPct);
+            nextConfig.lurePreserveHpPct = Number.isFinite(value)
+                ? Math.max(5, Math.min(90, value))
+                : config.lurePreserveHpPct;
+        }
+        if (nextConfig.lureSmartSwitchCooldownMs !== undefined) {
+            const value = Number(nextConfig.lureSmartSwitchCooldownMs);
+            nextConfig.lureSmartSwitchCooldownMs = Number.isFinite(value)
+                ? Math.max(300, Math.min(3000, value))
+                : config.lureSmartSwitchCooldownMs;
+        }
+        if (nextConfig.lureSmartHealthAdvantagePct !== undefined) {
+            const value = Number(nextConfig.lureSmartHealthAdvantagePct);
+            nextConfig.lureSmartHealthAdvantagePct = Number.isFinite(value)
+                ? Math.max(5, Math.min(50, value))
+                : config.lureSmartHealthAdvantagePct;
+        }
+        if (nextConfig.lurePredictiveLeash !== undefined) {
+            nextConfig.lurePredictiveLeash = !!nextConfig.lurePredictiveLeash;
+        }
+        if (nextConfig.lurePredictiveAwaySteps !== undefined) {
+            const value = Number(nextConfig.lurePredictiveAwaySteps);
+            nextConfig.lurePredictiveAwaySteps = Number.isFinite(value)
+                ? Math.max(1, Math.min(4, Math.trunc(value)))
+                : config.lurePredictiveAwaySteps;
+        }
+        if (nextConfig.lurePredictiveWindowMs !== undefined) {
+            const value = Number(nextConfig.lurePredictiveWindowMs);
+            nextConfig.lurePredictiveWindowMs = Number.isFinite(value)
+                ? Math.max(600, Math.min(4000, value))
+                : config.lurePredictiveWindowMs;
+        }
+        if (nextConfig.lureLastMobHpPct !== undefined) {
+            const value = Number(nextConfig.lureLastMobHpPct);
+            nextConfig.lureLastMobHpPct = Number.isFinite(value)
+                ? Math.max(5, Math.min(90, value))
+                : config.lureLastMobHpPct;
+        }
+        if (nextConfig.lureLastMobMode !== undefined) {
+            nextConfig.lureLastMobMode =
+                String(nextConfig.lureLastMobMode || "slow").toLowerCase() === "kill"
+                    ? "kill"
+                    : "slow";
+        }
+        if (nextConfig.lurePreferredTrackRadius !== undefined) {
+            const value = Number(nextConfig.lurePreferredTrackRadius);
+            nextConfig.lurePreferredTrackRadius = Number.isFinite(value)
+                ? Math.max(6, Math.min(20, Math.trunc(value)))
+                : config.lurePreferredTrackRadius;
+        }
+        if (nextConfig.lurePreferredLostGraceMs !== undefined) {
+            const value = Number(nextConfig.lurePreferredLostGraceMs);
+            nextConfig.lurePreferredLostGraceMs = Number.isFinite(value)
+                ? Math.max(300, Math.min(3000, value))
+                : config.lurePreferredLostGraceMs;
+        }
+        if (nextConfig.lureLeashEdgeX !== undefined) {
+            const value = Number(nextConfig.lureLeashEdgeX);
+            nextConfig.lureLeashEdgeX = Number.isFinite(value)
+                ? Math.max(3, Math.min(7, value))
+                : config.lureLeashEdgeX;
+        }
+        if (nextConfig.lureLeashEdgeY !== undefined) {
+            const value = Number(nextConfig.lureLeashEdgeY);
+            nextConfig.lureLeashEdgeY = Number.isFinite(value)
+                ? Math.max(2, Math.min(5, value))
+                : config.lureLeashEdgeY;
+        }
+        if (nextConfig.lureLeashResumeX !== undefined) {
+            const value = Number(nextConfig.lureLeashResumeX);
+            nextConfig.lureLeashResumeX = Number.isFinite(value)
+                ? Math.max(2, Math.min(6, value))
+                : config.lureLeashResumeX;
+        }
+        if (nextConfig.lureLeashResumeY !== undefined) {
+            const value = Number(nextConfig.lureLeashResumeY);
+            nextConfig.lureLeashResumeY = Number.isFinite(value)
+                ? Math.max(1, Math.min(4, value))
+                : config.lureLeashResumeY;
+        }
+        if (nextConfig.lureLeashLostGraceMs !== undefined) {
+            const value = Number(nextConfig.lureLeashLostGraceMs);
+            nextConfig.lureLeashLostGraceMs = Number.isFinite(value)
+                ? Math.max(500, Math.min(5000, value))
+                : config.lureLeashLostGraceMs;
+        }
+        if (nextConfig.fastReacquireMs !== undefined) {
+            const value = Number(nextConfig.fastReacquireMs);
+            nextConfig.fastReacquireMs = Number.isFinite(value) ? Math.max(50, Math.min(500, value)) : config.fastReacquireMs;
+        }
         if (nextConfig.preferredTargetNames !== undefined) {
             nextConfig.preferredTargetNames = Array.isArray(nextConfig.preferredTargetNames)
                  ? nextConfig.preferredTargetNames.map(n => String(n).trim()).filter(Boolean)
@@ -6636,7 +10710,35 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                  ? nextConfig.ignoredTargetNames.map(n => String(n).trim()).filter(Boolean)
                  : [];
         }
+        const runeSlotChanged = nextConfig.runeHotbarSlot !== undefined;
         Object.assign(config, nextConfig);
+        invalidateCandidateSnapshot();
+        invalidateAntiKSSnapshot();
+
+        if (!config.lureMode)
+            clearLureState("disabled");
+
+        if (chaseSettingChanged) {
+            const target = getCurrentTarget();
+            const playerPos = normalizePosition(bot.getPlayerPosition());
+            const targetPos = normalizePosition(target?.getPosition?.() || target?.__position);
+            const shouldChase =
+                !!config.useClientChase &&
+                !!playerPos &&
+                !!targetPos &&
+                playerPos.z === targetPos.z &&
+                getTileDistance(playerPos, targetPos) > 1;
+            setClientChaseMode(shouldChase);
+            state._chaseEnabledForDistance = shouldChase;
+        }
+
+        if (runeSlotChanged) {
+            state.lastRuneCountRequestAt = 0;
+            state.lastRuneMissingWarningAt = 0;
+            state.runeCountItemId = 0;
+            state.runeCountFluidType = 0;
+            if (state.running) getAttackRuneCountState(Date.now(), true);
+        }
         persistConfig();
         bot.log("auto attack config updated", {
             ...config
@@ -6663,10 +10765,21 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         triggerAttack,
         canUseRune,
         triggerRune,
+        getRuneCountState: () => getAttackRuneCountState(Date.now(), false),
+        getRuneCooldownRemainingMs: getAttackRuneCooldownRemainingMs,
         getNearbyMonsters,
         getCurrentTarget,
         getCurrentFollowTarget,
+        isRunning: () => state.running,
+        isEnabled: () => !!config.enabled,
+        isLureActive,
+        isLureMovementHeld,
+        getLureLastMobInfo,
+        getLureContext,
+        isProtectionZoneBlocked,
+        getProtectionZoneBlockInfo,
         isCombatActive,
+        isMovementOwned,
         syncMeleeChase,
         normalizeHotbarSlot,
         setClientChaseMode,
@@ -6703,11 +10816,15 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         running: false,
         timerId: null,
         observerTimerId: null,
+        routeRevision: 0,
         noWayObserver: null,
+        noWayElements: null, // Current DOM nodes, to detect replacements after reconnect.
         noWayLastSeenAt: 0,
         noWayLastText: "",
         noWayRecoveryIndex: -1,
         fallbackMoveTimerId: null,
+        // Invalidates an old manual step whenever its waypoint/path is superseded.
+        fallbackMoveRequestId: 0,
         currentIndex: 0,
         direction: 1,
         lastPathAt: 0,
@@ -6718,6 +10835,67 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         lastTeleportResetAt: 0,
         pendingTransitionSource: null,
         pausedForCombat: false,
+        lureLeashPaused: false,
+        lureLeashPauseCount: 0,
+        lureLeashResumeCount: 0,
+
+        // v1.5.10: proactive lure-route creature bypass. Normal CaveBot waits
+        // for temporary blockers; lure mode must route around them immediately
+        // or it can stand still long enough to kill the mob.
+        lureBlockerId: null,
+        lureBlockerName: null,
+        lureBlockerSince: 0,
+        lureBlockerLastSeenAt: 0,
+        lureBlockerReason: null,
+        lureBlockerDetourAt: 0,
+        lureBlockerDetours: 0,
+        lureBlockerWaits: 0,
+        lureBlockedWaypointSkips: 0,
+        lureBlockerClears: 0,
+
+        // v1.5.14: multiple lure mobs sealing a tight local route is treated
+        // as intentional pack congestion, not a CaveBot navigation failure.
+        lureCrowdBlocked: false,
+        lureCrowdBlockerIds: [],
+        lureCrowdBlockerNames: [],
+        lureCrowdBlockedSince: 0,
+        lureCrowdLastSeenAt: 0,
+        lureCrowdReason: null,
+        lureCrowdActivations: 0,
+        lureCrowdClears: 0,
+        lureCrowdHoldTicks: 0,
+        lureCrowdNoWaySuppressions: 0,
+
+        // v1.5.17: native Pathfinder NO_WAY arrives asynchronously and can
+        // beat the next CaveBot tick. During lure, defer a NO_WAY briefly when
+        // multiple nearby mobs could explain it, then let the next tick decide
+        // pack congestion vs. genuine route failure.
+        lureNoWayPending: false,
+        lureNoWayPendingUntil: 0,
+        lureNoWayPendingAt: 0,
+        lureNoWayPendingIndex: -1,
+        lureNoWayPendingKey: null,
+        lureNoWayPendingMobIds: [],
+        lureNoWayPendingMobNames: [],
+        lureNoWayDeferrals: 0,
+        lureNoWayResolvedAsCrowd: 0,
+        lureNoWayEscalations: 0,
+        lureNoWayLastResolution: null,
+        lureNoWayLastResolutionAt: 0,
+
+        // v1.5.16: movement shaping for the last low-HP lure mob.
+        lureLastMobMoveActive: false,
+        lureLastMobMoveMode: null,
+        lureLastMobMovePhase: "run",
+        lureLastMobMovePhaseUntil: 0,
+        lureLastMobSlowRuns: 0,
+        lureLastMobSlowHolds: 0,
+        lureLastMobKillHolds: 0,
+        lureLastMobMoveResets: 0,
+
+        // A missing player/position is not a navigation stall. Avoid counting
+        // offline/character-load time against the stuck watchdog.
+        positionUnavailable: false,
         lastWaypointTarget: null,
         lastSkipCheckAt: 0,
         skipAttemptCount: 0,
@@ -6734,6 +10912,39 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         recoveryLastTargetIndex: -1,
         recoveryLastTargetAt: 0,
         recoveryLastTargetKey: null,
+        // Temporary memory for recovery side-step tiles that proved unhelpful.
+        // Entries are short-lived and only influence recovery/side-step selection.
+        recoveryObstacleTiles: new Map(),
+        // Lightweight route-health/telemetry counters. These never drive normal
+        // Pathfinder navigation; they are for bounded recovery decisions and status.
+        routeHealth: new Map(),
+        // Recent recovery event history for diagnostics. Bounded so long-running
+        // CaveBot sessions cannot grow memory indefinitely. This is telemetry only
+        // and never changes Pathfinder navigation decisions.
+        recoveryHistory: [],
+        telemetry: {
+            progressEvents: 0,
+            recoveryEvents: 0,
+            nativeStalls: 0,
+            noWayEvents: 0,
+            teleportEvents: 0,
+            lastEventAt: 0,
+            lastEvent: null,
+        },
+        recoveryReason: null,
+        recoveryReasonAt: 0,
+        recoveryReasonIndex: -1,
+        recoveryReasonKey: null,
+        recoveryActive: false,
+        // Small, fixed-size circuit breaker state; never retains entire routes.
+        circuitFailures: null,
+        circuitTrip: null,
+        nativePathWatchKey: null,
+        nativePathWatchAt: 0,
+        nativePathWatchBestDistance: Infinity,
+        noWayLastWaypointKey: null,
+        noWayFailureKey: null,
+        noWayFailureAt: 0,
         recoveryBlockerWaitAt: 0,
         recoveryBlockerWaitKey: null,
         floorRecoveryLoop: null, // { key: string, count: number, firstAt: number, lastAt: number }
@@ -6741,6 +10952,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         lastAutoProbeLogAt: 0,
         lastTransitionLogKey: null,
         lastDistanceToWaypoint: null,
+        bestDistanceToWaypoint: Infinity,
+        waypointProgressKey: null,
         positionHistory: [],
         _stuckLogged: false,
         standReached: {},
@@ -6785,28 +10998,115 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         // the previous recovery made no route progress. If it is the only viable
         // target, the fallback pass may still select it.
         recoveryAvoidRepeatMs: 10000,
+        // Temporarily avoid the exact waypoint that produced a native "There is no way." failure.
+        noWayAvoidMs: 10000,
+        // Remember failed recovery side-step tiles briefly. This is deliberately
+        // short-lived so a temporary blocker can become usable again.
+        recoveryObstacleMemoryMs: 10000,
+        // Log a compact route-health warning after this many recovery events on
+        // the same waypoint. This does not stop or reroute the bot.
+        routeHealthWarningThreshold: 3,
+        // Temporarily avoid a recovery hotspot after repeated recent failures.
+        // This affects recovery selection only; normal route traversal is untouched.
+        recoveryHotspotAvoidMs: 10000,
+        // Give lightly unhealthy recovery targets a small score penalty before
+        // they become full hotspots. This keeps recovery adaptive without making
+        // a waypoint unavailable after only one or two failures.
+        recoveryHealthPenalty: 0.75,
+        // Recovery-health counters describe recent trouble, not lifetime trouble.
+        // After a quiet period the counters reset so one new transient failure
+        // cannot instantly reactivate an old hotspot from much earlier in the run.
+        routeHealthDecayMs: 60000,
+        // Keep the most recent recovery events available through CaveBot status.
+        recoveryHistoryLimit: 50,
+        // Final safety stop for repeated navigation failures in the SAME physical
+        // area without real progress. Never counts combat pauses, floor changes,
+        // temporary-blocker waits or SCRIPT waypoints.
+        circuitBreakerEnabled: true,
+        circuitBreakerMaxFailures: 8,
+        circuitBreakerWindowMs: 120000,
+        // Number of tiles of actual displacement from the failed area required
+        // to treat a new failure as a separate incident (not waypoint index hops).
+        circuitBreakerProgressTiles: 4,
         // Number of native Pathfinder repath recoveries before route-level recovery.
         maxRepathRecoveries: 2,
         // Number of controlled side-steps around a confirmed temporary blocker.
         maxRecoverySideSteps: 2,
         // Minimum time between controlled recovery side-steps.
         recoverySideStepCooldownMs: 1500,
-        // Recovery should normally land on ordinary walk waypoints, not on
-        // rope/shovel/ladder/stand/script transition points. Those waypoints
-        // can intentionally change floors or trigger scripts and can create a
-        // recovery loop after a teleport or unexpected floor change.
+        // Native Pathfinder watchdog waits for the normal stuck timeout before
+        // intervening in an active-but-stalled native path.
+        nativePathWatchdogMs: 5000,
+        // Recovery normally prefers ordinary walking waypoints. STAND remains
+        // eligible because it is also used as a precise walking marker;
+        // rope/shovel/ladder stay protected unless transition fallback is active.
+        // SCRIPT waypoints are never recovery targets or recovery checks.
         recoveryAllowTransitionWaypoints: false,
         // Stop quickly when floor-mismatch recovery selects the same route point
         // repeatedly. This prevents rope/teleport/script cycles from looping forever.
         maxFloorRecoveryRepeats: 1,
         floorRecoveryLoopTimeoutMs: 30000,
         temporaryBlockerWaitMs: 2500,
+
+        // Lure-only blocker handling is intentionally much faster than normal
+        // stuck recovery. Detours are one controlled tile at a time.
+        lureBlockerDetourCooldownMs: 550,
+        lureBlockerForgetMs: 1200,
+        lureCrowdRadius: 3,
+        lureCrowdMinMobs: 2,
+        lureCrowdClearGraceMs: 500,
+
+        // Long enough to cross one normal CaveBot tick (500ms) and observe the
+        // updated creature geometry, short enough not to hide a real bad route.
+        lureNoWayArbitrationMs: 1100,
+
+        // Slow mode intentionally moves about half speed: one CaveBot movement
+        // window followed by one hold window. Values are bounded around the
+        // normal 500ms CaveBot tick so the pattern stays stable.
+        lureLastMobSlowRunMs: 500,
+        lureLastMobSlowHoldMs: 500,
     },
             bot.storage.get(configStorageKey, {}));
     config.tickMs = 500;
     // Recovery distance is intentionally capped at 50 tiles. A persisted value
     // from an older build must not silently expand the recovery search again.
-    config.maxWaypointDistance = Math.max(1, Math.min(50, Math.trunc(Number(config.maxWaypointDistance) || 50)));
+    function boundedWaypointDistance(value) {
+        const number = Number(value);
+        return Number.isFinite(number) && number > 0
+            ? Math.max(1, Math.min(50, Math.trunc(number))) : 50;
+    }
+    config.maxWaypointDistance = boundedWaypointDistance(config.maxWaypointDistance);
+    config.nativePathWatchdogMs = Math.max(5000, Math.trunc(Number(config.nativePathWatchdogMs) || 5000));
+    config.noWayAvoidMs = Math.max(1000, Math.trunc(Number(config.noWayAvoidMs) || 10000));
+    config.lureBlockerDetourCooldownMs = Math.max(250, Math.min(2000, Math.trunc(Number(config.lureBlockerDetourCooldownMs) || 550)));
+    config.lureBlockerForgetMs = Math.max(500, Math.min(5000, Math.trunc(Number(config.lureBlockerForgetMs) || 1200)));
+    config.lureCrowdRadius = Math.max(2, Math.min(5, Math.trunc(Number(config.lureCrowdRadius) || 3)));
+    config.lureCrowdMinMobs = Math.max(2, Math.min(6, Math.trunc(Number(config.lureCrowdMinMobs) || 2)));
+    config.lureCrowdClearGraceMs = Math.max(100, Math.min(2000, Math.trunc(Number(config.lureCrowdClearGraceMs) || 500)));
+    config.lureNoWayArbitrationMs = Math.max(600, Math.min(2500, Math.trunc(Number(config.lureNoWayArbitrationMs) || 1100)));
+    config.lureLastMobSlowRunMs = Math.max(350, Math.min(2000, Math.trunc(Number(config.lureLastMobSlowRunMs) || 500)));
+    config.lureLastMobSlowHoldMs = Math.max(350, Math.min(2500, Math.trunc(Number(config.lureLastMobSlowHoldMs) || 500)));
+    config.recoveryObstacleMemoryMs = Math.max(1000, Math.trunc(Number(config.recoveryObstacleMemoryMs) || 10000));
+    config.routeHealthWarningThreshold = Math.max(1, Math.trunc(Number(config.routeHealthWarningThreshold) || 3));
+    config.recoveryHotspotAvoidMs = Math.max(1000, Math.min(60000, Math.trunc(Number(config.recoveryHotspotAvoidMs) || 10000)));
+    config.recoveryHealthPenalty = Number.isFinite(Number(config.recoveryHealthPenalty))
+        ? Math.max(0, Math.min(10, Number(config.recoveryHealthPenalty))) : 0.75;
+    config.recoveryHealthPenaltyWindowMs = Math.max(5000, Math.min(300000, Math.trunc(Number(config.recoveryHealthPenaltyWindowMs) || 30000)));
+    config.routeHealthDecayMs = Math.max(10000, Math.min(600000, Math.trunc(Number(config.routeHealthDecayMs) || 60000)));
+    config.recoveryHistoryLimit = Math.max(10, Math.min(200, Math.trunc(Number(config.recoveryHistoryLimit) || 50)));
+    function normalizeCircuitConfig() {
+        config.circuitBreakerEnabled = config.circuitBreakerEnabled !== false;
+        const failures = Number(config.circuitBreakerMaxFailures);
+        config.circuitBreakerMaxFailures = Number.isFinite(failures)
+            ? Math.max(3, Math.min(30, Math.trunc(failures))) : 8;
+        const windowMs = Number(config.circuitBreakerWindowMs);
+        config.circuitBreakerWindowMs = Number.isFinite(windowMs)
+            ? Math.max(15000, Math.min(600000, Math.trunc(windowMs))) : 120000;
+        const travel = Number(config.circuitBreakerProgressTiles);
+        config.circuitBreakerProgressTiles = Number.isFinite(travel)
+            ? Math.max(3, Math.min(10, Math.trunc(travel))) : 4;
+    }
+    normalizeCircuitConfig();
 
     // ---- PRESET MANAGEMENT ----
     function normalizePresetName(value) {
@@ -6892,6 +11192,116 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         return config.activePresetName;
     }
 
+    // Route edits can invalidate recovery decisions made against the old route
+    // topology. Keep the current waypoint/index, but discard stale recovery
+    // penalties, NO_WAY quarantine, remembered blockers, and target-avoidance
+    // state so an edited route gets a clean recovery context.
+    function resetRecoveryContext(reason = "route changed") {
+        // A delayed native-path fallback must never walk toward a pre-edit route.
+        state.fallbackMoveRequestId++;
+        if (state.fallbackMoveTimerId != null) {
+            window.clearTimeout(state.fallbackMoveTimerId);
+            state.fallbackMoveTimerId = null;
+        }
+        // An edited route/manual waypoint jump supersedes the destination
+        // already queued inside the *native* Pathfinder, not just our 75ms
+        // fallback. Only touch movement owned by an actively navigating CaveBot;
+        // leave manual walking and Attack's combat/chase movement alone.
+        if (state.running && !state.pausedForCombat && !bot.attack?.isCombatActive?.()) {
+            const pf = window.gameClient?.world?.pathfinder;
+            if (pf) {
+                try { pf.setPathfindCache?.(null); } catch (error) {}
+                try { pf.__isAutoWalking = false; } catch (error) {}
+                try { pf.__finalDestination = null; } catch (error) {}
+                try { pf.__hybridPath = null; } catch (error) {}
+            }
+            const player = window.gameClient?.player;
+            try {
+                if (Array.isArray(player?.__preWalks)) player.__preWalks.length = 0;
+            } catch (error) {}
+            // Server-side mapclick walking may still be executing after the
+            // local destination is cleared. Stop it before the next bot tick
+            // requests the selected route's destination.
+            try {
+                if (typeof StopWalkPacket === 'function' &&
+                    typeof window.gameClient?.send === 'function') {
+                    window.gameClient.send(new StopWalkPacket());
+                }
+            } catch (error) {
+                bot.log('Cave: route-change stop packet failed', error?.message || error);
+            }
+        }
+        state.routeHealth.clear();
+        state.recoveryHistory.length = 0;
+        state.recoveryObstacleTiles.clear();
+        // Route-indexed transition state belongs to the OLD route. In particular,
+        // an already-reached STAND or an active STAND timeout must not be inherited
+        // by a different waypoint after an edit, preset switch, or manual jump.
+        state.standReached = {};
+        state.standStartAt = {};
+        state._standAttempt = null;
+        state._ropeUsed = null;
+        state._ropeNextUseAt = null;
+        state._ropeWaitingFloorChange = null;
+        state._shovelUsed = null;
+        state._shovelState = null;
+        state._shovelOpened = null;
+        state._shovelOpenedAt = null;
+        state._shovelRetry = null;
+        state._ladderUsed = null;
+        state._ladderNextUseAt = null;
+        state._ladderWaitingFloorChange = null;
+        state.lastWaypointTarget = null;
+        state.lastPathAt = 0;
+        state.pathAttemptStart = 0;
+        state.positionHistory = [];
+        state.recoveryLastTargetIndex = -1;
+        state.recoveryLastTargetAt = 0;
+        state.recoveryLastTargetKey = null;
+        state.noWayRecoveryIndex = -1;
+        state.noWayFailureKey = null;
+        state.noWayFailureAt = 0;
+        state.noWayLastWaypointKey = null;
+        state.noWayLastSeenAt = 0;
+        state.noWayLastText = "";
+        state.recoveryReason = null;
+        state.recoveryReasonAt = 0;
+        state.recoveryReasonIndex = -1;
+        state.recoveryReasonKey = null;
+        state.recoveryActive = false;
+        state.circuitFailures = null;
+        state.circuitTrip = null;
+        state.stuckRecoveryAttempts = 0;
+        state.recoverySideStepAttempts = 0;
+        state.recoveryBestDistance = Infinity;
+        state.recoveryNoProgressAt = 0;
+        state.recoverySideStepLastKey = null;
+        state.recoverySideStepOriginKey = null;
+        state.lastRecoveryAt = 0;
+        state.recoveryBlockerWaitAt = 0;
+        state.recoveryBlockerWaitKey = null;
+        state.floorRecoveryLoop = null;
+        state.nativePathWatchKey = null;
+        state.nativePathWatchAt = 0;
+        state.nativePathWatchBestDistance = Infinity;
+        state.lastDistanceToWaypoint = null;
+        state.bestDistanceToWaypoint = Infinity;
+        state.waypointProgressKey = null;
+        state._stuckLogged = false;
+        // Do not charge the new destination for time spent on the old path.
+        // A route edit gets a fresh stuck/native-watchdog baseline, even if the
+        // player has not moved yet; no new background timer is introduced.
+        if (state.running) {
+            const now = Date.now();
+            const pos = normalizePosition(bot.getPlayerPosition());
+            resetWaypointProgressTracking(getCurrentWaypoint(), pos, now);
+            state.lastPositionKey = getPositionKey(pos);
+            state.recoveryNoProgressAt = now;
+        }
+        if (reason)
+            bot.log(`Cave: recovery context reset (${reason})`);
+    }
+
     function upsertPreset(name, nextRoute = route, nextTransitions = transitions) {
         const norm = normalizePresetName(name);
         if (!norm)
@@ -6924,6 +11334,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         state.currentIndex = 0;
         state.direction = 1;
         state.pendingTransitionSource = null;
+        resetRecoveryContext("preset changed");
+        state.routeRevision++;
         setActivePresetName(preset.name);
         persistLegacyActivePreset();
         return preset;
@@ -6943,6 +11355,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     }
 
     function persistRoute() {
+        state.routeRevision++;
         persistActivePreset();
     }
 
@@ -6977,6 +11390,632 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         if (!ignoreCreatures && (tile.isOccupied() || isTileOccupiedByCreature(x, y, z)))
             return false;
         return true;
+    }
+
+    function getCreatureBlockingTile(x, y, z) {
+        const creatures = window.gameClient?.world?.activeCreatures || {};
+        const player = window.gameClient?.player;
+        const monsterType =
+            (typeof CONST !== "undefined" && CONST.TYPES)
+                ? CONST.TYPES.MONSTER
+                : undefined;
+
+        for (const id in creatures) {
+            const creature = creatures[id];
+            if (!creature || creature.id === player?.id)
+                continue;
+
+            // Lure blocker logic is for mobs, not players/NPCs/our summon.
+            if (monsterType !== undefined && creature.type !== monsterType)
+                continue;
+            if (creature.masterId === player?.id)
+                continue;
+
+            const health = Number(creature.state?.health ?? creature.health);
+            if (Number.isFinite(health) && health <= 0)
+                continue;
+
+            const pos = normalizePosition(creature.getPosition?.() || creature.__position);
+            if (
+                pos &&
+                pos.x === Math.trunc(x) &&
+                pos.y === Math.trunc(y) &&
+                pos.z === Math.trunc(z)
+            ) {
+                return creature;
+            }
+        }
+        return null;
+    }
+
+    function isOrdinaryLureWaypoint(waypoint) {
+        return !!waypoint &&
+            waypoint.x !== undefined &&
+            waypoint.x !== null &&
+            waypoint.y !== undefined &&
+            waypoint.y !== null &&
+            !waypoint.script &&
+            !waypoint.stand &&
+            !waypoint.rope &&
+            !waypoint.shovel &&
+            !waypoint.ladder;
+    }
+
+    function clearLureRouteBlocker(reason = null) {
+        if (state.lureBlockerId != null)
+            state.lureBlockerClears++;
+
+        state.lureBlockerId = null;
+        state.lureBlockerName = null;
+        state.lureBlockerSince = 0;
+        state.lureBlockerLastSeenAt = 0;
+        state.lureBlockerReason = reason;
+    }
+
+    function markLureRouteBlocker(creature, reason, now = Date.now()) {
+        if (!creature?.id)
+            return;
+
+        if (state.lureBlockerId !== creature.id) {
+            state.lureBlockerId = creature.id;
+            state.lureBlockerName = creature.name || "Mob";
+            state.lureBlockerSince = now;
+        }
+        state.lureBlockerLastSeenAt = now;
+        state.lureBlockerReason = reason;
+    }
+
+    function getLureBlockerId() {
+        if (!bot.attack?.isLureActive?.())
+            return null;
+
+        if (state.lureBlockerId == null)
+            return null;
+
+        const now = Date.now();
+        const forgetMs = Math.max(
+            500,
+            Number(config.lureBlockerForgetMs) || 1200
+        );
+        if (
+            state.lureBlockerLastSeenAt &&
+            now - state.lureBlockerLastSeenAt > forgetMs
+        ) {
+            clearLureRouteBlocker("blocker expired");
+            return null;
+        }
+        return state.lureBlockerId;
+    }
+
+    function getNearbyLureMobsForCave(position) {
+        if (!position || !bot.attack?.isLureActive?.())
+            return [];
+
+        const creatures = window.gameClient?.world?.activeCreatures || {};
+        const player = window.gameClient?.player;
+        const monsterType =
+            (typeof CONST !== "undefined" && CONST.TYPES)
+                ? CONST.TYPES.MONSTER
+                : undefined;
+
+        const configuredRadius = Math.max(
+            1,
+            Math.trunc(Number(bot.attack?.config?.lureRadius) || 5)
+        );
+        const radius = Math.min(
+            configuredRadius,
+            Math.max(2, Math.min(5, Math.trunc(Number(config.lureCrowdRadius) || 3)))
+        );
+
+        const result = [];
+        for (const id in creatures) {
+            const creature = creatures[id];
+            if (!creature || creature.id === player?.id)
+                continue;
+            if (monsterType !== undefined && creature.type !== monsterType)
+                continue;
+            if (creature.masterId === player?.id)
+                continue;
+
+            const health = Number(creature.state?.health ?? creature.health);
+            if (Number.isFinite(health) && health <= 0)
+                continue;
+
+            const pos = normalizePosition(creature.getPosition?.() || creature.__position);
+            if (!pos || pos.z !== position.z)
+                continue;
+
+            const distance = Math.max(
+                Math.abs(pos.x - position.x),
+                Math.abs(pos.y - position.y)
+            );
+            if (distance <= radius) {
+                result.push({
+                    creature,
+                    position: pos,
+                    distance
+                });
+            }
+        }
+
+        result.sort((a, b) => {
+            if (a.distance !== b.distance)
+                return a.distance - b.distance;
+            return Number(a.creature?.id || 0) - Number(b.creature?.id || 0);
+        });
+        return result;
+    }
+
+    function getLocallyUsefulLureRouteTiles(position, waypoint) {
+        if (!position || !waypoint || position.z !== waypoint.z)
+            return [];
+
+        const currentDistance = getDistance(position, waypoint);
+        const toWpX = waypoint.x - position.x;
+        const toWpY = waypoint.y - position.y;
+        const candidates = [
+            { dx: 1, dy: 0 }, { dx: -1, dy: 0 },
+            { dx: 0, dy: 1 }, { dx: 0, dy: -1 },
+            { dx: 1, dy: 1 }, { dx: 1, dy: -1 },
+            { dx: -1, dy: 1 }, { dx: -1, dy: -1 }
+        ];
+
+        const useful = [];
+        for (const step of candidates) {
+            const x = position.x + step.dx;
+            const y = position.y + step.dy;
+            const z = position.z;
+
+            // Ignore creatures for the static-map test. The point is to prove
+            // there IS a valid local lane and that mobs are what currently seal it.
+            if (!isTileWalkable(x, y, z, true))
+                continue;
+
+            const tile = getTileAt({ x, y, z });
+            if (tile && isFloorChangeTile(tile))
+                continue;
+
+            const nextDistance = getDistance({ x, y, z }, waypoint);
+            const dot = step.dx * toWpX + step.dy * toWpY;
+
+            // A purely backward escape tile does not mean the forward corridor
+            // is open. Keep forward/lateral route candidates only.
+            if (dot < 0 && nextDistance > currentDistance)
+                continue;
+
+            useful.push({
+                x,
+                y,
+                z,
+                blocker: getCreatureBlockingTile(x, y, z),
+                occupied: isTileOccupiedByCreature(x, y, z)
+            });
+        }
+
+        return useful;
+    }
+
+    function clearLureCrowdBlock(reason = null, now = Date.now()) {
+        const wasBlocked = state.lureCrowdBlocked;
+        if (wasBlocked)
+            state.lureCrowdClears++;
+
+        state.lureCrowdBlocked = false;
+        state.lureCrowdBlockerIds = [];
+        state.lureCrowdBlockerNames = [];
+        state.lureCrowdBlockedSince = 0;
+        state.lureCrowdLastSeenAt = 0;
+        state.lureCrowdReason = reason;
+
+        if (wasBlocked) {
+            state.lastWaypointTarget = null;
+            state.lastPathAt = 0;
+            state.pathAttemptStart = 0;
+            state.stuckCount = 0;
+            state.stuckRecoveryAttempts = 0;
+            state.lastRecoveryAt = 0;
+            state.nativePathWatchAt = now;
+        }
+    }
+
+    function detectLureCrowdBlock(position, waypoint, now = Date.now()) {
+        if (
+            !bot.attack?.isLureActive?.() ||
+            !position ||
+            !isOrdinaryLureWaypoint(waypoint) ||
+            position.z !== waypoint.z
+        ) {
+            return null;
+        }
+
+        const nearby = getNearbyLureMobsForCave(position);
+        const minMobs = Math.max(
+            2,
+            Math.min(6, Math.trunc(Number(config.lureCrowdMinMobs) || 2))
+        );
+        if (nearby.length < minMobs)
+            return null;
+
+        const usefulTiles = getLocallyUsefulLureRouteTiles(position, waypoint);
+
+        // If the map itself provides no locally useful tile, don't hide it as
+        // creature congestion; normal recovery may be dealing with a real route issue.
+        if (!usefulTiles.length)
+            return null;
+
+        const creatureBlocked = usefulTiles.filter(tile => !!tile.blocker);
+        const openUseful = usefulTiles.filter(tile => !tile.occupied);
+
+        // Crowd-blocked means a static lane exists, at least one mob occupies it,
+        // and there is no currently-open useful local lane.
+        if (!creatureBlocked.length || openUseful.length)
+            return null;
+
+        const ids = [];
+        const names = [];
+        for (const item of nearby) {
+            if (item.creature?.id == null)
+                continue;
+            ids.push(item.creature.id);
+            names.push(item.creature.name || "Mob");
+        }
+
+        return {
+            blockerIds: ids,
+            blockerNames: names,
+            reason:
+                `${nearby.length} lure mobs sealing ${usefulTiles.length} local route tile` +
+                `${usefulTiles.length === 1 ? "" : "s"}`
+        };
+    }
+
+    function updateLureCrowdBlock(position, waypoint, now = Date.now()) {
+        const crowd = detectLureCrowdBlock(position, waypoint, now);
+        const graceMs = Math.max(
+            100,
+            Math.min(2000, Math.trunc(Number(config.lureCrowdClearGraceMs) || 500))
+        );
+
+        if (crowd) {
+            if (!state.lureCrowdBlocked) {
+                state.lureCrowdBlocked = true;
+                state.lureCrowdBlockedSince = now;
+                state.lureCrowdActivations++;
+                bot.log("Cave: lure pack congestion detected", {
+                    mobs: crowd.blockerNames,
+                    reason: crowd.reason
+                });
+            }
+
+            state.lureCrowdLastSeenAt = now;
+            state.lureCrowdBlockerIds = crowd.blockerIds;
+            state.lureCrowdBlockerNames = crowd.blockerNames;
+            state.lureCrowdReason = crowd.reason;
+            return true;
+        }
+
+        if (
+            state.lureCrowdBlocked &&
+            state.lureCrowdLastSeenAt &&
+            now - state.lureCrowdLastSeenAt <= graceMs
+        ) {
+            return true;
+        }
+
+        if (state.lureCrowdBlocked)
+            clearLureCrowdBlock("corridor opened", now);
+
+        return false;
+    }
+
+    function isLureCrowdBlocked() {
+        return !!state.running &&
+            !!state.lureCrowdBlocked &&
+            !!bot.attack?.isLureActive?.();
+    }
+
+    function getLureBlockedCreatureIds() {
+        if (!bot.attack?.isLureActive?.())
+            return [];
+
+        const ids = new Set();
+        const single = getLureBlockerId();
+        if (single != null)
+            ids.add(single);
+
+        if (state.lureCrowdBlocked) {
+            for (const id of state.lureCrowdBlockerIds || []) {
+                if (id != null)
+                    ids.add(id);
+            }
+        }
+
+        return Array.from(ids);
+    }
+
+    function clearLureNoWayArbitration(reason = null, now = Date.now()) {
+        state.lureNoWayPending = false;
+        state.lureNoWayPendingUntil = 0;
+        state.lureNoWayPendingAt = 0;
+        state.lureNoWayPendingIndex = -1;
+        state.lureNoWayPendingKey = null;
+        state.lureNoWayPendingMobIds = [];
+        state.lureNoWayPendingMobNames = [];
+
+        if (reason) {
+            state.lureNoWayLastResolution = reason;
+            state.lureNoWayLastResolutionAt = now;
+        }
+    }
+
+    function armLureNoWayArbitration(position, waypoint, now = Date.now()) {
+        if (
+            !bot.attack?.isLureActive?.() ||
+            !position ||
+            !isOrdinaryLureWaypoint(waypoint)
+        ) {
+            return false;
+        }
+
+        const nearby = getNearbyLureMobsForCave(position);
+        const minMobs = Math.max(
+            2,
+            Math.min(6, Math.trunc(Number(config.lureCrowdMinMobs) || 2))
+        );
+        if (nearby.length < minMobs)
+            return false;
+
+        const waypointKey = getWaypointKey(waypoint);
+        const samePending =
+            state.lureNoWayPending &&
+            state.lureNoWayPendingIndex === state.currentIndex &&
+            state.lureNoWayPendingKey === waypointKey;
+
+        if (!samePending) {
+            state.lureNoWayDeferrals++;
+            state.lureNoWayPendingAt = now;
+        }
+
+        state.lureNoWayPending = true;
+        state.lureNoWayPendingUntil =
+            now + Math.max(
+                600,
+                Math.min(
+                    2500,
+                    Math.trunc(Number(config.lureNoWayArbitrationMs) || 1100)
+                )
+            );
+        state.lureNoWayPendingIndex = state.currentIndex;
+        state.lureNoWayPendingKey = waypointKey;
+        state.lureNoWayPendingMobIds = nearby
+            .map(item => item.creature?.id)
+            .filter(id => id != null);
+        state.lureNoWayPendingMobNames = nearby
+            .map(item => item.creature?.name || "Mob");
+
+        // Crucially, do NOT call setRecoveryReason('NO_WAY') yet. A congestion
+        // event must not pollute route-health telemetry or prime recovery.
+        state.recoveryActive = false;
+        if (state.recoveryReason === "NO_WAY") {
+            state.recoveryReason = null;
+            state.recoveryReasonAt = 0;
+            state.recoveryReasonIndex = -1;
+            state.recoveryReasonKey = null;
+        }
+
+        state.lastProgressAt = now;
+        state.nativePathWatchAt = now;
+        state.stuckCount = 0;
+        state.stuckRecoveryAttempts = 0;
+        state.recoverySideStepAttempts = 0;
+        state.recoveryBlockerWaitAt = 0;
+        state.recoveryBlockerWaitKey = null;
+
+        if (!samePending) {
+            bot.log("Cave: lure NO_WAY deferred for congestion check", {
+                waypoint: state.currentIndex + 1,
+                mobs: state.lureNoWayPendingMobNames,
+                arbitrationMs:
+                    state.lureNoWayPendingUntil - state.lureNoWayPendingAt
+            });
+        }
+        return true;
+    }
+
+    function forceNativeNoWayRecovery(now, currentWp, source = "native NO_WAY") {
+        if (!currentWp)
+            return false;
+
+        const circuitTripped = setRecoveryReason("NO_WAY", now, currentWp);
+        if (circuitTripped)
+            return true;
+
+        const maxRepathRecoveries = Math.max(
+            0,
+            Math.trunc(Number(config.maxRepathRecoveries ?? 2) || 0)
+        );
+        const maxRecoverySideSteps = Math.max(
+            0,
+            Math.trunc(Number(config.maxRecoverySideSteps ?? 2) || 0)
+        );
+
+        state.stuckRecoveryAttempts = maxRepathRecoveries;
+        state.recoverySideStepAttempts = maxRecoverySideSteps;
+        state.recoveryBlockerWaitAt = now;
+        state.recoveryBlockerWaitKey = null;
+        state.recoveryBestDistance = Infinity;
+        state.recoveryNoProgressAt = now;
+        state.lastRecoveryAt = 0;
+        state.lastProgressAt =
+            now - Math.max(1000, Number(config.stuckTimeoutMs) || 5000) - 1;
+        state._stuckLogged = false;
+
+        bot.log(
+            `Cave: Pathfinder reported "There is no way." at waypoint #` +
+            `${state.currentIndex + 1} – forcing waypoint recovery (${source})`
+        );
+        return false;
+    }
+
+    function processLureNoWayArbitration(position, waypoint, now = Date.now()) {
+        if (!state.lureNoWayPending)
+            return "none";
+
+        const waypointKey = getWaypointKey(waypoint);
+        const stillSameWaypoint =
+            state.currentIndex === state.lureNoWayPendingIndex &&
+            waypointKey === state.lureNoWayPendingKey;
+
+        if (
+            !bot.attack?.isLureActive?.() ||
+            !isOrdinaryLureWaypoint(waypoint) ||
+            !stillSameWaypoint
+        ) {
+            clearLureNoWayArbitration("cancelled: lure/waypoint changed", now);
+            return "none";
+        }
+
+        // First give the precise geometry classifier a fresh tick. This is the
+        // race seen in logs: MutationObserver saw NO_WAY before creature/tile
+        // state had settled, while the next CaveBot tick correctly saw congestion.
+        if (
+            updateLureCrowdBlock(position, waypoint, now) ||
+            isLureCrowdBlocked()
+        ) {
+            state.lureNoWayResolvedAsCrowd++;
+            state.lureCrowdNoWaySuppressions++;
+            clearLureNoWayArbitration("resolved as lure crowd congestion", now);
+            return "crowd";
+        }
+
+        if (now < state.lureNoWayPendingUntil)
+            return "hold";
+
+        // The grace window expired and the pack did not explain the failure.
+        // Only now is this a real NO_WAY for route-health/recovery purposes.
+        state.lureNoWayEscalations++;
+        clearLureNoWayArbitration("escalated to real NO_WAY", now);
+        const circuitTripped = forceNativeNoWayRecovery(
+            now,
+            waypoint,
+            "after lure congestion arbitration"
+        );
+        return circuitTripped ? "circuit" : "escalated";
+    }
+
+    function findImmediateLureRouteBlocker(position, waypoint) {
+        if (!position || !isOrdinaryLureWaypoint(waypoint))
+            return null;
+        if (position.z !== waypoint.z)
+            return null;
+
+        const dx = Math.sign(waypoint.x - position.x);
+        const dy = Math.sign(waypoint.y - position.y);
+        const probes = [];
+
+        // Probe the most direct next tile first, then cardinal components of a
+        // diagonal. This mirrors the tiles CaveBot/pathfinder is most likely to
+        // need immediately.
+        if (dx || dy)
+            probes.push({ x: position.x + dx, y: position.y + dy, z: position.z });
+        if (dx && dy) {
+            probes.push({ x: position.x + dx, y: position.y, z: position.z });
+            probes.push({ x: position.x, y: position.y + dy, z: position.z });
+        }
+
+        // If the ordinary waypoint itself is close and occupied, include it.
+        const waypointDistance = Math.max(
+            Math.abs(waypoint.x - position.x),
+            Math.abs(waypoint.y - position.y)
+        );
+        if (waypointDistance <= 2) {
+            probes.push({ x: waypoint.x, y: waypoint.y, z: waypoint.z, waypointTile: true });
+        }
+
+        const seen = new Set();
+        for (const probe of probes) {
+            const key = `${probe.x},${probe.y},${probe.z}`;
+            if (seen.has(key))
+                continue;
+            seen.add(key);
+
+            const creature = getCreatureBlockingTile(probe.x, probe.y, probe.z);
+            if (creature) {
+                return {
+                    creature,
+                    position: probe,
+                    waypointTile: !!probe.waypointTile ||
+                        (probe.x === waypoint.x && probe.y === waypoint.y)
+                };
+            }
+        }
+
+        return null;
+    }
+
+    function findLureBlockerDetourStep(position, waypoint, blockerPosition) {
+        if (!position || !waypoint || !blockerPosition)
+            return null;
+
+        const toWpX = waypoint.x - position.x;
+        const toWpY = waypoint.y - position.y;
+        const candidates = [
+            { dx: 1, dy: 0 }, { dx: -1, dy: 0 },
+            { dx: 0, dy: 1 }, { dx: 0, dy: -1 },
+            { dx: 1, dy: 1 }, { dx: 1, dy: -1 },
+            { dx: -1, dy: 1 }, { dx: -1, dy: -1 }
+        ];
+
+        const scored = [];
+        for (const c of candidates) {
+            const x = position.x + c.dx;
+            const y = position.y + c.dy;
+            const z = position.z;
+
+            if (x === blockerPosition.x && y === blockerPosition.y)
+                continue;
+            if (bot.blacklist?.isBlacklisted(x, y, z))
+                continue;
+
+            // Unlike normal recovery, a lure detour must be genuinely empty:
+            // stepping toward another creature only creates a second blocker.
+            if (!isTileWalkable(x, y, z, false))
+                continue;
+
+            const tile = getTileAt({ x, y, z });
+            if (tile && isFloorChangeTile(tile))
+                continue;
+
+            const distToWaypoint = Math.max(
+                Math.abs(x - waypoint.x),
+                Math.abs(y - waypoint.y)
+            );
+            const dot = c.dx * toWpX + c.dy * toWpY;
+            const blockerDistance = Math.max(
+                Math.abs(x - blockerPosition.x),
+                Math.abs(y - blockerPosition.y)
+            );
+
+            // Prefer lateral/forward bypasses. Backward is allowed only as a
+            // fallback in a narrow corridor to pull the monster off the lane.
+            const backwardPenalty = dot < 0 ? 2.25 : 0;
+            const lateralPenalty = dot === 0 ? 0.20 : 0;
+            const diagonalPenalty = (c.dx !== 0 && c.dy !== 0) ? 0.15 : 0;
+            const blockerPenalty = blockerDistance <= 1 ? 0.45 : 0;
+
+            scored.push({
+                x, y, z,
+                score:
+                    distToWaypoint +
+                    backwardPenalty +
+                    lateralPenalty +
+                    diagonalPenalty +
+                    blockerPenalty
+            });
+        }
+
+        scored.sort((a, b) => a.score - b.score);
+        return scored[0] || null;
     }
 
     function getDirection(dx, dy) {
@@ -7923,10 +12962,17 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         return true;
     }
 
+    // Remember the exact Pathfinder object whose search method we wrapped.
+    // A client reconnect may replace world.pathfinder before cleanup runs;
+    // looking up only the current Pathfinder would retain the old wrapper and
+    // its closure over this CaveBot instance.
+    let fieldPatchOwner = null;
     function installFieldIgnoringPathfinder() {
         const pf = window.gameClient?.world?.pathfinder;
         if (!pf || typeof pf.search !== "function")
             return false;
+        if (fieldPatchOwner && fieldPatchOwner !== pf)
+            uninstallFieldIgnoringPathfinder();
         if (pf.__mbCaveFieldSearchInstalled)
             return true;
 
@@ -7997,11 +13043,13 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             return new Array();
         };
         pf.__mbCaveFieldSearchInstalled = true;
+        fieldPatchOwner = pf;
         return true;
     }
 
     function uninstallFieldIgnoringPathfinder() {
-        const pf = window.gameClient?.world?.pathfinder;
+        const pf = fieldPatchOwner;
+        fieldPatchOwner = null;
         if (!pf || !pf.__mbCaveFieldSearchInstalled)
             return;
         if (pf.__mbCaveOriginalSearch)
@@ -8016,16 +13064,37 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             return true;
         }
         // ---- BLACKLIST CHECK ----
-        if (bot.blacklist?.isBlacklisted(waypoint.x, waypoint.y, waypoint.z)) {
+        // Never recursively follow an all-blacklisted route: in loop mode that
+        // previously recursed without a bound (including a one-waypoint route).
+        // Keep the existing route order and advance semantics for normal skips.
+        let blacklistedSkips = 0;
+        while (waypoint && waypoint.x !== undefined && waypoint.x !== null &&
+               bot.blacklist?.isBlacklisted(waypoint.x, waypoint.y, waypoint.z)) {
+            if (blacklistedSkips >= route.length) {
+                bot.log("Cave: all route waypoints are blacklisted – stopping instead of looping");
+                haltCaveNavigationForSafety();
+                try { bot.notify?.server?.("CaveBot stopped: all route waypoints blacklisted", 'red', 1); } catch (e) {}
+                return false;
+            }
             bot.log("cave skipping blacklisted waypoint", waypoint);
             state.lastWaypointTarget = null;
-            const nextWp = advanceWaypoint();
-            if (nextWp)
-                return goToWaypoint(nextWp);
-            return false;
+            waypoint = advanceWaypoint();
+            blacklistedSkips++;
+            if (!waypoint) return false;
         }
         // ---- END BLACKLIST CHECK ----
+        if (waypoint.x === undefined || waypoint.x === null) return true;
 
+        // Only the newest CaveBot movement request may issue a delayed manual
+        // step. Cancel even when the new native path succeeds: otherwise a
+        // pending fallback from an earlier failure could fire 75ms later.
+        const fallbackRequestId = ++state.fallbackMoveRequestId;
+        if (state.fallbackMoveTimerId != null) {
+            window.clearTimeout(state.fallbackMoveTimerId);
+            state.fallbackMoveTimerId = null;
+        }
+        const fallbackWaypointIndex = state.currentIndex;
+        const fallbackRouteRevision = state.routeRevision;
         const from = bot.getPlayerPosition();
         if (!from || !waypoint)
             return false;
@@ -8045,14 +13114,16 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         // fallback so reload/stop cannot leave an orphaned movement command behind.
         const pf = window.gameClient?.world?.pathfinder;
         if (!success || !pf?.__finalDestination) {
-            if (state.fallbackMoveTimerId != null) {
-                clearTimeout(state.fallbackMoveTimerId);
+            state.fallbackMoveTimerId = window.setTimeout(() => {
                 state.fallbackMoveTimerId = null;
-            }
-            state.fallbackMoveTimerId = setTimeout(() => {
-                state.fallbackMoveTimerId = null;
-                if (!state.running) return;
-                if (pf?.__finalDestination || pf?.__isAutoWalking) return;
+                if (!state.running || state.pausedForCombat || state.positionUnavailable ||
+                    bot.attack?.isCombatActive?.()) return;
+                if (fallbackRequestId !== state.fallbackMoveRequestId ||
+                    fallbackWaypointIndex !== state.currentIndex ||
+                    fallbackRouteRevision !== state.routeRevision) return;
+                // A reconnect may replace the native Pathfinder in this window.
+                const livePf = window.gameClient?.world?.pathfinder;
+                if (livePf !== pf || livePf?.__finalDestination || livePf?.__isAutoWalking) return;
                 const current = bot.getPlayerPosition();
                 if (!current) return;
                 const dx = waypoint.x - current.x;
@@ -8446,6 +13517,9 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
     // ---- WAYPOINT NAVIGATION ----
     function advanceWaypoint() {
+        state.noWayRecoveryIndex = -1;
+        state.noWayFailureKey = null;
+        state.noWayFailureAt = 0;
         state._standAttempt = null;
         state._ropeUsed = undefined;
         state._ropeNextUseAt = undefined;
@@ -8498,14 +13572,12 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
      * target, transition target, or reason to enable transition recovery.
      */
     function isRecoveryTransitionWaypoint(wp) {
-        if (!wp)
+        if (!wp || wp.script)
             return false;
         return wp.stand === true || wp.rope === true || wp.shovel === true || wp.ladder === true;
     }
 
-    function isAllowedRecoveryWaypoint(wp) {
-        return !!wp && (config.recoveryAllowTransitionWaypoints === true || !isRecoveryTransitionWaypoint(wp));
-    }
+
 
     /**
      * Skips to the waypoint closest to the player's current position.
@@ -8514,6 +13586,272 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     // Recovery intentionally does not perform a local connectivity/path test here.
     // The native Pathfinder owns mapclick reachability and can legitimately route
     // across locally disconnected terrain such as separate islands.
+
+    function getWaypointKey(waypoint) {
+        if (!waypoint || waypoint.x === undefined || waypoint.y === undefined || waypoint.z === undefined)
+            return null;
+        return `${waypoint.x},${waypoint.y},${waypoint.z}`;
+    }
+
+    function rememberRecoveryObstacle(key, now = Date.now()) {
+        if (!key) return;
+        state.recoveryObstacleTiles.set(String(key), now + Math.max(1000, Number(config.recoveryObstacleMemoryMs) || 10000));
+        // Bounded per-route memory: an extended session can encounter arbitrarily
+        // many different temporary obstruction coordinates.
+        if (state.recoveryObstacleTiles.size > 200) {
+            pruneRecoveryObstacleMemory(now);
+            while (state.recoveryObstacleTiles.size > 200) {
+                state.recoveryObstacleTiles.delete(state.recoveryObstacleTiles.keys().next().value);
+            }
+        }
+    }
+
+    function isRememberedRecoveryObstacle(key, now = Date.now()) {
+        if (!key) return false;
+        const expiresAt = state.recoveryObstacleTiles.get(String(key));
+        if (!expiresAt) return false;
+        if (expiresAt <= now) {
+            state.recoveryObstacleTiles.delete(String(key));
+            return false;
+        }
+        return true;
+    }
+
+    function pruneRecoveryObstacleMemory(now = Date.now()) {
+        for (const [key, expiresAt] of state.recoveryObstacleTiles.entries()) {
+            if (expiresAt <= now) state.recoveryObstacleTiles.delete(key);
+        }
+    }
+
+    function circuitWaypointDistance(position, waypoint) {
+        if (!position || !waypoint || position.z !== waypoint.z) return Infinity;
+        return Math.max(Math.abs(position.x - waypoint.x), Math.abs(position.y - waypoint.y));
+    }
+
+    function resetCircuitStreak() {
+        state.circuitFailures = null;
+    }
+
+    // A different waypoint INDEX is not genuine progress; closest-waypoint
+    // recovery can change it while the player stays trapped on the same tiles.
+    function noteCircuitMovement(position, now = Date.now()) {
+        const streak = state.circuitFailures;
+        if (!streak || !position) return;
+        if (now - streak.firstAt > config.circuitBreakerWindowMs ||
+            position.z !== streak.position.z) {
+            resetCircuitStreak();
+            return;
+        }
+        const travel = Math.max(Math.abs(position.x - streak.position.x),
+            Math.abs(position.y - streak.position.y));
+        const waypointDistance = circuitWaypointDistance(position, streak.waypoint);
+        if (travel >= config.circuitBreakerProgressTiles ||
+            (Number.isFinite(waypointDistance) &&
+             (streak.initialDistance - waypointDistance >= config.circuitBreakerProgressTiles ||
+              (waypointDistance === 0 && streak.initialDistance > 0)))) {
+            resetCircuitStreak();
+        }
+    }
+
+    // A CaveBot safety stop must also cancel movement already queued inside the
+    // *native* Pathfinder. Clearing our own tick/fallback timer is not enough:
+    // the game can keep walking toward the old destination after CaveBot stops.
+    // Only call this for a deliberate navigation safety stop, not an ordinary
+    // user toggle (which may occur while the player is walking manually).
+    function haltCaveNavigationForSafety() {
+        // Stop first so callbacks/observers cannot enqueue a new bot path while
+        // the native destination is being cleared. stop() persists enabled=false.
+        stop();
+        const pf = window.gameClient?.world?.pathfinder;
+        if (pf) {
+            try { pf.setPathfindCache?.(null); } catch (error) {}
+            try { pf.__isAutoWalking = false; } catch (error) {}
+            try { pf.__finalDestination = null; } catch (error) {}
+            try { pf.__hybridPath = null; } catch (error) {}
+        }
+        const player = window.gameClient?.player;
+        try {
+            if (Array.isArray(player?.__preWalks)) player.__preWalks.length = 0;
+        } catch (error) {}
+        // Tell the server to stop as well: clearing local Pathfinder state alone
+        // does not cancel an already-sent walk command.
+        try {
+            if (typeof StopWalkPacket === 'function' &&
+                typeof window.gameClient?.send === 'function') {
+                window.gameClient.send(new StopWalkPacket());
+            }
+        } catch (error) {
+            bot.log('Cave: safety stop packet failed', error?.message || error);
+        }
+    }
+
+    function recordCircuitFailure(reason, now, waypoint) {
+        if (!config.circuitBreakerEnabled || !state.running || !waypoint || waypoint.script ||
+            !['STUCK', 'NATIVE_STALL', 'NO_WAY', 'STAND_TIMEOUT'].includes(reason)) return false;
+        const pos = normalizePosition(bot.getPlayerPosition());
+        if (!pos || pos.z !== waypoint.z || state.pausedForCombat || bot.attack?.isCombatActive?.())
+            return false;
+        noteCircuitMovement(pos, now);
+        let streak = state.circuitFailures;
+        if (!streak) {
+            streak = {
+                firstAt: now,
+                lastAt: now,
+                count: 0,
+                position: { x: pos.x, y: pos.y, z: pos.z },
+                waypoint: { x: waypoint.x, y: waypoint.y, z: waypoint.z },
+                initialDistance: circuitWaypointDistance(pos, waypoint)
+            };
+            state.circuitFailures = streak;
+        }
+        streak.count++;
+        streak.lastAt = now;
+        if (streak.count < config.circuitBreakerMaxFailures) return false;
+
+        const failures = streak.count;
+        state.circuitTrip = {
+            at: now, reason, failures,
+            index: state.currentIndex,
+            position: { x: pos.x, y: pos.y, z: pos.z },
+        };
+        bot.log(`Cave: CIRCUIT BREAKER – ${failures} recovery failures near waypoint #${state.currentIndex + 1} without real progress; stopping CaveBot`);
+        // Persist disabled and stop the native path, too; otherwise the character
+        // can keep walking on a previously issued Pathfinder path after the alarm.
+        haltCaveNavigationForSafety();
+        try { bot.playAlarm?.(); } catch (error) {}
+        try { bot.notify?.server?.(`CaveBot stopped: ${failures} repeated navigation failures near waypoint #${state.currentIndex + 1}`, 'red', 1); } catch (error) {}
+        try { bot.ui?.refreshCaveStatus?.(); } catch (error) {}
+        return true;
+    }
+
+    function getMovementStatus(now = Date.now()) {
+        if (state.circuitTrip) return 'Safety stopped';
+        if (!state.running) return 'Idle';
+        if (state.positionUnavailable) return 'Waiting for player';
+        if (state.pausedForCombat) return 'Attacking / paused';
+        if (state.combatCooldownUntil > now) return 'Combat cooldown';
+        if (bot._waitUntil && now < bot._waitUntil) return 'Waiting';
+        if (state._ropeWaitingFloorChange?.index === state.currentIndex ||
+            state._ladderWaitingFloorChange?.index === state.currentIndex ||
+            state._shovelOpened?.[state.currentIndex]) return 'Waiting for floor change';
+        if (state.recoveryBlockerWaitKey && state.recoveryBlockerWaitAt &&
+            now - state.recoveryBlockerWaitAt < Math.max(0, Number(config.temporaryBlockerWaitMs) || 2500))
+            return 'Waiting for blocker';
+        if (state.recoveryActive) return 'Recovering';
+        const wp = getCurrentWaypoint();
+        if (wp?.rope) return 'Using rope';
+        if (wp?.shovel) return 'Using shovel';
+        if (wp?.ladder) return 'Using ladder';
+        if (wp?.stand) return 'Walking to STAND';
+        return 'Walking';
+    }
+
+    function getMovementSummary(now = Date.now()) {
+        const failures = state.circuitFailures;
+        const active = !!failures && now - failures.firstAt <= config.circuitBreakerWindowMs;
+        return {
+            mode: getMovementStatus(now),
+            reason: state.recoveryReason,
+            failures: active ? failures.count : 0,
+            limit: config.circuitBreakerMaxFailures,
+            safetyStopped: !!state.circuitTrip,
+            trip: state.circuitTrip ? { ...state.circuitTrip, position: { ...state.circuitTrip.position } } : null,
+        };
+    }
+
+    function setRecoveryReason(reason, now = Date.now(), waypoint = getCurrentWaypoint()) {
+        state.recoveryReason = reason || null;
+        state.recoveryReasonAt = now;
+        state.recoveryReasonIndex = state.currentIndex;
+        state.recoveryReasonKey = getWaypointKey(waypoint);
+        if (reason && reason !== 'TEMP_BLOCKER') state.recoveryActive = true;
+
+        if (reason) {
+            state.telemetry.recoveryEvents++;
+            state.telemetry.lastEventAt = now;
+            state.telemetry.lastEvent = reason;
+            if (reason === 'NATIVE_STALL') state.telemetry.nativeStalls++;
+            if (reason === 'NO_WAY') state.telemetry.noWayEvents++;
+            if (reason === 'TELEPORT') state.telemetry.teleportEvents++;
+
+            const key = state.recoveryReasonKey || `index:${state.currentIndex}`;
+
+            // Keep a compact recent event trail. This is intentionally separate
+            // from routeHealth so the aggregate counters remain cheap while the
+            // caller can still inspect what happened most recently.
+            state.recoveryHistory.push({
+                at: now,
+                reason,
+                index: state.currentIndex,
+                key,
+                waypoint: getCurrentWaypoint() ? cloneValue(getCurrentWaypoint()) : null,
+            });
+            if (state.recoveryHistory.length > config.recoveryHistoryLimit) {
+                state.recoveryHistory.splice(0, state.recoveryHistory.length - config.recoveryHistoryLimit);
+            }
+
+            let health = state.routeHealth.get(key);
+            const healthDecayMs = Math.max(10000, Number(config.routeHealthDecayMs) || 60000);
+            // Route health is intentionally recent-window state. If this waypoint
+            // has been quiet long enough, forget the old failure streak before
+            // recording the new event. Without this decay, three ancient failures
+            // plus one fresh transient failure would immediately recreate a hotspot.
+            if (!health || !Number.isFinite(health.lastAt) || (health.lastAt > 0 && now - health.lastAt >= healthDecayMs)) {
+                health = {
+                    index: state.currentIndex,
+                    key,
+                    recoveries: 0,
+                    noWay: 0,
+                    nativeStalls: 0,
+                    teleports: 0,
+                    lastReason: null,
+                    lastAt: 0,
+                };
+            }
+            health.index = state.currentIndex;
+            health.recoveries++;
+            health.lastReason = reason;
+            health.lastAt = now;
+            if (reason === 'NO_WAY') health.noWay++;
+            if (reason === 'NATIVE_STALL') health.nativeStalls++;
+            if (reason === 'TELEPORT') health.teleports++;
+            state.routeHealth.set(key, health);
+
+            // Keep the map bounded on long-running bots. Use a single linear scan
+            // instead of Array.from(...).sort(...) so a recovery event does not
+            // allocate/sort a temporary copy of the entire health map.
+            if (state.routeHealth.size > 256) {
+                let oldestKey = null;
+                let oldestAt = Infinity;
+                for (const [entryKey, entry] of state.routeHealth.entries()) {
+                    const entryAt = Number(entry?.lastAt) || 0;
+                    if (entryAt < oldestAt) {
+                        oldestAt = entryAt;
+                        oldestKey = entryKey;
+                    }
+                }
+                if (oldestKey !== null) state.routeHealth.delete(oldestKey);
+            }
+
+            if (health.recoveries === config.routeHealthWarningThreshold) {
+                bot.log(`Cave: route health warning – waypoint #${state.currentIndex + 1} has ${health.recoveries} recovery events`, health);
+            }
+            return recordCircuitFailure(reason, now, waypoint);
+        }
+        return false;
+    }
+
+    function resetWaypointProgressTracking(waypoint, position, now = Date.now()) {
+        const key = getWaypointKey(waypoint);
+        const distance = getDistanceToWaypoint(position, waypoint);
+        state.waypointProgressKey = key;
+        state.lastDistanceToWaypoint = Number.isFinite(distance) ? distance : null;
+        state.bestDistanceToWaypoint = Number.isFinite(distance) ? distance : Infinity;
+        state.lastProgressAt = now;
+        state.nativePathWatchKey = key;
+        state.nativePathWatchAt = now;
+        state.nativePathWatchBestDistance = Number.isFinite(distance) ? distance : Infinity;
+    }
 
     function skipToClosestWaypoint(options = {}) {
         const pos = normalizePosition(bot.getPlayerPosition());
@@ -8525,15 +13863,22 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         // across disconnected terrain (for example, water between islands). Keep
         // recovery bounded by floor and distance, while leaving actual reachability
         // to the native Pathfinder.
-        const limit = Math.max(1, Math.trunc(Number(config.maxWaypointDistance) || 50));
+        const limit = boundedWaypointDistance(config.maxWaypointDistance);
         const allowTransitionFallback = options.allowTransitionFallback === true;
         const excludeIndex = Number.isInteger(options.excludeIndex) ? options.excludeIndex : -1;
         const avoidIndex = Number.isInteger(options.avoidIndex) ? options.avoidIndex : -1;
         const avoidKey = typeof options.avoidKey === "string" ? options.avoidKey : null;
+        const now = Date.now();
         const avoidRepeat = (avoidIndex >= 0 || avoidKey !== null) && Number.isFinite(Number(config.recoveryAvoidRepeatMs)) &&
-            Date.now() - (Number(state.recoveryLastTargetAt) || 0) < Math.max(0, Number(config.recoveryAvoidRepeatMs));
+            now - (Number(state.recoveryLastTargetAt) || 0) < Math.max(0, Number(config.recoveryAvoidRepeatMs));
+        // noWayFailureKey contains index:coordinates for duplicate-notice locking;
+        // use the actual coordinate key when quarantining recovery candidates.
+        // Otherwise a duplicate route point at the same tile evades quarantine.
+        const noWayKey = state.noWayLastWaypointKey || null;
+        const noWayAvoidActive = !!noWayKey && Number.isFinite(Number(state.noWayFailureAt)) &&
+            now - Number(state.noWayFailureAt) < Math.max(0, Number(config.noWayAvoidMs) || 10000);
 
-        const findBest = (allowTransitions, skipAvoided, skipCurrentTile = true) => {
+        const findBest = (allowTransitions, skipAvoided, skipCurrentTile = true, skipFailedNoWay = true) => {
             let bestIdx = -1;
             let bestScore = Infinity;
             let bestProgress = Infinity;
@@ -8545,8 +13890,30 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 const wp = route[i];
                 if (skipAvoided && avoidRepeat && (i === avoidIndex || (avoidKey !== null && wp && `${wp.x},${wp.y},${wp.z}` === avoidKey)))
                     continue;
-                if (!wp || wp.x === undefined || wp.y === undefined || wp.z === undefined)
+                if (skipAvoided && skipFailedNoWay && noWayAvoidActive &&
+                    (i === state.noWayRecoveryIndex || (noWayKey !== null && wp && `${wp.x},${wp.y},${wp.z}` === noWayKey)))
                     continue;
+                if (!wp || wp.script || wp.x === undefined || wp.y === undefined || wp.z === undefined)
+                    continue;
+                // SCRIPT is an action, not a navigation/recovery destination,
+                // including when it happens to have coordinates.
+
+                // Adaptive recovery: a route tile that has repeatedly caused
+                // recoveries recently becomes a temporary recovery hotspot.
+                // Keep it out of normal recovery selection when another target
+                // exists. This never skips the waypoint during ordinary traversal,
+                // never permanently blacklists it, and later fallback passes may
+                // still select it if it is the only viable recovery target.
+                const candidateKey = `${wp.x},${wp.y},${wp.z}`;
+                const candidateHealth = state.routeHealth.get(candidateKey);
+                const hotspotAvoidMs = Math.max(1000, Number(config.recoveryHotspotAvoidMs) || 10000);
+                const hotspotActive = candidateHealth &&
+                    candidateHealth.recoveries >= Math.max(1, Number(config.routeHealthWarningThreshold) || 3) &&
+                    Number.isFinite(candidateHealth.lastAt) &&
+                    (now - candidateHealth.lastAt) < hotspotAvoidMs;
+                if (skipAvoided && hotspotActive && i !== state.currentIndex)
+                    continue;
+
                 if (wp.z !== pos.z)
                     continue;
 
@@ -8579,7 +13946,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 // but creates no movement, so the next stall can repeat the same cycle.
                 // Keep an exact-tile candidate available as a final fallback below so
                 // a very small/compact route is never made unrecoverable.
-                if (cheb === 0 && !skipCurrentTile)
+                if (cheb === 0 && skipCurrentTile)
                     continue;
 
                 const manhattan = Math.abs(wp.x - pos.x) + Math.abs(wp.y - pos.y);
@@ -8587,10 +13954,32 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 // Prefer a nearby waypoint. When distances are essentially equal, prefer
                 // the waypoint that is ahead of the current route position so recovery
                 // does not unnecessarily jump backwards through the route.
-                const forwardPenalty = config.loopMode
-                    ? Math.min((i - state.currentIndex + route.length) % route.length, route.length) * 0.01
-                    : (i < state.currentIndex ? route.length * 0.01 : 0);
-                const score = manhattan + forwardPenalty;
+                const routeForwardDistance = config.loopMode
+                    ? (i - state.currentIndex + route.length) % route.length
+                    : Math.max(0, i - state.currentIndex);
+                const routeBackwardDistance = config.loopMode
+                    ? (state.currentIndex - i + route.length) % route.length
+                    : Math.max(0, state.currentIndex - i);
+                const preferredRouteDistance = state.direction === -1 ? routeBackwardDistance : routeForwardDistance;
+                const wrongDirectionPenalty = state.direction === -1
+                    ? routeForwardDistance < routeBackwardDistance ? 0.35 : 0
+                    : routeBackwardDistance < routeForwardDistance ? 0.35 : 0;
+                const routePenalty = Math.min(preferredRouteDistance, route.length) * 0.012;
+                const transitionPenalty = isStand ? 0 : (isTransition ? 0.08 : 0);
+                // Before a waypoint reaches the hotspot threshold, lightly penalize
+                // candidates that have already caused recent recoveries. This makes
+                // recovery prefer an equally-near, healthier route point without
+                // creating a hard exclusion after a single transient failure.
+                const healthPenaltyWindowMs = Math.max(5000, Number(config.recoveryHealthPenaltyWindowMs) || 30000);
+                const healthPenaltyActive = candidateHealth && candidateHealth.recoveries > 0 &&
+                    Number.isFinite(candidateHealth.lastAt) &&
+                    (now - candidateHealth.lastAt) < healthPenaltyWindowMs;
+                const healthPenalty = healthPenaltyActive
+                    ? Math.min(2, candidateHealth.recoveries) *
+                      Math.max(0, Number(config.recoveryHealthPenalty) || 0)
+                    : 0;
+                const score = manhattan + routePenalty + wrongDirectionPenalty +
+                    transitionPenalty + healthPenalty;
 
                 if (score < bestScore) {
                     bestScore = score;
@@ -8618,9 +14007,17 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         // If repeat-avoidance found nothing, retry once without that preference.
         // Never let the safety preference turn a recoverable route into a hard stop.
         if (result.bestIdx < 0 && avoidRepeat) {
-            result = findBest(false, false);
+            result = findBest(false, false, true, noWayAvoidActive);
             if (result.bestIdx < 0 && allowTransitionFallback)
-                result = findBest(true, false);
+                result = findBest(true, false, true, noWayAvoidActive);
+        }
+
+        // If the recent NO_WAY target is the only viable candidate, allow it only
+        // as a final fallback rather than making a tiny route unrecoverable.
+        if (result.bestIdx < 0 && noWayAvoidActive) {
+            result = findBest(false, false, true, false);
+            if (result.bestIdx < 0 && allowTransitionFallback)
+                result = findBest(true, false, true, false);
         }
 
         // Last-resort pass: if the route is extremely compact and every useful
@@ -8649,9 +14046,10 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         state.recoveryLastTargetAt = Date.now();
         state.recoveryLastTargetKey = `${wp.x},${wp.y},${wp.z}`;
         bot.log(
-            `Cave: skipping to closest same-floor ${result.bestIsTransition ? 'transition ' : ''}waypoint #${result.bestIdx + 1} ` +
-            `(${wp.x}, ${wp.y}, ${wp.z}) – ${result.bestProgress} tiles away` +
-            `${avoidRepeat && (result.bestIdx !== avoidIndex || avoidKey !== `${wp.x},${wp.y},${wp.z}`) ? ' (avoided previous recovery target)' : ''}`
+            `Cave: recovery (${state.recoveryReason || 'UNKNOWN'}) → closest same-floor ${result.bestIsTransition ? 'transition ' : ''}waypoint #${result.bestIdx + 1} ` +
+            `(${wp.x}, ${wp.y}, ${wp.z}) – ${result.bestProgress} tiles away, score ${Number(result.bestScore).toFixed(3)}` +
+            `${avoidRepeat && (result.bestIdx !== avoidIndex || avoidKey !== `${wp.x},${wp.y},${wp.z}`) ? ' (avoided previous recovery target)' : ''}` +
+            `${noWayAvoidActive && result.bestIdx !== state.noWayRecoveryIndex ? ' (avoided recent NO_WAY target)' : ''}`
         );
         goToWaypoint(wp);
         return wp;
@@ -8755,6 +14153,10 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             return true;
 
         state.lastTeleportResetAt = now;
+        // A teleport invalidates the active native path, but not the short-lived
+        // obstacle memory: those tiles describe local failures and may still be
+        // useful if the teleport lands nearby. Expired entries are removed now.
+        pruneRecoveryObstacleMemory(now);
         state._standAttempt = null;
         state._ropeUsed = undefined;
         state._ropeNextUseAt = undefined;
@@ -8768,8 +14170,14 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         state.lastWaypointTarget = null;
         state.pathAttemptStart = 0;
         state.lastDistanceToWaypoint = null;
+        state.bestDistanceToWaypoint = Infinity;
+        state.waypointProgressKey = null;
+        state.nativePathWatchKey = null;
+        state.nativePathWatchAt = 0;
+        state.nativePathWatchBestDistance = Infinity;
         state.lastPathAt = 0;
         state.stuckCount = 0;
+        setRecoveryReason('TELEPORT', now, getCurrentWaypoint());
         state.stuckRecoveryAttempts = 0;
         state.positionHistory = [];
 
@@ -8795,7 +14203,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         if (!position || !route.length)
             return null;
 
-        const limit = Math.max(1, Math.trunc(Number(config.maxWaypointDistance) || 50));
+        const limit = boundedWaypointDistance(config.maxWaypointDistance);
         let skipped = 0;
         const maxPasses = Math.max(1, route.length);
 
@@ -8828,6 +14236,11 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             state.lastWaypointTarget = null;
             state.pathAttemptStart = 0;
             state.lastDistanceToWaypoint = null;
+            state.bestDistanceToWaypoint = Infinity;
+            state.waypointProgressKey = null;
+            state.nativePathWatchKey = null;
+            state.nativePathWatchAt = 0;
+            state.nativePathWatchBestDistance = Infinity;
             state.lastPathAt = 0;
 
             const next = advanceWaypoint();
@@ -8840,21 +14253,121 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             // cycling forever.
             if (state.currentIndex === oldIndex) {
                 bot.log("Cave: no waypoint within distance limit – stopping");
-                stop();
+                haltCaveNavigationForSafety();
                 return null;
             }
         }
 
         bot.log("Cave: skipped a full route pass with no waypoint within distance limit – stopping");
-        stop();
+        haltCaveNavigationForSafety();
         return null;
+    }
+
+    function resetLureLastMobMovement(reason = null) {
+        if (state.lureLastMobMoveActive)
+            state.lureLastMobMoveResets++;
+
+        state.lureLastMobMoveActive = false;
+        state.lureLastMobMoveMode = null;
+        state.lureLastMobMovePhase = "run";
+        state.lureLastMobMovePhaseUntil = 0;
+    }
+
+    function getLastMobMovementDecision(now = Date.now()) {
+        const info = bot.attack?.getLureLastMobInfo?.();
+        if (!info?.active) {
+            resetLureLastMobMovement("inactive");
+            return { active: false, hold: false, mode: null };
+        }
+
+        const mode = info.mode === "kill" ? "kill" : "slow";
+        if (!state.lureLastMobMoveActive || state.lureLastMobMoveMode !== mode) {
+            state.lureLastMobMoveActive = true;
+            state.lureLastMobMoveMode = mode;
+            state.lureLastMobMovePhase = "run";
+            state.lureLastMobMovePhaseUntil = now + Math.max(
+                350,
+                Number(config.lureLastMobSlowRunMs) || 500
+            );
+        }
+
+        if (mode === "kill") {
+            state.lureLastMobKillHolds++;
+            return {
+                active: true,
+                hold: true,
+                mode,
+                info,
+                reason: "finish last low-HP mob"
+            };
+        }
+
+        const runMs = Math.max(
+            350,
+            Number(config.lureLastMobSlowRunMs) || 500
+        );
+        const holdMs = Math.max(
+            350,
+            Number(config.lureLastMobSlowHoldMs) || 500
+        );
+
+        if (state.lureLastMobMovePhase === "run") {
+            if (now >= state.lureLastMobMovePhaseUntil) {
+                state.lureLastMobMovePhase = "hold";
+                state.lureLastMobMovePhaseUntil = now + holdMs;
+                state.lureLastMobSlowHolds++;
+                return {
+                    active: true,
+                    hold: true,
+                    mode,
+                    info,
+                    reason: "slow-pull hold"
+                };
+            }
+
+            return {
+                active: true,
+                hold: false,
+                mode,
+                info,
+                reason: "slow-pull run"
+            };
+        }
+
+        if (now >= state.lureLastMobMovePhaseUntil) {
+            state.lureLastMobMovePhase = "run";
+            state.lureLastMobMovePhaseUntil = now + runMs;
+            state.lureLastMobSlowRuns++;
+            return {
+                active: true,
+                hold: false,
+                mode,
+                info,
+                reason: "slow-pull run"
+            };
+        }
+
+        state.lureLastMobSlowHolds++;
+        return {
+            active: true,
+            hold: true,
+            mode,
+            info,
+            reason: "slow-pull hold"
+        };
     }
 
     // ---- MAIN LOOP ----
     function scheduleNextTick() {
-        if (!state.running)
+        if (!state.running || state.timerId != null)
             return;
-        state.timerId = window.setTimeout(() => tick(), config.tickMs);
+        // Exactly one outstanding CaveBot tick. Several early-return branches
+        // schedule a tick inside try, and finally schedules again; without this
+        // guard the older timer ID was overwritten and could not be cancelled.
+        state.timerId = window.setTimeout(() => {
+            state.timerId = null;
+            tick();
+        }, config.tickMs);
     }
 
     /**
@@ -8866,6 +14379,61 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     function tick() {
         if (!state.running)
             return;
+
+        // The client may replace #cancelmessage/#notification on reconnect.
+        // Reuse this existing 500ms tick to rebind observers as needed, instead
+        // of retaining detached DOM nodes or adding another polling interval.
+        ensureNoWayObserver();
+
+        // During disconnects/loading/floor-stream gaps the game may temporarily
+        // have no player position. Never turn that absence into STUCK, NO_WAY or
+        // circuit-breaker events. No new polling timer is needed: reuse the one
+        // scheduled CaveBot tick and rebase watchdogs exactly once on return.
+        const livePosition = window.gameClient?.player
+            ? normalizePosition(bot.getPlayerPosition()) : null;
+        if (!livePosition) {
+            if (!state.positionUnavailable) {
+                state.positionUnavailable = true;
+                // Otherwise the observer can "learn" a fake floor transition
+                // across a disconnect / character load.
+                state.lastObservedPosition = null;
+                state.pendingTransitionSource = null;
+                bot.log('Cave: waiting for player position');
+            }
+            scheduleNextTick();
+            return;
+        }
+        if (state.positionUnavailable) {
+            const now = Date.now();
+            state.positionUnavailable = false;
+            state.lastObservedPosition = null;
+            state.pendingTransitionSource = null;
+            resetWaypointProgressTracking(getCurrentWaypoint(), livePosition, now);
+            state.lastPositionKey = getPositionKey(livePosition);
+            state.stuckCount = 0;
+            state.stuckRecoveryAttempts = 0;
+            state.recoverySideStepAttempts = 0;
+            state.recoveryBlockerWaitAt = 0;
+            state.recoveryBlockerWaitKey = null;
+            state.recoveryBestDistance = Infinity;
+            state.recoveryNoProgressAt = now;
+            state._stuckLogged = false;
+            state.lastWaypointTarget = null;
+            state.lastPathAt = 0;
+            state.pathAttemptStart = 0;
+            state.recoveryActive = false;
+            state.circuitFailures = null;
+            // An old destination from before disconnect must not race the
+            // post-reconnect native Pathfinder request.
+            const pf = window.gameClient?.world?.pathfinder;
+            if (pf) {
+                try { pf.setPathfindCache?.(null); } catch (e) {}
+                pf.__isAutoWalking = false;
+                pf.__finalDestination = null;
+                pf.__hybridPath = null;
+            }
+            bot.log('Cave: player position restored – navigation watchdog reset');
+        }
 
         if (bot._waitUntil && Date.now() < bot._waitUntil) {
             scheduleNextTick();
@@ -8879,6 +14447,12 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
         // ---- stopMovement helper ----
         function stopMovement() {
+            // Combat owns movement now: cancel any queued CaveBot manual step.
+            state.fallbackMoveRequestId++;
+            if (state.fallbackMoveTimerId != null) {
+                window.clearTimeout(state.fallbackMoveTimerId);
+                state.fallbackMoveTimerId = null;
+            }
             const pf = window.gameClient?.world?.pathfinder;
             if (pf) {
                 pf.setPathfindCache(null);
@@ -8902,54 +14476,89 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         }
 
         // ---- Combat pause ----
-        function hasValidTarget() {
+        // Paused time is not movement-stall time. The previous implementation
+        // returned here throughout combat without rebasing lastProgressAt or
+        // the native Pathfinder watchdog. As soon as a target died/disappeared,
+        // a long fight could trigger an immediate, false STUCK recovery.
+        function resumeAfterCombat(reason) {
+            if (!state.pausedForCombat) return;
+            const now = Date.now();
+            state.pausedForCombat = false;
+            state.recoveryActive = false;
             const player = window.gameClient?.player;
-            if (!player)
+            if (player?.__preWalks) player.__preWalks.length = 0;
+            state.combatCooldownUntil = now + 200;
+            const position = normalizePosition(bot.getPlayerPosition());
+            const waypoint = getCurrentWaypoint();
+            resetWaypointProgressTracking(waypoint, position, now);
+            state.lastPositionKey = getPositionKey(position);
+            state.stuckCount = 0;
+            state.stuckRecoveryAttempts = 0;
+            state.lastRecoveryAt = 0;
+            state.recoverySideStepAttempts = 0;
+            state.recoverySideStepLastKey = null;
+            state.recoverySideStepOriginKey = null;
+            state.recoveryBlockerWaitAt = 0;
+            state.recoveryBlockerWaitKey = null;
+            state.recoveryBestDistance = Infinity;
+            state.recoveryNoProgressAt = now;
+            state._stuckLogged = false;
+            // Leave the native path cleared by stopMovement(). Normal routing
+            // starts a new path after the cooldown, not a recovery path.
+            bot.log(`cave resumed (${reason}) – cooldown 200ms`);
+        }
+
+        function hasValidTarget() {
+            // Lure Mode deliberately attacks through route movement. A valid
+            // target during lure must never pause CaveBot.
+            if (bot.attack?.isLureActive?.()) {
+                resumeAfterCombat("lure attack-through");
                 return false;
-            const target = player.__target;
+            }
+
+            const player = window.gameClient?.player;
+            if (!player) {
+                resumeAfterCombat("no player");
+                return false;
+            }
+            let target = player.__target || player.getTarget?.() || null;
+            // A target may temporarily be absent from __target while the attack
+            // module still has an engaged, live creature (e.g. during chasing).
+            // Do not let CaveBot take ownership of movement in that interval.
+            if (!target && (bot.attack?.isCombatActive?.() || bot.attack?.isMovementOwned?.())) {
+                target = bot.attack?.getCurrentFollowTarget?.() || null;
+                // Targeting keeps a 400ms movement-ownership handoff after the
+                // target pointer disappears so CaveBot cannot issue a competing
+                // movement command on the same client frame.
+                if (!target) return true;
+            }
             if (!target) {
-                if (state.pausedForCombat) {
-                    state.pausedForCombat = false;
-                    // Clear prediction queue to avoid extra step
-                    if (player.__preWalks)
-                        player.__preWalks.length = 0;
-                    state.combatCooldownUntil = Date.now() + 200; // 200ms cooldown
-                    bot.log("cave resumed (no target) – cooldown 200ms");
-                }
+                resumeAfterCombat("no target");
                 return false;
             }
             const health = target.state?.health ?? target.health;
             if (health !== undefined && health <= 0) {
-                if (state.pausedForCombat) {
-                    state.pausedForCombat = false;
-                    if (player.__preWalks)
-                        player.__preWalks.length = 0;
-                    state.combatCooldownUntil = Date.now() + 200;
-                    bot.log("cave resumed (target dead) – cooldown 200ms");
-                }
+                resumeAfterCombat("target dead");
                 return false;
             }
             try {
-                const pp = player.getPosition().projected();
-                const tp = target.getPosition().projected();
+                const ppRaw = player.getPosition?.();
+                const tpRaw = target.getPosition?.() || target.__position;
+                const pp = ppRaw?.projected?.() || ppRaw;
+                const tp = tpRaw?.projected?.() || tpRaw;
+                if (!pp || !tp || ![pp.x, pp.y, tp.x, tp.y].every(Number.isFinite))
+                    return true; // client has not supplied a usable target position yet
                 const onScreen = Math.abs(pp.x - tp.x) < 8 && Math.abs(pp.y - tp.y) < 6;
-                if (!onScreen && state.pausedForCombat) {
-                    state.pausedForCombat = false;
-                    if (player.__preWalks)
-                        player.__preWalks.length = 0;
-                    state.combatCooldownUntil = Date.now() + 200;
-                    bot.log("cave resumed (target off‑screen) – cooldown 200ms");
-                }
-                return onScreen;
+                // The attack module can still be engaged while chasing a target
+                // past the edge of the screen. Let it own movement until combat
+                // actually ends; otherwise preserve the previous off-screen resume.
+                const stillFighting = !onScreen && !!bot.attack?.isCombatActive?.();
+                if (!onScreen && !stillFighting) resumeAfterCombat("target off-screen");
+                return onScreen || stillFighting;
             } catch {
-                if (state.pausedForCombat) {
-                    state.pausedForCombat = false;
-                    if (player.__preWalks)
-                        player.__preWalks.length = 0;
-                    state.combatCooldownUntil = Date.now() + 200;
-                    bot.log("cave resumed (error) – cooldown 200ms");
-                }
-                return false;
+                // Missing client-side projection isn't proof the target is gone.
+                // Wait for a real target loss/death instead of recovering mid-fight.
+                return true;
             }
         }
 
@@ -8962,6 +14571,47 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             }
             scheduleNextTick();
             return;
+        }
+
+        // v1.5.09: Lure Mode may keep attacking while moving, but if a pulled
+        // mob approaches the trailing viewport edge, hold CaveBot in place
+        // until that mob catches back up. This prevents outrunning the pack.
+        const lureLeashHeld = bot.attack?.isLureMovementHeld?.() === true;
+        if (lureLeashHeld) {
+            clearLureRouteBlocker("screen leash holding");
+            if (!state.lureLeashPaused) {
+                state.lureLeashPaused = true;
+                state.lureLeashPauseCount++;
+                stopMovement();
+
+                const holdNow = Date.now();
+                const holdPos = normalizePosition(bot.getPlayerPosition());
+                const holdWp = getCurrentWaypoint();
+                resetWaypointProgressTracking(holdWp, holdPos, holdNow);
+                state.lastPositionKey = getPositionKey(holdPos);
+                state.stuckCount = 0;
+                state.stuckRecoveryAttempts = 0;
+
+                bot.log("CaveBot held for lure pack");
+            }
+            scheduleNextTick();
+            return;
+        }
+
+        if (state.lureLeashPaused) {
+            state.lureLeashPaused = false;
+            state.lureLeashResumeCount++;
+
+            const resumeNow = Date.now();
+            const resumePos = normalizePosition(bot.getPlayerPosition());
+            const resumeWp = getCurrentWaypoint();
+            resetWaypointProgressTracking(resumeWp, resumePos, resumeNow);
+            state.lastPositionKey = getPositionKey(resumePos);
+            state.lastPathAt = 0;
+            state.stuckCount = 0;
+            state.stuckRecoveryAttempts = 0;
+
+            bot.log("CaveBot resumed after lure pack caught up");
         }
 
         try {
@@ -8979,6 +14629,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             // Reset special waypoint state immediately after a GM teleport,
             // temple return, floor jump or similar server-side relocation.
             detectUnexpectedPositionJump(position, now);
+            noteCircuitMovement(position, now);
 
             // ---- Helper: is the player currently targeting something? ----
             //function _hasTarget() {
@@ -8997,6 +14648,233 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                     scheduleNextTick();
                     return;
                 }
+            }
+
+            // ---- LURE NO_WAY ARBITRATION ----
+            // Native NO_WAY is asynchronous. If it arrived while 2+ lure mobs
+            // were nearby, hold this waypoint briefly and let the fresh tick
+            // decide whether the route is truly bad or merely creature-sealed.
+            const lureNoWayDecision = processLureNoWayArbitration(
+                position,
+                waypoint,
+                now
+            );
+
+            if (lureNoWayDecision === "hold") {
+                stopMovement();
+
+                resetWaypointProgressTracking(waypoint, position, now);
+                state.lastPositionKey = positionKey;
+                state.lastProgressAt = now;
+                state.lastRecoveryAt = 0;
+                state.lastPathAt = now;
+                state.pathAttemptStart = now;
+                state.stuckCount = 0;
+                state.stuckRecoveryAttempts = 0;
+                state.recoverySideStepAttempts = 0;
+                state.recoveryBlockerWaitAt = 0;
+                state.recoveryBlockerWaitKey = null;
+                state.recoveryBestDistance = getDistanceToWaypoint(position, waypoint);
+                state.recoveryNoProgressAt = now;
+                state.nativePathWatchAt = now;
+                state.nativePathWatchBestDistance = state.recoveryBestDistance;
+                state._stuckLogged = false;
+
+                scheduleNextTick();
+                return;
+            }
+
+            if (lureNoWayDecision === "circuit") {
+                return;
+            }
+
+            // ---- LAST LOW-HP LURE MOB MOVEMENT ----
+            // Exactly one weak lure mob gets special handling. In Kill mode,
+            // hold completely and finish it. In Slow mode, alternate normal
+            // CaveBot movement windows with intentional holds so auto-attacks
+            // can keep landing without sprinting away from the target.
+            if (bot.attack?.isLureActive?.() && isOrdinaryLureWaypoint(waypoint)) {
+                const lastMobMove = getLastMobMovementDecision(now);
+
+                if (lastMobMove.active && lastMobMove.hold) {
+                    clearLureRouteBlocker("last low-HP mob movement hold");
+                    clearLureCrowdBlock("last low-HP mob movement hold");
+                    stopMovement();
+
+                    resetWaypointProgressTracking(waypoint, position, now);
+                    state.lastPositionKey = positionKey;
+                    state.lastProgressAt = now;
+                    state.lastRecoveryAt = 0;
+                    state.lastPathAt = now;
+                    state.pathAttemptStart = now;
+                    state.stuckCount = 0;
+                    state.stuckRecoveryAttempts = 0;
+                    state.recoverySideStepAttempts = 0;
+                    state.recoveryBlockerWaitAt = 0;
+                    state.recoveryBlockerWaitKey = null;
+                    state.recoveryBestDistance = getDistanceToWaypoint(position, waypoint);
+                    state.recoveryNoProgressAt = now;
+                    state.nativePathWatchAt = now;
+                    state.nativePathWatchBestDistance = state.recoveryBestDistance;
+                    state._stuckLogged = false;
+
+                    scheduleNextTick();
+                    return;
+                }
+            } else {
+                resetLureLastMobMovement("not ordinary lure movement");
+            }
+
+            // ---- LURE CROWD CONGESTION HOLD ----
+            // Multiple pulled mobs can legitimately seal a one-tile corridor.
+            // A valid static lane still exists, so this is not a stuck/path error.
+            if (bot.attack?.isLureActive?.() && isOrdinaryLureWaypoint(waypoint)) {
+                if (updateLureCrowdBlock(position, waypoint, now)) {
+                    state.lureCrowdHoldTicks++;
+
+                    clearLureRouteBlocker("crowd congestion owns blocker handling");
+                    stopMovement();
+
+                    // Rebase all movement watchdogs every hold tick. This makes
+                    // the wait intentional and prevents recovery/blacklisting.
+                    resetWaypointProgressTracking(waypoint, position, now);
+                    state.lastPositionKey = positionKey;
+                    state.lastProgressAt = now;
+                    state.lastRecoveryAt = 0;
+                    state.lastPathAt = now;
+                    state.pathAttemptStart = now;
+                    state.stuckCount = 0;
+                    state.stuckRecoveryAttempts = 0;
+                    state.recoverySideStepAttempts = 0;
+                    state.recoverySideStepAt = 0;
+                    state.recoverySideStepLastKey = null;
+                    state.recoverySideStepOriginKey = null;
+                    state.recoveryBlockerWaitAt = 0;
+                    state.recoveryBlockerWaitKey = null;
+                    state.recoveryBestDistance = getDistanceToWaypoint(position, waypoint);
+                    state.recoveryNoProgressAt = now;
+                    state.nativePathWatchAt = now;
+                    state.nativePathWatchBestDistance = state.recoveryBestDistance;
+                    state._stuckLogged = false;
+
+                    scheduleNextTick();
+                    return;
+                }
+            } else if (state.lureCrowdBlocked) {
+                clearLureCrowdBlock("lure inactive or special waypoint", now);
+            }
+
+            // ---- LURE ROUTE BLOCKER BYPASS ----
+            // During attack-through lure, never wait through normal CaveBot's
+            // multi-second temporary-blocker recovery while attacking the mob.
+            // Detect the blocker immediately, tell Targeting not to attack that
+            // exact monster, and route around it one tile at a time.
+            if (bot.attack?.isLureActive?.() && isOrdinaryLureWaypoint(waypoint)) {
+                const blocker = findImmediateLureRouteBlocker(position, waypoint);
+
+                if (blocker) {
+                    const reason = blocker.waypointTile
+                        ? "mob occupying lure waypoint"
+                        : "mob blocking next lure step";
+                    markLureRouteBlocker(blocker.creature, reason, now);
+
+                    // If we're already beside an ordinary waypoint whose exact
+                    // tile is occupied, reaching that exact tile adds no route
+                    // value. Safely advance to the next route marker instead of
+                    // standing there until the monster dies/moves.
+                    if (blocker.waypointTile) {
+                        const distance = Math.max(
+                            Math.abs(position.x - waypoint.x),
+                            Math.abs(position.y - waypoint.y)
+                        );
+                        if (distance <= 1) {
+                            const oldIndex = state.currentIndex;
+                            const nextWp = advanceWaypoint();
+                            state.lureBlockedWaypointSkips++;
+                            state.lastWaypointTarget = null;
+                            state.pathAttemptStart = 0;
+                            state.lastDistanceToWaypoint = null;
+                            state.lastPathAt = 0;
+                            state.lastProgressAt = now;
+                            state.stuckCount = 0;
+                            state.stuckRecoveryAttempts = 0;
+                            state.recoverySideStepAttempts = 0;
+                            state.recoveryBlockerWaitAt = 0;
+                            state.recoveryBlockerWaitKey = null;
+
+                            bot.log(
+                                `Cave: lure mob occupies ordinary waypoint #${oldIndex + 1} – ` +
+                                `advancing instead of killing blocker`
+                            );
+
+                            if (nextWp && nextWp.x !== undefined) {
+                                goToWaypoint(nextWp);
+                            }
+                            scheduleNextTick();
+                            return;
+                        }
+                    }
+
+                    const detourCooldownMs = Math.max(
+                        250,
+                        Number(config.lureBlockerDetourCooldownMs) || 550
+                    );
+                    const canDetour =
+                        now - state.lureBlockerDetourAt >= detourCooldownMs;
+                    const detour = canDetour
+                        ? findLureBlockerDetourStep(position, waypoint, blocker.position)
+                        : null;
+
+                    if (detour) {
+                        state.lureBlockerDetourAt = now;
+                        state.lureBlockerDetours++;
+                        state.lastProgressAt = now;
+                        state.lastPathAt = 0;
+                        state.lastWaypointTarget = null;
+                        state.pathAttemptStart = 0;
+                        state.stuckCount = 0;
+                        state.stuckRecoveryAttempts = 0;
+                        state.recoverySideStepAttempts = 0;
+                        state.recoveryBlockerWaitAt = 0;
+                        state.recoveryBlockerWaitKey = null;
+
+                        // Cancel the blocked route before issuing the one-tile
+                        // bypass. The next normal tick repaths to the waypoint.
+                        stopMovement();
+
+                        bot.log("Cave: lure blocker – immediate detour", {
+                            blockerId: blocker.creature.id,
+                            blockerName: blocker.creature.name || "Mob",
+                            detour
+                        });
+
+                        goToPosition(detour);
+                        scheduleNextTick();
+                        return;
+                    }
+
+                    // No safe lateral tile (often a one-tile corridor). Stop
+                    // advancing, but Targeting now excludes this blocker, so we
+                    // wait for/pull the mob instead of standing still killing it.
+                    state.lureBlockerWaits++;
+                    state.lastProgressAt = now;
+                    state.lastPathAt = 0;
+                    state.lastWaypointTarget = null;
+                    state.pathAttemptStart = 0;
+                    stopMovement();
+
+                    bot.log("Cave: lure blocker – waiting for mob to clear route", {
+                        blockerId: blocker.creature.id,
+                        blockerName: blocker.creature.name || "Mob"
+                    });
+
+                    scheduleNextTick();
+                    return;
+                }
+
+                clearLureRouteBlocker("route clear");
+            } else if (!bot.attack?.isLureActive?.()) {
+                clearLureRouteBlocker("lure inactive");
             }
 
             // ---- STAND WAYPOINT ----
@@ -9103,6 +14981,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 // route waypoint instead of blindly advancing to the next waypoint.
                 const standTimeout = Math.max(5000, Number(config.standTimeoutMs) || 10000);
                 if (state.standStartAt[index] && now - state.standStartAt[index] > standTimeout) {
+                    if (setRecoveryReason('STAND_TIMEOUT', now, waypoint)) return;
                     delete state.standStartAt[index];
                     state._standAttempt = null;
                     bot.log(`Stand waypoint stalled for ${standTimeout / 1000}s – selecting recovery waypoint`);
@@ -9984,19 +15863,29 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             let madeProgress = false;
             if (positionKey && positionKey !== state.lastPositionKey) {
                 const progressWaypoint = getCurrentWaypoint();
+                const progressKey = getWaypointKey(progressWaypoint);
                 const currentWaypointDistance = progressWaypoint
                     ? getDistanceToWaypoint(position, progressWaypoint)
                     : Infinity;
-                const previousWaypointDistance = Number(state.lastDistanceToWaypoint);
+                if (progressKey !== state.waypointProgressKey) {
+                    resetWaypointProgressTracking(progressWaypoint, position, now);
+                }
+                const previousBestDistance = Number(state.bestDistanceToWaypoint);
                 const distanceImproved = Number.isFinite(currentWaypointDistance) &&
-                    (!Number.isFinite(previousWaypointDistance) || currentWaypointDistance < previousWaypointDistance);
+                    (!Number.isFinite(previousBestDistance) || currentWaypointDistance < previousBestDistance);
 
                 madeProgress = distanceImproved;
                 state.lastPositionKey = positionKey;
                 if (Number.isFinite(currentWaypointDistance))
                     state.lastDistanceToWaypoint = currentWaypointDistance;
-                if (distanceImproved)
+                if (distanceImproved) {
+                    state.bestDistanceToWaypoint = currentWaypointDistance;
+                    state.recoveryActive = false;
+                    state.lastProgressAt = now;
                     state.stuckCount = 0;
+                    state.nativePathWatchBestDistance = currentWaypointDistance;
+                    state.nativePathWatchAt = now;
+                }
 
                 // Normal movement resets recovery state only when it is genuine
                 // route progress. A creature pushing us around must not keep
@@ -10062,6 +15951,26 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             }
 
             // ---- STUCK DETECTION / GUARDED RECOVERY ----
+            const currentProgressWaypoint = getCurrentWaypoint();
+            const currentProgressKey = getWaypointKey(currentProgressWaypoint);
+            const currentProgressDistance = currentProgressWaypoint
+                ? getDistanceToWaypoint(position, currentProgressWaypoint)
+                : Infinity;
+            if (currentProgressKey !== state.waypointProgressKey) {
+                resetWaypointProgressTracking(currentProgressWaypoint, position, now);
+            } else if (Number.isFinite(currentProgressDistance) && currentProgressDistance < Number(state.bestDistanceToWaypoint)) {
+                state.bestDistanceToWaypoint = currentProgressDistance;
+                state.recoveryActive = false;
+                state.lastDistanceToWaypoint = currentProgressDistance;
+                state.lastProgressAt = now;
+                state.nativePathWatchBestDistance = currentProgressDistance;
+                state.nativePathWatchAt = now;
+                state.telemetry.progressEvents++;
+                state.telemetry.lastEventAt = now;
+                state.telemetry.lastEvent = 'PROGRESS';
+                madeProgress = true;
+            }
+
             const stuckTimeout = config.stuckTimeoutMs || 2000;
             const stalledFor = now - state.lastProgressAt;
 
@@ -10072,8 +15981,18 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                     // First recover by rebuilding the native path. This avoids
                     // skipping a perfectly valid waypoint just because one path
                     // attempt got blocked by a creature, door, or transient state.
-                    const maxRepathRecoveries = Math.max(0, Math.trunc(Number(config.maxRepathRecoveries) || 2));
+                    const maxRepathRecoveries = Math.max(0, Math.trunc(Number(config.maxRepathRecoveries ?? 2) || 0));
+                    // If the previous recovery side-step did not produce route progress,
+                    // remember that exact tile briefly. This prevents repeated attempts
+                    // to step onto the same temporarily bad square without constraining
+                    // native Pathfinder pathfinding.
+                    if (state.recoverySideStepLastKey && state.recoverySideStepOriginKey &&
+                        state.recoverySideStepLastKey !== getPositionKey(position)) {
+                        rememberRecoveryObstacle(state.recoverySideStepLastKey, now);
+                    }
+                    pruneRecoveryObstacleMemory(now);
                     if (state.stuckRecoveryAttempts < maxRepathRecoveries) {
+                        if (setRecoveryReason('STUCK', now, currentWp)) return;
                         state.stuckRecoveryAttempts++;
                         const recoveryDistance = getDistanceToWaypoint(position, currentWp);
                         state.recoveryBestDistance = Number.isFinite(recoveryDistance) ? recoveryDistance : Infinity;
@@ -10135,6 +16054,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                             temporaryBlockerConfirmed = true;
                             const blockerKey = `${posForBlocker.x},${posForBlocker.y},${posForBlocker.z}|${currentWp.x},${currentWp.y},${currentWp.z}`;
                             if (state.recoveryBlockerWaitKey !== blockerKey) {
+                                setRecoveryReason('TEMP_BLOCKER', now, currentWp);
                                 state.recoveryBlockerWaitKey = blockerKey;
                                 state.recoveryBlockerWaitAt = now;
                                 state.lastProgressAt = now;
@@ -10161,7 +16081,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                     // blocker. Never sidestep blindly after Pathfinder failures: that
                     // can make the bot bounce along a shoreline/water edge while the
                     // native Pathfinder keeps insisting on an unreachable island route.
-                    const maxRecoverySideSteps = Math.max(0, Math.trunc(Number(config.maxRecoverySideSteps) || 2));
+                    const maxRecoverySideSteps = Math.max(0, Math.trunc(Number(config.maxRecoverySideSteps ?? 2) || 0));
                     const recoverySideStepCooldownMs = Math.max(250, Number(config.recoverySideStepCooldownMs) || 1500);
                     if (temporaryBlockerConfirmed && state.recoverySideStepAttempts < maxRecoverySideSteps && now - state.recoverySideStepAt > recoverySideStepCooldownMs) {
                         const posNow = normalizePosition(bot.getPlayerPosition());
@@ -10206,6 +16126,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                                 const candidateKey = `${nx},${ny},${posNow.z}`;
                                 if (state.recoverySideStepLastKey === candidateKey) continue;
                                 if (state.recoverySideStepOriginKey === candidateKey) continue;
+                                if (isRememberedRecoveryObstacle(candidateKey, now)) continue;
                                 state.recoverySideStepAt = now;
                                 state.recoveryBlockerWaitAt = 0;
                                 state.recoveryBlockerWaitKey = null;
@@ -10318,9 +16239,17 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
             // ---- AT WAYPOINT ----
             if (isAtWaypoint(position, waypoint)) {
+                // A successful arrival is strong evidence that the immediate route
+                // area is usable again. Keep only genuinely expired obstacle memory.
+                pruneRecoveryObstacleMemory(now);
                 state.lastWaypointTarget = null;
                 state.pathAttemptStart = 0;
                 state.lastDistanceToWaypoint = null;
+                state.bestDistanceToWaypoint = Infinity;
+                state.waypointProgressKey = null;
+                state.nativePathWatchKey = null;
+                state.nativePathWatchAt = 0;
+                state.nativePathWatchBestDistance = Infinity;
                 state.stuckCount = 0;
                 state.stuckRecoveryAttempts = 0;
                 state.lastRecoveryAt = 0;
@@ -10347,7 +16276,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 }
                 state.lastWaypointTarget = waypoint;
                 state.pathAttemptStart = now;
-                state.lastDistanceToWaypoint = getDistanceToWaypoint(position, waypoint);
+                resetWaypointProgressTracking(waypoint, position, now);
                 goToWaypoint(waypoint);
                 return;
             }
@@ -10406,13 +16335,46 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             const nativePathActive = !!(pf?.__finalDestination || pf?.__isAutoWalking || pf?.__pathfindCache?.length);
             const stalled = !state.lastProgressAt || (now - state.lastProgressAt >= config.repathMs);
             const pathExpired = !state.lastPathAt || (now - state.lastPathAt >= config.repathMs);
+            const waypointKey = getWaypointKey(waypoint);
 
-            // Native Pathfinder already owns its active AutoWalk batch and has
-            // its own loop detection / continuation. While it is active, CaveBot
-            // observes instead of competing with it. Rebuild only after the native
-            // state disappears, or after two guarded local stall observations.
+            if (state.nativePathWatchKey !== waypointKey) {
+                state.nativePathWatchKey = waypointKey;
+                state.nativePathWatchAt = now;
+                state.nativePathWatchBestDistance = Number.isFinite(currentDist) ? currentDist : Infinity;
+            }
+            if (Number.isFinite(currentDist) && currentDist < state.nativePathWatchBestDistance) {
+                state.nativePathWatchBestDistance = currentDist;
+                state.nativePathWatchAt = now;
+            }
+
+            // Native Pathfinder owns active AutoWalk batches. We normally leave it
+            // completely alone, but a path can remain flagged as active while the
+            // character has made no real route progress. This watchdog waits for the
+            // full stuck window before allowing one guarded native-path reset.
+            const nativeStallMs = Math.max(Number(config.nativePathWatchdogMs) || 5000, Number(config.stuckTimeoutMs) || 5000);
+            const nativeWatchStalled = nativePathActive && state.nativePathWatchAt > 0 &&
+                (now - state.nativePathWatchAt >= nativeStallMs);
+
             if (!nativePathActive) {
                 goToWaypoint(waypoint);
+            } else if (nativeWatchStalled && (now - state.lastRecoveryAt) > 1000) {
+                if (setRecoveryReason('NATIVE_STALL', now, waypoint)) return;
+                state.lastRecoveryAt = now;
+                state.stuckCount++;
+                state.nativePathWatchAt = now;
+                state.lastPathAt = 0;
+                state.lastWaypointTarget = null;
+                bot.log(`Cave: native Pathfinder active but no route progress for ${(nativeStallMs / 1000).toFixed(1)}s – guarded repath ${state.stuckCount}/2`);
+                if (state.stuckCount >= 2) {
+                    state.stuckCount = 0;
+                    state.lastProgressAt = now - nativeStallMs;
+                    state.stuckRecoveryAttempts = Math.max(state.stuckRecoveryAttempts, Math.max(0, Math.trunc(Number(config.maxRepathRecoveries ?? 2) || 0)));
+                    // Let the existing bounded recovery path decide whether to
+                    // sidestep, wait for a creature, or select a recovery waypoint.
+                    goToWaypoint(waypoint);
+                } else {
+                    goToWaypoint(waypoint);
+                }
             } else if (stalled && pathExpired && (now - state.lastRecoveryAt) > 1000) {
                 state.lastRecoveryAt = now;
                 state.stuckCount++;
@@ -10436,66 +16398,108 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     // the player moving because creatures push them around, which would otherwise
     // delay route-level recovery indefinitely.
     function installNoWayObserver() {
-        if (state.noWayObserver)
+        if (!state.running || state.noWayObserver)
             return;
 
-        const attach = () => {
-            if (!window.MutationObserver)
-                return false;
+        if (!window.MutationObserver) return;
 
-            // Different client builds expose the Pathfinder cancellation message
-            // through different DOM nodes. Prefer the real cancel-message node,
-            // but also watch the legacy notification node as a fallback.
-            const elements = [
-                document.getElementById("cancelmessage"),
-                document.getElementById("notification")
-            ].filter(Boolean);
-            if (!elements.length)
-                return false;
+        // Different client builds expose the Pathfinder cancellation message
+        // through different DOM nodes. Capture ONLY the currently attached nodes.
+        const elements = [
+            document.getElementById("cancelmessage"),
+            document.getElementById("notification")
+        ].filter(Boolean);
+        if (!elements.length) return;
 
-            const check = (element) => {
-                if (!state.running)
+        const check = (element) => {
+                if (!state.running || state.positionUnavailable || !window.gameClient?.player)
+                    return;
+                // Combat/target-chase owns movement here. A message from a
+                // cancelled pre-combat path must not arm CaveBot recovery.
+                const lureAttackThrough = bot.attack?.isLureActive?.() === true;
+                if (
+                    state.pausedForCombat ||
+                    (!lureAttackThrough && (
+                        window.gameClient?.player?.__target ||
+                        window.gameClient?.player?.getTarget?.() ||
+                        bot.attack?.isCombatActive?.()
+                    ))
+                )
                     return;
                 const text = String(element.textContent || "").trim();
                 if (!text || !/there is no way\.?/i.test(text))
                     return;
 
                 const now = Date.now();
-                // MutationObserver can report several mutations for one message.
-                if (text === state.noWayLastText && now - state.noWayLastSeenAt < 1000)
+                const currentWp = getCurrentWaypoint();
+
+                // Script-only waypoints are actions, not navigation targets. Never let
+                // a stale DOM Pathfinder message trigger recovery while one is active.
+                if (!currentWp || currentWp.script || currentWp.x === undefined || currentWp.y === undefined || currentWp.z === undefined)
                     return;
+
+                const crowdPos = normalizePosition(bot.getPlayerPosition());
+
+                // Tight lure corridors can make native Pathfinder report
+                // "There is no way." even though the map route is valid and
+                // merely creature-occupied. If geometry is already settled,
+                // suppress immediately.
+                if (
+                    bot.attack?.isLureActive?.() &&
+                    (
+                        updateLureCrowdBlock(crowdPos, currentWp, now) ||
+                        isLureCrowdBlocked()
+                    )
+                ) {
+                    state.lureCrowdNoWaySuppressions++;
+                    state.lastProgressAt = now;
+                    state.nativePathWatchAt = now;
+                    state.stuckCount = 0;
+                    state.stuckRecoveryAttempts = 0;
+                    clearLureNoWayArbitration(
+                        "observer resolved immediate crowd congestion",
+                        now
+                    );
+                    return;
+                }
+
+                const waypointKey = getWaypointKey(currentWp);
+                const failureKey = `${state.currentIndex}:${waypointKey || 'script'}`;
+
+                // MutationObserver can report several mutations for one message.
+                // Treat the DOM message as a fresh failure only when either the
+                // waypoint changed or the same waypoint has been quiet long enough.
+                if (text === state.noWayLastText && now - state.noWayLastSeenAt < 1000 &&
+                    state.noWayFailureKey === failureKey)
+                    return;
+
                 state.noWayLastText = text;
                 state.noWayLastSeenAt = now;
 
-                // Do not repeatedly re-arm recovery from the same DOM message while
-                // CaveBot is still working on the same waypoint. A different current
-                // waypoint is allowed to trigger recovery again.
-                if (state.noWayRecoveryIndex === state.currentIndex)
+                if (state.noWayFailureKey === failureKey && now - state.noWayFailureAt < 1500)
                     return;
+
+                state.noWayFailureKey = failureKey;
+                state.noWayFailureAt = now;
+                state.noWayLastWaypointKey = waypointKey;
                 state.noWayRecoveryIndex = state.currentIndex;
 
-                const maxRepathRecoveries = Math.max(0, Math.trunc(Number(config.maxRepathRecoveries) || 2));
-                const maxRecoverySideSteps = Math.max(0, Math.trunc(Number(config.maxRecoverySideSteps) || 2));
+                // Critical v1.5.17 ordering: when several lure mobs are nearby,
+                // do not record NO_WAY or prime recovery on the MutationObserver
+                // frame. Give the next CaveBot tick one short arbitration window
+                // to see the settled creature geometry.
+                if (
+                    bot.attack?.isLureActive?.() &&
+                    armLureNoWayArbitration(crowdPos, currentWp, now)
+                ) {
+                    return;
+                }
 
-                // A native "There is no way." means Pathfinder already exhausted
-                // its route to this destination. Skip the normal repath/blocker
-                // grace stages and let the existing closest-waypoint recovery run
-                // on the next CaveBot tick. This does not alter STAND floor-mismatch
-                // semantics and SCRIPT remains completely outside recovery checks.
-                state.stuckRecoveryAttempts = maxRepathRecoveries;
-                state.recoverySideStepAttempts = maxRecoverySideSteps;
-                state.recoveryBlockerWaitAt = now;
-                state.recoveryBlockerWaitKey = null;
-                state.recoveryBestDistance = Infinity;
-                state.recoveryNoProgressAt = now;
-                state.lastRecoveryAt = 0;
-                state.lastProgressAt = now - Math.max(1000, Number(config.stuckTimeoutMs) || 5000) - 1;
-                state._stuckLogged = false;
-                bot.log('Cave: Pathfinder reported "There is no way." – forcing waypoint recovery');
+                if (forceNativeNoWayRecovery(now, currentWp, "immediate")) return;
             };
 
-            const observers = [];
-            for (const element of elements) {
+        const observers = [];
+        for (const element of elements) {
                 // Establish a baseline without treating an already-visible old
                 // cancellation message as a brand-new Pathfinder failure.
                 const initialText = String(element.textContent || "").trim();
@@ -10511,20 +16515,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 observers.push(observer);
             }
 
-            state.noWayObserver = observers;
-            return true;
-        };
-
-        if (attach())
-            return;
-
-        // UI may not have created the cancel-message node yet. Retry briefly without
-        // introducing another permanent polling loop.
-        const retryId = window.setInterval(() => {
-            if (attach())
-                window.clearInterval(retryId);
-        }, 500);
-        bot.addCleanup(() => window.clearInterval(retryId));
+        state.noWayObserver = observers;
+        state.noWayElements = elements;
     }
 
     function stopNoWayObserver() {
@@ -10537,10 +16529,33 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             }
             state.noWayObserver = null;
         }
+        // Never keep a detached game-client DOM tree reachable from CaveBot.
+        state.noWayElements = null;
+    }
+
+    function ensureNoWayObserver() {
+        if (!state.running) return;
+        const elements = [
+            document.getElementById("cancelmessage"),
+            document.getElementById("notification")
+        ].filter(Boolean);
+        const observed = state.noWayElements;
+        if (observed && state.noWayObserver &&
+            observed.length === elements.length &&
+            observed.every((element, i) => element === elements[i])) return;
+
+        // A node was removed, replaced, or added. Release the old observers and
+        // establish a fresh baseline (never replay an old visible NO_WAY message).
+        stopNoWayObserver();
+        if (elements.length) installNoWayObserver();
+        // When the client has no notification nodes yet, the next CaveBot tick
+        // retries. No separate unbounded 500ms interval is necessary.
     }
 
     function startObserver() {
-        installNoWayObserver();
+        // Floor-transition learning is intentionally always on, but the DOM
+        // Pathfinder-error observer is only useful while CaveBot is running.
+        // Do not retain notification DOM nodes or retry every 500ms while idle.
         if (state.observerTimerId != null)
             return;
         state.observerTimerId = window.setInterval(() => {
@@ -10574,11 +16589,6 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
     // ---- PUBLIC API ----
     function start(overrides = {}) {
-        Object.assign(config, overrides, {
-            enabled: true
-        });
-        config.tickMs = 500;
-        persistConfig();
         if (!route.length) {
             bot.log("cave bot cannot start without waypoints");
             return false;
@@ -10587,8 +16597,33 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             bot.log("cave bot already running");
             return false;
         }
+        Object.assign(config, overrides, { enabled: true });
+        config.tickMs = 500;
+        persistConfig();
         const pos = normalizePosition(bot.getPlayerPosition());
         state.running = true;
+        // Only active navigation needs Pathfinder cancellation notifications.
+        // installNoWayObserver is idempotent and its retry timer is tracked.
+        installNoWayObserver();
+        // A fresh run must not inherit special-waypoint completion/attempt flags
+        // from the previous run. This resets state only, not the route, recovery
+        // history, current config, or STAND floor-mismatch semantics.
+        state.standReached = {};
+        state.standStartAt = {};
+        state._standAttempt = null;
+        state._ropeUsed = null;
+        state._ropeNextUseAt = null;
+        state._ropeWaitingFloorChange = null;
+        state._shovelUsed = null;
+        state._shovelState = null;
+        state._shovelOpened = null;
+        state._shovelOpenedAt = null;
+        state._shovelRetry = null;
+        state._ladderUsed = null;
+        state._ladderNextUseAt = null;
+        state._ladderWaitingFloorChange = null;
+        state.pendingTransitionSource = null;
+        state.lastObservedPosition = null;
         state.currentIndex = findClosestWaypointIndex(pos);
         state.direction = state.currentIndex >= route.length - 1 ? -1 : 1;
         if (route.length <= 1)
@@ -10596,9 +16631,68 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         state.lastPathAt = 0;
         state.lastPositionKey = getPositionKey(pos);
         state.lastProgressAt = Date.now();
+        state.bestDistanceToWaypoint = Infinity;
+        state.waypointProgressKey = null;
+        state.nativePathWatchKey = null;
+        state.nativePathWatchAt = 0;
+        state.nativePathWatchBestDistance = Infinity;
+        state.recoveryReason = null;
+        state.recoveryReasonAt = 0;
+        state.recoveryReasonIndex = -1;
+        state.recoveryReasonKey = null;
+        state.recoveryActive = false;
+        state.circuitTrip = null;
+        state.circuitFailures = null;
+        state.noWayLastWaypointKey = null;
+        state.noWayFailureKey = null;
+        state.noWayFailureAt = 0;
         state.stuckRecoveryAttempts = 0;
         state.lastRecoveryAt = 0;
         state.pausedForCombat = false;
+        state.lureLeashPaused = false;
+        state.lureLeashPauseCount = 0;
+        state.lureLeashResumeCount = 0;
+        state.lureBlockerId = null;
+        state.lureBlockerName = null;
+        state.lureBlockerSince = 0;
+        state.lureBlockerLastSeenAt = 0;
+        state.lureBlockerReason = null;
+        state.lureBlockerDetourAt = 0;
+        state.lureBlockerDetours = 0;
+        state.lureBlockerWaits = 0;
+        state.lureBlockedWaypointSkips = 0;
+        state.lureBlockerClears = 0;
+        state.lureCrowdBlocked = false;
+        state.lureCrowdBlockerIds = [];
+        state.lureCrowdBlockerNames = [];
+        state.lureCrowdBlockedSince = 0;
+        state.lureCrowdLastSeenAt = 0;
+        state.lureCrowdReason = null;
+        state.lureCrowdActivations = 0;
+        state.lureCrowdClears = 0;
+        state.lureCrowdHoldTicks = 0;
+        state.lureCrowdNoWaySuppressions = 0;
+        state.lureNoWayPending = false;
+        state.lureNoWayPendingUntil = 0;
+        state.lureNoWayPendingAt = 0;
+        state.lureNoWayPendingIndex = -1;
+        state.lureNoWayPendingKey = null;
+        state.lureNoWayPendingMobIds = [];
+        state.lureNoWayPendingMobNames = [];
+        state.lureNoWayDeferrals = 0;
+        state.lureNoWayResolvedAsCrowd = 0;
+        state.lureNoWayEscalations = 0;
+        state.lureNoWayLastResolution = null;
+        state.lureNoWayLastResolutionAt = 0;
+        state.lureLastMobMoveActive = false;
+        state.lureLastMobMoveMode = null;
+        state.lureLastMobMovePhase = "run";
+        state.lureLastMobMovePhaseUntil = 0;
+        state.lureLastMobSlowRuns = 0;
+        state.lureLastMobSlowHolds = 0;
+        state.lureLastMobKillHolds = 0;
+        state.lureLastMobMoveResets = 0;
+        state.positionUnavailable = false;
         state.pathAttemptStart = 0;
         state.noWayLastSeenAt = 0;
         state.noWayLastText = "";
@@ -10624,6 +16718,11 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     function stop(options = {}) {
         const shouldPersist = options.persistEnabled !== false;
         state.running = false;
+        state.fallbackMoveRequestId++;
+        stopNoWayObserver();
+        // Do not leave CaveBot's wrapped native search on the game client after
+        // CaveBot stops (including a Pink Skull or circuit-breaker safety stop).
+        uninstallFieldIgnoringPathfinder();
         if (state.timerId != null) {
             window.clearTimeout(state.timerId);
             state.timerId = null;
@@ -10637,6 +16736,18 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             persistConfig();
         }
         state.pausedForCombat = false;
+        state.lureLeashPaused = false;
+        clearLureRouteBlocker("CaveBot stopped");
+        clearLureCrowdBlock("CaveBot stopped");
+        clearLureNoWayArbitration("CaveBot stopped");
+        resetLureLastMobMovement("CaveBot stopped");
+        state.positionUnavailable = false;
+        state.recoveryReason = null;
+        state.recoveryReasonAt = 0;
+        state.recoveryReasonIndex = -1;
+        state.recoveryReasonKey = null;
+        state.recoveryActive = false;
+        state.circuitFailures = null;
         bot.log("cave bot stopped");
         return true;
     }
@@ -10645,12 +16756,18 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         const norm = normalizeWaypoint(waypoint);
         if (!norm)
             return null;
-        // If insertIndex is a valid number, insert at that position; otherwise append
-        if (typeof insertIndex === 'number' && insertIndex >= 0 && insertIndex <= route.length) {
+        // Preserve the currently targeted waypoint *object* if a new point is
+        // inserted before it. The new point belongs to the next route pass;
+        // without this adjustment, inserting while running silently redirects
+        // CaveBot to a different coordinate at the same numeric index.
+        if (Number.isInteger(insertIndex) && insertIndex >= 0 && insertIndex <= route.length) {
+            if (route.length && insertIndex <= state.currentIndex)
+                state.currentIndex++;
             route.splice(insertIndex, 0, norm);
         } else {
             route.push(norm);
         }
+        resetRecoveryContext("waypoint added");
         persistRoute();
         bot.log("cave waypoint added", {
             ...norm,
@@ -10673,6 +16790,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         route = [];
         state.currentIndex = 0;
         state.direction = 1;
+        resetRecoveryContext("route cleared");
         persistRoute();
         bot.log("cave route cleared");
         if (state.running)
@@ -10694,6 +16812,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         const removed = route.pop();
         if (state.currentIndex >= route.length)
             state.currentIndex = Math.max(0, route.length - 1);
+        resetRecoveryContext("waypoint removed");
         if (route.length <= 1)
             state.direction = 1;
         persistRoute();
@@ -10712,9 +16831,144 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         const next = Math.max(0, Math.min(route.length - 1, Math.trunc(Number(index) || 0)));
         state.currentIndex = next;
         state.direction = next >= route.length - 1 ? -1 : 1;
+        resetRecoveryContext("current waypoint changed");
         if (route.length <= 1)
             state.direction = 1;
         return state.currentIndex;
+    }
+
+    // On-demand, read-only route audit. This is advisory ONLY: never changes
+    // navigation, auto-transitions, recovery, route order, or config. In
+    // particular do not inspect SCRIPT waypoints or try local-connectivity
+    // checks (the native Pathfinder owns routing, including distant mapclicks).
+    function auditRoute(maxIssues = 20) {
+        const capValue = Number(maxIssues);
+        const cap = Number.isFinite(capValue)
+            ? Math.max(1, Math.min(50, Math.trunc(capValue))) : 20;
+        const issues = [];
+        let issueCount = 0;
+        const warn = (index, text) => {
+            issueCount++;
+            if (issues.length < cap) issues.push({ index, text });
+        };
+        if (!route.length) warn(-1, 'Route has no waypoints.');
+        let previousWalk = null;
+        for (let index = 0; index < route.length; index++) {
+            const wp = route[index];
+            // SCRIPT is deliberately outside every route-audit rule, including
+            // when the script waypoint also happens to carry coordinates.
+            if (!wp || wp.script) {
+                previousWalk = null;
+                continue;
+            }
+            const coords = [wp.x, wp.y, wp.z];
+            if (!coords.every(Number.isSafeInteger)) {
+                warn(index, 'Walking waypoint has missing or invalid coordinates.');
+                previousWalk = null;
+                continue;
+            }
+            const actions = ['stand', 'rope', 'shovel', 'ladder']
+                .filter(name => wp[name] === true);
+            if (actions.length > 1) {
+                warn(index, `Multiple waypoint actions (${actions.join(', ')}); check which action is intended.`);
+            }
+            const isSpecial = actions.length > 0;
+            // Only consecutive ordinary WALK points on the same floor are
+            // comparable. STAND can mark a hole/teleporter; ROPE/SHOVEL/LADDER
+            // change floors. Never flag those legitimate manual transitions.
+            if (previousWalk && !isSpecial && previousWalk.z === wp.z) {
+                const distance = Math.max(
+                    Math.abs(wp.x - previousWalk.x),
+                    Math.abs(wp.y - previousWalk.y));
+                if (distance > 50) {
+                    warn(index, `Walk from #${previousWalk.index + 1} is ${distance} tiles; the 50-tile distance guard may skip this waypoint.`);
+                }
+            }
+            previousWalk = isSpecial ? null : { index, x: wp.x, y: wp.y, z: wp.z };
+        }
+        return {
+            waypointCount: route.length,
+            issueCount,
+            truncated: issueCount > issues.length,
+            issues
+        };
+    }
+
+    function getRouteHealth() {
+        return Array.from(state.routeHealth.values())
+            .sort((a, b) => (b.lastAt || 0) - (a.lastAt || 0))
+            .map(entry => ({ ...entry }));
+    }
+
+    function getRecoveryHistory(limit = config.recoveryHistoryLimit) {
+        const max = Math.max(1, Math.min(config.recoveryHistoryLimit, Math.trunc(Number(limit) || config.recoveryHistoryLimit)));
+        return state.recoveryHistory.slice(-max).map(entry => ({
+            ...entry,
+            waypoint: entry.waypoint ? { ...entry.waypoint } : null,
+        }));
+    }
+
+    function clearRouteHealth() {
+        state.routeHealth.clear();
+        state.recoveryHistory.length = 0;
+        state.recoveryReason = null;
+        state.recoveryReasonAt = 0;
+        state.recoveryReasonIndex = -1;
+        state.recoveryReasonKey = null;
+        bot.log("Cave: route health history cleared");
+        return true;
+    }
+
+    function getTelemetry() {
+        const pos = normalizePosition(bot.getPlayerPosition());
+        const wp = getCurrentWaypoint();
+        return {
+            ...state.telemetry,
+            currentIndex: state.currentIndex,
+            currentDistance: getDistanceToWaypoint(pos, wp),
+            bestDistance: state.bestDistanceToWaypoint,
+            stalledForMs: Math.max(0, Date.now() - (state.lastProgressAt || Date.now())),
+            nativePathActive: !!(window.gameClient?.world?.pathfinder?.__finalDestination ||
+                window.gameClient?.world?.pathfinder?.__isAutoWalking ||
+                window.gameClient?.world?.pathfinder?.__pathfindCache?.length),
+            rememberedObstacleTiles: state.recoveryObstacleTiles.size,
+        };
+    }
+
+    // A read-only, allocation-light UI snapshot. The full status() API remains
+    // available to integrations, but the visible Cave tab refreshes every second:
+    // cloning the entire route, all presets, transitions and sorted route-health
+    // history on each refresh created substantial avoidable heap churn.
+    function getUiStatus(now = Date.now()) {
+        const pos = normalizePosition(bot.getPlayerPosition());
+        const wp = getCurrentWaypoint();
+        const pf = window.gameClient?.world?.pathfinder;
+        const recent = [];
+        // At most three entries, never copies the route or retains waypoint objects.
+        for (let i = state.recoveryHistory.length - 1;
+             i >= 0 && recent.length < 3; i--) {
+            const event = state.recoveryHistory[i];
+            if (!event) continue;
+            recent.push(`${event.reason} #${event.index + 1} (${Math.max(0, Math.floor((now - event.at) / 1000))}s ago)`);
+        }
+        const movement = getMovementSummary(now);
+        const isPaused = state.positionUnavailable || state.pausedForCombat || state.combatCooldownUntil > now ||
+            (bot._waitUntil && bot._waitUntil > now) ||
+            ['Waiting for blocker', 'Waiting for floor change', 'Waiting'].includes(movement.mode);
+        const progressAgeMs = state.running && !isPaused && state.lastProgressAt
+            ? Math.max(0, now - state.lastProgressAt) : null;
+        return {
+            running: state.running,
+            routeLength: route.length,
+            currentIndex: state.currentIndex,
+            waypointKey: getWaypointKey(wp),
+            distanceToWaypoint: getDistanceToWaypoint(pos, wp),
+            circuitBreakerEnabled: config.circuitBreakerEnabled,
+            movement,
+            nativePathActive: !!(pf?.__finalDestination || pf?.__isAutoWalking || pf?.__pathfindCache?.length),
+            progressAgeMs,
+            recentRecoveries: recent.join(' · '),
+        };
     }
 
     function status() {
@@ -10732,17 +16986,110 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             currentIndex: state.currentIndex,
             direction: state.direction,
             currentWaypoint: cloneValue(wp),
+            recoveryReason: state.recoveryReason,
+            recoveryReasonAt: state.recoveryReasonAt,
+            recoveryReasonIndex: state.recoveryReasonIndex,
+            recoveryReasonKey: state.recoveryReasonKey,
             distanceToWaypoint: getDistanceToWaypoint(pos, wp),
             lastPathAt: state.lastPathAt,
             lastProgressAt: state.lastProgressAt,
             pendingTransitionSource: cloneValue(state.pendingTransitionSource),
             pausedForCombat: state.pausedForCombat,
+            lureLeashPaused: state.lureLeashPaused,
+            lureLeashPauseCount: state.lureLeashPauseCount || 0,
+            lureLeashResumeCount: state.lureLeashResumeCount || 0,
+            lureBlockerId: getLureBlockerId(),
+            lureBlockerName: state.lureBlockerName,
+            lureBlockerReason: state.lureBlockerReason,
+            lureBlockerSince: state.lureBlockerSince || 0,
+            lureBlockerDetours: state.lureBlockerDetours || 0,
+            lureBlockerWaits: state.lureBlockerWaits || 0,
+            lureBlockedWaypointSkips: state.lureBlockedWaypointSkips || 0,
+            lureBlockerClears: state.lureBlockerClears || 0,
+            lureCrowdBlocked: isLureCrowdBlocked(),
+            lureCrowdBlockerIds: Array.from(state.lureCrowdBlockerIds || []),
+            lureCrowdBlockerNames: Array.from(state.lureCrowdBlockerNames || []),
+            lureCrowdBlockedSince: state.lureCrowdBlockedSince || 0,
+            lureCrowdReason: state.lureCrowdReason,
+            lureCrowdActivations: state.lureCrowdActivations || 0,
+            lureCrowdClears: state.lureCrowdClears || 0,
+            lureCrowdHoldTicks: state.lureCrowdHoldTicks || 0,
+            lureCrowdNoWaySuppressions: state.lureCrowdNoWaySuppressions || 0,
+            lureNoWayPending: state.lureNoWayPending,
+            lureNoWayPendingUntil: state.lureNoWayPendingUntil || 0,
+            lureNoWayPendingIndex: state.lureNoWayPendingIndex,
+            lureNoWayPendingMobIds: Array.from(state.lureNoWayPendingMobIds || []),
+            lureNoWayPendingMobNames: Array.from(state.lureNoWayPendingMobNames || []),
+            lureNoWayDeferrals: state.lureNoWayDeferrals || 0,
+            lureNoWayResolvedAsCrowd: state.lureNoWayResolvedAsCrowd || 0,
+            lureNoWayEscalations: state.lureNoWayEscalations || 0,
+            lureNoWayLastResolution: state.lureNoWayLastResolution,
+            lureNoWayLastResolutionAt: state.lureNoWayLastResolutionAt || 0,
+            lureLastMobMoveActive: state.lureLastMobMoveActive,
+            lureLastMobMoveMode: state.lureLastMobMoveMode,
+            lureLastMobMovePhase: state.lureLastMobMovePhase,
+            lureLastMobSlowRuns: state.lureLastMobSlowRuns || 0,
+            lureLastMobSlowHolds: state.lureLastMobSlowHolds || 0,
+            lureLastMobKillHolds: state.lureLastMobKillHolds || 0,
+            lureLastMobMoveResets: state.lureLastMobMoveResets || 0,
+            movement: getMovementSummary(),
+            telemetry: {
+                ...state.telemetry,
+                currentDistance: getDistanceToWaypoint(pos, wp),
+                bestDistance: state.bestDistanceToWaypoint,
+                stalledForMs: Math.max(0, Date.now() - (state.lastProgressAt || Date.now())),
+                nativePathActive: !!(window.gameClient?.world?.pathfinder?.__finalDestination ||
+                    window.gameClient?.world?.pathfinder?.__isAutoWalking ||
+                    window.gameClient?.world?.pathfinder?.__pathfindCache?.length),
+                rememberedObstacleTiles: state.recoveryObstacleTiles.size,
+            },
+            routeHealth: getRouteHealth().slice(0, 25),
+            recoveryHistory: getRecoveryHistory(10),
         };
     }
 
     function updateConfig(nextConfig = {}) {
         Object.assign(config, nextConfig);
         config.tickMs = 500;
+        config.maxWaypointDistance = boundedWaypointDistance(config.maxWaypointDistance);
+        config.lureBlockerDetourCooldownMs = Math.max(
+            250,
+            Math.min(2000, Math.trunc(Number(config.lureBlockerDetourCooldownMs) || 550))
+        );
+        config.lureBlockerForgetMs = Math.max(
+            500,
+            Math.min(5000, Math.trunc(Number(config.lureBlockerForgetMs) || 1200))
+        );
+        config.lureCrowdRadius = Math.max(
+            2,
+            Math.min(5, Math.trunc(Number(config.lureCrowdRadius) || 3))
+        );
+        config.lureCrowdMinMobs = Math.max(
+            2,
+            Math.min(6, Math.trunc(Number(config.lureCrowdMinMobs) || 2))
+        );
+        config.lureCrowdClearGraceMs = Math.max(
+            100,
+            Math.min(2000, Math.trunc(Number(config.lureCrowdClearGraceMs) || 500))
+        );
+        config.lureNoWayArbitrationMs = Math.max(
+            600,
+            Math.min(2500, Math.trunc(Number(config.lureNoWayArbitrationMs) || 1100))
+        );
+        config.lureLastMobSlowRunMs = Math.max(
+            350,
+            Math.min(2000, Math.trunc(Number(config.lureLastMobSlowRunMs) || 500))
+        );
+        config.lureLastMobSlowHoldMs = Math.max(
+            350,
+            Math.min(2500, Math.trunc(Number(config.lureLastMobSlowHoldMs) || 500))
+        );
+        normalizeCircuitConfig();
+        if (!config.circuitBreakerEnabled) resetCircuitStreak();
+        // Zero intentionally disables the optional light recovery penalty.
+        const penalty = Number(config.recoveryHealthPenalty);
+        config.recoveryHealthPenalty = Number.isFinite(penalty)
+            ? Math.max(0, Math.min(10, penalty)) : 0.75;
         persistConfig();
         bot.log("cave config updated", {
             ...config
@@ -10763,6 +17110,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             state.currentIndex = index - 1;
         else if (state.currentIndex === index - 1)
             state.currentIndex = index;
+        resetRecoveryContext("waypoint reordered or deleted");
         persistRoute();
         return true;
     }
@@ -10777,6 +17125,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             state.currentIndex = index + 1;
         else if (state.currentIndex === index + 1)
             state.currentIndex = index;
+        resetRecoveryContext("waypoint reordered or deleted");
         persistRoute();
         return true;
     }
@@ -10803,6 +17152,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             state.currentIndex++;
         }
 
+        resetRecoveryContext("waypoint reordered or deleted");
         persistRoute();
         bot.log(`Waypoint moved from ${f} to ${t}`, wp);
         return true;
@@ -10812,6 +17162,11 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         if (!route.length || index < 0 || index >= route.length)
             return false;
         route.splice(index, 1);
+        // Deleting an earlier waypoint shifts the active one left. Deleting
+        // the active waypoint intentionally selects the next point (at the
+        // same index), or the previous point if we removed the last item.
+        if (index < state.currentIndex)
+            state.currentIndex--;
         if (state.currentIndex >= route.length)
             state.currentIndex = Math.max(0, route.length - 1);
         if (route.length === 0) {
@@ -10820,6 +17175,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             if (state.running)
                 stop();
         }
+        resetRecoveryContext("waypoint reordered or deleted");
         persistRoute();
         return true;
     }
@@ -10872,6 +17228,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         if (updates.script !== undefined) {
             wp.script = updates.script ? String(updates.script).trim() : undefined;
         }
+        resetRecoveryContext("waypoint updated");
         persistRoute();
         bot.log("Waypoint updated", {
             index,
@@ -10897,13 +17254,20 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         start,
         stop,
         status,
+        getUiStatus,
         updateConfig,
         config,
         getRoute,
+        auditRoute,
+        getWaypointListMeta: () => ({ revision: state.routeRevision, index: state.currentIndex, length: route.length, running: state.running }),
+        isRunning: () => state.running,
         getTransitions,
         getPresetNames,
         getActivePresetName,
         getCurrentWaypoint,
+        getLureBlockerId,
+        getLureBlockedCreatureIds,
+        isLureCrowdBlocked,
         createPreset,
         savePreset,
         loadPreset,
@@ -10928,6 +17292,10 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         getLoopMode,
         inspectNearbyTiles,
         isAtWaypoint,
+        getRouteHealth,
+        getRecoveryHistory,
+        getMovementSummary,
+        clearRouteHealth,
         updateWaypoint,
         mergePresets: mergePresets,
         renamePreset: renamePreset,
@@ -10984,262 +17352,545 @@ window.__minibiaBotBundle.installEquipRingModule = function installEquipRingModu
     const state = {
         running: false,
         timerId: null,
-        lastEquipAt: 0
+        player: null,
+        equipment: null,
+        pending: null,
+        lastEquipAt: 0,
+        lastConfirmedAt: 0,
+        retryAfter: 0,
+        lastSupplyWarningAt: 0,
+        lastFailureWarningAt: 0,
+        lastCountRequestAt: 0,
+        failedAttempts: 0,
+        captureMode: false,
+        captureHandler: null,
     };
     let resumeListenersAttached = false;
-
+    let unsubscribeItemCounts = null;
     const config = Object.assign({
         tickMs: 1000,
         equipCooldownMs: 1500,
-        enabled: false
-    },
-            bot.storage.get(configStorageKey, {}));
-    config.tickMs = 1000;
+        equipConfirmMs: 3500,
+        failedRetryMs: 5000,
+        countRefreshMs: 5000,   // Server-side full-inventory count refresh cadence.
+        countFreshMs: 12000,    // A zero count only blocks equip while this reading is fresh.
+        ringId: 0,              // Client/inventory ID (CID); 0 = any ring.
+        warnMissingRing: false, // Optional, throttled warning; never unequips a ring.
+        enabled: false,
+    }, bot.storage.get(configStorageKey, {}));
 
-    function persistConfig() {
-        bot.storage.set(configStorageKey, {
-            ...config
-        });
+    function normalizeConfig() {
+        config.tickMs = 1000;
+        config.ringId = Number.isSafeInteger(Number(config.ringId)) && Number(config.ringId) > 0
+            && Number(config.ringId) <= 65535 ? Number(config.ringId) : 0;
+        config.equipCooldownMs = Math.max(1000, Math.min(60000, Number(config.equipCooldownMs) || 1500));
+        config.equipConfirmMs = Math.max(1500, Math.min(15000, Number(config.equipConfirmMs) || 3500));
+        config.failedRetryMs = Math.max(3000, Math.min(60000, Number(config.failedRetryMs) || 5000));
+        config.countRefreshMs = Math.max(2000, Math.min(30000, Number(config.countRefreshMs) || 5000));
+        config.countFreshMs = Math.max(config.countRefreshMs, Math.min(60000, Number(config.countFreshMs) || 12000));
+        config.warnMissingRing = config.warnMissingRing === true;
+    }
+    normalizeConfig();
+    function persistConfig() { bot.storage.set(configStorageKey, { ...config }); }
+    function getEquipment() { return window.gameClient?.player?.equipment || null; }
+    function getEquippedRing() { return getEquipment()?.getSlotItem?.(RING_SLOT) || null; }
+    function hasEquippedRing() { return !!getEquippedRing(); }
+    function getHotbarManager() { return window.gameClient?.interface?.hotbarManager || null; }
+
+    function getConfiguredRingSid(ringId = config.ringId) {
+        if (!ringId) return 0;
+        const sid = Number(window.gameClient?.sidByCid?.[ringId]);
+        return Number.isSafeInteger(sid) && sid > 0 ? sid : 0;
+    }
+    function getRingItemConfig(ringId, item = null) {
+        const id = Number(ringId || item?.id || 0);
+        if (!Number.isSafeInteger(id) || id <= 0) return null;
+        const itemSid = Number(item?.sid || 0);
+        return {
+            id,
+            fluidType: Math.max(0, Math.trunc(Number(item?.fluidType) || 0)),
+            sid: itemSid > 0 ? itemSid : getConfiguredRingSid(id),
+        };
+    }
+    function requestSelectedRingCount(now = Date.now(), force = false) {
+        if (!config.ringId || typeof bot.requestItemCounts !== "function") return false;
+        if (!force && now - state.lastCountRequestAt < config.countRefreshMs) return false;
+        state.lastCountRequestAt = now;
+        return !!bot.requestItemCounts([{ id: config.ringId, fluidType: 0 }]);
+    }
+    function getSelectedRingCountState(now = Date.now()) {
+        if (!config.ringId || typeof bot.getItemCountReading !== "function") {
+            return { known: false, fresh: false, count: null, at: 0 };
+        }
+        const reading = bot.getItemCountReading(config.ringId, 0);
+        if (!reading) return { known: false, fresh: false, count: null, at: 0 };
+        const age = Math.max(0, now - Number(reading.at || 0));
+        return {
+            known: true,
+            fresh: age <= config.countFreshMs,
+            count: Math.max(0, Math.trunc(Number(reading.count) || 0)),
+            at: Number(reading.at || 0),
+        };
     }
 
-    function getEquipment() {
-        return window.gameClient?.player?.equipment || null;
+    // Listen to the same HOTBAR_ITEM_COUNT replies that update the native hotbar.
+    // Keep this inside the Equip Ring module so the subscription exists whenever
+    // the module exists, regardless of whether Alert missing ring is enabled.
+    function handleItemCountUpdate(reading) {
+        if (!reading || !config.ringId) return;
+        if (Number(reading.itemId) !== Number(config.ringId)) return;
+        if (Math.max(0, Math.trunc(Number(reading.fluidType) || 0)) !== 0) return;
+
+        if (typeof bot.ui?.refreshEquipRingStatus === "function") {
+            bot.ui.refreshEquipRingStatus();
+        }
     }
-    function getOpenContainers() {
-        return Array.from(window.gameClient?.player?.__openedContainers || []);
+    function attachItemCountListener() {
+        if (unsubscribeItemCounts || typeof bot.subscribeItemCounts !== "function") return;
+        unsubscribeItemCounts = bot.subscribeItemCounts(handleItemCountUpdate);
+    }
+    function detachItemCountListener() {
+        if (!unsubscribeItemCounts) return;
+        try { unsubscribeItemCounts(); } catch (e) {}
+        unsubscribeItemCounts = null;
     }
 
     function getItemDefinition(item) {
-        if (!item)
-            return null;
-        return window.gameClient?.itemDefinitionsBySid?.[item.sid] ||
-        window.gameClient?.itemDefinitions?.[item.id] || null;
+        if (!item) return null;
+        const client = window.gameClient;
+        return client?.itemDefinitionsByCid?.[item.id]
+            || client?.itemDefinitionsBySid?.[item.sid]
+            || client?.itemDefinitions?.[item.id] || null;
     }
-
     function getItemName(item) {
-        const def = getItemDefinition(item);
-        return def?.properties?.name || item?.name || "";
+        return getItemDefinition(item)?.properties?.name || item?.name || "";
     }
-
     function isRingItem(item) {
-        if (!item)
-            return false;
+        if (!item) return false;
         const def = getItemDefinition(item);
-        const slotType = String(def?.properties?.slotType || def?.properties?.slot || "").trim().toLowerCase();
-        if (slotType === "ring")
-            return true;
-        return /\bring\b/i.test(getItemName(item));
+        const slot = String(def?.properties?.slotType || def?.properties?.slot || "").trim().toLowerCase();
+        return slot === "ring" || /\bring\b/i.test(getItemName(item));
     }
-
-    function getEquippedRing() {
-        const eq = getEquipment();
-        return eq?.getSlotItem?.(RING_SLOT) || null;
+    function matchesSelectedRing(item, wantedId = config.ringId) {
+        if (!item) return false;
+        if (!wantedId) return isRingItem(item);
+        if (Number(item.id) === wantedId) return isRingItem(item);
+        // A dormant CID can become a different active CID when the ring is worn.
+        // transformDeEquipTo is a SID: map it back to the inventory CID.
+        const dormantSid = getItemDefinition(item)?.properties?.transformDeEquipTo;
+        const dormant = dormantSid != null
+            ? window.gameClient?.itemDefinitionsBySid?.[dormantSid] : null;
+        return !!dormant && Number(dormant.id) === wantedId && isRingItem(item);
     }
-    function hasEquippedRing() {
-        return !!getEquippedRing();
+    function ringSatisfied(worn) {
+        return config.ringId ? matchesSelectedRing(worn) : !!worn;
     }
-
     function findBestRingSource() {
         const eq = getEquipment();
-        if (!eq)
-            return null;
-        let best = null,
-        bestCount = -1;
-        const consider = (container, slotIndex, item) => {
-            if (!isRingItem(item))
-                return;
-            const count = (typeof item.getCount === "function" ? item.getCount() : item.count) || 1;
-            if (count > bestCount) {
-                bestCount = count;
-                best = {
-                    container,
-                    slotIndex,
-                    item,
-                    count,
-                    name: getItemName(item)
-                };
+        if (!eq) return null;
+        let best = null;
+        let bestCount = -1;
+        // Only open BAGS are sources. Moving from another equipment slot can
+        // flip worn rings back into that slot and spam server ring transforms.
+        for (const container of window.gameClient?.player?.__openedContainers || []) {
+            if (!container?.getSlotItem) continue;
+            const countSlots = container.slots?.length ?? Number(container.size) ?? 0;
+            for (let i = 0; i < countSlots; i++) {
+                const item = container.getSlotItem(i);
+                if (!item || !isRingItem(item)) continue;
+                if (config.ringId && Number(item.id) !== config.ringId) continue;
+                const count = (typeof item.getCount === "function" ? item.getCount() : item.count) || 1;
+                if (count > bestCount) {
+                    bestCount = count;
+                    best = { container, slotIndex: i, item, count, name: getItemName(item) };
+                }
             }
-        };
-        for (let i = 0; i < eq.slots.length; i++) {
-            if (i === RING_SLOT)
-                continue;
-            consider(eq, i, eq.getSlotItem(i));
         }
-        getOpenContainers().forEach(container => {
-            (container?.slots || []).forEach((slot, i) => {
-                consider(container, i, container.getSlotItem(i));
-            });
-        });
         return best;
     }
+    function getOpenedContainerById(containerId) {
+        const wanted = Number(containerId);
+        if (!Number.isFinite(wanted)) return null;
+        for (const container of window.gameClient?.player?.__openedContainers || []) {
+            if (Number(container?.__containerId) === wanted) return container;
+        }
+        return null;
+    }
 
+    // Equipped rings can use a transformed CID. When that happens, save the
+    // normal inventory CID so HotbarManager's server count/equip path can find
+    // the same ring in backpacks later.
+    function getCapturedRingId(item) {
+        if (!isRingItem(item)) return 0;
+        const activeId = Number(item?.id || 0);
+        const dormantSid = Number(getItemDefinition(item)?.properties?.transformDeEquipTo || 0);
+        const dormantDef = dormantSid > 0
+            ? window.gameClient?.itemDefinitionsBySid?.[dormantSid] : null;
+        const capturedId = Number(dormantDef?.id || activeId || 0);
+        return Number.isSafeInteger(capturedId) && capturedId > 0 && capturedId <= 65535
+            ? capturedId : 0;
+    }
+
+    function refreshCaptureUi() {
+        if (typeof bot.ui?.refreshEquipRingStatus === "function")
+            bot.ui.refreshEquipRingStatus();
+    }
+
+    function clearCaptureMode() {
+        if (state.captureHandler) {
+            document.removeEventListener("click", state.captureHandler, true);
+            state.captureHandler = null;
+        }
+        state.captureMode = false;
+        refreshCaptureUi();
+    }
+
+    function startCaptureRing() {
+        if (state.captureMode) {
+            clearCaptureMode();
+            bot.log("Equip Ring: ring ID selection cancelled");
+            return false;
+        }
+
+        state.captureMode = true;
+        bot.log("Equip Ring: click a ring in an open backpack or equipment slot");
+
+        const handler = (event) => {
+            const target = event?.target;
+            const slot = target?.closest?.(".slot[slotindex]");
+            if (!slot) return;
+
+            event.preventDefault();
+            event.stopPropagation();
+
+            let item = null;
+            let source = "unknown";
+            let sourceSlot = -1;
+
+            const containerEl = slot.closest?.("[containerindex]")
+                || slot.closest?.("[containerIndex]");
+            if (containerEl) {
+                const containerId = Number(containerEl.getAttribute("containerindex")
+                    || containerEl.getAttribute("containerIndex"));
+                const container = getOpenedContainerById(containerId);
+                const slotIndex = Number(slot.getAttribute("slotindex"));
+                if (container && Number.isSafeInteger(slotIndex) && slotIndex >= 0) {
+                    item = container.getSlotItem?.(slotIndex) || null;
+                    source = "container";
+                    sourceSlot = slotIndex;
+                }
+            } else {
+                const eq = getEquipment();
+                if (eq?.slots) {
+                    for (let i = 0; i < eq.slots.length; i++) {
+                        const slotEl = eq.slots[i]?.element;
+                        if (slotEl && (slotEl === slot || slotEl.contains?.(slot))) {
+                            item = eq.getSlotItem?.(i) || null;
+                            source = "equipment";
+                            sourceSlot = i;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (!item) {
+                bot.log("Equip Ring: no item found in the selected slot");
+                clearCaptureMode();
+                return;
+            }
+            if (!isRingItem(item)) {
+                bot.log("Equip Ring: selected item is not a ring", { id: item.id });
+                clearCaptureMode();
+                return;
+            }
+
+            const capturedId = getCapturedRingId(item);
+            if (!capturedId) {
+                bot.log("Equip Ring: could not resolve the selected ring ID", { id: item.id });
+                clearCaptureMode();
+                return;
+            }
+
+            const visibleId = Number(item.id || 0);
+            updateConfig({ ringId: capturedId });
+            requestSelectedRingCount(Date.now(), true);
+            bot.log("Equip Ring: captured ring ID", {
+                ringId: capturedId,
+                visibleId,
+                transformed: visibleId !== capturedId,
+                source,
+                slot: sourceSlot,
+            });
+            clearCaptureMode();
+        };
+
+        state.captureHandler = handler;
+        document.addEventListener("click", handler, true);
+        refreshCaptureUi();
+        return true;
+    }
+
+    function syncSession() {
+        const player = window.gameClient?.player || null;
+        const eq = player?.equipment || null;
+        if (state.player !== player || state.equipment !== eq) {
+            state.player = player;
+            state.equipment = eq;
+            state.pending = null;
+            state.lastEquipAt = 0;
+            state.retryAfter = 0;
+            state.failedAttempts = 0;
+            state.lastSupplyWarningAt = 0;
+            state.lastFailureWarningAt = 0;
+            state.lastCountRequestAt = 0;
+        }
+        return eq;
+    }
+    function reconcilePending(now) {
+        const pending = state.pending;
+        if (!pending) return;
+        const worn = getEquippedRing();
+        // Compare with the ID of THAT request, even if the UI changed since.
+        if (matchesSelectedRing(worn, pending.ringId) &&
+                (!pending.ringId ? !!worn : true) &&
+                (pending.ringId || Number(worn?.id) === pending.sourceId ||
+                    worn !== pending.previousWorn)) {
+            state.pending = null;
+            state.retryAfter = 0;
+            state.failedAttempts = 0;
+            state.lastConfirmedAt = now;
+            bot.log("Equip Ring: equipped (confirmed)", { name: pending.name, id: pending.sourceId });
+        } else if (now - pending.at >= config.equipConfirmMs) {
+            state.pending = null;
+            state.failedAttempts = Math.min(1000, state.failedAttempts + 1);
+            state.retryAfter = now + config.failedRetryMs;
+            if (now - state.lastFailureWarningAt >= 60000 || !state.lastFailureWarningAt) {
+                state.lastFailureWarningAt = now;
+                bot.log("Equip Ring: move not confirmed; retrying after cooldown", {
+                    id: pending.sourceId, attempts: state.failedAttempts,
+                });
+            }
+        }
+    }
+    function warnMissing(now, countState = null) {
+        if (!config.warnMissingRing || now - state.lastSupplyWarningAt < 60000) return;
+        // For a configured ring, only call it missing when the SERVER has
+        // recently confirmed a zero count. This includes closed/nested bags.
+        if (config.ringId) {
+            if (!countState?.fresh || countState.count !== 0) return;
+            state.lastSupplyWarningAt = now;
+            bot.log("Equip Ring: server item count is 0", { ringId: config.ringId });
+            return;
+        }
+        state.lastSupplyWarningAt = now;
+        bot.log("Equip Ring: no ring found in open bags", { ringId: "any" });
+    }
     function getGateStatus(now = Date.now()) {
-        const eq = getEquipment();
-        const source = findBestRingSource();
-        const cd = Math.max(0, config.equipCooldownMs - (now - state.lastEquipAt));
+        const eq = syncSession();
+        reconcilePending(now);
+        const worn = getEquippedRing();
+        const satisfied = ringSatisfied(worn);
+        const pending = !!state.pending;
+
+        let source = null;
+        let countState = { known: false, fresh: false, count: null, at: 0 };
+
+        // Keep the selected ring's HotbarManager count current even while the
+        // ring is already equipped. The UI count should describe supply state,
+        // not only whether Equip Ring currently needs to act. Requests remain
+        // rate-limited by requestSelectedRingCount().
+        if (config.ringId) {
+            requestSelectedRingCount(now);
+            countState = getSelectedRingCountState(now);
+        }
+        if (!satisfied && !pending) {
+            source = findBestRingSource();
+        }
+
+        const remaining = Math.max(0,
+            config.equipCooldownMs - (now - state.lastEquipAt), state.retryAfter - now);
+
+        // A fresh server count of zero is authoritative. A positive count means
+        // the ring exists somewhere in the full inventory, including closed
+        // backpacks. Unknown/stale counts do not block the HotbarManager from
+        // trying its own server-side fallback.
+        const available = config.ringId
+            ? !(countState.fresh && countState.count === 0)
+            : !!source;
+
         return {
             hasEquipment: !!eq,
-            hasRingEquipped: hasEquippedRing(),
-            hasRingAvailable: !!source,
-            cooldownReady: cd === 0,
-            cooldownRemainingMs: cd,
+            hasRingEquipped: !!worn,
+            hasSelectedRingEquipped: satisfied,
+            hasRingAvailable: available,
+            serverCountKnown: countState.known,
+            serverCountFresh: countState.fresh,
+            serverCount: countState.count,
+            awaitingConfirmation: pending,
+            cooldownReady: remaining === 0,
+            cooldownRemainingMs: remaining,
             source,
-            canEquip: !!eq && !hasEquippedRing() && !!source && cd === 0,
+            canEquip: !!eq && !satisfied && !pending && available && remaining === 0,
         };
     }
-
-    function canEquipRing(now) {
-        return getGateStatus(now).canEquip;
-    }
+    function canEquipRing(now = Date.now()) { return getGateStatus(now).canEquip; }
     function tryEquipRing(now = Date.now()) {
-        if (!config.enabled || !canEquipRing(now))
+        if (!state.running || !config.enabled) return false;
+        const gate = getGateStatus(now);
+        if (gate.hasEquipment && !gate.hasSelectedRingEquipped &&
+                !gate.awaitingConfirmation && !gate.hasRingAvailable) {
+            warnMissing(now, {
+                known: gate.serverCountKnown, fresh: gate.serverCountFresh, count: gate.serverCount,
+            });
+        }
+        if (!gate.canEquip) return false;
+
+        const hm = getHotbarManager();
+        if (!hm || typeof hm.__handleItemUseWithMode !== "function") {
+            if (now - state.lastFailureWarningAt >= 60000 || !state.lastFailureWarningAt) {
+                state.lastFailureWarningAt = now;
+                bot.log("Equip Ring: HotbarManager equip function is unavailable");
+            }
             return false;
-        const eq = getEquipment();
-        const source = findBestRingSource();
-        if (!eq || !source)
-            return false;
-        const from = {
-            which: source.container,
-            index: source.slotIndex
-        };
-        const to = {
-            which: eq,
-            index: RING_SLOT
-        };
-        const count = source.count || 1;
-        window.gameClient.send(new ItemMovePacket(from, to, count));
+        }
+
+        // If a specific CID is configured we can use the same path as a hotbar
+        // item in mode="ring". HotbarManager first prefers an open-container
+        // ItemMovePacket, then falls back to HotbarUsePacket useMode=4 so the
+        // SERVER can find the ring in closed/nested inventory. For "any ring"
+        // we still need a locally visible source to know which CID to request.
+        const source = gate.source;
+        const requestedId = config.ringId || Number(source?.item?.id || 0);
+        const itemConfig = getRingItemConfig(requestedId, source?.item || null);
+        if (!itemConfig) return false;
+
+        const previousWorn = getEquippedRing();
+        const moved = bot.actions.runShared('equip-ring', bot.actions.priorities.UTILITY, () => {
+            hm.__handleItemUseWithMode(itemConfig, "ring");
+            return true;
+        });
+        if (!moved) return false;
+
         state.lastEquipAt = now;
-        bot.log("equipped ring", {
-            name: source.name,
-            fromContainerId: source.container?.__containerId ?? null,
-            fromSlot: source.slotIndex
+        state.pending = {
+            at: now,
+            ringId: config.ringId,
+            sourceId: itemConfig.id,
+            name: source?.name || getItemDefinition({ id: itemConfig.id, sid: itemConfig.sid })?.properties?.name || "ring",
+            previousWorn,
+        };
+        requestSelectedRingCount(now, true);
+        bot.log("Equip Ring: hotbar equip requested", {
+            name: state.pending.name,
+            id: itemConfig.id,
+            serverCount: gate.serverCount,
         });
         return true;
     }
 
-    // ---- Resume listeners (boilerplate) ----
     function scheduleNextTick() {
-        if (!state.running)
-            return;
-        state.timerId = window.setTimeout(() => tick(), config.tickMs);
+        if (!state.running) return;
+        if (state.timerId != null) window.clearTimeout(state.timerId);
+        state.timerId = window.setTimeout(tick, config.tickMs);
     }
     function runImmediateTick() {
-        if (!state.running)
-            return;
-        if (state.timerId != null) {
-            window.clearTimeout(state.timerId);
-            state.timerId = null;
-        }
+        if (!state.running) return;
+        if (state.timerId != null) window.clearTimeout(state.timerId);
+        state.timerId = null;
         tick();
     }
-    function handleResume() {
-        if (!document.hidden)
-            runImmediateTick();
-    }
-
+    function handleResume() { if (!document.hidden) runImmediateTick(); }
     function attachResumeListeners() {
-        if (resumeListenersAttached)
-            return;
+        if (resumeListenersAttached) return;
         document.addEventListener("visibilitychange", handleResume);
         window.addEventListener("focus", handleResume);
         window.addEventListener("pageshow", handleResume);
         resumeListenersAttached = true;
     }
     function detachResumeListeners() {
-        if (!resumeListenersAttached)
-            return;
+        if (!resumeListenersAttached) return;
         document.removeEventListener("visibilitychange", handleResume);
         window.removeEventListener("focus", handleResume);
         window.removeEventListener("pageshow", handleResume);
         resumeListenersAttached = false;
     }
-
     function tick() {
-        if (!state.running)
-            return;
-        try {
-            tryEquipRing();
-        } catch (e) {
-            bot.log("equip ring tick failed", e?.message || e);
-        } finally {
-            scheduleNextTick();
-        }
+        state.timerId = null;
+        if (!state.running) return;
+        try { tryEquipRing(); }
+        catch (e) { bot.log("Equip Ring: tick failed", e?.message || e); }
+        finally { scheduleNextTick(); }
     }
-
     function start(overrides = {}) {
-        Object.assign(config, overrides, {
-            enabled: true
-        });
-        config.tickMs = 1000;
+        Object.assign(config, overrides, { enabled: true });
+        normalizeConfig();
         persistConfig();
-        if (state.running) {
-            bot.log("equip ring already running");
-            return false;
-        }
+        if (state.running) return false;
         state.running = true;
+        syncSession();
         attachResumeListeners();
-        bot.log("equip ring started", {
-            ...config
-        });
+        requestSelectedRingCount(Date.now(), true);
+        bot.log("Equip Ring started", { ringId: config.ringId || "any" });
         tick();
         return true;
     }
-
     function stop(options = {}) {
-        const shouldPersist = options.persistEnabled !== false;
+        const wasRunning = state.running;
         state.running = false;
-        if (state.timerId != null) {
-            window.clearTimeout(state.timerId);
-            state.timerId = null;
-        }
+        state.pending = null;
+        clearCaptureMode();
+        if (state.timerId != null) window.clearTimeout(state.timerId);
+        state.timerId = null;
         detachResumeListeners();
-        if (shouldPersist) {
+        if (options.persistEnabled !== false) {
             config.enabled = false;
             persistConfig();
         }
-        bot.log("equip ring stopped");
-        return true;
+        if (wasRunning) bot.log("Equip Ring stopped");
+        return wasRunning;
     }
-
     function status() {
+        const gates = getGateStatus();
         return {
             running: state.running,
-            config: {
-                ...config
-            },
-            gates: getGateStatus(),
+            config: { ...config },
+            gates,
             equippedRing: getEquippedRing(),
             lastEquipAt: state.lastEquipAt,
+            lastConfirmedAt: state.lastConfirmedAt,
+            failedAttempts: state.failedAttempts,
+            selectingRing: state.captureMode,
         };
     }
-
     function updateConfig(nextConfig = {}) {
+        const oldId = config.ringId;
         Object.assign(config, nextConfig);
-        config.tickMs = 1000;
+        normalizeConfig();
+        if (config.ringId !== oldId) {
+            state.pending = null;
+            state.lastEquipAt = 0;
+            state.retryAfter = 0;
+            state.failedAttempts = 0;
+            state.lastSupplyWarningAt = 0;
+            state.lastCountRequestAt = 0;
+            if (config.ringId) requestSelectedRingCount(Date.now(), true);
+        }
         persistConfig();
-        bot.log("equip ring config updated", {
-            ...config
-        });
-        return {
-            ...config
-        };
+        return { ...config };
     }
-
-    if (config.enabled)
-        start();
-
+    attachItemCountListener();
+    bot.addCleanup(() => {
+        stop({ persistEnabled: false });
+        detachItemCountListener();
+    });
+    if (config.enabled) start();
     bot.equipRing = {
-        start,
-        stop,
-        status,
-        updateConfig,
-        config,
-        getEquippedRing,
-        hasEquippedRing,
-        findBestRingSource,
-        getGateStatus,
-        canEquipRing,
-        tryEquipRing,
+        start, stop, status, updateConfig, config,
+        getEquippedRing, hasEquippedRing, findBestRingSource,
+        getSelectedRingCountState, requestSelectedRingCount,
+        getGateStatus, canEquipRing, tryEquipRing,
+        startCaptureRing, clearCaptureMode,
     };
 };
 
@@ -11383,7 +18034,8 @@ window.__minibiaBotBundle.installAutoEatModule = function installAutoEatModule(b
             bot.log("Eat: invalid hotbar slot", config.eatHotbarSlot);
             return false;
         }
-        const clicked = bot.clickHotbar(slot - 1);
+        const clicked = bot.actions.runShared('auto-eat',
+            bot.actions.priorities.UTILITY, () => bot.clickHotbar(slot - 1));
         if (clicked) {
             state.lastFoodAt = Date.now();
             bot.log("used eat hotkey", {
@@ -12442,6 +19094,8 @@ window.__minibiaBotBundle.installExoriModule = function installExoriModule(bot) 
         running: false,
         timerId: null,
         lastCastAt: 0,
+        lastBlockedReason: null,
+        targetingBlockedTicks: 0,
     };
 
     const config = Object.assign({
@@ -12451,6 +19105,8 @@ window.__minibiaBotBundle.installExoriModule = function installExoriModule(bot) 
         cooldownMs: 5000,
         monsterCount: 3,
         range: 1,
+        playerProximityCheck: false,
+        playerProximityDistance: 3,
     }, bot.storage.get(configStorageKey, {}));
 
     function persistConfig() {
@@ -12461,6 +19117,31 @@ window.__minibiaBotBundle.installExoriModule = function installExoriModule(bot) 
             cooldownMs: config.cooldownMs,
             monsterCount: config.monsterCount,
             range: config.range,
+            playerProximityCheck: config.playerProximityCheck,
+            playerProximityDistance: config.playerProximityDistance,
+        });
+    }
+
+    function isTargetingRunning() {
+        // Exori is a Targeting sub-feature. Its own checkbox "arms" it, but
+        // actual casting is allowed only while Targeting is running.
+        return bot.attack?.isRunning?.() === true;
+    }
+
+    // Only scan other players when enabled; X-Ray already excludes our own character.
+    function hasPlayerTooClose() {
+        if (config.playerProximityCheck !== true) return false;
+        const me = bot.getPlayerPosition();
+        if (!me) return true; // Avoid an unsafe AoE cast if position is unavailable.
+        const radius = Math.max(1, Math.min(10, Number(config.playerProximityDistance) || 3));
+        const myId = window.gameClient?.player?.id;
+        const players = bot.xray?.getVisiblePlayers?.({ sameFloorOnly: true });
+        if (!players) return true; // Cannot confirm the area is clear.
+        return players.some(player => {
+            if (!player || player.id === myId) return false;
+            const pos = player.__position || player.getPosition?.();
+            if (!pos || pos.z !== me.z) return false;
+            return Math.abs(pos.x - me.x) <= radius && Math.abs(pos.y - me.y) <= radius;
         });
     }
 
@@ -12468,9 +19149,14 @@ window.__minibiaBotBundle.installExoriModule = function installExoriModule(bot) 
         const me = bot.getPlayerPosition();
         if (!me)
             return [];
-        const monsters = bot.xray?.getVisibleMonsters?.({
-            sameFloorOnly: true
-        }) || [];
+
+        // Reuse Targeting's native monster filter when available. That filter
+        // already rejects players/NPC-like creatures, dead monsters, our own
+        // summon, wrong-floor creatures and things outside native visibility.
+        const monsters = bot.attack?.getNearbyMonsters?.(false) ||
+            bot.xray?.getVisibleMonsters?.({ sameFloorOnly: true }) ||
+            [];
+
         return monsters.filter(m => {
             const pos = m.__position || m.getPosition?.();
             if (!pos)
@@ -12482,21 +19168,60 @@ window.__minibiaBotBundle.installExoriModule = function installExoriModule(bot) 
     }
 
     function canCast(now) {
-        if (now - state.lastCastAt < config.cooldownMs)
+        if (!isTargetingRunning()) {
+            state.lastBlockedReason = "targeting off";
             return false;
+        }
+        if (bot.attack?.isProtectionZoneBlocked?.(now)) {
+            state.lastBlockedReason = "protection zone";
+            return false;
+        }
+        if (bot.attack?.isLureActive?.()) {
+            state.lastBlockedReason = "luring";
+            return false;
+        }
+        if (now - state.lastCastAt < config.cooldownMs) {
+            state.lastBlockedReason = "cooldown";
+            return false;
+        }
+        if (hasPlayerTooClose()) {
+            state.lastBlockedReason = "player nearby";
+            return false;
+        }
         const mana = bot.mana();
-        if (mana == null || mana < config.manaCost)
+        if (mana == null || mana < config.manaCost) {
+            state.lastBlockedReason = "mana";
             return false;
+        }
         const nearby = getMonstersInRange();
-        return nearby.length >= config.monsterCount;
+        if (nearby.length < config.monsterCount) {
+            state.lastBlockedReason = "not enough monsters";
+            return false;
+        }
+        state.lastBlockedReason = null;
+        return true;
     }
 
     function tryCast(now) {
         if (!config.enabled || !state.running)
             return false;
+        if (!isTargetingRunning()) {
+            state.lastBlockedReason = "targeting off";
+            state.targetingBlockedTicks++;
+            return false;
+        }
+        if (bot.attack?.isProtectionZoneBlocked?.(now)) {
+            state.lastBlockedReason = "protection zone";
+            return false;
+        }
+        if (bot.attack?.isLureActive?.()) {
+            state.lastBlockedReason = "luring";
+            return false;
+        }
         if (!canCast(now))
             return false;
-        const sent = bot.sendChat(config.spellWords);
+        const sent = bot.actions.runShared('exori',
+            bot.actions.priorities.COMBAT, () => bot.sendChat(config.spellWords));
         if (sent) {
             state.lastCastAt = now;
             bot.log(`Exori cast (${getMonstersInRange().length} monsters nearby, mana ${bot.mana()})`);
@@ -12529,7 +19254,9 @@ window.__minibiaBotBundle.installExoriModule = function installExoriModule(bot) 
         persistConfig();
         state.running = true;
         state.lastCastAt = 0;
-        bot.log("Exori enabled");
+        bot.log(isTargetingRunning()
+            ? "Exori enabled"
+            : "Exori armed (waiting for Targeting)");
         tick();
         return true;
     }
@@ -12543,6 +19270,7 @@ window.__minibiaBotBundle.installExoriModule = function installExoriModule(bot) 
             state.timerId = null;
         }
         config.enabled = false;
+        state.lastBlockedReason = null;
         persistConfig();
         bot.log("Exori disabled");
         return true;
@@ -12550,12 +19278,16 @@ window.__minibiaBotBundle.installExoriModule = function installExoriModule(bot) 
 
     function status() {
         const now = Date.now();
+        const targetingRunning = isTargetingRunning();
         const nearby = getMonstersInRange();
         const mana = bot.mana();
         const ready = canCast(now);
         const cooldownRemaining = Math.max(0, config.cooldownMs - (now - state.lastCastAt));
         return {
-            running: state.running,
+            // "running" means Exori is actually allowed to operate now.
+            running: state.running && config.enabled && targetingRunning,
+            armed: state.running && config.enabled,
+            targetingRunning,
             config: {
                 ...config
             },
@@ -12564,11 +19296,15 @@ window.__minibiaBotBundle.installExoriModule = function installExoriModule(bot) 
             ready: ready,
             cooldownRemaining: cooldownRemaining,
             lastCastAt: state.lastCastAt,
+            lastBlockedReason: state.lastBlockedReason,
+            targetingBlockedTicks: state.targetingBlockedTicks,
         };
     }
 
     function updateConfig(next) {
         Object.assign(config, next);
+        config.playerProximityCheck = config.playerProximityCheck === true;
+        config.playerProximityDistance = Math.max(1, Math.min(10, Number(config.playerProximityDistance) || 3));
         persistConfig();
         return {
             ...config
@@ -13713,6 +20449,14 @@ window.__minibiaBotBundle.installNotificationModule = function installNotificati
         return orig.playMessageAlarm.call(this);
     };
 
+    bot.addCleanup(() => {
+        for (const { element, timer } of activeNotifications.values()) {
+            clearTimeout(timer);
+            element.remove();
+        }
+        activeNotifications.clear();
+        // Timers from a previous bot instance must not keep its DOM and closures alive.
+    });
     bot.log('Notification system updated – top-right, 15s, one per type.');
 };
 
@@ -13863,8 +20607,13 @@ window.__minibiaBotBundle.installMovementPatch = function installMovementPatch(b
                 },
                 set(value) {
                     targetValue = value;
-                    if (value !== null && value !== undefined) {
-                        // Target acquired – cancel autowalk immediately
+                    if (
+                        value !== null &&
+                        value !== undefined &&
+                        bot.attack?.isLureActive?.() !== true
+                    ) {
+                        // Normal combat owns movement. During Lure Mode the
+                        // target is attack-only and CaveBot keeps autowalking.
                         stopMovement(client);
                     }
                 }
@@ -13890,7 +20639,10 @@ window.__minibiaBotBundle.installMovementPatch = function installMovementPatch(b
 
                 // Block autowalk packets only if a valid target exists (alive, on screen)
                 if (packetName === "AutoWalkPacket" || packetName === "WalkToDestinationPacket") {
-                    if (hasValidTarget(client)) {
+                    if (
+                        hasValidTarget(client) &&
+                        bot.attack?.isLureActive?.() !== true
+                    ) {
                         //bot.log(`${TAG} blocked ${packetName} (valid target active)`);
                         return false; // drop the packet
                     }
@@ -14825,7 +21577,12 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
         const count = source.item.count || 1;
         try {
             if (window.gameClient?.send) {
-                window.gameClient.send(new ItemMovePacket(from, to, count));
+                const sent = bot.actions.runShared('paladin-equip',
+                    bot.actions.priorities.UTILITY, () => {
+                        window.gameClient.send(new ItemMovePacket(from, to, count));
+                        return true;
+                    });
+                if (!sent) return false;
                 state.lastEquipAt = Date.now();
                 bot.log("Paladin: equipped weapon (moved from slot " + source.slot + " to left hand)", {
                     weaponId
@@ -14937,7 +21694,8 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
 
         // High mana spell
         if (manaPercent > config.highManaThreshold && config.highManaSpellWords) {
-            const sent = bot.sendChat(config.highManaSpellWords.trim());
+            const sent = bot.actions.runShared('paladin-high-mana',
+                bot.actions.priorities.UTILITY, () => bot.sendChat(config.highManaSpellWords.trim()));
             if (sent)
                 return true;
         }
@@ -14945,7 +21703,8 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
         // Craft ammo
         if (ammo <= config.ammoThreshold) {
             if (stats.mana.current >= config.craftManaCost && config.craftSpellWords) {
-                const sent = bot.sendChat(config.craftSpellWords.trim());
+                const sent = bot.actions.runShared('paladin-craft',
+                    bot.actions.priorities.UTILITY, () => bot.sendChat(config.craftSpellWords.trim()));
                 if (sent) {
                     bot.log("Paladin: crafted ammo", {
                         ammo,
@@ -15190,6 +21949,9 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         destinationTitle: null,
         trackedItems: new Map(),
         captureMode: false,
+        captureHandler: null,
+        pendingMove: null,
+        lastFullLogAt: 0,
     };
 
     // Load config
@@ -15285,8 +22047,12 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         return -1;
     }
 
+    // One outstanding inventory move at a time. Containers update asynchronously;
+    // re-sending every slot before acknowledgement can duplicate requests and
+    // repeatedly target the same empty destination slot.
     function moveItems() {
-        if (!state.running)
+        if (!state.running || bot.actions?.isHalted?.() ||
+            bot.autoPickup?.isBusy?.())
             return false;
         const dest = getDestinationContainer();
         if (!dest) {
@@ -15294,60 +22060,79 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                 state._lastDestLog = Date.now();
                 bot.log("Looter: no destination container found. Make sure it's open and selected.");
             }
+            state.pendingMove = null;
             return false;
         }
 
-        const containers = getContainersArray();
-        let moved = 0;
+        const now = Date.now();
+        if (state.pendingMove) {
+            const pending = state.pendingMove;
+            const source = getContainerById(pending.sourceId);
+            const item = source?.getSlotItem?.(pending.slot);
+            const destination = getContainerById(pending.destId);
+            const targetItem = destination?.getSlotItem?.(pending.targetSlot);
+            if (!source || !destination || source.__containerId === destination.__containerId) {
+                state.pendingMove = null;
+                return false;
+            }
+            // Any observed change means the client is catching up: wait for the next tick
+            // before looking for another item. No optimistic source-slot reuse.
+            if (!item || item.id !== pending.itemId || item.count !== pending.count) {
+                state.pendingMove = null;
+                return false;
+            }
+            // Destination can update before source: do not re-send from a stale
+            // source slot while the server is still synchronizing containers.
+            if (targetItem && now - pending.at < 5000) return false;
+            if (now - pending.at < 3000) return false;
+            state.pendingMove = null;
+        }
 
+        const containers = getContainersArray();
         for (const container of containers) {
-            if (container.__containerId === dest.__containerId)
-                continue;
+            if (container.__containerId === dest.__containerId) continue;
             for (let slot = 0; slot < container.size; slot++) {
                 const item = container.getSlotItem(slot);
-                if (!item)
-                    continue;
-                if (!state.trackedItems.has(item.id))
-                    continue;
-
+                if (!item || !state.trackedItems.has(item.id)) continue;
                 const targetSlot = findEmptySlot(dest);
                 if (targetSlot === -1) {
-                    bot.log("Looter: destination container full");
-                    return moved > 0;
-                }
-
-                try {
-                    if (window.gameClient?.mouse?.sendItemMove) {
-                        window.gameClient.mouse.sendItemMove({
-                            which: container,
-                            index: slot
-                        }, {
-                            which: dest,
-                            index: targetSlot
-                        },
-                            item.count);
-                    } else if (window.gameClient?.send) {
-                        const from = {
-                            which: container,
-                            index: slot
-                        };
-                        const to = {
-                            which: dest,
-                            index: targetSlot
-                        };
-                        window.gameClient.send(new ItemMovePacket(from, to, item.count));
+                    if (now - state.lastFullLogAt > 30000) {
+                        state.lastFullLogAt = now;
+                        bot.log("Looter: destination container full");
                     }
-                    moved++;
+                    return false;
+                }
+                if (!window.gameClient?.mouse?.sendItemMove &&
+                    !window.gameClient?.send) return false;
+                let sent = false;
+                try {
+                    const sendMove = () => {
+                        const from = { which: container, index: slot };
+                        const to = { which: dest, index: targetSlot };
+                        if (window.gameClient?.mouse?.sendItemMove) {
+                            window.gameClient.mouse.sendItemMove(from, to, item.count);
+                        } else {
+                            window.gameClient.send(new ItemMovePacket(from, to, item.count));
+                        }
+                        return true;
+                    };
+                    sent = bot.actions?.runShared
+                        ? bot.actions.runShared('looter-move', bot.actions.priorities.UTILITY, sendMove)
+                        : sendMove();
                 } catch (e) {
                     bot.log("Looter: move failed", e);
+                    return false;
                 }
+                if (!sent) return false;
+                state.pendingMove = {
+                    sourceId: container.__containerId, slot,
+                    itemId: item.id, count: item.count,
+                    destId: dest.__containerId, targetSlot, at: now
+                };
+                return true; // Wait for server/container update before the next move.
             }
         }
-
-        if (moved > 0) {
-            bot.log("Looter: moved", moved, "items");
-        }
-        return moved > 0;
+        return false;
     }
 
     function tick() {
@@ -15365,20 +22150,35 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
     function scheduleNextTick() {
         if (!state.running)
             return;
-        state.timerId = window.setTimeout(tick, 1000);
+        if (state.timerId !== null) window.clearTimeout(state.timerId);
+        state.timerId = window.setTimeout(() => {
+            state.timerId = null;
+            tick();
+        }, 1000);
     }
 
     function start() {
         if (state.running)
             return false;
         state.running = true;
+        state.pendingMove = null;
         bot.log("Looter started");
         tick();
         return true;
     }
 
+    function clearCaptureMode() {
+        if (state.captureHandler) {
+            document.removeEventListener("click", state.captureHandler, true);
+            state.captureHandler = null;
+        }
+        state.captureMode = false;
+    }
+
     function stop() {
         state.running = false;
+        state.pendingMove = null;
+        clearCaptureMode();
         if (state.timerId != null) {
             window.clearTimeout(state.timerId);
             state.timerId = null;
@@ -15406,6 +22206,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         if (Array.isArray(next.trackedItems)) {
             state.trackedItems = new Map(next.trackedItems);
         }
+        state.pendingMove = null;
         persistConfig();
         return {
             destinationId: state.destinationId,
@@ -15431,8 +22232,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             const containerEl = slot.closest("[containerindex]");
             if (!containerEl) {
                 bot.log("Looter: not in a container");
-                state.captureMode = false;
-                document.removeEventListener("click", handler, true);
+                clearCaptureMode();
                 return;
             }
 
@@ -15445,8 +22245,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                 // Debug: list available container IDs
                 const available = getContainersArray().map(c => c.__containerId);
                 bot.log("Available containers:", available);
-                state.captureMode = false;
-                document.removeEventListener("click", handler, true);
+                clearCaptureMode();
                 return;
             }
 
@@ -15454,8 +22253,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             const item = container.getSlotItem(slotIndex);
             if (!item) {
                 bot.log("Looter: no item in slot");
-                state.captureMode = false;
-                document.removeEventListener("click", handler, true);
+                clearCaptureMode();
                 return;
             }
 
@@ -15466,12 +22264,12 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                 id: item.id,
                 name: itemName
             });
-            state.captureMode = false;
-            document.removeEventListener("click", handler, true);
+            clearCaptureMode();
             if (typeof bot.ui?.refreshLooterStatus === "function")
                 bot.ui.refreshLooterStatus();
         };
 
+        state.captureHandler = handler;
         document.addEventListener("click", handler, true);
     }
 
@@ -15498,8 +22296,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                 // Debug: list available container IDs
                 const available = getContainersArray().map(c => c.__containerId);
                 bot.log("Available containers:", available);
-                state.captureMode = false;
-                document.removeEventListener("click", handler, true);
+                clearCaptureMode();
                 return;
             }
 
@@ -15510,12 +22307,12 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                 containerId,
                 title: state.destinationTitle
             });
-            state.captureMode = false;
-            document.removeEventListener("click", handler, true);
+            clearCaptureMode();
             if (typeof bot.ui?.refreshLooterStatus === "function")
                 bot.ui.refreshLooterStatus();
         };
 
+        state.captureHandler = handler;
         document.addEventListener("click", handler, true);
     }
 
@@ -15529,6 +22326,9 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         }
         return false;
     }
+
+    // Covers UI capture listeners even if Looter was never started.
+    bot.addCleanup(() => stop());
 
     // ---- Public API ----
     bot.looter = {
@@ -15550,166 +22350,144 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
 window.__minibiaBotBundle.installPinkSkullDetectorModule = function installPinkSkullDetectorModule(bot) {
     const configStorageKey = "minibiaBot.pinkSkull.config";
     let checkInterval = null;
+    let triggered = false;
+    const PINK_SKULL_VALUE = 6; // Confirmed for this client build.
 
-    const config = Object.assign({
-        enabled: false
-    },
-            bot.storage.get(configStorageKey, {}));
+    const config = Object.assign({ enabled: false }, bot.storage.get(configStorageKey, {}));
 
     function persistConfig() {
-        bot.storage.set(configStorageKey, {
-            ...config
-        });
+        bot.storage.set(configStorageKey, { ...config });
     }
 
-    function getPinkSkullValue() {
-        // Attempt to get the pink skull constant from CONST.SKULL
-        if (typeof CONST !== 'undefined' && CONST.SKULL && typeof CONST.SKULL.PINK !== 'undefined') {
-            return CONST.SKULL.PINK;
+    // DOM fallback: this client renders pink skulls with hue-rotate(280deg).
+    function isPinkViaDom(player) {
+        try {
+            const ce = player?.characterElement;
+            const root = (ce?.element instanceof Element) ? ce.element
+                : (ce instanceof Element) ? ce
+                : document.getElementById('character-element-prototype');
+            if (!root) return false;
+            const skullIcon = root.querySelector('.skull-icon');
+            if (!skullIcon) return false;
+            const computed = window.getComputedStyle(skullIcon);
+            if (computed.display === 'none' ||
+                computed.visibility === 'hidden' ||
+                Number(computed.opacity || 1) === 0) return false;
+            const hueMatch = (computed.filter || '').match(/hue-rotate\(\s*(-?\d+(?:\.\d+)?)deg\s*\)/i);
+            if (!hueMatch) return false;
+            const hue = ((Number(hueMatch[1]) % 360) + 360) % 360;
+            return Math.abs(hue - 280) <= 15;
+        } catch (e) {
+            return false;
         }
-        // Fallback: numeric value from common OTC implementations (often 4)
-        return 4;
+    }
+
+    function isPlayerPinkSkull(player) {
+        if (player?.skull === PINK_SKULL_VALUE)
+            return { detected: true, method: `player.skull=${PINK_SKULL_VALUE}` };
+        if (isPinkViaDom(player))
+            return { detected: true, method: "DOM hue-rotate(280deg)" };
+        return { detected: false, method: null };
+    }
+
+    function clearCheckInterval() {
+        if (checkInterval !== null) {
+            clearInterval(checkInterval);
+            checkInterval = null;
+        }
     }
 
     function checkSkull() {
-        if (!config.enabled)
-            return;
-
+        if (!config.enabled || triggered) return;
         const player = window.gameClient?.player;
-        if (!player)
-            return;
+        if (!player) return;
+        const result = isPlayerPinkSkull(player);
+        if (!result.detected) return;
 
-        const pink = getPinkSkullValue();
-        if (player.skull === pink) {
-            bot.log("PINK SKULL DETECTED! Disconnecting...");
-            bot.playAlarm?.();
+        // Latch and turn off the timer FIRST: no duplicate alarms or logouts.
+        triggered = true;
+        bot.actions?.halt?.(); // Block participating actions before module shutdown.
+        clearCheckInterval();
+        config.enabled = false;
+        try { persistConfig(); } catch (e) { bot.log("Pink Skull config save failed:", e); }
+        bot.log(`PINK SKULL DETECTED via ${result.method}! Disconnecting...`);
+        try { bot.playAlarm?.(); } catch (e) { bot.log("Pink Skull alarm failed:", e); }
 
-            // Stop all modules (like panic does)
-            if (bot.cave?.stop)
-                bot.cave.stop({
-                    persistEnabled: false
-                });
-            if (bot.attack?.stop)
-                bot.attack.stop({
-                    persistEnabled: false
-                });
-            if (bot.rune?.stop)
-                bot.rune.stop({
-                    persistEnabled: false
-                });
-            if (bot.heal?.stop)
-                bot.heal.stop({
-                    persistEnabled: false
-                });
-            if (bot.invisible?.stop)
-                bot.invisible.stop({
-                    persistEnabled: false
-                });
-            if (bot.magicShield?.stop)
-                bot.magicShield.stop({
-                    persistEnabled: false
-                });
-            if (bot.equipRing?.stop)
-                bot.equipRing.stop({
-                    persistEnabled: false
-                });
-            if (bot.eat?.stop)
-                bot.eat.stop({
-                    persistEnabled: false
-                });
-            if (bot.paladin?.stop)
-                bot.paladin.stop({
-                    persistEnabled: false
-                });
-            if (bot.looter?.stop)
-                bot.looter.stop({
-                    persistEnabled: false
-                });
+        // Prevent auto-reconnect from immediately undoing the safety logout.
+        try { bot.reconnect?.disable?.(); } catch (e) { bot.log("Auto-reconnect disable failed:", e); }
 
-            // Disconnect
-            try {
-                if (window.gameClient && typeof window.gameClient.disconnect === 'function') {
-                    window.gameClient.disconnect();
-                    bot.log("Game client disconnected.");
-                } else {
-                    bot.log("Could not disconnect: gameClient.disconnect not available.");
-                }
-            } catch (e) {
-                bot.log("Disconnect failed:", e);
+        // Module errors must never prevent the disconnect. Preserve enabled
+        // preferences so that a deliberate reload does not silently erase them.
+        for (const name of ["autoPickup", "cave", "attack", "rune", "heal", "invisible", "magicShield",
+                            "equipRing", "eat", "paladin", "looter"]) {
+            try { bot[name]?.stop?.({ persistEnabled: false }); }
+            catch (e) { bot.log(`Pink Skull: failed to stop ${name}:`, e); }
+        }
+
+        try {
+            if (typeof window.gameClient?.disconnect === 'function') {
+                window.gameClient.disconnect();
+                bot.log("Game client disconnected.");
+            } else {
+                bot.log("Could not disconnect: gameClient.disconnect not available.");
             }
-
-            // Disable the detector to prevent repeated triggers
-            config.enabled = false;
-            persistConfig();
-            if (checkInterval) {
-                clearInterval(checkInterval);
-                checkInterval = null;
-            }
-            // Update UI toggle
-            if (typeof bot.ui?.refreshPinkSkullStatus === 'function') {
-                bot.ui.refreshPinkSkullStatus();
-            }
+        } catch (e) {
+            bot.log("Disconnect failed:", e);
+        } finally {
+            try { bot.ui?.refreshPinkSkullStatus?.(); } catch (e) {}
         }
     }
 
     function start() {
-        if (config.enabled)
-            return false;
-        config.enabled = true;
-        persistConfig();
-        if (checkInterval)
-            clearInterval(checkInterval);
+        if (triggered || checkInterval !== null) return false;
+        if (!config.enabled) {
+            config.enabled = true;
+            persistConfig();
+        }
+        // Also starts correctly when config.enabled was restored from storage.
         checkInterval = setInterval(checkSkull, 1000);
         bot.log("Pink Skull Detector enabled");
+        checkSkull(); // Detect an already-active pink skull without waiting 1 second.
         return true;
     }
 
     function stop() {
-        if (!config.enabled)
-            return false;
+        if (!config.enabled && checkInterval === null) return false;
         config.enabled = false;
+        clearCheckInterval();
         persistConfig();
-        if (checkInterval) {
-            clearInterval(checkInterval);
-            checkInterval = null;
-        }
         bot.log("Pink Skull Detector disabled");
         return true;
     }
 
     function status() {
-        return {
-            running: config.enabled,
-            config: {
-                ...config
-            },
-            profiles: bot.profiles?.list?.() || [],
-        };
+        return { running: config.enabled && checkInterval !== null && !triggered,
+                 config: { ...config } };
     }
 
-    function updateConfig(next) {
+    function updateConfig(next = {}) {
         if (next.enabled !== undefined) {
-            if (next.enabled)
-                start();
-            else
-                stop();
+            if (next.enabled) start();
+            else stop();
         }
-        return {
-            ...config
-        };
+        return { ...config };
     }
 
-    // Auto-start if enabled
-    if (config.enabled) {
-        start();
-    }
+    // Timer is owned by this bot instance, not by the global page lifetime.
+    bot.addCleanup(() => { clearCheckInterval(); triggered = true; });
+    if (config.enabled) start();
 
     bot.pinkSkull = {
-        start,
-        stop,
-        status,
-        updateConfig,
-        config,
+        start, stop, status, updateConfig, config,
+        _debugState: () => {
+            const p = window.gameClient?.player;
+            return {
+                playerSkull: p?.skull,
+                pinkValue: PINK_SKULL_VALUE,
+                domPink: p ? isPinkViaDom(p) : null,
+                detected: p ? isPlayerPinkSkull(p) : null,
+            };
+        },
     };
 };
 
@@ -17411,7 +24189,8 @@ window.__minibiaBotBundle.installSupportModule = function installSupportModule(b
 
     function castSio(targetName) {
         if (!targetName) return false;
-        const sent = bot.sendChat("exura sio " + targetName);
+        const sent = bot.actions.runShared('support-sio',
+            bot.actions.priorities.SUPPORT, () => bot.sendChat("exura sio " + targetName));
         if (sent) logDebug(`Cast exura sio on ${targetName}`);
         return sent;
     }
@@ -17472,7 +24251,8 @@ window.__minibiaBotBundle.installSupportModule = function installSupportModule(b
 
         state.actionInProgress = true;
         try {
-            const success = useItemOnCreature(source, current.id);
+            const success = bot.actions.runShared('support-rune',
+                bot.actions.priorities.SUPPORT, () => useItemOnCreature(source, current.id));
             if (success) {
                 state.lastRuneHealAt[key] = now;
                 logDebug(`Rune CID ${config.runeItemId} -> ${name} (HP ${hpPercent.toFixed(0)}%)`);
@@ -17722,7 +24502,7 @@ function upgradeSectionHeaders(panel) {
             {
                 key: "cave",
                 btnId: "minibia-bot-status-cave-toggle",
-                isRunning: () => !!bot.cave?.status?.().running,
+                isRunning: () => !!bot.cave?.isRunning?.(),
                 start: () => bot.cave?.start?.(),
                 stop:  () => bot.cave?.stop?.(),
             },
@@ -17965,9 +24745,9 @@ function upgradeSectionHeaders(panel) {
         const spell = document.getElementById("minibia-bot-heal-spell")?.value.trim() || "";
         const manaCost = parseInt(document.getElementById("minibia-bot-heal-manacost")?.value || "0", 10) || 0;
         const minHp = parseInt(document.getElementById("minibia-bot-heal-minhp")?.value || "0", 10) || 0;
-        const maxHp = parseInt(document.getElementById("minibia-bot-heal-maxhp")?.value || "100", 10) || 100;
+        const maxHp = parseInt(document.getElementById("minibia-bot-heal-maxhp")?.value ?? "100", 10);
         const minMana = parseInt(document.getElementById("minibia-bot-heal-minmana")?.value || "0", 10) || 0;
-        const maxMana = parseInt(document.getElementById("minibia-bot-heal-maxmana")?.value || "100", 10) || 100;
+        const maxMana = parseInt(document.getElementById("minibia-bot-heal-maxmana")?.value ?? "100", 10);
         return {
             slot,
             spellWords: spell,
@@ -18145,10 +24925,19 @@ function upgradeSectionHeaders(panel) {
             melee: document.getElementById("minibia-bot-auto-attack-melee"),
             hotkey: document.getElementById("minibia-bot-auto-attack-hotkey"),
             runeHotkey: document.getElementById("minibia-bot-auto-attack-rune-hotkey"),
+            runeCount: document.getElementById("minibia-bot-auto-attack-rune-count"),
             maxDist: document.getElementById("minibia-bot-auto-attack-maxdist"),
             antiKS: document.getElementById("minibia-bot-auto-attack-antiks"),
             antiKSSelf: document.getElementById("minibia-bot-auto-attack-antiks-self"),
             antiKSOther: document.getElementById("minibia-bot-auto-attack-antiks-other"),
+            lure: document.getElementById("minibia-bot-auto-attack-lure"),
+            lureCount: document.getElementById("minibia-bot-auto-attack-lure-count"),
+            lureRadius: document.getElementById("minibia-bot-auto-attack-lure-radius"),
+            lureSmart: document.getElementById("minibia-bot-auto-attack-lure-smart"),
+            lurePreserveHp: document.getElementById("minibia-bot-auto-attack-lure-preserve-hp"),
+            lureLastHp: document.getElementById("minibia-bot-auto-attack-lure-last-hp"),
+            lureLastMode: document.getElementById("minibia-bot-auto-attack-lure-last-mode"),
+            lureStatus: document.getElementById("minibia-bot-auto-attack-lure-status"),
         };
         const kiteToggle = document.getElementById("minibia-bot-auto-attack-kite");
         const idealDistInput = document.getElementById("minibia-bot-auto-attack-ideal-dist");
@@ -18171,6 +24960,18 @@ function upgradeSectionHeaders(panel) {
         if (inputs.runeHotkey && document.activeElement !== inputs.runeHotkey) {
             inputs.runeHotkey.value = attackConfig.runeHotbarSlot ? String(attackConfig.runeHotbarSlot) : "";
         }
+        if (inputs.runeCount) {
+            if (!attackConfig.runeHotbarSlot || !status?.runeItemId) {
+                inputs.runeCount.textContent = "";
+                inputs.runeCount.title = attackConfig.runeHotbarSlot ? "The selected hotbar slot is not bound to an item." : "Set a rune hotbar slot to show supply.";
+            } else if (status.runeItemCount !== null && status.runeItemCount !== undefined) {
+                inputs.runeCount.textContent = `×${status.runeItemCount}`;
+                inputs.runeCount.title = `Server inventory count for rune CID ${status.runeItemId}${status.runeItemCountFresh ? "" : " (stale)"}.`;
+            } else {
+                inputs.runeCount.textContent = "×?";
+                inputs.runeCount.title = `Waiting for server inventory count for rune CID ${status.runeItemId}.`;
+            }
+        }
         if (inputs.maxDist && document.activeElement !== inputs.maxDist) {
             inputs.maxDist.value = attackConfig.maxTargetDistance ?? 5;
         }
@@ -18181,6 +24982,81 @@ function upgradeSectionHeaders(panel) {
         }
         if (inputs.antiKSOther && document.activeElement !== inputs.antiKSOther) {
             inputs.antiKSOther.value = attackConfig.antiKSOtherRange ?? 2;
+        }
+        if (inputs.lure)
+            inputs.lure.checked = attackConfig.lureMode === true;
+        if (inputs.lureCount && document.activeElement !== inputs.lureCount) {
+            inputs.lureCount.value = attackConfig.lureMobThreshold ?? 3;
+        }
+        if (inputs.lureRadius && document.activeElement !== inputs.lureRadius) {
+            inputs.lureRadius.value = attackConfig.lureRadius ?? 5;
+        }
+        if (inputs.lureSmart)
+            inputs.lureSmart.checked = attackConfig.lureSmartTargeting !== false;
+        if (inputs.lurePreserveHp && document.activeElement !== inputs.lurePreserveHp) {
+            inputs.lurePreserveHp.value = attackConfig.lurePreserveHpPct ?? 30;
+            inputs.lurePreserveHp.disabled = attackConfig.lureSmartTargeting === false;
+        }
+        if (inputs.lureLastHp && document.activeElement !== inputs.lureLastHp) {
+            inputs.lureLastHp.value = attackConfig.lureLastMobHpPct ?? 20;
+        }
+        if (inputs.lureLastMode && document.activeElement !== inputs.lureLastMode) {
+            inputs.lureLastMode.value =
+                String(attackConfig.lureLastMobMode || "slow").toLowerCase() === "kill"
+                    ? "kill"
+                    : "slow";
+        }
+        if (inputs.lureStatus) {
+            if (!attackConfig.lureMode) {
+                inputs.lureStatus.textContent = "Lure: off";
+            } else if (status?.lureActive) {
+                const wp = status.lureWaypointIndex != null
+                    ? ` → WP ${status.lureWaypointIndex + 1}`
+                    : "";
+                if (status.lurePreferredPending) {
+                    const name = status.lurePreferredTrackedName
+                        ? ` • ${status.lurePreferredTrackedName}`
+                        : "";
+                    const dist = Number.isFinite(Number(status.lurePreferredTrackedDistance))
+                        ? ` ${Math.round(Number(status.lurePreferredTrackedDistance))}t`
+                        : "";
+                    inputs.lureStatus.textContent =
+                        `Preferred ahead${dist}${name} • preserving pack`;
+                } else if (status.lureLastMobActive) {
+                    const hp = Number.isFinite(Number(status.lureLastMobHealthPct))
+                        ? Math.round(Number(status.lureLastMobHealthPct))
+                        : "?";
+                    const name = status.lureLastMobName
+                        ? ` • ${status.lureLastMobName}`
+                        : "";
+                    inputs.lureStatus.textContent =
+                        status.lureLastMobMode === "kill"
+                            ? `Finishing last mob ${hp}%${name}`
+                            : `Slow-finishing last mob ${hp}%${name}`;
+                } else if (status.lureCrowdBlocked) {
+                    inputs.lureStatus.textContent =
+                        `Pack blocking corridor • holding (${status.lureCrowdBlockerCount} mobs)`;
+                } else if (status.lureMovementHeld) {
+                    const mob = status.lureLeashMobName
+                        ? ` • ${status.lureLeashMobName}`
+                        : "";
+                    const predictive =
+                        status.lureLeashReason === "trailing mob losing ground"
+                            ? "Catching lagging pack"
+                            : "Waiting for pack";
+                    inputs.lureStatus.textContent =
+                        `${predictive} ${status.lureMobCount}/${status.lureMobThreshold} @${status.lureRadius}t${mob}`;
+                } else {
+                    const smart = status.lureSmartTargeting
+                        ? ` • smart>${Math.round(status.lurePreserveHpPct)}%`
+                        : "";
+                    inputs.lureStatus.textContent =
+                        `Luring + attacking ${status.lureMobCount}/${status.lureMobThreshold} @${status.lureRadius}t${wp}${smart}`;
+                }
+            } else {
+                inputs.lureStatus.textContent =
+                    `Lure: ${status?.lureReason || "ready"} (${status?.lureMobCount ?? 0}/${attackConfig.lureMobThreshold ?? 3} @${attackConfig.lureRadius ?? 5}t)`;
+            }
         }
         refreshAutoAttackPreferredStatus();
         if (typeof refreshTitlebarRunIndicators === "function")
@@ -18367,9 +25243,36 @@ function upgradeSectionHeaders(panel) {
     }
 
     function refreshEquipRingStatus() {
+        const status = bot.equipRing?.status?.();
         const toggle = document.getElementById("minibia-bot-equip-ring-enabled");
-        if (toggle)
-            toggle.checked = !!bot.equipRing?.status?.().running;
+        if (toggle) toggle.checked = !!status?.running;
+        const idInput = document.getElementById("minibia-bot-equip-ring-id");
+        if (idInput && document.activeElement !== idInput)
+            idInput.value = bot.equipRing?.config?.ringId || "";
+        const selectButton = document.getElementById("minibia-bot-equip-ring-select");
+        if (selectButton) {
+            const selecting = !!status?.selectingRing;
+            selectButton.setAttribute("aria-pressed", selecting ? "true" : "false");
+            selectButton.title = selecting
+                ? "Selecting ring: click a ring in an open backpack/equipment slot. Click 🔍 again to cancel."
+                : "Click, then click a ring in an open backpack or equipment slot";
+        }
+        const countLabel = document.getElementById("minibia-bot-equip-ring-count");
+        if (countLabel) {
+            const ringId = Number(bot.equipRing?.config?.ringId || 0);
+            if (!ringId) {
+                countLabel.textContent = "";
+                countLabel.title = "Set a ring ID to use the server-side item count.";
+            } else if (status?.gates?.serverCountFresh) {
+                countLabel.textContent = `×${status.gates.serverCount ?? 0}`;
+                countLabel.title = "Server item count (full inventory, including closed backpacks).";
+            } else {
+                countLabel.textContent = "×?";
+                countLabel.title = "Waiting for the server item count.";
+            }
+        }
+        const warnToggle = document.getElementById("minibia-bot-equip-ring-warn");
+        if (warnToggle) warnToggle.checked = !!bot.equipRing?.config?.warnMissingRing;
     }
 
     function refreshTalkStatus() {
@@ -18472,13 +25375,12 @@ function upgradeSectionHeaders(panel) {
         const select = document.getElementById("minibia-bot-cave-preset-select");
         const label = document.getElementById("minibia-bot-cave-preset-status");
         const delBtn = document.getElementById("minibia-bot-cave-preset-delete");
-        const status = bot.cave?.status?.();
-        // ★ Get the list and sort it alphabetically (case-insensitive)
-        let names = status?.presetNames || bot.cave?.getPresetNames?.() || [];
+        // Avoid cloning the entire cave route and recovery telemetry just to refresh the preset selector.
+        let names = bot.cave?.getPresetNames?.() || [];
         names = [...names].sort((a, b) => a.localeCompare(b, undefined, {
                 sensitivity: 'base'
             }));
-        const active = status?.activePresetName || bot.cave?.getActivePresetName?.() || "Default";
+        const active = bot.cave?.getActivePresetName?.() || "Default";
 
         if (select) {
             const prev = select.value;
@@ -18550,14 +25452,20 @@ function upgradeSectionHeaders(panel) {
 
     // ---- CAVE WAYPOINT LIST ----
     let selectedWaypointIndex = null;
+    let lastWaypointListKey = null;
+    let lastWaypointListElement = null;
 
     function refreshCaveWaypointList() {
         const container = document.getElementById("minibia-bot-cave-waypoint-list");
-        if (!container)
-            return;
+        if (!container || !container.getClientRects().length) return;
+        const meta = bot.cave?.getWaypointListMeta?.() || { revision: 0, index: 0 };
+        const current = meta.index;
+        const playerPos = bot.getPlayerPosition?.();
+        const listKey = `${meta.revision}|${current}|${selectedWaypointIndex}|${playerPos?.x},${playerPos?.y},${playerPos?.z}`;
+        if (lastWaypointListElement === container && lastWaypointListKey === listKey) return;
         const route = bot.cave?.getRoute?.() || [];
-        const status = bot.cave?.status?.();
-        const current = status?.currentIndex ?? 0;
+        lastWaypointListElement = container;
+        lastWaypointListKey = listKey;
         container.innerHTML = "";
         if (!route.length) {
             const empty = document.createElement("div");
@@ -18610,7 +25518,7 @@ function upgradeSectionHeaders(panel) {
                 coords.style.cssText = "color:#ffcf5a;font-weight:bold;";
             const distSpan = document.createElement("span");
             distSpan.style.cssText = "margin-left:auto;font-size:10px;opacity:0.6;";
-            const pos = bot.getPlayerPosition?.();
+            const pos = playerPos;
             if (pos && wp.z === pos.z) {
                 const dx = Math.abs(pos.x - wp.x),
                 dy = Math.abs(pos.y - wp.y);
@@ -18631,7 +25539,7 @@ function upgradeSectionHeaders(panel) {
                 if (scriptInput)
                     scriptInput.value = wp.script || "";
                 bot.cave.setCurrentIndex(idx);
-                if (bot.cave?.status?.().running)
+                if (bot.cave?.isRunning?.())
                     bot.cave.goToWaypoint(route[idx]);
                 refreshCaveStatus();
                 refreshCaveWaypointList();
@@ -18677,7 +25585,7 @@ function upgradeSectionHeaders(panel) {
             return;
 
         // Only auto‑scroll if cavebot is running, unless forced
-        const isRunning = bot.cave?.status?.().running;
+        const isRunning = bot.cave?.isRunning?.();
         if (!force && !isRunning)
             return;
 
@@ -18783,20 +25691,50 @@ function upgradeSectionHeaders(panel) {
     function refreshCaveStatus() {
         const toggle = document.getElementById("minibia-bot-cave-toggle");
         const label = document.getElementById("minibia-bot-cave-status");
-        const route = bot.cave?.getRoute?.() || [];
-        const status = bot.cave?.status?.();
+        // Avoid full CaveBot status() on the one-second UI poll: it clones the
+        // whole route and recovery history even when all the tab needs is a few
+        // live scalars. Keep the fallback for older installs/modules.
+        const status = bot.cave?.getUiStatus?.() || bot.cave?.status?.();
+        const routeLength = status?.routeLength ?? status?.route?.length ?? 0;
         if (toggle)
             toggle.checked = !!status?.running;
         if (label) {
-            if (!route.length)
+            if (status?.movement?.safetyStopped) {
+                label.textContent = `Status: SAFETY STOP – ${status.movement.trip?.failures || 0} repeated failures near waypoint #${(status.movement.trip?.index ?? 0) + 1}`;
+            } else if (!routeLength) {
                 label.textContent = "Status: no waypoints";
-            else if (status?.running) {
+            } else if (status?.running) {
                 const wpNum = (status.currentIndex ?? 0) + 1;
                 const dist = Number.isFinite(status?.distanceToWaypoint) && status.distanceToWaypoint >= 0 ? `, dist ${status.distanceToWaypoint}` : "";
-                label.textContent = `Status: running (${wpNum}/${route.length}${dist})`;
+                const recovery = status.movement?.mode === 'Recovering' && status.movement.reason ? ` (${status.movement.reason})` : "";
+                label.textContent = `Status: ${status.movement?.mode || 'Walking'}${recovery} (${wpNum}/${routeLength}${dist})`;
             } else {
-                label.textContent = `Status: idle (${route.length} waypoint${route.length === 1 ? "" : "s"})`;
+                label.textContent = `Status: idle (${routeLength} waypoint${routeLength === 1 ? "" : "s"})`;
             }
+        }
+        const breaker = document.getElementById('minibia-bot-cave-breaker-status');
+        if (breaker && status?.movement) {
+            const m = status.movement;
+            const enabled = status.circuitBreakerEnabled ?? status.config?.circuitBreakerEnabled;
+            breaker.textContent = m.safetyStopped ? 'Safety stopped – restart manually' :
+                `Recovery safety: ${m.failures}/${m.limit}${enabled === false ? ' (off)' : ''}`;
+        }
+        const nav = document.getElementById('minibia-bot-cave-nav-diagnostics');
+        if (nav) {
+            if (!status?.running) {
+                nav.textContent = 'Navigation: idle';
+            } else {
+                const position = status.waypointKey || 'unknown waypoint';
+                const nativePath = status.nativePathActive ? 'active' : 'idle';
+                const progress = Number.isFinite(status.progressAgeMs)
+                    ? `${(status.progressAgeMs / 1000).toFixed(1)}s since progress`
+                    : 'progress timer paused';
+                nav.textContent = `Navigation: ${position} · native path ${nativePath} · ${progress}`;
+            }
+        }
+        const recent = document.getElementById('minibia-bot-cave-recent-recoveries');
+        if (recent) {
+            recent.textContent = `Recent recovery: ${status?.recentRecoveries || 'none'}`;
         }
     }
 
@@ -19059,13 +25997,14 @@ function upgradeSectionHeaders(panel) {
 
     function getCollapsedQuickModules() {
         return [
-            { id: "minibia-bot-collapsed-cave", isRunning: () => !!bot.cave?.status?.().running, start: () => bot.cave?.start?.(), stop: () => bot.cave?.stop?.() },
+            { id: "minibia-bot-collapsed-cave", isRunning: () => !!bot.cave?.isRunning?.(), start: () => bot.cave?.start?.(), stop: () => bot.cave?.stop?.() },
             { id: "minibia-bot-collapsed-attack", isRunning: () => !!bot.attack?.status?.().running, start: () => bot.attack?.start?.(), stop: () => bot.attack?.stop?.() },
             { id: "minibia-bot-collapsed-heal", isRunning: () => !!bot.heal?.status?.().running, start: () => bot.heal?.start?.(), stop: () => bot.heal?.stop?.() },
             { id: "minibia-bot-collapsed-rune", isRunning: () => !!bot.rune?.status?.().running, start: () => bot.rune?.start?.(), stop: () => bot.rune?.stop?.() },
             { id: "minibia-bot-collapsed-paladin", isRunning: () => !!bot.paladin?.status?.().running, start: () => bot.paladin?.startCraft?.(), stop: () => bot.paladin?.stopCraft?.() },
             { id: "minibia-bot-collapsed-looter", isRunning: () => !!bot.looter?.status?.().running, start: () => bot.looter?.start?.(), stop: () => bot.looter?.stop?.() },
             { id: "minibia-bot-collapsed-fisher", isRunning: () => !!bot.fisher?.status?.().running, start: () => bot.fisher?.start?.(), stop: () => bot.fisher?.stop?.() },
+            { id: "minibia-bot-collapsed-equip-ring", isRunning: () => !!bot.equipRing?.status?.().running, start: () => bot.equipRing?.start?.(), stop: () => bot.equipRing?.stop?.() },
         ];
     }
 
@@ -19078,7 +26017,12 @@ function upgradeSectionHeaders(panel) {
             let running = false;
             try { running = !!m.isRunning(); } catch {}
             btn.dataset.running = running ? "true" : "false";
-            btn.title = `${btn.title.split(" – ")[0]} ${running ? "(running)" : "(stopped)"}`;
+            const baseTitle = btn.dataset.mbBaseTitle || btn.title || "Module";
+            btn.dataset.mbBaseTitle = baseTitle.replace(/\s+\((?:running|stopped)\)(?:\s+\((?:running|stopped)\))*$/i, "");
+            const movement = m.id === 'minibia-bot-collapsed-cave' ? bot.cave?.getMovementSummary?.() : null;
+            const caveDetail = movement?.safetyStopped ? ' – SAFETY STOP' :
+                running && movement?.mode ? ` – ${movement.mode}${movement.mode === 'Recovering' && movement.reason ? ` (${movement.reason})` : ''}` : '';
+            btn.title = `${btn.dataset.mbBaseTitle} ${running ? "(running)" : "(stopped)"}${caveDetail}`;
         });
     }
 
@@ -19092,14 +26036,16 @@ function upgradeSectionHeaders(panel) {
         let caveRunning = false,
         attackRunning = false;
         try {
-            caveRunning = !!bot.cave?.status?.().running;
+            caveRunning = !!bot.cave?.isRunning?.();
         } catch {}
         try {
             attackRunning = !!bot.attack?.status?.().running;
         } catch {}
         if (caveInd) {
             caveInd.dataset.running = caveRunning ? "true" : "false";
-            caveInd.title = caveRunning ? "Cavebot running" : "Cavebot stopped";
+            const movement = bot.cave?.getMovementSummary?.();
+            caveInd.title = movement?.safetyStopped ? 'Cavebot – SAFETY STOP' :
+                caveRunning ? `Cavebot – ${movement?.mode || 'walking'}` : 'Cavebot stopped';
         }
         if (attackInd) {
             attackInd.dataset.running = attackRunning ? "true" : "false";
@@ -19885,7 +26831,7 @@ function upgradeSectionHeaders(panel) {
         panel.id = "minibia-bot-panel";
         panel.innerHTML = `
 <div class="mb-titlebar">
-  <div class="mb-title">mb0t <span class="mb-title-version">v1.4.46</span></div>
+  <div class="mb-title">mb0t <span class="mb-title-version">v${String(bot.version || "?")}</span></div>
   <div class="mb-title-status">
     <span class="mb-run-indicator" id="minibia-bot-title-cave-status" data-running="false"><span class="mb-run-dot"></span><span class="mb-run-label">🏃‍♂️‍➡️</span></span>
     <span class="mb-run-indicator" id="minibia-bot-title-attack-status" data-running="false"><span class="mb-run-dot"></span><span class="mb-run-label">⚔️</span></span>
@@ -19905,6 +26851,7 @@ function upgradeSectionHeaders(panel) {
     <button type="button" class="mb-run-indicator mb-collapsed-module-button" id="minibia-bot-collapsed-paladin" title="Spear Crafter"><span class="mb-run-dot"></span><span class="mb-run-label">🏹</span></button>
     <button type="button" class="mb-run-indicator mb-collapsed-module-button" id="minibia-bot-collapsed-looter" title="Looter"><span class="mb-run-dot"></span><span class="mb-run-label">💰</span></button>
     <button type="button" class="mb-run-indicator mb-collapsed-module-button" id="minibia-bot-collapsed-fisher" title="Fishing"><span class="mb-run-dot"></span><span class="mb-run-label">🎣</span></button>
+    <button type="button" class="mb-run-indicator mb-collapsed-module-button" id="minibia-bot-collapsed-equip-ring" title="Equip Ring"><span class="mb-run-dot"></span><span class="mb-run-label">💍</span></button>
   </div>
 </div>
 
@@ -20069,13 +27016,13 @@ function upgradeSectionHeaders(panel) {
     </div>
     <div class="mb-section" style="margin-top:8px;padding:10px;background:rgba(255,255,255,0.03);">
       <div class="mb-section-title mb-section-title--sub" style="margin-top:0;">
+        <input type="checkbox" id="minibia-bot-paralyze-enabled" class="mb-title-toggle" />
         <span class="mb-title-text">🧊 Clear Paralyze</span>
       </div>
       <div style="display:grid;grid-template-columns:1fr 90px;gap:6px;margin-bottom:6px;">
         <label class="mb-field"><span class="mb-field-label">Spell Words</span><input type="text" id="minibia-bot-paralyze-spell" placeholder="exura" /></label>
-        <label class="mb-field"><span class="mb-field-label">Only Above HP %</span><input type="number" id="minibia-bot-paralyze-minhp" min="0" max="100" value="70" /></label>
+        <label class="mb-field"><span class="mb-field-label">Above HP%</span><input type="number" id="minibia-bot-paralyze-minhp" min="0" max="100" value="70" /></label>
       </div>
-      <label class="mb-toggle" style="font-size:11px;"><input type="checkbox" id="minibia-bot-paralyze-enabled" /> Enable paralyze clear</label>
     </div>
     <div class="mb-small-note" style="margin-top:6px;">Rules are checked in order. First rule whose HP and MP ranges match will trigger. If spell words are given, mana cost must be set (and current mana must be ≥ that).</div>
   </div>
@@ -20372,7 +27319,15 @@ function upgradeSectionHeaders(panel) {
       <!-- Right Column -->
       <div style="display:flex; flex-direction:column; gap:10px;">
         <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-auto-magic-shield-enabled" /><span>Utamo Vita</span></label>
-        <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-equip-ring-enabled" /><span>Equip Ring</span></label>
+        <div style="display:flex; flex-direction:column; gap:10px;">
+          <div style="display:flex; align-items:center; gap:4px; flex-wrap:nowrap;">
+            <label class="mb-toggle" style="margin:0; font-size:11px; flex:0 0 auto;"><input type="checkbox" id="minibia-bot-equip-ring-enabled" /><span>Equip Ring</span></label>
+            <input type="number" id="minibia-bot-equip-ring-id" min="0" max="65535" step="1" placeholder="ID" title="Ring inventory item ID (CID). Empty or 0 = any ring." aria-label="Ring item ID" style="box-sizing:border-box;width:42px;min-width:42px;padding:4px 1px;font-size:10px;text-align:center;" />
+            <button type="button" class="mb-small-button" id="minibia-bot-equip-ring-select" title="Click, then click a ring in an open backpack or equipment slot" aria-label="Select ring item ID" aria-pressed="false" style="padding:3px 4px; min-width:22px; font-size:11px; line-height:1.2;">🔍</button>
+            <span id="minibia-bot-equip-ring-count" title="Set a ring ID to use the server-side item count." style="font-size:10px; color:#aaa; min-width:24px; white-space:nowrap;"> </span>
+          </div>
+          <label class="mb-toggle" style="margin:0; font-size:11px;" title="Alert at most once per minute when the server reports no matching ring in your full inventory"><input type="checkbox" id="minibia-bot-equip-ring-warn" /><span>Alert missing ring</span></label>
+        </div>
         <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-pink-skull-enabled" /><span>Pink Skull</span></label>
         <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-reconnect-enabled" /><span>Auto‑Reconnect</span></label>
         <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-autostacker-convert-currency" /><span>Convert Currency</span></label>
@@ -20433,6 +27388,12 @@ function upgradeSectionHeaders(panel) {
       <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-cave-auto-transitions" /> Auto Transitions</label>
       <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-cave-ignore-fields" /> Walk Through Fields</label>
     </div>
+    <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:6px; font-size:10px;">
+      <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-cave-breaker-enabled" /> Recovery Circuit Breaker</label>
+      <label class="mb-field" style="flex:0 0 62px;"><span class="mb-field-label">Failures</span><input type="number" id="minibia-bot-cave-breaker-failures" min="3" max="30" value="8" style="padding:3px 4px;font-size:11px;" /></label>
+      <label class="mb-field" style="flex:0 0 70px;"><span class="mb-field-label">Window (s)</span><input type="number" id="minibia-bot-cave-breaker-window" min="15" max="600" value="120" style="padding:3px 4px;font-size:11px;" /></label>
+      <span id="minibia-bot-cave-breaker-status" style="color:#cdbb8b;">Recovery safety: 0/8</span>
+    </div>
 
     <!-- Presets -->
     <div style="display:flex; gap:6px; align-items:center; margin-bottom:6px;">
@@ -20467,6 +27428,12 @@ function upgradeSectionHeaders(panel) {
       <button type="button" class="mb-small-button" id="minibia-bot-cave-move-up" style="padding:4px;">▲</button>
       <button type="button" class="mb-small-button" id="minibia-bot-cave-move-down" style="padding:4px;">▼</button>
       <button type="button" class="mb-small-button" id="minibia-bot-cave-delete-selected" style="padding:4px; background:#5a2020; border-color:#883030;">✕</button>
+    </div>
+
+    <!-- Read-only route audit; runs only when clicked, never on a timer. -->
+    <div style="margin-bottom:6px;">
+      <button type="button" class="mb-small-button" id="minibia-bot-cave-audit" style="padding:3px 8px; font-size:10px;">Audit Route</button>
+      <div id="minibia-bot-cave-audit-result" aria-live="polite" style="white-space:pre-line; color:#cdbb8b; font-size:10px; margin-top:3px;"></div>
     </div>
 
     <!-- Waypoint list -->
@@ -20511,6 +27478,8 @@ function upgradeSectionHeaders(panel) {
     <!-- Status -->
     <div style="font-size:10px; color:#cdbb8b; margin-top:6px; display:grid; gap:2px;">
       <div id="minibia-bot-cave-status">Status: no waypoints</div>
+      <div id="minibia-bot-cave-nav-diagnostics" style="color:#b7b7b7;">Navigation: idle</div>
+      <div id="minibia-bot-cave-recent-recoveries" style="color:#b7b7b7; overflow-wrap:anywhere;">Recent recovery: none</div>
       <div id="minibia-bot-cave-closest">Closest start: none</div>
       <div id="minibia-bot-cave-transition-status">Transitions learned: none</div>
     </div>
@@ -20534,6 +27503,18 @@ function upgradeSectionHeaders(panel) {
       <label class="mb-field" style="flex:0 0 120px;"><span class="mb-field-label" style="font-size:10px;">Max Target Dist</span><input type="number" id="minibia-bot-auto-attack-maxdist" min="1" max="10" value="5" style="padding:3px 4px;font-size:11px;" /></label>
     </div>
 
+    <!-- Lure Mode -->
+    <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-top:10px;">
+      <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-auto-attack-lure" /><span>Lure</span></label>
+      <label class="mb-field" style="flex:0 0 90px;"><span class="mb-field-label" style="font-size:10px;">Fight at mobs</span><input type="number" id="minibia-bot-auto-attack-lure-count" min="1" max="20" value="3" style="padding:3px 4px;font-size:11px;" /></label>
+      <label class="mb-field" style="flex:0 0 82px;"><span class="mb-field-label" style="font-size:10px;">Lure Radius</span><input type="number" id="minibia-bot-auto-attack-lure-radius" min="1" max="8" value="5" style="padding:3px 4px;font-size:11px;" /></label>
+      <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-auto-attack-lure-smart" checked /><span>Smart</span></label>
+      <label class="mb-field" style="flex:0 0 78px;"><span class="mb-field-label" style="font-size:10px;">Preserve HP</span><input type="number" id="minibia-bot-auto-attack-lure-preserve-hp" min="5" max="90" value="30" style="padding:3px 4px;font-size:11px;" /></label>
+      <label class="mb-field" style="flex:0 0 74px;"><span class="mb-field-label" style="font-size:10px;">Last Mob HP</span><input type="number" id="minibia-bot-auto-attack-lure-last-hp" min="5" max="90" value="20" style="padding:3px 4px;font-size:11px;" /></label>
+      <label class="mb-field" style="flex:0 0 88px;"><span class="mb-field-label" style="font-size:10px;">Last Mob</span><select id="minibia-bot-auto-attack-lure-last-mode" style="padding:3px 4px;font-size:11px;"><option value="slow">Slow</option><option value="kill">Kill</option></select></label>
+      <span id="minibia-bot-auto-attack-lure-status" class="mb-small-note" style="font-size:10px;">Lure: off</span>
+    </div>
+
     <hr style="margin:12px 0;border-color:#444;">
 
     <!-- Kite Mode -->
@@ -20542,7 +27523,11 @@ function upgradeSectionHeaders(panel) {
       <label class="mb-field" style="flex:0 0 65px;"><span class="mb-field-label" style="font-size:10px;">Kite Dist</span><input type="number" id="minibia-bot-auto-attack-ideal-dist" min="1" max="10" value="3" style="padding:3px 4px;font-size:11px;" /></label>
       <span style="color:#666;">|</span>
       <label class="mb-field" style="flex:0 0 60px;"><span class="mb-field-label" style="font-size:10px;">Use Rune</span><input type="number" id="minibia-bot-auto-attack-rune-hotkey" min="1" max="12" placeholder="4" style="padding:3px 4px;font-size:11px;" /></label>
-      <span style="color:#666;">|</span>
+      <span id="minibia-bot-auto-attack-rune-count" style="font-size:10px;color:#aaa;min-width:22px;white-space:nowrap;" title="Set a rune hotbar slot to show supply."></span>
+    </div>
+
+    <!-- Anti-KS -->
+    <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-top:10px;">
       <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-auto-attack-antiks" /><span>Anti-KS</span></label>
       <label class="mb-field" style="flex:0 0 40px;"><span class="mb-field-label" style="font-size:10px;">Self</span><input type="number" id="minibia-bot-auto-attack-antiks-self" min="1" max="5" value="2" style="padding:3px 4px;font-size:11px;" /></label>
       <label class="mb-field" style="flex:0 0 40px;"><span class="mb-field-label" style="font-size:10px;">Other</span><input type="number" id="minibia-bot-auto-attack-antiks-other" min="1" max="5" value="2" style="padding:3px 4px;font-size:11px;" /></label>
@@ -21046,6 +28031,7 @@ function upgradeSectionHeaders(panel) {
                 try { refreshRuneStatus?.(); } catch {}
                 try { refreshPaladinStatus?.(); } catch {}
                 try { refreshLooterStatus?.(); } catch {}
+                try { refreshEquipRingStatus?.(); } catch {}
             });
         });
 
@@ -21054,7 +28040,7 @@ function upgradeSectionHeaders(panel) {
         const titleAttack = panel.querySelector("#minibia-bot-title-attack-status");
         if (titleCave) {
             titleCave.addEventListener("click", () => {
-                const running = !!bot.cave?.status?.().running;
+                const running = !!bot.cave?.isRunning?.();
                 running ? bot.cave.stop() : bot.cave.start();
                 refreshTitlebarRunIndicators();
                 refreshCaveStatus();
@@ -21100,13 +28086,36 @@ function upgradeSectionHeaders(panel) {
 
         // ---- Equip Ring ----
         const equipRingToggle = panel.querySelector("#minibia-bot-equip-ring-enabled");
+        const equipRingId = panel.querySelector("#minibia-bot-equip-ring-id");
+        const equipRingSelect = panel.querySelector("#minibia-bot-equip-ring-select");
+        const equipRingWarn = panel.querySelector("#minibia-bot-equip-ring-warn");
         if (equipRingToggle) {
             equipRingToggle.checked = !!bot.equipRing?.status?.().running;
             equipRingToggle.addEventListener("change", function () {
-                if (this.checked)
-                    bot.equipRing.start();
-                else
-                    bot.equipRing.stop();
+                if (this.checked) bot.equipRing.start();
+                else bot.equipRing.stop();
+                refreshEquipRingStatus();
+            });
+        }
+        if (equipRingId) {
+            equipRingId.value = bot.equipRing?.config?.ringId || "";
+            equipRingId.addEventListener("change", function () {
+                const id = Number(this.value);
+                bot.equipRing?.updateConfig?.({ ringId:
+                    Number.isSafeInteger(id) && id >= 1 && id <= 65535 ? id : 0 });
+                refreshEquipRingStatus();
+            });
+        }
+        if (equipRingSelect) {
+            equipRingSelect.addEventListener("click", function () {
+                bot.equipRing?.startCaptureRing?.();
+                refreshEquipRingStatus();
+            });
+        }
+        if (equipRingWarn) {
+            equipRingWarn.checked = !!bot.equipRing?.config?.warnMissingRing;
+            equipRingWarn.addEventListener("change", function () {
+                bot.equipRing?.updateConfig?.({ warnMissingRing: this.checked });
                 refreshEquipRingStatus();
             });
         }
@@ -21484,13 +28493,37 @@ function upgradeSectionHeaders(panel) {
 
         // ---- Exori toggle ----
         const exoriToggle = document.getElementById('minibia-bot-exori-enabled');
-        if (exoriToggle) {
-            function refreshExoriStatus() {
-                if (exoriToggle && document.activeElement !== exoriToggle) {
-                    exoriToggle.checked = !!bot.exori?.status?.().running;
-                }
+
+        function refreshExoriStatus() {
+            if (!exoriToggle)
+                return;
+
+            const exoriStatus = bot.exori?.status?.();
+            const targetingRunning = bot.attack?.isRunning?.() === true;
+
+            // Targeting is the master switch. Preserve Exori's own configured
+            // preference internally, but show it as inactive and prevent edits
+            // while Targeting itself is off.
+            exoriToggle.disabled = !targetingRunning;
+            exoriToggle.title = targetingRunning
+                ? "Cast Exori while Targeting is running"
+                : "Enable Targeting to use Exori";
+
+            if (document.activeElement !== exoriToggle) {
+                exoriToggle.checked =
+                    targetingRunning &&
+                    !!exoriStatus?.armed;
             }
+        }
+
+        if (exoriToggle) {
             exoriToggle.addEventListener('change', function () {
+                // The UI is disabled while Targeting is off, but keep this guard
+                // in case another script dispatches a change event directly.
+                if (bot.attack?.isRunning?.() !== true) {
+                    refreshExoriStatus();
+                    return;
+                }
                 if (this.checked) {
                     bot.exori.start();
                 } else {
@@ -21500,8 +28533,8 @@ function upgradeSectionHeaders(panel) {
             });
             // Initial refresh
             setTimeout(refreshExoriStatus, 100);
-            // Periodic refresh (optional)
-            setInterval(refreshExoriStatus, 2000);
+            const exoriStatusTimer = setInterval(refreshExoriStatus, 1000);
+            bot.addCleanup(() => clearInterval(exoriStatusTimer));
         }
 
         // ---- Keep Diagonal ----
@@ -21540,7 +28573,8 @@ function upgradeSectionHeaders(panel) {
                 exoriMonstersInput.value = status?.config?.monsterCount ?? 3;
             }
         }
-        setInterval(refreshExoriMonsters, 2000);
+        const exoriMonstersTimer = setInterval(refreshExoriMonsters, 2000);
+        bot.addCleanup(() => clearInterval(exoriMonstersTimer));
         setTimeout(refreshExoriMonsters, 100);
 
         // Exori player check
@@ -21550,9 +28584,9 @@ function upgradeSectionHeaders(panel) {
             // Load initial state
             const config = bot.exori?.config;
             if (config) {
-                exoriPlayerCheck.checked = config.playerProximityCheck !== false;
+                exoriPlayerCheck.checked = config.playerProximityCheck === true;
                 if (exoriPlayerDist)
-                    exoriPlayerDist.value = config.playerProximityDistance || 3;
+                    exoriPlayerDist.value = config.playerProximityDistance ?? 3;
             }
             exoriPlayerCheck.addEventListener("change", function () {
                 bot.exori.updateConfig({
@@ -21865,7 +28899,8 @@ function upgradeSectionHeaders(panel) {
         }
 
         // Periodic refresh (every 2s)
-        setInterval(refreshComboStatus, 2000);
+        const comboStatusTimer = setInterval(refreshComboStatus, 2000);
+        bot.addCleanup(() => clearInterval(comboStatusTimer));
 
         // ---- Outfit Randomizer ----
         const outfitToggle = panel.querySelector("#minibia-bot-outfit-randomizer-enabled");
@@ -21924,7 +28959,8 @@ function upgradeSectionHeaders(panel) {
         }
 
         // Refresh periodically (like other utility modules)
-        setInterval(refreshOutfitRandomizerStatus, 5000);
+        const outfitStatusTimer = setInterval(refreshOutfitRandomizerStatus, 5000);
+        bot.addCleanup(() => clearInterval(outfitStatusTimer));
 
         const playerAttackToggle = panel.querySelector("#minibia-bot-player-attack-alert");
         if (playerAttackToggle) {
@@ -23288,6 +30324,13 @@ function upgradeSectionHeaders(panel) {
         const antiKSInput = panel.querySelector("#minibia-bot-auto-attack-antiks");
         const antiKSSelfInput = panel.querySelector("#minibia-bot-auto-attack-antiks-self");
         const antiKSOtherInput = panel.querySelector("#minibia-bot-auto-attack-antiks-other");
+        const lureInput = panel.querySelector("#minibia-bot-auto-attack-lure");
+        const lureCountInput = panel.querySelector("#minibia-bot-auto-attack-lure-count");
+        const lureRadiusInput = panel.querySelector("#minibia-bot-auto-attack-lure-radius");
+        const lureSmartInput = panel.querySelector("#minibia-bot-auto-attack-lure-smart");
+        const lurePreserveHpInput = panel.querySelector("#minibia-bot-auto-attack-lure-preserve-hp");
+        const lureLastHpInput = panel.querySelector("#minibia-bot-auto-attack-lure-last-hp");
+        const lureLastModeInput = panel.querySelector("#minibia-bot-auto-attack-lure-last-mode");
 
         if (autoAttackHotkeyInput) {
             autoAttackHotkeyInput.value = String(bot.attack?.config?.targetHotbarSlot ?? 3);
@@ -23337,6 +30380,7 @@ function upgradeSectionHeaders(panel) {
                     bot.attack.stop();
                 refreshAutoAttackStatus();
                 refreshTitlebarRunIndicators();
+                refreshExoriStatus();
             });
         }
         if (maxDistInput) {
@@ -23375,6 +30419,92 @@ function upgradeSectionHeaders(panel) {
                 bot.attack.updateConfig({
                     antiKSOtherRange: val
                 });
+            });
+        }
+
+        if (lureInput) {
+            lureInput.checked = bot.attack?.config?.lureMode === true;
+            lureInput.addEventListener("change", () => {
+                bot.attack.updateConfig({
+                    lureMode: lureInput.checked
+                });
+                refreshAutoAttackStatus();
+            });
+        }
+
+        if (lureCountInput) {
+            lureCountInput.value = bot.attack?.config?.lureMobThreshold ?? 3;
+            lureCountInput.addEventListener("change", () => {
+                const val = Math.min(20, Math.max(1, Math.trunc(Number(lureCountInput.value) || 3)));
+                lureCountInput.value = String(val);
+                bot.attack.updateConfig({
+                    lureMobThreshold: val
+                });
+                refreshAutoAttackStatus();
+            });
+        }
+
+        if (lureRadiusInput) {
+            lureRadiusInput.value = bot.attack?.config?.lureRadius ?? 5;
+            lureRadiusInput.addEventListener("change", () => {
+                const val = Math.min(8, Math.max(1, Math.trunc(Number(lureRadiusInput.value) || 5)));
+                lureRadiusInput.value = String(val);
+                bot.attack.updateConfig({
+                    lureRadius: val
+                });
+                refreshAutoAttackStatus();
+            });
+        }
+
+        if (lureSmartInput) {
+            lureSmartInput.checked = bot.attack?.config?.lureSmartTargeting !== false;
+            lureSmartInput.addEventListener("change", () => {
+                bot.attack.updateConfig({
+                    lureSmartTargeting: lureSmartInput.checked
+                });
+                if (lurePreserveHpInput)
+                    lurePreserveHpInput.disabled = !lureSmartInput.checked;
+                refreshAutoAttackStatus();
+            });
+        }
+
+        if (lurePreserveHpInput) {
+            lurePreserveHpInput.value = bot.attack?.config?.lurePreserveHpPct ?? 30;
+            lurePreserveHpInput.disabled = bot.attack?.config?.lureSmartTargeting === false;
+            lurePreserveHpInput.addEventListener("change", () => {
+                const val = Math.min(90, Math.max(5, Number(lurePreserveHpInput.value) || 30));
+                lurePreserveHpInput.value = String(val);
+                bot.attack.updateConfig({
+                    lurePreserveHpPct: val
+                });
+                refreshAutoAttackStatus();
+            });
+        }
+
+        if (lureLastHpInput) {
+            lureLastHpInput.value = bot.attack?.config?.lureLastMobHpPct ?? 20;
+            lureLastHpInput.addEventListener("change", () => {
+                const val = Math.min(90, Math.max(5, Number(lureLastHpInput.value) || 20));
+                lureLastHpInput.value = String(val);
+                bot.attack.updateConfig({
+                    lureLastMobHpPct: val
+                });
+                refreshAutoAttackStatus();
+            });
+        }
+
+        if (lureLastModeInput) {
+            lureLastModeInput.value =
+                String(bot.attack?.config?.lureLastMobMode || "slow").toLowerCase() === "kill"
+                    ? "kill"
+                    : "slow";
+            lureLastModeInput.addEventListener("change", () => {
+                const mode = lureLastModeInput.value === "kill" ? "kill" : "slow";
+                lureLastModeInput.value = mode;
+                bot.attack.updateConfig({
+                    lureLastMobMode: mode
+                });
+                refreshAutoAttackStatus();
             });
         }
 
@@ -23740,6 +30870,24 @@ function upgradeSectionHeaders(panel) {
             });
         }
 
+        // Route audit is manual/on-demand, with no background scan or timers.
+        const caveAuditButton = panel.querySelector('#minibia-bot-cave-audit');
+        const caveAuditResult = panel.querySelector('#minibia-bot-cave-audit-result');
+        if (caveAuditButton && caveAuditResult) {
+            caveAuditButton.addEventListener('click', () => {
+                const report = bot.cave?.auditRoute?.();
+                if (!report) return;
+                const heading = `Audit snapshot: ${report.waypointCount} waypoints, ${report.issueCount} warning${report.issueCount === 1 ? '' : 's'}.`;
+                caveAuditResult.textContent = report.issues.length
+                    ? [heading, ...report.issues.map(issue =>
+                        `${issue.index >= 0 ? `#${issue.index + 1}: ` : ''}${issue.text}`),
+                        ...(report.truncated ? ['More warnings omitted.'] : []),
+                        'Advisory only; native Pathfinder reachability is not checked.'].join('\n')
+                    : `${heading} No structural warnings. Native Pathfinder reachability is not checked.`;
+                bot.log(`Cave: ${heading}`);
+            });
+        }
+
         // Cave tolerance
         const toleranceInput = panel.querySelector("#minibia-bot-cave-tolerance");
         if (toleranceInput) {
@@ -23756,7 +30904,7 @@ function upgradeSectionHeaders(panel) {
         // Cave toggle
         const caveToggle = panel.querySelector("#minibia-bot-cave-toggle");
         if (caveToggle) {
-            caveToggle.checked = !!bot.cave?.status?.().running;
+            caveToggle.checked = !!bot.cave?.isRunning?.();
             caveToggle.addEventListener("change", () => {
                 if (caveToggle.checked)
                     bot.cave.start();
@@ -23794,6 +30942,29 @@ function upgradeSectionHeaders(panel) {
                 bot.cave.updateConfig({
                     ignoreFields: ignoreFieldsToggle.checked
                 });
+            });
+        }
+
+        // Circuit-breaker controls persist through the CaveBot config.
+        const breakerEnabled = panel.querySelector('#minibia-bot-cave-breaker-enabled');
+        const breakerFailures = panel.querySelector('#minibia-bot-cave-breaker-failures');
+        const breakerWindow = panel.querySelector('#minibia-bot-cave-breaker-window');
+        if (breakerEnabled) {
+            breakerEnabled.checked = bot.cave?.config?.circuitBreakerEnabled !== false;
+            breakerEnabled.addEventListener('change', () => bot.cave?.updateConfig?.({ circuitBreakerEnabled: breakerEnabled.checked }));
+        }
+        if (breakerFailures) {
+            breakerFailures.value = String(bot.cave?.config?.circuitBreakerMaxFailures ?? 8);
+            breakerFailures.addEventListener('change', () => {
+                const result = bot.cave?.updateConfig?.({ circuitBreakerMaxFailures: Number(breakerFailures.value) });
+                breakerFailures.value = String(result?.circuitBreakerMaxFailures ?? 8);
+            });
+        }
+        if (breakerWindow) {
+            breakerWindow.value = String((bot.cave?.config?.circuitBreakerWindowMs ?? 120000) / 1000);
+            breakerWindow.addEventListener('change', () => {
+                const result = bot.cave?.updateConfig?.({ circuitBreakerWindowMs: Number(breakerWindow.value) * 1000 });
+                breakerWindow.value = String((result?.circuitBreakerWindowMs ?? 120000) / 1000);
             });
         }
 
@@ -24258,6 +31429,8 @@ function upgradeSectionHeaders(panel) {
         const antibotTimer = window.setInterval(refreshAntiBotStatus, 1000);
         bot.addCleanup(() => window.clearInterval(antibotTimer));
         const caveTimer = window.setInterval(() => {
+            const caveTab = document.querySelector('[data-tab-panel="cave"]');
+            if (!caveTab || !caveTab.getClientRects().length) return;
             refreshCaveStatus();
             refreshCavePresetControls();
             refreshCaveClosestStatus();
@@ -24274,8 +31447,6 @@ function upgradeSectionHeaders(panel) {
         bot.addCleanup(() => window.clearInterval(titleTimer));
         const lightHackLegitTimer = setInterval(refreshLightHackLegitStatus, 2000);
         bot.addCleanup(() => clearInterval(lightHackLegitTimer));
-        const paladinStatusTimer = window.setInterval(refreshPaladinStatus, 2000);
-        bot.addCleanup(() => window.clearInterval(paladinStatusTimer));
 
         // Position, drag, collapse
         applySavedPanelPosition(panel);
@@ -24430,6 +31601,7 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
         installed: false,
         nm: null,
         originalSetServerMessage: null,
+        wrapper: null,
         retryTimer: null,
     };
 
@@ -24456,18 +31628,24 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
         }
 
         lootFilterState.nm = nm;
-        lootFilterState.originalSetServerMessage = nm.setServerMessage.bind(nm);
+        lootFilterState.originalSetServerMessage = nm.setServerMessage;
 
+        const originalSetServerMessage = nm.setServerMessage;
         nm.setServerMessage = function (message, color, priority) {
             if (config.hideLootMessages &&
                 typeof message === "string" &&
                 message.startsWith(LOOT_PREFIX)) {
                 return false; // drop it
             }
-            return lootFilterState.originalSetServerMessage(message, color, priority);
+            return originalSetServerMessage.call(this, message, color, priority);
         };
 
+        lootFilterState.wrapper = nm.setServerMessage;
         lootFilterState.installed = true;
+        if (lootFilterState.retryTimer) {
+            window.clearInterval(lootFilterState.retryTimer);
+            lootFilterState.retryTimer = null;
+        }
         bot.log("[UI Tweaks] Loot message filter installed.");
     }
 
@@ -24481,9 +31659,12 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
             !lootFilterState.originalSetServerMessage) {
             return;
         }
-        lootFilterState.nm.setServerMessage = lootFilterState.originalSetServerMessage;
+        if (lootFilterState.nm.setServerMessage === lootFilterState.wrapper) {
+            lootFilterState.nm.setServerMessage = lootFilterState.originalSetServerMessage;
+        }
         lootFilterState.installed = false;
         lootFilterState.nm = null;
+        lootFilterState.wrapper = null;
         lootFilterState.originalSetServerMessage = null;
         bot.log("[UI Tweaks] Loot message filter removed.");
     }
@@ -24614,6 +31795,7 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
     // ---- Popup hider & floating text spoof ----
     let __originalCreateTextElement = null;
     let __originalCreateTextElementMethod = null;
+    let __floatingTextWrapper = null;
 
     // ---- Food consumption messages ----
     const CONSUMPTION_MSGS = new Set([
@@ -24809,6 +31991,7 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
                 new MessageElement(entity, message, color, loudness));
         };
 
+        __floatingTextWrapper = proto.createTextElement;
         bot.log("[UI] Floating text patch: installed (name spoof + popup hider)");
     }
 
@@ -25025,8 +32208,24 @@ function bindControls(panel) {
     // ---- Cleanup on bot destroy ----
     bot.addCleanup(() => {
         uninstallTTL();
-        applyLootFilter();
-        // Restore other patches if needed (handled individually)
+        uninstallLootFilter();
+        if (__originalNameDescriptor && typeof Creature !== "undefined") {
+            Object.defineProperty(Creature.prototype, 'name', __originalNameDescriptor);
+            __originalNameDescriptor = null;
+        }
+        if (__originalChannelAddMessage && typeof Channel !== "undefined") {
+            Channel.prototype.addMessage = __originalChannelAddMessage;
+            __originalChannelAddMessage = null;
+        }
+        const mgr = window.gameClient?.interface?.screenElementManager;
+        if (mgr && __originalCreateTextElementMethod) {
+            const proto = Object.getPrototypeOf(mgr);
+            if (proto.createTextElement === __floatingTextWrapper)
+                proto.createTextElement = __originalCreateTextElementMethod;
+        }
+        __floatingTextWrapper = null;
+        __originalCreateTextElement = null;
+        __originalCreateTextElementMethod = null;
     });
 
     // ---- Public API ----
@@ -25747,6 +32946,10 @@ window.__minibiaBotBundle.installTormentedGhostModule = function installTormente
         patched: false,
         replyTimer: null,
         debug: false,
+        hookOwner: null,
+        hookWrapper: null,
+        hookRetryTimer: null,
+        startTimer: null,
     };
 
     const config = Object.assign({
@@ -25812,14 +33015,19 @@ window.__minibiaBotBundle.installTormentedGhostModule = function installTormente
         if (state.patched)
             return;
         if (typeof Creature === 'undefined' || !Creature.prototype) {
-            setTimeout(installSpeechHook, 500);
+            if (state.running && config.enabled && state.hookRetryTimer === null)
+                state.hookRetryTimer = setTimeout(() => {
+                    state.hookRetryTimer = null;
+                    if (state.running && config.enabled) installSpeechHook();
+                }, 500);
             return;
         }
 
         const originalSay = Creature.prototype.say;
         state.originalSay = originalSay;
 
-        Creature.prototype.say = function (packet) {
+        state.hookOwner = Creature.prototype;
+        const wrapper = function (packet) {
             const result = originalSay.call(this, packet);
 
             if (!state.running || !config.enabled)
@@ -25847,6 +33055,13 @@ window.__minibiaBotBundle.installTormentedGhostModule = function installTormente
             if (now - last < config.cooldownMs)
                 return result;
             state.replyCooldown.set(creatureId, now);
+            if (state.replyCooldown.size > 200) {
+                for (const [id, at] of state.replyCooldown) {
+                    if (now - at >= config.cooldownMs) state.replyCooldown.delete(id);
+                }
+                while (state.replyCooldown.size > 200)
+                    state.replyCooldown.delete(state.replyCooldown.keys().next().value);
+            }
 
             if (config.triggerAlarm) {
                 bot.playGMAlarm?.();
@@ -25868,17 +33083,23 @@ window.__minibiaBotBundle.installTormentedGhostModule = function installTormente
             return result;
         };
 
+        state.hookWrapper = wrapper;
+        state.hookOwner.say = wrapper;
         state.patched = true;
         bot.log("[Ghost] Speech hook installed.");
     }
 
     function uninstallSpeechHook() {
-        if (!state.patched)
-            return;
-        if (state.originalSay) {
-            Creature.prototype.say = state.originalSay;
-            state.originalSay = null;
+        if (state.hookRetryTimer !== null) {
+            clearTimeout(state.hookRetryTimer);
+            state.hookRetryTimer = null;
         }
+        if (!state.patched) return;
+        if (state.hookOwner?.say === state.hookWrapper)
+            state.hookOwner.say = state.originalSay;
+        state.originalSay = null;
+        state.hookOwner = null;
+        state.hookWrapper = null;
         state.patched = false;
         bot.log("[Ghost] Speech hook removed.");
     }
@@ -25888,8 +33109,7 @@ window.__minibiaBotBundle.installTormentedGhostModule = function installTormente
             enabled: true
         });
         persistConfig();
-        if (state.running)
-            return false;
+        if (state.running && state.patched) return false;
         state.running = true;
         state.replyCooldown.clear();
         if (state.replyTimer) {
@@ -25904,11 +33124,16 @@ window.__minibiaBotBundle.installTormentedGhostModule = function installTormente
     function stop(options = {}) {
         const shouldPersist = options.persistEnabled !== false;
         state.running = false;
+        if (state.startTimer !== null) {
+            clearTimeout(state.startTimer);
+            state.startTimer = null;
+        }
         if (state.replyTimer) {
             clearTimeout(state.replyTimer);
             state.replyTimer = null;
         }
         uninstallSpeechHook();
+        state.replyCooldown.clear();
         if (shouldPersist) {
             config.enabled = false;
             persistConfig();
@@ -25944,7 +33169,11 @@ window.__minibiaBotBundle.installTormentedGhostModule = function installTormente
     }
 
     if (config.enabled)
-        setTimeout(() => start(), 1000);
+        state.startTimer = setTimeout(() => {
+            state.startTimer = null;
+            if (config.enabled) start();
+        }, 1000);
+    bot.addCleanup(() => stop({ persistEnabled: false }));
 
     bot.tormentedGhost = {
         start,
@@ -25971,6 +33200,16 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
         patched: false,
         resumeCave: false,
         resumeAttack: false,
+        hookOwner: null,
+        hookWrapper: null,
+        hookRetryTimer: null,
+        startupTimer: null,
+        walkInterval: null,
+        walkTimer: null,
+        delayedJobs: new Set(),
+        pendingTiles: new Set(),
+        attemptToken: 0,
+        ownedPathfinder: null,
     };
 
     const config = Object.assign({
@@ -26055,25 +33294,56 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
         return success;
     }
 
-    function __resumeModules() {
-        if (state.resumeCave) {
-            bot.cave.start();
-            state.resumeCave = false;
-        }
-        if (state.resumeAttack) {
-            bot.attack.start();
-            state.resumeAttack = false;
+    function clearPickupTimers() {
+        if (state.walkInterval !== null) clearInterval(state.walkInterval);
+        if (state.walkTimer !== null) clearTimeout(state.walkTimer);
+        state.walkInterval = state.walkTimer = null;
+        for (const timer of state.delayedJobs) clearTimeout(timer);
+        state.delayedJobs.clear();
+        state.pendingTiles.clear();
+    }
+
+    function __resumeModules(allowResume = state.running && config.enabled) {
+        clearPickupTimers();
+        // Only clear a destination if AutoPickup actually took control of
+        // Pathfinder; an adjacent pickup must never erase CaveBot's route.
+        // Clear it BEFORE restarting the paused modules, not after they may
+        // have already requested their next native path.
+        const ownedPathfinder = state.ownedPathfinder;
+        state.ownedPathfinder = null;
+        if (ownedPathfinder) {
+            ownedPathfinder.setPathfindCache?.(null);
+            ownedPathfinder.__finalDestination = null;
         }
         state.pickupInProgress = false;
-        const pf = gameClient.world.pathfinder;
-        pf.setPathfindCache(null);
-        pf.__finalDestination = null;
+        const resumeCave = allowResume && state.resumeCave;
+        const resumeAttack = allowResume && state.resumeAttack;
+        state.resumeCave = state.resumeAttack = false;
+        // A stop/reload/emergency disconnect must never restart either module.
+        if (resumeCave) bot.cave?.start?.();
+        if (resumeAttack) bot.attack?.start?.();
     }
 
     function __walkAndPickup(pos, itemId) {
-        if (state.pickupInProgress)
+        if (state.pickupInProgress || bot.actions?.isHalted?.() ||
+            bot.attack?.isCombatActive?.() || window.gameClient?.player?.getTarget?.())
             return;
         state.pickupInProgress = true;
+        const token = ++state.attemptToken;
+        const finish = () => {
+            if (token !== state.attemptToken || !state.pickupInProgress) return;
+            const current = bot.getPlayerPosition();
+            const inReach = current && current.z === pos.z &&
+                Math.max(Math.abs(pos.x - current.x), Math.abs(pos.y - current.y)) <= 1;
+            // A timeout is not an arrival. Avoid remote pickup requests and
+            // re-check combat in case a fight began during the walk.
+            if (inReach && !bot.actions?.isHalted?.() &&
+                !bot.attack?.isCombatActive?.() &&
+                !window.gameClient?.player?.getTarget?.()) {
+                __doPickup(pos, itemId);
+            }
+            __resumeModules();
+        };
 
         const playerPos = bot.getPlayerPosition();
         if (!playerPos) {
@@ -26083,9 +33353,7 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
 
         const dist = Math.max(Math.abs(pos.x - playerPos.x), Math.abs(pos.y - playerPos.y));
         if (dist <= 1) {
-            __doPickup(pos, itemId, function (success) {
-                __resumeModules();
-            });
+            finish();
             return;
         }
 
@@ -26104,32 +33372,35 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
             state.resumeAttack = true;
         }
 
-        const pf = gameClient.world.pathfinder;
-        pf.setPathfindCache(null);
-        pf.__finalDestination = null;
-        pf.findPath(playerPos, pos);
+        const pf = gameClient.world?.pathfinder;
+        if (!pf?.findPath) {
+            __resumeModules();
+            return;
+        }
+        state.ownedPathfinder = pf;
+        try {
+            pf.setPathfindCache?.(null);
+            pf.__finalDestination = null;
+            pf.findPath(playerPos, pos);
+        } catch (e) {
+            bot.log('[AutoPickup] Could not start pickup path:', e);
+            __resumeModules();
+            return;
+        }
 
-        let intervalId = setInterval(() => {
+        state.walkInterval = setInterval(() => {
             const currentPos = bot.getPlayerPosition();
             if (!currentPos)
                 return;
             const d = Math.max(Math.abs(pos.x - currentPos.x), Math.abs(pos.y - currentPos.y));
             if (d <= 1) {
-                clearInterval(intervalId);
-                __doPickup(pos, itemId, function (success) {
-                    __resumeModules();
-                });
+                finish();
             }
         }, 100);
 
-        setTimeout(() => {
-            if (intervalId) {
-                clearInterval(intervalId);
-                intervalId = null;
-            }
-            __doPickup(pos, itemId, function (success) {
-                __resumeModules();
-            });
+        state.walkTimer = setTimeout(() => {
+            if (token !== state.attemptToken) return;
+            finish();
         }, config.walkTimeoutMs);
     }
 
@@ -26139,13 +33410,19 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
             return;
         const handler = gameClient?.networkManager?.packetHandler;
         if (!handler || typeof handler.handleItemAdd !== "function") {
-            setTimeout(installHook, 500);
+            if (state.running && config.enabled && state.hookRetryTimer === null)
+                state.hookRetryTimer = setTimeout(() => {
+                    state.hookRetryTimer = null;
+                    if (state.running && config.enabled) installHook();
+                }, 500);
             return;
         }
 
         state.originalHandleItemAdd = handler.handleItemAdd;
-        handler.handleItemAdd = function (packet) {
-            const result = state.originalHandleItemAdd.call(this, packet);
+        state.hookOwner = handler;
+        const original = handler.handleItemAdd;
+        const wrapper = function (packet) {
+            const result = original.call(this, packet);
 
             if (!state.running || !config.enabled)
                 return result;
@@ -26180,41 +33457,72 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
                 return result;
             }
             state.cooldown.set(tileKey, now);
+            if (state.cooldown.size > 200) {
+                for (const [key, at] of state.cooldown)
+                    if (now - at >= config.cooldownMs) state.cooldown.delete(key);
+                while (state.cooldown.size > 200)
+                    state.cooldown.delete(state.cooldown.keys().next().value);
+            }
 
-            setTimeout(() => {
-                if (!state.running || !config.enabled)
-                    return;
-                const tile = gameClient.world.getTileFromWorldPosition(pos);
-                if (!tile)
-                    return;
-                const topItem = getTopItemOnTile(tile);
-                if (!topItem || topItem.id !== itemId)
-                    return;
-                // Re-check blacklist
-                const def2 = gameClient.itemDefinitionsByCid?.[topItem.id];
-                const name2 = def2?.properties?.name || "";
-                if (isItemIgnored(topItem.id, name2)) {
-                    bot.log(`[AutoPickup] Skipping blacklisted item (late check) ${topItem.id} (${name2})`);
-                    return;
-                }
-                __walkAndPickup(pos, itemId);
-            }, config.delayMs);
+            // Duplicate packet events for a tile share one bounded pending job.
+            // During active combat postpone pickup rather than stopping Targeting.
+            if (state.pendingTiles.has(tileKey) || state.pendingTiles.size >= 64)
+                return result;
+            state.pendingTiles.add(tileKey);
+            const pickupPos = { x: pos.x, y: pos.y, z: pos.z };
+            const schedulePickup = (attempt) => {
+                const delayedJob = setTimeout(() => {
+                    state.delayedJobs.delete(delayedJob);
+                    const abandon = () => state.pendingTiles.delete(tileKey);
+                    if (!state.running || !config.enabled || bot.actions?.isHalted?.()) {
+                        abandon();
+                        return;
+                    }
+                    const tile = gameClient.world?.getTileFromWorldPosition(pickupPos);
+                    const topItem = getTopItemOnTile(tile);
+                    if (!topItem || topItem.id !== itemId) {
+                        abandon();
+                        return;
+                    }
+                    const def2 = gameClient.itemDefinitionsByCid?.[topItem.id];
+                    const name2 = def2?.properties?.name || "";
+                    if (isItemIgnored(topItem.id, name2)) {
+                        abandon();
+                        return;
+                    }
+                    if (bot.attack?.isCombatActive?.() ||
+                        window.gameClient?.player?.getTarget?.() || state.pickupInProgress) {
+                        if (attempt < 30) schedulePickup(attempt + 1);
+                        else abandon();
+                        return;
+                    }
+                    abandon();
+                    __walkAndPickup(pickupPos, itemId);
+                }, attempt === 0 ? config.delayMs : 500);
+                state.delayedJobs.add(delayedJob);
+            };
+            schedulePickup(0);
 
             return result;
         };
 
+        state.hookWrapper = wrapper;
+        handler.handleItemAdd = wrapper;
         state.patched = true;
         bot.log("[AutoPickup] Hook installed.");
     }
 
     function uninstallHook() {
-        if (!state.patched)
-            return;
-        const handler = gameClient?.networkManager?.packetHandler;
-        if (handler && state.originalHandleItemAdd) {
-            handler.handleItemAdd = state.originalHandleItemAdd;
-            state.originalHandleItemAdd = null;
+        if (state.hookRetryTimer !== null) {
+            clearTimeout(state.hookRetryTimer);
+            state.hookRetryTimer = null;
         }
+        if (!state.patched) return;
+        if (state.hookOwner?.handleItemAdd === state.hookWrapper)
+            state.hookOwner.handleItemAdd = state.originalHandleItemAdd;
+        state.originalHandleItemAdd = null;
+        state.hookOwner = null;
+        state.hookWrapper = null;
         state.patched = false;
         bot.log("[AutoPickup] Hook removed.");
     }
@@ -26230,6 +33538,7 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
             return false;
         }
         state.running = true;
+        clearPickupTimers();
         state.cooldown.clear();
         state.pickupInProgress = false;
         state.resumeCave = false;
@@ -26245,10 +33554,16 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
     function stop(options = {}) {
         const shouldPersist = options.persistEnabled !== false;
         state.running = false;
-        if (state.pickupInProgress) {
-            __resumeModules();
+        ++state.attemptToken;
+        if (state.startupTimer !== null) {
+            clearTimeout(state.startupTimer);
+            state.startupTimer = null;
         }
+        // Explicit stop cancels walking and pending pickup; it must not resume
+        // CaveBot or Targeting after Pink Skull / destruction.
+        __resumeModules(false);
         uninstallHook();
+        state.cooldown.clear();
         if (shouldPersist) {
             config.enabled = false;
             persistConfig();
@@ -26299,13 +33614,18 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
     }
 
     if (config.enabled) {
-        setTimeout(() => start(), 1000);
+        state.startupTimer = setTimeout(() => {
+            state.startupTimer = null;
+            if (config.enabled) start();
+        }, 1000);
     }
+    bot.addCleanup(() => stop({ persistEnabled: false }));
 
     bot.autoPickup = {
         start,
         stop,
         status,
+        isBusy: () => state.pickupInProgress,
         updateConfig,
         config,
     };
@@ -26320,6 +33640,9 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         running: false,
         debuggerInstance: null,
         originalIsDevMode: null,
+        hookWrapper: null,
+        retryTimer: null,
+        destroyed: false,
     };
 
     const config = Object.assign({
@@ -26338,36 +33661,50 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         return dbg;
     }
 
+    function clearRetry() {
+        if (state.retryTimer !== null) {
+            clearTimeout(state.retryTimer);
+            state.retryTimer = null;
+        }
+    }
+
     function installHook() {
+        if (state.destroyed || !state.running || !config.enabled) return false;
         if (state.originalIsDevMode) return true;
         const dbg = findDebugger();
         if (!dbg) {
-            // Debugger instance not ready yet — retry
-            setTimeout(installHook, 500);
+            if (state.retryTimer === null) {
+                state.retryTimer = setTimeout(() => {
+                    state.retryTimer = null;
+                    installHook();
+                }, 500);
+            }
             return false;
         }
-
-        // Save the original — bind so we can call it later without `this` trouble
+        clearRetry();
+        // Preserve the original function identity for exact restoration.
+        const original = dbg.isDevMode;
         state.debuggerInstance = dbg;
-        state.originalIsDevMode = dbg.isDevMode.bind(dbg);
-
-        // Patch the INSTANCE (not the prototype). Most Tibia builds set
-        // isDevMode as an own property, so a prototype patch is a no-op.
-        dbg.isDevMode = function () {
+        state.originalIsDevMode = original;
+        state.hookWrapper = function () {
             if (state.running && config.enabled) return true;
-            return state.originalIsDevMode();
+            return original.apply(this, arguments);
         };
-
+        dbg.isDevMode = state.hookWrapper;
         bot.log("[ItemID] isDevMode patched on debugger instance.");
         return true;
     }
 
     function uninstallHook() {
-        if (!state.debuggerInstance || !state.originalIsDevMode) return;
-        state.debuggerInstance.isDevMode = state.originalIsDevMode;
+        clearRetry();
+        const dbg = state.debuggerInstance;
+        if (dbg && state.originalIsDevMode && dbg.isDevMode === state.hookWrapper) {
+            dbg.isDevMode = state.originalIsDevMode;
+            bot.log("[ItemID] isDevMode restored.");
+        }
         state.debuggerInstance = null;
         state.originalIsDevMode = null;
-        bot.log("[ItemID] isDevMode restored.");
+        state.hookWrapper = null;
     }
 
     function forceRedraw() {
@@ -26416,14 +33753,15 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
 
     // Restore on bot destroy
     bot.addCleanup(() => {
+        state.destroyed = true;
         state.running = false;
         uninstallHook();
     });
 
-    // Auto-start if the user had it enabled before reload
+    // Auto-start (or retry) without an untracked startup timer.
     if (config.enabled) {
         state.running = true;
-        setTimeout(() => installHook(), 500);
+        installHook();
     }
 
     bot.itemIdDisplay = {
@@ -26843,6 +34181,10 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         });
         document.addEventListener("touchstart", unlock, {
             once: true
+        });
+        bot.addCleanup(() => {
+            document.removeEventListener("click", unlock);
+            document.removeEventListener("touchstart", unlock);
         });
 
         window.pzBot = bot.pz;
