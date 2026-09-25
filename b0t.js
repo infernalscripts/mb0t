@@ -803,7 +803,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.5.45",
+        version: "1.5.51",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -844,6 +844,8 @@ addCleanup(() => {
                 this.talk.stop({
                     persistEnabled: false
                 });
+            if (this.looter?.stop)
+                this.looter.stop();
             if (this.ui?.destroy)
                 this.ui.destroy();
             stopReconnectWatcher();
@@ -27419,6 +27421,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         destinationId: null,
         destinationTitle: null,
         trackedItems: new Map(),
+        dropItemIds: new Set(),
         captureMode: false,
         captureHandler: null,
         pendingMove: null,
@@ -27436,6 +27439,25 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         corpseJobsFailed: 0,
         corpseDeathsQueued: 0,
         corpseDeathsIgnored: 0,
+
+        // v1.5.48: corpse-approach progress/recovery telemetry.
+        corpseApproachStalls: 0,
+        corpseApproachSideSwitches: 0,
+        corpseApproachNoRoute: 0,
+        corpseApproachLastReason: null,
+        corpseAdjacentSkips: 0,
+
+        // v1.5.50: corpse death-hook ownership/reload protection.
+        deathHookRepairs: 0,
+        staleDeathHooksRemoved: 0,
+        lastDeathHookRepairAt: 0,
+
+        // v1.5.51: per-item loot dropper.
+        droppedItemMoves: 0,
+        dropMoveFailures: 0,
+        lastDroppedItemId: null,
+        lastDroppedItemName: null,
+        lastDropAt: 0,
     };
 
     // Load config
@@ -27457,13 +27479,29 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         2500,
         Math.min(15000, Number(stored.corpseApproachTimeoutMs) || 8000)
     );
+    state.corpseStuckMs = Math.max(
+        800,
+        Math.min(3000, Number(stored.corpseStuckMs) || 1500)
+    );
     state.corpseLootHoldMs = Math.max(
         2000,
         Math.min(15000, Number(stored.corpseLootHoldMs) || 8000)
     );
     if (Array.isArray(stored.trackedItems)) {
         for (const [id, name] of stored.trackedItems) {
-            state.trackedItems.set(id, name);
+            state.trackedItems.set(Number(id), name);
+        }
+    }
+
+    if (Array.isArray(stored.dropItemIds)) {
+        for (const id of stored.dropItemIds) {
+            const numericId = Number(id);
+            if (
+                Number.isFinite(numericId) &&
+                state.trackedItems.has(numericId)
+            ) {
+                state.dropItemIds.add(numericId);
+            }
         }
     }
 
@@ -27472,10 +27510,12 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             destinationId: state.destinationId,
             destinationTitle: state.destinationTitle,
             trackedItems: Array.from(state.trackedItems.entries()),
+            dropItemIds: Array.from(state.dropItemIds.values()),
             walkToCorpses: state.walkToCorpses,
             corpseMaxDistance: state.corpseMaxDistance,
             corpseOpenDelayMs: state.corpseOpenDelayMs,
             corpseApproachTimeoutMs: state.corpseApproachTimeoutMs,
+            corpseStuckMs: state.corpseStuckMs,
             corpseLootHoldMs: state.corpseLootHoldMs,
         });
     }
@@ -27645,6 +27685,210 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         return null;
     }
 
+    function isDropTrackedItem(itemId) {
+        return state.dropItemIds.has(
+            Number(itemId)
+        );
+    }
+
+    function setTrackedItemDrop(
+        itemId,
+        enabled
+    ) {
+        const id = Number(itemId);
+        if (
+            !Number.isFinite(id) ||
+            !state.trackedItems.has(id)
+        ) {
+            return false;
+        }
+
+        if (enabled)
+            state.dropItemIds.add(id);
+        else
+            state.dropItemIds.delete(id);
+
+        persistConfig();
+
+        if (
+            typeof bot.ui?.refreshLooterStatus ===
+                "function"
+        ) {
+            bot.ui.refreshLooterStatus();
+        }
+
+        return true;
+    }
+
+    function containerHasDestinationTrackedItems(
+        container
+    ) {
+        if (!container)
+            return false;
+
+        for (
+            let slot = 0;
+            slot < container.size;
+            slot++
+        ) {
+            const item =
+                container.getSlotItem?.(slot);
+
+            if (
+                item &&
+                state.trackedItems.has(item.id) &&
+                !isDropTrackedItem(item.id)
+            ) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    function getPlayerDropTile() {
+        const player =
+            window.gameClient?.player;
+
+        if (!player)
+            return null;
+
+        try {
+            const tile =
+                player.getTile?.();
+            if (tile)
+                return tile;
+        } catch (e) {}
+
+        try {
+            const pos =
+                player.getPosition?.() ||
+                bot.getPlayerPosition?.();
+
+            if (!pos)
+                return null;
+
+            return (
+                window.gameClient?.world
+                    ?.getTileFromWorldPosition?.(
+                        pos
+                    ) || null
+            );
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function sendTrackedItemDrop(
+        container,
+        slot,
+        item,
+        now = Date.now()
+    ) {
+        if (
+            !container ||
+            !item ||
+            !state.trackedItems.has(item.id) ||
+            !isDropTrackedItem(item.id)
+        ) {
+            return false;
+        }
+
+        const tile =
+            getPlayerDropTile();
+
+        if (!tile) {
+            state.dropMoveFailures++;
+            return false;
+        }
+
+        const sendDrop = () => {
+            const from = {
+                which: container,
+                index: slot
+            };
+            const to = {
+                which: tile,
+                index: 0xFF
+            };
+
+            if (
+                window.gameClient?.mouse
+                    ?.sendItemMove
+            ) {
+                window.gameClient.mouse
+                    .sendItemMove(
+                        from,
+                        to,
+                        item.count
+                    );
+            } else if (
+                window.gameClient?.send &&
+                typeof ItemMovePacket ===
+                    "function"
+            ) {
+                window.gameClient.send(
+                    new ItemMovePacket(
+                        from,
+                        to,
+                        item.count
+                    )
+                );
+            } else {
+                return false;
+            }
+
+            return true;
+        };
+
+        let sent = false;
+
+        try {
+            sent =
+                bot.actions?.runShared
+                    ? bot.actions.runShared(
+                        "looter-drop",
+                        bot.actions.priorities
+                            .UTILITY,
+                        sendDrop
+                    )
+                    : sendDrop();
+        } catch (e) {
+            state.dropMoveFailures++;
+            bot.log(
+                "Looter: drop move failed",
+                e
+            );
+            return false;
+        }
+
+        if (!sent) {
+            state.dropMoveFailures++;
+            return false;
+        }
+
+        state.pendingMove = {
+            kind: "drop",
+            sourceId:
+                container.__containerId,
+            slot,
+            itemId: item.id,
+            count: item.count,
+            at: now
+        };
+
+        state.droppedItemMoves++;
+        state.lastDroppedItemId =
+            item.id;
+        state.lastDroppedItemName =
+            state.trackedItems.get(
+                item.id
+            ) || null;
+        state.lastDropAt = now;
+
+        return true;
+    }
+
     function containerHasTrackedItems(container) {
         if (!container)
             return false;
@@ -27696,97 +27940,232 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         } catch (e) {}
     }
 
-    function getCorpseApproachDestination(
+    function getCorpseApproachKey(pos) {
+        if (!pos)
+            return "";
+        return `${Number(pos.x)},${Number(pos.y)},${Number(pos.z)}`;
+    }
+
+    function getCorpseApproachCandidates(
         corpsePosition,
-        playerPosition
+        playerPosition,
+        excludedKeys = null
     ) {
         if (!corpsePosition || !playerPosition)
-            return null;
+            return [];
 
-        const mouse = window.gameClient?.mouse;
+        const world = window.gameClient?.world;
+        const pf = world?.pathfinder;
+        if (!world || !pf)
+            return [];
 
-        try {
+        const startPos = new Position(
+            Number(playerPosition.x),
+            Number(playerPosition.y),
+            Number(playerPosition.z)
+        );
+        const startTile =
+            world.getTileFromWorldPosition?.(startPos) ||
+            null;
+
+        if (!startTile)
+            return [];
+
+        const offsets = [
+            { x: 0, y: -1 },
+            { x: 1, y: 0 },
+            { x: 0, y: 1 },
+            { x: -1, y: 0 },
+            { x: -1, y: -1 },
+            { x: 1, y: -1 },
+            { x: -1, y: 1 },
+            { x: 1, y: 1 }
+        ];
+
+        const candidates = [];
+
+        for (const offset of offsets) {
+            const pos = new Position(
+                Number(corpsePosition.x) +
+                    offset.x,
+                Number(corpsePosition.y) +
+                    offset.y,
+                Number(corpsePosition.z)
+            );
+
+            const key =
+                getCorpseApproachKey(pos);
+
             if (
-                mouse &&
-                typeof mouse.__findAdjacentWalkable === "function"
+                excludedKeys?.has?.(key)
             ) {
-                const nativeDestination =
-                    mouse.__findAdjacentWalkable(
-                        new Position(
-                            corpsePosition.x,
-                            corpsePosition.y,
-                            corpsePosition.z
-                        ),
-                        playerPosition
+                continue;
+            }
+
+            const tile =
+                world.getTileFromWorldPosition?.(pos) ||
+                null;
+
+            if (!tile)
+                continue;
+
+            let walkable = false;
+            let occupied = false;
+
+            try {
+                walkable =
+                    tile.isWalkable?.() === true;
+                occupied =
+                    tile.isOccupied?.() === true;
+            } catch (e) {}
+
+            if (!walkable)
+                continue;
+
+            const alreadyThere =
+                Number(pos.x) ===
+                    Number(playerPosition.x) &&
+                Number(pos.y) ===
+                    Number(playerPosition.y) &&
+                Number(pos.z) ===
+                    Number(playerPosition.z);
+
+            // A locally walkable tile occupied by another creature is not a
+            // useful corpse-approach destination. The player's own tile is OK.
+            if (occupied && !alreadyThere)
+                continue;
+
+            if (alreadyThere) {
+                candidates.push({
+                    pos,
+                    key,
+                    pathSteps: 0,
+                    pathCost: 0
+                });
+                continue;
+            }
+
+            if (typeof pf.search !== "function")
+                continue;
+
+            try {
+                const path =
+                    pf.search(
+                        startTile,
+                        tile
                     );
 
-                if (nativeDestination)
-                    return nativeDestination;
-            }
-        } catch (e) {}
-
-        // Conservative fallback: inspect only the eight adjacent tiles and let
-        // the native pathfinder decide whether the selected tile is reachable.
-        const world = window.gameClient?.world;
-        const candidates = [];
-        for (let dx = -1; dx <= 1; dx++) {
-            for (let dy = -1; dy <= 1; dy++) {
-                if (dx === 0 && dy === 0)
+                if (
+                    !Array.isArray(path) ||
+                    path.length <= 0
+                ) {
                     continue;
+                }
 
-                const pos = new Position(
-                    Number(corpsePosition.x) + dx,
-                    Number(corpsePosition.y) + dy,
-                    Number(corpsePosition.z)
-                );
-
-                let tile = null;
-                try {
-                    tile =
-                        world?.getTileFromWorldPosition?.(pos) ||
-                        null;
-                } catch (e) {}
-
-                if (!tile)
-                    continue;
-
-                let walkable = false;
-                try {
-                    walkable =
-                        tile.isWalkable?.() === true &&
-                        tile.isOccupied?.() !== true;
-                } catch (e) {}
-
-                if (!walkable)
-                    continue;
-
-                const distance = Math.max(
-                    Math.abs(pos.x - playerPosition.x),
-                    Math.abs(pos.y - playerPosition.y)
-                );
+                const rawCost =
+                    Number(tile.__g);
 
                 candidates.push({
                     pos,
-                    distance
+                    key,
+                    pathSteps:
+                        path.length,
+                    pathCost:
+                        Number.isFinite(rawCost) &&
+                        rawCost >= 0
+                            ? rawCost
+                            : path.length * 100
                 });
-            }
+            } catch (e) {}
         }
 
-        candidates.sort((a, b) =>
-            a.distance - b.distance
-        );
+        candidates.sort((a, b) => {
+            if (a.pathCost !== b.pathCost)
+                return a.pathCost - b.pathCost;
+            if (a.pathSteps !== b.pathSteps)
+                return a.pathSteps - b.pathSteps;
 
-        return candidates[0]?.pos || null;
+            const ad =
+                Math.abs(
+                    Number(a.pos.x) -
+                    Number(playerPosition.x)
+                ) +
+                Math.abs(
+                    Number(a.pos.y) -
+                    Number(playerPosition.y)
+                );
+            const bd =
+                Math.abs(
+                    Number(b.pos.x) -
+                    Number(playerPosition.x)
+                ) +
+                Math.abs(
+                    Number(b.pos.y) -
+                    Number(playerPosition.y)
+                );
+
+            return ad - bd;
+        });
+
+        return candidates;
+    }
+
+    function getCorpseApproachDestination(
+        corpsePosition,
+        playerPosition,
+        excludedKeys = null
+    ) {
+        const candidates =
+            getCorpseApproachCandidates(
+                corpsePosition,
+                playerPosition,
+                excludedKeys
+            );
+
+        return candidates[0] || null;
+    }
+
+    function noteCorpseApproachProgress(
+        job,
+        playerPos,
+        now = Date.now()
+    ) {
+        if (!job || !playerPos)
+            return false;
+
+        const key =
+            getCorpseApproachKey(
+                playerPos
+            );
+
+        if (
+            key &&
+            key !== job.lastPlayerPositionKey
+        ) {
+            job.lastPlayerPositionKey = key;
+            job.lastProgressAt = now;
+            job.lastProgressPosition = {
+                x: Number(playerPos.x),
+                y: Number(playerPos.y),
+                z: Number(playerPos.z)
+            };
+            return true;
+        }
+
+        return false;
     }
 
     function walkAdjacentToCorpse(
         job,
-        now = Date.now()
+        now = Date.now(),
+        reason = "initial approach"
     ) {
         if (!job?.position)
             return false;
 
-        const playerPos = bot.getPlayerPosition();
+        const playerPos =
+            bot.getPlayerPosition();
+
         if (
             !playerPos ||
             Number(playerPos.z) !==
@@ -27794,6 +28173,12 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         ) {
             return false;
         }
+
+        noteCorpseApproachProgress(
+            job,
+            playerPos,
+            now
+        );
 
         const dx = Math.abs(
             Number(job.position.x) -
@@ -27804,31 +28189,50 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             Number(playerPos.y)
         );
 
-        // Already beside it. The game's auto-open-corpse behavior owns the
-        // actual opening; Looter deliberately sends no use/open action.
         if (dx <= 1 && dy <= 1) {
             job.arrivedAdjacentAt =
                 job.arrivedAdjacentAt || now;
+            clearCorpseApproachMovement(job);
             return true;
         }
 
-        const destination =
+        const route =
             getCorpseApproachDestination(
                 job.position,
-                playerPos
+                playerPos,
+                job.failedApproachKeys
             );
 
-        if (!destination)
+        if (!route?.pos) {
+            state.corpseApproachNoRoute++;
+            state.corpseApproachLastReason =
+                `${reason}: no reachable adjacent tile`;
             return false;
+        }
 
-        const pf = window.gameClient?.world?.pathfinder;
-        if (!pf || typeof pf.findPath !== "function")
+        const destination =
+            route.pos;
+
+        const pf =
+            window.gameClient?.world?.pathfinder;
+
+        if (
+            !pf ||
+            typeof pf.findPath !== "function"
+        ) {
             return false;
+        }
 
         try {
-            pf.__pathfindCache = new Array();
-            pf.__finalDestination = null;
+            // Cancel only the previous corpse approach before choosing a new
+            // side. setPathfindCache(null) also clears stale autowalk state.
+            if (
+                job.walkDestination
+            ) {
+                clearCorpseApproachMovement(job);
+            }
 
+            pf.setPathfindCache?.(null);
             pf.findPath(
                 playerPos,
                 destination
@@ -27839,8 +28243,29 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                 y: Number(destination.y),
                 z: Number(destination.z)
             };
+            job.walkDestinationKey =
+                route.key;
             job.lastWalkAt = now;
+            job.lastProgressAt =
+                job.lastProgressAt || now;
             job.walkAttempts++;
+            job.lastWalkReason = reason;
+
+            bot.log(
+                "Looter: corpse approach route selected",
+                {
+                    reason,
+                    destination:
+                        job.walkDestination,
+                    pathSteps:
+                        route.pathSteps,
+                    pathCost:
+                        route.pathCost,
+                    attempt:
+                        job.walkAttempts
+                }
+            );
+
             return true;
         } catch (e) {
             bot.log(
@@ -27851,9 +28276,156 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         }
     }
 
+    function recoverStalledCorpseApproach(
+        job,
+        now = Date.now()
+    ) {
+        if (!job)
+            return false;
+
+        const playerPos =
+            bot.getPlayerPosition();
+
+        if (!playerPos)
+            return false;
+
+        noteCorpseApproachProgress(
+            job,
+            playerPos,
+            now
+        );
+
+        const dx = Math.abs(
+            Number(job.position.x) -
+            Number(playerPos.x)
+        );
+        const dy = Math.abs(
+            Number(job.position.y) -
+            Number(playerPos.y)
+        );
+
+        if (
+            dx <= 1 &&
+            dy <= 1 &&
+            Number(playerPos.z) ===
+                Number(job.position.z)
+        ) {
+            job.arrivedAdjacentAt =
+                job.arrivedAdjacentAt || now;
+            return true;
+        }
+
+        const stuckMs =
+            Math.max(
+                800,
+                Math.min(
+                    3000,
+                    Number(
+                        state.corpseStuckMs
+                    ) || 1500
+                )
+            );
+
+        if (
+            now -
+                Number(
+                    job.lastProgressAt ||
+                    job.startedAt ||
+                    now
+                ) <
+            stuckMs
+        ) {
+            return false;
+        }
+
+        state.corpseApproachStalls++;
+        state.corpseApproachLastReason =
+            "movement stalled";
+
+        if (!job.failedApproachKeys)
+            job.failedApproachKeys =
+                new Set();
+
+        if (job.walkDestinationKey) {
+            job.failedApproachKeys.add(
+                job.walkDestinationKey
+            );
+        }
+
+        clearCorpseApproachMovement(job);
+
+        // Refresh the progress watchdog before the new attempt so the next side
+        // gets a full grace period of its own.
+        job.lastProgressAt = now;
+
+        if (
+            walkAdjacentToCorpse(
+                job,
+                now,
+                "movement stalled – alternate side"
+            )
+        ) {
+            state.corpseApproachSideSwitches++;
+            return true;
+        }
+
+        // Dynamic blockers may have made every side unavailable. Clear the
+        // failed-side memory once and re-evaluate all reachable adjacent tiles
+        // before giving up completely.
+        if (
+            job.failedApproachKeys.size > 0 &&
+            !job.failedSideResetUsed
+        ) {
+            job.failedSideResetUsed = true;
+            job.failedApproachKeys.clear();
+
+            if (
+                walkAdjacentToCorpse(
+                    job,
+                    now,
+                    "movement stalled – retry all sides"
+                )
+            ) {
+                state.corpseApproachSideSwitches++;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     function pauseModulesForCorpse(job) {
         if (!job)
-            return;
+            return false;
+
+        const playerPos =
+            bot.getPlayerPosition();
+
+        if (
+            playerPos &&
+            Number(playerPos.z) ===
+                Number(job.position?.z)
+        ) {
+            const distance =
+                Math.max(
+                    Math.abs(
+                        Number(job.position?.x) -
+                        Number(playerPos.x)
+                    ),
+                    Math.abs(
+                        Number(job.position?.y) -
+                        Number(playerPos.y)
+                    )
+                );
+
+            if (
+                Number.isFinite(distance) &&
+                distance <= 1
+            ) {
+                state.corpseAdjacentSkips++;
+                return false;
+            }
+        }
 
         job.resumeCave =
             !!bot.cave?.status?.().running;
@@ -27873,6 +28445,8 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                 persistEnabled: false
             });
         }
+
+        return true;
     }
 
     function resumeModulesAfterCorpse(job) {
@@ -27964,6 +28538,15 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             Math.abs(Number(pos.y) - Number(playerPos.y))
         );
 
+        // v1.5.49: if the monster dies on an adjacent tile, do not create a
+        // movement-ownership job at all. The game's normal corpse auto-open
+        // and existing Looter container scan can handle it without pausing
+        // CaveBot or Targeting.
+        if (Number.isFinite(distance) && distance <= 1) {
+            state.corpseAdjacentSkips++;
+            return false;
+        }
+
         if (
             !Number.isFinite(distance) ||
             distance > state.corpseMaxDistance
@@ -27985,6 +28568,12 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         while (state.corpseQueue.length >= 8)
             state.corpseQueue.shift();
 
+        // Final invariant: corpse walking NEVER queues adjacent corpses.
+        if (distance <= 1) {
+            state.corpseAdjacentSkips++;
+            return false;
+        }
+
         state.corpseQueue.push({
             key,
             monsterId: creature.id,
@@ -28005,7 +28594,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         state.corpseDeathsQueued++;
 
         bot.log(
-            "Looter: queued distant corpse",
+            `Looter v${bot.version}: queued distant corpse`,
             {
                 id: creature.id,
                 name:
@@ -28021,6 +28610,177 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
 
         scheduleNextTick(100);
         return true;
+    }
+
+    function looksLikeLegacyLooterDeathHook(fn) {
+        if (typeof fn !== "function")
+            return false;
+
+        if (fn.__mbotLooterDeathHook === true)
+            return true;
+
+        try {
+            const source =
+                Function.prototype.toString.call(fn);
+
+            return (
+                source.includes(
+                    "Looter: corpse death hook failed"
+                ) &&
+                source.includes(
+                    "enqueueCorpseDeath"
+                ) &&
+                source.includes(
+                    "CONST.PROPERTIES.HEALTH"
+                )
+            );
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function getNativePropertyChangeHandler(handler) {
+        if (!handler)
+            return null;
+
+        try {
+            const proto =
+                Object.getPrototypeOf(handler);
+
+            if (
+                proto &&
+                typeof proto.handlePropertyChange ===
+                    "function"
+            ) {
+                return proto.handlePropertyChange;
+            }
+        } catch (e) {}
+
+        try {
+            if (
+                typeof PacketHandler !== "undefined" &&
+                typeof PacketHandler.prototype
+                    ?.handlePropertyChange ===
+                    "function"
+            ) {
+                return PacketHandler.prototype
+                    .handlePropertyChange;
+            }
+        } catch (e) {}
+
+        return null;
+    }
+
+    function stripStaleLooterDeathHooks(handler) {
+        if (
+            !handler ||
+            typeof handler.handlePropertyChange !==
+                "function"
+        ) {
+            return 0;
+        }
+
+        let current =
+            handler.handlePropertyChange;
+        let removed = 0;
+
+        while (
+            current?.__mbotLooterDeathHook ===
+                true &&
+            typeof current
+                .__mbotLooterDeathHookOriginal ===
+                "function" &&
+            removed < 16
+        ) {
+            current =
+                current
+                    .__mbotLooterDeathHookOriginal;
+            removed++;
+        }
+
+        if (
+            looksLikeLegacyLooterDeathHook(
+                current
+            )
+        ) {
+            const nativeHandler =
+                getNativePropertyChangeHandler(
+                    handler
+                );
+
+            if (
+                nativeHandler &&
+                nativeHandler !== current
+            ) {
+                current = nativeHandler;
+                removed++;
+            }
+        }
+
+        if (
+            removed > 0 &&
+            handler.handlePropertyChange !==
+                current
+        ) {
+            handler.handlePropertyChange =
+                current;
+            state.deathHookRepairs++;
+            state.staleDeathHooksRemoved +=
+                removed;
+            state.lastDeathHookRepairAt =
+                Date.now();
+
+            bot.log(
+                "Looter: removed stale corpse death hook(s)",
+                {
+                    removed,
+                    version: bot.version
+                }
+            );
+        }
+
+        return removed;
+    }
+
+    function ensureDeathHookOwnership() {
+        if (!state.running)
+            return false;
+
+        const handler =
+            window.gameClient?.networkManager
+                ?.packetHandler;
+
+        if (
+            !handler ||
+            typeof handler.handlePropertyChange !==
+                "function"
+        ) {
+            return false;
+        }
+
+        if (
+            state.deathHookWrapper &&
+            handler.handlePropertyChange ===
+                state.deathHookWrapper
+        ) {
+            return true;
+        }
+
+        if (
+            looksLikeLegacyLooterDeathHook(
+                handler.handlePropertyChange
+            )
+        ) {
+            stripStaleLooterDeathHooks(
+                handler
+            );
+        }
+
+        state.deathHookOwner = null;
+        state.deathHookOriginal = null;
+        state.deathHookWrapper = null;
+
+        return installDeathHook();
     }
 
     function installDeathHook() {
@@ -28046,6 +28806,10 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             }
             return false;
         }
+
+        stripStaleLooterDeathHooks(
+            handler
+        );
 
         const original =
             handler.handlePropertyChange;
@@ -28127,6 +28891,12 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             return result;
         };
 
+        wrapper.__mbotLooterDeathHook = true;
+        wrapper.__mbotLooterDeathHookVersion =
+            String(bot.version || "?");
+        wrapper.__mbotLooterDeathHookOriginal =
+            original;
+
         state.deathHookOwner = handler;
         state.deathHookOriginal = original;
         state.deathHookWrapper = wrapper;
@@ -28206,6 +28976,25 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                 )
             );
 
+            // Re-check right before ownership. The corpse may have been distant
+            // when queued but the player can naturally reach it during the
+            // short death->corpse delay. In that case normal looting should
+            // continue with ZERO CaveBot/Targeting pause.
+            if (distance <= 1) {
+                state.corpseQueue.shift();
+                state.corpseAdjacentSkips++;
+                bot.log(
+                    "Looter: corpse already adjacent – no approach needed",
+                    {
+                        monster:
+                            candidate.monsterName,
+                        position:
+                            candidate.position
+                    }
+                );
+                continue;
+            }
+
             if (distance > state.corpseMaxDistance) {
                 state.corpseQueue.shift();
                 state.corpseJobsFailed++;
@@ -28229,6 +29018,20 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                 walkAttempts: 0,
                 arrivedAdjacentAt: 0,
                 walkDestination: null,
+                walkDestinationKey: null,
+                failedApproachKeys: new Set(),
+                failedSideResetUsed: false,
+                lastPlayerPositionKey:
+                    getCorpseApproachKey(
+                        playerPos
+                    ),
+                lastProgressAt: now,
+                lastProgressPosition: {
+                    x: Number(playerPos.x),
+                    y: Number(playerPos.y),
+                    z: Number(playerPos.z)
+                },
+                lastWalkReason: null,
                 baselineContainerIds:
                     getOpenContainerIds(),
                 openedContainerId: null,
@@ -28237,9 +29040,13 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             };
 
             state.corpseJob = job;
-            state.corpseJobsStarted++;
 
-            pauseModulesForCorpse(job);
+            if (!pauseModulesForCorpse(job)) {
+                state.corpseJob = null;
+                continue;
+            }
+
+            state.corpseJobsStarted++;
 
             bot.log(
                 "Looter: walking to distant corpse",
@@ -28365,16 +29172,35 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                     return true;
                 }
 
-                // Re-path at a low rate if movement was interrupted before
-                // reaching the adjacent tile.
-                if (
-                    now - job.lastWalkAt > 1000 &&
-                    job.walkAttempts < 5
-                ) {
-                    if (!walkAdjacentToCorpse(job, now)) {
+                noteCorpseApproachProgress(
+                    job,
+                    playerPos,
+                    now
+                );
+
+                const stalled =
+                    now -
+                        Number(
+                            job.lastProgressAt ||
+                            job.startedAt ||
+                            now
+                        ) >=
+                    state.corpseStuckMs;
+
+                if (stalled) {
+                    const recovered =
+                        recoverStalledCorpseApproach(
+                            job,
+                            now
+                        );
+
+                    if (
+                        !recovered &&
+                        now - job.startedAt > 2500
+                    ) {
                         finishCorpseJob(
                             false,
-                            "corpse approach path unavailable"
+                            "corpse approach stalled with no reachable alternate side"
                         );
                     }
                 }
@@ -28396,9 +29222,18 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             return false;
         }
 
+        const needsDestination =
+            containerHasDestinationTrackedItems(
+                corpseContainer
+            );
+
         const dest =
             getDestinationContainer();
-        if (!dest) {
+
+        if (
+            needsDestination &&
+            !dest
+        ) {
             finishCorpseJob(
                 false,
                 "no destination container"
@@ -28406,7 +29241,10 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             return false;
         }
 
-        if (findEmptySlot(dest) === -1) {
+        if (
+            needsDestination &&
+            findEmptySlot(dest) === -1
+        ) {
             finishCorpseJob(
                 false,
                 "destination container full"
@@ -28414,7 +29252,8 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             return false;
         }
 
-        // Existing tracked-item transfer logic owns the actual item moves.
+        // Drop-marked items go to the player's tile first; ordinary tracked
+        // loot still goes to the selected destination.
         moveItems();
 
         const pendingFromCorpse =
@@ -28452,87 +29291,276 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
     // re-sending every slot before acknowledgement can duplicate requests and
     // repeatedly target the same empty destination slot.
     function moveItems() {
-        if (!state.running || bot.actions?.isHalted?.() ||
-            bot.autoPickup?.isBusy?.())
-            return false;
-        const dest = getDestinationContainer();
-        if (!dest) {
-            if (!state._lastDestLog || Date.now() - state._lastDestLog > 30000) {
-                state._lastDestLog = Date.now();
-                bot.log("Looter: no destination container found. Make sure it's open and selected.");
-            }
-            state.pendingMove = null;
+        if (
+            !state.running ||
+            bot.actions?.isHalted?.() ||
+            bot.autoPickup?.isBusy?.()
+        ) {
             return false;
         }
 
         const now = Date.now();
+
         if (state.pendingMove) {
-            const pending = state.pendingMove;
-            const source = getContainerById(pending.sourceId);
-            const item = source?.getSlotItem?.(pending.slot);
-            const destination = getContainerById(pending.destId);
-            const targetItem = destination?.getSlotItem?.(pending.targetSlot);
-            if (!source || !destination || source.__containerId === destination.__containerId) {
+            const pending =
+                state.pendingMove;
+            const source =
+                getContainerById(
+                    pending.sourceId
+                );
+            const item =
+                source?.getSlotItem?.(
+                    pending.slot
+                );
+
+            if (!source) {
                 state.pendingMove = null;
                 return false;
             }
-            // Any observed change means the client is catching up: wait for the next tick
-            // before looking for another item. No optimistic source-slot reuse.
-            if (!item || item.id !== pending.itemId || item.count !== pending.count) {
+
+            // A changed/empty source slot means the server acknowledged it.
+            if (
+                !item ||
+                item.id !== pending.itemId ||
+                item.count !== pending.count
+            ) {
                 state.pendingMove = null;
                 return false;
             }
-            // Destination can update before source: do not re-send from a stale
-            // source slot while the server is still synchronizing containers.
-            if (targetItem && now - pending.at < 5000) return false;
-            if (now - pending.at < 3000) return false;
-            state.pendingMove = null;
+
+            if (
+                pending.kind === "drop"
+            ) {
+                if (
+                    now - pending.at <
+                    3000
+                ) {
+                    return false;
+                }
+
+                state.pendingMove = null;
+            } else {
+                const destination =
+                    getContainerById(
+                        pending.destId
+                    );
+                const targetItem =
+                    destination?.getSlotItem?.(
+                        pending.targetSlot
+                    );
+
+                if (
+                    !destination ||
+                    source.__containerId ===
+                        destination.__containerId
+                ) {
+                    state.pendingMove = null;
+                    return false;
+                }
+
+                if (
+                    targetItem &&
+                    now - pending.at < 5000
+                ) {
+                    return false;
+                }
+
+                if (
+                    now - pending.at <
+                    3000
+                ) {
+                    return false;
+                }
+
+                state.pendingMove = null;
+            }
         }
 
-        const containers = getContainersArray();
+        const containers =
+            getContainersArray();
+
+        // Pass 1: drop-marked items. Includes the selected destination bag so
+        // toggling Drop also clears matching stacks already stored there.
         for (const container of containers) {
-            if (container.__containerId === dest.__containerId) continue;
-            for (let slot = 0; slot < container.size; slot++) {
-                const item = container.getSlotItem(slot);
-                if (!item || !state.trackedItems.has(item.id)) continue;
-                const targetSlot = findEmptySlot(dest);
+            for (
+                let slot = 0;
+                slot < container.size;
+                slot++
+            ) {
+                const item =
+                    container.getSlotItem(slot);
+
+                if (
+                    !item ||
+                    !state.trackedItems.has(
+                        item.id
+                    ) ||
+                    !isDropTrackedItem(
+                        item.id
+                    )
+                ) {
+                    continue;
+                }
+
+                return sendTrackedItemDrop(
+                    container,
+                    slot,
+                    item,
+                    now
+                );
+            }
+        }
+
+        // Pass 2: normal tracked items go to the selected destination.
+        const dest =
+            getDestinationContainer();
+
+        if (!dest) {
+            if (
+                !state._lastDestLog ||
+                now -
+                    state._lastDestLog >
+                    30000
+            ) {
+                state._lastDestLog = now;
+                bot.log(
+                    "Looter: no destination container found. Drop-marked items still work; normal loot requires an open selected destination."
+                );
+            }
+
+            return false;
+        }
+
+        for (const container of containers) {
+            if (
+                container.__containerId ===
+                dest.__containerId
+            ) {
+                continue;
+            }
+
+            for (
+                let slot = 0;
+                slot < container.size;
+                slot++
+            ) {
+                const item =
+                    container.getSlotItem(slot);
+
+                if (
+                    !item ||
+                    !state.trackedItems.has(
+                        item.id
+                    ) ||
+                    isDropTrackedItem(
+                        item.id
+                    )
+                ) {
+                    continue;
+                }
+
+                const targetSlot =
+                    findEmptySlot(dest);
+
                 if (targetSlot === -1) {
-                    if (now - state.lastFullLogAt > 30000) {
-                        state.lastFullLogAt = now;
-                        bot.log("Looter: destination container full");
+                    if (
+                        now -
+                            state.lastFullLogAt >
+                        30000
+                    ) {
+                        state.lastFullLogAt =
+                            now;
+                        bot.log(
+                            "Looter: destination container full"
+                        );
                     }
                     return false;
                 }
-                if (!window.gameClient?.mouse?.sendItemMove &&
-                    !window.gameClient?.send) return false;
-                let sent = false;
-                try {
-                    const sendMove = () => {
-                        const from = { which: container, index: slot };
-                        const to = { which: dest, index: targetSlot };
-                        if (window.gameClient?.mouse?.sendItemMove) {
-                            window.gameClient.mouse.sendItemMove(from, to, item.count);
-                        } else {
-                            window.gameClient.send(new ItemMovePacket(from, to, item.count));
-                        }
-                        return true;
-                    };
-                    sent = bot.actions?.runShared
-                        ? bot.actions.runShared('looter-move', bot.actions.priorities.UTILITY, sendMove)
-                        : sendMove();
-                } catch (e) {
-                    bot.log("Looter: move failed", e);
+
+                if (
+                    !window.gameClient?.mouse
+                        ?.sendItemMove &&
+                    !window.gameClient?.send
+                ) {
                     return false;
                 }
-                if (!sent) return false;
+
+                let sent = false;
+
+                try {
+                    const sendMove = () => {
+                        const from = {
+                            which: container,
+                            index: slot
+                        };
+                        const to = {
+                            which: dest,
+                            index: targetSlot
+                        };
+
+                        if (
+                            window.gameClient
+                                ?.mouse
+                                ?.sendItemMove
+                        ) {
+                            window.gameClient.mouse
+                                .sendItemMove(
+                                    from,
+                                    to,
+                                    item.count
+                                );
+                        } else {
+                            window.gameClient.send(
+                                new ItemMovePacket(
+                                    from,
+                                    to,
+                                    item.count
+                                )
+                            );
+                        }
+
+                        return true;
+                    };
+
+                    sent =
+                        bot.actions?.runShared
+                            ? bot.actions.runShared(
+                                "looter-move",
+                                bot.actions
+                                    .priorities
+                                    .UTILITY,
+                                sendMove
+                            )
+                            : sendMove();
+                } catch (e) {
+                    bot.log(
+                        "Looter: move failed",
+                        e
+                    );
+                    return false;
+                }
+
+                if (!sent)
+                    return false;
+
                 state.pendingMove = {
-                    sourceId: container.__containerId, slot,
-                    itemId: item.id, count: item.count,
-                    destId: dest.__containerId, targetSlot, at: now
+                    kind: "move",
+                    sourceId:
+                        container
+                            .__containerId,
+                    slot,
+                    itemId: item.id,
+                    count: item.count,
+                    destId:
+                        dest.__containerId,
+                    targetSlot,
+                    at: now
                 };
-                return true; // Wait for server/container update before the next move.
+
+                return true;
             }
         }
+
         return false;
     }
 
@@ -28541,6 +29569,8 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             return;
         try {
             const now = Date.now();
+
+            ensureDeathHookOwnership();
 
             if (state.corpseJob) {
                 updateCorpseJob(now);
@@ -28591,6 +29621,14 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         state.pendingMove = null;
         state.corpseQueue = [];
         state.corpseJob = null;
+        state.corpseApproachStalls = 0;
+        state.corpseApproachSideSwitches = 0;
+        state.corpseApproachNoRoute = 0;
+        state.corpseApproachLastReason = null;
+        state.corpseAdjacentSkips = 0;
+        state.deathHookRepairs = 0;
+        state.staleDeathHooksRemoved = 0;
+        state.lastDeathHookRepairAt = 0;
         installDeathHook();
         bot.log("Looter started");
         tick();
@@ -28639,11 +29677,36 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             destinationId: state.destinationId,
             destinationTitle: state.destinationTitle,
             trackedItems: Array.from(state.trackedItems.entries()),
+            dropItemIds: Array.from(state.dropItemIds.values()),
             walkToCorpses: state.walkToCorpses,
             corpseMaxDistance: state.corpseMaxDistance,
             corpseOpenDelayMs: state.corpseOpenDelayMs,
             corpseApproachTimeoutMs: state.corpseApproachTimeoutMs,
+            corpseStuckMs: state.corpseStuckMs,
             corpseLootHoldMs: state.corpseLootHoldMs,
+            corpseApproachStalls:
+                state.corpseApproachStalls,
+            corpseApproachSideSwitches:
+                state.corpseApproachSideSwitches,
+            corpseApproachNoRoute:
+                state.corpseApproachNoRoute,
+            corpseApproachLastReason:
+                state.corpseApproachLastReason,
+            corpseAdjacentSkips:
+                state.corpseAdjacentSkips,
+            deathHookRepairs:
+                state.deathHookRepairs,
+            staleDeathHooksRemoved:
+                state.staleDeathHooksRemoved,
+            lastDeathHookRepairAt:
+                state.lastDeathHookRepairAt,
+            deathHookOwned:
+                !!(
+                    state.deathHookWrapper &&
+                    state.deathHookOwner
+                        ?.handlePropertyChange ===
+                        state.deathHookWrapper
+                ),
             corpseQueueLength:
                 state.corpseQueue.length,
             corpseJobActive:
@@ -28675,8 +29738,42 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             state.destinationTitle = next.destinationTitle;
         }
         if (Array.isArray(next.trackedItems)) {
-            state.trackedItems = new Map(next.trackedItems);
+            state.trackedItems =
+                new Map(
+                    next.trackedItems.map(
+                        ([id, name]) => [
+                            Number(id),
+                            name
+                        ]
+                    )
+                );
+
+            for (
+                const id of
+                Array.from(
+                    state.dropItemIds
+                )
+            ) {
+                if (
+                    !state.trackedItems.has(id)
+                ) {
+                    state.dropItemIds.delete(id);
+                }
+            }
         }
+
+        if (Array.isArray(next.dropItemIds)) {
+            state.dropItemIds =
+                new Set(
+                    next.dropItemIds
+                        .map(Number)
+                        .filter(id =>
+                            Number.isFinite(id) &&
+                            state.trackedItems.has(id)
+                        )
+                );
+        }
+
         if (next.walkToCorpses !== undefined) {
             state.walkToCorpses =
                 !!next.walkToCorpses;
@@ -28725,6 +29822,17 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                     )
                 );
         }
+        if (next.corpseStuckMs !== undefined) {
+            state.corpseStuckMs =
+                Math.max(
+                    800,
+                    Math.min(
+                        3000,
+                        Number(next.corpseStuckMs) ||
+                            1500
+                    )
+                );
+        }
         if (next.corpseLootHoldMs !== undefined) {
             state.corpseLootHoldMs =
                 Math.max(
@@ -28754,6 +29862,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             corpseMaxDistance: state.corpseMaxDistance,
             corpseOpenDelayMs: state.corpseOpenDelayMs,
             corpseApproachTimeoutMs: state.corpseApproachTimeoutMs,
+            corpseStuckMs: state.corpseStuckMs,
             corpseLootHoldMs: state.corpseLootHoldMs
         };
     }
@@ -28801,7 +29910,10 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             }
 
             const itemName = window.gameClient?.itemDefinitionsBySid?.[item.sid]?.properties?.name || `Item ${item.id}`;
-            state.trackedItems.set(item.id, itemName);
+            state.trackedItems.set(
+                Number(item.id),
+                itemName
+            );
             persistConfig();
             bot.log("Looter: added tracked item", {
                 id: item.id,
@@ -28860,8 +29972,11 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
     }
 
     function removeTrackedItem(id) {
+        id = Number(id);
+
         if (state.trackedItems.has(id)) {
             state.trackedItems.delete(id);
+            state.dropItemIds.delete(id);
             persistConfig();
             if (typeof bot.ui?.refreshLooterStatus === "function")
                 bot.ui.refreshLooterStatus();
@@ -28882,7 +29997,16 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         startCaptureItem,
         startSelectDestination,
         removeTrackedItem,
-        getTrackedItems: () => Array.from(state.trackedItems.entries()),
+        setTrackedItemDrop,
+        isDropTrackedItem,
+        getTrackedItems: () =>
+            Array.from(
+                state.trackedItems.entries()
+            ),
+        getDropItemIds: () =>
+            Array.from(
+                state.dropItemIds.values()
+            ),
         getDestinationId: () => state.destinationId,
         getDestinationTitle: () => state.destinationTitle,
         isCorpseBusy: () => !!state.corpseJob,
@@ -31258,9 +32382,38 @@ function upgradeSectionHeaders(panel) {
                 for (const [id, name] of items) {
                     const row = document.createElement("div");
                     row.className = "mb-list-row";
-                    row.style.cssText = "display:flex;justify-content:space-between;align-items:center;padding:2px 0;border-bottom:1px solid rgba(255,255,255,0.05);";
+                    row.style.cssText = "display:flex;justify-content:space-between;align-items:center;gap:8px;padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.05);";
+
                     const label = document.createElement("span");
                     label.textContent = `${name} (${id})`;
+                    label.style.cssText = "flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
+
+                    const actions = document.createElement("div");
+                    actions.style.cssText = "display:flex;align-items:center;gap:7px;flex:0 0 auto;";
+
+                    const dropLabel = document.createElement("label");
+                    dropLabel.className = "mb-toggle";
+                    dropLabel.style.cssText = "margin:0;font-size:10px;display:flex;align-items:center;gap:4px;white-space:nowrap;";
+
+                    const dropToggle = document.createElement("input");
+                    dropToggle.type = "checkbox";
+                    dropToggle.checked =
+                        !!bot.looter?.isDropTrackedItem?.(id);
+                    dropToggle.title =
+                        "Drop this tracked item on your current ground tile instead of moving it to the loot destination.";
+                    dropToggle.addEventListener("change", () => {
+                        bot.looter?.setTrackedItemDrop?.(
+                            id,
+                            dropToggle.checked
+                        );
+                    });
+
+                    const dropText = document.createElement("span");
+                    dropText.textContent = "Drop";
+
+                    dropLabel.appendChild(dropToggle);
+                    dropLabel.appendChild(dropText);
+
                     const removeBtn = document.createElement("button");
                     removeBtn.type = "button";
                     removeBtn.className = "mb-small-button";
@@ -31270,8 +32423,11 @@ function upgradeSectionHeaders(panel) {
                         bot.looter.removeTrackedItem(id);
                         refreshLooterStatus();
                     });
+
+                    actions.appendChild(dropLabel);
+                    actions.appendChild(removeBtn);
                     row.appendChild(label);
-                    row.appendChild(removeBtn);
+                    row.appendChild(actions);
                     listContainer.appendChild(row);
                 }
             }
@@ -33975,200 +35131,368 @@ function upgradeSectionHeaders(panel) {
       <span class="mb-title-text">🏃 Cave Bot</span>
     </div>
 
-    <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-bottom:6px;">
+    <!-- Main settings -->
+    <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
       <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-cave-loop" /> Loop</label>
       <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-cave-auto-transitions" /> Auto Transitions</label>
       <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-cave-ignore-fields" /> Walk Through Fields</label>
     </div>
-    <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:6px; font-size:10px;">
-      <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-cave-breaker-enabled" /> Recovery Circuit Breaker</label>
-      <label class="mb-field" style="flex:0 0 62px;"><span class="mb-field-label">Failures</span><input type="number" id="minibia-bot-cave-breaker-failures" min="3" max="30" value="8" style="padding:3px 4px;font-size:11px;" /></label>
-      <label class="mb-field" style="flex:0 0 70px;"><span class="mb-field-label">Window (s)</span><input type="number" id="minibia-bot-cave-breaker-window" min="15" max="600" value="120" style="padding:3px 4px;font-size:11px;" /></label>
-      <span id="minibia-bot-cave-breaker-status" style="color:#cdbb8b;">Recovery safety: 0/8</span>
-    </div>
+
+    <div id="minibia-bot-cave-status" style="font-size:10px; color:#cdbb8b; margin-top:6px;">Status: no waypoints</div>
 
     <!-- Presets -->
-    <div style="display:flex; gap:6px; align-items:center; margin-bottom:6px;">
-      <select id="minibia-bot-cave-preset-select" style="flex:1; padding:4px 6px; font-size:11px;"></select>
-      <button type="button" class="mb-small-button" id="minibia-bot-cave-preset-new" style="padding:2px 8px; font-size:10px;">New</button>
-      <button type="button" class="mb-small-button" id="minibia-bot-cave-preset-delete" style="padding:2px 8px; font-size:10px;">Del</button>
-      <button type="button" class="mb-small-button" id="minibia-bot-cave-preset-rename" style="padding:2px 8px; font-size:10px;">Rename</button>
-      <button type="button" class="mb-small-button" id="minibia-bot-cave-preset-export" style="padding:2px 8px; font-size:10px;">Export</button>
+    <div style="border-top:1px solid rgba(255,255,255,0.08); margin-top:9px; padding-top:8px;">
+      <div class="mb-section-title mb-section-title--sub" style="margin:0 0 5px 0;">
+        <span class="mb-title-text">Presets</span>
+      </div>
+      <div style="display:flex; gap:6px; align-items:center;">
+        <select id="minibia-bot-cave-preset-select" style="flex:1; padding:4px 6px; font-size:11px;"></select>
+        <button type="button" class="mb-small-button" id="minibia-bot-cave-preset-new" style="padding:2px 8px; font-size:10px;">New</button>
+        <button type="button" class="mb-small-button" id="minibia-bot-cave-preset-delete" style="padding:2px 8px; font-size:10px;">Del</button>
+        <button type="button" class="mb-small-button" id="minibia-bot-cave-preset-rename" style="padding:2px 8px; font-size:10px;">Rename</button>
+        <button type="button" class="mb-small-button" id="minibia-bot-cave-preset-export" style="padding:2px 8px; font-size:10px;">Export</button>
+      </div>
     </div>
 
-    <!-- Controls -->
-    <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:6px;">
-      <div style="display:flex; align-items:center; gap:4px;">
-        <label style="font-size:11px; color:#e9d39b;">Direction</label>
-        <select id="minibia-bot-cave-direction" style="padding:2px; font-size:11px;">
-          <option value="NW">NW</option><option value="N">N</option><option value="NE">NE</option>
-          <option value="W">W</option><option value="C" selected>C</option><option value="E">E</option>
-          <option value="SW">SW</option><option value="S">S</option><option value="SE">SE</option>
-        </select>
+    <!-- Waypoint controls -->
+    <div style="border-top:1px solid rgba(255,255,255,0.08); margin-top:9px; padding-top:8px;">
+      <div class="mb-section-title mb-section-title--sub" style="margin:0 0 5px 0;">
+        <span class="mb-title-text">Waypoint Controls</span>
       </div>
 
-      <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-cave-stand" /> Stand</label>
-      <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-cave-rope" /> Rope</label>
-      <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-cave-shovel" /> Shovel</label>
-      <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-cave-ladder" /> Ladder</label>
+      <div style="display:flex; flex-wrap:wrap; gap:8px 12px; align-items:center; margin-bottom:6px;">
+        <div style="display:flex; align-items:center; gap:4px;">
+          <label style="font-size:11px; color:#e9d39b;">Direction</label>
+          <select id="minibia-bot-cave-direction" style="padding:2px; font-size:11px;">
+            <option value="NW">NW</option><option value="N">N</option><option value="NE">NE</option>
+            <option value="W">W</option><option value="C" selected>C</option><option value="E">E</option>
+            <option value="SW">SW</option><option value="S">S</option><option value="SE">SE</option>
+          </select>
+        </div>
+
+        <span style="color:#666;">|</span>
+        <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-cave-stand" /> Stand</label>
+        <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-cave-rope" /> Rope</label>
+        <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-cave-shovel" /> Shovel</label>
+        <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-cave-ladder" /> Ladder</label>
+      </div>
+
+      <div style="display:grid; grid-template-columns:repeat(5, 1fr); gap:4px;">
+        <button type="button" class="mb-small-button" id="minibia-bot-cave-add" style="padding:4px;">+ Add</button>
+        <button type="button" class="mb-small-button" id="minibia-bot-cave-add-script" style="padding:4px;">+ Script</button>
+        <button type="button" class="mb-small-button" id="minibia-bot-cave-move-up" style="padding:4px;">▲</button>
+        <button type="button" class="mb-small-button" id="minibia-bot-cave-move-down" style="padding:4px;">▼</button>
+        <button type="button" class="mb-small-button" id="minibia-bot-cave-delete-selected" style="padding:4px; background:#5a2020; border-color:#883030;">✕</button>
+      </div>
     </div>
 
-    <!-- Buttons -->
-    <div style="display:grid; grid-template-columns:repeat(5, 1fr); gap:4px; margin-bottom:6px;">
-      <button type="button" class="mb-small-button" id="minibia-bot-cave-add" style="padding:4px;">+ Add</button>
-      <button type="button" class="mb-small-button" id="minibia-bot-cave-add-script" style="padding:4px;">+ Script</button>
-      <button type="button" class="mb-small-button" id="minibia-bot-cave-move-up" style="padding:4px;">▲</button>
-      <button type="button" class="mb-small-button" id="minibia-bot-cave-move-down" style="padding:4px;">▼</button>
-      <button type="button" class="mb-small-button" id="minibia-bot-cave-delete-selected" style="padding:4px; background:#5a2020; border-color:#883030;">✕</button>
-    </div>
-
-    <!-- Read-only route audit; runs only when clicked, never on a timer. -->
-    <div style="margin-bottom:6px;">
-      <button type="button" class="mb-small-button" id="minibia-bot-cave-audit" style="padding:3px 8px; font-size:10px;">Audit Route</button>
-      <div id="minibia-bot-cave-audit-result" aria-live="polite" style="white-space:pre-line; color:#cdbb8b; font-size:10px; margin-top:3px;"></div>
-    </div>
-
-    <!-- Waypoint list -->
-    <div style="margin-bottom:6px;">
-      <div style="display:flex; align-items:center; gap:8px; margin-bottom:4px;">
+    <!-- Waypoints -->
+    <div style="border-top:1px solid rgba(255,255,255,0.08); margin-top:9px; padding-top:8px;">
+      <div style="display:flex; align-items:center; gap:8px; margin-bottom:5px; flex-wrap:wrap;">
         <div class="mb-section-title mb-section-title--sub" style="margin:0; padding:0; border-bottom:none; min-height:auto;">
           <span class="mb-title-text">Waypoints</span>
         </div>
+
         <span style="color:#666;">|</span>
-        <div style="display:flex; gap:6px; align-items:center; margin:4px 0 8px 0; padding:4px 6px; background:rgba(255,255,255,0.03); border-radius:4px;">
-          <span style="font-size:11px; color:#e9d39b;">Skip SQM</span>
+        <label style="display:flex; gap:5px; align-items:center; font-size:11px; color:#e9d39b;">
+          <span>Skip SQM</span>
           <input type="number" id="minibia-bot-cave-tolerance" min="0" max="5" step="1" value="0" style="width:40px; padding:2px 4px; font-size:11px;" />
-        </div>
+        </label>
+
         <span style="color:#666;">|</span>
-        <div style="display:flex; gap:6px; align-items:center; margin:4px 0 8px 0; padding:4px 6px; background:rgba(255,255,255,0.03); border-radius:4px;">
-          <span style="font-size:11px; color:#e9d39b;">Move to #</span>
+        <label style="display:flex; gap:5px; align-items:center; font-size:11px; color:#e9d39b;">
+          <span>Move to #</span>
           <input type="number" id="minibia-bot-cave-move-to-index" min="0" value="0" style="width:40px; padding:2px 4px; font-size:11px;" />
-          <button type="button" class="mb-small-button" id="minibia-bot-cave-move-to-index-btn" style="padding:2px 12px;">Go</button>
-          <span id="minibia-bot-cave-move-status" style="font-size:10px; color:#999; margin-left:auto;"></span>
-        </div>
+        </label>
+        <button type="button" class="mb-small-button" id="minibia-bot-cave-move-to-index-btn" style="padding:2px 10px;">Go</button>
+        <span id="minibia-bot-cave-move-status" style="font-size:10px; color:#999;"></span>
       </div>
+
       <div id="minibia-bot-cave-waypoint-list" style="max-height:120px; overflow-y:auto; border:1px solid rgba(224,200,148,0.2); border-radius:4px; padding:2px; font-size:11px;"></div>
     </div>
 
     <!-- Waypoint properties -->
-    <div style="border-top:1px solid rgba(255,255,255,0.1); padding-top:6px; margin-top:4px;">
-      <div class="mb-section-title mb-section-title--sub" style="margin-top:0;">
+    <div style="border-top:1px solid rgba(255,255,255,0.08); margin-top:9px; padding-top:8px;">
+      <div class="mb-section-title mb-section-title--sub" style="margin:0 0 5px 0;">
         <span class="mb-title-text">Waypoint Properties</span>
       </div>
+
       <div style="display:flex; align-items:center; gap:8px; margin-bottom:4px;">
-        <span style="font-size:11px; color:#e9d39b; font-weight:bold;">Script</span>
+        <span style="font-size:11px; color:#e9d39b;">Script</span>
         <span style="color:#666;">|</span>
         <label style="font-size:11px; color:#e9d39b; white-space:nowrap;">Label</label>
         <input type="text" id="minibia-bot-cave-waypoint-label" placeholder="Optional label" style="flex:1; padding:4px 6px; font-size:11px;" />
       </div>
-      <div>
-        <textarea id="minibia-bot-cave-waypoint-script" placeholder="Code to run when reached" rows="2" style="width:100%; resize:vertical; padding:4px 6px; font-size:11px; box-sizing:border-box;"></textarea>
-      </div>
+
+      <textarea id="minibia-bot-cave-waypoint-script" placeholder="Code to run when reached" rows="2" style="width:100%; resize:vertical; padding:4px 6px; font-size:11px; box-sizing:border-box;"></textarea>
       <button type="button" class="mb-small-button" id="minibia-bot-cave-waypoint-save" style="margin-top:4px;">Save</button>
     </div>
 
-    <!-- Status -->
-    <div style="font-size:10px; color:#cdbb8b; margin-top:6px; display:grid; gap:2px;">
-      <div id="minibia-bot-cave-status">Status: no waypoints</div>
-      <div id="minibia-bot-cave-nav-diagnostics" style="color:#b7b7b7;">Navigation: idle</div>
-      <div id="minibia-bot-cave-recent-recoveries" style="color:#b7b7b7; overflow-wrap:anywhere;">Recent recovery: none</div>
-      <div id="minibia-bot-cave-closest">Closest start: none</div>
-      <div id="minibia-bot-cave-transition-status">Transitions learned: none</div>
+    <!-- Recovery safety - intentionally near the bottom -->
+    <div style="border-top:1px solid rgba(255,255,255,0.08); margin-top:10px; padding-top:8px;">
+      <div class="mb-section-title mb-section-title--sub" style="margin:0 0 5px 0;">
+        <span class="mb-title-text">Recovery Safety</span>
+      </div>
+
+      <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; font-size:10px;">
+        <label class="mb-toggle" style="margin:0; font-size:11px;">
+          <input type="checkbox" id="minibia-bot-cave-breaker-enabled" />
+          <span>Recovery Circuit Breaker</span>
+        </label>
+        <label class="mb-field" style="flex:0 0 62px;">
+          <span class="mb-field-label">Failures</span>
+          <input type="number" id="minibia-bot-cave-breaker-failures" min="3" max="30" value="8" style="padding:3px 4px;font-size:11px;" />
+        </label>
+        <label class="mb-field" style="flex:0 0 70px;">
+          <span class="mb-field-label">Window (s)</span>
+          <input type="number" id="minibia-bot-cave-breaker-window" min="15" max="600" value="120" style="padding:3px 4px;font-size:11px;" />
+        </label>
+      </div>
+      <div id="minibia-bot-cave-breaker-status" style="color:#cdbb8b; font-size:10px; margin-top:4px;">Recovery safety: 0/8</div>
+    </div>
+
+    <!-- Debug - deliberately last -->
+    <div style="border-top:1px solid rgba(255,255,255,0.08); margin-top:10px; padding-top:8px;">
+      <div class="mb-section-title mb-section-title--sub" style="margin:0 0 5px 0;">
+        <span class="mb-title-text">Debug</span>
+      </div>
+
+      <div style="margin-bottom:6px;">
+        <button type="button" class="mb-small-button" id="minibia-bot-cave-audit" style="padding:3px 8px; font-size:10px;">Audit Route</button>
+        <div id="minibia-bot-cave-audit-result" aria-live="polite" style="white-space:pre-line; color:#cdbb8b; font-size:10px; margin-top:3px;"></div>
+      </div>
+
+      <div style="font-size:10px; color:#b7b7b7; display:grid; gap:2px;">
+        <div id="minibia-bot-cave-nav-diagnostics">Navigation: idle</div>
+        <div id="minibia-bot-cave-recent-recoveries" style="overflow-wrap:anywhere;">Recent recovery: none</div>
+        <div id="minibia-bot-cave-closest">Closest start: none</div>
+        <div id="minibia-bot-cave-transition-status">Transitions learned: none</div>
+      </div>
     </div>
 
   </div>
 </div>
-
 <!-- Targeting Tab -->
 <div class="mb-tab-panel" data-tab-panel="targeting">
-
-  <!-- Auto Attack -->
   <div class="mb-section">
+
     <div class="mb-section-title">
       <input type="checkbox" id="minibia-bot-auto-attack-enabled" class="mb-title-toggle" />
       <span class="mb-title-text">⚔️ Targeting</span>
     </div>
-    <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
-      <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-auto-attack-melee" /><span>Melee</span></label>
-      <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-auto-attack-client-chase" /><span>Client Chase</span></label>
-      <span style="color:#666;">|</span>
-      <label class="mb-field" style="flex:0 0 120px;"><span class="mb-field-label" style="font-size:10px;">Max Target Dist</span><input type="number" id="minibia-bot-auto-attack-maxdist" min="1" max="10" value="5" style="padding:3px 4px;font-size:11px;" /></label>
+
+    <!-- Core targeting -->
+    <div>
+      <div class="mb-section-title mb-section-title--sub" style="margin:0 0 6px 0;">
+        <span class="mb-title-text">Core Targeting</span>
+      </div>
+
+      <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
+        <label class="mb-toggle" style="margin:0; font-size:11px;">
+          <input type="checkbox" id="minibia-bot-auto-attack-melee" />
+          <span>Melee</span>
+        </label>
+
+        <label class="mb-toggle" style="margin:0; font-size:11px;">
+          <input type="checkbox" id="minibia-bot-auto-attack-client-chase" />
+          <span>Client Chase</span>
+        </label>
+
+        <label class="mb-field" style="flex:0 0 118px;">
+          <span class="mb-field-label" style="font-size:10px;">Max Target Dist</span>
+          <input type="number" id="minibia-bot-auto-attack-maxdist" min="1" max="10" value="5" style="padding:3px 4px;font-size:11px;" />
+        </label>
+      </div>
     </div>
 
-    <!-- Lure Mode -->
-    <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-top:10px;">
-      <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-auto-attack-lure" /><span>Lure</span></label>
-      <label class="mb-field" style="flex:0 0 90px;"><span class="mb-field-label" style="font-size:10px;">Fight at mobs</span><input type="number" id="minibia-bot-auto-attack-lure-count" min="1" max="20" value="3" style="padding:3px 4px;font-size:11px;" /></label>
-      <label class="mb-field" style="flex:0 0 82px;"><span class="mb-field-label" style="font-size:10px;">Lure Radius</span><input type="number" id="minibia-bot-auto-attack-lure-radius" min="1" max="8" value="5" style="padding:3px 4px;font-size:11px;" /></label>
-      <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-auto-attack-lure-smart" checked /><span>Smart</span></label>
-      <label class="mb-field" style="flex:0 0 78px;"><span class="mb-field-label" style="font-size:10px;">Preserve HP</span><input type="number" id="minibia-bot-auto-attack-lure-preserve-hp" min="5" max="90" value="30" style="padding:3px 4px;font-size:11px;" /></label>
-      <label class="mb-field" style="flex:0 0 74px;"><span class="mb-field-label" style="font-size:10px;">Last Mob HP</span><input type="number" id="minibia-bot-auto-attack-lure-last-hp" min="5" max="90" value="20" style="padding:3px 4px;font-size:11px;" /></label>
-      <label class="mb-field" style="flex:0 0 88px;"><span class="mb-field-label" style="font-size:10px;">Last Mob</span><select id="minibia-bot-auto-attack-lure-last-mode" style="padding:3px 4px;font-size:11px;"><option value="slow">Slow</option><option value="kill">Kill</option></select></label>
-      <span id="minibia-bot-auto-attack-lure-status" class="mb-small-note" style="font-size:10px;">Lure: off</span>
+    <!-- Movement and runes -->
+    <div style="border-top:1px solid rgba(255,255,255,0.08); margin-top:10px; padding-top:8px;">
+      <div class="mb-section-title mb-section-title--sub" style="margin:0 0 6px 0;">
+        <span class="mb-title-text">Movement &amp; Runes</span>
+      </div>
+
+      <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
+        <label class="mb-toggle" style="margin:0; font-size:11px;">
+          <input type="checkbox" id="minibia-bot-auto-attack-kite" />
+          <span>Kite</span>
+        </label>
+
+        <label class="mb-field" style="flex:0 0 70px;">
+          <span class="mb-field-label" style="font-size:10px;">Kite Dist</span>
+          <input type="number" id="minibia-bot-auto-attack-ideal-dist" min="1" max="10" value="3" style="padding:3px 4px;font-size:11px;" />
+        </label>
+
+        <label class="mb-toggle" style="margin:0; font-size:11px;">
+          <input type="checkbox" id="minibia-bot-auto-attack-keep-diagonal" />
+          <span>Keep Diagonal</span>
+        </label>
+
+        <span style="color:#666;">|</span>
+
+        <label class="mb-field" style="flex:0 0 72px;">
+          <span class="mb-field-label" style="font-size:10px;">Rune Slot</span>
+          <input type="number" id="minibia-bot-auto-attack-rune-hotkey" min="1" max="12" placeholder="4" style="padding:3px 4px;font-size:11px;" />
+        </label>
+
+        <span id="minibia-bot-auto-attack-rune-count" style="font-size:10px;color:#aaa;min-width:22px;white-space:nowrap;" title="Set a rune hotbar slot to show supply."></span>
+      </div>
     </div>
 
-    <hr style="margin:12px 0;border-color:#444;">
+    <!-- Lure -->
+    <div style="border-top:1px solid rgba(255,255,255,0.08); margin-top:10px; padding-top:8px;">
+      <div class="mb-section-title mb-section-title--sub" style="margin:0 0 6px 0;">
+        <span class="mb-title-text">Lure</span>
+      </div>
 
-    <!-- Kite Mode -->
-    <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
-      <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-auto-attack-kite" /><span>Kite</span></label>
-      <label class="mb-field" style="flex:0 0 65px;"><span class="mb-field-label" style="font-size:10px;">Kite Dist</span><input type="number" id="minibia-bot-auto-attack-ideal-dist" min="1" max="10" value="3" style="padding:3px 4px;font-size:11px;" /></label>
-      <span style="color:#666;">|</span>
-      <label class="mb-field" style="flex:0 0 60px;"><span class="mb-field-label" style="font-size:10px;">Use Rune</span><input type="number" id="minibia-bot-auto-attack-rune-hotkey" min="1" max="12" placeholder="4" style="padding:3px 4px;font-size:11px;" /></label>
-      <span id="minibia-bot-auto-attack-rune-count" style="font-size:10px;color:#aaa;min-width:22px;white-space:nowrap;" title="Set a rune hotbar slot to show supply."></span>
+      <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
+        <label class="mb-toggle" style="margin:0; font-size:11px;">
+          <input type="checkbox" id="minibia-bot-auto-attack-lure" />
+          <span>Enable Lure</span>
+        </label>
+
+        <label class="mb-field" style="flex:0 0 88px;">
+          <span class="mb-field-label" style="font-size:10px;">Fight at mobs</span>
+          <input type="number" id="minibia-bot-auto-attack-lure-count" min="1" max="20" value="3" style="padding:3px 4px;font-size:11px;" />
+        </label>
+
+        <label class="mb-field" style="flex:0 0 82px;">
+          <span class="mb-field-label" style="font-size:10px;">Lure Radius</span>
+          <input type="number" id="minibia-bot-auto-attack-lure-radius" min="1" max="8" value="5" style="padding:3px 4px;font-size:11px;" />
+        </label>
+
+        <label class="mb-toggle" style="margin:0; font-size:11px;">
+          <input type="checkbox" id="minibia-bot-auto-attack-lure-smart" checked />
+          <span>Smart Lure</span>
+        </label>
+      </div>
+
+      <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-top:7px;">
+        <label class="mb-field" style="flex:0 0 82px;">
+          <span class="mb-field-label" style="font-size:10px;">Preserve HP</span>
+          <input type="number" id="minibia-bot-auto-attack-lure-preserve-hp" min="5" max="90" value="30" style="padding:3px 4px;font-size:11px;" />
+        </label>
+
+        <label class="mb-field" style="flex:0 0 82px;">
+          <span class="mb-field-label" style="font-size:10px;">Last Mob HP</span>
+          <input type="number" id="minibia-bot-auto-attack-lure-last-hp" min="5" max="90" value="20" style="padding:3px 4px;font-size:11px;" />
+        </label>
+
+        <label class="mb-field" style="flex:0 0 94px;">
+          <span class="mb-field-label" style="font-size:10px;">Last Mob Mode</span>
+          <select id="minibia-bot-auto-attack-lure-last-mode" style="padding:3px 4px;font-size:11px;">
+            <option value="slow">Slow</option>
+            <option value="kill">Kill</option>
+          </select>
+        </label>
+
+        <span id="minibia-bot-auto-attack-lure-status" class="mb-small-note" style="font-size:10px; margin-left:auto;">Lure: off</span>
+      </div>
     </div>
 
     <!-- Anti-KS -->
-    <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-top:10px;">
-      <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-auto-attack-antiks" /><span>Anti-KS</span></label>
-      <label class="mb-field" style="flex:0 0 40px;"><span class="mb-field-label" style="font-size:10px;">Self</span><input type="number" id="minibia-bot-auto-attack-antiks-self" min="1" max="5" value="2" style="padding:3px 4px;font-size:11px;" /></label>
-      <label class="mb-field" style="flex:0 0 40px;"><span class="mb-field-label" style="font-size:10px;">Other</span><input type="number" id="minibia-bot-auto-attack-antiks-other" min="1" max="5" value="2" style="padding:3px 4px;font-size:11px;" /></label>
+    <div style="border-top:1px solid rgba(255,255,255,0.08); margin-top:10px; padding-top:8px;">
+      <div class="mb-section-title mb-section-title--sub" style="margin:0 0 6px 0;">
+        <span class="mb-title-text">Anti-KS</span>
+      </div>
+
+      <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
+        <label class="mb-toggle" style="margin:0; font-size:11px;">
+          <input type="checkbox" id="minibia-bot-auto-attack-antiks" />
+          <span>Enable Anti-KS</span>
+        </label>
+
+        <label class="mb-field" style="flex:0 0 62px;">
+          <span class="mb-field-label" style="font-size:10px;">Self Range</span>
+          <input type="number" id="minibia-bot-auto-attack-antiks-self" min="1" max="5" value="2" style="padding:3px 4px;font-size:11px;" />
+        </label>
+
+        <label class="mb-field" style="flex:0 0 66px;">
+          <span class="mb-field-label" style="font-size:10px;">Other Range</span>
+          <input type="number" id="minibia-bot-auto-attack-antiks-other" min="1" max="5" value="2" style="padding:3px 4px;font-size:11px;" />
+        </label>
+      </div>
     </div>
 
-    <hr style="margin:12px 0;border-color:#444;">
+    <!-- Exori -->
+    <div style="border-top:1px solid rgba(255,255,255,0.08); margin-top:10px; padding-top:8px;">
+      <div class="mb-section-title mb-section-title--sub" style="margin:0 0 6px 0;">
+        <span class="mb-title-text">Exori</span>
+      </div>
 
-    <!-- Exori Settings -->
-    <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
-      <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-exori-enabled" /><span>Cast Exori</span></label>
-      <label class="mb-field" style="flex:0 0 90px;"><span class="mb-field-label" style="font-size:10px;">On X mobs</span><input type="number" id="minibia-bot-exori-monsters" min="1" max="10" value="3" style="padding:3px 4px;font-size:11px;" /></label>
-      <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-exori-player-check" /><span>Avoid Players</span></label>
-      <label class="mb-field" style="flex:0 0 80px;"><span class="mb-field-label" style="font-size:10px;">Avoid Dist</span><input type="number" id="minibia-bot-exori-player-dist" min="1" max="10" value="3" style="padding:3px 4px;font-size:11px;" /></label>
+      <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
+        <label class="mb-toggle" style="margin:0; font-size:11px;">
+          <input type="checkbox" id="minibia-bot-exori-enabled" />
+          <span>Cast Exori</span>
+        </label>
+
+        <label class="mb-field" style="flex:0 0 86px;">
+          <span class="mb-field-label" style="font-size:10px;">On X mobs</span>
+          <input type="number" id="minibia-bot-exori-monsters" min="1" max="10" value="3" style="padding:3px 4px;font-size:11px;" />
+        </label>
+
+        <label class="mb-toggle" style="margin:0; font-size:11px;">
+          <input type="checkbox" id="minibia-bot-exori-player-check" />
+          <span>Avoid Players</span>
+        </label>
+
+        <label class="mb-field" style="flex:0 0 76px;">
+          <span class="mb-field-label" style="font-size:10px;">Avoid Dist</span>
+          <input type="number" id="minibia-bot-exori-player-dist" min="1" max="10" value="3" style="padding:3px 4px;font-size:11px;" />
+        </label>
+      </div>
     </div>
 
-    <hr style="margin:12px 0;border-color:#444;">
+    <!-- Target lists -->
+    <div style="border-top:1px solid rgba(255,255,255,0.08); margin-top:10px; padding-top:8px;">
+      <div class="mb-section-title mb-section-title--sub" style="margin:0 0 6px 0;">
+        <span class="mb-title-text">Target Lists</span>
+      </div>
 
-    <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
-      <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-auto-attack-keep-diagonal" /><span>Keep Diagonal</span></label>
+      <div style="display:grid; gap:8px;">
+
+        <div>
+          <div style="display:flex; gap:6px; align-items:end; flex-wrap:wrap;">
+            <label class="mb-field" style="flex:1; min-width:120px;">
+              <span class="mb-field-label" style="font-size:10px;">Preferred Mobs</span>
+              <textarea id="minibia-bot-auto-attack-preferred-names" placeholder="Orc Shaman, Amazon" style="min-height:30px;padding:3px 4px;font-size:11px;resize:vertical;"></textarea>
+            </label>
+
+            <label class="mb-field" style="flex:0 0 104px;">
+              <span class="mb-field-label" style="font-size:10px;">Match Mode</span>
+              <select id="minibia-bot-auto-attack-preferred-match-mode" style="padding:3px 4px;font-size:11px;">
+                <option value="exact">Exact</option>
+                <option value="includes">Contains</option>
+              </select>
+            </label>
+
+            <button type="button" class="mb-small-button" id="minibia-bot-auto-attack-preferred-save" style="padding:3px 10px;font-size:11px;width:auto;">Save</button>
+          </div>
+
+          <div style="display:flex; gap:8px; margin-top:3px; flex-wrap:wrap;">
+            <div class="mb-small-note" id="minibia-bot-auto-attack-preferred-status" style="font-size:10px;">Preferred: none</div>
+            <div class="mb-small-note" style="font-size:10px;">Ranked first; other mobs still allowed.</div>
+          </div>
+        </div>
+
+        <div style="border-top:1px solid rgba(255,255,255,0.06); padding-top:7px;">
+          <div style="display:flex; gap:6px; align-items:end; flex-wrap:wrap;">
+            <label class="mb-field" style="flex:1; min-width:120px;">
+              <span class="mb-field-label" style="font-size:10px;">Ignored Mobs</span>
+              <textarea id="minibia-bot-auto-attack-ignored-names" placeholder="Dragon, Demon, Ghost" style="min-height:30px;padding:3px 4px;font-size:11px;resize:vertical;"></textarea>
+            </label>
+
+            <button type="button" class="mb-small-button" id="minibia-bot-auto-attack-ignored-save" style="padding:3px 10px;font-size:11px;width:auto;">Save</button>
+          </div>
+
+          <div class="mb-small-note" id="minibia-bot-auto-attack-ignored-status" style="font-size:10px; margin-top:3px;">Ignored: none</div>
+          <div class="mb-small-note" style="font-size:10px;">Hard veto for mb0t auto-targeting.</div>
+        </div>
+
+      </div>
     </div>
 
-    <hr style="margin:12px 0;border-color:#444;">
-
-    <!-- Target Priority -->
-    <div style="display:flex; gap:6px; align-items:end; flex-wrap:wrap;">
-      <label class="mb-field" style="flex:1; min-width:100px;"><span class="mb-field-label" style="font-size:10px;">Preferred Mobs</span><textarea id="minibia-bot-auto-attack-preferred-names" placeholder="Orc Shaman, Amazon" style="min-height:28px;padding:3px 4px;font-size:11px;resize:vertical;"></textarea></label>
-      <label class="mb-field" style="flex:0 0 110px;"><span class="mb-field-label" style="font-size:10px;">Match Mode</span><select id="minibia-bot-auto-attack-preferred-match-mode" style="padding:3px 4px;font-size:11px;"><option value="exact">Exact</option><option value="includes">Contains</option></select></label>
-      <button type="button" class="mb-small-button" id="minibia-bot-auto-attack-preferred-save" style="padding:3px 10px;font-size:11px;width:auto;">Save</button>
-    </div>
-    <div style="display:flex; gap:8px; margin-top:4px; flex-wrap:wrap;">
-      <div class="mb-small-note" id="minibia-bot-auto-attack-preferred-status" style="font-size:10px;">Preferred: none</div>
-      <div class="mb-small-note" style="font-size:10px;">Ranked first, others allowed</div>
-    </div>
-
-    <hr style="margin:12px 0;border-color:#444;">
-
-    <!-- Ignored Mobs (Blacklist) -->
-    <div style="display:flex; gap:6px; align-items:end; flex-wrap:wrap;">
-      <label class="mb-field" style="flex:1; min-width:100px;">
-        <span class="mb-field-label">Ignored Mobs (never attack)</span>
-        <textarea id="minibia-bot-auto-attack-ignored-names" placeholder="Dragon, Demon, Orc Berserker" style="min-height:28px;padding:3px 4px;font-size:11px;resize:vertical;"></textarea>
-      </label>
-      <button type="button" class="mb-small-button" id="minibia-bot-auto-attack-ignored-save" style="padding:3px 10px;font-size:11px;width:auto;">Save</button>
-    </div>
-    <div class="mb-small-note" id="minibia-bot-auto-attack-ignored-status" style="font-size:10px;">Ignored: none</div>
   </div>
-
 </div>
-
 <!-- Talk Tab -->
 <div class="mb-tab-panel" data-tab-panel="talk">
   <div class="mb-section">
@@ -34290,6 +35614,7 @@ function upgradeSectionHeaders(panel) {
         <span class="mb-title-text">Tracked Items</span>
       </div>
       <div id="minibia-bot-looter-item-list" style="max-height:150px; overflow-y:auto; border:1px solid rgba(224,200,148,0.2); border-radius:4px; padding:4px; font-size:11px;"></div>
+      <div class="mb-small-note" style="margin-top:3px;">Drop = move matching tracked loot to your current ground tile instead of the selected destination.</div>
       <div style="display:flex; gap:6px; margin-top:4px;">
         <input type="text" id="minibia-bot-looter-manual-input" placeholder="Item name" style="flex:1;" />
         <button type="button" class="mb-small-button" id="minibia-bot-looter-manual-add">Add</button>
