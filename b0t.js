@@ -803,7 +803,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.5.35",
+        version: "1.5.38",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -5005,6 +5005,26 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         preferredAccessHandoffs: 0,
         preferredAccessExoriHints: 0,
 
+        // v1.5.36: ordinary mb0t-selected targets get a lighter access-clear
+        // state. If live pathing is blocked by a monster but static geometry
+        // can reach the target, clear the real blocker and then hand back to
+        // the original target. Manual targets are never taken over here.
+        ordinaryAccessBlocked: false,
+        ordinaryAccessTargetId: null,
+        ordinaryAccessTargetName: null,
+        ordinaryAccessBlockerIds: [],
+        ordinaryAccessBlockerNames: [],
+        ordinaryAccessClearTargetId: null,
+        ordinaryAccessSince: 0,
+        ordinaryAccessLastProbeAt: 0,
+        ordinaryAccessLastReason: null,
+        ordinaryAccessActivations: 0,
+        ordinaryAccessClears: 0,
+        ordinaryAccessHandoffs: 0,
+        ordinaryAccessWallRejects: 0,
+        ordinaryAccessNoBlockerRejects: 0,
+        ordinaryAccessManualBypasses: 0,
+
         // v1.5.23: preferred mobs separated by static geometry must not pin
         // lure/targeting. Only creature-blocked routes get access-clear logic.
         preferredWallBlocks: 0,
@@ -5188,6 +5208,13 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         preferredAccessSearchRadius: 9,
         preferredWallSkipMs: 8000,
 
+        // Ordinary access-clear is intentionally lighter than preferred access:
+        // fast route probe, short no-blocker grace, and shorter wall backoff.
+        ordinaryAccessProbeMs: 300,
+        ordinaryAccessSearchRadius: 9,
+        ordinaryAccessNoBlockerGraceMs: 900,
+        ordinaryWallSkipMs: 2500,
+
         // Native small-screen bounds are <8 x <6 projected tiles. Pause route
         // movement before a trailing mob reaches that hard edge, then resume
         // only after it catches up into the inner band (hysteresis).
@@ -5267,6 +5294,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         config.preferredAccessProbeMs = Math.max(150, Math.min(1000, Number(config.preferredAccessProbeMs) || 300));
         config.preferredAccessSearchRadius = Math.max(4, Math.min(14, Math.trunc(Number(config.preferredAccessSearchRadius) || 9)));
         config.preferredWallSkipMs = Math.max(2000, Math.min(30000, Number(config.preferredWallSkipMs) || 8000));
+        config.ordinaryAccessProbeMs = Math.max(150, Math.min(1000, Number(config.ordinaryAccessProbeMs) || 300));
+        config.ordinaryAccessSearchRadius = Math.max(4, Math.min(14, Math.trunc(Number(config.ordinaryAccessSearchRadius) || 9)));
+        config.ordinaryAccessNoBlockerGraceMs = Math.max(300, Math.min(2500, Number(config.ordinaryAccessNoBlockerGraceMs) || 900));
+        config.ordinaryWallSkipMs = Math.max(750, Math.min(10000, Number(config.ordinaryWallSkipMs) || 2500));
         config.lureLeashEdgeX = Math.max(3, Math.min(7, Number(config.lureLeashEdgeX) || 6));
         config.lureLeashEdgeY = Math.max(2, Math.min(5, Number(config.lureLeashEdgeY) || 4));
         config.lureLeashResumeX = Math.max(2, Math.min(config.lureLeashEdgeX - 1, Number(config.lureLeashResumeX) || 4));
@@ -5920,8 +5951,16 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         // v1.5.08: below the requested on-screen mob count, keep attacking
         // ordinary mobs while CaveBot continues pulling toward the waypoint.
         // Targeting is forbidden from owning movement in this branch.
-        if (syncLureMode(now))
+        if (syncLureMode(now)) {
+            if (state.ordinaryAccessBlocked) {
+                clearOrdinaryAccessState(
+                    "lure mode took movement/combat ownership",
+                    now,
+                    false
+                );
+            }
             return tryLureAttack(now);
+        }
 
         let tickCandidates = null;
         const getTickCandidates = () => {
@@ -5942,6 +5981,31 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         const deadTarget = getCurrentTarget();
         const deadHealth = deadTarget?.state?.health ?? deadTarget?.health ?? null;
         if (deadTarget && Number.isFinite(Number(deadHealth)) && Number(deadHealth) <= 0) {
+            if (
+                state.ordinaryAccessBlocked &&
+                deadTarget.id ===
+                    state.ordinaryAccessClearTargetId
+            ) {
+                if (
+                    isSameCreature(
+                        getCurrentTarget(),
+                        deadTarget
+                    )
+                ) {
+                    clearCurrentTarget();
+                }
+                if (
+                    state.engagedTargetId ===
+                    deadTarget.id
+                ) {
+                    clearEngagedTarget();
+                }
+
+                state.ordinaryAccessLastProbeAt = 0;
+                syncOrdinaryAccessClear(now);
+                return true;
+            }
+
             handoffTarget(deadTarget, "target defeated", now, 300);
             return true;
         }
@@ -5983,6 +6047,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         // though the underlying map route is valid. Temporarily attack those
         // blockers instead of standing still with an unreachable preferred mob.
         syncPreferredAccessClear(now);
+        syncOrdinaryAccessClear(now);
 
         // 2) Movement
         if (config.kiteMode && getEngagedTarget()) {
@@ -6066,6 +6131,78 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 state.unreachableStart = 0;
                 return false;
             }
+            const autoOwnedOrdinary =
+                state.autoTargetId === current.id &&
+                !isManualTargetProtected(
+                    current,
+                    now
+                ) &&
+                !state.ordinaryAccessBlocked;
+
+            if (autoOwnedOrdinary) {
+                const accessInfo =
+                    probeOrdinaryCreatureBlock(
+                        current,
+                        now
+                    );
+
+                if (
+                    accessInfo?.clearTarget &&
+                    activateOrdinaryAccessState(
+                        accessInfo,
+                        now
+                    )
+                ) {
+                    state.unreachableStart = 0;
+                    return true;
+                }
+
+                if (accessInfo?.wallBlocked) {
+                    rejectOrdinaryAccessTarget(
+                        current,
+                        "ordinary target blocked by wall/static geometry",
+                        now
+                    );
+                    state.unreachableStart = 0;
+                    return false;
+                }
+
+                if (!state.unreachableStart)
+                    state.unreachableStart = now;
+
+                const graceMs = Math.max(
+                    300,
+                    Math.min(
+                        2500,
+                        Number(
+                            config
+                                .ordinaryAccessNoBlockerGraceMs
+                        ) || 900
+                    )
+                );
+
+                if (
+                    now - state.unreachableStart >
+                    graceMs
+                ) {
+                    state.ordinaryAccessNoBlockerRejects++;
+                    handoffTarget(
+                        current,
+                        "ordinary target unreachable with no creature blocker",
+                        now,
+                        1200
+                    );
+                    state.unreachableStart = 0;
+                    return false;
+                }
+
+                // Static geometry may be valid while the live pathfinder is
+                // briefly stale/occupied. Give it a short grace only.
+                return false;
+            }
+
+            // Manual targets keep the historical longer grace because automatic
+            // blocker clearing must never hijack a user-selected target.
             if (!state.unreachableStart)
                 state.unreachableStart = now;
             if (now - state.unreachableStart > 3000) {
@@ -6073,7 +6210,6 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 state.unreachableStart = 0;
                 return false;
             }
-            // Still unreachable but not timed out – don't attack, but keep target
             return false;
         } else {
             state.unreachableStart = 0;
@@ -7038,15 +7174,22 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         return true;
     }
 
-    function findStaticPreferredAccessRoute(target, playerPos = null) {
+    function findStaticTargetAccessRoute(
+        target,
+        playerPos = null,
+        requestedSearchRadius = null
+    ) {
         const start = playerPos || normalizePosition(bot.getPlayerPosition());
         const targetPos = normalizePosition(target?.getPosition?.() || target?.__position);
         if (!start || !targetPos || start.z !== targetPos.z)
             return null;
 
+        const searchRadius = Number.isFinite(Number(requestedSearchRadius))
+            ? Number(requestedSearchRadius)
+            : Number(config.preferredAccessSearchRadius) || 9;
         const radius = Math.max(
             Math.max(4, Number(config.maxTargetDistance) + 3 || 8),
-            Math.max(4, Math.min(14, Number(config.preferredAccessSearchRadius) || 9))
+            Math.max(4, Math.min(14, searchRadius))
         );
         const minX = start.x - radius;
         const maxX = start.x + radius;
@@ -7162,7 +7305,11 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             return null;
 
         // A static route proves walls/map geometry are not the problem.
-        const staticRoute = findStaticPreferredAccessRoute(target, playerPos);
+        const staticRoute = findStaticTargetAccessRoute(
+            target,
+            playerPos,
+            config.preferredAccessSearchRadius
+        );
         if (!staticRoute?.length)
             return null;
 
@@ -7350,6 +7497,560 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             activations: state.preferredAccessActivations || 0,
             clears: state.preferredAccessClears || 0,
             handoffs: state.preferredAccessHandoffs || 0
+        };
+    }
+
+    function probeOrdinaryCreatureBlock(
+        target,
+        now = Date.now()
+    ) {
+        if (
+            !target ||
+            isPreferredCreature(target)
+        ) {
+            return null;
+        }
+
+        const playerPos =
+            normalizePosition(bot.getPlayerPosition());
+        const targetPos = normalizePosition(
+            target.getPosition?.() || target.__position
+        );
+        if (
+            !playerPos ||
+            !targetPos ||
+            playerPos.z !== targetPos.z
+        ) {
+            return null;
+        }
+
+        const liveApproach = getTargetApproachInfo(target);
+        if (liveApproach?.reachable) {
+            return {
+                target,
+                reachable: true,
+                staticRoute: null,
+                blockers: [],
+                clearTarget: null,
+                wallBlocked: false,
+                reason: "ordinary target already reachable"
+            };
+        }
+
+        const staticRoute = findStaticTargetAccessRoute(
+            target,
+            playerPos,
+            config.ordinaryAccessSearchRadius
+        );
+
+        if (!staticRoute?.length) {
+            return {
+                target,
+                reachable: false,
+                staticRoute: null,
+                blockers: [],
+                clearTarget: null,
+                wallBlocked: true,
+                reason:
+                    "ordinary target has no verified static route"
+            };
+        }
+
+        const antiKS = getAntiKSContext(now);
+        const blockers = [];
+        const seen = new Set();
+
+        for (let i = 0; i < staticRoute.length; i++) {
+            const step = staticRoute[i];
+            const blocker = getNativeMonsterAtTile(
+                step.x,
+                step.y,
+                step.z,
+                target.id
+            );
+            if (
+                !blocker ||
+                seen.has(blocker.id)
+            ) {
+                continue;
+            }
+
+            if (getAntiKSBlockReason(blocker, antiKS, now))
+                continue;
+
+            seen.add(blocker.id);
+            blockers.push({
+                monster: blocker,
+                routeIndex: i
+            });
+        }
+
+        blockers.sort((a, b) => {
+            if (a.routeIndex !== b.routeIndex)
+                return a.routeIndex - b.routeIndex;
+
+            const ah =
+                getCreatureHealthPercent(a.monster);
+            const bh =
+                getCreatureHealthPercent(b.monster);
+
+            if (
+                Number.isFinite(ah) &&
+                Number.isFinite(bh) &&
+                ah !== bh
+            ) {
+                return ah - bh;
+            }
+
+            return Number(a.monster?.id || 0) -
+                Number(b.monster?.id || 0);
+        });
+
+        return {
+            target,
+            reachable: false,
+            staticRoute,
+            blockers:
+                blockers.map(entry => entry.monster),
+            clearTarget:
+                blockers[0]?.monster || null,
+            wallBlocked: false,
+            reason: blockers.length
+                ? (
+                    `${blockers.length} creature blocker` +
+                    `${blockers.length === 1 ? "" : "s"} ` +
+                    `sealing ordinary target route`
+                )
+                : "static route exists but no monster blocker found"
+        };
+    }
+
+    function clearOrdinaryAccessState(
+        reason = null,
+        now = Date.now(),
+        handoffOriginal = false
+    ) {
+        const originalId =
+            state.ordinaryAccessTargetId;
+        const wasBlocked =
+            state.ordinaryAccessBlocked;
+
+        state.ordinaryAccessBlocked = false;
+        state.ordinaryAccessTargetId = null;
+        state.ordinaryAccessTargetName = null;
+        state.ordinaryAccessBlockerIds = [];
+        state.ordinaryAccessBlockerNames = [];
+        state.ordinaryAccessClearTargetId = null;
+        state.ordinaryAccessSince = 0;
+        state.ordinaryAccessLastProbeAt = now;
+        state.ordinaryAccessLastReason = reason;
+
+        if (wasBlocked)
+            state.ordinaryAccessClears++;
+
+        if (
+            !handoffOriginal ||
+            originalId == null
+        ) {
+            return false;
+        }
+
+        const original =
+            getCanonicalActiveCreature({ id: originalId }) ||
+            window.gameClient?.world?.activeCreatures?.[
+                originalId
+            ] ||
+            null;
+
+        if (!original)
+            return false;
+
+        const validInfo = isTargetValidAndOnScreen(
+            original,
+            {
+                returnDetails: true,
+                maxDx: 8,
+                maxDy: 6,
+                skipReachability: true
+            }
+        );
+        if (!validInfo.valid)
+            return false;
+
+        if (
+            getAntiKSBlockReason(
+                original,
+                getAntiKSContext(now),
+                now
+            )
+        ) {
+            return false;
+        }
+
+        const approach =
+            getTargetApproachInfo(original);
+
+        if (!approach?.reachable)
+            return false;
+
+        if (setCurrentTarget(original)) {
+            state.ordinaryAccessHandoffs++;
+            bot.log(
+                "Ordinary target access opened – returning to target",
+                {
+                    id: original.id,
+                    name: original.name || "Mob",
+                    reason
+                }
+            );
+            return true;
+        }
+
+        return false;
+    }
+
+    function rejectOrdinaryAccessTarget(
+        target,
+        reason,
+        now = Date.now(),
+        skipMs = null
+    ) {
+        if (!target?.id)
+            return false;
+
+        const effectiveSkipMs = Math.max(
+            750,
+            Math.min(
+                10000,
+                Number(skipMs) ||
+                    Number(config.ordinaryWallSkipMs) ||
+                    2500
+            )
+        );
+
+        state.ordinaryAccessWallRejects++;
+        state.ordinaryAccessLastReason = reason;
+
+        clearOrdinaryAccessState(
+            reason,
+            now,
+            false
+        );
+
+        return handoffTarget(
+            target,
+            reason,
+            now,
+            effectiveSkipMs
+        );
+    }
+
+    function activateOrdinaryAccessState(
+        info,
+        now = Date.now()
+    ) {
+        if (
+            !info?.target ||
+            !info?.clearTarget
+        ) {
+            return false;
+        }
+
+        // Only mb0t-owned ordinary targets may be redirected automatically.
+        // A user-clicked manual target remains entirely under user control.
+        if (
+            state.autoTargetId !== info.target.id ||
+            isManualTargetProtected(info.target, now) ||
+            isPreferredCreature(info.target)
+        ) {
+            state.ordinaryAccessManualBypasses++;
+            return false;
+        }
+
+        const newActivation =
+            !state.ordinaryAccessBlocked ||
+            state.ordinaryAccessTargetId !==
+                info.target.id;
+
+        if (newActivation) {
+            state.ordinaryAccessActivations++;
+            state.ordinaryAccessSince = now;
+
+            bot.log(
+                "Ordinary target access blocked – clearing route mob",
+                {
+                    targetId: info.target.id,
+                    targetName:
+                        info.target.name || "Mob",
+                    blockers:
+                        info.blockers.map(monster => ({
+                            id: monster.id,
+                            name:
+                                monster.name || "Mob"
+                        }))
+                }
+            );
+        }
+
+        state.ordinaryAccessBlocked = true;
+        state.ordinaryAccessTargetId =
+            info.target.id;
+        state.ordinaryAccessTargetName =
+            info.target.name || "Mob";
+        state.ordinaryAccessBlockerIds =
+            info.blockers.map(monster => monster.id);
+        state.ordinaryAccessBlockerNames =
+            info.blockers.map(
+                monster => monster.name || "Mob"
+            );
+        state.ordinaryAccessClearTargetId =
+            info.clearTarget.id;
+        state.ordinaryAccessLastProbeAt = now;
+        state.ordinaryAccessLastReason =
+            info.reason;
+
+        const current = getCurrentTarget();
+        if (
+            !current ||
+            current.id !== info.clearTarget.id
+        ) {
+            if (setCurrentTarget(info.clearTarget))
+                state.ordinaryAccessHandoffs++;
+        }
+
+        return true;
+    }
+
+    function syncOrdinaryAccessClear(
+        now = Date.now()
+    ) {
+        if (!state.ordinaryAccessBlocked)
+            return false;
+
+        // Preferred access always owns this problem class if it becomes active.
+        if (state.preferredAccessBlocked) {
+            clearOrdinaryAccessState(
+                "preferred access took priority",
+                now,
+                false
+            );
+            return false;
+        }
+
+        const originalId =
+            state.ordinaryAccessTargetId;
+        const original =
+            window.gameClient?.world?.activeCreatures?.[
+                originalId
+            ] ||
+            getCanonicalActiveCreature({
+                id: originalId
+            }) ||
+            null;
+
+        const hp = Number(
+            original?.state?.health ??
+            original?.health
+        );
+
+        if (
+            !original ||
+            (Number.isFinite(hp) && hp <= 0)
+        ) {
+            clearOrdinaryAccessState(
+                "ordinary target gone",
+                now,
+                false
+            );
+            return false;
+        }
+
+        // If the user clicks something manually while access-clear is active,
+        // cancel automatic ownership immediately.
+        const current = getCurrentTarget();
+        if (
+            current &&
+            current.id !==
+                state.ordinaryAccessClearTargetId &&
+            isManualTargetProtected(current, now)
+        ) {
+            clearOrdinaryAccessState(
+                "manual target took ownership",
+                now,
+                false
+            );
+            return false;
+        }
+
+        const probeMs = Math.max(
+            150,
+            Math.min(
+                1000,
+                Number(config.ordinaryAccessProbeMs) ||
+                    300
+            )
+        );
+
+        if (
+            now -
+                Number(
+                    state.ordinaryAccessLastProbeAt || 0
+                ) >=
+            probeMs
+        ) {
+            state.ordinaryAccessLastProbeAt = now;
+
+            const info =
+                probeOrdinaryCreatureBlock(
+                    original,
+                    now
+                );
+
+            if (!info) {
+                clearOrdinaryAccessState(
+                    "ordinary access probe unavailable",
+                    now,
+                    false
+                );
+                return false;
+            }
+
+            if (info.reachable) {
+                clearOrdinaryAccessState(
+                    "ordinary access opened",
+                    now,
+                    true
+                );
+                return false;
+            }
+
+            if (info.wallBlocked) {
+                rejectOrdinaryAccessTarget(
+                    original,
+                    "ordinary target blocked by wall/static geometry",
+                    now
+                );
+                return false;
+            }
+
+            if (!info.clearTarget) {
+                const noBlockerGraceMs =
+                    Math.max(
+                        300,
+                        Math.min(
+                            2500,
+                            Number(
+                                config
+                                    .ordinaryAccessNoBlockerGraceMs
+                            ) || 900
+                        )
+                    );
+
+                if (
+                    now -
+                        Number(
+                            state.ordinaryAccessSince ||
+                            now
+                        ) >=
+                    noBlockerGraceMs
+                ) {
+                    state.ordinaryAccessNoBlockerRejects++;
+                    rejectOrdinaryAccessTarget(
+                        original,
+                        "ordinary target unreachable with no creature blocker",
+                        now,
+                        1200
+                    );
+                    return false;
+                }
+
+                return true;
+            }
+
+            activateOrdinaryAccessState(
+                info,
+                now
+            );
+        }
+
+        let clearTarget =
+            window.gameClient?.world?.activeCreatures?.[
+                state.ordinaryAccessClearTargetId
+            ] ||
+            null;
+
+        const clearHp = Number(
+            clearTarget?.state?.health ??
+            clearTarget?.health
+        );
+
+        if (
+            !clearTarget ||
+            (
+                Number.isFinite(clearHp) &&
+                clearHp <= 0
+            )
+        ) {
+            state.ordinaryAccessLastProbeAt = 0;
+            return true;
+        }
+
+        const activeCurrent = getCurrentTarget();
+        if (
+            !activeCurrent ||
+            activeCurrent.id !== clearTarget.id
+        ) {
+            if (
+                !activeCurrent ||
+                !isManualTargetProtected(
+                    activeCurrent,
+                    now
+                )
+            ) {
+                if (setCurrentTarget(clearTarget))
+                    state.ordinaryAccessHandoffs++;
+            }
+        }
+
+        return true;
+    }
+
+    function isOrdinaryAccessBlocked() {
+        return !!state.ordinaryAccessBlocked;
+    }
+
+    function getOrdinaryAccessInfo() {
+        return {
+            active: !!state.ordinaryAccessBlocked,
+            targetId: state.ordinaryAccessTargetId,
+            targetName:
+                state.ordinaryAccessTargetName,
+            blockerIds: Array.from(
+                state.ordinaryAccessBlockerIds || []
+            ),
+            blockerNames: Array.from(
+                state.ordinaryAccessBlockerNames || []
+            ),
+            clearTargetId:
+                state.ordinaryAccessClearTargetId,
+            since:
+                state.ordinaryAccessSince || 0,
+            reason:
+                state.ordinaryAccessLastReason,
+            activations:
+                state.ordinaryAccessActivations || 0,
+            clears:
+                state.ordinaryAccessClears || 0,
+            handoffs:
+                state.ordinaryAccessHandoffs || 0,
+            wallRejects:
+                state.ordinaryAccessWallRejects || 0,
+            noBlockerRejects:
+                state.ordinaryAccessNoBlockerRejects ||
+                0,
+            manualBypasses:
+                state.ordinaryAccessManualBypasses ||
+                0
         };
     }
 
@@ -9903,6 +10604,21 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         state.preferredAccessClears = 0;
         state.preferredAccessHandoffs = 0;
         state.preferredAccessExoriHints = 0;
+        state.ordinaryAccessBlocked = false;
+        state.ordinaryAccessTargetId = null;
+        state.ordinaryAccessTargetName = null;
+        state.ordinaryAccessBlockerIds = [];
+        state.ordinaryAccessBlockerNames = [];
+        state.ordinaryAccessClearTargetId = null;
+        state.ordinaryAccessSince = 0;
+        state.ordinaryAccessLastProbeAt = 0;
+        state.ordinaryAccessLastReason = null;
+        state.ordinaryAccessActivations = 0;
+        state.ordinaryAccessClears = 0;
+        state.ordinaryAccessHandoffs = 0;
+        state.ordinaryAccessWallRejects = 0;
+        state.ordinaryAccessNoBlockerRejects = 0;
+        state.ordinaryAccessManualBypasses = 0;
         state.preferredWallBlocks = 0;
         state.preferredWallBlockLastId = null;
         state.preferredWallBlockLastName = null;
@@ -11591,6 +12307,21 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         state.preferredAccessClears = 0;
         state.preferredAccessHandoffs = 0;
         state.preferredAccessExoriHints = 0;
+        state.ordinaryAccessBlocked = false;
+        state.ordinaryAccessTargetId = null;
+        state.ordinaryAccessTargetName = null;
+        state.ordinaryAccessBlockerIds = [];
+        state.ordinaryAccessBlockerNames = [];
+        state.ordinaryAccessClearTargetId = null;
+        state.ordinaryAccessSince = 0;
+        state.ordinaryAccessLastProbeAt = 0;
+        state.ordinaryAccessLastReason = null;
+        state.ordinaryAccessActivations = 0;
+        state.ordinaryAccessClears = 0;
+        state.ordinaryAccessHandoffs = 0;
+        state.ordinaryAccessWallRejects = 0;
+        state.ordinaryAccessNoBlockerRejects = 0;
+        state.ordinaryAccessManualBypasses = 0;
         state.preferredWallBlocks = 0;
         state.preferredWallBlockLastId = null;
         state.preferredWallBlockLastName = null;
@@ -11852,6 +12583,9 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             preferredAccess: getPreferredAccessInfo(),
             preferredAccessBlocked: isPreferredAccessBlocked(),
             preferredAccessExoriHints: state.preferredAccessExoriHints || 0,
+            ordinaryAccess: getOrdinaryAccessInfo(),
+            ordinaryAccessBlocked:
+                isOrdinaryAccessBlocked(),
             preferredWallBlocks: state.preferredWallBlocks || 0,
             preferredWallBlockLastId: state.preferredWallBlockLastId,
             preferredWallBlockLastName: state.preferredWallBlockLastName,
@@ -12146,6 +12880,30 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 ? Math.max(2000, Math.min(30000, value))
                 : config.preferredWallSkipMs;
         }
+        if (nextConfig.ordinaryAccessProbeMs !== undefined) {
+            const value = Number(nextConfig.ordinaryAccessProbeMs);
+            nextConfig.ordinaryAccessProbeMs = Number.isFinite(value)
+                ? Math.max(150, Math.min(1000, value))
+                : config.ordinaryAccessProbeMs;
+        }
+        if (nextConfig.ordinaryAccessSearchRadius !== undefined) {
+            const value = Number(nextConfig.ordinaryAccessSearchRadius);
+            nextConfig.ordinaryAccessSearchRadius = Number.isFinite(value)
+                ? Math.max(4, Math.min(14, Math.trunc(value)))
+                : config.ordinaryAccessSearchRadius;
+        }
+        if (nextConfig.ordinaryAccessNoBlockerGraceMs !== undefined) {
+            const value = Number(nextConfig.ordinaryAccessNoBlockerGraceMs);
+            nextConfig.ordinaryAccessNoBlockerGraceMs = Number.isFinite(value)
+                ? Math.max(300, Math.min(2500, value))
+                : config.ordinaryAccessNoBlockerGraceMs;
+        }
+        if (nextConfig.ordinaryWallSkipMs !== undefined) {
+            const value = Number(nextConfig.ordinaryWallSkipMs);
+            nextConfig.ordinaryWallSkipMs = Number.isFinite(value)
+                ? Math.max(750, Math.min(10000, value))
+                : config.ordinaryWallSkipMs;
+        }
         if (nextConfig.lureLeashEdgeX !== undefined) {
             const value = Number(nextConfig.lureLeashEdgeX);
             nextConfig.lureLeashEdgeX = Number.isFinite(value)
@@ -12259,6 +13017,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         getLureContext,
         isPreferredAccessBlocked,
         getPreferredAccessInfo,
+        isOrdinaryAccessBlocked,
+        getOrdinaryAccessInfo,
         isProtectionZoneBlocked,
         getProtectionZoneBlockInfo,
         isCombatActive,
@@ -26348,12 +27108,44 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         captureHandler: null,
         pendingMove: null,
         lastFullLogAt: 0,
+
+        // v1.5.37: optional corpse-approach ownership.
+        corpseQueue: [],
+        corpseJob: null,
+        deathHookOwner: null,
+        deathHookOriginal: null,
+        deathHookWrapper: null,
+        deathHookRetryTimer: null,
+        corpseJobsStarted: 0,
+        corpseJobsCompleted: 0,
+        corpseJobsFailed: 0,
+        corpseDeathsQueued: 0,
+        corpseDeathsIgnored: 0,
     };
 
     // Load config
     const stored = bot.storage.get(configStorageKey, {});
     state.destinationId = stored.destinationId || null;
     state.destinationTitle = stored.destinationTitle || null;
+
+    // Optional corpse walking is OFF by default.
+    state.walkToCorpses = stored.walkToCorpses === true;
+    state.corpseMaxDistance = Math.max(
+        1,
+        Math.min(30, Number(stored.corpseMaxDistance) || 12)
+    );
+    state.corpseOpenDelayMs = Math.max(
+        100,
+        Math.min(1500, Number(stored.corpseOpenDelayMs) || 300)
+    );
+    state.corpseApproachTimeoutMs = Math.max(
+        2500,
+        Math.min(15000, Number(stored.corpseApproachTimeoutMs) || 8000)
+    );
+    state.corpseLootHoldMs = Math.max(
+        2000,
+        Math.min(15000, Number(stored.corpseLootHoldMs) || 8000)
+    );
     if (Array.isArray(stored.trackedItems)) {
         for (const [id, name] of stored.trackedItems) {
             state.trackedItems.set(id, name);
@@ -26365,6 +27157,11 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             destinationId: state.destinationId,
             destinationTitle: state.destinationTitle,
             trackedItems: Array.from(state.trackedItems.entries()),
+            walkToCorpses: state.walkToCorpses,
+            corpseMaxDistance: state.corpseMaxDistance,
+            corpseOpenDelayMs: state.corpseOpenDelayMs,
+            corpseApproachTimeoutMs: state.corpseApproachTimeoutMs,
+            corpseLootHoldMs: state.corpseLootHoldMs,
         });
     }
 
@@ -26441,6 +27238,720 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                 return i;
         }
         return -1;
+    }
+
+    function getTileAtPosition(pos) {
+        if (!pos)
+            return null;
+        try {
+            return window.gameClient?.world?.getTileFromWorldPosition?.(pos) || null;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function getTopTileItem(tile) {
+        if (!tile)
+            return null;
+
+        try {
+            if (typeof tile.peekItem === "function")
+                return tile.peekItem(0xFF);
+        } catch (e) {}
+
+        if (Array.isArray(tile.items) && tile.items.length)
+            return tile.items[tile.items.length - 1];
+
+        return null;
+    }
+
+    function isCorpseContainerItem(item) {
+        if (!item)
+            return false;
+
+        try {
+            if (
+                typeof item.isContainer === "function" &&
+                item.isContainer()
+            ) {
+                return true;
+            }
+        } catch (e) {}
+
+        const def =
+            window.gameClient?.itemDefinitionsByCid?.[item.id];
+        return def?.properties?.type === "corpse";
+    }
+
+    function getCorpseTileInfo(pos) {
+        const tile = getTileAtPosition(pos);
+        if (!tile)
+            return null;
+
+        const topItem = getTopTileItem(tile);
+        if (!isCorpseContainerItem(topItem))
+            return null;
+
+        return {
+            tile,
+            item: topItem
+        };
+    }
+
+    function getOpenContainerIds() {
+        return new Set(
+            getContainersArray()
+                .map(container => Number(container?.__containerId))
+                .filter(Number.isFinite)
+        );
+    }
+
+    function getNewOpenedContainer(baselineIds) {
+        const containers = getContainersArray();
+        for (const container of containers) {
+            const id = Number(container?.__containerId);
+            if (
+                !Number.isFinite(id) ||
+                baselineIds?.has(id)
+            ) {
+                continue;
+            }
+
+            // Destination opening is not the corpse we are waiting for.
+            if (
+                state.destinationId != null &&
+                id === Number(state.destinationId)
+            ) {
+                continue;
+            }
+
+            return container;
+        }
+        return null;
+    }
+
+    function containerHasTrackedItems(container) {
+        if (!container)
+            return false;
+
+        for (let slot = 0; slot < container.size; slot++) {
+            const item = container.getSlotItem?.(slot);
+            if (
+                item &&
+                state.trackedItems.has(item.id)
+            ) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    function clearNativePendingCorpseUse(job) {
+        const mouse = window.gameClient?.mouse;
+        if (!mouse || !job?.position)
+            return;
+
+        try {
+            const pending = mouse.__pendingUsePosition;
+            if (
+                pending &&
+                pending.x === job.position.x &&
+                pending.y === job.position.y &&
+                pending.z === job.position.z
+            ) {
+                mouse.__pendingUseObject = null;
+                mouse.__pendingUsePosition = null;
+            }
+        } catch (e) {}
+    }
+
+    function pauseModulesForCorpse(job) {
+        if (!job)
+            return;
+
+        job.resumeCave =
+            !!bot.cave?.status?.().running;
+        job.resumeAttack =
+            !!bot.attack?.status?.().running;
+
+        // Pause Cave first so it cannot request another destination while
+        // Targeting is being released.
+        if (job.resumeCave) {
+            bot.cave?.stop?.({
+                persistEnabled: false
+            });
+        }
+
+        if (job.resumeAttack) {
+            bot.attack?.stop?.({
+                persistEnabled: false
+            });
+        }
+    }
+
+    function resumeModulesAfterCorpse(job) {
+        if (!job)
+            return;
+
+        // Targeting first, CaveBot second: Cave movement resumes with targeting
+        // already initialized, matching the existing recovery conventions.
+        if (
+            state.running &&
+            job.resumeAttack
+        ) {
+            bot.attack?.start?.();
+        }
+        if (
+            state.running &&
+            job.resumeCave
+        ) {
+            bot.cave?.start?.();
+        }
+
+        job.resumeAttack = false;
+        job.resumeCave = false;
+    }
+
+    function finishCorpseJob(
+        success,
+        reason = null
+    ) {
+        const job = state.corpseJob;
+        if (!job)
+            return false;
+
+        clearNativePendingCorpseUse(job);
+
+        if (success)
+            state.corpseJobsCompleted++;
+        else
+            state.corpseJobsFailed++;
+
+        bot.log(
+            success
+                ? "Looter: corpse looting finished"
+                : "Looter: corpse approach ended",
+            {
+                reason,
+                monster:
+                    job.monsterName || "Monster",
+                position: job.position,
+                openedContainerId:
+                    job.openedContainerId || null
+            }
+        );
+
+        state.pendingMove = null;
+        state.corpseJob = null;
+        resumeModulesAfterCorpse(job);
+        return true;
+    }
+
+    function useCorpseNatively(job, now = Date.now()) {
+        if (!job?.position)
+            return false;
+
+        const info =
+            getCorpseTileInfo(job.position);
+        if (!info)
+            return false;
+
+        const mouse = window.gameClient?.mouse;
+        if (!mouse || typeof mouse.use !== "function")
+            return false;
+
+        try {
+            // Native Mouse.use already does the important part for ground
+            // containers: path to an adjacent walkable tile, then use/open the
+            // corpse after arrival. We deliberately reuse that client logic.
+            mouse.use({
+                which: info.tile,
+                index: 0xFF
+            });
+            job.lastUseAt = now;
+            job.useAttempts++;
+            return true;
+        } catch (e) {
+            bot.log("Looter: native corpse use failed", e);
+            return false;
+        }
+    }
+
+    function enqueueCorpseDeath(
+        creature,
+        now = Date.now()
+    ) {
+        if (
+            !state.running ||
+            !state.walkToCorpses ||
+            !creature
+        ) {
+            return false;
+        }
+
+        const pos = creature.getPosition?.() ||
+            creature.__position;
+        if (!pos)
+            return false;
+
+        const playerPos = bot.getPlayerPosition();
+        if (
+            !playerPos ||
+            Number(playerPos.z) !== Number(pos.z)
+        ) {
+            state.corpseDeathsIgnored++;
+            return false;
+        }
+
+        const distance = Math.max(
+            Math.abs(Number(pos.x) - Number(playerPos.x)),
+            Math.abs(Number(pos.y) - Number(playerPos.y))
+        );
+
+        if (
+            !Number.isFinite(distance) ||
+            distance > state.corpseMaxDistance
+        ) {
+            state.corpseDeathsIgnored++;
+            return false;
+        }
+
+        const key =
+            `${pos.x},${pos.y},${pos.z}`;
+
+        if (
+            state.corpseJob?.key === key ||
+            state.corpseQueue.some(entry => entry.key === key)
+        ) {
+            return false;
+        }
+
+        while (state.corpseQueue.length >= 8)
+            state.corpseQueue.shift();
+
+        state.corpseQueue.push({
+            key,
+            monsterId: creature.id,
+            monsterName: creature.name || "Monster",
+            position: {
+                x: Number(pos.x),
+                y: Number(pos.y),
+                z: Number(pos.z)
+            },
+            deathAt: now,
+            notBefore:
+                now + state.corpseOpenDelayMs,
+            expiresAt:
+                now +
+                state.corpseOpenDelayMs +
+                5000
+        });
+        state.corpseDeathsQueued++;
+
+        bot.log(
+            "Looter: queued distant corpse",
+            {
+                id: creature.id,
+                name:
+                    creature.name || "Monster",
+                distance,
+                position: {
+                    x: pos.x,
+                    y: pos.y,
+                    z: pos.z
+                }
+            }
+        );
+
+        scheduleNextTick(100);
+        return true;
+    }
+
+    function installDeathHook() {
+        if (state.deathHookWrapper)
+            return true;
+
+        const handler =
+            window.gameClient?.networkManager?.packetHandler;
+        if (
+            !handler ||
+            typeof handler.handlePropertyChange !== "function"
+        ) {
+            if (
+                state.running &&
+                state.deathHookRetryTimer == null
+            ) {
+                state.deathHookRetryTimer =
+                    window.setTimeout(() => {
+                        state.deathHookRetryTimer = null;
+                        if (state.running)
+                            installDeathHook();
+                    }, 500);
+            }
+            return false;
+        }
+
+        const original =
+            handler.handlePropertyChange;
+
+        const wrapper = function(packet) {
+            let deathCandidate = null;
+
+            try {
+                if (
+                    state.running &&
+                    state.walkToCorpses &&
+                    packet?.property ===
+                        CONST.PROPERTIES.HEALTH &&
+                    Number(packet?.value) === 0
+                ) {
+                    const creature =
+                        window.gameClient?.world?.getCreature?.(
+                            packet.guid
+                        ) ||
+                        window.gameClient?.world?.activeCreatures?.[
+                            packet.guid
+                        ] ||
+                        null;
+
+                    const health = Number(
+                        creature?.state?.health ??
+                        creature?.health
+                    );
+
+                    const monsterType =
+                        typeof CONST !== "undefined"
+                            ? CONST.TYPES?.MONSTER
+                            : undefined;
+
+                    const exactMonster =
+                        creature &&
+                        (
+                            monsterType === undefined ||
+                            creature.type === monsterType
+                        );
+
+                    const currentTarget =
+                        bot.attack?.getCurrentTarget?.() ||
+                        window.gameClient?.player?.getTarget?.() ||
+                        null;
+
+                    const wasTargeted =
+                        creature &&
+                        currentTarget &&
+                        currentTarget.id === creature.id;
+
+                    if (
+                        exactMonster &&
+                        wasTargeted &&
+                        (!Number.isFinite(health) || health > 0)
+                    ) {
+                        deathCandidate = creature;
+                    }
+                }
+            } catch (e) {}
+
+            const result =
+                original.call(this, packet);
+
+            if (deathCandidate) {
+                try {
+                    enqueueCorpseDeath(
+                        deathCandidate,
+                        Date.now()
+                    );
+                } catch (e) {
+                    bot.log(
+                        "Looter: corpse death hook failed",
+                        e
+                    );
+                }
+            }
+
+            return result;
+        };
+
+        state.deathHookOwner = handler;
+        state.deathHookOriginal = original;
+        state.deathHookWrapper = wrapper;
+        handler.handlePropertyChange = wrapper;
+
+        bot.log("Looter: corpse death hook installed");
+        return true;
+    }
+
+    function uninstallDeathHook() {
+        if (state.deathHookRetryTimer != null) {
+            window.clearTimeout(
+                state.deathHookRetryTimer
+            );
+            state.deathHookRetryTimer = null;
+        }
+
+        if (
+            state.deathHookOwner?.handlePropertyChange ===
+            state.deathHookWrapper
+        ) {
+            state.deathHookOwner.handlePropertyChange =
+                state.deathHookOriginal;
+        }
+
+        state.deathHookOwner = null;
+        state.deathHookOriginal = null;
+        state.deathHookWrapper = null;
+    }
+
+    function startNextCorpseJob(
+        now = Date.now()
+    ) {
+        if (
+            state.corpseJob ||
+            !state.walkToCorpses ||
+            !state.corpseQueue.length ||
+            bot.actions?.isHalted?.()
+        ) {
+            return false;
+        }
+
+        // Drop stale/dead candidates until we find a real corpse tile.
+        while (state.corpseQueue.length) {
+            const candidate =
+                state.corpseQueue[0];
+
+            if (now < candidate.notBefore)
+                return false;
+
+            if (now > candidate.expiresAt) {
+                state.corpseQueue.shift();
+                state.corpseJobsFailed++;
+                continue;
+            }
+
+            const playerPos =
+                bot.getPlayerPosition();
+            if (
+                !playerPos ||
+                Number(playerPos.z) !==
+                    Number(candidate.position.z)
+            ) {
+                state.corpseQueue.shift();
+                state.corpseJobsFailed++;
+                continue;
+            }
+
+            const distance = Math.max(
+                Math.abs(
+                    candidate.position.x -
+                    playerPos.x
+                ),
+                Math.abs(
+                    candidate.position.y -
+                    playerPos.y
+                )
+            );
+
+            if (distance > state.corpseMaxDistance) {
+                state.corpseQueue.shift();
+                state.corpseJobsFailed++;
+                continue;
+            }
+
+            const corpseInfo =
+                getCorpseTileInfo(candidate.position);
+
+            // Corpse item-add may arrive a little after HEALTH=0.
+            if (!corpseInfo)
+                return false;
+
+            state.corpseQueue.shift();
+
+            const job = {
+                ...candidate,
+                startedAt: now,
+                lootStartedAt: 0,
+                lastUseAt: 0,
+                useAttempts: 0,
+                baselineContainerIds:
+                    getOpenContainerIds(),
+                openedContainerId: null,
+                resumeCave: false,
+                resumeAttack: false
+            };
+
+            state.corpseJob = job;
+            state.corpseJobsStarted++;
+
+            pauseModulesForCorpse(job);
+
+            bot.log(
+                "Looter: walking to distant corpse",
+                {
+                    monster:
+                        job.monsterName,
+                    position:
+                        job.position,
+                    distance
+                }
+            );
+
+            if (!useCorpseNatively(job, now)) {
+                finishCorpseJob(
+                    false,
+                    "native corpse use unavailable"
+                );
+                return false;
+            }
+
+            return true;
+        }
+
+        return false;
+    }
+
+    function updateCorpseJob(
+        now = Date.now()
+    ) {
+        const job = state.corpseJob;
+        if (!job)
+            return false;
+
+        if (
+            !state.running ||
+            !state.walkToCorpses ||
+            bot.actions?.isHalted?.()
+        ) {
+            finishCorpseJob(
+                false,
+                "Looter stopped or halted"
+            );
+            return false;
+        }
+
+        if (
+            now - job.startedAt >
+            state.corpseApproachTimeoutMs
+        ) {
+            finishCorpseJob(
+                false,
+                "corpse approach timeout"
+            );
+            return false;
+        }
+
+        if (job.openedContainerId == null) {
+            const opened =
+                getNewOpenedContainer(
+                    job.baselineContainerIds
+                );
+
+            if (opened) {
+                job.openedContainerId =
+                    opened.__containerId;
+                job.lootStartedAt = now;
+
+                bot.log(
+                    "Looter: corpse opened",
+                    {
+                        monster:
+                            job.monsterName,
+                        containerId:
+                            job.openedContainerId
+                    }
+                );
+            } else {
+                const corpseInfo =
+                    getCorpseTileInfo(job.position);
+
+                if (!corpseInfo) {
+                    // Give the death/item packets a little room before
+                    // declaring the corpse gone.
+                    if (
+                        now - job.startedAt > 1200
+                    ) {
+                        finishCorpseJob(
+                            false,
+                            "corpse disappeared before opening"
+                        );
+                    }
+                    return true;
+                }
+
+                // Native pending-use normally handles this itself. Re-issue at
+                // a low rate if the client dropped the pending action.
+                if (
+                    now - job.lastUseAt > 1200 &&
+                    job.useAttempts < 3
+                ) {
+                    useCorpseNatively(job, now);
+                }
+
+                return true;
+            }
+        }
+
+        const corpseContainer =
+            getContainerById(
+                job.openedContainerId
+            );
+
+        if (!corpseContainer) {
+            finishCorpseJob(
+                false,
+                "corpse container closed"
+            );
+            return false;
+        }
+
+        const dest =
+            getDestinationContainer();
+        if (!dest) {
+            finishCorpseJob(
+                false,
+                "no destination container"
+            );
+            return false;
+        }
+
+        if (findEmptySlot(dest) === -1) {
+            finishCorpseJob(
+                false,
+                "destination container full"
+            );
+            return false;
+        }
+
+        // Existing tracked-item transfer logic owns the actual item moves.
+        moveItems();
+
+        const pendingFromCorpse =
+            state.pendingMove &&
+            Number(state.pendingMove.sourceId) ===
+                Number(job.openedContainerId);
+
+        if (
+            !containerHasTrackedItems(corpseContainer) &&
+            !pendingFromCorpse
+        ) {
+            finishCorpseJob(
+                true,
+                "tracked corpse items transferred"
+            );
+            return false;
+        }
+
+        if (
+            job.lootStartedAt &&
+            now - job.lootStartedAt >
+                state.corpseLootHoldMs
+        ) {
+            finishCorpseJob(
+                false,
+                "corpse loot hold timeout"
+            );
+            return false;
+        }
+
+        return true;
     }
 
     // One outstanding inventory move at a time. Containers update asynchronously;
@@ -26535,7 +28046,16 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         if (!state.running)
             return;
         try {
-            moveItems();
+            const now = Date.now();
+
+            if (state.corpseJob) {
+                updateCorpseJob(now);
+            } else {
+                startNextCorpseJob(now);
+
+                if (!state.corpseJob)
+                    moveItems();
+            }
         } catch (e) {
             bot.log("Looter tick failed", e);
         } finally {
@@ -26543,14 +28063,31 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         }
     }
 
-    function scheduleNextTick() {
+    function scheduleNextTick(delayOverride = null) {
         if (!state.running)
             return;
-        if (state.timerId !== null) window.clearTimeout(state.timerId);
+
+        if (state.timerId !== null)
+            window.clearTimeout(state.timerId);
+
+        const delay = Number.isFinite(
+            Number(delayOverride)
+        )
+            ? Math.max(
+                50,
+                Number(delayOverride)
+            )
+            : (
+                state.corpseJob ||
+                state.corpseQueue.length
+                    ? 200
+                    : 1000
+            );
+
         state.timerId = window.setTimeout(() => {
             state.timerId = null;
             tick();
-        }, 1000);
+        }, delay);
     }
 
     function start() {
@@ -26558,6 +28095,9 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             return false;
         state.running = true;
         state.pendingMove = null;
+        state.corpseQueue = [];
+        state.corpseJob = null;
+        installDeathHook();
         bot.log("Looter started");
         tick();
         return true;
@@ -26574,6 +28114,22 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
     function stop() {
         state.running = false;
         state.pendingMove = null;
+
+        const activeCorpseJob =
+            state.corpseJob;
+        state.corpseQueue = [];
+        state.corpseJob = null;
+
+        if (activeCorpseJob) {
+            clearNativePendingCorpseUse(
+                activeCorpseJob
+            );
+            // Explicit stop must not restart gameplay modules.
+            activeCorpseJob.resumeAttack = false;
+            activeCorpseJob.resumeCave = false;
+        }
+
+        uninstallDeathHook();
         clearCaptureMode();
         if (state.timerId != null) {
             window.clearTimeout(state.timerId);
@@ -26589,6 +28145,31 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             destinationId: state.destinationId,
             destinationTitle: state.destinationTitle,
             trackedItems: Array.from(state.trackedItems.entries()),
+            walkToCorpses: state.walkToCorpses,
+            corpseMaxDistance: state.corpseMaxDistance,
+            corpseOpenDelayMs: state.corpseOpenDelayMs,
+            corpseApproachTimeoutMs: state.corpseApproachTimeoutMs,
+            corpseLootHoldMs: state.corpseLootHoldMs,
+            corpseQueueLength:
+                state.corpseQueue.length,
+            corpseJobActive:
+                !!state.corpseJob,
+            corpseJobMonster:
+                state.corpseJob?.monsterName ||
+                null,
+            corpseJobPosition:
+                state.corpseJob?.position ||
+                null,
+            corpseJobsStarted:
+                state.corpseJobsStarted,
+            corpseJobsCompleted:
+                state.corpseJobsCompleted,
+            corpseJobsFailed:
+                state.corpseJobsFailed,
+            corpseDeathsQueued:
+                state.corpseDeathsQueued,
+            corpseDeathsIgnored:
+                state.corpseDeathsIgnored,
         };
     }
 
@@ -26602,12 +28183,84 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         if (Array.isArray(next.trackedItems)) {
             state.trackedItems = new Map(next.trackedItems);
         }
+        if (next.walkToCorpses !== undefined) {
+            state.walkToCorpses =
+                !!next.walkToCorpses;
+
+            if (!state.walkToCorpses) {
+                state.corpseQueue = [];
+                if (state.corpseJob) {
+                    finishCorpseJob(
+                        false,
+                        "walk-to-corpses disabled"
+                    );
+                }
+            }
+        }
+        if (next.corpseMaxDistance !== undefined) {
+            state.corpseMaxDistance =
+                Math.max(
+                    1,
+                    Math.min(
+                        30,
+                        Number(next.corpseMaxDistance) ||
+                            12
+                    )
+                );
+        }
+        if (next.corpseOpenDelayMs !== undefined) {
+            state.corpseOpenDelayMs =
+                Math.max(
+                    100,
+                    Math.min(
+                        1500,
+                        Number(next.corpseOpenDelayMs) ||
+                            300
+                    )
+                );
+        }
+        if (next.corpseApproachTimeoutMs !== undefined) {
+            state.corpseApproachTimeoutMs =
+                Math.max(
+                    2500,
+                    Math.min(
+                        15000,
+                        Number(
+                            next.corpseApproachTimeoutMs
+                        ) || 8000
+                    )
+                );
+        }
+        if (next.corpseLootHoldMs !== undefined) {
+            state.corpseLootHoldMs =
+                Math.max(
+                    2000,
+                    Math.min(
+                        15000,
+                        Number(next.corpseLootHoldMs) ||
+                            8000
+                    )
+                );
+        }
+
+        if (
+            state.running &&
+            !state.deathHookWrapper
+        ) {
+            installDeathHook();
+        }
+
         state.pendingMove = null;
         persistConfig();
         return {
             destinationId: state.destinationId,
             destinationTitle: state.destinationTitle,
-            trackedItems: Array.from(state.trackedItems.entries())
+            trackedItems: Array.from(state.trackedItems.entries()),
+            walkToCorpses: state.walkToCorpses,
+            corpseMaxDistance: state.corpseMaxDistance,
+            corpseOpenDelayMs: state.corpseOpenDelayMs,
+            corpseApproachTimeoutMs: state.corpseApproachTimeoutMs,
+            corpseLootHoldMs: state.corpseLootHoldMs
         };
     }
 
@@ -26738,6 +28391,14 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         getTrackedItems: () => Array.from(state.trackedItems.entries()),
         getDestinationId: () => state.destinationId,
         getDestinationTitle: () => state.destinationTitle,
+        isCorpseBusy: () => !!state.corpseJob,
+        getCorpseQueue: () =>
+            state.corpseQueue.map(entry => ({
+                ...entry,
+                position: {
+                    ...entry.position
+                }
+            })),
     };
 };
 
@@ -29023,7 +30684,31 @@ function upgradeSectionHeaders(panel) {
             toggle.checked = !!status?.running;
         }
         if (statusLabel) {
-            statusLabel.textContent = status?.running ? "Status: running" : "Status: idle";
+            if (status?.corpseJobActive) {
+                statusLabel.textContent =
+                    `Status: looting ${status.corpseJobMonster || "corpse"}`;
+            } else {
+                statusLabel.textContent =
+                    status?.running
+                        ? "Status: running"
+                        : "Status: idle";
+            }
+        }
+
+        if (
+            walkCorpseToggle &&
+            document.activeElement !== walkCorpseToggle
+        ) {
+            walkCorpseToggle.checked =
+                !!status?.walkToCorpses;
+        }
+
+        if (
+            corpseDistanceInput &&
+            document.activeElement !== corpseDistanceInput
+        ) {
+            corpseDistanceInput.value =
+                status?.corpseMaxDistance ?? 12;
         }
         if (ammoLabel) {
             ammoLabel.textContent = status?.ammoCount ?? 0;
@@ -29049,6 +30734,10 @@ function upgradeSectionHeaders(panel) {
         const statusLabel = document.getElementById("minibia-bot-looter-status");
         const destLabel = document.getElementById("minibia-bot-looter-dest-status");
         const listContainer = document.getElementById("minibia-bot-looter-item-list");
+        const walkCorpseToggle =
+            document.getElementById("minibia-bot-looter-walk-corpses");
+        const corpseDistanceInput =
+            document.getElementById("minibia-bot-looter-corpse-distance");
 
         const status = bot.looter?.status?.();
         if (toggle && document.activeElement !== toggle) {
@@ -32094,6 +33783,15 @@ function upgradeSectionHeaders(panel) {
         <button type="button" class="mb-small-button" id="minibia-bot-looter-capture-item" style="flex:1;">Track Item</button>
       </div>
       <div class="mb-small-note" id="minibia-bot-looter-dest-status">No destination selected</div>
+      <label class="mb-inline" style="justify-content:space-between;gap:8px;">
+        <span>Walk to distant corpses</span>
+        <input type="checkbox" id="minibia-bot-looter-walk-corpses" />
+      </label>
+      <label class="mb-inline" style="justify-content:space-between;gap:8px;">
+        <span>Max corpse distance</span>
+        <input type="number" id="minibia-bot-looter-corpse-distance" min="1" max="30" value="12" style="width:64px;" />
+      </label>
+      <div class="mb-small-note">When enabled, Looter pauses Targeting/CaveBot, walks beside the corpse, opens it, transfers tracked items, then resumes.</div>
       <div class="mb-section-title mb-section-title--sub">
         <span class="mb-title-text">Tracked Items</span>
       </div>
@@ -34620,6 +36318,10 @@ function upgradeSectionHeaders(panel) {
         const captureItemBtn = panel.querySelector("#minibia-bot-looter-capture-item");
         const manualInput = panel.querySelector("#minibia-bot-looter-manual-input");
         const manualAddBtn = panel.querySelector("#minibia-bot-looter-manual-add");
+        const walkCorpseToggle =
+            panel.querySelector("#minibia-bot-looter-walk-corpses");
+        const corpseDistanceInput =
+            panel.querySelector("#minibia-bot-looter-corpse-distance");
 
         if (looterToggle) {
             looterToggle.checked = !!bot.looter?.status?.().running;
@@ -34631,6 +36333,55 @@ function upgradeSectionHeaders(panel) {
                 }
                 refreshLooterStatus();
             });
+        }
+
+        if (walkCorpseToggle) {
+            const looterStatus =
+                bot.looter?.status?.();
+            walkCorpseToggle.checked =
+                !!looterStatus?.walkToCorpses;
+
+            walkCorpseToggle.addEventListener(
+                "change",
+                () => {
+                    bot.looter?.updateConfig?.({
+                        walkToCorpses:
+                            walkCorpseToggle.checked
+                    });
+                    refreshLooterStatus();
+                }
+            );
+        }
+
+        if (corpseDistanceInput) {
+            const looterStatus =
+                bot.looter?.status?.();
+            corpseDistanceInput.value =
+                looterStatus?.corpseMaxDistance ??
+                12;
+
+            corpseDistanceInput.addEventListener(
+                "change",
+                () => {
+                    const value =
+                        Math.max(
+                            1,
+                            Math.min(
+                                30,
+                                parseInt(
+                                    corpseDistanceInput.value,
+                                    10
+                                ) || 12
+                            )
+                        );
+                    corpseDistanceInput.value =
+                        String(value);
+                    bot.looter?.updateConfig?.({
+                        corpseMaxDistance: value
+                    });
+                    refreshLooterStatus();
+                }
+            );
         }
 
         if (selectDestBtn) {
@@ -37117,6 +38868,20 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
         running: false,
         timerId: null,
         seenKeys: new Set(),
+
+        // v1.5.38: explicit one-encounter reply/restart state.
+        killSwitchActive: false,
+        restartTimerId: null,
+        replyTimerIds: [],
+        restartSnapshot: null,
+        lastTriggerAt: 0,
+        lastSender: null,
+        suppressUntil: 0,
+        repliesSent: 0,
+        replyPairsScheduled: 0,
+        restoresCompleted: 0,
+        suppressedGmMessages: 0,
+        consumedMessageKeys: 0,
     };
     const config = Object.assign({
         enabled: false,
@@ -37125,6 +38890,10 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
         secondReplyDelayMs: 1000,
         firstReplyText: "Hey :D",
         secondReplyText: "i am here",
+
+        // One GM encounter gets one reply pair. New GM lines during this
+        // cooldown are consumed silently instead of scheduling more replies.
+        triggerCooldownMs: 60000,
     }, bot.storage.get(configStorageKey, {}));
 
     config.restartDelayMs = Math.max(
@@ -37139,11 +38908,79 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
         config.firstReplyDelayMs,
         Math.min(8000, Number(config.secondReplyDelayMs) || 1000)
     );
+    config.triggerCooldownMs = Math.max(
+        15000,
+        Math.min(300000, Number(config.triggerCooldownMs) || 60000)
+    );
 
     function persistConfig() {
         bot.storage.set(configStorageKey, {
-            enabled: config.enabled
+            enabled: config.enabled,
+            restartDelayMs: config.restartDelayMs,
+            firstReplyDelayMs: config.firstReplyDelayMs,
+            secondReplyDelayMs: config.secondReplyDelayMs,
+            firstReplyText: config.firstReplyText,
+            secondReplyText: config.secondReplyText,
+            triggerCooldownMs: config.triggerCooldownMs,
         });
+    }
+
+    function isGmDefaultMessage(msg) {
+        if (!msg || msg.channel !== "Default" || !msg.sender)
+            return false;
+
+        const myName = bot.getPlayerName();
+        const name = String(msg.sender).trim();
+        const lowerName = name.toLowerCase();
+
+        if (
+            !lowerName.startsWith("gm ") &&
+            !lowerName.startsWith("god ")
+        ) {
+            return false;
+        }
+
+        if (
+            myName &&
+            lowerName ===
+                String(myName).trim().toLowerCase()
+        ) {
+            return false;
+        }
+
+        return true;
+    }
+
+    function consumeCurrentChatMessages(
+        reason = null
+    ) {
+        const messages = getChatMessages();
+        let added = 0;
+
+        for (const msg of messages) {
+            if (!state.seenKeys.has(msg.key)) {
+                state.seenKeys.add(msg.key);
+                added++;
+            }
+        }
+
+        state.consumedMessageKeys += added;
+
+        if (reason && added > 0) {
+            bot.log(
+                `[GM Chat] Consumed ${added} existing chat message` +
+                `${added === 1 ? "" : "s"} (${reason})`
+            );
+        }
+
+        // Keep the dedupe set bounded.
+        if (state.seenKeys.size > 700) {
+            const arr = Array.from(state.seenKeys);
+            state.seenKeys =
+                new Set(arr.slice(-450));
+        }
+
+        return added;
     }
 
     function clearReplyTimers() {
@@ -37227,7 +39064,9 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
     }
 
     function scheduleGmAutoReplies() {
+        // There must never be more than one reply pair pending.
         clearReplyTimers();
+        state.replyPairsScheduled++;
 
         const firstDelay = Math.max(
             100,
@@ -37316,8 +39155,15 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
         if (modules.panic)
             bot.panic?.start?.();
 
-        if (snapshot.monitorRunning)
+        if (snapshot.monitorRunning) {
+            // The monitor was intentionally paused for 15s. Any GM lines that
+            // arrived during that pause belong to the SAME encounter and must
+            // not trigger another reply pair when scanning resumes.
+            consumeCurrentChatMessages(
+                "killswitch restore backlog"
+            );
             start();
+        }
 
         state.restoresCompleted++;
         refreshKillswitchUi();
@@ -37356,12 +39202,27 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
     }
 
     function triggerKillswitch(sender) {
-        if (state.killSwitchActive)
+        const now = Date.now();
+
+        if (
+            state.killSwitchActive ||
+            now < state.suppressUntil
+        ) {
             return false;
+        }
 
         state.killSwitchActive = true;
-        state.lastTriggerAt = Date.now();
+        state.lastTriggerAt = now;
         state.lastSender = sender || null;
+        state.suppressUntil =
+            now +
+            Math.max(
+                15000,
+                Math.min(
+                    300000,
+                    Number(config.triggerCooldownMs) || 60000
+                )
+            );
 
         bot.log(`[GM Chat] Detected GM/God in chat: ${sender}`);
         bot.playGMAlarm();
@@ -37369,6 +39230,13 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
         // Preserve exactly what was running so the 15s restore does not enable
         // modules the user had intentionally left off.
         state.restartSnapshot = snapshotRunningModules();
+
+        // Mark every message currently visible as belonging to this encounter.
+        // This prevents multiple existing GM lines from being processed one by
+        // one after each 15-second restart.
+        consumeCurrentChatMessages(
+            "GM encounter trigger"
+        );
 
         clearRestartTimer();
         clearReplyTimers();
@@ -37434,38 +39302,48 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
     function checkMessages() {
         if (!config.enabled || !state.running)
             return;
+
         const messages = getChatMessages();
-        const myName = bot.getPlayerName();
+        const now = Date.now();
+
         for (const msg of messages) {
             if (state.seenKeys.has(msg.key))
                 continue;
+
+            // Always consume first. Even a suppressed GM line should never be
+            // reconsidered after the cooldown expires.
             state.seenKeys.add(msg.key);
 
-            // ---- STRICTER CHECKS ----
-            // 1. Only process messages from the "Default" channel
-            if (msg.channel !== "Default")
+            if (!isGmDefaultMessage(msg))
                 continue;
 
-            // 2. Sender must exist and must start with "GM " or "God " (case-insensitive)
-            if (!msg.sender)
+            if (
+                state.killSwitchActive ||
+                now < state.suppressUntil
+            ) {
+                state.suppressedGmMessages++;
+                bot.log(
+                    "[GM Chat] Additional GM message suppressed during encounter cooldown",
+                    {
+                        sender: msg.sender,
+                        cooldownRemainingMs:
+                            Math.max(
+                                0,
+                                state.suppressUntil - now
+                            )
+                    }
+                );
                 continue;
-            const name = msg.sender.trim();
-            const lowerName = name.toLowerCase();
-            if (!lowerName.startsWith('gm ') && !lowerName.startsWith('god '))
-                continue;
+            }
 
-            // 3. Skip messages from the player themselves
-            if (myName && name.toLowerCase() === myName.toLowerCase())
-                continue;
-
-            // If we reach here, it's a real GM or God message in Default chat
             triggerKillswitch(msg.sender);
             return;
         }
-        // Limit seen keys size
-        if (state.seenKeys.size > 500) {
+
+        if (state.seenKeys.size > 700) {
             const arr = Array.from(state.seenKeys);
-            state.seenKeys = new Set(arr.slice(-300));
+            state.seenKeys =
+                new Set(arr.slice(-450));
         }
     }
 
@@ -37517,6 +39395,7 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
             clearRestartTimer();
             state.restartSnapshot = null;
             state.killSwitchActive = false;
+            state.suppressUntil = 0;
         }
 
         if (wasRunning)
@@ -37528,6 +39407,36 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
     function status() {
         return {
             running: state.running,
+            killSwitchActive:
+                state.killSwitchActive,
+            restartPending:
+                state.restartTimerId != null,
+            replyTimersPending:
+                state.replyTimerIds.length,
+            suppressUntil:
+                state.suppressUntil || 0,
+            cooldownRemainingMs:
+                Math.max(
+                    0,
+                    Number(state.suppressUntil || 0) -
+                        Date.now()
+                ),
+            lastTriggerAt:
+                state.lastTriggerAt || 0,
+            lastSender:
+                state.lastSender,
+            repliesSent:
+                state.repliesSent || 0,
+            replyPairsScheduled:
+                state.replyPairsScheduled || 0,
+            restoresCompleted:
+                state.restoresCompleted || 0,
+            suppressedGmMessages:
+                state.suppressedGmMessages || 0,
+            consumedMessageKeys:
+                state.consumedMessageKeys || 0,
+            seenKeyCount:
+                state.seenKeys.size,
             config: {
                 ...config
             }
@@ -37536,11 +39445,53 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
 
     function updateConfig(next) {
         Object.assign(config, next);
+
+        config.restartDelayMs = Math.max(
+            5000,
+            Math.min(
+                60000,
+                Number(config.restartDelayMs) || 15000
+            )
+        );
+        config.firstReplyDelayMs = Math.max(
+            100,
+            Math.min(
+                5000,
+                Number(config.firstReplyDelayMs) || 500
+            )
+        );
+        config.secondReplyDelayMs = Math.max(
+            config.firstReplyDelayMs,
+            Math.min(
+                8000,
+                Number(config.secondReplyDelayMs) || 1000
+            )
+        );
+        config.triggerCooldownMs = Math.max(
+            15000,
+            Math.min(
+                300000,
+                Number(config.triggerCooldownMs) || 60000
+            )
+        );
+        config.firstReplyText =
+            String(config.firstReplyText || "Hey :D");
+        config.secondReplyText =
+            String(config.secondReplyText || "i am here");
+
         persistConfig();
-        if (config.enabled && !state.running)
+
+        if (
+            config.enabled &&
+            !state.running &&
+            !state.killSwitchActive
+        ) {
             start();
+        }
+
         if (!config.enabled && state.running)
             stop();
+
         return {
             ...config
         };
@@ -37555,6 +39506,7 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
         clearRestartTimer();
         state.restartSnapshot = null;
         state.killSwitchActive = false;
+        state.suppressUntil = 0;
         state.running = false;
     });
 
