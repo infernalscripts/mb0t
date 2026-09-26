@@ -803,7 +803,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.5.67",
+        version: "1.5.69",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -15563,11 +15563,17 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         lastProgressAt: 0,
         lastStairsUseAt: 0,
         lastObservedPosition: null,
+
+        // v1.5.69: relocation detection must not share lastObservedPosition
+        // with the 200ms transition observer. That observer can update first
+        // after a temple teleport and erase the jump before Cave tick sees it.
+        lastRelocationCheckPosition: null,
         lastTeleportResetAt: 0,
 
-        // v1.5.34: temple/GM relocations recover directly to the nearest
-        // same-floor STAND instead of sequentially skipping old-route entries.
+        // Temple/GM relocations recover directly to the nearest same-floor
+        // non-Script waypoint instead of sequentially skipping old-route entries.
         teleportRecoverySelections: 0,
+        teleportRecoveryWaypointSelections: 0,
         teleportRecoveryStandSelections: 0,
         teleportRecoveryFallbackSelections: 0,
         teleportRecoveryLastAt: 0,
@@ -20599,22 +20605,29 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         return wp;
     }
 
-    function findClosestSameFloorStandForTeleport(position) {
+    function findClosestSameFloorWaypointForTeleport(
+        position
+    ) {
         if (!position || !route.length)
             return null;
 
-        const limit = boundedWaypointDistance(
-            config.maxWaypointDistance
-        );
+        const limit =
+            boundedWaypointDistance(
+                config.maxWaypointDistance
+            );
         let best = null;
 
-        for (let i = 0; i < route.length; i++) {
+        for (
+            let i = 0;
+            i < route.length;
+            i++
+        ) {
             const wp = route[i];
 
+            // Script is the only waypoint type excluded from relocation.
             if (
                 !wp ||
                 wp.script ||
-                wp.stand !== true ||
                 wp.x === undefined ||
                 wp.y === undefined ||
                 wp.z === undefined
@@ -20622,42 +20635,57 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 continue;
             }
 
-            if (Number(wp.z) !== Number(position.z))
+            if (
+                Number(wp.z) !==
+                Number(position.z)
+            ) {
                 continue;
+            }
 
             try {
                 if (
-                    bot.blacklist?.isBlacklisted?.(
-                        wp.x,
-                        wp.y,
-                        wp.z
-                    )
+                    bot.blacklist
+                        ?.isBlacklisted?.(
+                            wp.x,
+                            wp.y,
+                            wp.z
+                        )
                 ) {
                     continue;
                 }
             } catch (e) {}
 
-            const dx = Math.abs(wp.x - position.x);
-            const dy = Math.abs(wp.y - position.y);
-            const cheb = Math.max(dx, dy);
+            const dx =
+                Math.abs(
+                    Number(wp.x) -
+                    Number(position.x)
+                );
+            const dy =
+                Math.abs(
+                    Number(wp.y) -
+                    Number(position.y)
+                );
+            const cheb =
+                Math.max(dx, dy);
 
-            // Keep temple recovery local, but deliberately do NOT use a map
-            // connectivity test. The client graph can misclassify islands.
             if (cheb > limit)
                 continue;
 
-            const manhattan = dx + dy;
+            const manhattan =
+                dx + dy;
 
             if (
                 !best ||
                 cheb < best.cheb ||
                 (
                     cheb === best.cheb &&
-                    manhattan < best.manhattan
+                    manhattan <
+                        best.manhattan
                 ) ||
                 (
                     cheb === best.cheb &&
-                    manhattan === best.manhattan &&
+                    manhattan ===
+                        best.manhattan &&
                     i < best.index
                 )
             ) {
@@ -20722,12 +20750,13 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         const originalIndex = state.currentIndex;
         resetSpecialWaypointStateForTeleportRecovery(now);
 
-        const stand = findClosestSameFloorStandForTeleport(
-            position
-        );
+        const nearest =
+            findClosestSameFloorWaypointForTeleport(
+                position
+            );
 
-        if (stand) {
-            state.currentIndex = stand.index;
+        if (nearest) {
+            state.currentIndex = nearest.index;
             if (
                 state.direction !== 1 &&
                 state.direction !== -1
@@ -20738,46 +20767,46 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             state.recoveryActive = true;
             state.recoveryReason = "TELEPORT";
             state.recoveryReasonAt = now;
-            state.recoveryReasonIndex = stand.index;
+            state.recoveryReasonIndex = nearest.index;
             state.recoveryReasonKey =
-                getWaypointKey(stand.waypoint);
+                getWaypointKey(nearest.waypoint);
 
-            state.recoveryLastTargetIndex = stand.index;
+            state.recoveryLastTargetIndex = nearest.index;
             state.recoveryLastTargetAt = now;
             state.recoveryLastTargetKey =
-                `${stand.waypoint.x},${stand.waypoint.y},${stand.waypoint.z}`;
+                `${nearest.waypoint.x},${nearest.waypoint.y},${nearest.waypoint.z}`;
 
             state.teleportRecoverySelections++;
-            state.teleportRecoveryStandSelections++;
+            state.teleportRecoveryWaypointSelections++;
             state.teleportRecoveryLastAt = now;
-            state.teleportRecoveryLastIndex = stand.index;
+            state.teleportRecoveryLastIndex = nearest.index;
             state.teleportRecoveryLastReason = reason;
-            state.teleportRecoveryLastDistance = stand.cheb;
+            state.teleportRecoveryLastDistance = nearest.cheb;
 
             resetWaypointProgressTracking(
-                stand.waypoint,
+                nearest.waypoint,
                 position,
                 now
             );
 
             bot.log(
-                `Cave: teleport recovery → closest same-floor Stand ` +
-                `waypoint #${stand.index + 1} ` +
-                `(${stand.waypoint.x}, ${stand.waypoint.y}, ` +
-                `${stand.waypoint.z}) – ${stand.cheb} tiles away`,
+                `Cave: teleport recovery → closest same-floor waypoint ` +
+                `waypoint #${nearest.index + 1} ` +
+                `(${nearest.waypoint.x}, ${nearest.waypoint.y}, ` +
+                `${nearest.waypoint.z}) – ${nearest.cheb} tiles away`,
                 {
                     reason,
                     fromIndex: originalIndex + 1,
-                    selectedIndex: stand.index + 1
+                    selectedIndex: nearest.index + 1
                 }
             );
 
-            goToWaypoint(stand.waypoint);
-            return stand.waypoint;
+            goToWaypoint(nearest.waypoint);
+            return nearest.waypoint;
         }
 
-        // No local STAND exists: use the existing bounded same-floor recovery
-        // selector, not sequential wrong-floor / distance skipping.
+        // No local same-floor non-Script waypoint exists within the normal
+        // distance bound: fall back to the existing generic recovery selector.
         const fallback = skipToClosestWaypoint({
             allowTransitionFallback: false,
             excludeIndex: -1,
@@ -20792,7 +20821,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             state.teleportRecoveryLastIndex =
                 state.currentIndex;
             state.teleportRecoveryLastReason =
-                `${reason}: no same-floor Stand`;
+                `${reason}: no local same-floor waypoint`;
             state.teleportRecoveryLastDistance =
                 Math.max(
                     Math.abs(fallback.x - position.x),
@@ -20842,15 +20871,17 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             );
 
             if (distance > limit) {
-                const closestStand =
-                    findClosestSameFloorStandForTeleport(
+                const closestWaypoint =
+                    findClosestSameFloorWaypointForTeleport(
                         position
                     );
 
                 if (
-                    closestStand &&
-                    closestStand.cheb <= limit &&
-                    closestStand.cheb < distance
+                    closestWaypoint &&
+                    closestWaypoint.cheb <=
+                        limit &&
+                    closestWaypoint.cheb <
+                        distance
                 ) {
                     return true;
                 }
@@ -20936,31 +20967,68 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     // GM teleports, temple returns, death/reconnects and other server-side
     // position changes can invalidate all special-waypoint state. Detect a
     // large position jump before CaveBot starts acting on the old waypoint.
-    function detectUnexpectedPositionJump(position, now) {
-        if (!position || !state.lastObservedPosition) {
-            if (position)
-                state.lastObservedPosition = { x: position.x, y: position.y, z: position.z };
+    function detectUnexpectedPositionJump(
+        position,
+        now
+    ) {
+        if (
+            !position ||
+            !state.lastRelocationCheckPosition
+        ) {
+            if (position) {
+                state.lastRelocationCheckPosition = {
+                    x: Number(position.x),
+                    y: Number(position.y),
+                    z: Number(position.z)
+                };
+            }
             return false;
         }
 
-        const prev = state.lastObservedPosition;
-        const dx = Math.abs(position.x - prev.x);
-        const dy = Math.abs(position.y - prev.y);
-        const dz = Math.abs(position.z - prev.z);
-        const jumped = (dx + dy >= 20) || dz >= 2;
+        const prev =
+            state.lastRelocationCheckPosition;
 
-        state.lastObservedPosition = { x: position.x, y: position.y, z: position.z };
+        const dx =
+            Math.abs(
+                Number(position.x) -
+                Number(prev.x)
+            );
+        const dy =
+            Math.abs(
+                Number(position.y) -
+                Number(prev.y)
+            );
+        const dz =
+            Math.abs(
+                Number(position.z) -
+                Number(prev.z)
+            );
+
+        const jumped =
+            dx + dy >= 20 ||
+            dz >= 2;
+
+        // This baseline is written only here, so the independent observer
+        // cannot erase a teleport before the Cave tick evaluates it.
+        state.lastRelocationCheckPosition = {
+            x: Number(position.x),
+            y: Number(position.y),
+            z: Number(position.z)
+        };
+
         if (!jumped)
             return false;
 
-        // Do not repeatedly reset on every tick after the jump.
-        if (now - state.lastTeleportResetAt < 1500)
+        if (
+            now -
+                state.lastTeleportResetAt <
+            1500
+        ) {
             return true;
+        }
 
         state.lastTeleportResetAt = now;
-        // A teleport invalidates the active native path, but not the short-lived
-        // obstacle memory: those tiles describe local failures and may still be
-        // useful if the teleport lands nearby. Expired entries are removed now.
+
         pruneRecoveryObstacleMemory(now);
         state._standAttempt = null;
         state._ropeUsed = undefined;
@@ -20975,26 +21043,47 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         state.lastWaypointTarget = null;
         state.pathAttemptStart = 0;
         state.lastDistanceToWaypoint = null;
-        state.bestDistanceToWaypoint = Infinity;
+        state.bestDistanceToWaypoint =
+            Infinity;
         state.waypointProgressKey = null;
         state.nativePathWatchKey = null;
         state.nativePathWatchAt = 0;
-        state.nativePathWatchBestDistance = Infinity;
+        state.nativePathWatchBestDistance =
+            Infinity;
         state.lastPathAt = 0;
         state.stuckCount = 0;
-        setRecoveryReason('TELEPORT', now, getCurrentWaypoint());
+        setRecoveryReason(
+            "TELEPORT",
+            now,
+            getCurrentWaypoint()
+        );
         state.stuckRecoveryAttempts = 0;
         state.positionHistory = [];
 
-        const pf = window.gameClient?.world?.pathfinder;
+        const pf =
+            window.gameClient?.world
+                ?.pathfinder;
+
         if (pf) {
-            try { pf.setPathfindCache(null); } catch (e) {}
-            try { pf.__isAutoWalking = false; } catch (e) {}
-            try { pf.__finalDestination = null; } catch (e) {}
-            try { pf.__hybridPath = null; } catch (e) {}
+            try {
+                pf.setPathfindCache(null);
+            } catch (e) {}
+            try {
+                pf.__isAutoWalking = false;
+            } catch (e) {}
+            try {
+                pf.__finalDestination = null;
+            } catch (e) {}
+            try {
+                pf.__hybridPath = null;
+            } catch (e) {}
         }
 
-        bot.log(`Cave: unexpected position jump detected (${dx}, ${dy}, z ${dz}) – resetting navigation`);
+        bot.log(
+            `Cave: unexpected position jump detected ` +
+            `(${dx}, ${dy}, z ${dz}) – resetting navigation`
+        );
+
         return true;
     }
 
@@ -21248,6 +21337,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 // Otherwise the observer can "learn" a fake floor transition
                 // across a disconnect / character load.
                 state.lastObservedPosition = null;
+                state.lastRelocationCheckPosition = null;
                 state.pendingTransitionSource = null;
                 bot.log('Cave: waiting for player position');
             }
@@ -21258,6 +21348,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             const now = Date.now();
             state.positionUnavailable = false;
             state.lastObservedPosition = null;
+            state.lastRelocationCheckPosition = null;
             state.pendingTransitionSource = null;
             resetWaypointProgressTracking(getCurrentWaypoint(), livePosition, now);
             state.lastPositionKey = getPositionKey(livePosition);
@@ -21517,9 +21608,9 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             // ---- DECLARE WAYPOINT HERE ----
             let waypoint = getCurrentWaypoint();
 
-            // v1.5.34: consume a relocation BEFORE ordinary sequential floor /
-            // distance skipping. Temple recovery anchors to nearest same-floor
-            // STAND first, then uses generic same-floor recovery as fallback.
+            // Consume relocation BEFORE ordinary sequential floor/distance
+            // skipping. Temple recovery anchors to the nearest same-floor
+            // non-Script waypoint.
             if (
                 waypoint &&
                 position &&
@@ -23860,7 +23951,16 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         state._ladderWaitingFloorChange = null;
         state.pendingTransitionSource = null;
         state.lastObservedPosition = null;
+        state.lastRelocationCheckPosition =
+            pos
+                ? {
+                    x: Number(pos.x),
+                    y: Number(pos.y),
+                    z: Number(pos.z)
+                }
+                : null;
         state.teleportRecoverySelections = 0;
+        state.teleportRecoveryWaypointSelections = 0;
         state.teleportRecoveryStandSelections = 0;
         state.teleportRecoveryFallbackSelections = 0;
         state.teleportRecoveryLastAt = 0;
@@ -24303,6 +24403,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             recoveryReasonKey: state.recoveryReasonKey,
             teleportRecoverySelections:
                 state.teleportRecoverySelections || 0,
+            teleportRecoveryWaypointSelections:
+                state.teleportRecoveryWaypointSelections || 0,
             teleportRecoveryStandSelections:
                 state.teleportRecoveryStandSelections || 0,
             teleportRecoveryFallbackSelections:
@@ -24315,6 +24417,10 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 state.teleportRecoveryLastReason,
             teleportRecoveryLastDistance:
                 state.teleportRecoveryLastDistance,
+            lastRelocationCheckPosition:
+                cloneValue(
+                    state.lastRelocationCheckPosition
+                ),
             distanceToWaypoint: getDistanceToWaypoint(pos, wp),
             lastPathAt: state.lastPathAt,
             lastProgressAt: state.lastProgressAt,
@@ -37234,7 +37340,7 @@ function upgradeSectionHeaders(panel) {
   justify-content: center;
   gap: 5px;
   padding: 2px 8px;
-  min-height: 22px;
+  min-height: 14px;
 }
 /* Collapsed quick buttons intentionally reuse the exact same visual treatment
    as the Cave/Attack status pills in the title row. */
@@ -37256,7 +37362,7 @@ function upgradeSectionHeaders(panel) {
 
 /* ── Collapsed state ── */
 #minibia-bot-panel[data-collapsed="true"] {
-  width: 232px;
+  width: 192px;
   min-height: 0;
   background-image: url("/png/bg2.png");
   background-color: #2a241e;
@@ -37680,7 +37786,7 @@ function upgradeSectionHeaders(panel) {
     display: none;
   }
   #minibia-bot-panel[data-collapsed="true"] {
-    width: 222px;
+    width: 192px;
   }
 }
 
