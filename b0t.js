@@ -803,7 +803,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.5.51",
+        version: "1.5.59",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -4951,6 +4951,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         offscreenTargetLastDy: null,
         offscreenTargetLastDistance: null,
         offscreenTargetLastReason: null,
+        offscreenLureHoldClears: 0,
+        offscreenLastMobClears: 0,
         offscreenEngagedRejects: 0,
 
         canonicalTargetRefreshes: 0,
@@ -5198,6 +5200,25 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         playerSessionSeen: false,
         movementOwner: null,
         movementOwnedUntil: 0,
+
+        // v1.5.52: kite movement diagnostics.
+        lastKiteMoveAt: 0,
+        lastKiteMoveReason: null,
+        lastKiteMoveDirection: null,
+        lastKiteDistanceBefore: null,
+        lastKiteDistanceAfter: null,
+        kiteCloserStepRejects: 0,
+        kiteScoredMoves: 0,
+        kiteRouteStepChanges: 0,
+        kiteDiagonalFallbacks: 0,
+        kiteDiagonalEmergencyMoves: 0,
+        kiteDiagonalRejectedNonEmergency: 0,
+        kiteCardinalMoves: 0,
+
+        // v1.5.59: continuously enforce native Client Chase OFF during Kite.
+        kiteChaseForceOffCount: 0,
+        kiteChaseLastForcedOffAt: 0,
+
         // v1.4.86: native rune cooldown + server-side inventory count.
         lastRuneCountRequestAt: 0,
         lastRuneMissingWarningAt: 0,
@@ -5228,6 +5249,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         kiteStuckCount: 0,
         unreachableStart: 0,
         keepDiagonal: false,
+
+        // v1.5.53: smoother route-aware kite defaults. Kite movement is
+        // cardinal-first; diagonal movement is emergency fallback only.
+        kiteRetreatWaypointTolerance: 2,
         // Keep a target briefly before ordinary distance-based retargeting. A
         // preferred target can still pre-empt immediately.
         targetStickMs: 1800,
@@ -5317,6 +5342,13 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         config.targetHotbarSlot = storedConfig.hotbarSlot;
     }
 
+    // v1.5.54: Kite owns movement. Native Client Chase must never compete
+    // with it, including when an older saved config had both enabled.
+    config.kiteMode = !!config.kiteMode;
+    config.useClientChase = !!config.useClientChase;
+    if (config.kiteMode)
+        config.useClientChase = false;
+
     // Defensive normalization for the retarget guard. These are intentionally
     // conservative and do not alter how the initial target is selected.
     {
@@ -5401,17 +5433,72 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     const ladderItemIds = new Set([1948, 1968, 435, 5542]);
     const teleporterItemIds = new Set([5756]);
 
+    // Known open/transition hole variants used by the client. A hole can still
+    // report tile.isWalkable() even though stepping onto it changes floor.
+    const kiteHoleItemIds = new Set([
+        12396,
+        12400,
+        12401,
+        12402
+    ]);
+
     function isFloorChangeTile(tile) {
         if (!tile)
             return false;
-        if (ladderItemIds.has(tile.id) || teleporterItemIds.has(tile.id))
-            return true;
-        if (Array.isArray(tile.items)) {
-            for (const item of tile.items) {
-                if (ladderItemIds.has(item.id) || teleporterItemIds.has(item.id))
-                    return true;
+
+        const things = [
+            tile,
+            ...(Array.isArray(tile.items)
+                ? tile.items
+                : [])
+        ];
+
+        for (const thing of things) {
+            if (!thing)
+                continue;
+
+            const id =
+                Number(thing.id);
+
+            if (
+                ladderItemIds.has(id) ||
+                teleporterItemIds.has(id) ||
+                kiteHoleItemIds.has(id)
+            ) {
+                return true;
+            }
+
+            // Use the native item-definition floorchange flag whenever
+            // available. This catches stairs/holes not covered by known IDs.
+            const def =
+                getThingDefinition(thing.id);
+
+            if (def?.properties?.floorchange)
+                return true;
+
+            // Last-resort semantic guard for transition tiles whose definitions
+            // do not expose floorchange consistently.
+            const name =
+                String(
+                    def?.properties?.name ||
+                    thing?.name ||
+                    ""
+                )
+                    .trim()
+                    .toLowerCase();
+
+            if (
+                name.includes("hole") ||
+                name.includes("rope spot") ||
+                name.includes("ladder") ||
+                name.includes("stairs") ||
+                name.includes("staircase") ||
+                name.includes("teleport")
+            ) {
+                return true;
             }
         }
+
         return false;
     }
 
@@ -5596,6 +5683,53 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         }
     }
 
+    function enforceKiteClientChaseOff(
+        now = Date.now()
+    ) {
+        if (!config.kiteMode)
+            return false;
+
+        // Keep the saved/runtime flag aligned with the hard Kite rule too.
+        if (config.useClientChase)
+            config.useClientChase = false;
+
+        const selector =
+            window.gameClient?.interface
+                ?.fightModeSelector;
+
+        if (!selector)
+            return false;
+
+        const current =
+            Number(
+                selector.currentChaseMode
+            );
+
+        // Only send a client mode change when needed; this runs every
+        // Targeting tick while Kite is enabled.
+        if (
+            !Number.isFinite(current) ||
+            current !== 0
+        ) {
+            const changed =
+                setClientChaseMode(false);
+
+            if (changed) {
+                state.kiteChaseForceOffCount++;
+                state.kiteChaseLastForcedOffAt =
+                    now;
+            }
+
+            state._chaseEnabledForDistance =
+                false;
+
+            return changed;
+        }
+
+        state._chaseEnabledForDistance = false;
+        return false;
+    }
+
     // ---- Tile safety helpers (copied from cave module) ----
     function getTileAtPosition(pos) {
         if (!pos)
@@ -5663,9 +5797,17 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         // Must be walkable (allows ignoring creatures later)
         if (!tile.isWalkable())
             return false;
-        // Avoid floor-changing tiles (holes, ladders, stairs, rope spots, etc.)
-        if (isFloorChangeTile(tile))
+        // Floor changes are a hard veto for Kite even when the native client
+        // considers the tile walkable. Running into a hole while retreating is
+        // never an acceptable escape step.
+        if (
+            isFloorChangeTile(tile) ||
+            isHoleTile(tile) ||
+            isRopeTargetTile(tile)
+        ) {
             return false;
+        }
+
         return true;
     }
 
@@ -5716,95 +5858,407 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         return true;
     }
 
-    // ---- Chase: move directly toward target ----
-    function syncChase(now) {
-        if (!config.kiteMode)
-            return false;
-        const target = getEngagedTarget();
-        if (!target)
-            return false;
-
-        const playerPos = normalizePosition(bot.getPlayerPosition());
-        const targetPos = normalizePosition(target.getPosition?.() || target.__position);
-        if (!playerPos || !targetPos || playerPos.z !== targetPos.z)
-            return false;
-
-        const dist = getTileDistance(playerPos, targetPos);
-        const ideal = Math.max(1, Number(config.idealDistance) || 3);
-        if (dist <= ideal + 1)
-            return false;
-
-        let dx = targetPos.x - playerPos.x;
-        let dy = targetPos.y - playerPos.y;
-        let stepX = dx > 0 ? 1 : (dx < 0 ? -1 : 0);
-        let stepY = dy > 0 ? 1 : (dy < 0 ? -1 : 0);
-
-        const attempts = [{
-                dx: stepX,
-                dy: 0
-            }, {
-                dx: 0,
-                dy: stepY
-            }, {
-                dx: stepX,
-                dy: stepY
-            }
-        ];
-
-        for (const a of attempts) {
-            if (a.dx === 0 && a.dy === 0)
-                continue;
-            const nx = playerPos.x + a.dx;
-            const ny = playerPos.y + a.dy;
-            // ★ Safe check
-            if (isSafeToWalkTile(nx, ny, playerPos.z, false)) {
-                const dir = getDirection(a.dx, a.dy);
-                if (dir !== null && window.gameClient?.keyboard) {
-                    window.gameClient.keyboard.handleMoveKey(dir);
-                    return true;
-                }
-            }
-        }
-        return false;
+    function getChebyshevDistance(a, b) {
+        if (!a || !b)
+            return Number.POSITIVE_INFINITY;
+        return Math.max(
+            Math.abs(Number(a.x) - Number(b.x)),
+            Math.abs(Number(a.y) - Number(b.y))
+        );
     }
 
-    function kiteAwayFallback(targetPos, playerPos, dist) {
-        const dx = playerPos.x - targetPos.x;
-        const dy = playerPos.y - targetPos.y;
-        let stepX = dx > 0 ? 1 : (dx < 0 ? -1 : 0);
-        let stepY = dy > 0 ? 1 : (dy < 0 ? -1 : 0);
-        const attempts = [{
-                dx: stepX,
-                dy: 0
-            }, {
-                dx: 0,
-                dy: stepY
-            }, {
-                dx: stepX,
-                dy: stepY
-            }
+    function getKiteStepCandidates(
+        playerPos,
+        targetPos,
+        idealDistance,
+        retreatWaypoint = null,
+        mode = "away"
+    ) {
+        if (!playerPos || !targetPos)
+            return [];
+
+        const currentTargetDist =
+            getChebyshevDistance(
+                playerPos,
+                targetPos
+            );
+
+        const currentRouteDist =
+            retreatWaypoint
+                ? getChebyshevDistance(
+                    playerPos,
+                    retreatWaypoint
+                )
+                : 0;
+
+        const offsets = [
+            [0, -1], [1, 0], [0, 1], [-1, 0],
+            [-1, -1], [1, -1], [-1, 1], [1, 1]
         ];
-        for (const a of attempts) {
-            if (a.dx === 0 && a.dy === 0)
+
+        const candidates = [];
+
+        for (const [dx, dy] of offsets) {
+            const nx = playerPos.x + dx;
+            const ny = playerPos.y + dy;
+
+            if (
+                bot.blacklist?.isBlacklisted(
+                    nx,
+                    ny,
+                    playerPos.z
+                )
+            ) {
                 continue;
-            const nx = playerPos.x + a.dx;
-            const ny = playerPos.y + a.dy;
+            }
+
             const candidatePos = {
                 x: nx,
                 y: ny,
                 z: playerPos.z
             };
+
             if (!isSafeTileForKite(candidatePos))
                 continue;
-            if (isTileWalkable(nx, ny, playerPos.z, false)) {
-                const dir = getDirection(a.dx, a.dy);
-                if (dir !== null && window.gameClient?.keyboard) {
-                    window.gameClient.keyboard.handleMoveKey(dir);
-                    return true;
-                }
+
+            if (
+                !isTileWalkable(
+                    nx,
+                    ny,
+                    playerPos.z,
+                    false
+                )
+            ) {
+                continue;
             }
+
+            const nextTargetDist =
+                getChebyshevDistance(
+                    candidatePos,
+                    targetPos
+                );
+
+            const targetDelta =
+                nextTargetDist -
+                currentTargetDist;
+
+            // Hard safety rule while too close: Kite must never voluntarily
+            // step CLOSER to the engaged target.
+            if (
+                mode === "away" &&
+                currentTargetDist <
+                    idealDistance &&
+                targetDelta < 0
+            ) {
+                state.kiteCloserStepRejects++;
+                continue;
+            }
+
+            // Chase is part of distance control, but never overshoot inside
+            // the requested kite distance.
+            if (
+                mode === "chase" &&
+                (
+                    nextTargetDist >=
+                        currentTargetDist ||
+                    nextTargetDist <
+                        idealDistance
+                )
+            ) {
+                continue;
+            }
+
+            let routeProgress = 0;
+            if (retreatWaypoint) {
+                const nextRouteDist =
+                    getChebyshevDistance(
+                        candidatePos,
+                        retreatWaypoint
+                    );
+                routeProgress =
+                    currentRouteDist -
+                    nextRouteDist;
+            }
+
+            const isDiagonalStep =
+                dx !== 0 &&
+                dy !== 0;
+
+            let score = 0;
+
+            if (mode === "away") {
+                // Target separation is the primary objective. Route progress
+                // is secondary, so a retreat waypoint can never pull us back
+                // toward the monster just because it is geometrically closer.
+                score += targetDelta * 120;
+                score += routeProgress * 22;
+
+                if (
+                    nextTargetDist >=
+                    idealDistance
+                ) {
+                    score += 24;
+                }
+
+                // A same-distance sidestep is useful when direct retreat is
+                // blocked, but still ranks below a genuine separation step.
+                if (targetDelta === 0)
+                    score += 8;
+            } else {
+                // Chase only runs when outside the upper hysteresis edge.
+                score +=
+                    (currentTargetDist -
+                        nextTargetDist) *
+                    100;
+            }
+
+            candidates.push({
+                dx,
+                dy,
+                direction:
+                    getDirection(dx, dy),
+                score,
+                nextTargetDist,
+                targetDelta,
+                routeProgress,
+                isDiagonalStep
+            });
         }
-        return false;
+
+        candidates.sort((a, b) => {
+            if (b.score !== a.score)
+                return b.score - a.score;
+            if (
+                b.nextTargetDist !==
+                a.nextTargetDist
+            ) {
+                return (
+                    b.nextTargetDist -
+                    a.nextTargetDist
+                );
+            }
+            return (
+                b.routeProgress -
+                a.routeProgress
+            );
+        });
+
+        return candidates;
+    }
+
+    function selectKiteMovementCandidate(
+        candidates,
+        mode = "away"
+    ) {
+        if (!Array.isArray(candidates))
+            return null;
+
+        const cardinal =
+            candidates.find(
+                candidate =>
+                    !candidate.isDiagonalStep
+            );
+
+        if (cardinal)
+            return cardinal;
+
+        // v1.5.59: Kite chase is cardinal-only. A diagonal chase is slower,
+        // leaves the character between tiles longer, and is not worth it.
+        if (mode === "chase") {
+            state.kiteDiagonalRejectedNonEmergency++;
+            return null;
+        }
+
+        const diagonal =
+            candidates.find(candidate => {
+                if (!candidate.isDiagonalStep)
+                    return false;
+
+                const currentDistance =
+                    Number(candidate.nextTargetDist) -
+                    Number(candidate.targetDelta);
+
+                // Retreat diagonals are emergency-only:
+                // 1) monster must already be adjacent,
+                // 2) the diagonal must INCREASE distance,
+                // 3) every legal cardinal was already unavailable above.
+                if (
+                    currentDistance > 1 ||
+                    candidate.targetDelta <= 0
+                ) {
+                    return false;
+                }
+
+                return true;
+            });
+
+        if (!diagonal) {
+            state.kiteDiagonalRejectedNonEmergency++;
+            return null;
+        }
+
+        diagonal.__fallbackCounted = true;
+        diagonal.__emergencyDiagonal = true;
+
+        return diagonal;
+    }
+
+    function performKiteStep(
+        candidate,
+        reason,
+        currentDistance,
+        now = Date.now()
+    ) {
+        if (
+            !candidate ||
+            candidate.direction === null ||
+            candidate.direction ===
+                undefined
+        ) {
+            return false;
+        }
+
+        const keyboard =
+            window.gameClient?.keyboard;
+
+        if (
+            !keyboard ||
+            typeof keyboard.handleMoveKey !==
+                "function"
+        ) {
+            return false;
+        }
+
+        keyboard.handleMoveKey(
+            candidate.direction
+        );
+
+        state.lastKiteMoveAt = now;
+        state.lastKiteMoveReason =
+            reason || "kite";
+        state.lastKiteMoveDirection =
+            candidate.direction;
+        state.lastKiteDistanceBefore =
+            currentDistance;
+        state.lastKiteDistanceAfter =
+            candidate.nextTargetDist;
+        state.kiteScoredMoves++;
+
+        if (candidate.isDiagonalStep) {
+            state.kiteDiagonalFallbacks +=
+                candidate.__fallbackCounted
+                    ? 0
+                    : 1;
+
+            if (candidate.__emergencyDiagonal)
+                state.kiteDiagonalEmergencyMoves++;
+        } else {
+            state.kiteCardinalMoves++;
+        }
+
+        return true;
+    }
+
+    // ---- Chase: move toward target only when outside kite hysteresis ----
+    function syncChase(now) {
+        if (!config.kiteMode)
+            return false;
+
+        const target = getEngagedTarget();
+        if (!target)
+            return false;
+
+        const playerPos =
+            normalizePosition(
+                bot.getPlayerPosition()
+            );
+        const targetPos =
+            normalizePosition(
+                target.getPosition?.() ||
+                target.__position
+            );
+
+        if (
+            !playerPos ||
+            !targetPos ||
+            playerPos.z !== targetPos.z
+        ) {
+            return false;
+        }
+
+        const dist =
+            getTileDistance(
+                playerPos,
+                targetPos
+            );
+        const ideal =
+            Math.max(
+                1,
+                Number(config.idealDistance) ||
+                    3
+            );
+
+        // One-tile deadband: don't oscillate between chase and retreat.
+        if (dist <= ideal + 1)
+            return false;
+
+        const candidates =
+            getKiteStepCandidates(
+                playerPos,
+                targetPos,
+                ideal,
+                null,
+                "chase"
+            );
+
+        const candidate =
+            selectKiteMovementCandidate(
+                candidates,
+                "chase"
+            );
+
+        return performKiteStep(
+            candidate,
+            "kite chase",
+            dist,
+            now
+        );
+    }
+
+    function kiteAwayFallback(
+        targetPos,
+        playerPos,
+        dist,
+        now = Date.now()
+    ) {
+        const ideal =
+            Math.max(
+                1,
+                Number(config.idealDistance) ||
+                    3
+            );
+
+        const candidates =
+            getKiteStepCandidates(
+                playerPos,
+                targetPos,
+                ideal,
+                null,
+                "away"
+            );
+
+        const candidate =
+            selectKiteMovementCandidate(
+                candidates,
+                "away"
+            );
+
+        return performKiteStep(
+            candidate,
+            "kite away fallback",
+            dist,
+            now
+        );
     }
 
     // ---- REACHABILITY CACHE ----
@@ -5942,7 +6396,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         const loopMode = bot.cave?.getLoopMode?.() ?? false;
 
         if (!caveStatus?.running || !caveStatus?.pausedForCombat || route.length === 0) {
-            return kiteAwayFallback(targetPos, playerPos, dist);
+            return kiteAwayFallback(targetPos, playerPos, dist, now);
         }
 
         // ---- Store original index when we first start kiting ----
@@ -5970,7 +6424,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         }
         if (idx < 0) {
             state.kiteWaypointIndex = null;
-            return kiteAwayFallback(targetPos, playerPos, dist);
+            return kiteAwayFallback(targetPos, playerPos, dist, now);
         }
 
         let targetWp = route[idx];
@@ -5980,127 +6434,78 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         }
 
         const distToWp = getTileDistance(playerPos, targetWp);
-        // ★ Tolerance = 3 (switch sooner)
-        const tolerance = Math.max(6, Number(config.waypointTolerance) || 6);
+        const tolerance =
+            Math.max(
+                1,
+                Math.min(
+                    6,
+                    Number(
+                        config.kiteRetreatWaypointTolerance
+                    ) || 2
+                )
+            );
 
         if (distToWp <= tolerance) {
-            // ★ Move to the next retreat waypoint (another -2)
-            let nextIdx = idx - 2;
+            // Retreat through the cave route ONE waypoint at a time. The old
+            // -2 jump skipped route geometry and made kiting overly aggressive.
+            let nextIdx = idx - 1;
+
             if (loopMode) {
                 if (nextIdx < 0)
-                    nextIdx = route.length + nextIdx;
+                    nextIdx = route.length - 1;
             } else {
-                nextIdx = Math.max(0, Math.min(route.length - 1, nextIdx));
+                nextIdx = Math.max(0, nextIdx);
             }
-            if (nextIdx >= 0 && nextIdx < route.length) {
-                state.kiteWaypointIndex = nextIdx;
-                bot.cave.setCurrentIndex(nextIdx);
-                targetWp = route[nextIdx];
+
+            if (
+                nextIdx >= 0 &&
+                nextIdx < route.length
+            ) {
+                if (nextIdx !== idx) {
+                    state.kiteRouteStepChanges++;
+                    state.kiteWaypointIndex =
+                        nextIdx;
+                    bot.cave.setCurrentIndex(
+                        nextIdx
+                    );
+                    targetWp =
+                        route[nextIdx];
+                }
             } else {
                 state.kiteWaypointIndex = null;
-                return kiteAwayFallback(targetPos, playerPos, dist);
+                return kiteAwayFallback(
+                    targetPos,
+                    playerPos,
+                    dist,
+                    now
+                );
             }
         }
 
-        // ---- MOVE TOWARD THE RETREAT WAYPOINT (CARDINAL-FIRST) ----
-        const dx = targetWp.x - playerPos.x;
-        const dy = targetWp.y - playerPos.y;
-        const stepX = dx > 0 ? 1 : (dx < 0 ? -1 : 0);
-        const stepY = dy > 0 ? 1 : (dy < 0 ? -1 : 0);
+        // Score every legal neighboring tile. Target separation is primary;
+        // progress toward the retreat waypoint is secondary.
+        const kiteCandidates =
+            getKiteStepCandidates(
+                playerPos,
+                targetPos,
+                ideal,
+                targetWp,
+                "away"
+            );
 
-        function isValidKiteTile(nx, ny) {
-            if (bot.blacklist?.isBlacklisted(nx, ny, playerPos.z))
-                return false;
-            const candidatePos = {
-                x: nx,
-                y: ny,
-                z: playerPos.z
-            };
-            if (!isSafeTileForKite(candidatePos))
-                return false;
-            return isTileWalkable(nx, ny, playerPos.z, false);
-        }
+        const kiteCandidate =
+            selectKiteMovementCandidate(
+                kiteCandidates,
+                "away"
+            );
 
-        let moved = false;
-
-        // Cardinal attempts
-        const cardinalAttempts = [{
-                dx: stepX,
-                dy: 0
-            }, {
-                dx: 0,
-                dy: stepY
-            }
-        ];
-        for (const a of cardinalAttempts) {
-            if (a.dx === 0 && a.dy === 0)
-                continue;
-            const nx = playerPos.x + a.dx;
-            const ny = playerPos.y + a.dy;
-            if (isValidKiteTile(nx, ny)) {
-                const dir = getDirection(a.dx, a.dy);
-                if (dir !== null && window.gameClient?.keyboard) {
-                    window.gameClient.keyboard.handleMoveKey(dir);
-                    moved = true;
-                    break;
-                }
-            }
-        }
-
-        // Diagonal attempts
-        if (!moved && stepX !== 0 && stepY !== 0) {
-            const diagAttempts = [{
-                    dx: stepX,
-                    dy: stepY
-                }, {
-                    dx: stepX,
-                    dy: -stepY
-                }, {
-                    dx: -stepX,
-                    dy: stepY
-                }, {
-                    dx: -stepX,
-                    dy: -stepY
-                }
-            ];
-            diagAttempts.sort((a, b) => {
-                const da = Math.abs(targetWp.x - (playerPos.x + a.dx)) + Math.abs(targetWp.y - (playerPos.y + a.dy));
-                const db = Math.abs(targetWp.x - (playerPos.x + b.dx)) + Math.abs(targetWp.y - (playerPos.y + b.dy));
-                return da - db;
-            });
-            for (const a of diagAttempts) {
-                const nx = playerPos.x + a.dx;
-                const ny = playerPos.y + a.dy;
-                if (isValidKiteTile(nx, ny)) {
-                    const dir = getDirection(a.dx, a.dy);
-                    if (dir !== null && window.gameClient?.keyboard) {
-                        window.gameClient.keyboard.handleMoveKey(dir);
-                        moved = true;
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Fallback: all 8 directions
-        if (!moved) {
-            const fallbackOffsets = [
-                [0, -1], [1, 0], [0, 1], [-1, 0],
-                [-1, -1], [1, -1], [-1, 1], [1, 1]
-            ];
-            for (const off of fallbackOffsets) {
-                const nx = playerPos.x + off[0];
-                const ny = playerPos.y + off[1];
-                if (isValidKiteTile(nx, ny)) {
-                    const dir = getDirection(off[0], off[1]);
-                    if (dir !== null && window.gameClient?.keyboard) {
-                        window.gameClient.keyboard.handleMoveKey(dir);
-                        moved = true;
-                        break;
-                    }
-                }
-            }
-        }
+        const moved =
+            performKiteStep(
+                kiteCandidate,
+                "route kite",
+                dist,
+                now
+            );
 
         // Stuck detection
         if (!moved) {
@@ -6108,8 +6513,42 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 state.kiteStuckCount = 0;
             state.kiteStuckCount++;
             if (state.kiteStuckCount > 5) {
-                bot.log("Kite: retreat waypoint blocked, skipping to previous waypoint");
-                state.kiteWaypointIndex = (state.kiteWaypointIndex - 2 + route.length) % route.length;
+                let nextIdx =
+                    Number(
+                        state.kiteWaypointIndex
+                    ) - 1;
+
+                if (loopMode) {
+                    if (nextIdx < 0)
+                        nextIdx =
+                            route.length - 1;
+                } else {
+                    nextIdx =
+                        Math.max(0, nextIdx);
+                }
+
+                if (
+                    nextIdx !==
+                    state.kiteWaypointIndex
+                ) {
+                    state.kiteWaypointIndex =
+                        nextIdx;
+                    state.kiteRouteStepChanges++;
+
+                    bot.log(
+                        "Kite: retreat blocked – moving one route waypoint back",
+                        {
+                            waypoint:
+                                nextIdx + 1,
+                            loopMode
+                        }
+                    );
+                } else {
+                    bot.log(
+                        "Kite: retreat blocked at route boundary – using local separation only"
+                    );
+                }
+
                 state.kiteStuckCount = 0;
             }
         } else {
@@ -7167,6 +7606,30 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
         if (state.engagedTargetId === current.id)
             clearEngagedTarget();
+
+        // v1.5.56: off-screen target release must also tear down any lure
+        // ownership held by that exact mob. Otherwise CaveBot can remain
+        // frozen on a stale "held for lure pack" state after targeting is gone.
+        if (
+            state.lureMovementHeld &&
+            state.lureLeashMobId === current.id
+        ) {
+            clearLureMovementHold(
+                "attack target left native screen",
+                now
+            );
+            state.offscreenLureHoldClears++;
+        }
+
+        if (
+            state.lureLastMobActive &&
+            state.lureLastMobId === current.id
+        ) {
+            clearLureLastMobState(
+                "last lure mob left native screen"
+            );
+            state.offscreenLastMobClears++;
+        }
 
         // Release all movement/combat ownership immediately. Lure will hand
         // movement back to CaveBot; normal targeting may reacquire another
@@ -9070,61 +9533,120 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             null;
 
         if (watched) {
-            const offset = getLureProjectedOffset(watched, playerPos);
-            const health = Number(watched.state?.health ?? watched.health);
-            const alive = !Number.isFinite(health) || health > 0;
-
-            if (offset && alive) {
-                state.lureLeashLastSeenAt = now;
-                state.lureLeashScreenX = offset.absX;
-                state.lureLeashScreenY = offset.absY;
-                state.lureLeashTileDistance = getTileDistance(playerPos, offset.mobPos);
-                const stillTrailing = isMobTrailingWaypoint(
-                    watched,
-                    context.waypoint,
-                    playerPos
-                );
-                const watchedMotion = updateLureMotionSample(
-                    watched,
-                    state.lureLeashTileDistance,
-                    stillTrailing,
-                    now
-                );
-
-                // Stay held until the lagging mob is comfortably back inside
-                // the inner band. This hysteresis prevents stop/start jitter.
-                const caughtUp =
-                    !stillTrailing ||
-                    (
-                        offset.absX <= resumeX &&
-                        offset.absY <= resumeY &&
-                        state.lureLeashTileDistance <= leashRadiusResume &&
-                        !watchedMotion.movingAway
-                    );
-
-                if (caughtUp) {
-                    const heldForMs = state.lureLeashStartedAt
-                        ? Math.max(0, now - state.lureLeashStartedAt)
-                        : 0;
-                    const mobName = state.lureLeashMobName;
-                    const watchedId = watched?.id;
-                    resetLureMotionSample(watchedId);
-                    clearLureMovementHold("pack caught up", now);
-                    bot.log("Lure screen leash resumed movement", {
-                        mobName,
-                        heldForMs
-                    });
-                    return false;
-                }
-
-                return true;
-            }
+            const health = Number(
+                watched.state?.health ??
+                watched.health
+            );
+            const alive =
+                !Number.isFinite(health) ||
+                health > 0;
 
             // Dead/removed mobs must never pin the route.
-            if (!alive || !window.gameClient?.world?.activeCreatures?.[watched.id]) {
-                clearLureMovementHold("leash mob gone", now);
+            if (
+                !alive ||
+                !window.gameClient?.world
+                    ?.activeCreatures?.[
+                        watched.id
+                    ]
+            ) {
+                clearLureMovementHold(
+                    "leash mob gone",
+                    now
+                );
                 return false;
             }
+
+            const nativeScreen =
+                getNativeSmallScreenInfo(
+                    watched
+                );
+
+            // activeCreatures can retain creatures outside the actual viewport.
+            // Only a truly native-screen-visible mob may refresh lastSeenAt.
+            if (nativeScreen.visible) {
+                const offset =
+                    getLureProjectedOffset(
+                        watched,
+                        playerPos
+                    );
+
+                if (offset) {
+                    state.lureLeashLastSeenAt =
+                        now;
+                    state.lureLeashScreenX =
+                        offset.absX;
+                    state.lureLeashScreenY =
+                        offset.absY;
+                    state.lureLeashTileDistance =
+                        getTileDistance(
+                            playerPos,
+                            offset.mobPos
+                        );
+
+                    const stillTrailing =
+                        isMobTrailingWaypoint(
+                            watched,
+                            context.waypoint,
+                            playerPos
+                        );
+                    const watchedMotion =
+                        updateLureMotionSample(
+                            watched,
+                            state.lureLeashTileDistance,
+                            stillTrailing,
+                            now
+                        );
+
+                    const caughtUp =
+                        !stillTrailing ||
+                        (
+                            offset.absX <= resumeX &&
+                            offset.absY <= resumeY &&
+                            state.lureLeashTileDistance <=
+                                leashRadiusResume &&
+                            !watchedMotion.movingAway
+                        );
+
+                    if (caughtUp) {
+                        const heldForMs =
+                            state.lureLeashStartedAt
+                                ? Math.max(
+                                    0,
+                                    now -
+                                        state.lureLeashStartedAt
+                                )
+                                : 0;
+                        const mobName =
+                            state.lureLeashMobName;
+                        const watchedId =
+                            watched?.id;
+
+                        resetLureMotionSample(
+                            watchedId
+                        );
+                        clearLureMovementHold(
+                            "pack caught up",
+                            now
+                        );
+
+                        bot.log(
+                            "Lure screen leash resumed movement",
+                            {
+                                mobName,
+                                heldForMs
+                            }
+                        );
+                        return false;
+                    }
+
+                    return true;
+                }
+            }
+
+            // Native off-screen: don't refresh lastSeenAt. Fall through to the
+            // lost-grace timeout below instead of holding CaveBot indefinitely.
+            state.lureLeashReason =
+                "lure mob outside native screen";
         }
 
         // If the mob crossed just outside the viewport, remain stopped for a
@@ -9135,12 +9657,33 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             : Number.POSITIVE_INFINITY;
 
         if (unseenForMs <= lostGraceMs) {
-            state.lureLeashReason = "waiting for off-screen lure mob";
+            state.lureLeashReason =
+                "brief off-screen lure grace";
             return true;
         }
 
         state.lureLeashLostTimeouts++;
-        clearLureMovementHold("lost lure mob timeout", now);
+
+        const lostMobId =
+            state.lureLeashMobId;
+        const lostMobName =
+            state.lureLeashMobName;
+
+        clearLureMovementHold(
+            "off-screen lure grace expired",
+            now
+        );
+
+        bot.log(
+            "Lure leash released – mob remained off-screen",
+            {
+                mobId: lostMobId,
+                mobName: lostMobName,
+                unseenForMs,
+                lostGraceMs
+            }
+        );
+
         return false;
     }
 
@@ -10732,6 +11275,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         state.offscreenTargetLastDy = null;
         state.offscreenTargetLastDistance = null;
         state.offscreenTargetLastReason = null;
+        state.offscreenLureHoldClears = 0;
+        state.offscreenLastMobClears = 0;
         state.offscreenEngagedRejects = 0;
         state.canonicalTargetRefreshes = 0;
         state.canonicalFollowRefreshes = 0;
@@ -10924,6 +11469,20 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         state.meleeProgressAt = 0;
         state.kiteWaypointIndex = null;
         state.kiteOriginalIndex = null;
+        state.lastKiteMoveAt = 0;
+        state.lastKiteMoveReason = null;
+        state.lastKiteMoveDirection = null;
+        state.lastKiteDistanceBefore = null;
+        state.lastKiteDistanceAfter = null;
+        state.kiteCloserStepRejects = 0;
+        state.kiteScoredMoves = 0;
+        state.kiteRouteStepChanges = 0;
+        state.kiteDiagonalFallbacks = 0;
+        state.kiteDiagonalEmergencyMoves = 0;
+        state.kiteDiagonalRejectedNonEmergency = 0;
+        state.kiteCardinalMoves = 0;
+        state.kiteChaseForceOffCount = 0;
+        state.kiteChaseLastForcedOffAt = 0;
         state._chaseEnabledForDistance = false;
         state.movementOwner = null;
         state.movementOwnedUntil = 0;
@@ -10950,9 +11509,16 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         }
 
         if (state.playerSessionRef !== player) {
-            resetAttackSessionState(state.playerSessionRef ? "player replaced" : "player restored");
+            resetAttackSessionState(
+                state.playerSessionRef
+                    ? "player replaced"
+                    : "player restored"
+            );
             state.playerSessionRef = player;
-            if (config.useClientChase)
+
+            if (config.kiteMode)
+                enforceKiteClientChaseOff();
+            else if (config.useClientChase)
                 setClientChaseMode(2);
         }
         return true;
@@ -12398,6 +12964,12 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             ensureTargetAckHook();
             ensureCancelMessageHook();
             const tickNow = Date.now();
+
+            if (config.kiteMode)
+                enforceKiteClientChaseOff(
+                    tickNow
+                );
+
             checkTargetAckTimeout(tickNow);
             pruneRejectedTargetBackoff(tickNow);
             tryAttack();
@@ -12413,6 +12985,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         Object.assign(config, overrides, {
             enabled: true
         });
+
+        if (config.kiteMode)
+            config.useClientChase = false;
+
         persistConfig();
         if (state.running) {
             bot.log("auto attack already running");
@@ -12424,8 +13000,11 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         ensureCancelMessageHook();
         attachAttackRuneCountListener();
         getAttackRuneCountState(Date.now(), true);
-        // Apply chase mode if enabled
-        if (config.useClientChase) {
+        // Kite and native Client Chase are mutually exclusive.
+        if (config.kiteMode) {
+            setClientChaseMode(0);
+            state._chaseEnabledForDistance = false;
+        } else if (config.useClientChase) {
             setClientChaseMode(2);
         }
         bot.log("auto attack started", {
@@ -12769,6 +13348,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 state.offscreenTargetLastDistance,
             offscreenTargetLastReason:
                 state.offscreenTargetLastReason,
+            offscreenLureHoldClears:
+                state.offscreenLureHoldClears || 0,
+            offscreenLastMobClears:
+                state.offscreenLastMobClears || 0,
             offscreenEngagedRejects:
                 state.offscreenEngagedRejects || 0,
             canonicalTargetRefreshes: state.canonicalTargetRefreshes || 0,
@@ -12970,6 +13553,34 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                     : 0,
             manualTargetDetections: state.manualTargetDetections || 0,
             clientChaseMode: Number(window.gameClient?.interface?.fightModeSelector?.currentChaseMode ?? 0),
+            lastKiteMoveAt:
+                state.lastKiteMoveAt || 0,
+            lastKiteMoveReason:
+                state.lastKiteMoveReason,
+            lastKiteMoveDirection:
+                state.lastKiteMoveDirection,
+            lastKiteDistanceBefore:
+                state.lastKiteDistanceBefore,
+            lastKiteDistanceAfter:
+                state.lastKiteDistanceAfter,
+            kiteCloserStepRejects:
+                state.kiteCloserStepRejects || 0,
+            kiteScoredMoves:
+                state.kiteScoredMoves || 0,
+            kiteRouteStepChanges:
+                state.kiteRouteStepChanges || 0,
+            kiteDiagonalFallbacks:
+                state.kiteDiagonalFallbacks || 0,
+            kiteDiagonalEmergencyMoves:
+                state.kiteDiagonalEmergencyMoves || 0,
+            kiteDiagonalRejectedNonEmergency:
+                state.kiteDiagonalRejectedNonEmergency || 0,
+            kiteCardinalMoves:
+                state.kiteCardinalMoves || 0,
+            kiteChaseForceOffCount:
+                state.kiteChaseForceOffCount || 0,
+            kiteChaseLastForcedOffAt:
+                state.kiteChaseLastForcedOffAt || 0,
             movementOwned: isMovementOwned(Date.now()),
             movementOwner: state.movementOwner,
             currentTarget: currentTarget ? {
@@ -12996,9 +13607,30 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function updateConfig(nextConfig = {}) {
-        const chaseSettingChanged = nextConfig.useClientChase !== undefined;
-        if (nextConfig.useClientChase !== undefined) {
+        let chaseSettingChanged =
+            nextConfig.useClientChase !== undefined;
+
+        if (nextConfig.kiteMode !== undefined)
+            nextConfig.kiteMode = !!nextConfig.kiteMode;
+
+        if (nextConfig.useClientChase !== undefined)
             nextConfig.useClientChase = !!nextConfig.useClientChase;
+
+        const resultingKiteMode =
+            nextConfig.kiteMode !== undefined
+                ? nextConfig.kiteMode
+                : !!config.kiteMode;
+
+        // Kite is the sole movement owner. Any attempt to enable Client Chase
+        // while Kite is on is converted to OFF.
+        if (resultingKiteMode) {
+            if (
+                config.useClientChase ||
+                nextConfig.useClientChase !== false
+            ) {
+                chaseSettingChanged = true;
+            }
+            nextConfig.useClientChase = false;
         }
         if (nextConfig.targetHotbarSlot !== undefined) {
             nextConfig.targetHotbarSlot = normalizeHotbarSlot(nextConfig.targetHotbarSlot) ?? config.targetHotbarSlot;
@@ -13018,6 +13650,28 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         if (nextConfig.antiKSOtherRange !== undefined) {
             nextConfig.antiKSOtherRange = Math.max(1, Math.trunc(Number(nextConfig.antiKSOtherRange) || 2));
         }
+        if (
+            nextConfig.kiteRetreatWaypointTolerance !==
+                undefined
+        ) {
+            const value =
+                Number(
+                    nextConfig
+                        .kiteRetreatWaypointTolerance
+                );
+            nextConfig.kiteRetreatWaypointTolerance =
+                Number.isFinite(value)
+                    ? Math.max(
+                        1,
+                        Math.min(
+                            6,
+                            Math.trunc(value)
+                        )
+                    )
+                    : config
+                        .kiteRetreatWaypointTolerance;
+        }
+
         if (nextConfig.targetStickMs !== undefined) {
             const value = Number(nextConfig.targetStickMs);
             nextConfig.targetStickMs = Number.isFinite(value) ? Math.max(0, Math.min(10000, value)) : config.targetStickMs;
@@ -13254,18 +13908,33 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         if (!config.lureMode)
             clearLureState("disabled");
 
-        if (chaseSettingChanged) {
+        if (config.kiteMode) {
+            enforceKiteClientChaseOff();
+        } else if (chaseSettingChanged) {
             const target = getCurrentTarget();
-            const playerPos = normalizePosition(bot.getPlayerPosition());
-            const targetPos = normalizePosition(target?.getPosition?.() || target?.__position);
+            const playerPos =
+                normalizePosition(
+                    bot.getPlayerPosition()
+                );
+            const targetPos =
+                normalizePosition(
+                    target?.getPosition?.() ||
+                    target?.__position
+                );
+
             const shouldChase =
                 !!config.useClientChase &&
                 !!playerPos &&
                 !!targetPos &&
                 playerPos.z === targetPos.z &&
-                getTileDistance(playerPos, targetPos) > 1;
+                getTileDistance(
+                    playerPos,
+                    targetPos
+                ) > 1;
+
             setClientChaseMode(shouldChase);
-            state._chaseEnabledForDistance = shouldChase;
+            state._chaseEnabledForDistance =
+                shouldChase;
         }
 
         if (runeSlotChanged) {
@@ -13388,6 +14057,14 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
         pendingTransitionSource: null,
         pausedForCombat: false,
+
+        // v1.5.55: external owners (currently distant-corpse Looter) can pause
+        // CaveBot movement without turning the module off or changing config.
+        externalPauseReasons: new Set(),
+        externalPauseSince: 0,
+        externalPauseCount: 0,
+        externalResumeCount: 0,
+
         lureLeashPaused: false,
         lureLeashPauseCount: 0,
         lureLeashResumeCount: 0,
@@ -13831,6 +14508,124 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         state.pathAttemptStart = 0;
         state.lastDistanceToWaypoint = null;
         state.lastPathAt = 0;
+    }
+
+    function normalizeExternalPauseReason(
+        reason
+    ) {
+        const value =
+            String(reason || "external")
+                .trim();
+        return value || "external";
+    }
+
+    function isMovementPausedExternally() {
+        return (
+            state.externalPauseReasons
+                ?.size > 0
+        );
+    }
+
+    function pauseMovement(
+        reason = "external"
+    ) {
+        if (!state.running)
+            return false;
+
+        const key =
+            normalizeExternalPauseReason(
+                reason
+            );
+
+        const wasPaused =
+            isMovementPausedExternally();
+
+        state.externalPauseReasons.add(key);
+
+        if (!wasPaused) {
+            const now = Date.now();
+
+            state.externalPauseSince = now;
+            state.externalPauseCount++;
+
+            stopCaveMovementNow();
+
+            const pos =
+                normalizePosition(
+                    bot.getPlayerPosition()
+                );
+
+            resetWaypointProgressTracking(
+                getCurrentWaypoint(),
+                pos,
+                now
+            );
+            state.lastPositionKey =
+                getPositionKey(pos);
+            state.recoveryActive = false;
+            state.circuitFailures = null;
+
+            bot.log(
+                "Cave: movement paused",
+                {
+                    reason: key
+                }
+            );
+        }
+
+        return true;
+    }
+
+    function resumeMovement(
+        reason = "external"
+    ) {
+        const key =
+            normalizeExternalPauseReason(
+                reason
+            );
+
+        const hadReason =
+            state.externalPauseReasons
+                .delete(key);
+
+        if (!hadReason)
+            return false;
+
+        if (
+            state.externalPauseReasons.size ===
+                0
+        ) {
+            const now = Date.now();
+            const pos =
+                normalizePosition(
+                    bot.getPlayerPosition()
+                );
+
+            state.externalPauseSince = 0;
+            state.externalResumeCount++;
+
+            resetWaypointProgressTracking(
+                getCurrentWaypoint(),
+                pos,
+                now
+            );
+            state.lastPositionKey =
+                getPositionKey(pos);
+            state.lastWaypointTarget = null;
+            state.lastPathAt = 0;
+            state.pathAttemptStart = 0;
+            state.recoveryActive = false;
+            state.circuitFailures = null;
+
+            bot.log(
+                "Cave: movement resumed",
+                {
+                    reason: key
+                }
+            );
+        }
+
+        return true;
     }
 
     // ---- PRESET MANAGEMENT ----
@@ -17950,6 +18745,13 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         if (state.circuitTrip) return 'Safety stopped';
         if (!state.running) return 'Idle';
         if (state.positionUnavailable) return 'Waiting for player';
+        if (isMovementPausedExternally()) {
+            const reason =
+                Array.from(
+                    state.externalPauseReasons
+                )[0] || "external";
+            return `Paused: ${reason}`;
+        }
         if (state.pausedForCombat) return 'Attacking / paused';
         if (state.combatCooldownUntil > now) return 'Combat cooldown';
         if (bot._waitUntil && now < bot._waitUntil) return 'Waiting';
@@ -18970,6 +19772,23 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         }
 
         if (state.combatCooldownUntil && Date.now() < state.combatCooldownUntil) {
+            scheduleNextTick();
+            return;
+        }
+
+        // External pause is NOT a module stop. Keep the CaveBot tick alive and
+        // its running/config flags unchanged while another feature owns movement.
+        if (isMovementPausedExternally()) {
+            const now = Date.now();
+
+            state.lastProgressAt = now;
+            state.nativePathWatchAt = 0;
+            state.nativePathWatchBestDistance =
+                Infinity;
+            state.recoveryNoProgressAt = now;
+            state.recoveryActive = false;
+            state.circuitFailures = null;
+
             scheduleNextTick();
             return;
         }
@@ -21553,6 +22372,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         state.stuckRecoveryAttempts = 0;
         state.lastRecoveryAt = 0;
         state.pausedForCombat = false;
+        state.externalPauseReasons.clear();
+        state.externalPauseSince = 0;
         state.lureLeashPaused = false;
         state.lureLeashPauseCount = 0;
         state.lureLeashResumeCount = 0;
@@ -21699,6 +22520,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             persistConfig();
         }
         state.pausedForCombat = false;
+        state.externalPauseReasons.clear();
+        state.externalPauseSince = 0;
         state.lureLeashPaused = false;
         clearLureDetourPlan("CaveBot stopped");
         clearLureStaticRouteCache("CaveBot stopped");
@@ -21919,7 +22742,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             recent.push(`${event.reason} #${event.index + 1} (${Math.max(0, Math.floor((now - event.at) / 1000))}s ago)`);
         }
         const movement = getMovementSummary(now);
-        const isPaused = state.positionUnavailable || state.pausedForCombat || state.combatCooldownUntil > now ||
+        const isPaused = state.positionUnavailable || isMovementPausedExternally() ||
+            state.pausedForCombat || state.combatCooldownUntil > now ||
             (bot._waitUntil && bot._waitUntil > now) ||
             ['Waiting for blocker', 'Waiting for floor change', 'Waiting'].includes(movement.mode);
         const progressAgeMs = state.running && !isPaused && state.lastProgressAt
@@ -21976,6 +22800,18 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             lastProgressAt: state.lastProgressAt,
             pendingTransitionSource: cloneValue(state.pendingTransitionSource),
             pausedForCombat: state.pausedForCombat,
+            externallyPaused:
+                isMovementPausedExternally(),
+            externalPauseReasons:
+                Array.from(
+                    state.externalPauseReasons
+                ),
+            externalPauseSince:
+                state.externalPauseSince || 0,
+            externalPauseCount:
+                state.externalPauseCount || 0,
+            externalResumeCount:
+                state.externalResumeCount || 0,
             lureLeashPaused: state.lureLeashPaused,
             lureLeashPauseCount: state.lureLeashPauseCount || 0,
             lureLeashResumeCount: state.lureLeashResumeCount || 0,
@@ -22385,6 +23221,10 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         auditRoute,
         getWaypointListMeta: () => ({ revision: state.routeRevision, index: state.currentIndex, length: route.length, running: state.running }),
         isRunning: () => state.running,
+        pauseMovement,
+        resumeMovement,
+        isMovementPaused:
+            isMovementPausedExternally,
         getTransitions,
         getPresetNames,
         getActivePresetName,
@@ -27458,6 +28298,15 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         lastDroppedItemId: null,
         lastDroppedItemName: null,
         lastDropAt: 0,
+
+        // v1.5.54: distant corpse walking is between-fights activity only.
+        corpseCombatClearSince: 0,
+        corpseCombatWaitTicks: 0,
+        corpseCombatDeferrals: 0,
+        corpseCombatResumes: 0,
+        corpseCombatLastBlockedAt: 0,
+        corpseCombatLastReason: null,
+        corpseCombatLastMonsterCount: 0,
     };
 
     // Load config
@@ -27479,6 +28328,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         2500,
         Math.min(15000, Number(stored.corpseApproachTimeoutMs) || 8000)
     );
+
     state.corpseStuckMs = Math.max(
         800,
         Math.min(3000, Number(stored.corpseStuckMs) || 1500)
@@ -27486,6 +28336,22 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
     state.corpseLootHoldMs = Math.max(
         2000,
         Math.min(15000, Number(stored.corpseLootHoldMs) || 8000)
+    );
+    state.corpseCombatClearGraceMs = Math.max(
+        300,
+        Math.min(
+            3000,
+            Number(stored.corpseCombatClearGraceMs) ||
+                750
+        )
+    );
+    state.corpseQueueHoldMs = Math.max(
+        10000,
+        Math.min(
+            120000,
+            Number(stored.corpseQueueHoldMs) ||
+                45000
+        )
     );
     if (Array.isArray(stored.trackedItems)) {
         for (const [id, name] of stored.trackedItems) {
@@ -27517,6 +28383,10 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             corpseApproachTimeoutMs: state.corpseApproachTimeoutMs,
             corpseStuckMs: state.corpseStuckMs,
             corpseLootHoldMs: state.corpseLootHoldMs,
+            corpseCombatClearGraceMs:
+                state.corpseCombatClearGraceMs,
+            corpseQueueHoldMs:
+                state.corpseQueueHoldMs,
         });
     }
 
@@ -28427,23 +29297,27 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             }
         }
 
-        job.resumeCave =
+        job.caveWasRunning =
             !!bot.cave?.status?.().running;
-        job.resumeAttack =
+        job.attackWasRunning =
             !!bot.attack?.status?.().running;
+        job.cavePausedByLooter = false;
 
-        // Pause Cave first so it cannot request another destination while
-        // Targeting is being released.
-        if (job.resumeCave) {
-            bot.cave?.stop?.({
-                persistEnabled: false
-            });
-        }
+        // v1.5.55: do NOT stop either module. Targeting remains fully running,
+        // and CaveBot remains running/enabled in the UI. Only Cave movement is
+        // externally paused while Looter owns the pathfinder.
+        if (job.caveWasRunning) {
+            job.cavePausedByLooter =
+                bot.cave?.pauseMovement?.(
+                    "looter-corpse"
+                ) === true;
 
-        if (job.resumeAttack) {
-            bot.attack?.stop?.({
-                persistEnabled: false
-            });
+            if (!job.cavePausedByLooter) {
+                bot.log(
+                    "Looter: could not pause CaveBot movement"
+                );
+                return false;
+            }
         }
 
         return true;
@@ -28453,21 +29327,17 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         if (!job)
             return;
 
-        // Targeting first, CaveBot second: Cave movement resumes with targeting
-        // already initialized, matching the existing recovery conventions.
-        if (
-            state.running &&
-            job.resumeAttack
-        ) {
-            bot.attack?.start?.();
-        }
-        if (
-            state.running &&
-            job.resumeCave
-        ) {
-            bot.cave?.start?.();
+        // Releasing Looter's pause never starts/stops modules. If the user
+        // manually switched CaveBot off during looting, it stays off.
+        if (job.cavePausedByLooter) {
+            bot.cave?.resumeMovement?.(
+                "looter-corpse"
+            );
         }
 
+        job.cavePausedByLooter = false;
+        job.caveWasRunning = false;
+        job.attackWasRunning = false;
         job.resumeAttack = false;
         job.resumeCave = false;
     }
@@ -28503,6 +29373,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
 
         state.pendingMove = null;
         state.corpseJob = null;
+        state.corpseCombatClearSince = 0;
         resumeModulesAfterCorpse(job);
         return true;
     }
@@ -28588,8 +29459,11 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                 now + state.corpseOpenDelayMs,
             expiresAt:
                 now +
-                state.corpseOpenDelayMs +
-                5000
+                Math.max(
+                    state.corpseQueueHoldMs,
+                    state.corpseOpenDelayMs +
+                        5000
+                )
         });
         state.corpseDeathsQueued++;
 
@@ -28927,6 +29801,227 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         state.deathHookWrapper = null;
     }
 
+    function getLiveCorpseCombatMonsters() {
+        let monsters = [];
+
+        try {
+            monsters =
+                bot.attack?.getNearbyMonsters?.(
+                    false
+                ) || [];
+        } catch (e) {
+            monsters = [];
+        }
+
+        return monsters.filter(monster => {
+            if (!monster)
+                return false;
+
+            // Ignored mobs are intentionally outside the user's combat cycle,
+            // so they do not hold distant corpse looting forever.
+            if (
+                bot.attack
+                    ?.isIgnoredTarget
+                    ?.(monster)
+            ) {
+                return false;
+            }
+
+            const hp =
+                Number(
+                    monster.state?.health ??
+                    monster.health
+                );
+
+            return (
+                !Number.isFinite(hp) ||
+                hp > 0
+            );
+        });
+    }
+
+    function getCorpseCombatGate(
+        now = Date.now(),
+        requireGrace = true
+    ) {
+        const liveMonsters =
+            getLiveCorpseCombatMonsters();
+
+        let attackCombatActive = false;
+        let currentTarget = null;
+
+        try {
+            attackCombatActive =
+                bot.attack?.isCombatActive?.() ===
+                true;
+        } catch (e) {}
+
+        try {
+            currentTarget =
+                bot.attack?.getCurrentTarget?.() ||
+                null;
+        } catch (e) {}
+
+        let currentTargetAlive = false;
+
+        if (currentTarget) {
+            const hp =
+                Number(
+                    currentTarget.state?.health ??
+                    currentTarget.health
+                );
+            currentTargetAlive =
+                !Number.isFinite(hp) ||
+                hp > 0;
+        }
+
+        if (
+            liveMonsters.length > 0 ||
+            attackCombatActive ||
+            currentTargetAlive
+        ) {
+            state.corpseCombatClearSince = 0;
+            state.corpseCombatWaitTicks++;
+            state.corpseCombatLastBlockedAt =
+                now;
+            state.corpseCombatLastMonsterCount =
+                liveMonsters.length;
+            state.corpseCombatLastReason =
+                liveMonsters.length > 0
+                    ? `${liveMonsters.length} live monster(s)`
+                    : (
+                        currentTargetAlive
+                            ? "active target"
+                            : "combat active"
+                    );
+
+            return {
+                clear: false,
+                reason:
+                    state.corpseCombatLastReason,
+                liveMonsterCount:
+                    liveMonsters.length
+            };
+        }
+
+        if (!state.corpseCombatClearSince)
+            state.corpseCombatClearSince = now;
+
+        const clearFor =
+            Math.max(
+                0,
+                now -
+                    state.corpseCombatClearSince
+            );
+
+        if (
+            requireGrace &&
+            clearFor <
+                state.corpseCombatClearGraceMs
+        ) {
+            state.corpseCombatWaitTicks++;
+            state.corpseCombatLastReason =
+                "combat-clear grace";
+
+            return {
+                clear: false,
+                reason: "combat-clear grace",
+                liveMonsterCount: 0,
+                clearFor
+            };
+        }
+
+        return {
+            clear: true,
+            reason: "clear",
+            liveMonsterCount: 0,
+            clearFor
+        };
+    }
+
+    function requeueCorpseJobAfterCombat(
+        job,
+        now = Date.now()
+    ) {
+        if (!job)
+            return false;
+
+        const candidate = {
+            key: job.key,
+            monsterId: job.monsterId,
+            monsterName:
+                job.monsterName ||
+                "Monster",
+            position: {
+                x: Number(job.position.x),
+                y: Number(job.position.y),
+                z: Number(job.position.z)
+            },
+            deathAt:
+                Number(job.deathAt) ||
+                now,
+            notBefore:
+                now +
+                state.corpseCombatClearGraceMs,
+            expiresAt:
+                Math.max(
+                    Number(job.expiresAt) || 0,
+                    now +
+                        state.corpseQueueHoldMs
+                )
+        };
+
+        if (
+            !state.corpseQueue.some(
+                entry =>
+                    entry.key === candidate.key
+            )
+        ) {
+            state.corpseQueue.unshift(
+                candidate
+            );
+        }
+
+        state.corpseCombatDeferrals++;
+        return true;
+    }
+
+    function deferCorpseJobForCombat(
+        job,
+        combatGate,
+        now = Date.now()
+    ) {
+        if (!job)
+            return false;
+
+        requeueCorpseJobAfterCombat(
+            job,
+            now
+        );
+
+        clearCorpseApproachMovement(job);
+        state.pendingMove = null;
+        state.corpseJob = null;
+        state.corpseCombatResumes++;
+
+        bot.log(
+            "Looter: combat resumed – distant corpse deferred",
+            {
+                reason:
+                    combatGate?.reason ||
+                    "combat active",
+                monster:
+                    job.monsterName ||
+                    "Monster",
+                position:
+                    job.position
+            }
+        );
+
+        resumeModulesAfterCorpse(job);
+        return true;
+    }
+
     function startNextCorpseJob(
         now = Date.now()
     ) {
@@ -28938,6 +30033,16 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         ) {
             return false;
         }
+
+        // Never pause CaveBot/Targeting while combat is still happening.
+        const combatGate =
+            getCorpseCombatGate(
+                now,
+                true
+            );
+
+        if (!combatGate.clear)
+            return false;
 
         // Drop stale/dead candidates until we find a real corpse tile.
         while (state.corpseQueue.length) {
@@ -29013,6 +30118,20 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             const job = {
                 ...candidate,
                 startedAt: now,
+
+                // Short routes should fail fast; long routes still keep enough
+                // time to walk. This deadline only covers APPROACH movement.
+                approachDeadlineAt:
+                    now +
+                    Math.min(
+                        state.corpseApproachTimeoutMs,
+                        Math.max(
+                            2000,
+                            1500 +
+                                distance * 700
+                        )
+                    ),
+
                 lootStartedAt: 0,
                 lastWalkAt: 0,
                 walkAttempts: 0,
@@ -29035,9 +30154,26 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                 baselineContainerIds:
                     getOpenContainerIds(),
                 openedContainerId: null,
+                caveWasRunning: false,
+                attackWasRunning: false,
+                cavePausedByLooter: false,
                 resumeCave: false,
                 resumeAttack: false
             };
+
+            // Re-check immediately before taking movement ownership.
+            const ownershipCombatGate =
+                getCorpseCombatGate(
+                    Date.now(),
+                    false
+                );
+
+            if (!ownershipCombatGate.clear) {
+                state.corpseQueue.unshift(
+                    candidate
+                );
+                return false;
+            }
 
             state.corpseJob = job;
 
@@ -29092,9 +30228,30 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             return false;
         }
 
+        const combatGate =
+            getCorpseCombatGate(
+                now,
+                false
+            );
+
+        if (!combatGate.clear) {
+            deferCorpseJobForCombat(
+                job,
+                combatGate,
+                now
+            );
+            return false;
+        }
+
         if (
-            now - job.startedAt >
-            state.corpseApproachTimeoutMs
+            now >
+            Number(
+                job.approachDeadlineAt ||
+                (
+                    job.startedAt +
+                    state.corpseApproachTimeoutMs
+                )
+            )
         ) {
             finishCorpseJob(
                 false,
@@ -29103,189 +30260,98 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             return false;
         }
 
-        if (job.openedContainerId == null) {
-            const opened =
-                getNewOpenedContainer(
-                    job.baselineContainerIds
+        const corpseInfo =
+            getCorpseTileInfo(
+                job.position
+            );
+
+        if (!corpseInfo) {
+            // Give the death/item update a brief moment before deciding the
+            // corpse no longer exists.
+            if (
+                now - job.startedAt >
+                1200
+            ) {
+                finishCorpseJob(
+                    false,
+                    "corpse disappeared before approach"
                 );
+                return false;
+            }
 
-            if (opened) {
-                job.openedContainerId =
-                    opened.__containerId;
-                job.lootStartedAt = now;
+            return true;
+        }
 
-                bot.log(
-                    "Looter: corpse opened",
-                    {
-                        monster:
-                            job.monsterName,
-                        containerId:
-                            job.openedContainerId
-                    }
-                );
-            } else {
-                const corpseInfo =
-                    getCorpseTileInfo(job.position);
+        const playerPos =
+            bot.getPlayerPosition();
 
-                if (!corpseInfo) {
-                    // Give death/item packets a little room before declaring
-                    // the corpse gone.
-                    if (
-                        now - job.startedAt > 1200
-                    ) {
-                        finishCorpseJob(
-                            false,
-                            "corpse disappeared before auto-open"
-                        );
-                    }
-                    return true;
-                }
+        if (!playerPos)
+            return true;
 
-                const playerPos =
-                    bot.getPlayerPosition();
+        const dx = Math.abs(
+            Number(job.position.x) -
+            Number(playerPos.x)
+        );
+        const dy = Math.abs(
+            Number(job.position.y) -
+            Number(playerPos.y)
+        );
 
-                if (!playerPos) {
-                    return true;
-                }
+        const adjacent =
+            dx <= 1 &&
+            dy <= 1 &&
+            Number(playerPos.z) ===
+                Number(job.position.z);
 
-                const dx = Math.abs(
-                    Number(job.position.x) -
-                    Number(playerPos.x)
-                );
-                const dy = Math.abs(
-                    Number(job.position.y) -
-                    Number(playerPos.y)
-                );
-                const adjacent =
-                    dx <= 1 &&
-                    dy <= 1 &&
-                    Number(playerPos.z) ===
-                        Number(job.position.z);
+        if (adjacent) {
+            // v1.5.58: walking beside the corpse is the ENTIRE job.
+            // No container wait, no loot hold, no corpse ownership after
+            // arrival. Native auto-open and the normal Looter loop continue
+            // independently after CaveBot movement is released.
+            finishCorpseJob(
+                true,
+                "arrived beside corpse"
+            );
+            return false;
+        }
 
-                if (adjacent) {
-                    job.arrivedAdjacentAt =
-                        job.arrivedAdjacentAt || now;
+        noteCorpseApproachProgress(
+            job,
+            playerPos,
+            now
+        );
 
-                    // Do nothing here. The game/server auto-opens corpses when
-                    // the player is close enough. We only wait for the new
-                    // container to appear.
-                    return true;
-                }
+        const stalled =
+            now -
+                Number(
+                    job.lastProgressAt ||
+                    job.startedAt ||
+                    now
+                ) >=
+            state.corpseStuckMs;
 
-                noteCorpseApproachProgress(
+        if (stalled) {
+            const recovered =
+                recoverStalledCorpseApproach(
                     job,
-                    playerPos,
                     now
                 );
 
-                const stalled =
-                    now -
-                        Number(
-                            job.lastProgressAt ||
-                            job.startedAt ||
-                            now
-                        ) >=
-                    state.corpseStuckMs;
-
-                if (stalled) {
-                    const recovered =
-                        recoverStalledCorpseApproach(
-                            job,
-                            now
-                        );
-
-                    if (
-                        !recovered &&
-                        now - job.startedAt > 2500
-                    ) {
-                        finishCorpseJob(
-                            false,
-                            "corpse approach stalled with no reachable alternate side"
-                        );
-                    }
-                }
-
-                return true;
+            if (
+                !recovered &&
+                now - job.startedAt >
+                2500
+            ) {
+                finishCorpseJob(
+                    false,
+                    "corpse approach stalled with no reachable alternate side"
+                );
             }
-        }
-
-        const corpseContainer =
-            getContainerById(
-                job.openedContainerId
-            );
-
-        if (!corpseContainer) {
-            finishCorpseJob(
-                false,
-                "corpse container closed"
-            );
-            return false;
-        }
-
-        const needsDestination =
-            containerHasDestinationTrackedItems(
-                corpseContainer
-            );
-
-        const dest =
-            getDestinationContainer();
-
-        if (
-            needsDestination &&
-            !dest
-        ) {
-            finishCorpseJob(
-                false,
-                "no destination container"
-            );
-            return false;
-        }
-
-        if (
-            needsDestination &&
-            findEmptySlot(dest) === -1
-        ) {
-            finishCorpseJob(
-                false,
-                "destination container full"
-            );
-            return false;
-        }
-
-        // Drop-marked items go to the player's tile first; ordinary tracked
-        // loot still goes to the selected destination.
-        moveItems();
-
-        const pendingFromCorpse =
-            state.pendingMove &&
-            Number(state.pendingMove.sourceId) ===
-                Number(job.openedContainerId);
-
-        if (
-            !containerHasTrackedItems(corpseContainer) &&
-            !pendingFromCorpse
-        ) {
-            finishCorpseJob(
-                true,
-                "tracked corpse items transferred"
-            );
-            return false;
-        }
-
-        if (
-            job.lootStartedAt &&
-            now - job.lootStartedAt >
-                state.corpseLootHoldMs
-        ) {
-            finishCorpseJob(
-                false,
-                "corpse loot hold timeout"
-            );
-            return false;
         }
 
         return true;
     }
+
 
     // One outstanding inventory move at a time. Containers update asynchronously;
     // re-sending every slot before acknowledgement can duplicate requests and
@@ -29629,6 +30695,13 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         state.deathHookRepairs = 0;
         state.staleDeathHooksRemoved = 0;
         state.lastDeathHookRepairAt = 0;
+        state.corpseCombatClearSince = 0;
+        state.corpseCombatWaitTicks = 0;
+        state.corpseCombatDeferrals = 0;
+        state.corpseCombatResumes = 0;
+        state.corpseCombatLastBlockedAt = 0;
+        state.corpseCombatLastReason = null;
+        state.corpseCombatLastMonsterCount = 0;
         installDeathHook();
         bot.log("Looter started");
         tick();
@@ -29656,7 +30729,20 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             clearCorpseApproachMovement(
                 activeCorpseJob
             );
-            // Explicit stop must not restart gameplay modules.
+
+            // This is only releasing a movement pause; it does not start or
+            // stop CaveBot/Targeting and therefore respects manual toggles.
+            if (
+                activeCorpseJob
+                    .cavePausedByLooter
+            ) {
+                bot.cave?.resumeMovement?.(
+                    "looter-corpse"
+                );
+            }
+
+            activeCorpseJob.cavePausedByLooter =
+                false;
             activeCorpseJob.resumeAttack = false;
             activeCorpseJob.resumeCave = false;
         }
@@ -29684,6 +30770,24 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             corpseApproachTimeoutMs: state.corpseApproachTimeoutMs,
             corpseStuckMs: state.corpseStuckMs,
             corpseLootHoldMs: state.corpseLootHoldMs,
+            corpseCombatClearGraceMs:
+                state.corpseCombatClearGraceMs,
+            corpseQueueHoldMs:
+                state.corpseQueueHoldMs,
+            corpseCombatClearSince:
+                state.corpseCombatClearSince,
+            corpseCombatWaitTicks:
+                state.corpseCombatWaitTicks,
+            corpseCombatDeferrals:
+                state.corpseCombatDeferrals,
+            corpseCombatResumes:
+                state.corpseCombatResumes,
+            corpseCombatLastBlockedAt:
+                state.corpseCombatLastBlockedAt,
+            corpseCombatLastReason:
+                state.corpseCombatLastReason,
+            corpseCombatLastMonsterCount:
+                state.corpseCombatLastMonsterCount,
             corpseApproachStalls:
                 state.corpseApproachStalls,
             corpseApproachSideSwitches:
@@ -32677,11 +33781,25 @@ function upgradeSectionHeaders(panel) {
         const kiteToggle = document.getElementById("minibia-bot-auto-attack-kite");
         const idealDistInput = document.getElementById("minibia-bot-auto-attack-ideal-dist");
         const keepDiagonalToggle = document.getElementById("minibia-bot-auto-attack-keep-diagonal");
+        const clientChaseStatusToggle = document.getElementById("minibia-bot-auto-attack-client-chase");
         if (keepDiagonalToggle && document.activeElement !== keepDiagonalToggle) {
             keepDiagonalToggle.checked = attackConfig.keepDiagonal || false;
         }
         if (kiteToggle)
-            kiteToggle.checked = attackConfig.kiteMode !== false;
+            kiteToggle.checked = !!attackConfig.kiteMode;
+
+        if (clientChaseStatusToggle) {
+            clientChaseStatusToggle.checked =
+                !!attackConfig.useClientChase &&
+                !attackConfig.kiteMode;
+            clientChaseStatusToggle.disabled =
+                !!attackConfig.kiteMode;
+            clientChaseStatusToggle.title =
+                attackConfig.kiteMode
+                    ? "Client Chase is automatically disabled while Kite is enabled."
+                    : "";
+        }
+
         if (idealDistInput && document.activeElement !== idealDistInput) {
             idealDistInput.value = attackConfig.idealDistance ?? 3;
         }
@@ -35609,7 +36727,7 @@ function upgradeSectionHeaders(panel) {
         <span>Max corpse distance</span>
         <input type="number" id="minibia-bot-looter-corpse-distance" min="1" max="30" value="12" style="width:64px;" />
       </label>
-      <div class="mb-small-note">When enabled, Looter pauses Targeting/CaveBot, walks beside the corpse, waits for auto-open, transfers tracked items, then resumes.</div>
+      <div class="mb-small-note">When enabled, Looter waits until combat is clear, temporarily pauses CaveBot movement, walks beside a distant corpse, then immediately releases movement. Native auto-open and normal looting continue independently.</div>
       <div class="mb-section-title mb-section-title--sub">
         <span class="mb-title-text">Tracked Items</span>
       </div>
@@ -37728,18 +38846,37 @@ function upgradeSectionHeaders(panel) {
 
         const clientChaseToggle = panel.querySelector("#minibia-bot-auto-attack-client-chase");
         if (clientChaseToggle) {
-            clientChaseToggle.checked = bot.attack?.config?.useClientChase || false;
+            clientChaseToggle.checked =
+                !!bot.attack?.config?.useClientChase &&
+                !bot.attack?.config?.kiteMode;
+            clientChaseToggle.disabled =
+                !!bot.attack?.config?.kiteMode;
+
             clientChaseToggle.addEventListener("change", function () {
+                if (bot.attack?.config?.kiteMode) {
+                    this.checked = false;
+                    this.disabled = true;
+                    bot.attack.updateConfig({
+                        useClientChase: false
+                    });
+                    bot.attack.setClientChaseMode(0);
+                    bot.log(
+                        "Client chase remains OFF while Kite is enabled"
+                    );
+                    return;
+                }
+
                 const enabled = this.checked;
                 bot.attack.updateConfig({
                     useClientChase: enabled
                 });
-                if (enabled) {
-                    bot.attack.setClientChaseMode(2); // aggressive chase
-                } else {
-                    bot.attack.setClientChaseMode(0); // stand
-                }
-                bot.log("Client chase toggled to", enabled ? "ON" : "OFF");
+                bot.attack.setClientChaseMode(
+                    enabled ? 2 : 0
+                );
+                bot.log(
+                    "Client chase toggled to",
+                    enabled ? "ON" : "OFF"
+                );
             });
         }
 
@@ -38492,11 +39629,34 @@ function upgradeSectionHeaders(panel) {
         const idealDistInput = panel.querySelector("#minibia-bot-auto-attack-ideal-dist");
 
         if (kiteToggle) {
-            kiteToggle.checked = bot.attack?.config?.kiteMode || false;
+            kiteToggle.checked =
+                !!bot.attack?.config?.kiteMode;
+
             kiteToggle.addEventListener("change", function () {
+                const enabled = this.checked;
+
                 bot.attack.updateConfig({
-                    kiteMode: this.checked
+                    kiteMode: enabled,
+                    ...(enabled
+                        ? {
+                            useClientChase: false
+                        }
+                        : {})
                 });
+
+                if (enabled)
+                    bot.attack.setClientChaseMode(0);
+
+                if (clientChaseToggle) {
+                    clientChaseToggle.checked = false;
+                    clientChaseToggle.disabled = enabled;
+                    clientChaseToggle.title =
+                        enabled
+                            ? "Client Chase is automatically disabled while Kite is enabled."
+                            : "";
+                }
+
+                refreshAutoAttackStatus();
             });
         }
 
