@@ -803,7 +803,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.5.61",
+        version: "1.5.65",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -5094,6 +5094,16 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         viewportVisibilityFallbacks: 0,
         viewportLastVisibleWidth: 0,
         viewportLastVisibleHeight: 0,
+
+        // v1.5.63: Kite line-of-sight safety.
+        kiteLosChecks: 0,
+        kiteLosBlocked: 0,
+        kiteLosCurrentTargetClears: 0,
+        kiteLosCandidateRejects: 0,
+        kiteLosUnknownTileBlocks: 0,
+        kiteLosCornerBlocks: 0,
+        kiteLosLastReason: null,
+        kiteLosLastBlockPosition: null,
         ignoredLastTargetId: null,
         ignoredLastTargetName: null,
         ignoredLastAt: 0,
@@ -5228,6 +5238,22 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         // v1.5.59: continuously enforce native Client Chase OFF during Kite.
         kiteChaseForceOffCount: 0,
         kiteChaseLastForcedOffAt: 0,
+
+        // v1.5.64: prevent A-B-A-B pocket oscillation. Track actual occupied
+        // tiles plus the last issued cardinal vector and score a few tiles of
+        // onward escape space before choosing the next retreat step.
+        kiteRecentPositions: [],
+        kiteLastMoveDx: 0,
+        kiteLastMoveDy: 0,
+        kiteImmediateReverseAvoids: 0,
+        kiteRecentTilePenalties: 0,
+        kiteLookaheadChecks: 0,
+        kiteLookaheadDeadEndPenalties: 0,
+        kiteDeadEndHardRejects: 0,
+        kiteDeadEndForcedEntries: 0,
+        kiteForwardEscapeHorizonHits: 0,
+        kiteOscillationDetections: 0,
+        kiteLastOscillationAt: 0,
 
         // v1.4.86: native rune cooldown + server-side inventory count.
         lastRuneCountRequestAt: 0,
@@ -5760,6 +5786,362 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         return String(def?.properties?.name || thing?.name || "").trim().toLowerCase();
     }
 
+    function thingBlocksProjectileLine(
+        thing
+    ) {
+        if (!thing)
+            return false;
+
+        try {
+            if (
+                typeof PropBitFlag !==
+                    "undefined" &&
+                PropBitFlag?.prototype
+                    ?.flags
+                    ?.DatFlagBlockProjectile !==
+                    undefined &&
+                thing.hasFlag?.(
+                    PropBitFlag.prototype
+                        .flags
+                        .DatFlagBlockProjectile
+                )
+            ) {
+                return true;
+            }
+        } catch (e) {}
+
+        // definitions.json mirrors the server OTBM flags.
+        // Bit 1 (numeric value 2) = BLOCK_PROJECTILE.
+        const def =
+            getThingDefinition(
+                thing.id
+            );
+        const flags =
+            Number(def?.flags);
+
+        return (
+            Number.isFinite(flags) &&
+            (flags & 2) === 2
+        );
+    }
+
+    function tileBlocksProjectileLine(
+        tile
+    ) {
+        // Kite is safety-first: unknown tiles in a purported visible ray are
+        // treated as blocked rather than attacking through unloaded geometry.
+        if (!tile) {
+            state.kiteLosUnknownTileBlocks++;
+            return true;
+        }
+
+        if (
+            thingBlocksProjectileLine(
+                tile
+            )
+        ) {
+            return true;
+        }
+
+        if (
+            Array.isArray(tile.items)
+        ) {
+            for (
+                const item of tile.items
+            ) {
+                if (
+                    thingBlocksProjectileLine(
+                        item
+                    )
+                ) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    function getWorldTileForLos(
+        x,
+        y,
+        z
+    ) {
+        if (
+            typeof Position !==
+            "function"
+        ) {
+            return null;
+        }
+
+        return (
+            window.gameClient?.world
+                ?.getTileFromWorldPosition?.(
+                    new Position(
+                        Number(x),
+                        Number(y),
+                        Number(z)
+                    )
+                ) || null
+        );
+    }
+
+    function getTargetLineOfSightInfo(
+        target
+    ) {
+        state.kiteLosChecks++;
+
+        const playerPos =
+            normalizePosition(
+                bot.getPlayerPosition()
+            );
+        const targetPos =
+            normalizePosition(
+                target?.getPosition?.() ||
+                target?.__position
+            );
+
+        if (
+            !playerPos ||
+            !targetPos ||
+            playerPos.z !== targetPos.z
+        ) {
+            state.kiteLosBlocked++;
+            state.kiteLosLastReason =
+                "missing/split-floor LOS";
+            state.kiteLosLastBlockPosition =
+                null;
+
+            return {
+                clear: false,
+                reason:
+                    state.kiteLosLastReason,
+                blockPosition: null
+            };
+        }
+
+        const distance =
+            getTileDistance(
+                playerPos,
+                targetPos
+            );
+
+        // Adjacent combat is not a ranged LOS problem.
+        if (distance <= 1) {
+            return {
+                clear: true,
+                reason: "adjacent",
+                blockPosition: null
+            };
+        }
+
+        let x =
+            Number(playerPos.x);
+        let y =
+            Number(playerPos.y);
+        const endX =
+            Number(targetPos.x);
+        const endY =
+            Number(targetPos.y);
+        const z =
+            Number(playerPos.z);
+
+        const deltaX =
+            endX - x;
+        const deltaY =
+            endY - y;
+        const stepX =
+            Math.sign(deltaX);
+        const stepY =
+            Math.sign(deltaY);
+        const absX =
+            Math.abs(deltaX);
+        const absY =
+            Math.abs(deltaY);
+
+        const tDeltaX =
+            absX > 0
+                ? 1 / absX
+                : Number.POSITIVE_INFINITY;
+        const tDeltaY =
+            absY > 0
+                ? 1 / absY
+                : Number.POSITIVE_INFINITY;
+
+        // Ray begins at the centre of the player's tile, so the first vertical
+        // / horizontal boundary is half a tile away.
+        let tMaxX =
+            absX > 0
+                ? 0.5 / absX
+                : Number.POSITIVE_INFINITY;
+        let tMaxY =
+            absY > 0
+                ? 0.5 / absY
+                : Number.POSITIVE_INFINITY;
+
+        const testIntermediateTile = (
+            tx,
+            ty,
+            reason =
+                "projectile blocker"
+        ) => {
+            // Never test the origin or target tile themselves.
+            if (
+                (
+                    tx === playerPos.x &&
+                    ty === playerPos.y
+                ) ||
+                (
+                    tx === endX &&
+                    ty === endY
+                )
+            ) {
+                return null;
+            }
+
+            const tile =
+                getWorldTileForLos(
+                    tx,
+                    ty,
+                    z
+                );
+
+            if (
+                tileBlocksProjectileLine(
+                    tile
+                )
+            ) {
+                const blockPosition = {
+                    x: tx,
+                    y: ty,
+                    z
+                };
+
+                state.kiteLosBlocked++;
+                state.kiteLosLastReason =
+                    reason;
+                state.kiteLosLastBlockPosition =
+                    blockPosition;
+
+                return {
+                    clear: false,
+                    reason,
+                    blockPosition
+                };
+            }
+
+            return null;
+        };
+
+        // Bounded supercover DDA through all grid cells touched by the ray.
+        // Exact corner crossings check BOTH orthogonal side tiles. This is
+        // deliberately conservative so an L-shaped wall corner cannot be shot
+        // through just because the mathematical line passes through the vertex.
+        for (
+            let safety = 0;
+            safety < 64 &&
+            (x !== endX || y !== endY);
+            safety++
+        ) {
+            if (tMaxX < tMaxY) {
+                x += stepX;
+                tMaxX += tDeltaX;
+
+                const blocked =
+                    testIntermediateTile(
+                        x,
+                        y
+                    );
+                if (blocked)
+                    return blocked;
+                continue;
+            }
+
+            if (tMaxY < tMaxX) {
+                y += stepY;
+                tMaxY += tDeltaY;
+
+                const blocked =
+                    testIntermediateTile(
+                        x,
+                        y
+                    );
+                if (blocked)
+                    return blocked;
+                continue;
+            }
+
+            // Exact corner crossing.
+            const sideX = {
+                x: x + stepX,
+                y
+            };
+            const sideY = {
+                x,
+                y: y + stepY
+            };
+
+            const blockX =
+                testIntermediateTile(
+                    sideX.x,
+                    sideX.y,
+                    "blocked corner LOS"
+                );
+            if (blockX) {
+                state.kiteLosCornerBlocks++;
+                return blockX;
+            }
+
+            const blockY =
+                testIntermediateTile(
+                    sideY.x,
+                    sideY.y,
+                    "blocked corner LOS"
+                );
+            if (blockY) {
+                state.kiteLosCornerBlocks++;
+                return blockY;
+            }
+
+            x += stepX;
+            y += stepY;
+            tMaxX += tDeltaX;
+            tMaxY += tDeltaY;
+
+            const diagonalBlock =
+                testIntermediateTile(
+                    x,
+                    y
+                );
+            if (diagonalBlock)
+                return diagonalBlock;
+        }
+
+        state.kiteLosLastReason =
+            "clear";
+        state.kiteLosLastBlockPosition =
+            null;
+
+        return {
+            clear: true,
+            reason: "clear",
+            blockPosition: null
+        };
+    }
+
+    function hasKiteLineOfSight(
+        target
+    ) {
+        if (!config.kiteMode)
+            return true;
+
+        return (
+            getTargetLineOfSightInfo(
+                target
+            ).clear === true
+        );
+    }
+
     function isLadderThing(thing) {
         if (!thing?.id)
             return false;
@@ -5877,6 +6259,343 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         );
     }
 
+    function getKitePositionKey(
+        pos
+    ) {
+        if (!pos)
+            return "";
+        return (
+            `${Number(pos.x)},` +
+            `${Number(pos.y)},` +
+            `${Number(pos.z)}`
+        );
+    }
+
+    function recordObservedKitePosition(
+        pos,
+        now = Date.now()
+    ) {
+        if (!pos)
+            return;
+
+        const key =
+            getKitePositionKey(pos);
+        if (!key)
+            return;
+
+        const history =
+            state.kiteRecentPositions;
+
+        const last =
+            history[
+                history.length - 1
+            ];
+
+        if (
+            !last ||
+            last.key !== key
+        ) {
+            history.push({
+                key,
+                at: now
+            });
+        } else {
+            last.at = now;
+        }
+
+        while (
+            history.length > 8
+        ) {
+            history.shift();
+        }
+
+        // Detect actual occupied-tile A-B-A-B oscillation.
+        if (history.length >= 4) {
+            const a =
+                history[
+                    history.length - 4
+                ]?.key;
+            const b =
+                history[
+                    history.length - 3
+                ]?.key;
+            const c =
+                history[
+                    history.length - 2
+                ]?.key;
+            const d =
+                history[
+                    history.length - 1
+                ]?.key;
+
+            if (
+                a &&
+                b &&
+                a === c &&
+                b === d &&
+                a !== b
+            ) {
+                state.kiteOscillationDetections++;
+                state.kiteLastOscillationAt =
+                    now;
+            }
+        }
+
+        const cutoff =
+            now - 3500;
+
+        while (
+            history.length > 1 &&
+            Number(history[0]?.at) <
+                cutoff
+        ) {
+            history.shift();
+        }
+    }
+
+    function getRecentKiteVisitCount(
+        pos,
+        now = Date.now()
+    ) {
+        const key =
+            getKitePositionKey(pos);
+
+        if (!key)
+            return 0;
+
+        const cutoff =
+            now - 2500;
+
+        let count = 0;
+
+        for (
+            const entry of
+            state.kiteRecentPositions
+        ) {
+            if (
+                entry?.key === key &&
+                Number(entry.at) >= cutoff
+            ) {
+                count++;
+            }
+        }
+
+        return count;
+    }
+
+    function isImmediateKiteBacktrack(
+        pos
+    ) {
+        const history =
+            state.kiteRecentPositions;
+
+        if (history.length < 2)
+            return false;
+
+        const previous =
+            history[
+                history.length - 2
+            ];
+
+        return (
+            previous?.key ===
+            getKitePositionKey(pos)
+        );
+    }
+
+    function getKiteEscapeSpaceInfo(
+        startPos,
+        originPos,
+        targetPos,
+        currentTargetDist,
+        idealDistance,
+        mode = "away",
+        maxDepth = 6
+    ) {
+        state.kiteLookaheadChecks++;
+
+        if (
+            !startPos ||
+            !targetPos
+        ) {
+            return {
+                maxDepth: 0,
+                reachableCount: 0,
+                branchCount: 0,
+                horizonCount: 0,
+                reachesHorizon: false,
+                isLocalPocket: true
+            };
+        }
+
+        const z =
+            Number(startPos.z);
+
+        const queue = [{
+            x: Number(startPos.x),
+            y: Number(startPos.y),
+            z,
+            depth: 0
+        }];
+
+        const seen =
+            new Set([
+                getKitePositionKey(
+                    startPos
+                )
+            ]);
+
+        // Critical v1.5.65 change: do NOT let the lookahead count the tile we
+        // are standing on as "future escape space". For a tunnel entrance that
+        // means the search measures only what lies AHEAD of the candidate.
+        if (originPos) {
+            seen.add(
+                getKitePositionKey(
+                    originPos
+                )
+            );
+        }
+
+        let furthest = 0;
+        let reachableCount = 0;
+        let branchCount = 0;
+        let horizonCount = 0;
+
+        const cardinalOffsets = [
+            [0, -1],
+            [1, 0],
+            [0, 1],
+            [-1, 0]
+        ];
+
+        for (
+            let cursor = 0;
+            cursor < queue.length &&
+            cursor < 128;
+            cursor++
+        ) {
+            const node =
+                queue[cursor];
+
+            if (
+                node.depth >= maxDepth
+            ) {
+                horizonCount++;
+                continue;
+            }
+
+            let localBranches = 0;
+
+            for (
+                const [dx, dy] of
+                cardinalOffsets
+            ) {
+                const next = {
+                    x: node.x + dx,
+                    y: node.y + dy,
+                    z
+                };
+                const key =
+                    getKitePositionKey(next);
+
+                if (seen.has(key))
+                    continue;
+
+                if (
+                    bot.blacklist?.isBlacklisted(
+                        next.x,
+                        next.y,
+                        z
+                    )
+                ) {
+                    continue;
+                }
+
+                if (
+                    !isSafeTileForKite(
+                        next
+                    )
+                ) {
+                    continue;
+                }
+
+                // Creature occupancy is temporary and should not make permanent
+                // map geometry look like a dead end. Immediate movement still
+                // checks occupancy separately before this helper is called.
+                if (
+                    !isTileWalkable(
+                        next.x,
+                        next.y,
+                        z,
+                        true
+                    )
+                ) {
+                    continue;
+                }
+
+                const nextTargetDist =
+                    getChebyshevDistance(
+                        next,
+                        targetPos
+                    );
+
+                if (
+                    mode === "away" &&
+                    currentTargetDist <
+                        idealDistance &&
+                    nextTargetDist <
+                        currentTargetDist
+                ) {
+                    continue;
+                }
+
+                seen.add(key);
+                localBranches++;
+
+                const depth =
+                    node.depth + 1;
+
+                queue.push({
+                    ...next,
+                    depth
+                });
+
+                reachableCount++;
+                furthest =
+                    Math.max(
+                        furthest,
+                        depth
+                    );
+            }
+
+            if (localBranches >= 2)
+                branchCount++;
+        }
+
+        const reachesHorizon =
+            horizonCount > 0;
+
+        if (reachesHorizon)
+            state.kiteForwardEscapeHorizonHits++;
+
+        // If the only way out is back through originPos, and the forward flood
+        // cannot even continue six cardinal steps, this is a local cul-de-sac.
+        const isLocalPocket =
+            !reachesHorizon;
+
+        if (isLocalPocket)
+            state.kiteLookaheadDeadEndPenalties++;
+
+        return {
+            maxDepth: furthest,
+            reachableCount,
+            branchCount,
+            horizonCount,
+            reachesHorizon,
+            isLocalPocket
+        };
+    }
+
     function getKiteStepCandidates(
         playerPos,
         targetPos,
@@ -5886,6 +6605,11 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     ) {
         if (!playerPos || !targetPos)
             return [];
+
+        recordObservedKitePosition(
+            playerPos,
+            Date.now()
+        );
 
         const currentTargetDist =
             getChebyshevDistance(
@@ -5994,6 +6718,36 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 dx !== 0 &&
                 dy !== 0;
 
+            const recentVisitCount =
+                getRecentKiteVisitCount(
+                    candidatePos
+                );
+            const immediateBacktrack =
+                isImmediateKiteBacktrack(
+                    candidatePos
+                );
+
+            const escapeSpace =
+                !isDiagonalStep &&
+                mode === "away"
+                    ? getKiteEscapeSpaceInfo(
+                        candidatePos,
+                        playerPos,
+                        targetPos,
+                        currentTargetDist,
+                        idealDistance,
+                        mode,
+                        6
+                    )
+                    : {
+                        maxDepth: 0,
+                        reachableCount: 0,
+                        branchCount: 0,
+                        horizonCount: 0,
+                        reachesHorizon: false,
+                        isLocalPocket: false
+                    };
+
             let score = 0;
 
             if (mode === "away") {
@@ -6014,6 +6768,64 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 // blocked, but still ranks below a genuine separation step.
                 if (targetDelta === 0)
                     score += 8;
+
+                if (!isDiagonalStep) {
+                    // Prefer tiles that still have room to continue escaping.
+                    // This prevents stepping deeper into a two-tile pocket
+                    // just because that first tile looks locally good.
+                    score +=
+                        escapeSpace.maxDepth *
+                        26;
+                    score +=
+                        Math.min(
+                            12,
+                            escapeSpace.reachableCount
+                        ) *
+                        4;
+                    score +=
+                        escapeSpace.branchCount *
+                        8;
+
+                    if (
+                        escapeSpace.isLocalPocket
+                    ) {
+                        // This penalty is secondary to the hard selector veto,
+                        // but keeps forced-choice ordering sensible if every
+                        // available cardinal tile is itself enclosed.
+                        score -= 260;
+                    }
+                }
+
+                if (recentVisitCount > 0) {
+                    score -=
+                        recentVisitCount *
+                        95;
+                    state.kiteRecentTilePenalties++;
+                }
+
+                if (immediateBacktrack)
+                    score -= 120;
+
+                // Directional momentum matters after a forced reversal at the
+                // end of a pocket: once Kite starts walking OUT, keep walking
+                // out instead of immediately selecting the tile it just left.
+                if (
+                    dx === state.kiteLastMoveDx &&
+                    dy === state.kiteLastMoveDy
+                ) {
+                    score += 38;
+                } else if (
+                    dx ===
+                        -state.kiteLastMoveDx &&
+                    dy ===
+                        -state.kiteLastMoveDy &&
+                    (
+                        state.kiteLastMoveDx !== 0 ||
+                        state.kiteLastMoveDy !== 0
+                    )
+                ) {
+                    score -= 85;
+                }
             } else {
                 // Chase only runs when outside the upper hysteresis edge.
                 score +=
@@ -6031,7 +6843,26 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 nextTargetDist,
                 targetDelta,
                 routeProgress,
-                isDiagonalStep
+                isDiagonalStep,
+                position: candidatePos,
+                positionKey:
+                    getKitePositionKey(
+                        candidatePos
+                    ),
+                recentVisitCount,
+                immediateBacktrack,
+                escapeDepth:
+                    escapeSpace.maxDepth,
+                escapeReachableCount:
+                    escapeSpace.reachableCount,
+                escapeBranchCount:
+                    escapeSpace.branchCount,
+                escapeHorizonCount:
+                    escapeSpace.horizonCount,
+                reachesEscapeHorizon:
+                    !!escapeSpace.reachesHorizon,
+                deadEndTrap:
+                    !!escapeSpace.isLocalPocket
             });
         }
 
@@ -6063,14 +6894,72 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         if (!Array.isArray(candidates))
             return null;
 
-        const cardinal =
-            candidates.find(
+        const cardinals =
+            candidates.filter(
                 candidate =>
                     !candidate.isDiagonalStep
             );
 
-        if (cardinal)
-            return cardinal;
+        if (cardinals.length) {
+            const nonPocketCardinals =
+                mode === "away"
+                    ? cardinals.filter(
+                        candidate =>
+                            !candidate.deadEndTrap
+                    )
+                    : cardinals;
+
+            // Hard rule: never voluntarily enter a local cul-de-sac while a
+            // cardinal alternative has real forward continuation.
+            const usableCardinals =
+                nonPocketCardinals.length
+                    ? nonPocketCardinals
+                    : cardinals;
+
+            if (
+                mode === "away" &&
+                nonPocketCardinals.length &&
+                nonPocketCardinals.length <
+                    cardinals.length
+            ) {
+                state.kiteDeadEndHardRejects +=
+                    cardinals.length -
+                    nonPocketCardinals.length;
+            }
+
+            if (
+                mode === "away" &&
+                !nonPocketCardinals.length &&
+                cardinals.some(
+                    candidate =>
+                        candidate.deadEndTrap
+                )
+            ) {
+                state.kiteDeadEndForcedEntries++;
+            }
+
+            const nonBacktrack =
+                usableCardinals.find(
+                    candidate =>
+                        !candidate
+                            .immediateBacktrack
+                );
+
+            if (nonBacktrack) {
+                if (
+                    usableCardinals[0]
+                        ?.immediateBacktrack
+                ) {
+                    state.kiteImmediateReverseAvoids++;
+                }
+                return nonBacktrack;
+            }
+
+            // If reversal is the only safe cardinal exit, allow it. Importantly,
+            // a safe backtrack beats a non-backtracking dead-end entry because
+            // pocket filtering happened BEFORE this anti-reversal preference.
+            return usableCardinals[0];
+        }
 
         // v1.5.59: Kite chase is cardinal-only. A diagonal chase is slower,
         // leaves the character between tiles longer, and is not worth it.
@@ -6148,6 +7037,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             reason || "kite";
         state.lastKiteMoveDirection =
             candidate.direction;
+        state.kiteLastMoveDx =
+            Number(candidate.dx) || 0;
+        state.kiteLastMoveDy =
+            Number(candidate.dy) || 0;
         state.lastKiteDistanceBefore =
             currentDistance;
         state.lastKiteDistanceAfter =
@@ -6583,6 +7476,13 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         // Otherwise an off-screen target can keep stale combat ownership alive
         // while lure/normal branches disagree about who owns movement.
         releaseCurrentTargetIfOffScreen(now);
+
+        // v1.5.63: being visible in the rendered playfield is not enough for
+        // Kite. A target behind a projectile-blocking corner/wall is released
+        // before Lure/normal movement can wait on it.
+        releaseCurrentKiteTargetIfLineBlocked(
+            now
+        );
 
         // v1.5.44: ignored names are an unconditional veto for mb0t-owned
         // targets. This also handles changing the Ignore list mid-fight.
@@ -8016,6 +8916,56 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         return true;
     }
 
+    function releaseCurrentKiteTargetIfLineBlocked(
+        now = Date.now()
+    ) {
+        if (!config.kiteMode)
+            return false;
+
+        const current =
+            getCurrentTarget();
+
+        if (!current)
+            return false;
+
+        const info =
+            getTargetLineOfSightInfo(
+                current
+            );
+
+        if (info.clear)
+            return false;
+
+        state.kiteLosCurrentTargetClears++;
+        state.kiteLosLastReason =
+            info.reason;
+
+        handoffTarget(
+            current,
+            `kite LOS blocked: ${info.reason}`,
+            now,
+            350
+        );
+
+        bot.log(
+            "Kite: target released – line of sight blocked",
+            {
+                id:
+                    current.id ?? null,
+                name:
+                    current.name ||
+                    "Mob",
+                reason:
+                    info.reason,
+                blockPosition:
+                    info.blockPosition ||
+                    null
+            }
+        );
+
+        return true;
+    }
+
     function isNativeVisibleMonster(creature) {
         const client = window.gameClient;
         const player = client?.player;
@@ -8054,7 +9004,25 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
         // Actual rendered-playfield visibility. This measures the rendered
         // creature against the canvas area really visible inside .main .upper.
-        return getNativeSmallScreenInfo(creature).visible;
+        if (
+            !getNativeSmallScreenInfo(
+                creature
+            ).visible
+        ) {
+            return false;
+        }
+
+        if (
+            config.kiteMode &&
+            !hasKiteLineOfSight(
+                creature
+            )
+        ) {
+            state.kiteLosCandidateRejects++;
+            return false;
+        }
+
+        return true;
     }
 
     function getNearbyMonsters(sortByDistance = true) {
@@ -11823,6 +12791,14 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         state.viewportVisibilityFallbacks = 0;
         state.viewportLastVisibleWidth = 0;
         state.viewportLastVisibleHeight = 0;
+        state.kiteLosChecks = 0;
+        state.kiteLosBlocked = 0;
+        state.kiteLosCurrentTargetClears = 0;
+        state.kiteLosCandidateRejects = 0;
+        state.kiteLosUnknownTileBlocks = 0;
+        state.kiteLosCornerBlocks = 0;
+        state.kiteLosLastReason = null;
+        state.kiteLosLastBlockPosition = null;
         state.ignoredLastTargetId = null;
         state.ignoredLastTargetName = null;
         state.ignoredLastAt = 0;
@@ -11920,6 +12896,18 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         state.kiteCardinalMoves = 0;
         state.kiteChaseForceOffCount = 0;
         state.kiteChaseLastForcedOffAt = 0;
+        state.kiteRecentPositions = [];
+        state.kiteLastMoveDx = 0;
+        state.kiteLastMoveDy = 0;
+        state.kiteImmediateReverseAvoids = 0;
+        state.kiteRecentTilePenalties = 0;
+        state.kiteLookaheadChecks = 0;
+        state.kiteLookaheadDeadEndPenalties = 0;
+        state.kiteDeadEndHardRejects = 0;
+        state.kiteDeadEndForcedEntries = 0;
+        state.kiteForwardEscapeHorizonHits = 0;
+        state.kiteOscillationDetections = 0;
+        state.kiteLastOscillationAt = 0;
         state._chaseEnabledForDistance = false;
         state.movementOwner = null;
         state.movementOwnedUntil = 0;
@@ -12061,6 +13049,15 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         if (current) {
             if (!getNativeSmallScreenInfo(current).visible) {
                 state.offscreenEngagedRejects++;
+                return null;
+            }
+
+            if (
+                config.kiteMode &&
+                !hasKiteLineOfSight(
+                    current
+                )
+            ) {
                 return null;
             }
 
@@ -12209,6 +13206,32 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                         : distance
             });
         }
+        if (
+            config.kiteMode &&
+            !options.skipLineOfSight &&
+            distance > 1
+        ) {
+            const losInfo =
+                getTargetLineOfSightInfo(
+                    target
+                );
+
+            if (!losInfo.clear) {
+                state.kiteLosCandidateRejects++;
+
+                return result(
+                    false,
+                    {
+                        reason:
+                            `blocked line of sight: ${losInfo.reason}`,
+                        dx,
+                        dy,
+                        distance
+                    }
+                );
+            }
+        }
+
         // ---- REACHABILITY CHECK ----
         if (!options.skipReachability && !isTargetReachable(target)) {
             return result(false, {
@@ -13907,6 +14930,22 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 state.viewportLastVisibleWidth || 0,
             viewportLastVisibleHeight:
                 state.viewportLastVisibleHeight || 0,
+            kiteLosChecks:
+                state.kiteLosChecks || 0,
+            kiteLosBlocked:
+                state.kiteLosBlocked || 0,
+            kiteLosCurrentTargetClears:
+                state.kiteLosCurrentTargetClears || 0,
+            kiteLosCandidateRejects:
+                state.kiteLosCandidateRejects || 0,
+            kiteLosUnknownTileBlocks:
+                state.kiteLosUnknownTileBlocks || 0,
+            kiteLosCornerBlocks:
+                state.kiteLosCornerBlocks || 0,
+            kiteLosLastReason:
+                state.kiteLosLastReason,
+            kiteLosLastBlockPosition:
+                state.kiteLosLastBlockPosition,
             ignoredLastTargetId:
                 state.ignoredLastTargetId,
             ignoredLastTargetName:
@@ -14034,6 +15073,34 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 state.kiteChaseForceOffCount || 0,
             kiteChaseLastForcedOffAt:
                 state.kiteChaseLastForcedOffAt || 0,
+            kiteRecentPositions:
+                state.kiteRecentPositions
+                    .map(entry => ({
+                        key: entry.key,
+                        at: entry.at
+                    })),
+            kiteLastMoveDx:
+                state.kiteLastMoveDx || 0,
+            kiteLastMoveDy:
+                state.kiteLastMoveDy || 0,
+            kiteImmediateReverseAvoids:
+                state.kiteImmediateReverseAvoids || 0,
+            kiteRecentTilePenalties:
+                state.kiteRecentTilePenalties || 0,
+            kiteLookaheadChecks:
+                state.kiteLookaheadChecks || 0,
+            kiteLookaheadDeadEndPenalties:
+                state.kiteLookaheadDeadEndPenalties || 0,
+            kiteDeadEndHardRejects:
+                state.kiteDeadEndHardRejects || 0,
+            kiteDeadEndForcedEntries:
+                state.kiteDeadEndForcedEntries || 0,
+            kiteForwardEscapeHorizonHits:
+                state.kiteForwardEscapeHorizonHits || 0,
+            kiteOscillationDetections:
+                state.kiteOscillationDetections || 0,
+            kiteLastOscillationAt:
+                state.kiteLastOscillationAt || 0,
             movementOwned: isMovementOwned(Date.now()),
             movementOwner: state.movementOwner,
             currentTarget: currentTarget ? {
@@ -28760,6 +29827,14 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         corpseCombatLastBlockedAt: 0,
         corpseCombatLastReason: null,
         corpseCombatLastMonsterCount: 0,
+
+        // v1.5.62: if combat interrupts a distant-corpse approach once, do
+        // not retry that corpse. This prevents Cave <-> corpse A-B loops.
+        corpseCombatAbandoned: new Map(),
+        corpseCombatAbandonCount: 0,
+        corpseCombatAbandonQueueSkips: 0,
+        corpseCombatLastAbandonedKey: null,
+        corpseCombatLastAbandonedAt: 0,
     };
 
     // Load config
@@ -29831,6 +30906,114 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         return true;
     }
 
+    function pruneCombatAbandonedCorpses(
+        now = Date.now()
+    ) {
+        for (
+            const [key, expiresAt] of
+            state.corpseCombatAbandoned.entries()
+        ) {
+            if (
+                !Number.isFinite(
+                    Number(expiresAt)
+                ) ||
+                Number(expiresAt) <= now
+            ) {
+                state.corpseCombatAbandoned.delete(
+                    key
+                );
+            }
+        }
+    }
+
+    function isCorpseCombatAbandoned(
+        key,
+        now = Date.now()
+    ) {
+        if (!key)
+            return false;
+
+        pruneCombatAbandonedCorpses(now);
+
+        const expiresAt =
+            Number(
+                state.corpseCombatAbandoned.get(
+                    key
+                )
+            );
+
+        return (
+            Number.isFinite(expiresAt) &&
+            expiresAt > now
+        );
+    }
+
+    function abandonCorpseAfterCombat(
+        job,
+        combatGate,
+        now = Date.now()
+    ) {
+        if (!job?.key)
+            return false;
+
+        // Keep the block longer than the normal corpse queue lifetime. The
+        // corpse is no longer worth revisiting after it already dragged us
+        // into live combat once.
+        const blockUntil =
+            now +
+            Math.max(
+                60000,
+                Number(
+                    state.corpseQueueHoldMs
+                ) || 45000
+            );
+
+        state.corpseCombatAbandoned.set(
+            job.key,
+            blockUntil
+        );
+        state.corpseCombatAbandonCount++;
+        state.corpseCombatLastAbandonedKey =
+            job.key;
+        state.corpseCombatLastAbandonedAt =
+            now;
+
+        // Remove any duplicate copy already waiting in the queue.
+        const before =
+            state.corpseQueue.length;
+
+        state.corpseQueue =
+            state.corpseQueue.filter(
+                entry =>
+                    entry?.key !== job.key
+            );
+
+        state.corpseCombatAbandonQueueSkips +=
+            Math.max(
+                0,
+                before -
+                    state.corpseQueue.length
+            );
+
+        bot.log(
+            "Looter: combat resumed – distant corpse abandoned",
+            {
+                reason:
+                    combatGate?.reason ||
+                    "combat active",
+                monster:
+                    job.monsterName ||
+                    "Monster",
+                position:
+                    job.position,
+                corpseKey:
+                    job.key
+            }
+        );
+
+        return true;
+    }
+
     function enqueueCorpseDeath(
         creature,
         now = Date.now()
@@ -29883,8 +31066,21 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             `${pos.x},${pos.y},${pos.z}`;
 
         if (
+            isCorpseCombatAbandoned(
+                key,
+                now
+            )
+        ) {
+            state.corpseCombatAbandonQueueSkips++;
+            return false;
+        }
+
+        if (
             state.corpseJob?.key === key ||
-            state.corpseQueue.some(entry => entry.key === key)
+            state.corpseQueue.some(
+                entry =>
+                    entry.key === key
+            )
         ) {
             return false;
         }
@@ -30392,53 +31588,6 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         };
     }
 
-    function requeueCorpseJobAfterCombat(
-        job,
-        now = Date.now()
-    ) {
-        if (!job)
-            return false;
-
-        const candidate = {
-            key: job.key,
-            monsterId: job.monsterId,
-            monsterName:
-                job.monsterName ||
-                "Monster",
-            position: {
-                x: Number(job.position.x),
-                y: Number(job.position.y),
-                z: Number(job.position.z)
-            },
-            deathAt:
-                Number(job.deathAt) ||
-                now,
-            notBefore:
-                now +
-                state.corpseCombatClearGraceMs,
-            expiresAt:
-                Math.max(
-                    Number(job.expiresAt) || 0,
-                    now +
-                        state.corpseQueueHoldMs
-                )
-        };
-
-        if (
-            !state.corpseQueue.some(
-                entry =>
-                    entry.key === candidate.key
-            )
-        ) {
-            state.corpseQueue.unshift(
-                candidate
-            );
-        }
-
-        state.corpseCombatDeferrals++;
-        return true;
-    }
-
     function deferCorpseJobForCombat(
         job,
         combatGate,
@@ -30447,29 +31596,20 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         if (!job)
             return false;
 
-        requeueCorpseJobAfterCombat(
+        // v1.5.62: combat interruption means this corpse is unsafe to revisit.
+        // Abandon it instead of requeueing and oscillating between route/corpse.
+        abandonCorpseAfterCombat(
             job,
+            combatGate,
             now
         );
 
         clearCorpseApproachMovement(job);
         state.pendingMove = null;
         state.corpseJob = null;
+        state.corpseCombatDeferrals++;
         state.corpseCombatResumes++;
-
-        bot.log(
-            "Looter: combat resumed – distant corpse deferred",
-            {
-                reason:
-                    combatGate?.reason ||
-                    "combat active",
-                monster:
-                    job.monsterName ||
-                    "Monster",
-                position:
-                    job.position
-            }
-        );
+        state.corpseCombatClearSince = 0;
 
         resumeModulesAfterCorpse(job);
         return true;
@@ -30501,6 +31641,17 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         while (state.corpseQueue.length) {
             const candidate =
                 state.corpseQueue[0];
+
+            if (
+                isCorpseCombatAbandoned(
+                    candidate?.key,
+                    now
+                )
+            ) {
+                state.corpseQueue.shift();
+                state.corpseCombatAbandonQueueSkips++;
+                continue;
+            }
 
             if (now < candidate.notBefore)
                 return false;
@@ -31155,6 +32306,11 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         state.corpseCombatLastBlockedAt = 0;
         state.corpseCombatLastReason = null;
         state.corpseCombatLastMonsterCount = 0;
+        state.corpseCombatAbandoned.clear();
+        state.corpseCombatAbandonCount = 0;
+        state.corpseCombatAbandonQueueSkips = 0;
+        state.corpseCombatLastAbandonedKey = null;
+        state.corpseCombatLastAbandonedAt = 0;
         installDeathHook();
         bot.log("Looter started");
         tick();
@@ -31177,6 +32333,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             state.corpseJob;
         state.corpseQueue = [];
         state.corpseJob = null;
+        state.corpseCombatAbandoned.clear();
 
         if (activeCorpseJob) {
             clearCorpseApproachMovement(
@@ -31241,6 +32398,16 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                 state.corpseCombatLastReason,
             corpseCombatLastMonsterCount:
                 state.corpseCombatLastMonsterCount,
+            corpseCombatAbandonCount:
+                state.corpseCombatAbandonCount,
+            corpseCombatAbandonQueueSkips:
+                state.corpseCombatAbandonQueueSkips,
+            corpseCombatAbandonedCount:
+                state.corpseCombatAbandoned.size,
+            corpseCombatLastAbandonedKey:
+                state.corpseCombatLastAbandonedKey,
+            corpseCombatLastAbandonedAt:
+                state.corpseCombatLastAbandonedAt,
             corpseApproachStalls:
                 state.corpseApproachStalls,
             corpseApproachSideSwitches:
