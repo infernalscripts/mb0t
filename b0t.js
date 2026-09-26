@@ -803,7 +803,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.5.60",
+        version: "1.5.61",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -5087,6 +5087,13 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         preferredOffscreenTrackRejects: 0,
         preferredOffscreenAccessClears: 0,
         preferredOffscreenHandoffRejects: 0,
+
+        // v1.5.61: actual rendered viewport visibility.
+        viewportVisibilityChecks: 0,
+        viewportVisibilityRejects: 0,
+        viewportVisibilityFallbacks: 0,
+        viewportLastVisibleWidth: 0,
+        viewportLastVisibleHeight: 0,
         ignoredLastTargetId: null,
         ignoredLastTargetName: null,
         ignoredLastAt: 0,
@@ -7459,23 +7466,41 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function getNativeSmallScreenInfo(creature) {
-        const player = window.gameClient?.player;
+        const client =
+            window.gameClient;
+        const player =
+            client?.player;
+
+        state.viewportVisibilityChecks++;
+
         if (!player || !creature) {
             return {
                 visible: false,
-                reason: !player ? "no player" : "no creature",
+                reason:
+                    !player
+                        ? "no player"
+                        : "no creature",
                 dx: null,
                 dy: null,
-                distance: Number.POSITIVE_INFINITY
+                distance:
+                    Number.POSITIVE_INFINITY,
+                screenX: null,
+                screenY: null,
+                clipped: false
             };
         }
 
-        const playerPos = normalizePosition(
-            player.getPosition?.()
-        );
-        const creaturePos = normalizePosition(
-            creature.getPosition?.() || creature.__position
-        );
+        const playerPos =
+            normalizePosition(
+                player.getPosition?.()
+            );
+        const creatureRawPos =
+            creature.getPosition?.() ||
+            creature.__position;
+        const creaturePos =
+            normalizePosition(
+                creatureRawPos
+            );
 
         if (!playerPos || !creaturePos) {
             return {
@@ -7483,62 +7508,377 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 reason: "missing position",
                 dx: null,
                 dy: null,
-                distance: Number.POSITIVE_INFINITY
+                distance:
+                    Number.POSITIVE_INFINITY,
+                screenX: null,
+                screenY: null,
+                clipped: false
             };
         }
 
-        if (playerPos.z !== creaturePos.z) {
+        if (
+            playerPos.z !==
+            creaturePos.z
+        ) {
             return {
                 visible: false,
                 reason: "different floor",
                 dx: null,
                 dy: null,
-                distance: Number.POSITIVE_INFINITY
+                distance:
+                    getTileDistance(
+                        playerPos,
+                        creaturePos
+                    ),
+                screenX: null,
+                screenY: null,
+                clipped: false
             };
         }
 
         let dx = null;
         let dy = null;
+
         try {
-            const pp = player.getPosition().projected();
-            const cp =
-                (creature.getPosition?.() || creature.__position)
+            const pp =
+                player.getPosition()
                     .projected();
-            dx = Math.abs(pp.x - cp.x);
-            dy = Math.abs(pp.y - cp.y);
-        } catch (e) {
+            const cp =
+                creatureRawPos.projected();
+
+            dx =
+                Math.abs(
+                    pp.x - cp.x
+                );
+            dy =
+                Math.abs(
+                    pp.y - cp.y
+                );
+        } catch (e) {}
+
+        const distance =
+            getTileDistance(
+                playerPos,
+                creaturePos
+            );
+
+        const renderer =
+            client?.renderer;
+        const canvas =
+            renderer?.screen?.canvas;
+
+        if (
+            !renderer ||
+            !canvas ||
+            typeof renderer
+                .getCreatureScreenPosition !==
+                "function" ||
+            typeof canvas
+                .getBoundingClientRect !==
+                "function"
+        ) {
+            state.viewportVisibilityFallbacks++;
+
             return {
                 visible: false,
-                reason: "projection failed",
-                dx: null,
-                dy: null,
-                distance:
-                    getTileDistance(playerPos, creaturePos)
+                reason:
+                    "render viewport unavailable",
+                dx,
+                dy,
+                distance,
+                screenX: null,
+                screenY: null,
+                clipped: false
             };
         }
 
-        // MiniSource Creature.canSeeSmall() is exactly dx < 8 && dy < 6.
-        // Require both the native function and the explicit projected envelope
-        // when available so a stale/custom client result cannot pin targeting.
-        const projectedVisible =
-            Number.isFinite(dx) &&
-            Number.isFinite(dy) &&
-            dx < 8 &&
-            dy < 6;
-        const nativeVisible =
-            typeof player.canSeeSmall === "function"
-                ? !!player.canSeeSmall(creature)
-                : projectedVisible;
+        let screenPos = null;
+        let canvasRect = null;
+        let upperRect = null;
+
+        try {
+            screenPos =
+                renderer
+                    .getCreatureScreenPosition(
+                        creature
+                    );
+            canvasRect =
+                canvas.getBoundingClientRect();
+
+            const upper =
+                document.querySelector(
+                    ".main .upper"
+                );
+
+            upperRect =
+                upper &&
+                typeof upper
+                    .getBoundingClientRect ===
+                    "function"
+                    ? upper.getBoundingClientRect()
+                    : null;
+        } catch (e) {
+            state.viewportVisibilityFallbacks++;
+
+            return {
+                visible: false,
+                reason:
+                    "render viewport measurement failed",
+                dx,
+                dy,
+                distance,
+                screenX: null,
+                screenY: null,
+                clipped: false
+            };
+        }
+
+        if (
+            !screenPos ||
+            !canvasRect ||
+            !Number.isFinite(
+                canvasRect.width
+            ) ||
+            !Number.isFinite(
+                canvasRect.height
+            ) ||
+            canvasRect.width <= 0 ||
+            canvasRect.height <= 0 ||
+            !Number.isFinite(
+                Number(canvas.width)
+            ) ||
+            !Number.isFinite(
+                Number(canvas.height)
+            ) ||
+            Number(canvas.width) <= 0 ||
+            Number(canvas.height) <= 0
+        ) {
+            state.viewportVisibilityFallbacks++;
+
+            return {
+                visible: false,
+                reason:
+                    "invalid render viewport",
+                dx,
+                dy,
+                distance,
+                screenX: null,
+                screenY: null,
+                clipped: false
+            };
+        }
+
+        try {
+            const tile =
+                client.world
+                    ?.getTileFromWorldPosition?.(
+                        creatureRawPos
+                    );
+
+            const elevation =
+                Number(
+                    tile?.__renderElevation
+                );
+
+            if (
+                Number.isFinite(elevation) &&
+                elevation !== 0
+            ) {
+                screenPos.x -= elevation;
+                screenPos.y -= elevation;
+            }
+        } catch (e) {}
+
+        if (
+            creature
+                .__needsDisplacementShift
+        ) {
+            screenPos.x -= 0.25;
+            screenPos.y -= 0.25;
+        }
+
+        const visibleLeft =
+            upperRect
+                ? Math.max(
+                    canvasRect.left,
+                    upperRect.left
+                )
+                : canvasRect.left;
+        const visibleTop =
+            upperRect
+                ? Math.max(
+                    canvasRect.top,
+                    upperRect.top
+                )
+                : canvasRect.top;
+        const visibleRight =
+            upperRect
+                ? Math.min(
+                    canvasRect.right,
+                    upperRect.right
+                )
+                : canvasRect.right;
+        const visibleBottom =
+            upperRect
+                ? Math.min(
+                    canvasRect.bottom,
+                    upperRect.bottom
+                )
+                : canvasRect.bottom;
+
+        const visibleWidth =
+            Math.max(
+                0,
+                visibleRight -
+                    visibleLeft
+            );
+        const visibleHeight =
+            Math.max(
+                0,
+                visibleBottom -
+                    visibleTop
+            );
+
+        state.viewportLastVisibleWidth =
+            visibleWidth;
+        state.viewportLastVisibleHeight =
+            visibleHeight;
+
+        if (
+            visibleWidth <= 0 ||
+            visibleHeight <= 0
+        ) {
+            state.viewportVisibilityRejects++;
+
+            return {
+                visible: false,
+                reason:
+                    "canvas fully clipped",
+                dx,
+                dy,
+                distance,
+                screenX: null,
+                screenY: null,
+                clipped: true
+            };
+        }
+
+        const cssTileWidth =
+            32 *
+            (
+                canvasRect.width /
+                Number(canvas.width)
+            );
+        const cssTileHeight =
+            32 *
+            (
+                canvasRect.height /
+                Number(canvas.height)
+            );
+
+        const centerX =
+            canvasRect.left +
+            (
+                (
+                    Number(screenPos.x) +
+                    0.5
+                ) *
+                cssTileWidth
+            );
+        const centerY =
+            canvasRect.top +
+            (
+                (
+                    Number(screenPos.y) +
+                    0.5
+                ) *
+                cssTileHeight
+            );
+
+        const edgePadX =
+            Math.max(
+                2,
+                cssTileWidth * 0.06
+            );
+        const edgePadY =
+            Math.max(
+                2,
+                cssTileHeight * 0.06
+            );
+
+        const minCenterX =
+            visibleLeft +
+            cssTileWidth / 2 +
+            edgePadX;
+        const maxCenterX =
+            visibleRight -
+            cssTileWidth / 2 -
+            edgePadX;
+        const minCenterY =
+            visibleTop +
+            cssTileHeight / 2 +
+            edgePadY;
+        const maxCenterY =
+            visibleBottom -
+            cssTileHeight / 2 -
+            edgePadY;
+
+        const renderedVisible =
+            Number.isFinite(centerX) &&
+            Number.isFinite(centerY) &&
+            centerX >= minCenterX &&
+            centerX <= maxCenterX &&
+            centerY >= minCenterY &&
+            centerY <= maxCenterY;
+
+        const clipped =
+            upperRect
+                ? (
+                    visibleLeft >
+                        canvasRect.left ||
+                    visibleTop >
+                        canvasRect.top ||
+                    visibleRight <
+                        canvasRect.right ||
+                    visibleBottom <
+                        canvasRect.bottom
+                )
+                : false;
+
+        if (!renderedVisible)
+            state.viewportVisibilityRejects++;
 
         return {
-            visible: nativeVisible && projectedVisible,
+            visible:
+                renderedVisible,
             reason:
-                nativeVisible && projectedVisible
-                    ? "visible"
-                    : `off screen dx=${dx} dy=${dy}`,
+                renderedVisible
+                    ? "visible in rendered playfield"
+                    : (
+                        `outside rendered playfield ` +
+                        `x=${centerX.toFixed(1)} ` +
+                        `y=${centerY.toFixed(1)}`
+                    ),
             dx,
             dy,
-            distance: getTileDistance(playerPos, creaturePos)
+            distance,
+            screenX:
+                Number.isFinite(centerX)
+                    ? centerX
+                    : null,
+            screenY:
+                Number.isFinite(centerY)
+                    ? centerY
+                    : null,
+            clipped,
+            visibleRect: {
+                left: visibleLeft,
+                top: visibleTop,
+                right: visibleRight,
+                bottom: visibleBottom,
+                width: visibleWidth,
+                height: visibleHeight
+            }
         };
     }
 
@@ -7618,7 +7958,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             state.lureLeashMobId === current.id
         ) {
             clearLureMovementHold(
-                "attack target left native screen",
+                "attack target left visible playfield",
                 now
             );
             state.offscreenLureHoldClears++;
@@ -7631,7 +7971,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 current.id
         ) {
             clearPreferredAccessState(
-                "preferred/current target left native screen",
+                "preferred/current target left visible playfield",
                 now,
                 false
             );
@@ -7643,7 +7983,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             state.lureLastMobId === current.id
         ) {
             clearLureLastMobState(
-                "last lure mob left native screen"
+                "last lure mob left visible playfield"
             );
             state.offscreenLastMobClears++;
         }
@@ -7662,7 +8002,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         resetRetargetCandidate();
 
         bot.log(
-            "Target left native screen – released immediately",
+            "Target left visible playfield – released immediately",
             {
                 id: current.id,
                 name: current.name || "Mob",
@@ -7712,8 +8052,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 !Object.prototype.hasOwnProperty.call(world.activeCreatures, creature.id))
             return false;
 
-        // Exact native small-screen envelope. The helper also performs the
-        // explicit projected dx<8/dy<6 check used by MiniSource.
+        // Actual rendered-playfield visibility. This measures the rendered
+        // creature against the canvas area really visible inside .main .upper.
         return getNativeSmallScreenInfo(creature).visible;
     }
 
@@ -8191,7 +8531,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         ) {
             state.preferredOffscreenAccessClears++;
             clearPreferredAccessState(
-                "preferred target left native screen",
+                "preferred target left visible playfield",
                 now,
                 false
             );
@@ -8803,25 +9143,14 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function isStrictPreferredScreenVisible(creature) {
-        if (!isNativeVisibleMonster(creature))
-            return false;
-
-        const player = window.gameClient?.player;
-        const playerPos = player?.getPosition?.();
-        const creaturePos = creature?.getPosition?.() || creature?.__position;
-        if (!player || !playerPos || !creaturePos || playerPos.z !== creaturePos.z)
-            return false;
-
-        // Do not rely on canSeeSmall alone for preferred-lure handoff. Require
-        // the explicit native 15x11 projected viewport too, so an active/known
-        // preferred mob outside the actual screen cannot cancel lure.
-        try {
-            const pp = playerPos.projected();
-            const cp = creaturePos.projected();
-            return Math.abs(pp.x - cp.x) < 8 && Math.abs(pp.y - cp.y) < 6;
-        } catch (e) {
-            return false;
-        }
+        // Single source of truth: actual rendered/clipped playfield.
+        return (
+            !!creature &&
+            isNativeVisibleMonster(creature) &&
+            getNativeSmallScreenInfo(
+                creature
+            ).visible
+        );
     }
 
     function getTrackedPreferredLureTarget(now = Date.now()) {
@@ -9045,7 +9374,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             state.lurePreferredPending
         ) {
             clearLurePreferredPending(
-                "preferred left native screen"
+                "preferred left visible playfield"
             );
         }
 
@@ -9519,8 +9848,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         let danger = null;
         let heldCreature = null;
 
-        // If already holding, keep watching the same lagging mob even if it
-        // briefly crosses the exact canSeeSmall boundary.
+        // Keep the object briefly so the finite off-playfield grace can
+        // release the leash cleanly if it leaves the rendered playfield.
         if (state.lureMovementHeld && state.lureLeashMobId != null) {
             heldCreature =
                 window.gameClient?.world?.activeCreatures?.[state.lureLeashMobId] || null;
@@ -9746,7 +10075,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             // Native off-screen: don't refresh lastSeenAt. Fall through to the
             // lost-grace timeout below instead of holding CaveBot indefinitely.
             state.lureLeashReason =
-                "lure mob outside native screen";
+                "lure mob outside visible playfield";
         }
 
         // If the mob crossed just outside the viewport, remain stopped for a
@@ -11489,6 +11818,11 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         state.preferredOffscreenTrackRejects = 0;
         state.preferredOffscreenAccessClears = 0;
         state.preferredOffscreenHandoffRejects = 0;
+        state.viewportVisibilityChecks = 0;
+        state.viewportVisibilityRejects = 0;
+        state.viewportVisibilityFallbacks = 0;
+        state.viewportLastVisibleWidth = 0;
+        state.viewportLastVisibleHeight = 0;
         state.ignoredLastTargetId = null;
         state.ignoredLastTargetName = null;
         state.ignoredLastAt = 0;
@@ -13563,6 +13897,16 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 state.preferredOffscreenAccessClears || 0,
             preferredOffscreenHandoffRejects:
                 state.preferredOffscreenHandoffRejects || 0,
+            viewportVisibilityChecks:
+                state.viewportVisibilityChecks || 0,
+            viewportVisibilityRejects:
+                state.viewportVisibilityRejects || 0,
+            viewportVisibilityFallbacks:
+                state.viewportVisibilityFallbacks || 0,
+            viewportLastVisibleWidth:
+                state.viewportLastVisibleWidth || 0,
+            viewportLastVisibleHeight:
+                state.viewportLastVisibleHeight || 0,
             ignoredLastTargetId:
                 state.ignoredLastTargetId,
             ignoredLastTargetName:
