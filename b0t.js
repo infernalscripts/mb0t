@@ -803,7 +803,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.5.65",
+        version: "1.5.67",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -29807,6 +29807,19 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         corpseApproachLastReason: null,
         corpseAdjacentSkips: 0,
 
+        // v1.5.66: if normal movement naturally brings us beside a queued
+        // corpse, native auto-open already gets its chance. Remove that corpse
+        // immediately so distant-loot logic never backtracks to it later.
+        corpsePassedAdjacentConsumes: 0,
+        corpsePassedAdjacentLastKey: null,
+        corpsePassedAdjacentLastAt: 0,
+
+        // v1.5.67: distant corpse walking must never use a floor-change tile.
+        corpseFloorChangeDestinationRejects: 0,
+        corpseFloorChangePathRejects: 0,
+        corpseUnexpectedFloorAborts: 0,
+        corpseLastFloorChangeReject: null,
+
         // v1.5.50: corpse death-hook ownership/reload protection.
         deathHookRepairs: 0,
         staleDeathHooksRemoved: 0,
@@ -30344,6 +30357,188 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         return `${Number(pos.x)},${Number(pos.y)},${Number(pos.z)}`;
     }
 
+    const corpseUnsafeFloorChangeIds = new Set([
+        12396,
+        12400,
+        12401,
+        12402,
+        1948,
+        1968,
+        435,
+        5542,
+        5756
+    ]);
+
+    function getLooterThingDefinition(
+        thing
+    ) {
+        if (!thing)
+            return null;
+
+        const id =
+            Number(thing.id);
+
+        if (!Number.isFinite(id))
+            return null;
+
+        return (
+            window.gameClient
+                ?.itemDefinitionsByCid?.[
+                    id
+                ] || null
+        );
+    }
+
+    function isLooterFloorChangeThing(
+        thing
+    ) {
+        if (!thing)
+            return false;
+
+        const id =
+            Number(thing.id);
+
+        if (
+            Number.isFinite(id) &&
+            corpseUnsafeFloorChangeIds.has(id)
+        ) {
+            return true;
+        }
+
+        const def =
+            getLooterThingDefinition(
+                thing
+            );
+
+        if (
+            def?.properties
+                ?.floorchange
+        ) {
+            return true;
+        }
+
+        let hasNotPathable = false;
+
+        try {
+            if (
+                typeof PropBitFlag !==
+                    "undefined" &&
+                PropBitFlag?.prototype
+                    ?.flags
+                    ?.DatFlagNotPathable !==
+                    undefined &&
+                typeof thing.hasFlag ===
+                    "function"
+            ) {
+                hasNotPathable =
+                    thing.hasFlag(
+                        PropBitFlag.prototype
+                            .flags
+                            .DatFlagNotPathable
+                    ) === true;
+            }
+        } catch (e) {}
+
+        if (!hasNotPathable)
+            return false;
+
+        const name =
+            String(
+                def?.properties?.name ||
+                thing?.name ||
+                ""
+            )
+                .trim()
+                .toLowerCase();
+
+        return (
+            name.includes("hole") ||
+            name.includes("rope") ||
+            name.includes("ladder") ||
+            name.includes("stairs") ||
+            name.includes("staircase") ||
+            name.includes("teleport")
+        );
+    }
+
+    function isUnsafeCorpseApproachTile(
+        tile
+    ) {
+        if (!tile)
+            return true;
+
+        if (
+            isLooterFloorChangeThing(
+                tile
+            )
+        ) {
+            return true;
+        }
+
+        if (
+            Array.isArray(tile.items)
+        ) {
+            for (
+                const item of tile.items
+            ) {
+                if (
+                    isLooterFloorChangeThing(
+                        item
+                    )
+                ) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    function getUnsafeCorpsePathStep(
+        path
+    ) {
+        if (!Array.isArray(path))
+            return null;
+
+        for (
+            let i = 0;
+            i < path.length;
+            i++
+        ) {
+            const tile =
+                path[i];
+
+            if (
+                isUnsafeCorpseApproachTile(
+                    tile
+                )
+            ) {
+                const pos =
+                    tile?.__position;
+
+                return {
+                    index: i,
+                    tileId:
+                        Number(tile?.id) ||
+                        null,
+                    position:
+                        pos
+                            ? {
+                                x:
+                                    Number(pos.x),
+                                y:
+                                    Number(pos.y),
+                                z:
+                                    Number(pos.z)
+                            }
+                            : null
+                };
+            }
+        }
+
+        return null;
+    }
+
     function getCorpseApproachCandidates(
         corpsePosition,
         playerPosition,
@@ -30420,6 +30615,27 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             if (!walkable)
                 continue;
 
+            // The native pathfinder permits a floor-change tile when that tile
+            // is the FINAL destination. Looter must never use a hole/stair/
+            // teleport as the adjacent corpse destination.
+            if (
+                isUnsafeCorpseApproachTile(
+                    tile
+                )
+            ) {
+                state.corpseFloorChangeDestinationRejects++;
+                state.corpseLastFloorChangeReject = {
+                    kind: "destination",
+                    position: {
+                        x: Number(pos.x),
+                        y: Number(pos.y),
+                        z: Number(pos.z)
+                    },
+                    at: Date.now()
+                };
+                continue;
+            }
+
             const alreadyThere =
                 Number(pos.x) ===
                     Number(playerPosition.x) &&
@@ -30457,6 +30673,26 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                     !Array.isArray(path) ||
                     path.length <= 0
                 ) {
+                    continue;
+                }
+
+                const unsafeStep =
+                    getUnsafeCorpsePathStep(
+                        path
+                    );
+
+                if (unsafeStep) {
+                    state.corpseFloorChangePathRejects++;
+                    state.corpseLastFloorChangeReject = {
+                        kind: "path",
+                        destination: {
+                            x: Number(pos.x),
+                            y: Number(pos.y),
+                            z: Number(pos.z)
+                        },
+                        unsafeStep,
+                        at: Date.now()
+                    };
                     continue;
                 }
 
@@ -30659,6 +30895,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                         route.pathSteps,
                     pathCost:
                         route.pathCost,
+                    floorSafe: true,
                     attempt:
                         job.walkAttempts
                 }
@@ -31615,6 +31852,99 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         return true;
     }
 
+    function consumeNaturallyAdjacentQueuedCorpses(
+        now = Date.now()
+    ) {
+        if (
+            !state.walkToCorpses ||
+            !state.corpseQueue.length
+        ) {
+            return 0;
+        }
+
+        const playerPos =
+            bot.getPlayerPosition();
+
+        if (!playerPos)
+            return 0;
+
+        const playerX =
+            Number(playerPos.x);
+        const playerY =
+            Number(playerPos.y);
+        const playerZ =
+            Number(playerPos.z);
+
+        if (
+            !Number.isFinite(playerX) ||
+            !Number.isFinite(playerY) ||
+            !Number.isFinite(playerZ)
+        ) {
+            return 0;
+        }
+
+        let removed = 0;
+
+        state.corpseQueue =
+            state.corpseQueue.filter(
+                candidate => {
+                    const pos =
+                        candidate?.position;
+
+                    if (
+                        !pos ||
+                        Number(pos.z) !==
+                            playerZ
+                    ) {
+                        return true;
+                    }
+
+                    const distance =
+                        Math.max(
+                            Math.abs(
+                                Number(pos.x) -
+                                playerX
+                            ),
+                            Math.abs(
+                                Number(pos.y) -
+                                playerY
+                            )
+                        );
+
+                    if (
+                        !Number.isFinite(distance) ||
+                        distance > 1
+                    ) {
+                        return true;
+                    }
+
+                    removed++;
+                    state.corpseAdjacentSkips++;
+                    state.corpsePassedAdjacentConsumes++;
+                    state.corpsePassedAdjacentLastKey =
+                        candidate.key || null;
+                    state.corpsePassedAdjacentLastAt =
+                        now;
+
+                    bot.log(
+                        "Looter: passed queued corpse – removed from approach queue",
+                        {
+                            monster:
+                                candidate.monsterName ||
+                                "Monster",
+                            position:
+                                candidate.position,
+                            distance
+                        }
+                    );
+
+                    return false;
+                }
+            );
+
+        return removed;
+    }
+
     function startNextCorpseJob(
         now = Date.now()
     ) {
@@ -31722,6 +32052,10 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             const job = {
                 ...candidate,
                 startedAt: now,
+                approachFloor:
+                    Number(
+                        bot.getPlayerPosition()?.z
+                    ),
 
                 // Short routes should fail fast; long routes still keep enough
                 // time to walk. This deadline only covers APPROACH movement.
@@ -31828,6 +32162,37 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             finishCorpseJob(
                 false,
                 "Looter stopped or halted"
+            );
+            return false;
+        }
+
+        const livePlayerPos =
+            bot.getPlayerPosition();
+
+        if (
+            livePlayerPos &&
+            Number.isFinite(
+                Number(job.approachFloor)
+            ) &&
+            Number(livePlayerPos.z) !==
+                Number(job.approachFloor)
+        ) {
+            state.corpseUnexpectedFloorAborts++;
+            state.corpseLastFloorChangeReject = {
+                kind:
+                    "unexpected-floor-change",
+                fromZ:
+                    Number(job.approachFloor),
+                toZ:
+                    Number(livePlayerPos.z),
+                corpsePosition:
+                    job.position,
+                at: now
+            };
+
+            finishCorpseJob(
+                false,
+                "corpse approach changed floor – aborted"
             );
             return false;
         }
@@ -32242,6 +32607,13 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
 
             ensureDeathHookOwnership();
 
+            // This runs even during combat. If CaveBot/Targeting naturally
+            // walks us beside any queued corpse, native auto-open has already
+            // had its opportunity, so that corpse must never cause backtracking.
+            consumeNaturallyAdjacentQueuedCorpses(
+                now
+            );
+
             if (state.corpseJob) {
                 updateCorpseJob(now);
             } else {
@@ -32296,6 +32668,13 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         state.corpseApproachNoRoute = 0;
         state.corpseApproachLastReason = null;
         state.corpseAdjacentSkips = 0;
+        state.corpsePassedAdjacentConsumes = 0;
+        state.corpsePassedAdjacentLastKey = null;
+        state.corpsePassedAdjacentLastAt = 0;
+        state.corpseFloorChangeDestinationRejects = 0;
+        state.corpseFloorChangePathRejects = 0;
+        state.corpseUnexpectedFloorAborts = 0;
+        state.corpseLastFloorChangeReject = null;
         state.deathHookRepairs = 0;
         state.staleDeathHooksRemoved = 0;
         state.lastDeathHookRepairAt = 0;
@@ -32418,6 +32797,20 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                 state.corpseApproachLastReason,
             corpseAdjacentSkips:
                 state.corpseAdjacentSkips,
+            corpsePassedAdjacentConsumes:
+                state.corpsePassedAdjacentConsumes,
+            corpsePassedAdjacentLastKey:
+                state.corpsePassedAdjacentLastKey,
+            corpsePassedAdjacentLastAt:
+                state.corpsePassedAdjacentLastAt,
+            corpseFloorChangeDestinationRejects:
+                state.corpseFloorChangeDestinationRejects,
+            corpseFloorChangePathRejects:
+                state.corpseFloorChangePathRejects,
+            corpseUnexpectedFloorAborts:
+                state.corpseUnexpectedFloorAborts,
+            corpseLastFloorChangeReject:
+                state.corpseLastFloorChangeReject,
             deathHookRepairs:
                 state.deathHookRepairs,
             staleDeathHooksRemoved:
