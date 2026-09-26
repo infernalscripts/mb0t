@@ -803,7 +803,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.5.74",
+        version: "1.5.78",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -4921,6 +4921,16 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         combatStartedAt: 0,
         lastChaseAt: 0,
         lastChaseDestinationKey: null,
+
+        // v1.5.75: Client Chase is optional. Targeting can still pursue a
+        // fleeing engaged target with normal movement packets when it is OFF.
+        lastManualPursuitAt: 0,
+        lastManualPursuitTargetId: null,
+        lastManualPursuitReason: null,
+        manualPursuitSteps: 0,
+        manualPursuitMeleeTriggers: 0,
+        manualPursuitPathFailures: 0,
+
         lastFollowTargetId: null,
         lastFollowDistance: Number.POSITIVE_INFINITY,
         lastFollowProgressAt: 0,
@@ -7680,8 +7690,12 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             if (syncKite(now))
                 return true;
         } else if (config.meleeMode && !config.kiteMode) {
-            syncMeleeChase(now);
+            if (syncMeleeChase(now))
+                return true;
         }
+
+        // Melee OFF means Targeting does not move toward the monster.
+        // It stands still and attacks only from the current tile.
 
         // 3) Validate current target
         let current = getCurrentTarget(); // use 'let' so we can reassign later if needed
@@ -8859,7 +8873,9 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 bottom: visibleBottom,
                 width: visibleWidth,
                 height: visibleHeight
-            }
+            },
+            cssTileWidth,
+            cssTileHeight
         };
     }
 
@@ -12637,6 +12653,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             state.movementOwnedUntil = now + 400;
             return true;
         }
+        if (state.movementOwner === "manual-target-pursuit" && state.movementOwnedUntil > now)
+            return true;
         return state.movementOwnedUntil > now;
     }
 
@@ -12683,6 +12701,9 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         state.lastTargetHotkeyAt = 0;
         state.lastChaseAt = 0;
         state.lastChaseDestinationKey = null;
+        state.lastManualPursuitAt = 0;
+        state.lastManualPursuitTargetId = null;
+        state.lastManualPursuitReason = null;
         state.lastSelectedTargetId = null;
         state.targetSelectedAt = 0;
         state.lastTargetChangeAt = 0;
@@ -13898,12 +13919,21 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                     continue;
 
                 const rawCost = Number(tile.__g);
+                const firstPathTile = path[0] || null;
+                const firstPathPos = firstPathTile?.__position;
                 const route = {
                     position: candidate,
                     pathSteps: path.length,
                     pathCost: Number.isFinite(rawCost) && rawCost >= 0
                         ? rawCost
-                        : path.length * 100
+                        : path.length * 100,
+                    nextStep: firstPathPos
+                        ? {
+                            x: Number(firstPathPos.x),
+                            y: Number(firstPathPos.y),
+                            z: Number(firstPathPos.z)
+                        }
+                        : null
                 };
 
                 if (!best) {
@@ -13935,6 +13965,141 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
     function findReachableAdjacentPosition(targetPos, playerPos) {
         return findReachableAdjacentPath(targetPos, playerPos)?.position || null;
+    }
+
+    function sendManualTargetPursuitStep(playerPos, stepPos, target, reason, now = Date.now()) {
+        if (!playerPos || !stepPos || !target) return false;
+        if (now - state.lastManualPursuitAt < 140) return false;
+
+        const dx = Math.sign(Number(stepPos.x) - Number(playerPos.x));
+        const dy = Math.sign(Number(stepPos.y) - Number(playerPos.y));
+        if (dx === 0 && dy === 0) return false;
+        if (Number(stepPos.z) !== Number(playerPos.z)) return false;
+        if (!isSafeToWalkTile(Number(stepPos.x), Number(stepPos.y), Number(stepPos.z), false)) return false;
+
+        const dir = getDirection(dx, dy);
+        if (dir === null || dir === undefined) return false;
+
+        let moved = false;
+        try {
+            const keyboard = window.gameClient?.keyboard;
+            if (keyboard && typeof keyboard.handleMoveKey === "function") {
+                keyboard.handleMoveKey(dir);
+                moved = true;
+            }
+        } catch (e) {}
+
+        if (!moved && window.gameClient?.send && typeof MovementPacket === "function") {
+            try {
+                window.gameClient.send(new MovementPacket(dir));
+                if (window.gameClient?.player) {
+                    window.gameClient.player.setTurnBuffer?.(dir);
+                    const localPos = window.gameClient.player.getPosition?.();
+                    if (localPos && window.gameClient?.networkManager?.packetHandler?.handlePlayerMove) {
+                        const predicted = localPos.add(new Position(dx, dy, 0));
+                        window.gameClient.networkManager.packetHandler.handlePlayerMove(predicted);
+                    }
+                }
+                moved = true;
+            } catch (e) {}
+        }
+
+        if (!moved) return false;
+
+        const targetChanged = state.lastManualPursuitTargetId !== target.id;
+        state.lastManualPursuitAt = now;
+        state.lastManualPursuitTargetId = target.id ?? null;
+        state.lastManualPursuitReason = reason || "manual melee pursuit";
+        state.manualPursuitSteps++;
+        state.lastChaseAt = now;
+        state.lastMoveAt = now;
+        state.movementOwner = "manual-target-pursuit";
+        state.movementOwnedUntil = now + 450;
+
+        if (targetChanged) {
+            bot.log("Targeting: manual melee pursuit engaged", {
+                id: target.id ?? null,
+                name: target.name || "Mob",
+                reason: state.lastManualPursuitReason
+            });
+        }
+        return true;
+    }
+
+    function syncManualTargetPursuit(now = Date.now()) {
+        // Melee is the ONLY option that authorizes Targeting movement toward
+        // a monster. With Melee OFF, Targeting must stand still.
+        if (
+            !config.meleeMode ||
+            config.kiteMode ||
+            config.useClientChase
+        ) {
+            return false;
+        }
+
+        const target =
+            getEngagedTarget();
+        if (!target)
+            return false;
+
+        const playerPos =
+            normalizePosition(
+                bot.getPlayerPosition()
+            );
+        const targetPos =
+            normalizePosition(
+                target.getPosition?.() ||
+                target.__position
+            );
+
+        if (
+            !playerPos ||
+            !targetPos ||
+            playerPos.z !== targetPos.z
+        ) {
+            return false;
+        }
+
+        const dist =
+            getTileDistance(
+                playerPos,
+                targetPos
+            );
+
+        if (dist <= 1)
+            return false;
+
+        state.manualPursuitMeleeTriggers++;
+
+        if (
+            releaseTargetForAntiKS(
+                target,
+                now
+            )
+        ) {
+            return false;
+        }
+
+        const route =
+            findReachableAdjacentPath(
+                targetPos,
+                playerPos
+            );
+        const nextStep =
+            route?.nextStep;
+
+        if (!nextStep) {
+            state.manualPursuitPathFailures++;
+            return false;
+        }
+
+        return sendManualTargetPursuitStep(
+            playerPos,
+            nextStep,
+            target,
+            "Melee enabled; Client Chase disabled",
+            now
+        );
     }
 
     function syncMeleeChase(now = Date.now()) {
@@ -14045,6 +14210,11 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         // before chase ownership is maintained.
         if (releaseTargetForAntiKS(target, now))
             return false;
+
+        // Native Client Chase is optional. When disabled, close distance
+        // with ordinary movement packets instead of standing still.
+        if (!config.useClientChase && syncManualTargetPursuit(now))
+            return true;
 
         // v1.4.96: do not run a second independent stuck/retarget system here.
         // getEngagedTarget() has already synchronized engagedTargetId, so the
@@ -14344,6 +14514,9 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             state._chaseEnabledForDistance = false;
         } else if (config.useClientChase) {
             setClientChaseMode(2);
+        } else {
+            setClientChaseMode(0);
+            state._chaseEnabledForDistance = false;
         }
         bot.log("auto attack started", {
             ...config
@@ -14379,6 +14552,9 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         }
         clearEngagedTarget();
         state.lastChaseAt = 0;
+        state.lastManualPursuitAt = 0;
+        state.lastManualPursuitTargetId = null;
+        state.lastManualPursuitReason = null;
         clearCurrentFollowTarget();
         state.kiteWaypointIndex = null;
         state.skippedTargetIds.clear();
@@ -14605,6 +14781,13 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             combatDurationMs: state.combatStartedAt ? Math.max(0, Date.now() - state.combatStartedAt) : 0,
             targetCount: getCombatTargetCount(),
             lastChaseAt: state.lastChaseAt,
+            lastManualPursuitAt: state.lastManualPursuitAt || 0,
+            lastManualPursuitTargetId: state.lastManualPursuitTargetId,
+            lastManualPursuitReason: state.lastManualPursuitReason,
+            manualPursuitSteps: state.manualPursuitSteps || 0,
+            manualPursuitEdgeTriggers: state.manualPursuitEdgeTriggers || 0,
+            manualPursuitMeleeTriggers: state.manualPursuitMeleeTriggers || 0,
+            manualPursuitPathFailures: state.manualPursuitPathFailures || 0,
             targetSelectedAt: state.targetSelectedAt || 0,
             targetHeldMs: state.targetSelectedAt ? Math.max(0, Date.now() - state.targetSelectedAt) : 0,
             lastRetargetAt: state.lastRetargetAt || 0,
@@ -15384,7 +15567,7 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
     const RUNE_TYPES = Object.freeze({
         sd:    Object.freeze({ key:"sd",    label:"Sudden Death",        short:"SD",   itemId:3155, mode:"creature", shape:null }),
         gfb:   Object.freeze({ key:"gfb",   label:"Great Fireball",      short:"GFB",  itemId:3191, mode:"aoe", shape:Object.freeze(["0011100","0111110","1111111","1111111","1111111","0111110","0011100"]) }),
-        fb:    Object.freeze({ key:"fb",    label:"Fireball",            short:"FB",   itemId:3189, mode:"aoe", shape:Object.freeze(["01110","11111","11111","11111","01110"]) }),
+        fb:    Object.freeze({ key:"fb",    label:"Fireball",            short:"FB",   itemId:3189, mode:"aoe", shape:Object.freeze(["00100","01110","11111","01110","00100"]) }),
         hmm:   Object.freeze({ key:"hmm",   label:"Heavy Magic Missile", short:"HMM",  itemId:3198, mode:"creature", shape:null }),
         lmm:   Object.freeze({ key:"lmm",   label:"Light Magic Missile", short:"LMM",  itemId:3174, mode:"creature", shape:null }),
         explo: Object.freeze({ key:"explo", label:"Explosion",           short:"EXPL", itemId:3200, mode:"aoe", shape:Object.freeze(["010","111","010"]) }),
@@ -15416,6 +15599,9 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
         lastCountRequestAt:0, pendingUntil:0, lastCastAt:0,
         castCount:0, aoeCastCount:0, creatureCastCount:0,
         skippedCooldown:0, skippedNoSupply:0, skippedNoLos:0,
+        skippedAoeBelowThreshold:0,
+        lastRejectedAoeHitCount:0,
+        lastRejectedAoeRuleMin:0,
         skippedHealingPriority:0,
         healingPriorityDispatches:0,
         healingPriorityReadyBlocks:0,
@@ -15723,6 +15909,21 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
         if (def.mode === "creature" && !target) return false;
         if (def.mode === "aoe" && !aoe) return false;
 
+        // v1.5.78: for AoE runes, Creature Count means creatures ACTUALLY HIT
+        // by the best aim tile, not merely creatures visible somewhere on the
+        // screen. A GFB >=3 rule must truly cover at least 3 monsters.
+        if (
+            def.mode === "aoe" &&
+            aoe.hitCount < rule.minCreatures
+        ) {
+            state.skippedAoeBelowThreshold++;
+            state.lastRejectedAoeHitCount =
+                aoe.hitCount;
+            state.lastRejectedAoeRuleMin =
+                rule.minCreatures;
+            return false;
+        }
+
         // Healing always wins. Re-check immediately before taking the rune
         // lock so a heal becoming ready during target/AoE calculation cannot
         // lose the action window to an offensive rune.
@@ -15887,6 +16088,9 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
             castCount:state.castCount, aoeCastCount:state.aoeCastCount, creatureCastCount:state.creatureCastCount,
             skippedCooldown:state.skippedCooldown, skippedNoSupply:state.skippedNoSupply,
             skippedNoLos:state.skippedNoLos,
+            skippedAoeBelowThreshold:state.skippedAoeBelowThreshold,
+            lastRejectedAoeHitCount:state.lastRejectedAoeHitCount,
+            lastRejectedAoeRuleMin:state.lastRejectedAoeRuleMin,
             skippedHealingPriority:state.skippedHealingPriority,
             healingPriorityDispatches:state.healingPriorityDispatches,
             healingPriorityReadyBlocks:state.healingPriorityReadyBlocks,
