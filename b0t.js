@@ -803,7 +803,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.5.59",
+        version: "1.5.60",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -5084,6 +5084,9 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         ignoredEmergencyBlockersSkipped: 0,
         ignoredLastMobClears: 0,
         ignoredPreferredTrackSkips: 0,
+        preferredOffscreenTrackRejects: 0,
+        preferredOffscreenAccessClears: 0,
+        preferredOffscreenHandoffRejects: 0,
         ignoredLastTargetId: null,
         ignoredLastTargetName: null,
         ignoredLastAt: 0,
@@ -7622,6 +7625,20 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         }
 
         if (
+            state.preferredAccessTargetId ===
+                current.id ||
+            state.preferredAccessClearTargetId ===
+                current.id
+        ) {
+            clearPreferredAccessState(
+                "preferred/current target left native screen",
+                now,
+                false
+            );
+            state.preferredOffscreenAccessClears++;
+        }
+
+        if (
             state.lureLastMobActive &&
             state.lureLastMobId === current.id
         ) {
@@ -7953,6 +7970,14 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         if (!target || !isPreferredCreature(target))
             return null;
 
+        // Preferred access-clearing is a targeting feature, not a radar.
+        // Once the preferred leaves native screen, it cannot own special
+        // blocker-clearing or interrupt Lure.
+        if (!isStrictPreferredScreenVisible(target)) {
+            state.preferredOffscreenAccessClears++;
+            return null;
+        }
+
         const playerPos = normalizePosition(bot.getPlayerPosition());
         const targetPos = normalizePosition(target.getPosition?.() || target.__position);
         if (!playerPos || !targetPos || playerPos.z !== targetPos.z)
@@ -8036,14 +8061,27 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             if (
                 preferred &&
                 isPreferredCreature(preferred) &&
-                !isIgnoredTargetCreature(preferred)
+                !isIgnoredTargetCreature(preferred) &&
+                isStrictPreferredScreenVisible(preferred)
             ) {
-                const hp = Number(preferred.state?.health ?? preferred.health);
+                const hp = Number(
+                    preferred.state?.health ??
+                    preferred.health
+                );
                 if (!Number.isFinite(hp) || hp > 0) {
-                    const approach = getTargetApproachInfo(preferred);
+                    const approach =
+                        getTargetApproachInfo(
+                            preferred
+                        );
+
                     if (approach?.reachable) {
-                        if (setCurrentTarget(preferred))
+                        if (
+                            setCurrentTarget(
+                                preferred
+                            )
+                        ) {
                             state.preferredAccessHandoffs++;
+                        }
                     } else {
                         markPreferredWallBlocked(
                             preferred,
@@ -8052,6 +8090,14 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                         );
                     }
                 }
+            } else if (
+                preferred &&
+                isPreferredCreature(preferred) &&
+                !isStrictPreferredScreenVisible(
+                    preferred
+                )
+            ) {
+                state.preferredOffscreenHandoffRejects++;
             }
         }
     }
@@ -8059,6 +8105,15 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     function activatePreferredAccessState(info, now = Date.now()) {
         if (!info?.preferred || !info?.clearTarget)
             return false;
+
+        if (
+            !isStrictPreferredScreenVisible(
+                info.preferred
+            )
+        ) {
+            state.preferredOffscreenAccessClears++;
+            return false;
+        }
 
         const newActivation =
             !state.preferredAccessBlocked ||
@@ -8105,10 +8160,41 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         }
 
         const preferred =
-            window.gameClient?.world?.activeCreatures?.[state.preferredAccessTargetId] || null;
-        const hp = Number(preferred?.state?.health ?? preferred?.health);
-        if (!preferred || (Number.isFinite(hp) && hp <= 0)) {
-            clearPreferredAccessState("preferred target gone", now, false);
+            window.gameClient?.world
+                ?.activeCreatures?.[
+                    state.preferredAccessTargetId
+                ] || null;
+        const hp = Number(
+            preferred?.state?.health ??
+            preferred?.health
+        );
+
+        if (
+            !preferred ||
+            (
+                Number.isFinite(hp) &&
+                hp <= 0
+            )
+        ) {
+            clearPreferredAccessState(
+                "preferred target gone",
+                now,
+                false
+            );
+            return false;
+        }
+
+        if (
+            !isStrictPreferredScreenVisible(
+                preferred
+            )
+        ) {
+            state.preferredOffscreenAccessClears++;
+            clearPreferredAccessState(
+                "preferred target left native screen",
+                now,
+                false
+            );
             return false;
         }
 
@@ -8769,6 +8855,14 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 continue;
             if (!isPreferredCreature(creature))
                 continue;
+
+            // v1.5.60: no hidden preferred radar. Preferred mobs outside the
+            // native viewport are completely irrelevant to Lure/Targeting.
+            if (!isStrictPreferredScreenVisible(creature)) {
+                state.preferredOffscreenTrackRejects++;
+                continue;
+            }
+
             if (isIgnoredTargetCreature(creature)) {
                 state.ignoredPreferredTrackSkips++;
                 continue;
@@ -8941,18 +9035,19 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 Number.isFinite(trackedDistance) ? trackedDistance : null;
         }
 
-        const lostGraceMs = Math.max(
-            300,
-            Math.min(3000, Number(config.lurePreferredLostGraceMs) || 1200)
-        );
-        const preferredGracePending =
-            !trackedPreferred &&
-            state.lurePreferredPending &&
-            state.lurePreferredLastSeenAt > 0 &&
-            now - state.lurePreferredLastSeenAt <= lostGraceMs;
+        state.lurePreferredVisible =
+            preferredActionable;
+        state.lurePreferredActionableId =
+            actionablePreferred?.id ?? null;
 
-        state.lurePreferredVisible = preferredActionable;
-        state.lurePreferredActionableId = actionablePreferred?.id ?? null;
+        if (
+            !trackedPreferred &&
+            state.lurePreferredPending
+        ) {
+            clearLurePreferredPending(
+                "preferred left native screen"
+            );
+        }
 
         if (!config.lureMode) {
             return {
@@ -9030,12 +9125,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         // A known preferred mob that is not yet actionable gets first priority
         // over ordinary lure combat. Keep CaveBot moving and protect the lure
         // pack until the preferred target enters the real engage envelope.
-        if (trackedPreferred || preferredGracePending) {
+        if (trackedPreferred) {
             return {
                 active: true,
-                reason: trackedPreferred
-                    ? "preferred mob pending"
-                    : "preferred mob pending grace",
+                reason: "preferred mob pending",
                 threshold,
                 visibleMonsters,
                 preferredVisible: false,
@@ -9043,14 +9136,21 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 preferredActionableTarget: null,
                 preferredTrackedTarget: trackedPreferred,
                 preferredTrackedDistance:
-                    trackedPreferred
-                        ? (Number.isFinite(trackedDistance) ? trackedDistance : null)
-                        : state.lurePreferredTrackedDistance,
+                    Number.isFinite(trackedDistance)
+                        ? trackedDistance
+                        : null,
                 caveStatus,
                 waypoint,
-                waypointIndex: Number.isFinite(Number(caveStatus.currentIndex))
-                    ? Number(caveStatus.currentIndex)
-                    : null
+                waypointIndex:
+                    Number.isFinite(
+                        Number(
+                            caveStatus.currentIndex
+                        )
+                    )
+                        ? Number(
+                            caveStatus.currentIndex
+                        )
+                        : null
             };
         }
 
@@ -11386,6 +11486,9 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         state.ignoredEmergencyBlockersSkipped = 0;
         state.ignoredLastMobClears = 0;
         state.ignoredPreferredTrackSkips = 0;
+        state.preferredOffscreenTrackRejects = 0;
+        state.preferredOffscreenAccessClears = 0;
+        state.preferredOffscreenHandoffRejects = 0;
         state.ignoredLastTargetId = null;
         state.ignoredLastTargetName = null;
         state.ignoredLastAt = 0;
@@ -13454,6 +13557,12 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 state.ignoredLastMobClears || 0,
             ignoredPreferredTrackSkips:
                 state.ignoredPreferredTrackSkips || 0,
+            preferredOffscreenTrackRejects:
+                state.preferredOffscreenTrackRejects || 0,
+            preferredOffscreenAccessClears:
+                state.preferredOffscreenAccessClears || 0,
+            preferredOffscreenHandoffRejects:
+                state.preferredOffscreenHandoffRejects || 0,
             ignoredLastTargetId:
                 state.ignoredLastTargetId,
             ignoredLastTargetName:
