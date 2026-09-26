@@ -803,7 +803,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.5.70",
+        version: "1.5.74",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -2773,6 +2773,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
                 magicShield: !!bot.magicShield?.status?.().running,
                 eat: !!bot.eat?.status?.().running,
                 attack: !!bot.attack?.status?.().running,
+                runeShooter: !!bot.runeShooter?.status?.().running,
                 cave: !!bot.cave?.status?.().running,
                 equipRing: !!bot.equipRing?.status?.().running,
                 slimeTrainer: !!bot.slimeTrainer?.status?.().running,
@@ -2813,6 +2814,10 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
             });
         if (bot.attack?.stop)
             bot.attack.stop({
+                persistEnabled: false
+            });
+        if (bot.runeShooter?.stop)
+            bot.runeShooter.stop({
                 persistEnabled: false
             });
         if (bot.equipRing?.stop)
@@ -2870,6 +2875,8 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
                 bot.eat?.start?.();
             if (snap.modules.attack)
                 bot.attack?.start?.();
+            if (snap.modules.runeShooter)
+                bot.runeShooter?.start?.();
             if (snap.modules.cave)
                 bot.cave?.start?.();
             if (snap.modules.equipRing)
@@ -2913,6 +2920,8 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
                 bot.ui.refreshCaveStatus();
             if (bot.ui?.refreshAutoAttackStatus)
                 bot.ui.refreshAutoAttackStatus();
+            if (bot.ui?.refreshRuneShooterStatus)
+                bot.ui.refreshRuneShooterStatus();
             if (bot.ui?.refreshEquipRingStatus)
                 bot.ui.refreshEquipRingStatus();
             if (bot.ui?.refreshPaladinStatus)
@@ -2938,6 +2947,8 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
             bot.ui.refreshCaveStatus();
         if (bot.ui?.refreshAutoAttackStatus)
             bot.ui.refreshAutoAttackStatus();
+        if (bot.ui?.refreshRuneShooterStatus)
+            bot.ui.refreshRuneShooterStatus();
         if (bot.ui?.refreshEquipRingStatus)
             bot.ui.refreshEquipRingStatus();
         if (bot.ui?.refreshPaladinStatus)
@@ -4471,6 +4482,12 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
         updateConfig: updateConfig,
         readStats: readStats,
         tryHeal: tryHeal,
+
+        // v1.5.72: lower-priority combat modules can yield explicitly to
+        // Healing without duplicating its rule/cooldown/resource logic.
+        needsPriorityAction: needsPriorityAction,
+        hasPendingAction: hasPending,
+
         config: config,
     };
 };
@@ -4889,8 +4906,9 @@ window.__minibiaBotBundle.installAutoMagicShieldModule = function installAutoMag
 /**
  * ==================================================================================
  * 9. AUTO ATTACK MODULE
- *    Automatically targets and attacks monsters. Supports melee mode (follow +
- *    attack), rune usage, preferred targets, and anti‑kill‑steal.
+ *    Automatically targets and attacks monsters. Supports melee/kite movement,
+ *    preferred targets, lure handling, and anti‑kill‑steal. Attack runes are
+ *    handled exclusively by the separate Rune Shooter module.
  * ==================================================================================
  */
 window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackModule(bot) {
@@ -4899,7 +4917,6 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         running: false,
         timerId: null,
         lastTargetHotkeyAt: 0,
-        lastRuneHotkeyAt: 0,
         engagedTargetId: null,
         combatStartedAt: 0,
         lastChaseAt: 0,
@@ -5171,7 +5188,6 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         lureThresholdReachedAt: 0,
         lureAttackTicks: 0,
         lureTargetsAcquired: 0,
-        lureRunesUsed: 0,
         lureOutOfRangeClears: 0,
 
         // v1.5.13: smart lure preserves the pack while attack-through is
@@ -5182,7 +5198,6 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         lureLastSmartFromId: null,
         lureLastSmartToId: null,
         lureLastSmartReason: null,
-        lureRunePreserveSkips: 0,
         lureSmartTargetScore: null,
         lureSmartTargetHealthPct: null,
 
@@ -5206,7 +5221,6 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         lureLastMobStartedAt: 0,
         lureLastMobActivations: 0,
         lureLastMobFinishes: 0,
-        lureLastMobRuneBursts: 0,
 
         // v1.5.26: Last Mob is a hard finish override, not merely a Smart Lure
         // scoring hint. Keep that exact mob targeted until it dies while Slow
@@ -5280,21 +5294,62 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         kiteOscillationDetections: 0,
         kiteLastOscillationAt: 0,
 
-        // v1.4.86: native rune cooldown + server-side inventory count.
-        lastRuneCountRequestAt: 0,
-        lastRuneMissingWarningAt: 0,
-        runeCountItemId: 0,
-        runeCountFluidType: 0,
-        unsubscribeRuneCounts: null,
     };
 
-    const storedConfig = bot.storage.get(configStorageKey, {}) || {};
+    const legacyAttackRuneConfigKeys = [
+        "runeHotbarSlot",
+        "runeCooldownMs",
+        "runeCountRefreshMs",
+        "runeCountFreshMs",
+        "attackRuneHotbarSlot",
+        "attackRuneSlot"
+    ];
+
+    function stripLegacyAttackRuneConfig(source) {
+        if (!source || typeof source !== "object")
+            return source || {};
+
+        const cleaned = {
+            ...source
+        };
+
+        for (const key of legacyAttackRuneConfigKeys)
+            delete cleaned[key];
+
+        return cleaned;
+    }
+
+    const rawStoredConfig =
+        bot.storage.get(
+            configStorageKey,
+            {}
+        ) || {};
+    const storedConfig =
+        stripLegacyAttackRuneConfig(
+            rawStoredConfig
+        );
+
+    // v1.5.73: permanently remove retired Targeting hotbar-rune settings.
+    if (
+        legacyAttackRuneConfigKeys.some(
+            key =>
+                Object.prototype
+                    .hasOwnProperty.call(
+                        rawStoredConfig,
+                        key
+                    )
+        )
+    ) {
+        bot.storage.set(
+            configStorageKey,
+            storedConfig
+        );
+    }
+
     const config = Object.assign({
         tickMs: 150,
         targetHotbarSlot: 3,
-        runeHotbarSlot: null,
         targetCooldownMs: 1200,
-        runeCooldownMs: 1200,
         maxTargetDistance: 5,
         meleeMode: true,
         enabled: false,
@@ -5395,8 +5450,6 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         // Normal acquisition is still guarded by targetCooldownMs, but after
         // a target is lost/cleared we can acquire the next monster quickly.
         fastReacquireMs: 150,
-        runeCountRefreshMs: 5000,
-        runeCountFreshMs: 12000,
     },
             storedConfig);
     if (config.targetHotbarSlot == null && storedConfig.hotbarSlot != null) {
@@ -5479,16 +5532,22 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         config.lureLeashResumeY = Math.max(1, Math.min(config.lureLeashEdgeY - 1, Number(config.lureLeashResumeY) || 3));
         config.lureLeashLostGraceMs = Math.max(500, Math.min(5000, Number(config.lureLeashLostGraceMs) || 1800));
         config.fastReacquireMs = Math.max(50, Math.min(500, Number(config.fastReacquireMs) || 150));
-        config.runeCountRefreshMs = Math.max(2000, Math.min(30000, Number(config.runeCountRefreshMs) || 5000));
-        config.runeCountFreshMs = Math.max(config.runeCountRefreshMs, Math.min(60000, Number(config.runeCountFreshMs) || 12000));
     }
 
     // ---- Constants for floor-change detection (copied from cave module) ----
 
     function persistConfig() {
-        bot.storage.set(configStorageKey, {
-            ...config
-        });
+        // Never let retired hotbar-rune keys survive through direct config
+        // mutation, profile restore, or future save-all calls.
+        for (const key of legacyAttackRuneConfigKeys)
+            delete config[key];
+
+        bot.storage.set(
+            configStorageKey,
+            stripLegacyAttackRuneConfig(
+                config
+            )
+        );
     }
     // ---- FLOOR CHANGE DETECTION (copied from cave module) ----
     const ladderItemIds = new Set([1948, 1968, 435, 5542]);
@@ -8175,11 +8234,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
         // 6) Attack
         if (getCurrentTarget()) {
-            if (config.runeHotbarSlot && triggerRune(now))
-                return true;
-
-            // TargetPacket acquisition is already complete. triggerAttack()
-            // only acquires a target and can never do work while one exists.
+            // TargetPacket acquisition is already complete. Attack runes are
+            // handled exclusively by Rune Shooter.
             return false;
         } else {
             return triggerAttack(now, getTickCandidates());
@@ -11797,40 +11853,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
         current = maybeRotateSmartLureTarget(current, now);
 
-        // Single-target attack rune is allowed while pulling, except Smart
-        // Lure avoids spending burst damage on a mob at/below the preserve HP
-        // floor. Basic auto-attacks still continue, so lure never becomes idle.
-        const currentHp = getCreatureHealthPercent(current);
-        const preserveHp = Math.max(
-            5,
-            Math.min(90, Number(config.lurePreserveHpPct) || 30)
-        );
-        const lastMobException =
-            state.lureLastMobActive &&
-            state.lureLastMobId != null &&
-            current?.id === state.lureLastMobId;
-        const emergencyException =
-            emergencyId != null &&
-            current?.id === emergencyId;
-
-        const preserveRune =
-            !!config.lureSmartTargeting &&
-            !lastMobException &&
-            !emergencyException &&
-            Number.isFinite(currentHp) &&
-            currentHp <= preserveHp;
-
-        if (config.runeHotbarSlot && !preserveRune && triggerRune(now)) {
-            state.lureRunesUsed++;
-            if (lastMobException)
-                state.lureLastMobRuneBursts++;
-            return true;
-        }
-
-        if (config.runeHotbarSlot && preserveRune)
-            state.lureRunePreserveSkips++;
-
-        // Keeping the target selected is enough for normal auto-attack; do not
+        // Rune use is owned exclusively by Rune Shooter. Keeping the target
+        // selected is enough for normal auto-attack; do not
         // run melee chase, kite, stuck recovery, or route-based retargeting.
         return false;
     }
@@ -12657,11 +12681,6 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         state.engagedTargetId = null;
         state.combatStartedAt = 0;
         state.lastTargetHotkeyAt = 0;
-        state.lastRuneHotkeyAt = 0;
-        state.lastRuneCountRequestAt = 0;
-        state.lastRuneMissingWarningAt = 0;
-        state.runeCountItemId = 0;
-        state.runeCountFluidType = 0;
         state.lastChaseAt = 0;
         state.lastChaseDestinationKey = null;
         state.lastSelectedTargetId = null;
@@ -12842,14 +12861,12 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         state.lureThresholdReachedAt = 0;
         state.lureAttackTicks = 0;
         state.lureTargetsAcquired = 0;
-        state.lureRunesUsed = 0;
         state.lureOutOfRangeClears = 0;
         state.lureSmartSwitches = 0;
         state.lureLastSmartSwitchAt = 0;
         state.lureLastSmartFromId = null;
         state.lureLastSmartToId = null;
         state.lureLastSmartReason = null;
-        state.lureRunePreserveSkips = 0;
         state.lureSmartTargetScore = null;
         state.lureSmartTargetHealthPct = null;
         state.lureMotionHistory.clear();
@@ -12866,7 +12883,6 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         state.lureLastMobStartedAt = 0;
         state.lureLastMobActivations = 0;
         state.lureLastMobFinishes = 0;
-        state.lureLastMobRuneBursts = 0;
         state.lureLastMobForcedAttackTicks = 0;
         state.lureLastMobForcedReacquires = 0;
         state.lureLastMobRangeExtensions = 0;
@@ -14266,173 +14282,6 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         return false;
     }
 
-    function getAttackRuneSlotInfo() {
-        const slotNumber = normalizeHotbarSlot(config.runeHotbarSlot);
-        if (!slotNumber) return null;
-        const hm = window.gameClient?.interface?.hotbarManager;
-        const slot = hm?.slots?.[slotNumber - 1] || null;
-        const item = slot?.item || null;
-        if (!hm || !slot || !item) return { slotNumber, hm, slot, item: null, def: null, isRune: false };
-        const def = window.gameClient?.itemDefinitionsByCid?.[Number(item.id)] || null;
-        return {
-            slotNumber,
-            hm,
-            slot,
-            item,
-            def,
-            isRune: def?.properties?.type === "rune",
-        };
-    }
-
-    function getAttackRuneCountState(now = Date.now(), request = true) {
-        const info = getAttackRuneSlotInfo();
-        const itemId = Number(info?.item?.id || 0);
-        const fluidType = Math.max(0, Math.trunc(Number(info?.item?.fluidType) || 0));
-        if (!itemId) {
-            state.runeCountItemId = 0;
-            state.runeCountFluidType = 0;
-            return { itemId: 0, fluidType: 0, known: false, fresh: false, count: null, at: 0 };
-        }
-
-        // If the user changed the hotbar binding, forget the previous request
-        // cadence so the new item is queried immediately.
-        if (state.runeCountItemId !== itemId || state.runeCountFluidType !== fluidType) {
-            state.runeCountItemId = itemId;
-            state.runeCountFluidType = fluidType;
-            state.lastRuneCountRequestAt = 0;
-        }
-
-        if (request && typeof bot.requestItemCounts === "function" &&
-                now - state.lastRuneCountRequestAt >= config.runeCountRefreshMs) {
-            if (bot.requestItemCounts([{ id: itemId, fluidType }])) {
-                state.lastRuneCountRequestAt = now;
-            }
-        }
-
-        const reading = typeof bot.getItemCountReading === "function"
-            ? bot.getItemCountReading(itemId, fluidType)
-            : null;
-        if (!reading) return { itemId, fluidType, known: false, fresh: false, count: null, at: 0 };
-        const at = Number(reading.at || 0);
-        const age = Math.max(0, now - at);
-        return {
-            itemId,
-            fluidType,
-            known: true,
-            fresh: age <= config.runeCountFreshMs,
-            count: Math.max(0, Math.trunc(Number(reading.count) || 0)),
-            at,
-        };
-    }
-
-    function getAttackRuneCooldownRemainingMs(nowPerf = performance.now()) {
-        const info = getAttackRuneSlotInfo();
-        if (!info?.isRune || typeof info.hm?.__getRuneEffectiveCooldown !== "function") return 0;
-        // Attack runes use the aggressive rune cooldown bucket. Respect the
-        // definition when available rather than assuming every hotbar item is
-        // aggressive.
-        const aggressive = info.def?.properties?.aggressive !== false;
-        try {
-            const cd = info.hm.__getRuneEffectiveCooldown(aggressive);
-            return cd?.until > nowPerf ? Math.max(0, cd.until - nowPerf) : 0;
-        } catch (e) {
-            return 0;
-        }
-    }
-
-    function attachAttackRuneCountListener() {
-        if (state.unsubscribeRuneCounts || typeof bot.subscribeItemCounts !== "function") return;
-        state.unsubscribeRuneCounts = bot.subscribeItemCounts((reading) => {
-            if (!state.running || !reading) return;
-            if (Number(reading.itemId) !== Number(state.runeCountItemId)) return;
-            if (Math.max(0, Math.trunc(Number(reading.fluidType) || 0)) !== Number(state.runeCountFluidType || 0)) return;
-            try { bot.ui?.refreshAutoAttackStatus?.(); } catch (e) {}
-        });
-    }
-
-    function detachAttackRuneCountListener() {
-        if (!state.unsubscribeRuneCounts) return;
-        try { state.unsubscribeRuneCounts(); } catch (e) {}
-        state.unsubscribeRuneCounts = null;
-    }
-
-    function canUseRune(now = Date.now()) {
-        if (isProtectionZoneBlocked(now))
-            return false;
-
-        const slot = normalizeHotbarSlot(config.runeHotbarSlot);
-        const target = getCurrentTarget();
-        if (!slot || !target)
-            return false;
-
-        const targetInfo = isTargetValidAndOnScreen(target, {
-            returnDetails: true,
-            maxDx: 8,
-            maxDy: 6,
-            skipReachability: true
-        });
-        if (!targetInfo.valid)
-            return false;
-
-        if (releaseTargetForAntiKS(target, now))
-            return false;
-
-        const playerPos = normalizePosition(bot.getPlayerPosition());
-        const targetPos = normalizePosition(target.getPosition?.() || target.__position);
-        if (!playerPos || !targetPos)
-            return false;
-
-        const dist = getTileDistance(playerPos, targetPos);
-        const maxDist = Math.max(1, Number(config.maxTargetDistance) || 5);
-        if (dist > maxDist)
-            return false;
-
-        // Keep the old local guard as a minimum anti-spam delay, but also obey
-        // the client's authoritative rune cooldown when the selected hotbar
-        // slot is actually bound to a rune.
-        if (now - state.lastRuneHotkeyAt < Math.max(0, Number(config.runeCooldownMs) || 0))
-            return false;
-        if (getAttackRuneCooldownRemainingMs() > 0)
-            return false;
-
-        const countState = getAttackRuneCountState(now, true);
-        if (countState.itemId && countState.fresh && countState.count === 0) {
-            if (!state.lastRuneMissingWarningAt || now - state.lastRuneMissingWarningAt >= 60000) {
-                state.lastRuneMissingWarningAt = now;
-                bot.log("Targeting: attack rune count is 0", { itemId: countState.itemId, hotbarSlot: slot });
-            }
-            return false;
-        }
-        return true;
-    }
-
-    function triggerRune(now = Date.now()) {
-        if (!canUseRune(now))
-            return false;
-
-        // Optional debug log
-        const targetPos = normalizePosition(getCurrentTarget().getPosition?.() || getCurrentTarget().__position);
-        const playerPos = normalizePosition(bot.getPlayerPosition());
-        if (playerPos && targetPos) {
-            const dist = getTileDistance(playerPos, targetPos);
-            //bot.log(`Using rune on target at distance ${dist}`);
-        }
-
-        const slot = normalizeHotbarSlot(config.runeHotbarSlot);
-        const clicked = bot.actions.runShared('attack-rune',
-            bot.actions.priorities.COMBAT, () => bot.clickHotbar(slot - 1));
-        if (clicked) {
-            state.lastRuneHotkeyAt = now;
-            // Ask for a fresh full-inventory count on the next combat tick. The
-            // request is sent after the use packet, so the server can report
-            // the post-use supply without introducing another timer.
-            state.lastRuneCountRequestAt = 0;
-            markCombatActive(now);
-            //bot.log("used auto attack rune hotkey", { slot, target: getCurrentTarget()?.name || "Mob" });
-        }
-        return clicked;
-    }
-
     // ---- LOOP ----
     function scheduleNextTick() {
         if (!state.running)
@@ -14467,9 +14316,15 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function start(overrides = {}) {
-        Object.assign(config, overrides, {
-            enabled: true
-        });
+        Object.assign(
+            config,
+            stripLegacyAttackRuneConfig(
+                overrides
+            ),
+            {
+                enabled: true
+            }
+        );
 
         if (config.kiteMode)
             config.useClientChase = false;
@@ -14483,8 +14338,6 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         syncPlayerSession();
         ensureTargetAckHook();
         ensureCancelMessageHook();
-        attachAttackRuneCountListener();
-        getAttackRuneCountState(Date.now(), true);
         // Kite and native Client Chase are mutually exclusive.
         if (config.kiteMode) {
             setClientChaseMode(0);
@@ -14506,7 +14359,6 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         detachCancelMessageHook();
         resetPendingTargetAck();
         state.rejectedTargetBackoff.clear();
-        detachAttackRuneCountListener();
         if (state.timerId != null) {
             window.clearTimeout(state.timerId);
             state.timerId = null;
@@ -14675,14 +14527,12 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         state.lureThresholdReachedAt = 0;
         state.lureAttackTicks = 0;
         state.lureTargetsAcquired = 0;
-        state.lureRunesUsed = 0;
         state.lureOutOfRangeClears = 0;
         state.lureSmartSwitches = 0;
         state.lureLastSmartSwitchAt = 0;
         state.lureLastSmartFromId = null;
         state.lureLastSmartToId = null;
         state.lureLastSmartReason = null;
-        state.lureRunePreserveSkips = 0;
         state.lureSmartTargetScore = null;
         state.lureSmartTargetHealthPct = null;
         state.lureMotionHistory.clear();
@@ -14699,7 +14549,6 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         state.lureLastMobStartedAt = 0;
         state.lureLastMobActivations = 0;
         state.lureLastMobFinishes = 0;
-        state.lureLastMobRuneBursts = 0;
         state.lureLastMobForcedAttackTicks = 0;
         state.lureLastMobForcedReacquires = 0;
         state.lureLastMobRangeExtensions = 0;
@@ -14726,10 +14575,6 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         state.lastTargetOwner = null;
         state.playerSessionRef = null;
         state.playerSessionSeen = false;
-        state.lastRuneCountRequestAt = 0;
-        state.lastRuneMissingWarningAt = 0;
-        state.runeCountItemId = 0;
-        state.runeCountFluidType = 0;
         bot.log("auto attack stopped");
         return true;
     }
@@ -14737,8 +14582,6 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     function status() {
         const now = Date.now();
         const combatActive = syncCombatState(now);
-        const runeCount = getAttackRuneCountState(now, state.running);
-        const runeCooldownRemainingMs = getAttackRuneCooldownRemainingMs();
         const currentTarget = getCurrentTarget();
         const currentApproach = currentTarget ? getTargetApproachInfo(currentTarget) : null;
         const currentHealthPct = currentTarget ? getCreatureHealthPercent(currentTarget) : null;
@@ -14756,11 +14599,6 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 ...config
             },
             lastTargetHotkeyAt: state.lastTargetHotkeyAt,
-            lastRuneHotkeyAt: state.lastRuneHotkeyAt,
-            runeItemId: runeCount.itemId || null,
-            runeItemCount: runeCount.known ? runeCount.count : null,
-            runeItemCountFresh: runeCount.fresh,
-            runeCooldownRemainingMs,
             engagedTargetId: state.engagedTargetId,
             combatActive,
             combatStartedAt: state.combatStartedAt || 0,
@@ -14994,14 +14832,12 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             lureThresholdReachedAt: state.lureThresholdReachedAt || 0,
             lureAttackTicks: state.lureAttackTicks || 0,
             lureTargetsAcquired: state.lureTargetsAcquired || 0,
-            lureRunesUsed: state.lureRunesUsed || 0,
             lureOutOfRangeClears: state.lureOutOfRangeClears || 0,
             lureSmartSwitches: state.lureSmartSwitches || 0,
             lureLastSmartSwitchAt: state.lureLastSmartSwitchAt || 0,
             lureLastSmartFromId: state.lureLastSmartFromId,
             lureLastSmartToId: state.lureLastSmartToId,
             lureLastSmartReason: state.lureLastSmartReason,
-            lureRunePreserveSkips: state.lureRunePreserveSkips || 0,
             lureSmartTargetScore: state.lureSmartTargetScore,
             lureSmartTargetHealthPct: state.lureSmartTargetHealthPct,
             lurePredictiveLeash:
@@ -15022,7 +14858,6 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             lureLastMobStartedAt: state.lureLastMobStartedAt || 0,
             lureLastMobActivations: state.lureLastMobActivations || 0,
             lureLastMobFinishes: state.lureLastMobFinishes || 0,
-            lureLastMobRuneBursts: state.lureLastMobRuneBursts || 0,
             lureLastMobForcedAttackTicks:
                 state.lureLastMobForcedAttackTicks || 0,
             lureLastMobForcedReacquires:
@@ -15152,6 +14987,11 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function updateConfig(nextConfig = {}) {
+        nextConfig =
+            stripLegacyAttackRuneConfig(
+                nextConfig
+            );
+
         let chaseSettingChanged =
             nextConfig.useClientChase !== undefined;
 
@@ -15179,9 +15019,6 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         }
         if (nextConfig.targetHotbarSlot !== undefined) {
             nextConfig.targetHotbarSlot = normalizeHotbarSlot(nextConfig.targetHotbarSlot) ?? config.targetHotbarSlot;
-        }
-        if (nextConfig.runeHotbarSlot !== undefined) {
-            nextConfig.runeHotbarSlot = normalizeHotbarSlot(nextConfig.runeHotbarSlot);
         }
         if (nextConfig.maxTargetDistance !== undefined) {
             nextConfig.maxTargetDistance = Math.max(1, Math.trunc(Number(nextConfig.maxTargetDistance) || config.maxTargetDistance || 5));
@@ -15442,7 +15279,6 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                  ? nextConfig.ignoredTargetNames.map(n => String(n).trim()).filter(Boolean)
                  : [];
         }
-        const runeSlotChanged = nextConfig.runeHotbarSlot !== undefined;
         Object.assign(config, nextConfig);
         invalidateCandidateSnapshot();
         invalidateAntiKSSnapshot();
@@ -15482,13 +15318,6 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 shouldChase;
         }
 
-        if (runeSlotChanged) {
-            state.lastRuneCountRequestAt = 0;
-            state.lastRuneMissingWarningAt = 0;
-            state.runeCountItemId = 0;
-            state.runeCountFluidType = 0;
-            if (state.running) getAttackRuneCountState(Date.now(), true);
-        }
         persistConfig();
         bot.log("auto attack config updated", {
             ...config
@@ -15513,11 +15342,11 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         tryAttack,
         canAttack,
         triggerAttack,
-        canUseRune,
-        triggerRune,
-        getRuneCountState: () => getAttackRuneCountState(Date.now(), false),
-        getRuneCooldownRemainingMs: getAttackRuneCooldownRemainingMs,
         getNearbyMonsters,
+        getProjectileLineOfSightToPosition: (position) => {
+            if (!position) return false;
+            return getTargetLineOfSightInfo({ getPosition: () => position }).clear === true;
+        },
         getLureVisibleMonsterSnapshot,
         getCurrentTarget,
         getCurrentFollowTarget,
@@ -15540,6 +15369,540 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         normalizeHotbarSlot,
         setClientChaseMode,
         config,
+    };
+};
+
+/**
+ * ==================================================================================
+ * 9B. RUNE SHOOTER
+ *     Full-inventory attack runes with count-priority rules and smart AoE aiming.
+ * ==================================================================================
+ */
+window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooterModule(bot) {
+    const configStorageKey = "minibiaBot.runeShooter.config";
+
+    const RUNE_TYPES = Object.freeze({
+        sd:    Object.freeze({ key:"sd",    label:"Sudden Death",        short:"SD",   itemId:3155, mode:"creature", shape:null }),
+        gfb:   Object.freeze({ key:"gfb",   label:"Great Fireball",      short:"GFB",  itemId:3191, mode:"aoe", shape:Object.freeze(["0011100","0111110","1111111","1111111","1111111","0111110","0011100"]) }),
+        fb:    Object.freeze({ key:"fb",    label:"Fireball",            short:"FB",   itemId:3189, mode:"aoe", shape:Object.freeze(["01110","11111","11111","11111","01110"]) }),
+        hmm:   Object.freeze({ key:"hmm",   label:"Heavy Magic Missile", short:"HMM",  itemId:3198, mode:"creature", shape:null }),
+        lmm:   Object.freeze({ key:"lmm",   label:"Light Magic Missile", short:"LMM",  itemId:3174, mode:"creature", shape:null }),
+        explo: Object.freeze({ key:"explo", label:"Explosion",           short:"EXPL", itemId:3200, mode:"aoe", shape:Object.freeze(["010","111","010"]) }),
+    });
+    const RUNE_KEYS = Object.freeze(["sd","gfb","fb","hmm","lmm","explo"]);
+
+    function buildOffsets(mask) {
+        if (!Array.isArray(mask) || !mask.length) return [];
+        const h = mask.length;
+        const w = Math.max(...mask.map(r => String(r).length));
+        const cx = Math.floor(w / 2), cy = Math.floor(h / 2);
+        const out = [];
+        for (let y = 0; y < h; y++) {
+            const row = String(mask[y]);
+            for (let x = 0; x < row.length; x++) {
+                if (row[x] === "1") out.push({ x: x - cx, y: y - cy });
+            }
+        }
+        return out;
+    }
+    const SHAPES = Object.freeze({
+        gfb: Object.freeze(buildOffsets(RUNE_TYPES.gfb.shape)),
+        fb: Object.freeze(buildOffsets(RUNE_TYPES.fb.shape)),
+        explo: Object.freeze(buildOffsets(RUNE_TYPES.explo.shape)),
+    });
+
+    const state = {
+        running:false, timerId:null, unsubscribeCounts:null,
+        lastCountRequestAt:0, pendingUntil:0, lastCastAt:0,
+        castCount:0, aoeCastCount:0, creatureCastCount:0,
+        skippedCooldown:0, skippedNoSupply:0, skippedNoLos:0,
+        skippedHealingPriority:0,
+        healingPriorityDispatches:0,
+        healingPriorityReadyBlocks:0,
+        healingPriorityPendingBlocks:0,
+        visibleMonsterCount:0, lastRuneKey:null, lastRuneLabel:null,
+        lastHitCount:0, lastTargetPosition:null, lastTargetCreatureId:null,
+        lastTargetCreatureName:null, lastRuleMinCreatures:0, lastError:null,
+    };
+
+    const config = Object.assign({
+        enabled:false, tickMs:100, countRefreshMs:15000, countFreshMs:30000, rules:[]
+    }, bot.storage.get(configStorageKey, {}));
+
+    function normalizeRuneKey(value) {
+        const raw = String(value || "").trim().toLowerCase();
+        const aliases = {
+            "sudden death":"sd", sudden:"sd", sd:"sd",
+            "great fireball":"gfb", greatfireball:"gfb", gfb:"gfb",
+            fireball:"fb", fb:"fb",
+            "heavy magic missile":"hmm", heavymagicmissile:"hmm", hmm:"hmm",
+            "light magic missile":"lmm", lightmagicmissile:"lmm", lmm:"lmm",
+            explosion:"explo", "explosion rune":"explo", explo:"explo", expl:"explo",
+        };
+        return aliases[raw] || null;
+    }
+
+    function normalizeRules(rules) {
+        const out = [];
+        (Array.isArray(rules) ? rules : []).forEach((rule, index) => {
+            const rune = normalizeRuneKey(rule?.rune ?? rule?.type ?? rule?.runeType);
+            if (!rune || !RUNE_TYPES[rune]) return;
+            out.push({
+                rune,
+                minCreatures: Math.max(1, Math.min(30, Math.trunc(Number(rule?.minCreatures ?? rule?.creatureCount ?? 1) || 1))),
+                _order:index,
+            });
+        });
+        out.sort((a,b) => b.minCreatures - a.minCreatures || a._order - b._order);
+        return out.map(({rune,minCreatures}) => ({rune,minCreatures}));
+    }
+    config.rules = normalizeRules(config.rules);
+
+    function persistConfig() {
+        bot.storage.set(configStorageKey, {
+            enabled:!!config.enabled,
+            tickMs:config.tickMs,
+            countRefreshMs:config.countRefreshMs,
+            countFreshMs:config.countFreshMs,
+            rules:config.rules.map(r => ({...r})),
+        });
+    }
+
+    function getDefinition(key) { return RUNE_TYPES[normalizeRuneKey(key)] || null; }
+
+    function getConfiguredDefinitions() {
+        const seen = new Set(), out = [];
+        for (const rule of config.rules) {
+            const def = getDefinition(rule.rune);
+            if (!def || seen.has(def.itemId)) continue;
+            seen.add(def.itemId); out.push(def);
+        }
+        return out;
+    }
+
+    function requestRuneCounts(now = Date.now(), force = false) {
+        if (!force && now - state.lastCountRequestAt < Math.max(2000, Number(config.countRefreshMs) || 15000)) return false;
+        const defs = getConfiguredDefinitions();
+        if (!defs.length || typeof bot.requestItemCounts !== "function") return false;
+        const sent = bot.requestItemCounts(defs.map(def => ({ id:def.itemId, fluidType:0 })));
+        if (sent) state.lastCountRequestAt = now;
+        return sent;
+    }
+
+    function getRuneCountState(key, now = Date.now()) {
+        const def = getDefinition(key);
+        if (!def) return { known:false, fresh:false, count:null, at:0 };
+        const reading = typeof bot.getItemCountReading === "function"
+            ? bot.getItemCountReading(def.itemId, 0) : null;
+        if (!reading) return { known:false, fresh:false, count:null, at:0 };
+        const at = Number(reading.at || 0);
+        return {
+            known:true,
+            fresh: now - at <= Math.max(5000, Number(config.countFreshMs) || 30000),
+            count:Math.max(0, Math.trunc(Number(reading.count) || 0)),
+            at,
+        };
+    }
+
+    function getSupplySnapshot(now = Date.now()) {
+        const out = {};
+        for (const key of RUNE_KEYS) {
+            const def = RUNE_TYPES[key], r = getRuneCountState(key, now);
+            out[key] = { itemId:def.itemId, label:def.label, ...r };
+        }
+        return out;
+    }
+
+    function configuredCountsKnown(now = Date.now()) {
+        return getConfiguredDefinitions().every(def => getRuneCountState(def.key, now).known);
+    }
+
+    function getRuneCooldownRemainingMs() {
+        const hm = window.gameClient?.interface?.hotbarManager;
+        if (!hm || typeof hm.__getRuneEffectiveCooldown !== "function") return 0;
+        try {
+            const cd = hm.__getRuneEffectiveCooldown(true);
+            return cd?.until > performance.now() ? Math.max(0, cd.until - performance.now()) : 0;
+        } catch (e) { return 0; }
+    }
+
+    function normalizePosition(value) {
+        if (!value) return null;
+        const x=Number(value.x), y=Number(value.y), z=Number(value.z);
+        if (![x,y,z].every(Number.isFinite)) return null;
+        return { x:Math.trunc(x), y:Math.trunc(y), z:Math.trunc(z) };
+    }
+    function monsterPos(m) { return normalizePosition(m?.getPosition?.() || m?.__position); }
+    function dist(a,b) { return (!a || !b) ? Infinity : Math.max(Math.abs(a.x-b.x), Math.abs(a.y-b.y)); }
+
+    function hasLos(pos) {
+        const fn = bot.attack?.getProjectileLineOfSightToPosition;
+        if (typeof fn !== "function") return true;
+        try { return fn(pos) === true; } catch (e) { return false; }
+    }
+
+    function getEligibleMonsters(sorted = false) {
+        let monsters = [];
+        try { monsters = bot.attack?.getNearbyMonsters?.(sorted) || []; } catch (e) {}
+        const me = normalizePosition(bot.getPlayerPosition());
+        return monsters.filter(m => {
+            if (!m || m.id == null || bot.attack?.isIgnoredTarget?.(m)) return false;
+            const p = monsterPos(m);
+            if (!me || !p || p.z !== me.z) return false;
+            const hp = Number(m.state?.health ?? m.health);
+            return !(Number.isFinite(hp) && hp <= 0);
+        });
+    }
+
+    function getSingleTarget(monsters) {
+        if (!monsters?.length) return null;
+        const current = bot.attack?.getCurrentTarget?.();
+        if (current && monsters.some(m => Number(m.id) === Number(current.id))) {
+            const p = monsterPos(current);
+            if (p && hasLos(p)) return current;
+        }
+        for (const m of getEligibleMonsters(true)) {
+            const p = monsterPos(m);
+            if (p && hasLos(p)) return m;
+            state.skippedNoLos++;
+        }
+        return null;
+    }
+
+    function getLoadedTile(pos) {
+        const world = window.gameClient?.world;
+        if (!world || typeof world.getTileFromWorldPosition !== "function" || typeof Position !== "function") return null;
+        try { return world.getTileFromWorldPosition(new Position(pos.x,pos.y,pos.z)) || null; }
+        catch (e) { return null; }
+    }
+
+    function getBestAoeTarget(runeKey, monsters) {
+        const offsets = SHAPES[runeKey];
+        if (!offsets?.length || !monsters?.length) return null;
+        const me = normalizePosition(bot.getPlayerPosition());
+        if (!me) return null;
+        const entries = monsters.map(monster => ({monster,pos:monsterPos(monster)}))
+            .filter(e => e.pos && e.pos.z === me.z);
+        if (!entries.length) return null;
+        const currentId = Number(bot.attack?.getCurrentTarget?.()?.id);
+        const centers = new Map();
+        for (const e of entries) {
+            for (const off of offsets) {
+                const c = {x:e.pos.x-off.x, y:e.pos.y-off.y, z:e.pos.z};
+                centers.set(`${c.x},${c.y},${c.z}`, c);
+            }
+        }
+        const offsetSet = new Set(offsets.map(o => `${o.x},${o.y}`));
+        let best = null;
+        for (const center of centers.values()) {
+            if (!getLoadedTile(center)) continue;
+            if (!hasLos(center)) { state.skippedNoLos++; continue; }
+            const hits = [];
+            let includesCurrent = false, distanceSum = 0;
+            for (const e of entries) {
+                if (!offsetSet.has(`${e.pos.x-center.x},${e.pos.y-center.y}`)) continue;
+                hits.push(e.monster);
+                if (Number(e.monster.id) === currentId) includesCurrent = true;
+                distanceSum += dist(me,e.pos);
+            }
+            if (!hits.length) continue;
+            const candidate = {
+                position:center, hits, hitCount:hits.length, includesCurrent,
+                centerDistance:dist(me,center), distanceSum
+            };
+            if (!best ||
+                candidate.hitCount > best.hitCount ||
+                (candidate.hitCount === best.hitCount && candidate.includesCurrent && !best.includesCurrent) ||
+                (candidate.hitCount === best.hitCount && candidate.includesCurrent === best.includesCurrent && candidate.centerDistance < best.centerDistance) ||
+                (candidate.hitCount === best.hitCount && candidate.includesCurrent === best.includesCurrent && candidate.centerDistance === best.centerDistance && candidate.distanceSum < best.distanceSum)) {
+                best = candidate;
+            }
+        }
+        return best;
+    }
+
+    function sendCreatureRune(def, creature) {
+        if (!def || !creature || typeof HotbarUsePacket !== "function" || !window.gameClient?.send) return false;
+        window.gameClient.send(new HotbarUsePacket(def.itemId,0,1,creature.id));
+        return true;
+    }
+    function sendAoeRune(def, position) {
+        if (!def || !position || typeof HotbarUsePacket !== "function" || !window.gameClient?.send) return false;
+        window.gameClient.send(new HotbarUsePacket(def.itemId,0,3,0,position));
+        return true;
+    }
+
+    function yieldToHealing(
+        tryDispatch = false
+    ) {
+        const heal =
+            bot.heal;
+
+        if (!heal)
+            return false;
+
+        let running = false;
+
+        try {
+            running =
+                heal.status?.()
+                    ?.running === true;
+        } catch (e) {
+            // If Healing exists but its state cannot be read, fail closed for
+            // Rune Shooter rather than stealing an action from a possible heal.
+            state.skippedHealingPriority++;
+            state.healingPriorityReadyBlocks++;
+            return true;
+        }
+
+        if (!running)
+            return false;
+
+        if (
+            tryDispatch &&
+            typeof heal.tryHeal ===
+                "function"
+        ) {
+            try {
+                if (
+                    heal.tryHeal() === true
+                ) {
+                    state.skippedHealingPriority++;
+                    state.healingPriorityDispatches++;
+                    return true;
+                }
+            } catch (e) {
+                // Healing gets the conservative choice on an unexpected error.
+                state.skippedHealingPriority++;
+                state.healingPriorityReadyBlocks++;
+                return true;
+            }
+        }
+
+        try {
+            if (
+                heal.hasPendingAction?.() ===
+                true
+            ) {
+                state.skippedHealingPriority++;
+                state.healingPriorityPendingBlocks++;
+                return true;
+            }
+        } catch (e) {
+            state.skippedHealingPriority++;
+            state.healingPriorityPendingBlocks++;
+            return true;
+        }
+
+        try {
+            if (
+                heal.needsPriorityAction?.() ===
+                true
+            ) {
+                state.skippedHealingPriority++;
+                state.healingPriorityReadyBlocks++;
+                return true;
+            }
+        } catch (e) {
+            state.skippedHealingPriority++;
+            state.healingPriorityReadyBlocks++;
+            return true;
+        }
+
+        return false;
+    }
+
+    function tryRule(rule, monsters, now) {
+        const def = getDefinition(rule?.rune);
+        if (!def) return false;
+        const supply = getRuneCountState(def.key, now);
+        if (!supply.known || supply.count <= 0) { state.skippedNoSupply++; return false; }
+
+        const target = def.mode === "creature" ? getSingleTarget(monsters) : null;
+        const aoe = def.mode === "aoe" ? getBestAoeTarget(def.key, monsters) : null;
+        if (def.mode === "creature" && !target) return false;
+        if (def.mode === "aoe" && !aoe) return false;
+
+        // Healing always wins. Re-check immediately before taking the rune
+        // lock so a heal becoming ready during target/AoE calculation cannot
+        // lose the action window to an offensive rune.
+        if (
+            yieldToHealing(false)
+        ) {
+            return false;
+        }
+
+        const releaseRuneGuard = bot.actions?.tryAcquire?.("aggressive-rune", 900) || null;
+        if (bot.actions && !releaseRuneGuard) return false;
+
+        const action = () => def.mode === "creature"
+            ? sendCreatureRune(def,target) : sendAoeRune(def,aoe.position);
+        const sent = bot.actions?.runShared
+            ? bot.actions.runShared("rune-shooter", bot.actions.priorities.COMBAT, action, 120)
+            : action();
+
+        if (!sent) { releaseRuneGuard?.(); return false; }
+
+        state.lastCastAt = now;
+        state.pendingUntil = now + 700;
+        state.castCount++;
+        state.lastRuneKey = def.key;
+        state.lastRuneLabel = def.label;
+        state.lastRuleMinCreatures = rule.minCreatures;
+        state.lastError = null;
+
+        if (def.mode === "creature") {
+            state.creatureCastCount++;
+            state.lastHitCount = 1;
+            state.lastTargetPosition = monsterPos(target);
+            state.lastTargetCreatureId = target.id;
+            state.lastTargetCreatureName = target.name || "Mob";
+            bot.log("Rune Shooter: fired targeted rune", {
+                rune:def.label, itemId:def.itemId, minCreatures:rule.minCreatures,
+                visibleMonsters:monsters.length, target:state.lastTargetCreatureName,
+                targetId:target.id, supplyBefore:supply.count
+            });
+        } else {
+            state.aoeCastCount++;
+            state.lastHitCount = aoe.hitCount;
+            state.lastTargetPosition = {...aoe.position};
+            state.lastTargetCreatureId = null;
+            state.lastTargetCreatureName = null;
+            bot.log("Rune Shooter: fired AoE rune", {
+                rune:def.label, itemId:def.itemId, minCreatures:rule.minCreatures,
+                visibleMonsters:monsters.length, hitCount:aoe.hitCount, aim:aoe.position,
+                hits:aoe.hits.map(m => m.name || "Mob"), supplyBefore:supply.count
+            });
+        }
+        return true;
+    }
+
+    function tick() {
+        if (!state.running) return;
+        try {
+            const now = Date.now();
+            if (!config.enabled || bot.actions?.isHalted?.() ||
+                !window.gameClient?.networkManager?.isConnected?.() || !window.gameClient?.player) return;
+
+            // v1.5.72: Healing gets a synchronous first chance on every Rune
+            // Shooter tick. A dispatched, pending, or currently-ready heal
+            // blocks offensive rune use for this tick.
+            if (
+                yieldToHealing(true)
+            ) {
+                return;
+            }
+
+            requestRuneCounts(now,false);
+            if (!config.rules.length) return;
+            if (!configuredCountsKnown(now)) {
+                if (!state.lastCountRequestAt)
+                    requestRuneCounts(now,true);
+                return;
+            }
+            if (now < state.pendingUntil) return;
+            if (getRuneCooldownRemainingMs() > 0) { state.skippedCooldown++; return; }
+            if (bot.attack?.isProtectionZoneBlocked?.(now)) return;
+
+            const monsters = getEligibleMonsters(false);
+            state.visibleMonsterCount = monsters.length;
+            if (!monsters.length) return;
+
+            for (const rule of config.rules) {
+                if (monsters.length < rule.minCreatures) continue;
+                if (tryRule(rule,monsters,now)) break;
+            }
+        } catch (e) {
+            state.lastError = e?.message || String(e);
+            bot.log("Rune Shooter tick failed", e);
+        } finally {
+            scheduleNextTick();
+        }
+    }
+
+    function scheduleNextTick() {
+        if (!state.running) return;
+        if (state.timerId) clearTimeout(state.timerId);
+        state.timerId = setTimeout(tick, Math.max(50, Math.min(500, Number(config.tickMs) || 100)));
+    }
+
+    function attachCountListener() {
+        if (state.unsubscribeCounts || typeof bot.subscribeItemCounts !== "function") return;
+        state.unsubscribeCounts = bot.subscribeItemCounts(reading => {
+            if (!state.running || !reading) return;
+            const ids = new Set(getConfiguredDefinitions().map(def => Number(def.itemId)));
+            if (ids.has(Number(reading.itemId))) {
+                try { bot.ui?.refreshRuneShooterStatus?.(); } catch (e) {}
+            }
+        });
+    }
+    function detachCountListener() {
+        if (!state.unsubscribeCounts) return;
+        try { state.unsubscribeCounts(); } catch (e) {}
+        state.unsubscribeCounts = null;
+    }
+
+    function start() {
+        if (state.running) return false;
+        config.enabled = true; persistConfig();
+        state.running = true; state.pendingUntil = 0; state.lastCountRequestAt = 0; state.lastError = null;
+        attachCountListener(); requestRuneCounts(Date.now(),true); tick();
+        bot.log("Rune Shooter started", { rules:config.rules });
+        return true;
+    }
+    function stop(options = {}) {
+        const persist = options.persistEnabled !== false;
+        state.running = false;
+        if (state.timerId) { clearTimeout(state.timerId); state.timerId = null; }
+        detachCountListener();
+        if (persist) { config.enabled = false; persistConfig(); }
+        bot.log("Rune Shooter stopped");
+        return true;
+    }
+    function updateConfig(next = {}) {
+        if (next.rules !== undefined) config.rules = normalizeRules(next.rules);
+        if (next.tickMs !== undefined) config.tickMs = Math.max(50,Math.min(500,Math.trunc(Number(next.tickMs)||100)));
+        if (next.countRefreshMs !== undefined) config.countRefreshMs = Math.max(5000,Math.min(60000,Math.trunc(Number(next.countRefreshMs)||15000)));
+        if (next.countFreshMs !== undefined) config.countFreshMs = Math.max(10000,Math.min(120000,Math.trunc(Number(next.countFreshMs)||30000)));
+        if (next.enabled !== undefined) config.enabled = next.enabled === true;
+        persistConfig();
+        if (config.enabled && !state.running) start();
+        else if (!config.enabled && state.running) stop();
+        else if (state.running && next.rules !== undefined) { state.lastCountRequestAt = 0; requestRuneCounts(Date.now(),true); }
+        return {...config, rules:config.rules.map(r => ({...r}))};
+    }
+    function status() {
+        const now = Date.now();
+        return {
+            running:state.running,
+            config:{...config, rules:config.rules.map(r => ({...r}))},
+            visibleMonsterCount:state.visibleMonsterCount,
+            runeCooldownRemainingMs:Math.round(getRuneCooldownRemainingMs()),
+            supplies:getSupplySnapshot(now),
+            lastCastAt:state.lastCastAt, lastRuneKey:state.lastRuneKey, lastRuneLabel:state.lastRuneLabel,
+            lastHitCount:state.lastHitCount,
+            lastTargetPosition:state.lastTargetPosition ? {...state.lastTargetPosition} : null,
+            lastTargetCreatureId:state.lastTargetCreatureId, lastTargetCreatureName:state.lastTargetCreatureName,
+            lastRuleMinCreatures:state.lastRuleMinCreatures,
+            castCount:state.castCount, aoeCastCount:state.aoeCastCount, creatureCastCount:state.creatureCastCount,
+            skippedCooldown:state.skippedCooldown, skippedNoSupply:state.skippedNoSupply,
+            skippedNoLos:state.skippedNoLos,
+            skippedHealingPriority:state.skippedHealingPriority,
+            healingPriorityDispatches:state.healingPriorityDispatches,
+            healingPriorityReadyBlocks:state.healingPriorityReadyBlocks,
+            healingPriorityPendingBlocks:state.healingPriorityPendingBlocks,
+            lastError:state.lastError,
+        };
+    }
+    function getRuneTypes() {
+        return RUNE_KEYS.map(key => ({...RUNE_TYPES[key], shape:RUNE_TYPES[key].shape ? [...RUNE_TYPES[key].shape] : null}));
+    }
+
+    if (config.enabled) start();
+    bot.addCleanup(() => stop({persistEnabled:false}));
+    bot.runeShooter = {
+        start, stop, status, updateConfig, getRuneTypes, getRuneCountState,
+        requestCounts:() => requestRuneCounts(Date.now(),true), config
     };
 };
 
@@ -33392,7 +33755,7 @@ window.__minibiaBotBundle.installPinkSkullDetectorModule = function installPinkS
 
         // Module errors must never prevent the disconnect. Preserve enabled
         // preferences so that a deliberate reload does not silently erase them.
-        for (const name of ["autoPickup", "cave", "attack", "rune", "heal", "invisible", "magicShield",
+        for (const name of ["autoPickup", "cave", "attack", "runeShooter", "rune", "heal", "invisible", "magicShield",
                             "equipRing", "eat", "paladin", "looter"]) {
             try { bot[name]?.stop?.({ persistEnabled: false }); }
             catch (e) { bot.log(`Pink Skull: failed to stop ${name}:`, e); }
@@ -33482,6 +33845,7 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
         "minibiaBot.invisible.config",
         "minibiaBot.magicShield.config",
         "minibiaBot.attack.config",
+        "minibiaBot.runeShooter.config",
         "minibiaBot.cave.config",
         "minibiaBot.cave.route",
         "minibiaBot.cave.transitions",
@@ -33666,7 +34030,38 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
             if (value === undefined) {
                 localStorage.removeItem(key);
             } else {
-                localStorage.setItem(key, JSON.stringify(value));
+                let nextValue = value;
+
+                if (
+                    key ===
+                    "minibiaBot.attack.config" &&
+                    nextValue &&
+                    typeof nextValue ===
+                        "object"
+                ) {
+                    nextValue = {
+                        ...nextValue
+                    };
+                    for (const legacyKey of [
+                        "runeHotbarSlot",
+                        "runeCooldownMs",
+                        "runeCountRefreshMs",
+                        "runeCountFreshMs",
+                        "attackRuneHotbarSlot",
+                        "attackRuneSlot"
+                    ]) {
+                        delete nextValue[
+                            legacyKey
+                        ];
+                    }
+                }
+
+                localStorage.setItem(
+                    key,
+                    JSON.stringify(
+                        nextValue
+                    )
+                );
             }
         }
     }
@@ -35488,6 +35883,13 @@ function upgradeSectionHeaders(panel) {
                 stop:  () => bot.attack?.stop?.(),
             },
             {
+                key: "runeShooter",
+                btnId: "minibia-bot-status-rune-shooter-toggle",
+                isRunning: () => !!bot.runeShooter?.status?.().running,
+                start: () => bot.runeShooter?.start?.(),
+                stop:  () => bot.runeShooter?.stop?.(),
+            },
+            {
                 key: "heal",
                 btnId: "minibia-bot-status-heal-toggle",
                 isRunning: () => !!bot.heal?.status?.().running,
@@ -35950,6 +36352,144 @@ function upgradeSectionHeaders(panel) {
             toggle.checked = !!bot.heal?.status?.().running;
     }
 
+    // ---- RUNE SHOOTER UI ----
+    let runeShooterEditIndex = null;
+
+    function clearRuneShooterRuleForm() {
+        const type = document.getElementById("minibia-bot-rune-shooter-type");
+        const count = document.getElementById("minibia-bot-rune-shooter-count");
+        const save = document.getElementById("minibia-bot-rune-shooter-save");
+        if (type) type.value = "sd";
+        if (count) count.value = "1";
+        if (save) save.textContent = "Add Rule";
+        runeShooterEditIndex = null;
+    }
+
+    function setRuneShooterRuleForm(rule, index) {
+        const type = document.getElementById("minibia-bot-rune-shooter-type");
+        const count = document.getElementById("minibia-bot-rune-shooter-count");
+        const save = document.getElementById("minibia-bot-rune-shooter-save");
+        if (type) type.value = rule?.rune || "sd";
+        if (count) count.value = String(rule?.minCreatures ?? 1);
+        if (save) save.textContent = "Update Rule";
+        runeShooterEditIndex = index;
+    }
+
+    function refreshRuneShooterStatus() {
+        const toggle = document.getElementById("minibia-bot-rune-shooter-enabled");
+        const list = document.getElementById("minibia-bot-rune-shooter-rules-list");
+        const label = document.getElementById("minibia-bot-rune-shooter-status");
+        const status = bot.runeShooter?.status?.();
+
+        if (toggle && document.activeElement !== toggle)
+            toggle.checked = !!status?.running;
+
+        if (label) {
+            const last = status?.lastRuneLabel
+                ? `${status.lastRuneLabel}${status.lastHitCount ? ` (${status.lastHitCount} hit${status.lastHitCount === 1 ? "" : "s"})` : ""}`
+                : "none";
+            const cd = Number(status?.runeCooldownRemainingMs || 0);
+            label.textContent =
+                `Visible monsters: ${status?.visibleMonsterCount ?? 0} | Last: ${last}` +
+                (cd > 0 ? ` | Rune CD ${(cd / 1000).toFixed(1)}s` : "");
+        }
+
+        if (!list) return;
+        const rules = status?.config?.rules || bot.runeShooter?.config?.rules || [];
+        const supplies = status?.supplies || {};
+        const defs = bot.runeShooter?.getRuneTypes?.() || [];
+        const byKey = new Map(defs.map(def => [def.key, def]));
+
+        list.innerHTML = "";
+        if (!rules.length) {
+            const empty = document.createElement("div");
+            empty.className = "mb-small-note";
+            empty.textContent = "No rune shooter rules configured.";
+            list.appendChild(empty);
+            return;
+        }
+
+        rules.forEach((rule, index) => {
+            const def = byKey.get(rule.rune);
+            const supply = supplies[rule.rune];
+
+            const row = document.createElement("div");
+            row.className = "mb-list-row";
+            row.style.cssText = "display:grid;grid-template-columns:1fr auto auto;gap:6px;align-items:center;padding:4px 0;border-bottom:1px solid rgba(255,255,255,0.08);";
+
+            const info = document.createElement("div");
+            info.style.cssText = "display:flex;flex-wrap:wrap;gap:5px;align-items:center;font-size:11px;";
+
+            const rune = document.createElement("span");
+            rune.textContent = def?.short || String(rule.rune || "Rune").toUpperCase();
+            rune.style.cssText = "font-weight:bold;color:#e9d39b;";
+            info.appendChild(rune);
+
+            const count = document.createElement("span");
+            count.textContent = `≥ ${rule.minCreatures} creature${rule.minCreatures === 1 ? "" : "s"}`;
+            count.style.cssText = "background:#202a1a;padding:0 4px;border-radius:3px;color:#c8efb0;";
+            info.appendChild(count);
+
+            const mode = document.createElement("span");
+            mode.textContent = def?.mode === "aoe" ? "AoE auto-aim" : "single target";
+            mode.style.cssText = "opacity:0.72;";
+            info.appendChild(mode);
+
+            const qty = document.createElement("span");
+            qty.textContent = supply?.known ? `×${supply.count}` : "×?";
+            qty.style.cssText = "color:#9fcfff;";
+            qty.title = def ? `${def.label} CID ${def.itemId}${supply?.fresh === false ? " (count may be stale)" : ""}` : "";
+            info.appendChild(qty);
+
+            row.appendChild(info);
+
+            const edit = document.createElement("button");
+            edit.type = "button";
+            edit.className = "mb-small-button";
+            edit.textContent = "Edit";
+            edit.style.cssText = "width:auto;padding:2px 8px;";
+            edit.addEventListener("click", () => setRuneShooterRuleForm(rule, index));
+            row.appendChild(edit);
+
+            const remove = document.createElement("button");
+            remove.type = "button";
+            remove.className = "mb-small-button";
+            remove.textContent = "✕";
+            remove.title = "Remove rule";
+            remove.style.cssText = "width:24px;padding:2px;background:#5a2020;color:#ff8888;border-color:#883030;";
+            remove.addEventListener("click", () => {
+                const current = (bot.runeShooter?.config?.rules || []).map(entry => ({...entry}));
+                current.splice(index, 1);
+                bot.runeShooter?.updateConfig?.({ rules: current });
+                clearRuneShooterRuleForm();
+                refreshRuneShooterStatus();
+            });
+            row.appendChild(remove);
+
+            list.appendChild(row);
+        });
+    }
+
+    function saveRuneShooterRule() {
+        const type = document.getElementById("minibia-bot-rune-shooter-type");
+        const count = document.getElementById("minibia-bot-rune-shooter-count");
+        const rune = String(type?.value || "sd");
+        const minCreatures = Math.max(1, Math.min(30, Math.trunc(Number(count?.value) || 1)));
+        if (count) count.value = String(minCreatures);
+
+        const rules = (bot.runeShooter?.config?.rules || []).map(entry => ({...entry}));
+        const next = { rune, minCreatures };
+
+        if (runeShooterEditIndex !== null && runeShooterEditIndex >= 0 && runeShooterEditIndex < rules.length)
+            rules[runeShooterEditIndex] = next;
+        else
+            rules.push(next);
+
+        bot.runeShooter?.updateConfig?.({ rules });
+        clearRuneShooterRuleForm();
+        refreshRuneShooterStatus();
+    }
+
     // ---- AUTO ATTACK STATUS ----
     function refreshAutoAttackStatus() {
         const status = bot.attack?.status?.();
@@ -35958,8 +36498,6 @@ function upgradeSectionHeaders(panel) {
             enabled: document.getElementById("minibia-bot-auto-attack-enabled"),
             melee: document.getElementById("minibia-bot-auto-attack-melee"),
             hotkey: document.getElementById("minibia-bot-auto-attack-hotkey"),
-            runeHotkey: document.getElementById("minibia-bot-auto-attack-rune-hotkey"),
-            runeCount: document.getElementById("minibia-bot-auto-attack-rune-count"),
             maxDist: document.getElementById("minibia-bot-auto-attack-maxdist"),
             antiKS: document.getElementById("minibia-bot-auto-attack-antiks"),
             antiKSSelf: document.getElementById("minibia-bot-auto-attack-antiks-self"),
@@ -36004,21 +36542,6 @@ function upgradeSectionHeaders(panel) {
             inputs.melee.checked = attackConfig.meleeMode !== false;
         if (inputs.hotkey && document.activeElement !== inputs.hotkey) {
             inputs.hotkey.value = String(attackConfig.targetHotbarSlot ?? 3);
-        }
-        if (inputs.runeHotkey && document.activeElement !== inputs.runeHotkey) {
-            inputs.runeHotkey.value = attackConfig.runeHotbarSlot ? String(attackConfig.runeHotbarSlot) : "";
-        }
-        if (inputs.runeCount) {
-            if (!attackConfig.runeHotbarSlot || !status?.runeItemId) {
-                inputs.runeCount.textContent = "";
-                inputs.runeCount.title = attackConfig.runeHotbarSlot ? "The selected hotbar slot is not bound to an item." : "Set a rune hotbar slot to show supply.";
-            } else if (status.runeItemCount !== null && status.runeItemCount !== undefined) {
-                inputs.runeCount.textContent = `×${status.runeItemCount}`;
-                inputs.runeCount.title = `Server inventory count for rune CID ${status.runeItemId}${status.runeItemCountFresh ? "" : " (stale)"}.`;
-            } else {
-                inputs.runeCount.textContent = "×?";
-                inputs.runeCount.title = `Waiting for server inventory count for rune CID ${status.runeItemId}.`;
-            }
         }
         if (inputs.maxDist && document.activeElement !== inputs.maxDist) {
             inputs.maxDist.value = attackConfig.maxTargetDistance ?? 5;
@@ -37980,6 +38503,21 @@ function upgradeSectionHeaders(panel) {
         <button type="button" class="mb-status-toggle" id="minibia-bot-status-attack-toggle">Start</button>
       </div>
 
+      <div class="mb-status-card" data-status-module="runeShooter">
+        <div class="mb-status-card-top">
+          <div class="mb-status-card-icon">🎯</div>
+          <div class="mb-status-card-info">
+            <div class="mb-status-card-name">Rune Shooter</div>
+            <div class="mb-status-card-sub">Smart attack runes</div>
+          </div>
+        </div>
+        <div class="mb-status-card-state">
+          <span class="mb-status-dot"></span>
+          <span class="mb-status-text">Idle</span>
+        </div>
+        <button type="button" class="mb-status-toggle" id="minibia-bot-status-rune-shooter-toggle">Start</button>
+      </div>
+
       <div class="mb-status-card" data-status-module="heal">
         <div class="mb-status-card-top">
           <div class="mb-status-card-icon">💚</div>
@@ -38618,10 +39156,10 @@ function upgradeSectionHeaders(panel) {
       </div>
     </div>
 
-    <!-- Movement and runes -->
+    <!-- Movement -->
     <div style="border-top:1px solid rgba(255,255,255,0.08); margin-top:10px; padding-top:8px;">
       <div class="mb-section-title mb-section-title--sub" style="margin:0 0 6px 0;">
-        <span class="mb-title-text">Movement &amp; Runes</span>
+        <span class="mb-title-text">Movement</span>
       </div>
 
       <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
@@ -38640,29 +39178,53 @@ function upgradeSectionHeaders(panel) {
           <span>Keep Diagonal</span>
         </label>
 
-        <span style="color:#666;">|</span>
+      </div>
+    </div>
 
-        <label class="mb-field" style="flex:0 0 72px;">
-          <span class="mb-field-label" style="font-size:10px;">Rune Slot</span>
-          <input type="number" id="minibia-bot-auto-attack-rune-hotkey" min="1" max="12" placeholder="4" style="padding:3px 4px;font-size:11px;" />
+    <!-- Rune Shooter -->
+    <div style="border-top:1px solid rgba(255,255,255,0.08); margin-top:10px; padding-top:8px;">
+      <div class="mb-section-title mb-section-title--sub" style="margin:0 0 6px 0;">
+        <input type="checkbox" id="minibia-bot-rune-shooter-enabled" class="mb-title-toggle" />
+        <span class="mb-title-text">🎯 Rune Shooter</span>
+      </div>
+
+      <div id="minibia-bot-rune-shooter-rules-list" class="mb-list" style="margin:6px 0;"></div>
+
+      <div style="display:grid;grid-template-columns:1fr 108px;gap:6px;align-items:end;">
+        <label class="mb-field">
+          <span class="mb-field-label" style="font-size:10px;">Rune Type</span>
+          <select id="minibia-bot-rune-shooter-type" style="padding:3px 4px;font-size:11px;">
+            <option value="sd">Sudden Death (SD)</option>
+            <option value="gfb">Great Fireball (GFB)</option>
+            <option value="fb">Fireball (FB)</option>
+            <option value="hmm">Heavy Magic Missile (HMM)</option>
+            <option value="lmm">Light Magic Missile (LMM)</option>
+            <option value="explo">Explosion</option>
+          </select>
         </label>
 
-        <span id="minibia-bot-auto-attack-rune-count" style="font-size:10px;color:#aaa;min-width:22px;white-space:nowrap;" title="Set a rune hotbar slot to show supply."></span>
+        <label class="mb-field">
+          <span class="mb-field-label" style="font-size:10px;">Creature Count</span>
+          <input type="number" id="minibia-bot-rune-shooter-count" min="1" max="30" value="1" style="padding:3px 4px;font-size:11px;" />
+        </label>
       </div>
+
+      <div style="display:flex;gap:6px;margin-top:6px;">
+        <button type="button" class="mb-small-button" id="minibia-bot-rune-shooter-save" style="flex:1;">Add Rule</button>
+        <button type="button" class="mb-small-button" id="minibia-bot-rune-shooter-cancel" style="width:auto;padding:4px 10px;">Cancel</button>
+      </div>
+
+      <div id="minibia-bot-rune-shooter-status" class="mb-small-note" style="margin-top:5px;">Rune Shooter: idle</div>
     </div>
 
     <!-- Lure -->
     <div style="border-top:1px solid rgba(255,255,255,0.08); margin-top:10px; padding-top:8px;">
       <div class="mb-section-title mb-section-title--sub" style="margin:0 0 6px 0;">
+        <input type="checkbox" id="minibia-bot-auto-attack-lure" class="mb-title-toggle" />
         <span class="mb-title-text">Lure</span>
       </div>
 
       <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
-        <label class="mb-toggle" style="margin:0; font-size:11px;">
-          <input type="checkbox" id="minibia-bot-auto-attack-lure" />
-          <span>Enable Lure</span>
-        </label>
-
         <label class="mb-field" style="flex:0 0 88px;">
           <span class="mb-field-label" style="font-size:10px;">Fight at mobs</span>
           <input type="number" id="minibia-bot-auto-attack-lure-count" min="1" max="20" value="3" style="padding:3px 4px;font-size:11px;" />
@@ -38702,18 +39264,14 @@ function upgradeSectionHeaders(panel) {
       </div>
     </div>
 
-    <!-- Anti-KS -->
+    <!-- Anti-Killsteal -->
     <div style="border-top:1px solid rgba(255,255,255,0.08); margin-top:10px; padding-top:8px;">
       <div class="mb-section-title mb-section-title--sub" style="margin:0 0 6px 0;">
-        <span class="mb-title-text">Anti-KS</span>
+        <input type="checkbox" id="minibia-bot-auto-attack-antiks" class="mb-title-toggle" />
+        <span class="mb-title-text">Anti-Killsteal</span>
       </div>
 
       <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
-        <label class="mb-toggle" style="margin:0; font-size:11px;">
-          <input type="checkbox" id="minibia-bot-auto-attack-antiks" />
-          <span>Enable Anti-KS</span>
-        </label>
-
         <label class="mb-field" style="flex:0 0 62px;">
           <span class="mb-field-label" style="font-size:10px;">Self Range</span>
           <input type="number" id="minibia-bot-auto-attack-antiks-self" min="1" max="5" value="2" style="padding:3px 4px;font-size:11px;" />
@@ -38729,15 +39287,11 @@ function upgradeSectionHeaders(panel) {
     <!-- Exori -->
     <div style="border-top:1px solid rgba(255,255,255,0.08); margin-top:10px; padding-top:8px;">
       <div class="mb-section-title mb-section-title--sub" style="margin:0 0 6px 0;">
+        <input type="checkbox" id="minibia-bot-exori-enabled" class="mb-title-toggle" />
         <span class="mb-title-text">Exori</span>
       </div>
 
       <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
-        <label class="mb-toggle" style="margin:0; font-size:11px;">
-          <input type="checkbox" id="minibia-bot-exori-enabled" />
-          <span>Cast Exori</span>
-        </label>
-
         <label class="mb-field" style="flex:0 0 86px;">
           <span class="mb-field-label" style="font-size:10px;">On X mobs</span>
           <input type="number" id="minibia-bot-exori-monsters" min="1" max="10" value="3" style="padding:3px 4px;font-size:11px;" />
@@ -39267,6 +39821,7 @@ function upgradeSectionHeaders(panel) {
                 }
                 refreshCollapsedQuickModules();
                 try { refreshAutoHealStatus?.(); } catch {}
+                try { refreshRuneShooterStatus?.(); } catch {}
                 try { refreshRuneStatus?.(); } catch {}
                 try { refreshPaladinStatus?.(); } catch {}
                 try { refreshLooterStatus?.(); } catch {}
@@ -41626,11 +42181,29 @@ function upgradeSectionHeaders(panel) {
             paralyzeMinHp.addEventListener("change", saveParalyze);
         }
 
+        // Rune Shooter
+        const runeShooterToggle = panel.querySelector("#minibia-bot-rune-shooter-enabled");
+        const runeShooterSave = panel.querySelector("#minibia-bot-rune-shooter-save");
+        const runeShooterCancel = panel.querySelector("#minibia-bot-rune-shooter-cancel");
+
+        if (runeShooterToggle) {
+            runeShooterToggle.checked = !!bot.runeShooter?.status?.().running;
+            runeShooterToggle.addEventListener("change", () => {
+                if (runeShooterToggle.checked) bot.runeShooter?.start?.();
+                else bot.runeShooter?.stop?.();
+                refreshRuneShooterStatus();
+                refreshStatusTab();
+            });
+        }
+        if (runeShooterSave)
+            runeShooterSave.addEventListener("click", saveRuneShooterRule);
+        if (runeShooterCancel)
+            runeShooterCancel.addEventListener("click", clearRuneShooterRuleForm);
+
         // Auto Attack
         const autoAttackEnabledInput = panel.querySelector("#minibia-bot-auto-attack-enabled");
         const autoAttackMeleeInput = panel.querySelector("#minibia-bot-auto-attack-melee");
         const autoAttackHotkeyInput = panel.querySelector("#minibia-bot-auto-attack-hotkey");
-        const autoAttackRuneHotkeyInput = panel.querySelector("#minibia-bot-auto-attack-rune-hotkey");
         const maxDistInput = panel.querySelector("#minibia-bot-auto-attack-maxdist");
         const antiKSInput = panel.querySelector("#minibia-bot-auto-attack-antiks");
         const antiKSSelfInput = panel.querySelector("#minibia-bot-auto-attack-antiks-self");
@@ -41653,17 +42226,6 @@ function upgradeSectionHeaders(panel) {
                 });
             });
         }
-        if (autoAttackRuneHotkeyInput) {
-            autoAttackRuneHotkeyInput.value = bot.attack?.config?.runeHotbarSlot ? String(bot.attack.config.runeHotbarSlot) : "";
-            autoAttackRuneHotkeyInput.addEventListener("change", () => {
-                const raw = Number(autoAttackRuneHotkeyInput.value);
-                const slot = Number.isFinite(raw) && raw >= 1 && raw <= 12 ? Math.trunc(raw) : null;
-                autoAttackRuneHotkeyInput.value = slot ? String(slot) : "";
-                bot.attack.updateConfig({
-                    runeHotbarSlot: slot
-                });
-            });
-        }
         if (autoAttackMeleeInput) {
             autoAttackMeleeInput.checked = bot.attack?.config?.meleeMode !== false;
             autoAttackMeleeInput.addEventListener("change", () => {
@@ -41676,15 +42238,10 @@ function upgradeSectionHeaders(panel) {
             autoAttackEnabledInput.checked = !!bot.attack?.status?.().running;
             autoAttackEnabledInput.addEventListener("change", () => {
                 const targetSlot = Math.min(12, Math.max(1, Number(autoAttackHotkeyInput?.value) || bot.attack.config.targetHotbarSlot || 1));
-                const runeSlot = (() => {
-                    const raw = Number(autoAttackRuneHotkeyInput?.value);
-                    return Number.isFinite(raw) && raw >= 1 && raw <= 12 ? Math.trunc(raw) : null;
-                })();
                 const melee = !!autoAttackMeleeInput?.checked;
                 if (autoAttackEnabledInput.checked)
                     bot.attack.start({
                         targetHotbarSlot: targetSlot,
-                        runeHotbarSlot: runeSlot,
                         meleeMode: melee
                     });
                 else
@@ -42676,6 +43233,7 @@ function upgradeSectionHeaders(panel) {
                 // show the new state immediately (they all read from the same source).
                 try { refreshCaveStatus?.(); }        catch {}
                 try { refreshAutoAttackStatus?.(); }  catch {}
+                try { refreshRuneShooterStatus?.(); } catch {}
                 try { refreshAutoHealStatus?.(); }    catch {}
                 try { refreshLooterStatus?.(); }      catch {}
                 try { refreshRuneStatus?.(); }        catch {}
@@ -42699,6 +43257,7 @@ function upgradeSectionHeaders(panel) {
             refreshRuneStatus();
             refreshAutoHealStatus();
             refreshHealRules();
+            refreshRuneShooterStatus();
             refreshAutoInvisibleStatus();
             refreshAutoMagicShieldStatus();
             refreshAutoAttackStatus();
@@ -42760,6 +43319,8 @@ function upgradeSectionHeaders(panel) {
         bot.addCleanup(() => window.clearInterval(statusTabTimer));
         const looterTimer = window.setInterval(refreshLooterStatus, 1000);
         bot.addCleanup(() => window.clearInterval(looterTimer));
+        const runeShooterTimer = window.setInterval(refreshRuneShooterStatus, 1000);
+        bot.addCleanup(() => window.clearInterval(runeShooterTimer));
         const antibotTimer = window.setInterval(refreshAntiBotStatus, 1000);
         bot.addCleanup(() => window.clearInterval(antibotTimer));
         const caveTimer = window.setInterval(() => {
@@ -42812,6 +43373,7 @@ function upgradeSectionHeaders(panel) {
         refreshAutoInvisibleStatus,
         refreshAutoMagicShieldStatus,
         refreshAutoAttackStatus,
+        refreshRuneShooterStatus,
         refreshAutoAttackPreferredStatus,
         refreshAutoEatStatus,
         refreshCaveStatus,
@@ -44505,6 +45067,7 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
                 magicShield: getModuleRuntimeSnapshot(bot.magicShield),
                 cave: getModuleRuntimeSnapshot(bot.cave),
                 attack: getModuleRuntimeSnapshot(bot.attack),
+                runeShooter: getModuleRuntimeSnapshot(bot.runeShooter),
                 equipRing: getModuleRuntimeSnapshot(bot.equipRing),
                 slimeTrainer: getModuleRuntimeSnapshot(bot.slimeTrainer),
                 paladin:
@@ -44526,6 +45089,8 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
                     snapshot.modules.rune,
                 targeting:
                     snapshot.modules.attack,
+                runeShooter:
+                    snapshot.modules.runeShooter,
                 cavebot:
                     snapshot.modules.cave,
                 paladin:
@@ -44551,6 +45116,8 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
             bot.cave.stop({ persistEnabled: false });
         if (bot.attack?.stop)
             bot.attack.stop({ persistEnabled: false });
+        if (bot.runeShooter?.stop)
+            bot.runeShooter.stop({ persistEnabled: false });
         if (bot.equipRing?.stop)
             bot.equipRing.stop({ persistEnabled: false });
         if (bot.slimeTrainer?.stop)
@@ -44662,6 +45229,8 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
             bot.ui.refreshCaveStatus();
         if (bot.ui?.refreshAutoAttackStatus)
             bot.ui.refreshAutoAttackStatus();
+        if (bot.ui?.refreshRuneShooterStatus)
+            bot.ui.refreshRuneShooterStatus();
         if (bot.ui?.refreshEquipRingStatus)
             bot.ui.refreshEquipRingStatus();
         if (bot.ui?.refreshPaladinStatus)
@@ -44747,6 +45316,11 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
             "Targeting",
             bot.attack,
             modules.attack
+        );
+        restoreModuleFromSnapshot(
+            "Rune Shooter",
+            bot.runeShooter,
+            modules.runeShooter
         );
         restoreModuleFromSnapshot(
             "CaveBot",
@@ -46044,6 +46618,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         ["invisible", "minibiaBot.invisible.config"],
         ["magicShield", "minibiaBot.magicShield.config"],
         ["attack", "minibiaBot.attack.config"],
+        ["runeShooter", "minibiaBot.runeShooter.config"],
         ["cave", "minibiaBot.cave.config"],
         ["equipRing", "minibiaBot.equipRing.config"],
         ["eat", "minibiaBot.eat.config"],
@@ -46224,6 +46799,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         currentBundle.installAutoMagicShieldModule(bot);
         currentBundle.installBlacklistModule(bot);
         currentBundle.installAutoAttackModule(bot);
+        currentBundle.installRuneShooterModule(bot);
         currentBundle.installCaveModule(bot);
         currentBundle.installEquipRingModule(bot);
         currentBundle.installAutoEatModule(bot);
@@ -46276,6 +46852,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
             invisible: bot.invisible.status(),
             magicShield: bot.magicShield.status(),
             attack: bot.attack.status(),
+            runeShooter: bot.runeShooter.status(),
             cave: bot.cave.status(),
             equipRing: bot.equipRing.status(),
             eat: bot.eat.status(),
@@ -46296,6 +46873,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
                 ["invisible", "minibiaBot.invisible.config"],
                 ["magicShield", "minibiaBot.magicShield.config"],
                 ["attack", "minibiaBot.attack.config"],
+                ["runeShooter", "minibiaBot.runeShooter.config"],
                 ["equipRing", "minibiaBot.equipRing.config"],
                 ["eat", "minibiaBot.eat.config"],
                 ["talk", "minibiaBot.talk.config"],
@@ -46335,7 +46913,30 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
                 try {
                     // Write the live config object directly — no side effects,
                     // no module restart, no onEnabled toggles.
-                    bot.storage.set(key, JSON.parse(JSON.stringify(mod.config)));
+                    const snapshot =
+                        JSON.parse(
+                            JSON.stringify(
+                                mod.config
+                            )
+                        );
+
+                    if (name === "attack") {
+                        for (const legacyKey of [
+                            "runeHotbarSlot",
+                            "runeCooldownMs",
+                            "runeCountRefreshMs",
+                            "runeCountFreshMs",
+                            "attackRuneHotbarSlot",
+                            "attackRuneSlot"
+                        ]) {
+                            delete snapshot[legacyKey];
+                        }
+                    }
+
+                    bot.storage.set(
+                        key,
+                        snapshot
+                    );
                     saved++;
                 } catch (e) {
                     errors.push(`${name}: ${e.message}`);
