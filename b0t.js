@@ -803,7 +803,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.5.69",
+        version: "1.5.70",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -2776,11 +2776,19 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
                 cave: !!bot.cave?.status?.().running,
                 equipRing: !!bot.equipRing?.status?.().running,
                 slimeTrainer: !!bot.slimeTrainer?.status?.().running,
-                paladin: !!bot.paladin?.status?.().running,
+                paladin:
+                    bot.paladin?.getKillSwitchSnapshot?.() || {
+                        craftRunning: !!bot.paladin?.status?.().running,
+                        equipRunning: !!bot.paladin?.status?.().equipRunning,
+                        craftShouldRestore: !!bot.paladin?.status?.().running,
+                        equipShouldRestore: !!bot.paladin?.status?.().equipRunning
+                    },
                 looter: !!bot.looter?.status?.().running,
             }
         };
         state.restartSnapshot = snapshot;
+
+        bot.log("[Panic GM] Paladin snapshot", snapshot.modules.paladin);
 
         // Stop all modules (with persistEnabled: false to keep config.enabled true)
         if (bot.rune?.stop)
@@ -2868,8 +2876,25 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
                 bot.equipRing?.start?.();
             if (snap.modules.slimeTrainer)
                 bot.slimeTrainer?.start?.();
-            if (snap.modules.paladin)
-                bot.paladin?.start?.();
+
+            const paladinRestore =
+                bot.paladin?.restoreKillSwitchSnapshot?.(snap.modules.paladin);
+
+            if (paladinRestore) {
+                bot.log("[Panic GM] Paladin restore pass", paladinRestore);
+                if (!paladinRestore.craftRestored || !paladinRestore.equipRestored) {
+                    window.setTimeout(() => {
+                        const retry =
+                            bot.paladin?.restoreKillSwitchSnapshot?.(snap.modules.paladin);
+                        bot.log("[Panic GM] Paladin restore retry", retry);
+                        if (retry && (!retry.craftRestored || !retry.equipRestored)) {
+                            bot.log("[Panic GM] WARNING: Paladin crafter/equipper did not fully restore", retry);
+                        }
+                        bot.ui?.refreshPaladinStatus?.();
+                    }, 300);
+                }
+            }
+
             if (snap.modules.looter)
                 bot.looter?.start?.();
 
@@ -29823,6 +29848,55 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
             ammoCount: getAmmoCount(),
             lastCraftAt: state.lastCraftAt,
             lastEquipAt: state.lastEquipAt,
+            killSwitchSnapshot: getKillSwitchSnapshot(),
+        };
+    }
+
+    function getKillSwitchSnapshot() {
+        return {
+            craftRunning: state.running === true,
+            equipRunning: state.equipRunning === true,
+            craftEnabled: config.craftEnabled === true,
+            equipEnabled: config.equipEnabled === true,
+            weaponId: config.weaponId ?? null,
+            craftShouldRestore:
+                state.running === true ||
+                config.craftEnabled === true,
+            equipShouldRestore:
+                state.equipRunning === true ||
+                config.equipEnabled === true
+        };
+    }
+
+    function restoreKillSwitchSnapshot(snapshot = {}) {
+        const craftShouldRestore =
+            snapshot.craftShouldRestore === true ||
+            snapshot.craftRunning === true ||
+            snapshot.craftEnabled === true;
+        const equipShouldRestore =
+            snapshot.equipShouldRestore === true ||
+            snapshot.equipRunning === true ||
+            snapshot.equipEnabled === true;
+
+        if (craftShouldRestore && !state.running)
+            startCraft();
+
+        if (equipShouldRestore && !state.equipRunning) {
+            const weaponId = snapshot.weaponId ?? config.weaponId;
+            if (weaponId) {
+                startEquip({ weaponId });
+            } else {
+                bot.log("Paladin killswitch restore: equipper wanted but no weapon ID is configured");
+            }
+        }
+
+        return {
+            craftShouldRestore,
+            equipShouldRestore,
+            craftRunning: state.running === true,
+            equipRunning: state.equipRunning === true,
+            craftRestored: !craftShouldRestore || state.running === true,
+            equipRestored: !equipShouldRestore || state.equipRunning === true
         };
     }
 
@@ -29873,6 +29947,8 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
         // Helpers
         getAmmoCount,
         startCaptureWeapon,
+        getKillSwitchSnapshot,
+        restoreKillSwitchSnapshot,
     };
 };
 
@@ -44431,7 +44507,13 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
                 attack: getModuleRuntimeSnapshot(bot.attack),
                 equipRing: getModuleRuntimeSnapshot(bot.equipRing),
                 slimeTrainer: getModuleRuntimeSnapshot(bot.slimeTrainer),
-                paladin: getModuleRuntimeSnapshot(bot.paladin),
+                paladin:
+                    bot.paladin?.getKillSwitchSnapshot?.() || {
+                        craftRunning: !!bot.paladin?.status?.().running,
+                        equipRunning: !!bot.paladin?.status?.().equipRunning,
+                        craftShouldRestore: !!bot.paladin?.status?.().running,
+                        equipShouldRestore: !!bot.paladin?.status?.().equipRunning
+                    },
                 looter: getModuleRuntimeSnapshot(bot.looter),
                 panic: getModuleRuntimeSnapshot(bot.panic),
             }
@@ -44446,6 +44528,8 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
                     snapshot.modules.attack,
                 cavebot:
                     snapshot.modules.cave,
+                paladin:
+                    snapshot.modules.paladin,
                 looter:
                     snapshot.modules.looter
             }
@@ -44586,6 +44670,50 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
             bot.ui.refreshLooterStatus();
     }
 
+    function restorePaladinFromSnapshot(snapshotEntry, retryDelayMs = 250) {
+        if (!snapshotEntry || !bot.paladin?.restoreKillSwitchSnapshot)
+            return false;
+
+        let result = null;
+        try {
+            result = bot.paladin.restoreKillSwitchSnapshot(snapshotEntry);
+        } catch (e) {
+            state.restoreFailures++;
+            state.lastRestoreFailure = `Paladin: ${e?.message || e}`;
+            bot.log("[GM Chat] Failed to restore Paladin crafter/equipper", e);
+            return false;
+        }
+
+        bot.log("[GM Chat] Paladin restore pass", result);
+        if (result?.craftRestored && result?.equipRestored)
+            return true;
+
+        window.setTimeout(() => {
+            state.restoreRetries++;
+            let retry = null;
+            try {
+                retry = bot.paladin?.restoreKillSwitchSnapshot?.(snapshotEntry);
+            } catch (e) {
+                state.restoreFailures++;
+                state.lastRestoreFailure = `Paladin retry: ${e?.message || e}`;
+                bot.log("[GM Chat] Retry failed restoring Paladin crafter/equipper", e);
+                return;
+            }
+
+            bot.log("[GM Chat] Paladin restore retry", retry);
+            if (!retry?.craftRestored || !retry?.equipRestored) {
+                state.restoreFailures++;
+                state.lastRestoreFailure = "Paladin crafter/equipper did not fully resume";
+                bot.log("[GM Chat] WARNING: Paladin crafter/equipper did not fully restore", retry);
+            } else {
+                bot.log("[GM Chat] Restored Paladin crafter/equipper");
+            }
+            bot.ui?.refreshPaladinStatus?.();
+        }, Math.max(100, retryDelayMs));
+
+        return true;
+    }
+
     function restoreKillswitchModules(snapshot) {
         if (!snapshot)
             return false;
@@ -44635,9 +44763,7 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
             bot.slimeTrainer,
             modules.slimeTrainer
         );
-        restoreModuleFromSnapshot(
-            "Paladin",
-            bot.paladin,
+        restorePaladinFromSnapshot(
             modules.paladin
         );
         restoreModuleFromSnapshot(
