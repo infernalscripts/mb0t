@@ -2198,7 +2198,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.5.98",
+        version: "1.5.99",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -21957,6 +21957,41 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         if (!currentWp)
             return false;
 
+        const noWayPosition = normalizePosition(bot.getPlayerPosition());
+        if (
+            config.autoTransitions === true &&
+            noWayPosition &&
+            Number(currentWp.z) !== Number(noWayPosition.z)
+        ) {
+            // A cross-floor waypoint is expected to make native same-floor
+            // Pathfinder complain while Auto Transitions is searching/using the
+            // actual transition. Do not let that DOM cancellation yank CaveBot
+            // back to a same-floor recovery waypoint before the transition logic
+            // gets its next tick.
+            if (handleFloorChange(currentWp, now)) {
+                state.lastProgressAt = now;
+                state.nativePathWatchAt = now;
+                state.stuckCount = 0;
+                state.stuckRecoveryAttempts = 0;
+                return false;
+            }
+
+            state.lastProgressAt = now;
+            state.nativePathWatchAt = now;
+            state.stuckCount = 0;
+            state.stuckRecoveryAttempts = 0;
+            if (state.lastAutoProbeLogAt === 0 || now - state.lastAutoProbeLogAt > 2000) {
+                state.lastAutoProbeLogAt = now;
+                bot.log("Cave: ignoring native NO_WAY while Auto Transitions searches", {
+                    waypoint: state.currentIndex + 1,
+                    playerFloor: noWayPosition.z,
+                    targetFloor: currentWp.z,
+                    source
+                });
+            }
+            return false;
+        }
+
         // Long-range minimap pathing can fail even though the currently loaded
         // map has a valid route toward the same waypoint. Before recording a
         // route failure or changing waypoint, advance through that loaded A*
@@ -23382,7 +23417,32 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         return things.some(t => t?.id !== undefined && holeItemIds.has(t.id));
     }
     function isRopeSpotTile(tile) {
-        return tileHasNamedThing(tile, "rope spot");
+        if (!tile)
+            return false;
+
+        // Prefer the explicit definition/name when available.
+        if (tileHasNamedThing(tile, "rope spot"))
+            return true;
+
+        // Some Minibia rope spots do not expose the literal name through the
+        // client definition table. The native client still recognises them as
+        // non-pickupable multi-use world objects (see its double-tap/use path).
+        // Reuse that behavioural signal so Auto Transitions sees the same rope
+        // targets a player can actually use with a rope.
+        return getTileThings(tile).some(thing => {
+            if (!thing)
+                return false;
+            const name = getThingName(thing);
+            if (name && /\brope\b/i.test(name))
+                return true;
+            try {
+                const multiUse = typeof thing.isMultiUse === "function" && thing.isMultiUse();
+                const pickupable = typeof thing.isPickupable === "function" && thing.isPickupable();
+                if (multiUse && !pickupable)
+                    return true;
+            } catch (e) {}
+            return false;
+        });
     }
     function isRopeTargetTile(tile) {
         return isHoleTile(tile) || isRopeSpotTile(tile);
@@ -23425,23 +23485,35 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     function isTransitionCandidateTile(tile, waypoint, position) {
         if (!tile)
             return false;
-
-        // Prefer Minibia's own authoritative step-on classification when available.
-        // This covers floor-change tiles whose names/CIDs are not in the bot's
-        // local lists, while retaining the bot's existing fallbacks.
-        try {
-            if (window.gameClient?.mouse?.__isStepOnTile?.(tile))
-                return true;
-        } catch (e) {}
-
-        if (isFloorChangeTile(tile))
-            return true;
         if (!waypoint || !position || !Number.isFinite(waypoint.z) || !Number.isFinite(position.z))
             return false;
-        if (waypoint.z > position.z)
-            return isShovelTargetTile(tile);
-        if (waypoint.z < position.z)
-            return isRopeTargetTile(tile);
+
+        const goingDown = waypoint.z > position.z;
+        const goingUp = waypoint.z < position.z;
+
+        // Direction-specific tool targets must be checked before generic
+        // floor-change classification. Rope spots are often usable multi-use
+        // objects rather than tiles carrying properties.floorchange.
+        if (goingUp && isRopeTargetTile(tile))
+            return true;
+        if (goingDown && isShovelTargetTile(tile))
+            return true;
+
+        // Prefer Minibia's own authoritative step-on classification when available.
+        // Avoid selecting a plain downward hole while we are trying to go UP.
+        try {
+            if (window.gameClient?.mouse?.__isStepOnTile?.(tile)) {
+                if (goingUp && isHoleTile(tile) && !isLadderTile(tile) && !isStairsTile(tile))
+                    return false;
+                return true;
+            }
+        } catch (e) {}
+
+        if (isFloorChangeTile(tile)) {
+            if (goingUp && isHoleTile(tile) && !isLadderTile(tile) && !isStairsTile(tile))
+                return false;
+            return true;
+        }
         return false;
     }
 
@@ -23459,10 +23531,15 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 return 25;
         }
         if (goingUp) {
+            // A rope target is the strongest signal for an upward transition.
+            if (isRopeTargetTile(tile))
+                return -60;
+            if (isLadderTile(tile))
+                return -35;
             if (isStairsTile(tile))
                 return -20;
             if (isHoleTile(tile))
-                return 20;
+                return 40;
         }
         return 0;
     }
@@ -23771,6 +23848,77 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         });
 
         return best;
+    }
+
+    function findLoadedRopeTransition(position, waypoint) {
+        if (!position || !waypoint || !(waypoint.z < position.z))
+            return null;
+
+        let best = null;
+        let bestScore = Infinity;
+
+        // The normal transition probe is intentionally local. For an UP floor
+        // mismatch, make one rope-specific pass over already-loaded tiles so a
+        // visible rope spot near the edge of the screen cannot be missed just
+        // because it sits outside autoTransitionRadius. This pass does NOT admit
+        // generic stairs/holes, so it cannot wander to an unrelated city stair.
+        for (const tile of getLoadedTiles()) {
+            const p = getTilePosition(tile);
+            if (!p || p.z !== position.z || !isRopeTargetTile(tile))
+                continue;
+
+            const playerDistance = getDistance(position, p);
+            if (!Number.isFinite(playerDistance) || playerDistance > 20)
+                continue;
+
+            const waypointDistance = Math.abs(p.x - waypoint.x) + Math.abs(p.y - waypoint.y);
+            const score = playerDistance * 10 + waypointDistance;
+            if (score < bestScore) {
+                bestScore = score;
+                best = {
+                    tile,
+                    position: p,
+                    playerDistance,
+                    waypointDistance
+                };
+            }
+        }
+
+        return best;
+    }
+
+    function approachAutoTransitionArea(waypoint, now = Date.now()) {
+        const position = normalizePosition(bot.getPlayerPosition());
+        if (!position || !waypoint || position.z === waypoint.z)
+            return false;
+
+        // When the actual transition is just outside the loaded/scan area, move
+        // toward the cross-floor waypoint's X/Y on the CURRENT floor. As new
+        // tiles load, handleFloorChange() gets another chance to detect the rope,
+        // ladder, stair or hole. This is only active when Auto Transitions is ON.
+        const projected = {
+            x: Number(waypoint.x),
+            y: Number(waypoint.y),
+            z: Number(position.z)
+        };
+        if (!Number.isFinite(projected.x) || !Number.isFinite(projected.y))
+            return false;
+
+        const dist = getDistance(position, projected);
+        if (!Number.isFinite(dist) || dist <= 1)
+            return false;
+
+        const moved = goToPosition(projected);
+        if (moved && (state.lastAutoProbeLogAt === 0 || now - state.lastAutoProbeLogAt > 2000)) {
+            state.lastAutoProbeLogAt = now;
+            bot.log("Cave: auto transition approaching target area", {
+                from: position,
+                projected,
+                targetFloor: waypoint.z,
+                distance: dist
+            });
+        }
+        return moved;
     }
 
     function isAtWaypoint(position, waypoint) {
@@ -25242,6 +25390,33 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                     }
                 }
                 return true;
+            }
+        }
+
+        // Going up is special: rope spots are use-with targets and may not carry
+        // the same floorchange/name metadata as stairs. Search all currently
+        // loaded nearby tiles for a rope-compatible target before giving up.
+        if (waypoint.z < position.z) {
+            const ropeTarget = findLoadedRopeTransition(position, waypoint);
+            if (ropeTarget) {
+                const beforeUseAt = state.lastStairsUseAt;
+                const moved = useFloorChangeTile(ropeTarget, waypoint, now);
+                if (moved) {
+                    if (state.lastStairsUseAt !== beforeUseAt) {
+                        const key = `${ropeTarget.position.x},${ropeTarget.position.y},${ropeTarget.position.z}->${waypoint.z}`;
+                        if (state.lastAutoProbeKey !== key || now - state.lastAutoProbeLogAt > 1500) {
+                            state.lastAutoProbeKey = key;
+                            state.lastAutoProbeLogAt = now;
+                            bot.log("cave auto transition rope target", {
+                                tileX: ropeTarget.position.x,
+                                tileY: ropeTarget.position.y,
+                                tileZ: ropeTarget.position.z,
+                                targetZ: waypoint.z
+                            });
+                        }
+                    }
+                    return true;
+                }
             }
         }
 
@@ -28934,12 +29109,33 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 // conservative local/learned transition helper first. When it is
                 // disabled (the default), preserve the manual-transition recovery
                 // behavior introduced in v1.5.91.
-                if (config.autoTransitions === true && handleFloorChange(waypoint, now))
-                    return;
+                if (config.autoTransitions === true) {
+                    if (handleFloorChange(waypoint, now))
+                        return;
 
-                // The special STAND/hole mismatch was handled earlier and still
-                // advances forward. Every other unresolved mismatch re-anchors to
-                // the closest coordinate waypoint on the player's current floor.
+                    // If the transition is not loaded yet, keep the cross-floor
+                    // waypoint active and approach its X/Y on the current floor.
+                    // Do NOT immediately re-anchor to a same-floor waypoint; that
+                    // was the recovery loop that prevented rope spots from ever
+                    // getting a chance to load/be detected.
+                    if (approachAutoTransitionArea(waypoint, now))
+                        return;
+
+                    state.lastProgressAt = now;
+                    state.nativePathWatchAt = now;
+                    if (state.lastAutoProbeLogAt === 0 || now - state.lastAutoProbeLogAt > 2000) {
+                        state.lastAutoProbeLogAt = now;
+                        bot.log("Cave: Auto Transitions waiting for transition candidate", {
+                            waypoint: state.currentIndex + 1,
+                            playerFloor: position.z,
+                            targetFloor: waypoint.z
+                        });
+                    }
+                    return;
+                }
+
+                // Auto Transitions OFF: preserve the manual-transition recovery
+                // behaviour and re-anchor to the closest same-floor waypoint.
                 recoverToClosestSameFloorWaypoint(
                     position,
                     waypoint,
