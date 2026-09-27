@@ -2198,7 +2198,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.5.93",
+        version: "1.5.98",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -2411,12 +2411,17 @@ addCleanup(() => {
             return tryClickReconnect();
         },
 
-        /** Click a hotbar slot by index (0‑based) */
+        /** Trigger a hotbar slot by index (0-based) without synthesizing a DOM click.
+         *  DOM clicks can enter the client's Ctrl/Meta "Change Key" mode, so bot
+         *  actions must call HotbarManager's slot executor directly. */
         clickHotbar(index) {
-            const button = window.gameClient?.interface?.hotbarManager?.slots?.[index]?.canvas?.canvas;
-            if (!button)
+            const manager = window.gameClient?.interface?.hotbarManager;
+            const slotIndex = Math.trunc(Number(index));
+            if (!manager || !Number.isFinite(slotIndex) || !manager.slots?.[slotIndex])
                 return false;
-            button.click();
+            if (typeof manager.__handleClick !== "function")
+                return false;
+            manager.__handleClick(slotIndex);
             return true;
         },
 
@@ -2979,6 +2984,44 @@ addCleanup(() => {
             return {
                 ...customFollowState
             };
+        },
+
+        // Shared field-aware A* route builder used by PvP Follow and by
+        // Targeting's manual Melee Chase. This does NOT alter follow state
+        // and does NOT send FollowPacket; it only returns the route.
+        getFollowRouteForCreature(target, mode = "pvp") {
+            if (!target)
+                return null;
+            return getFollowCustomRoute(
+                target,
+                mode === "nonpvp" ? "nonpvp" : "pvp"
+            );
+        },
+
+        // Expose the exact PvP Follow tile validator so combat pursuit can
+        // validate queued A* steps with identical field/obstacle semantics.
+        isFollowRoutePositionPassable(position, options = {}) {
+            if (
+                !position ||
+                typeof Position !== "function"
+            ) {
+                return false;
+            }
+
+            const tile =
+                window.gameClient?.world
+                    ?.getTileFromWorldPosition?.(
+                        new Position(
+                            Number(position.x),
+                            Number(position.y),
+                            Number(position.z)
+                        )
+                    );
+
+            return isFollowFieldPassableTile(
+                tile,
+                options
+            );
         },
 
         stopFollowMovement() {
@@ -7499,25 +7542,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
             const id =
                 Number(thing.id);
-
-            if (
-                ladderItemIds.has(id) ||
-                teleporterItemIds.has(id) ||
-                kiteHoleItemIds.has(id)
-            ) {
-                return true;
-            }
-
-            // Use the native item-definition floorchange flag whenever
-            // available. This catches stairs/holes not covered by known IDs.
             const def =
                 getThingDefinition(thing.id);
-
-            if (def?.properties?.floorchange)
-                return true;
-
-            // Last-resort semantic guard for transition tiles whose definitions
-            // do not expose floorchange consistently.
             const name =
                 String(
                     def?.properties?.name ||
@@ -7527,12 +7553,35 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                     .trim()
                     .toLowerCase();
 
+            // User-approved Kite exceptions: rope spots and ladders may be
+            // crossed. Check these BEFORE the native floorchange flag because
+            // both can legitimately advertise floorchange metadata.
+            if (
+                ladderItemIds.has(id) ||
+                name.includes("ladder") ||
+                name.includes("rope spot")
+            ) {
+                continue;
+            }
+
+            if (
+                teleporterItemIds.has(id) ||
+                kiteHoleItemIds.has(id)
+            ) {
+                return true;
+            }
+
+            // Use the native item-definition floorchange flag whenever
+            // available. This catches stairs/holes not covered by known IDs.
+            if (def?.properties?.floorchange)
+                return true;
+
+            // Last-resort semantic guard for dangerous transition tiles.
             if (
                 name.includes("hole") ||
-                name.includes("rope spot") ||
-                name.includes("ladder") ||
                 name.includes("stairs") ||
                 name.includes("staircase") ||
+                name.includes("ramp") ||
                 name.includes("teleport")
             ) {
                 return true;
@@ -8547,7 +8596,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function isHoleTile(tile) {
-        return tileHasNamedThing(tile, "hole");
+        // A rope spot may contain "hole" in its descriptive name but is an
+        // approved Kite tile. Only classify non-rope holes as dangerous.
+        return tileHasNamedThing(tile, "hole") &&
+            !tileHasNamedThing(tile, "rope spot");
     }
 
     function isRopeTargetTile(tile) {
@@ -8577,8 +8629,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         // never an acceptable escape step.
         if (
             isFloorChangeTile(tile) ||
-            isHoleTile(tile) ||
-            isRopeTargetTile(tile)
+            isHoleTile(tile)
         ) {
             return false;
         }
@@ -9937,7 +9988,11 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         try {
             const pf = window.gameClient?.world?.pathfinder;
             if (pf && typeof pf.search === "function") {
-                const approach = findReachableAdjacentPath(targetPos, playerPos);
+                const approach = getManualMeleeFollowRoute(
+                    target,
+                    targetPos,
+                    playerPos
+                );
                 if (approach) {
                     result = {
                         reachable: true,
@@ -16689,6 +16744,69 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         return findReachableAdjacentPath(targetPos, playerPos)?.position || null;
     }
 
+    function getManualMeleeFollowRoute(target, targetPos, playerPos) {
+        if (
+            config.meleeMode &&
+            !config.kiteMode &&
+            !config.useClientChase &&
+            typeof bot.getFollowRouteForCreature === "function"
+        ) {
+            const followRoute =
+                bot.getFollowRouteForCreature(
+                    target,
+                    "pvp"
+                );
+
+            if (!followRoute)
+                return null;
+
+            if (followRoute.atGoal) {
+                return {
+                    position: null,
+                    pathSteps: 0,
+                    pathCost: 0,
+                    nextStep: null,
+                    pathPositions: [],
+                    pathHasMagicField: false,
+                    fieldTileCount: 0,
+                    destination: null,
+                    targetPosition: followRoute.targetPosition || targetPos
+                };
+            }
+
+            const pathPositions =
+                Array.isArray(followRoute.pathPositions)
+                    ? followRoute.pathPositions
+                    : [];
+            const nextStep =
+                pathPositions[0] || null;
+            const pathSteps =
+                Number(followRoute.pathSteps) ||
+                pathPositions.length;
+
+            return {
+                position: followRoute.destination || null,
+                destination: followRoute.destination || null,
+                targetPosition: followRoute.targetPosition || targetPos,
+                pathSteps,
+                // PvP Follow intentionally chooses by step count (then fields),
+                // so expose the same metric to Targeting selection/reachability.
+                pathCost: pathSteps * 100,
+                nextStep,
+                pathPositions,
+                pathHasMagicField:
+                    Number(followRoute.fieldTileCount || 0) > 0,
+                fieldTileCount:
+                    Number(followRoute.fieldTileCount || 0)
+            };
+        }
+
+        return findReachableAdjacentPath(
+            targetPos,
+            playerPos
+        );
+    }
+
     function stopManualTargetPursuitAutoWalk(
         reason = "manual pursuit stopped"
     ) {
@@ -16805,8 +16923,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             Math.max(
                 1,
                 Math.min(
-                    5,
-                    Number(options.maxSteps) || 5
+                    3,
+                    Number(options.maxSteps) || 3
                 )
             );
         const refreshOnDestinationChange =
@@ -16909,14 +17027,21 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 return false;
             }
 
-            if (
-                !isSafeTargetApproachTile(
-                    Number(step.x),
-                    Number(step.y),
-                    Number(step.z),
-                    false
-                )
-            ) {
+            const stepPassable =
+                owner === "melee" &&
+                typeof bot.isFollowRoutePositionPassable ===
+                    "function"
+                    ? bot.isFollowRoutePositionPassable(
+                        step
+                    )
+                    : isSafeTargetApproachTile(
+                        Number(step.x),
+                        Number(step.y),
+                        Number(step.z),
+                        false
+                    );
+
+            if (!stepPassable) {
                 state.manualPursuitPathFailures++;
                 return false;
             }
@@ -17205,7 +17330,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         }
 
         const route =
-            findReachableAdjacentPath(
+            getManualMeleeFollowRoute(
+                target,
                 targetPos,
                 playerPos
             );
@@ -19741,6 +19867,10 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         enabled: false,
         activePresetName: defaultPresetName,
         loopMode: true,
+        // Optional helper for simple cross-floor routes. Manual Rope/Shovel/Stand
+        // waypoints remain authoritative; this stays OFF unless explicitly enabled.
+        autoTransitions: false,
+        autoTransitionRadius: 6,
         stuckTimeoutMs: 5000,
         standTimeoutMs: 10000,
         maxSkipAttempts: 10,
@@ -19852,29 +19982,10 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         lureLastMobSlowHoldMs: 500,
     },
             bot.storage.get(configStorageKey, {}));
-    // v1.5.91: automatic floor transitions are removed. Strip old
-    // persisted settings so rope/hole auto-probing cannot be re-enabled.
-    const hadLegacyAutoTransitionConfig =
-        Object.prototype.hasOwnProperty.call(
-            config,
-            "autoTransitions"
-        ) ||
-        Object.prototype.hasOwnProperty.call(
-            config,
-            "autoTransitionRadius"
-        );
-
-    delete config.autoTransitions;
-    delete config.autoTransitionRadius;
-
-    if (hadLegacyAutoTransitionConfig) {
-        bot.storage.set(
-            configStorageKey,
-            {
-                ...config
-            }
-        );
-    }
+    // Auto transitions are opt-in. A missing/stale setting defaults safely to OFF.
+    config.autoTransitions = config.autoTransitions === true;
+    config.autoTransitionRadius = Math.max(2, Math.min(8,
+        Math.trunc(Number(config.autoTransitionRadius) || 6)));
 
     config.tickMs = 500;
     // Recovery distance is intentionally capped at 50 tiles. A persisted value
@@ -20337,16 +20448,11 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     }
 
     function persistConfig() {
-        const snapshot = {
-            ...config
-        };
-
-        delete snapshot.autoTransitions;
-        delete snapshot.autoTransitionRadius;
-
         bot.storage.set(
             configStorageKey,
-            snapshot
+            {
+                ...config
+            }
         );
     }
 
@@ -21849,6 +21955,13 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
     function forceNativeNoWayRecovery(now, currentWp, source = "native NO_WAY") {
         if (!currentWp)
+            return false;
+
+        // Long-range minimap pathing can fail even though the currently loaded
+        // map has a valid route toward the same waypoint. Before recording a
+        // route failure or changing waypoint, advance through that loaded A*
+        // frontier and retry the real waypoint from the newly loaded area.
+        if (tryCaveOffscreenFrontierRecovery(currentWp, now, source))
             return false;
 
         const circuitTripped = setRecoveryReason("NO_WAY", now, currentWp);
@@ -23594,6 +23707,72 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         return best;
     }
 
+    function findBestKnownTransition(position, waypoint) {
+        if (!position || !waypoint)
+            return null;
+        let best = null;
+        let bestScore = Infinity;
+
+        transitions.forEach(t => {
+            if (!t?.from || !t?.to || t.from.z !== position.z || t.to.z !== waypoint.z)
+                return;
+
+            const playerDist = getDistance(position, t.from);
+            const landingDist = getDistance(t.to, waypoint);
+            if (!Number.isFinite(playerDist) || !Number.isFinite(landingDist))
+                return;
+
+            const count = Math.min(5, Math.max(1, Number(t.count) || 1));
+            const ageDays = t.lastSeenAt
+                ? Math.max(0, (Date.now() - t.lastSeenAt) / 86400000)
+                : 999;
+            const confidenceBonus = (count - 1) * 3;
+            const agePenalty = Math.min(10, ageDays / 7);
+            const score = playerDist * 10 + landingDist * 2 + agePenalty - confidenceBonus;
+
+            if (score < bestScore) {
+                bestScore = score;
+                best = t;
+            }
+        });
+
+        return best;
+    }
+
+    function findNearbyTransitionTile(position, waypoint) {
+        if (!position || !waypoint)
+            return null;
+
+        const wpDist = Math.abs(position.x - waypoint.x) + Math.abs(position.y - waypoint.y);
+        // Keep auto probing deliberately local so city routes do not wander to
+        // unrelated stairs. Manual transition waypoints remain the preferred mode.
+        const configuredRadius = Math.max(2, Math.min(8,
+            Math.trunc(Number(config.autoTransitionRadius) || 6)));
+        const radius = Math.max(2, Math.min(8, configuredRadius, wpDist + 2));
+        let best = null;
+        let bestScore = Infinity;
+
+        getNearbyTransitionTiles(position, waypoint, radius).forEach(e => {
+            const playerDistance = getDistance(position, e.position);
+            const waypointDistance = Math.abs(e.position.x - waypoint.x) +
+                Math.abs(e.position.y - waypoint.y);
+            const score = playerDistance * 10 + waypointDistance +
+                getFloorChangeTileBias(e.tile, position, waypoint);
+
+            if (score < bestScore) {
+                bestScore = score;
+                best = {
+                    tile: e.tile,
+                    position: e.position,
+                    playerDistance,
+                    waypointDistance
+                };
+            }
+        });
+
+        return best;
+    }
+
     function isAtWaypoint(position, waypoint) {
         const d = getDistanceToWaypoint(position, waypoint);
         if (!Number.isFinite(d))
@@ -24128,6 +24307,362 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         }
     }
 
+    // ---- OFF-SCREEN WAYPOINT FRONTIER FALLBACK ----
+    // Native minimap pathing remains the primary long-range pathfinder. If it
+    // gives up on a waypoint that is outside the visible viewport, CaveBot can
+    // still make safe progress by A*-routing through the currently loaded tile
+    // graph toward the best reachable frontier, sending only a short AutoWalk
+    // segment, then retrying the REAL waypoint after the next map area loads.
+    // This never changes the route index or replaces the actual waypoint.
+    function isCaveWaypointOffScreen(fromPosition, waypoint) {
+        const from = normalizePosition(fromPosition);
+        const to = normalizePosition(waypoint);
+        if (!from || !to || from.z !== to.z)
+            return false;
+        // The game viewport is 17x13 tiles around the player (8 left/right,
+        // 6 up/down). Treat anything beyond that rectangle as off-screen.
+        return Math.abs(to.x - from.x) > 8 || Math.abs(to.y - from.y) > 6;
+    }
+
+    function isCaveFrontierPassableTile(tile) {
+        const pos = normalizePosition(tile?.__position);
+        if (!tile || !pos || tile.id === 0 || tile.__isPlaceholder)
+            return false;
+        if (isFloorChangeTile(tile))
+            return false;
+        if (bot.blacklist?.isBlacklisted(pos.x, pos.y, pos.z))
+            return false;
+
+        if (config.ignoreFields === true)
+            return caveFieldPassable(tile, null);
+
+        return isTileWalkable(pos.x, pos.y, pos.z, false);
+    }
+
+    function findCaveLoadedFrontierPath(fromPosition, waypoint, maxSegmentSteps = 10) {
+        const from = normalizePosition(fromPosition);
+        const to = normalizePosition(waypoint);
+        const pf = window.gameClient?.world?.pathfinder;
+
+        if (
+            !from ||
+            !to ||
+            from.z !== to.z ||
+            !pf ||
+            typeof BinaryHeap === "undefined"
+        ) {
+            return null;
+        }
+
+        const startTile = getTileAt(from);
+        if (!startTile || startTile.id === 0 || startTile.__isPlaceholder)
+            return null;
+
+        const syntheticTarget = {
+            __position: new Position(to.x, to.y, to.z)
+        };
+        const startDistance =
+            Math.abs(to.x - from.x) +
+            Math.abs(to.y - from.y);
+
+        try {
+            pf.__dirtyNodes
+                ?.forEach?.(
+                    node =>
+                        node.cleanPathfinding?.()
+                );
+
+            pf.__dirtyNodes = new Array(startTile);
+            startTile.__g = 0;
+            startTile.__h = pf.heuristic(startTile, syntheticTarget);
+            startTile.__f = startTile.__h;
+
+            const openHeap = new BinaryHeap();
+            openHeap.push(startTile);
+
+            let bestNode = null;
+            let bestDistance = Infinity;
+            let bestG = -Infinity;
+            let iterations = 0;
+
+            while (openHeap.size() > 0 && iterations < 4000) {
+                iterations++;
+                const currentNode = openHeap.pop();
+                if (!currentNode || currentNode.__closed)
+                    continue;
+
+                currentNode.__closed = true;
+
+                if (currentNode !== startTile) {
+                    const currentPos = normalizePosition(currentNode.__position);
+                    if (currentPos) {
+                        const distance =
+                            Math.abs(to.x - currentPos.x) +
+                            Math.abs(to.y - currentPos.y);
+                        const g = Number(currentNode.__g) || 0;
+
+                        // Closest reachable loaded tile to the real waypoint wins.
+                        // On ties, prefer the farther-along explored node so we end
+                        // near the loaded frontier instead of taking a tiny 1-step
+                        // segment and producing stop/start movement.
+                        if (
+                            distance < bestDistance ||
+                            (distance === bestDistance && g > bestG)
+                        ) {
+                            bestNode = currentNode;
+                            bestDistance = distance;
+                            bestG = g;
+                        }
+                    }
+                }
+
+                const neighbours =
+                    Array.isArray(currentNode.neighbours)
+                        ? currentNode.neighbours
+                        : [];
+
+                for (let i = 0; i < neighbours.length; i++) {
+                    const neighbourNode = neighbours[i];
+                    if (!neighbourNode || neighbourNode.__closed)
+                        continue;
+                    if (!isCaveFrontierPassableTile(neighbourNode))
+                        continue;
+
+                    const dx =
+                        Number(neighbourNode.__position?.x) -
+                        Number(currentNode.__position?.x);
+                    const dy =
+                        Number(neighbourNode.__position?.y) -
+                        Number(currentNode.__position?.y);
+                    const isDiagonal = dx !== 0 && dy !== 0;
+
+                    // Validate diagonals using the SAME passability rules as the
+                    // frontier route. Native __isDiagonalPassable() uses
+                    // isOccupied(), which would reintroduce the field problem.
+                    if (isDiagonal) {
+                        const z = Number(currentNode.__position?.z);
+                        const sideA = getTileAt({
+                            x: Number(currentNode.__position?.x) + dx,
+                            y: Number(currentNode.__position?.y),
+                            z
+                        });
+                        const sideB = getTileAt({
+                            x: Number(currentNode.__position?.x),
+                            y: Number(currentNode.__position?.y) + dy,
+                            z
+                        });
+
+                        if (
+                            !isCaveFrontierPassableTile(sideA) ||
+                            !isCaveFrontierPassableTile(sideB)
+                        ) {
+                            continue;
+                        }
+                    }
+
+                    const penalty = isDiagonal ? 3 : 1;
+                    const gScore =
+                        (Number(currentNode.__g) || 0) +
+                        penalty * neighbourNode.getCost(currentNode);
+                    const visited = neighbourNode.__visited;
+
+                    if (!visited || gScore < neighbourNode.__g) {
+                        neighbourNode.__visited = true;
+                        neighbourNode.__parent = currentNode;
+                        neighbourNode.__h =
+                            pf.heuristic(neighbourNode, syntheticTarget);
+                        neighbourNode.__g = gScore;
+                        neighbourNode.__f =
+                            neighbourNode.__g + neighbourNode.__h;
+
+                        pf.__dirtyNodes.push(neighbourNode);
+
+                        if (!visited)
+                            openHeap.push(neighbourNode);
+                        else
+                            openHeap.rescoreElement(neighbourNode);
+                    }
+                }
+            }
+
+            if (!bestNode)
+                return null;
+
+            const fullPath = pf.pathTo(bestNode);
+            if (!Array.isArray(fullPath) || fullPath.length === 0)
+                return null;
+
+            const segmentLength = Math.max(
+                1,
+                Math.min(
+                    Math.trunc(Number(maxSegmentSteps) || 10),
+                    fullPath.length
+                )
+            );
+            const path = fullPath.slice(0, segmentLength);
+            const endpoint = normalizePosition(path[path.length - 1]?.__position);
+            if (!endpoint)
+                return null;
+
+            return {
+                path,
+                startDistance,
+                frontierDistance: bestDistance,
+                endpoint,
+                fullPathLength: fullPath.length,
+                iterations
+            };
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function sendCaveLoadedFrontierPath(routeInfo, now = Date.now()) {
+        const path = Array.isArray(routeInfo?.path) ? routeInfo.path : [];
+        const client = window.gameClient;
+        const pf = client?.world?.pathfinder;
+        const current = normalizePosition(bot.getPlayerPosition());
+
+        if (
+            !client ||
+            !pf ||
+            !current ||
+            !path.length ||
+            typeof AutoWalkPacket !== "function"
+        ) {
+            return false;
+        }
+
+        const directions = [];
+        let previous = current;
+
+        for (let i = 0; i < path.length; i++) {
+            const tile = path[i];
+            const tilePos = normalizePosition(tile?.__position);
+            if (!tilePos || tilePos.z !== previous.z)
+                return false;
+
+            // Re-check the live tile immediately before sending. A creature can
+            // enter a frontier tile after the search was built.
+            if (!isCaveFrontierPassableTile(tile))
+                return false;
+
+            const dx = tilePos.x - previous.x;
+            const dy = tilePos.y - previous.y;
+            if (
+                Math.abs(dx) > 1 ||
+                Math.abs(dy) > 1 ||
+                (dx === 0 && dy === 0)
+            ) {
+                return false;
+            }
+
+            const direction = getDirection(Math.sign(dx), Math.sign(dy));
+            if (direction === null || direction === undefined)
+                return false;
+
+            directions.push(direction);
+            previous = tilePos;
+        }
+
+        if (!directions.length)
+            return false;
+
+        try {
+            if (pf.__isAutoWalking) {
+                try { client.send(new StopWalkPacket()); } catch (e) {}
+            }
+
+            pf.__pathfindCache = new Array();
+            pf.__minimapWaypoints = null;
+            pf.__recentMinimapStarts = [];
+            pf.__lastCancelPosition = null;
+            pf.__hybridPath = null;
+            pf.__autowalkStepHistory = [];
+            pf.__finalDestination = new Position(previous.x, previous.y, previous.z);
+            pf.__isAutoWalking = true;
+            pf.__autoWalkStepsRemaining = directions.length;
+            pf.__autowalkStartPosition = {
+                x: current.x,
+                y: current.y,
+                z: current.z
+            };
+            pf.__autowalkStartedAt =
+                typeof performance !== "undefined"
+                    ? performance.now()
+                    : now;
+
+            try { client.keyboard?.noteAutowalk?.(); } catch (e) {}
+
+            client.send(new AutoWalkPacket(directions));
+            state.lastPathAt = now;
+            return true;
+        } catch (e) {
+            pf.__isAutoWalking = false;
+            pf.__autoWalkStepsRemaining = 0;
+            pf.__finalDestination = null;
+            return false;
+        }
+    }
+
+    function tryCaveOffscreenFrontierRecovery(waypoint, now = Date.now(), source = "off-screen fallback") {
+        if (
+            !state.running ||
+            state.pausedForCombat ||
+            state.positionUnavailable ||
+            bot.attack?.isCombatActive?.() ||
+            bot.attack?.isLureActive?.() ||
+            !waypoint ||
+            waypoint.script
+        ) {
+            return false;
+        }
+
+        const current = normalizePosition(bot.getPlayerPosition());
+        if (!current || !isCaveWaypointOffScreen(current, waypoint))
+            return false;
+
+        const routeInfo = findCaveLoadedFrontierPath(current, waypoint, 10);
+        if (!routeInfo?.path?.length)
+            return false;
+
+        if (!sendCaveLoadedFrontierPath(routeInfo, now))
+            return false;
+
+        // This is progress toward the SAME waypoint, not a route recovery event.
+        // Do not poison route-health / circuit-breaker state with the native
+        // minimap failure that triggered this fallback.
+        state.recoveryActive = false;
+        if (state.recoveryReason === "NO_WAY") {
+            state.recoveryReason = null;
+            state.recoveryReasonAt = 0;
+            state.recoveryReasonIndex = -1;
+            state.recoveryReasonKey = null;
+        }
+        state.lastProgressAt = now;
+        state.nativePathWatchAt = now;
+        state.nativePathWatchBestDistance = getDistanceToWaypoint(current, waypoint);
+        state.stuckCount = 0;
+        state.stuckRecoveryAttempts = 0;
+        state.recoverySideStepAttempts = 0;
+        state.recoveryBlockerWaitAt = 0;
+        state.recoveryBlockerWaitKey = null;
+        state.lastWaypointTarget = waypoint;
+        state.pathAttemptStart = now;
+
+        const lastLogAt = Number(state.offscreenFrontierLastLogAt) || 0;
+        if (now - lastLogAt >= 1200) {
+            state.offscreenFrontierLastLogAt = now;
+            bot.log(
+                `Cave: ${source} at off-screen waypoint #${state.currentIndex + 1} – ` +
+                `walking loaded A* frontier ${routeInfo.path.length} step${routeInfo.path.length === 1 ? "" : "s"} ` +
+                `toward (${waypoint.x}, ${waypoint.y}, ${waypoint.z})`
+            );
+        }
+
+        return true;
+    }
+
     // Remember the exact Pathfinder object whose search method we wrapped.
     // A client reconnect may replace world.pathfinder before cleanup runs;
     // looking up only the current Pathfinder would retain the old wrapper and
@@ -24327,6 +24862,13 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 if (livePf !== pf || livePf?.__finalDestination || livePf?.__isAutoWalking) return;
                 const current = bot.getPlayerPosition();
                 if (!current) return;
+
+                // If the native long-range request failed to establish any
+                // destination at all, prefer a real loaded-map A* segment over
+                // the old blind one-tile fallback.
+                if (tryCaveOffscreenFrontierRecovery(waypoint, Date.now(), "native path did not start"))
+                    return;
+
                 const dx = waypoint.x - current.x;
                 const dy = waypoint.y - current.y;
                 const stepX = dx > 0 ? 1 : (dx < 0 ? -1 : 0);
@@ -24657,9 +25199,87 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         return true;
     }
 
-    // v1.5.91: automatic floor-transition probing/execution removed.
-    // Floor changes are owned exclusively by explicit Rope/Shovel/Stand
-    // waypoints. Generic floor mismatch recovery never uses tools.
+    function tileHasTeleporter(tile) {
+        if (!tile)
+            return false;
+        return getTileThings(tile).some(thing =>
+            teleporterItemIds.has(Number(thing?.id))
+        );
+    }
+
+    function handleFloorChange(waypoint, now = Date.now()) {
+        if (config.autoTransitions !== true)
+            return false;
+
+        const position = normalizePosition(bot.getPlayerPosition());
+        if (!position || !waypoint || position.z === waypoint.z)
+            return false;
+
+        // First prefer a local visible transition. This is intentionally bounded
+        // by autoTransitionRadius to avoid selecting unrelated city stairs.
+        const visible = findNearbyTransitionTile(position, waypoint);
+        if (visible) {
+            if (tileHasTeleporter(visible.tile)) {
+                const moved = goToPosition(visible.position);
+                if (moved)
+                    return true;
+            }
+
+            const beforeUseAt = state.lastStairsUseAt;
+            const moved = useFloorChangeTile(visible, waypoint, now);
+            if (moved) {
+                if (state.lastStairsUseAt !== beforeUseAt) {
+                    const key = `${visible.position.x},${visible.position.y},${visible.position.z}->${waypoint.z}`;
+                    if (state.lastAutoProbeKey !== key || now - state.lastAutoProbeLogAt > 1500) {
+                        state.lastAutoProbeKey = key;
+                        state.lastAutoProbeLogAt = now;
+                        bot.log("cave auto transition used", {
+                            tileX: visible.position.x,
+                            tileY: visible.position.y,
+                            tileZ: visible.position.z,
+                            targetZ: waypoint.z
+                        });
+                    }
+                }
+                return true;
+            }
+        }
+
+        // If no suitable visible transition is available, allow a previously
+        // observed transition that lands on the waypoint's floor.
+        const known = findBestKnownTransition(position, waypoint);
+        if (known) {
+            const target = {
+                tile: getTileAt(known.from),
+                position: known.from
+            };
+
+            if (tileHasTeleporter(target.tile)) {
+                const moved = goToPosition(known.from);
+                if (moved)
+                    return true;
+            }
+
+            const beforeUseAt = state.lastStairsUseAt;
+            const moved = useFloorChangeTile(target, waypoint, now);
+            if (moved) {
+                if (state.lastStairsUseAt !== beforeUseAt) {
+                    const key = `${getPositionKey(known.from)}->${getPositionKey(known.to)}`;
+                    if (state.lastTransitionLogKey !== key) {
+                        state.lastTransitionLogKey = key;
+                        bot.log("cave using learned floor transition", {
+                            from: known.from,
+                            to: known.to,
+                            waypoint
+                        });
+                    }
+                }
+                return true;
+            }
+        }
+
+        return false;
+    }
 
     // ---- WAYPOINT NAVIGATION ----
     function advanceWaypoint() {
@@ -28310,12 +28930,15 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 position &&
                 waypoint.z !== position.z
             ) {
-                // Generic CaveBot never probes/uses ropes, shovels, holes,
-                // ladders or teleporters automatically. Explicit
-                // Rope/Shovel/Stand waypoints own intentional transitions.
-                //
-                // The special STAND/hole mismatch was handled earlier and
-                // still advances forward. Every other mismatch re-anchors to
+                // Auto Transitions is strictly opt-in. When enabled, try the
+                // conservative local/learned transition helper first. When it is
+                // disabled (the default), preserve the manual-transition recovery
+                // behavior introduced in v1.5.91.
+                if (config.autoTransitions === true && handleFloorChange(waypoint, now))
+                    return;
+
+                // The special STAND/hole mismatch was handled earlier and still
+                // advances forward. Every other unresolved mismatch re-anchors to
                 // the closest coordinate waypoint on the player's current floor.
                 recoverToClosestSameFloorWaypoint(
                     position,
@@ -29267,17 +29890,20 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             ...nextConfig
         };
 
-        delete cleanConfig.autoTransitions;
-        delete cleanConfig.autoTransitionRadius;
+        if (cleanConfig.autoTransitions !== undefined)
+            cleanConfig.autoTransitions = cleanConfig.autoTransitions === true;
+        if (cleanConfig.autoTransitionRadius !== undefined)
+            cleanConfig.autoTransitionRadius = Math.max(2, Math.min(8,
+                Math.trunc(Number(cleanConfig.autoTransitionRadius) || 6)));
 
         Object.assign(
             config,
             cleanConfig
         );
 
-        delete config.autoTransitions;
-        delete config.autoTransitionRadius;
-
+        config.autoTransitions = config.autoTransitions === true;
+        config.autoTransitionRadius = Math.max(2, Math.min(8,
+            Math.trunc(Number(config.autoTransitionRadius) || 6)));
         config.tickMs = 500;
         config.maxWaypointDistance = boundedWaypointDistance(config.maxWaypointDistance);
         config.lureBlockerDetourCooldownMs = Math.max(
@@ -38224,7 +38850,8 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
         "minibiaBot.messageAlert.config",
         "minibiaBot.antibot.config",
         "minibiaBot.gmChatMonitor.config",
-        "minibiaBot.tormentedGhost.config",
+        "minibiaBot.antiBotCreature.config",
+        "minibiaBot.tormentedGhost.config", // legacy key; deleted by AntiBotCreature on startup
         "minibiaBot.keyringToggle.config",
         "minibiaBot.itemIdDisplay.config",
         "minibiaBot.ui.panelPosition",
@@ -38810,18 +39437,34 @@ window.__minibiaBotBundle.installAntiAfkModule = function installAntiAfkModule(b
 
     function sendTurn(dir) {
         try {
-            if (window.gameClient?.keyboard?.handleDirectionKey) {
-                window.gameClient.keyboard.handleDirectionKey(dir);
+            const keyboard =
+                window.gameClient?.keyboard;
+
+            // Native turn-only path. __setTurn updates the local turn buffer
+            // and sends PlayerTurnPacket; it never changes player position.
+            if (
+                keyboard &&
+                typeof keyboard.__setTurn ===
+                    "function"
+            ) {
+                keyboard.__setTurn(dir);
                 return true;
             }
-            if (window.gameClient?.send && typeof TurnPacket === 'function') {
-                window.gameClient.send(new TurnPacket(dir));
+
+            // Direct turn-only fallback for builds where __setTurn is hidden.
+            if (
+                window.gameClient?.send &&
+                typeof PlayerTurnPacket ===
+                    "function"
+            ) {
+                window.gameClient.send(
+                    new PlayerTurnPacket(dir)
+                );
                 return true;
             }
-            if (window.gameClient?.keyboard?.handleMoveKey) {
-                window.gameClient.keyboard.handleMoveKey(dir);
-                return true;
-            }
+
+            // Never fall back to handleMoveKey/MovementPacket: Anti-AFK may
+            // rotate the character, but it must never move them off the tile.
             return false;
         } catch (e) {
             return false;
@@ -43062,7 +43705,7 @@ function upgradeSectionHeaders(panel) {
 
       <!-- Right Column -->
       <div style="display:flex; flex-direction:column; gap:10px;">
-        <label class="mb-toggle"><input type="checkbox" id="minibia-bot-tormented-ghost-enabled" /><span>Anti-Bot Creature</span></label>
+        <label class="mb-toggle"><input type="checkbox" id="minibia-bot-antibot-creature-enabled" /><span>Anti-Bot Creature</span></label>
       </div>
     </div>
 
@@ -43404,6 +44047,7 @@ function upgradeSectionHeaders(panel) {
     <!-- Main settings -->
     <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
       <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-cave-loop" /> Loop</label>
+      <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-cave-auto-transitions" /> Auto Transitions</label>
       <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-cave-ignore-fields" /> Walk Through Fields</label>
     </div>
 
@@ -44480,56 +45124,27 @@ function upgradeSectionHeaders(panel) {
         // Initial refresh
         setTimeout(refreshAutoPickupStatus, 100);
 
-        // ---- Tormented Ghost ----
-        const ghostToggle = document.getElementById("minibia-bot-tormented-ghost-enabled");
-        const ghostDelay = document.getElementById("minibia-bot-tormented-ghost-delay");
-        const ghostStatus = document.getElementById("minibia-bot-tormented-ghost-status");
+        // ---- AntiBotCreature ----
+        const antiBotCreatureToggle = document.getElementById("minibia-bot-antibot-creature-enabled");
 
-        function refreshTormentedGhostStatus() {
-            const status = bot.tormentedGhost?.status?.();
+        function refreshAntiBotCreatureStatus() {
+            const status = bot.antiBotCreature?.status?.();
             if (!status)
                 return;
-            if (ghostToggle && document.activeElement !== ghostToggle) {
-                ghostToggle.checked = status.running;
-            }
-            if (ghostDelay && document.activeElement !== ghostDelay) {
-                ghostDelay.value = (status.config.replyDelayMs / 500).toFixed(1);
-            }
-            if (ghostStatus) {
-                if (status.ghostDetected) {
-                    ghostStatus.textContent = "👻 Ghost detected!";
-                } else if (status.running) {
-                    ghostStatus.textContent = "Watching...";
-                } else {
-                    ghostStatus.textContent = "Idle";
-                }
+            if (antiBotCreatureToggle && document.activeElement !== antiBotCreatureToggle) {
+                antiBotCreatureToggle.checked = status.running;
             }
         }
 
-        if (ghostToggle) {
-            ghostToggle.checked = !!bot.tormentedGhost?.status?.().running;
-            ghostToggle.addEventListener("change", function () {
+        if (antiBotCreatureToggle) {
+            antiBotCreatureToggle.checked = !!bot.antiBotCreature?.status?.().running;
+            antiBotCreatureToggle.addEventListener("change", function () {
                 if (this.checked) {
-                    const delay = Math.max(500, parseFloat(ghostDelay?.value) * 1000 || 3000);
-                    bot.tormentedGhost.updateConfig({
-                        enabled: true,
-                        replyDelayMs: delay,
-                    });
+                    bot.antiBotCreature?.start?.();
                 } else {
-                    bot.tormentedGhost.stop();
+                    bot.antiBotCreature?.stop?.();
                 }
-                refreshTormentedGhostStatus();
-            });
-        }
-
-        if (ghostDelay) {
-            ghostDelay.addEventListener("change", function () {
-                const val = Math.max(0.5, parseFloat(this.value) || 1);
-                this.value = val.toFixed(1);
-                bot.tormentedGhost.updateConfig({
-                    replyDelayMs: val * 1000,
-                });
-                refreshTormentedGhostStatus();
+                refreshAntiBotCreatureStatus();
             });
         }
 
@@ -47434,6 +48049,16 @@ function upgradeSectionHeaders(panel) {
             });
         }
 
+        const autoTransToggle = panel.querySelector("#minibia-bot-cave-auto-transitions");
+        if (autoTransToggle) {
+            autoTransToggle.checked = bot.cave?.config?.autoTransitions === true;
+            autoTransToggle.addEventListener("change", () => {
+                bot.cave.updateConfig({
+                    autoTransitions: autoTransToggle.checked
+                });
+            });
+        }
+
         const ignoreFieldsToggle = panel.querySelector("#minibia-bot-cave-ignore-fields");
         if (ignoreFieldsToggle) {
             ignoreFieldsToggle.checked = bot.cave?.config?.ignoreFields !== false;
@@ -47899,7 +48524,7 @@ function upgradeSectionHeaders(panel) {
             refreshLightHackLegitStatus();
             refreshPaladinStatus();
             refreshGmChatStatus();
-            refreshTormentedGhostStatus();
+            refreshAntiBotCreatureStatus();
             refreshStatusTab();
             refreshCollapsedQuickModules();
             if (convertCurrencyToggle) {
@@ -48802,232 +49427,6 @@ window.__minibiaBotBundle.installCustomNotificationModule = function installCust
     };
 
     bot.log('Custom notification module installed. bot.print now sends in‑game notifications.');
-};
-
-/**
- * ==================================================================================
- * SHOVEL HOTKEY MODULE (Sprite or Blank)
- * Shows the shovel sprite if available, otherwise blank (stealth).
- * ==================================================================================
- */
-window.__minibiaBotBundle.installShovelHotkeyModule = function installShovelHotkeyModule(bot) {
-    if (window.__shovelHotkeyInstalled)
-        return;
-    window.__shovelHotkeyInstalled = true;
-
-    const SHOVEL_CID = 2556; // Standard shovel
-
-    const hotbarInstance = gameClient?.interface?.hotbarManager;
-    if (!hotbarInstance) {
-        console.warn("[ShovelHotkey] HotbarManager instance not found.");
-        return;
-    }
-
-    const HotbarManagerClass = hotbarInstance.constructor;
-    if (!HotbarManagerClass) {
-        console.warn("[ShovelHotkey] Cannot find HotbarManager constructor.");
-        return;
-    }
-
-    const proto = HotbarManagerClass.prototype;
-
-    // ---- Add action definition ----
-    proto.ACTIONS.shovelHole = {
-        name: "Shovel Nearest Hole",
-        icon: "", // no fallback emoji
-        bg: "#6b4a20",
-        border: "#cc8844",
-        fg: "#ffdd88"
-    };
-
-    // ---- Patch executor ----
-    if (!proto.__executeActionShovelPatched) {
-        const originalExecuteAction = proto.__executeAction;
-        proto.__executeAction = function (actionId) {
-            if (actionId === "shovelHole") {
-                return this.__shovelHole();
-            }
-            return originalExecuteAction.call(this, actionId);
-        };
-        proto.__executeActionShovelPatched = true;
-    }
-
-    // ---- Patch the renderer: try sprite, else blank ----
-    if (!proto.__drawActionIconShovelPatched) {
-        const originalDrawActionIcon = proto.__drawActionIcon;
-        proto.__drawActionIcon = function (slot) {
-            if (slot.action === "shovelHole") {
-                if (slot.canvas) {
-                    const ctx = slot.canvas.context;
-                    slot.canvas.clear();
-                    // Try to draw the actual shovel sprite
-                    try {
-                        const item = new Item(SHOVEL_CID, 1);
-                        // Check if the sprite is loadable (if gameClient.spriteBuffer exists and has the sprite)
-                        // We can also attempt a draw and catch any exceptions.
-                        slot.canvas.drawSprite(item, Position.prototype.NULL, 32);
-                    } catch (e) {
-                        // If sprite fails, leave it blank – no fallback
-                        // Already cleared
-                    }
-                }
-                return; // early exit – don't call original
-            }
-            return originalDrawActionIcon.call(this, slot);
-        };
-        proto.__drawActionIconShovelPatched = true;
-    }
-
-    // ---- Helper: find a shovel ----
-    proto.__findShovelInInventory = function () {
-        const player = gameClient.player;
-        if (!player)
-            return null;
-
-        const equipment = player.equipment;
-        for (let i = 0; i < equipment.slots.length; i++) {
-            const item = equipment.getSlotItem(i);
-            if (item && this.__isShovelItem(item)) {
-                return {
-                    container: equipment,
-                    slotIndex: i,
-                    item: item
-                };
-            }
-        }
-
-        const containers = Array.from(player.__openedContainers);
-        for (const container of containers) {
-            for (let i = 0; i < container.slots.length; i++) {
-                const item = container.getSlotItem(i);
-                if (item && this.__isShovelItem(item)) {
-                    return {
-                        container: container,
-                        slotIndex: i,
-                        item: item
-                    };
-                }
-            }
-        }
-
-        return null;
-    };
-
-    proto.__isShovelItem = function (item) {
-        if (!item)
-            return false;
-        const def = gameClient.itemDefinitionsByCid ? gameClient.itemDefinitionsByCid[item.id] : null;
-        if (def && def.properties && def.properties.name) {
-            const name = def.properties.name.toLowerCase();
-            if (name.includes("shovel"))
-                return true;
-        }
-        const shovelIds = [2556, 2557, 3102];
-        return shovelIds.includes(item.id);
-    };
-
-    // ---- Helper: find nearest shovel-targetable tile ----
-    proto.__findNearestShovelTarget = function () {
-        const playerPos = gameClient.player.getPosition();
-        if (!playerPos)
-            return null;
-
-        const offsets = [
-            [0, 0], [0, -1], [1, -1], [1, 0], [1, 1],
-            [0, 1], [-1, 1], [-1, 0], [-1, -1]
-        ];
-
-        let bestTile = null;
-        let bestDist = Infinity;
-
-        for (const [dx, dy] of offsets) {
-            const x = playerPos.x + dx;
-            const y = playerPos.y + dy;
-            const z = playerPos.z;
-            const pos = new Position(x, y, z);
-            const tile = gameClient.world.getTileFromWorldPosition(pos);
-            if (!tile)
-                continue;
-
-            if (this.__isShovelTargetTile(tile)) {
-                const dist = Math.abs(dx) + Math.abs(dy);
-                if (dist < bestDist) {
-                    bestDist = dist;
-                    bestTile = tile;
-                }
-            }
-        }
-
-        return bestTile;
-    };
-
-    proto.__isShovelTargetTile = function (tile) {
-        if (!tile)
-            return false;
-        const things = [tile, ...(tile.items || [])];
-        for (const thing of things) {
-            if (!thing)
-                continue;
-            const holeIds = [12396, 12400, 12401, 12402];
-            if (holeIds.includes(thing.id))
-                return true;
-            const def = gameClient.itemDefinitionsByCid ? gameClient.itemDefinitionsByCid[thing.id] : null;
-            if (def && def.properties && def.properties.name) {
-                const name = def.properties.name.toLowerCase();
-                if (name.includes("hole") ||
-                    name.includes("stone pile") ||
-                    name.includes("dirt pile") ||
-                    name.includes("loose stone") ||
-                    name.includes("grave") ||
-                    name.includes("sand pile") ||
-                    name.includes("bush")) {
-                    return true;
-                }
-            }
-        }
-        return false;
-    };
-
-    // ---- The main action ----
-    proto.__shovelHole = function () {
-        const shovelSource = this.__findShovelInInventory();
-        if (!shovelSource) {
-            gameClient.interface.setCancelMessage("You don't have a shovel.");
-            return;
-        }
-
-        const targetTile = this.__findNearestShovelTarget();
-        if (!targetTile) {
-            gameClient.interface.setCancelMessage("No hole or dirt pile nearby.");
-            return;
-        }
-
-        const from = {
-            which: shovelSource.container,
-            index: shovelSource.slotIndex
-        };
-        const to = {
-            which: targetTile,
-            index: 0xFF
-        };
-
-        try {
-            if (gameClient.mouse && typeof gameClient.mouse.__handleItemUseWith === 'function') {
-                gameClient.mouse.__handleItemUseWith(from, to);
-                return;
-            }
-            if (window.gameClient && gameClient.send && typeof ItemUseWithPacket === 'function') {
-                gameClient.send(new ItemUseWithPacket(from, to));
-                return;
-            }
-            gameClient.interface.setCancelMessage("Cannot use shovel on this tile.");
-        } catch (e) {
-            console.error("[ShovelHotkey] Error:", e);
-            gameClient.interface.setCancelMessage("Failed to use shovel.");
-        }
-    };
-
-    bot.log("[ShovelHotkey] Installed – shows shovel sprite if available, otherwise blank.");
 };
 
 /**
@@ -50015,17 +50414,23 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
 };
 
 // ==================================================================================
-// TORMENTED GHOST – replies to any creature that mentions your name (robust match)
+// ANTIBOT CREATURE – responds only to orange creature speech
 // ==================================================================================
-window.__minibiaBotBundle.installTormentedGhostModule = function installTormentedGhostModule(bot) {
-    const configStorageKey = "minibiaBot.tormentedGhost.config";
+window.__minibiaBotBundle.installAntiBotCreatureModule = function installAntiBotCreatureModule(bot) {
+    const configStorageKey = "minibiaBot.antiBotCreature.config";
+    const legacyStorageKey = "minibiaBot.tormentedGhost.config";
+
+    // This is a new module identity. Never inherit stale TormentedGhost settings.
+    try {
+        window.localStorage.removeItem(legacyStorageKey);
+    } catch (e) {}
+
     const state = {
-        running: true,
+        running: false,
         replyCooldown: new Map(), // creatureId -> lastReplyTime
         originalSay: null,
         patched: false,
         replyTimer: null,
-        debug: false,
         hookOwner: null,
         hookWrapper: null,
         hookRetryTimer: null,
@@ -50033,131 +50438,111 @@ window.__minibiaBotBundle.installTormentedGhostModule = function installTormente
     };
 
     const config = Object.assign({
-        enabled: false,
+        enabled: true,
         replyDelayMs: 500,
+        replyText: "lol",
         triggerAlarm: true,
         cooldownMs: 30000,
-        debug: false, // NEW: log every creature saying
+        debug: false,
     }, bot.storage.get(configStorageKey, {}));
 
     function persistConfig() {
         bot.storage.set(configStorageKey, {
             enabled: config.enabled,
             replyDelayMs: config.replyDelayMs,
+            replyText: config.replyText,
             triggerAlarm: config.triggerAlarm,
             cooldownMs: config.cooldownMs,
             debug: config.debug,
         });
     }
 
-    // ---- Normalize: lowercase, strip punctuation/whitespace/quotes ----
-    function normalize(str) {
-        return String(str || "")
-        .toLowerCase()
-        .replace(/[^a-z0-9 ]/g, "") // keep letters, digits, spaces
-        .replace(/\s+/g, " ")
-        .trim();
+    function getOrangeColor() {
+        const configured = Number(window.Interface?.prototype?.COLORS?.ORANGE);
+        return Number.isFinite(configured) ? configured : 198;
     }
 
-    // ---- Check if a message mentions the player ----
-    function messageMentionsPlayer(message, playerName) {
-        if (!message || !playerName)
-            return false;
-
-        // 1) Direct case-insensitive substring (handles most cases)
-        if (message.toLowerCase().includes(playerName.toLowerCase())) {
-            return true;
-        }
-
-        // 2) Normalized comparison (strips brackets, quotes, punctuation, spacing)
-        const normMsg = normalize(message);
-        const normName = normalize(playerName);
-        if (normMsg.includes(normName)) {
-            return true;
-        }
-
-        // 3) First-word match (handles "Name The Great" vs "Name")
-        const firstName = playerName.split(/\s+/)[0];
-        if (firstName && firstName.length >= 3) {
-            const normFirst = normalize(firstName);
-            // Word-boundary match on the first name
-            const re = new RegExp("\\b" + normFirst.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\b", "i");
-            if (re.test(normMsg)) {
-                return true;
-            }
-        }
-
-        return false;
+    function isOrangeCreatureMessage(packet) {
+        return !!packet && Number(packet.color) === getOrangeColor();
     }
 
-    // ---- Hook Creature.say ----
     function installSpeechHook() {
         if (state.patched)
             return;
-        if (typeof Creature === 'undefined' || !Creature.prototype) {
-            if (state.running && config.enabled && state.hookRetryTimer === null)
+        if (typeof Creature === "undefined" || !Creature.prototype) {
+            if (state.running && config.enabled && state.hookRetryTimer === null) {
                 state.hookRetryTimer = setTimeout(() => {
                     state.hookRetryTimer = null;
-                    if (state.running && config.enabled) installSpeechHook();
+                    if (state.running && config.enabled)
+                        installSpeechHook();
                 }, 500);
+            }
             return;
         }
 
         const originalSay = Creature.prototype.say;
         state.originalSay = originalSay;
-
         state.hookOwner = Creature.prototype;
+
         const wrapper = function (packet) {
             const result = originalSay.call(this, packet);
 
             if (!state.running || !config.enabled)
                 return result;
-            if (this === gameClient.player)
+            if (this === window.gameClient?.player)
                 return result;
 
-            const message = packet.message || "";
-            const playerName = bot.getPlayerName();
+            // Anti-bot challenges are identified by the actual speech color.
+            // Do not react to ordinary NPC speech just because it contains the
+            // player's name, and ignore player speech entirely.
+            if (Number(this?.type) === 0 || !isOrangeCreatureMessage(packet))
+                return result;
 
-            // ---- DEBUG: log every creature saying so we can see the format ----
+            const message = String(packet?.message || "");
             if (config.debug) {
-                bot.log(`[Ghost-Debug] ${this.name} says: "${message}" (player="${playerName}")`);
+                bot.log(`[AntiBotCreature-Debug] orange speech from ${this?.name || this?.id}: "${message}"`);
             }
 
-            if (!playerName)
-                return result;
-
-            if (!messageMentionsPlayer(message, playerName))
-                return result;
-
             const now = Date.now();
-            const creatureId = this.id;
+            const creatureId = Number(this?.id) || String(this?.name || "orange-creature");
             const last = state.replyCooldown.get(creatureId) || 0;
             if (now - last < config.cooldownMs)
                 return result;
+
             state.replyCooldown.set(creatureId, now);
             if (state.replyCooldown.size > 200) {
                 for (const [id, at] of state.replyCooldown) {
-                    if (now - at >= config.cooldownMs) state.replyCooldown.delete(id);
+                    if (now - at >= config.cooldownMs)
+                        state.replyCooldown.delete(id);
                 }
                 while (state.replyCooldown.size > 200)
                     state.replyCooldown.delete(state.replyCooldown.keys().next().value);
             }
 
-            if (config.triggerAlarm) {
-                bot.playGMAlarm?.();
-            }
-            bot.log(`[Ghost] ${this.name} mentioned you: "${message}"`);
+            if (config.triggerAlarm)
+                bot.playAntiBotAlarm?.();
+
+            bot.log(`[AntiBotCreature] Orange message from ${this?.name || "creature"}: "${message}"`);
 
             if (state.replyTimer)
                 clearTimeout(state.replyTimer);
-            const self = this;
+
+            const speakerName = this?.name || "creature";
             state.replyTimer = setTimeout(() => {
-                if (state.running) {
-                    const sent = bot.sendChat("lol");
-                    if (sent)
-                        bot.log(`[Ghost] Replied "hi" to ${self.name}.`);
-                }
                 state.replyTimer = null;
+                if (!state.running || !config.enabled)
+                    return;
+
+                // Explicitly send through the Default channel. This also keeps
+                // the normal in-world speech behavior while avoiding whatever
+                // chat tab happens to be selected in the UI.
+                const sent = bot.sendChatToChannel(
+                    String(config.replyText || "lol"),
+                    "Default"
+                );
+                if (sent) {
+                    bot.log(`[AntiBotCreature] Replied in Default chat to ${speakerName}.`);
+                }
             }, config.replyDelayMs);
 
             return result;
@@ -50166,7 +50551,7 @@ window.__minibiaBotBundle.installTormentedGhostModule = function installTormente
         state.hookWrapper = wrapper;
         state.hookOwner.say = wrapper;
         state.patched = true;
-        bot.log("[Ghost] Speech hook installed.");
+        bot.log("[AntiBotCreature] speech hook installed");
     }
 
     function uninstallSpeechHook() {
@@ -50174,22 +50559,27 @@ window.__minibiaBotBundle.installTormentedGhostModule = function installTormente
             clearTimeout(state.hookRetryTimer);
             state.hookRetryTimer = null;
         }
-        if (!state.patched) return;
+        if (!state.patched)
+            return;
         if (state.hookOwner?.say === state.hookWrapper)
             state.hookOwner.say = state.originalSay;
         state.originalSay = null;
         state.hookOwner = null;
         state.hookWrapper = null;
         state.patched = false;
-        bot.log("[Ghost] Speech hook removed.");
+        bot.log("[AntiBotCreature] speech hook removed");
     }
 
     function start(overrides = {}) {
-        Object.assign(config, overrides, {
-            enabled: true
-        });
+        Object.assign(config, overrides, { enabled: true });
+        config.replyDelayMs = Math.max(0, Number(config.replyDelayMs) || 0);
+        config.cooldownMs = Math.max(1000, Number(config.cooldownMs) || 30000);
+        config.replyText = String(config.replyText || "lol").trim() || "lol";
         persistConfig();
-        if (state.running && state.patched) return false;
+
+        if (state.running && state.patched)
+            return false;
+
         state.running = true;
         state.replyCooldown.clear();
         if (state.replyTimer) {
@@ -50197,13 +50587,14 @@ window.__minibiaBotBundle.installTormentedGhostModule = function installTormente
             state.replyTimer = null;
         }
         installSpeechHook();
-        bot.log("[Ghost] started");
+        bot.log("[AntiBotCreature] started");
         return true;
     }
 
     function stop(options = {}) {
         const shouldPersist = options.persistEnabled !== false;
         state.running = false;
+
         if (state.startTimer !== null) {
             clearTimeout(state.startTimer);
             state.startTimer = null;
@@ -50212,57 +50603,62 @@ window.__minibiaBotBundle.installTormentedGhostModule = function installTormente
             clearTimeout(state.replyTimer);
             state.replyTimer = null;
         }
+
         uninstallSpeechHook();
         state.replyCooldown.clear();
+
         if (shouldPersist) {
             config.enabled = false;
             persistConfig();
         }
-        bot.log("[Ghost] stopped");
+
+        bot.log("[AntiBotCreature] stopped");
         return true;
     }
 
     function status() {
         return {
             running: state.running,
-            config: {
-                ...config
-            },
-            patched: state.patched
+            config: { ...config },
+            patched: state.patched,
+            orangeColor: getOrangeColor(),
         };
     }
 
     function updateConfig(next = {}) {
         Object.assign(config, next);
-        if (config.replyDelayMs < 500)
-            config.replyDelayMs = 500;
-        if (config.cooldownMs < 5000)
-            config.cooldownMs = 5000;
+        config.replyDelayMs = Math.max(0, Number(config.replyDelayMs) || 0);
+        config.cooldownMs = Math.max(1000, Number(config.cooldownMs) || 30000);
+        config.replyText = String(config.replyText || "lol").trim() || "lol";
         persistConfig();
+
         if (config.enabled && !state.running)
             start();
         if (!config.enabled && state.running)
             stop();
-        return {
-            ...config
-        };
+
+        return { ...config };
     }
 
-    if (config.enabled)
+    // Auto-enabled by default on a clean install. A user can still explicitly
+    // disable the new module; that choice is stored under the new key only.
+    if (config.enabled) {
         state.startTimer = setTimeout(() => {
             state.startTimer = null;
-            if (config.enabled) start();
+            if (config.enabled)
+                start();
         }, 1000);
+    }
+
     bot.addCleanup(() => stop({ persistEnabled: false }));
 
-    bot.tormentedGhost = {
+    bot.antiBotCreature = {
         start,
         stop,
         status,
         updateConfig,
         config,
-        // expose for console testing
-        _debugMatch: (msg, name) => messageMentionsPlayer(msg, name || bot.getPlayerName()),
+        _isOrangeMessage: isOrangeCreatureMessage,
     };
 };
 
@@ -51095,10 +51491,9 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
 
         currentBundle.installPanel(bot);
         currentBundle.installCustomNotificationModule(bot);
-        currentBundle.installShovelHotkeyModule(bot);
         currentBundle.installKeyringStealthToggleModule(bot);
         currentBundle.installGmChatMonitorModule(bot);
-        currentBundle.installTormentedGhostModule(bot);
+        currentBundle.installAntiBotCreatureModule(bot);
         currentBundle.installAutoPickupModule(bot);
         currentBundle.installItemIdDisplayModule(bot);
 
@@ -51165,7 +51560,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
                 ["messageAlert", "minibiaBot.messageAlert.config"],
                 ["antiBotMonitor", "minibiaBot.antibot.config"],
                 ["gmChatMonitor", "minibiaBot.gmChatMonitor.config"],
-                ["tormentedGhost", "minibiaBot.tormentedGhost.config"],
+                ["antiBotCreature", "minibiaBot.antiBotCreature.config"],
                 ["keyringToggle", "minibiaBot.keyringToggle.config"],
                 ["itemIdDisplay", "minibiaBot.itemIdDisplay.config"],
             ];
