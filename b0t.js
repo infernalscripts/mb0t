@@ -2198,7 +2198,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.5.99",
+        version: "1.6.01",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -3903,6 +3903,17 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         }
     }
 
+    // Generic lightweight alert exposed through the existing bot audio system.
+    // Reuses the Panic module's shared AudioContext/tone sequencer rather than
+    // creating a second audio engine or invoking one of the spoken alarm files.
+    function playGenericBeepBloop() {
+        playToneSequence([
+            { freq: 760, dur: 120, vol: 0.30 },
+            { freq: 420, dur: 180, delay: 145, vol: 0.30 },
+        ]);
+        return true;
+    }
+
     function playTargetDeathBeep() {
         playToneSequence([{
                     freq: 800,
@@ -5047,6 +5058,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         getVisibleGameMasters,
         getTrustedNames,
         getGameMasterNames,
+        playGenericBeepBloop,
         config,
         cancelRestart: function () {
             return bot.gmKillSwitch?.cancel?.(
@@ -50610,7 +50622,7 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
 };
 
 // ==================================================================================
-// ANTIBOT CREATURE – responds only to orange creature speech
+// ANTIBOT CREATURE – responds only to orange creature speech mentioning the player name
 // ==================================================================================
 window.__minibiaBotBundle.installAntiBotCreatureModule = function installAntiBotCreatureModule(bot) {
     const configStorageKey = "minibiaBot.antiBotCreature.config";
@@ -50695,8 +50707,27 @@ window.__minibiaBotBundle.installAntiBotCreatureModule = function installAntiBot
                 return result;
 
             const message = String(packet?.message || "");
+            const playerName = String(
+                bot.getPlayerName?.() ||
+                window.gameClient?.player?.name ||
+                window.gameClient?.player?.state?.name ||
+                ""
+            ).trim();
+            const normalizedMessage = message.toLowerCase().replace(/\s+/g, " ").trim();
+            const normalizedPlayerName = playerName.toLowerCase().replace(/\s+/g, " ").trim();
+
+            // Orange speech alone is not enough. Only an orange creature message
+            // that actually mentions the current character name is an anti-bot
+            // prompt. Ordinary orange NPC ambience (e.g. "Ribbit! Ribbit!") is ignored.
+            if (!normalizedPlayerName || !normalizedMessage.includes(normalizedPlayerName)) {
+                if (config.debug) {
+                    bot.log(`[AntiBotCreature-Debug] ignored orange speech from ${this?.name || this?.id}: player name not mentioned`);
+                }
+                return result;
+            }
+
             if (config.debug) {
-                bot.log(`[AntiBotCreature-Debug] orange speech from ${this?.name || this?.id}: "${message}"`);
+                bot.log(`[AntiBotCreature-Debug] matched orange speech from ${this?.name || this?.id}: "${message}"`);
             }
 
             const now = Date.now();
@@ -50716,7 +50747,7 @@ window.__minibiaBotBundle.installAntiBotCreatureModule = function installAntiBot
             }
 
             if (config.triggerAlarm)
-                bot.playAntiBotAlarm?.();
+                bot.panic?.playGenericBeepBloop?.();
 
             bot.log(`[AntiBotCreature] Orange message from ${this?.name || "creature"}: "${message}"`);
 
