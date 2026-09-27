@@ -19710,6 +19710,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     const shovelTargetNamePatterns = [
         /\bstone pile\b/i, /\bloose stone pile\b/i, /\bgravel pile\b/i, /\bdirt pile\b/i,
     ];
+    const LEARN_WAYPOINT_SPACING = 10;
+    const LEARN_TOOL_WINDOW_MS = 15000;
 
     const state = {
         running: false,
@@ -19990,10 +19992,25 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         _ladderNextUseAt: null, // index -> timestamp; prevents rapid repeated ladder attempts
         combatCooldownUntil: 0,
         _ladderWaitingFloorChange: null, // { index: number, fromZ: number, usedAt: number }
+
+        // Cave Learn Mode is a recorder only. It never drives movement.
+        learnMode: false,
+        learnDistance: 0,
+        learnLastPosition: null,
+        learnLastWaypointPosition: null,
+        learnPendingToolUse: null, // { type: "rope"|"shovel", position, at, fromZ }
+        learnRecordedCount: 0,
+        learnTransitionCount: 0,
     };
     const minimapOverlayState = {
         timerId: null
     };
+
+    let learnToolMouse = null;
+    let learnToolOriginal = null;
+    let learnToolWrapped = null;
+    let learnHotbarOriginal = null;
+    let learnHotbarWrapped = null;
 
     const config = Object.assign({
         tickMs: 250,
@@ -25282,16 +25299,311 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         return null;
     }
 
+    function getLearnStepDistance(a, b) {
+        if (!a || !b || a.z !== b.z)
+            return 0;
+        return Math.max(
+            Math.abs(Number(a.x) - Number(b.x)),
+            Math.abs(Number(a.y) - Number(b.y))
+        );
+    }
+
+    function isLearnSpecialWaypoint(waypoint) {
+        return !!(
+            waypoint?.stand ||
+            waypoint?.rope ||
+            waypoint?.shovel ||
+            waypoint?.ladder
+        );
+    }
+
+    function appendLearnWaypoint(waypoint, reason = "walk") {
+        const norm = normalizeWaypoint(waypoint);
+        if (!norm || !Number.isFinite(norm.x) || !Number.isFinite(norm.y) || !Number.isFinite(norm.z))
+            return null;
+
+        const lastIndex = route.length - 1;
+        const last = lastIndex >= 0 ? route[lastIndex] : null;
+        const samePosition = !!last &&
+            Number(last.x) === Number(norm.x) &&
+            Number(last.y) === Number(norm.y) &&
+            Number(last.z) === Number(norm.z);
+
+        if (samePosition) {
+            // A floor transition may happen on the same tile where the 10-SQM
+            // recorder just dropped a normal waypoint. Upgrade that point in
+            // place instead of creating two entries at identical coordinates.
+            if (isLearnSpecialWaypoint(norm)) {
+                route[lastIndex] = normalizeWaypoint({
+                    ...last,
+                    stand: !!norm.stand,
+                    rope: !!norm.rope,
+                    shovel: !!norm.shovel,
+                    ladder: !!norm.ladder,
+                    label: norm.label || last.label
+                });
+                persistRoute();
+                state.learnLastWaypointPosition = {
+                    x: norm.x,
+                    y: norm.y,
+                    z: norm.z
+                };
+                bot.log(`Cave Learn: upgraded waypoint #${lastIndex + 1} to ${reason}`, route[lastIndex]);
+                return cloneValue(route[lastIndex]);
+            }
+            state.learnLastWaypointPosition = {
+                x: norm.x,
+                y: norm.y,
+                z: norm.z
+            };
+            return cloneValue(last);
+        }
+
+        route.push(norm);
+        persistRoute();
+        state.learnRecordedCount++;
+        state.learnLastWaypointPosition = {
+            x: norm.x,
+            y: norm.y,
+            z: norm.z
+        };
+        bot.log(`Cave Learn: added ${reason} waypoint #${route.length}`, norm);
+        return cloneValue(norm);
+    }
+
+    function isNativeStepOnTransitionTile(tile) {
+        if (!tile)
+            return false;
+        try {
+            return window.gameClient?.mouse?.__isStepOnTile?.(tile) === true;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function findLearnTransitionCandidate(previous, current) {
+        if (!previous || !current || previous.z === current.z)
+            return null;
+
+        const goingUp = current.z < previous.z;
+        const pending = state.learnPendingToolUse;
+        const now = Date.now();
+
+        const pendingPosition = normalizePosition(pending?.position);
+        const pendingDistance = pendingPosition && pendingPosition.z === previous.z
+            ? Math.max(Math.abs(pendingPosition.x - previous.x), Math.abs(pendingPosition.y - previous.y))
+            : Infinity;
+        if (pending && now - Number(pending.at || 0) <= LEARN_TOOL_WINDOW_MS &&
+            Number(pending.fromZ) === Number(previous.z) && pendingDistance <= 2) {
+            if ((goingUp && pending.type === "rope") || (!goingUp && pending.type === "shovel")) {
+                return {
+                    type: pending.type,
+                    position: normalizePosition(pending.position),
+                    tile: getTileAt(pending.position),
+                    source: "tool-use"
+                };
+            }
+        }
+
+        let best = null;
+        let bestScore = Infinity;
+        const radius = 2;
+
+        for (let dy = -radius; dy <= radius; dy++) {
+            for (let dx = -radius; dx <= radius; dx++) {
+                const position = {
+                    x: previous.x + dx,
+                    y: previous.y + dy,
+                    z: previous.z
+                };
+                const tile = getTileAt(position);
+                if (!tile)
+                    continue;
+
+                let type = null;
+                let typeBias = 100;
+
+                if (goingUp) {
+                    if (isRopeTargetTile(tile)) {
+                        type = "rope";
+                        typeBias = 0;
+                    } else if (isLadderTile(tile)) {
+                        type = "ladder";
+                        typeBias = 10;
+                    } else if (
+                        isStairsTile(tile) ||
+                        tileHasTeleporter(tile) ||
+                        isFloorChangeTile(tile) ||
+                        isNativeStepOnTransitionTile(tile)
+                    ) {
+                        type = "stand";
+                        typeBias = 20;
+                    }
+                } else {
+                    if (isLadderTile(tile)) {
+                        type = "ladder";
+                        typeBias = 10;
+                    } else if (
+                        isStairsTile(tile) ||
+                        isHoleTile(tile) ||
+                        tileHasTeleporter(tile) ||
+                        isFloorChangeTile(tile) ||
+                        isNativeStepOnTransitionTile(tile)
+                    ) {
+                        type = "stand";
+                        typeBias = 20;
+                    }
+                }
+
+                if (!type)
+                    continue;
+
+                const playerDistance = Math.max(Math.abs(dx), Math.abs(dy));
+                const landingAlignment = Math.abs(position.x - current.x) + Math.abs(position.y - current.y);
+                const score = typeBias + playerDistance * 5 + landingAlignment;
+                if (score < bestScore) {
+                    bestScore = score;
+                    best = {
+                        type,
+                        position,
+                        tile,
+                        source: "tile-scan"
+                    };
+                }
+            }
+        }
+
+        if (best)
+            return best;
+
+        const observed = resolveObservedTransitionSource(previous);
+        if (observed) {
+            const tile = getTileAt(observed);
+            return {
+                type: isLadderTile(tile) ? "ladder" : "stand",
+                position: observed,
+                tile,
+                source: "observed-transition"
+            };
+        }
+
+        // Last-resort fail-safe for an unknown step-on transition. A Stand
+        // waypoint is safer than inventing a rope/shovel action we did not see.
+        return {
+            type: "stand",
+            position: { ...previous },
+            tile: getTileAt(previous),
+            source: "fallback"
+        };
+    }
+
+    function recordLearnTransition(previous, current) {
+        const candidate = findLearnTransitionCandidate(previous, current);
+        if (!candidate?.position)
+            return false;
+
+        const source = normalizePosition(candidate.position);
+        if (!source)
+            return false;
+
+        const waypoint = {
+            ...source,
+            stand: candidate.type === "stand",
+            rope: candidate.type === "rope",
+            shovel: candidate.type === "shovel",
+            ladder: candidate.type === "ladder"
+        };
+
+        appendLearnWaypoint(waypoint, candidate.type);
+        upsertTransition(source, current);
+        state.learnTransitionCount++;
+        state.learnDistance = 0;
+        state.learnPendingToolUse = null;
+        state.learnLastPosition = { ...current };
+
+        bot.log("Cave Learn: recorded floor transition", {
+            type: candidate.type,
+            from: source,
+            to: current,
+            detector: candidate.source
+        });
+        return true;
+    }
+
+    function recordLearnMovement(previous, current) {
+        if (!state.learnMode || !previous || !current)
+            return;
+
+        if (previous.z !== current.z) {
+            recordLearnTransition(previous, current);
+            return;
+        }
+
+        if (isSameTile(previous, current))
+            return;
+
+        const moved = getLearnStepDistance(previous, current);
+        // A large same-floor jump is a teleport/relocation, not ten tiles of
+        // ordinary walking. Reset the spacing counter at the new location.
+        if (moved > 5) {
+            state.learnDistance = 0;
+            state.learnLastPosition = { ...current };
+            bot.log("Cave Learn: same-floor relocation detected; spacing reset", {
+                from: previous,
+                to: current
+            });
+            return;
+        }
+
+        state.learnDistance += Math.max(1, moved);
+        state.learnLastPosition = { ...current };
+
+        if (state.learnDistance < LEARN_WAYPOINT_SPACING)
+            return;
+
+        const tile = getTileAt(current);
+        const transitionLike = !!tile && (
+            isFloorChangeTile(tile) ||
+            isNativeStepOnTransitionTile(tile) ||
+            isRopeSpotTile(tile) ||
+            isShovelTargetTile(tile)
+        );
+
+        // If this sample is already on a transition tile, wait for the next
+        // position update so the special waypoint can be recorded correctly.
+        if (transitionLike)
+            return;
+
+        appendLearnWaypoint(current, "walk");
+        state.learnDistance = 0;
+    }
+
     function observePosition() {
+        if (state.learnMode)
+            ensureLearnToolObserver();
+
         const current = normalizePosition(bot.getPlayerPosition());
         if (!current)
             return;
         const previous = state.lastObservedPosition;
-        if (previous && !isSameTile(previous, current) && previous.z !== current.z) {
-            const source = resolveObservedTransitionSource(previous);
-            if (source)
-                upsertTransition(source, current);
-            state.pendingTransitionSource = null;
+
+        if (previous && !isSameTile(previous, current)) {
+            let learnHandledTransition = false;
+            if (state.learnMode) {
+                if (previous.z !== current.z)
+                    learnHandledTransition = recordLearnTransition(previous, current) === true;
+                else
+                    recordLearnMovement(previous, current);
+            }
+
+            if (previous.z !== current.z) {
+                if (!learnHandledTransition) {
+                    const source = resolveObservedTransitionSource(previous);
+                    if (source)
+                        upsertTransition(source, current);
+                }
+                state.pendingTransitionSource = null;
+            }
         }
         state.lastObservedPosition = current;
     }
@@ -25391,6 +25703,194 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     }
     function findShovelSource() {
         return findToolSource(isShovelItem);
+    }
+
+    function getLearnUseObjectItem(object) {
+        const owner = object?.which;
+        const index = object?.index;
+        if (!owner || index === undefined || index === null)
+            return null;
+        try {
+            if (typeof owner.peekItem === "function")
+                return owner.peekItem(index);
+        } catch (e) {}
+        try {
+            if (typeof owner.getSlotItem === "function")
+                return owner.getSlotItem(index);
+        } catch (e) {}
+        return null;
+    }
+
+    function getLearnUseTargetPosition(object) {
+        const target = object?.which;
+        if (!target)
+            return null;
+        let raw = null;
+        try { raw = target.getPosition?.(); } catch (e) {}
+        raw = raw || target.__position || target.position || null;
+        return normalizePosition(raw);
+    }
+
+    function noteLearnToolUse(type, targetPosition) {
+        const playerPosition = normalizePosition(bot.getPlayerPosition());
+        const target = normalizePosition(targetPosition);
+        if (!state.learnMode || !type || !target || !playerPosition || target.z !== playerPosition.z)
+            return false;
+
+        state.learnPendingToolUse = {
+            type,
+            position: target,
+            at: Date.now(),
+            fromZ: playerPosition.z
+        };
+        bot.log(`Cave Learn: observed manual ${type} use`, {
+            target
+        });
+        return true;
+    }
+
+    function uninstallLearnToolObserver() {
+        if (learnToolMouse) {
+            if (learnToolWrapped && learnToolMouse.__handleItemUseWith === learnToolWrapped && learnToolOriginal) {
+                learnToolMouse.__handleItemUseWith = learnToolOriginal;
+            }
+            if (learnHotbarWrapped && learnToolMouse.__handleHotbarCrosshairUse === learnHotbarWrapped && learnHotbarOriginal) {
+                learnToolMouse.__handleHotbarCrosshairUse = learnHotbarOriginal;
+            }
+        }
+        learnToolMouse = null;
+        learnToolOriginal = null;
+        learnToolWrapped = null;
+        learnHotbarOriginal = null;
+        learnHotbarWrapped = null;
+    }
+
+    function ensureLearnToolObserver() {
+        const mouse = window.gameClient?.mouse;
+        if (!mouse)
+            return false;
+
+        const useWithReady = typeof mouse.__handleItemUseWith === "function";
+        const hotbarReady = typeof mouse.__handleHotbarCrosshairUse === "function";
+        const alreadyInstalled = learnToolMouse === mouse &&
+            (!useWithReady || (learnToolWrapped && mouse.__handleItemUseWith === learnToolWrapped)) &&
+            (!hotbarReady || (learnHotbarWrapped && mouse.__handleHotbarCrosshairUse === learnHotbarWrapped));
+        if (alreadyInstalled)
+            return true;
+
+        uninstallLearnToolObserver();
+        learnToolMouse = mouse;
+
+        if (useWithReady) {
+            const original = mouse.__handleItemUseWith;
+            const wrapped = function (fromObject, toObject) {
+                try {
+                    if (state.learnMode) {
+                        const item = getLearnUseObjectItem(fromObject);
+                        const targetPosition = getLearnUseTargetPosition(toObject);
+                        if (isRopeItem(item))
+                            noteLearnToolUse("rope", targetPosition);
+                        else if (isShovelItem(item))
+                            noteLearnToolUse("shovel", targetPosition);
+                    }
+                } catch (e) {
+                    bot.log("Cave Learn: use-with observer failed", e?.message || e);
+                }
+                return original.apply(this, arguments);
+            };
+            learnToolOriginal = original;
+            learnToolWrapped = wrapped;
+            mouse.__handleItemUseWith = wrapped;
+        }
+
+        // Closed-backpack / hotbar crosshair item use bypasses __handleItemUseWith
+        // and sends HotbarUsePacket directly. Observe that path too so a shovel
+        // used from the hotbar is not later misrecorded as a generic Stand/hole.
+        if (hotbarReady) {
+            const originalHotbar = mouse.__handleHotbarCrosshairUse;
+            const wrappedHotbar = function (toObject) {
+                try {
+                    if (state.learnMode) {
+                        const item = this?.__hotbarCrosshairItem;
+                        const targetPosition = getLearnUseTargetPosition(toObject);
+                        if (isRopeItem(item))
+                            noteLearnToolUse("rope", targetPosition);
+                        else if (isShovelItem(item))
+                            noteLearnToolUse("shovel", targetPosition);
+                    }
+                } catch (e) {
+                    bot.log("Cave Learn: hotbar tool observer failed", e?.message || e);
+                }
+                return originalHotbar.apply(this, arguments);
+            };
+            learnHotbarOriginal = originalHotbar;
+            learnHotbarWrapped = wrappedHotbar;
+            mouse.__handleHotbarCrosshairUse = wrappedHotbar;
+        }
+
+        return useWithReady || hotbarReady;
+    }
+
+    function setLearnMode(enabled) {
+        const next = enabled === true;
+        if (next === state.learnMode)
+            return state.learnMode;
+
+        const current = normalizePosition(bot.getPlayerPosition());
+
+        if (next) {
+            // Learn is intended for manual route recording. Do not let CaveBot
+            // fight the user's movement while the recorder is active.
+            if (state.running)
+                stop();
+
+            state.learnMode = true;
+            state.learnDistance = 0;
+            state.learnPendingToolUse = null;
+            state.learnLastPosition = current ? { ...current } : null;
+            state.lastObservedPosition = current ? { ...current } : state.lastObservedPosition;
+            ensureLearnToolObserver();
+
+            if (current)
+                appendLearnWaypoint(current, "start");
+
+            bot.log("Cave Learn enabled", {
+                spacing: LEARN_WAYPOINT_SPACING,
+                start: current,
+                routeLength: route.length
+            });
+            return true;
+        }
+
+        // Capture the exact place where recording ended even if fewer than ten
+        // tiles have elapsed since the previous automatic point.
+        if (current && state.learnLastWaypointPosition && !isSameTile(current, state.learnLastWaypointPosition)) {
+            const tile = getTileAt(current);
+            const transitionLike = !!tile && (
+                isFloorChangeTile(tile) ||
+                isNativeStepOnTransitionTile(tile) ||
+                isRopeSpotTile(tile) ||
+                isShovelTargetTile(tile)
+            );
+            if (!transitionLike)
+                appendLearnWaypoint(current, "end");
+        }
+
+        state.learnMode = false;
+        state.learnDistance = 0;
+        state.learnPendingToolUse = null;
+        state.learnLastPosition = null;
+        uninstallLearnToolObserver();
+        bot.log("Cave Learn disabled", {
+            routeLength: route.length,
+            learnedWaypoints: state.learnRecordedCount,
+            learnedTransitions: state.learnTransitionCount
+        });
+        return false;
+    }
+
+    function getLearnMode() {
+        return state.learnMode === true;
     }
 
     function useToolOnTile(tool, targetTile, targetPosition, actionLabel, now = Date.now()) {
@@ -29540,6 +30040,9 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             clearTimeout(state.fallbackMoveTimerId);
             state.fallbackMoveTimerId = null;
         }
+        state.learnMode = false;
+        state.learnPendingToolUse = null;
+        uninstallLearnToolObserver();
         stopObserver();
         stopNoWayObserver();
         if (state.timerId != null) {
@@ -30007,6 +30510,10 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             ? Math.max(0, now - state.lastProgressAt) : null;
         return {
             running: state.running,
+            learnMode: state.learnMode === true,
+            learnDistance: state.learnDistance,
+            learnRecordedCount: state.learnRecordedCount,
+            learnTransitionCount: state.learnTransitionCount,
             routeLength: route.length,
             currentIndex: state.currentIndex,
             waypointKey: getWaypointKey(wp),
@@ -30024,6 +30531,10 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         const wp = getCurrentWaypoint();
         return {
             running: state.running,
+            learnMode: state.learnMode === true,
+            learnDistance: state.learnDistance,
+            learnRecordedCount: state.learnRecordedCount,
+            learnTransitionCount: state.learnTransitionCount,
             config: {
                 ...config
             },
@@ -30528,6 +31039,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         deletePreset,
         addWaypoint,
         addWaypointCurrentSpot,
+        setLearnMode,
+        getLearnMode,
         clearWaypoints,
         clearTransitions,
         removeLastWaypoint,
@@ -42619,7 +43132,9 @@ function upgradeSectionHeaders(panel) {
         if (toggle)
             toggle.checked = !!status?.running;
         if (label) {
-            if (status?.movement?.safetyStopped) {
+            if (status?.learnMode) {
+                label.textContent = `Status: LEARN – recording every 10 tiles (${routeLength} waypoint${routeLength === 1 ? "" : "s"})`;
+            } else if (status?.movement?.safetyStopped) {
                 label.textContent = `Status: SAFETY STOP – ${status.movement.trip?.failures || 0} repeated failures near waypoint #${(status.movement.trip?.index ?? 0) + 1}`;
             } else if (!routeLength) {
                 label.textContent = "Status: no waypoints";
@@ -44393,6 +44908,7 @@ function upgradeSectionHeaders(panel) {
     <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
       <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-cave-loop" /> Loop</label>
       <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-cave-auto-transitions" /> Auto Transitions</label>
+      <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-cave-learn" /> Learn</label>
       <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-cave-ignore-fields" /> Walk Through Fields</label>
     </div>
 
@@ -48404,6 +48920,18 @@ function upgradeSectionHeaders(panel) {
             });
         }
 
+        const learnToggle = panel.querySelector("#minibia-bot-cave-learn");
+        if (learnToggle) {
+            learnToggle.checked = bot.cave?.getLearnMode?.() === true;
+            learnToggle.addEventListener("change", () => {
+                bot.cave?.setLearnMode?.(learnToggle.checked);
+                learnToggle.checked = bot.cave?.getLearnMode?.() === true;
+                refreshCaveStatus();
+                refreshCaveWaypointList();
+                refreshTitlebarRunIndicators();
+            });
+        }
+
         const ignoreFieldsToggle = panel.querySelector("#minibia-bot-cave-ignore-fields");
         if (ignoreFieldsToggle) {
             ignoreFieldsToggle.checked = bot.cave?.config?.ignoreFields !== false;
@@ -48912,6 +49440,9 @@ function upgradeSectionHeaders(panel) {
             const loopToggle = document.getElementById("minibia-bot-cave-loop");
             if (loopToggle)
                 loopToggle.checked = bot.cave?.getLoopMode?.() ?? false;
+            const learnToggle = document.getElementById("minibia-bot-cave-learn");
+            if (learnToggle && document.activeElement !== learnToggle)
+                learnToggle.checked = bot.cave?.getLearnMode?.() === true;
         }, 1000);
         const blacklistTimer = window.setInterval(refreshBlacklist, 2000);
         bot.addCleanup(() => window.clearInterval(blacklistTimer));
