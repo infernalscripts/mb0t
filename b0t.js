@@ -2198,7 +2198,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.01",
+        version: "1.6.02",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -3903,14 +3903,38 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         }
     }
 
+    // Audio Alerts also surface in the bot's top-right notification panel.
+    // The notification module is installed later during bootstrap, so resolve
+    // this dynamically at alert time rather than capturing it during install.
+    function showAudioAlertNotification(title, message, type = "audio") {
+        try {
+            return bot.showPanelNotification?.(
+                String(title || "🔔 AUDIO ALERT"),
+                String(message || "Audio alert triggered"),
+                String(type || "audio"),
+                15000
+            ) ?? false;
+        } catch (error) {
+            return false;
+        }
+    }
+
     // Generic lightweight alert exposed through the existing bot audio system.
     // Reuses the Panic module's shared AudioContext/tone sequencer rather than
     // creating a second audio engine or invoking one of the spoken alarm files.
-    function playGenericBeepBloop() {
+    // Callers may optionally supply panel notification details.
+    function playGenericBeepBloop(notification = null) {
         playToneSequence([
             { freq: 760, dur: 120, vol: 0.30 },
             { freq: 420, dur: 180, delay: 145, vol: 0.30 },
         ]);
+        if (notification?.title || notification?.message) {
+            showAudioAlertNotification(
+                notification.title || "🔔 ALERT",
+                notification.message || "Alert triggered",
+                notification.type || "audio-generic"
+            );
+        }
         return true;
     }
 
@@ -4699,6 +4723,11 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         const currentId = target ? target.id : null;
         if (config.targetDeathBeep && state.lastTargetId !== null && currentId === null) {
             playTargetDeathBeep();
+            showAudioAlertNotification(
+                "☠️ TARGET DEATH",
+                "Current target was defeated.",
+                "audio-target-death"
+            );
         }
         state.lastTargetId = currentId;
 
@@ -4709,6 +4738,11 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
                 if (now - state.lowHealthBeepLast >= config.lowHealthBeepRepeatMs) {
                     state.lowHealthBeepLast = now;
                     playLowHealthBeep();
+                    showAudioAlertNotification(
+                        "❤️ LOW HEALTH",
+                        `${Math.round(hpPct)}% HP (${health}/${maxHealth})`,
+                        "audio-low-health"
+                    );
                 }
             } else {
                 state.lowHealthBeepLast = 0;
@@ -4725,6 +4759,11 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
                     now - state.manaFullBeepLast >= config.manaFullRepeatMs) {
                     state.manaFullBeepLast = now;
                     playManaFullBeep();
+                    showAudioAlertNotification(
+                        "🔵 MANA FULL",
+                        `${mana}/${maxMana} mana`,
+                        "audio-mana-full"
+                    );
                 }
             } else {
                 state.manaFullSince = null;
@@ -4741,6 +4780,11 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
                     now - state.noTargetBeepLast >= config.noTargetRepeatMs) {
                     state.noTargetBeepLast = now;
                     playNoTargetBeep();
+                    showAudioAlertNotification(
+                        "🎯 NO TARGET",
+                        "No combat target selected.",
+                        "audio-no-target"
+                    );
                 }
             } else {
                 state.noTargetSince = null;
@@ -4757,6 +4801,11 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
                     if (now - state.lowCapBeepLast >= Math.max(1000, Number(config.lowCapRepeatMs) || 30000)) {
                         state.lowCapBeepLast = now;
                         playItemLowBeep();
+                        showAudioAlertNotification(
+                            "🎒 LOW CAPACITY",
+                            `${capacity.toFixed(0)} cap remaining (threshold ${Number(config.lowCapThreshold) || 0})`,
+                            "audio-low-capacity"
+                        );
                         bot.log(`Audio alert: low capacity (${capacity.toFixed(0)} < ${Number(config.lowCapThreshold) || 0})`);
                     }
                 } else {
@@ -4798,6 +4847,11 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
                         state.itemAlertLast[alertKey] = now;
                         playItemLowBeep();
                         const fluidLabel = Number(a.fluidType) > 0 ? ` fluid ${a.fluidType}` : "";
+                        showAudioAlertNotification(
+                            "📦 ITEM LOW",
+                            `${a.name || a.id}${fluidLabel}: ${count}/${a.threshold}`,
+                            `audio-item-${a.id}-${Number(a.fluidType) || 0}`
+                        );
                         bot.log(`Audio alert: ${a.name || a.id}${fluidLabel} low (${count}/${a.threshold})`);
                     }
                 }
@@ -8624,6 +8678,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         const tile = getTileAtPosition(pos);
         if (!tile)
             return false;
+
         // Creature-combat movement treats magic fields as passable.
         // Real blockers and occupied tiles are still rejected.
         if (
@@ -8636,9 +8691,53 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         ) {
             return false;
         }
+
+        const things = [
+            tile,
+            ...(Array.isArray(tile.items) ? tile.items : [])
+        ];
+        const approvedLadder = things.some(thing =>
+            thing && (
+                ladderItemIds.has(Number(thing.id)) ||
+                isLadderThing(thing)
+            )
+        );
+        const approvedRopeSpot =
+            tileHasNamedThing(tile, "rope spot");
+
+        // Fail closed on the client's own step-on-floor-change classifier.
+        // This catches hole/transition CIDs that are not in our small legacy
+        // hole list. Ladders and explicit rope spots are the only Kite-approved
+        // floor-change exceptions.
+        if (!approvedLadder && !approvedRopeSpot) {
+            try {
+                if (window.gameClient?.mouse?.__isStepOnTile?.(tile))
+                    return false;
+            } catch (e) {}
+
+            // Extra conservative guard: real Tibia floor-change ground sprites
+            // are commonly NotPathable even when their item definition/name is
+            // missing or stale. It is safer for Kite to reject an occasional
+            // decorative NotPathable tile than to descend through an unknown hole.
+            try {
+                const notPathableFlag =
+                    typeof PropBitFlag !== "undefined"
+                        ? PropBitFlag?.prototype?.flags?.DatFlagNotPathable
+                        : undefined;
+                if (
+                    notPathableFlag !== undefined &&
+                    typeof tile.hasFlag === "function" &&
+                    tile.hasFlag(notPathableFlag)
+                ) {
+                    return false;
+                }
+            } catch (e) {}
+        }
+
         // Floor changes are a hard veto for Kite even when the native client
         // considers the tile walkable. Running into a hole while retreating is
-        // never an acceptable escape step.
+        // never an acceptable escape step. isFloorChangeTile() already exempts
+        // the approved ladder / rope-spot cases above.
         if (
             isFloorChangeTile(tile) ||
             isHoleTile(tile)
@@ -9753,6 +9852,22 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 typeof keyboard.handleMoveKey !==
                     "function"
             ) {
+                return false;
+            }
+
+            // Final fail-closed guard before any one-step Kite movement.
+            // Candidate scoring should already have rejected dangerous floor
+            // changes, but never trust a stale/fallback candidate at send time.
+            const livePlayerPos = normalizePosition(bot.getPlayerPosition());
+            const liveNextPos = livePlayerPos ? {
+                x: livePlayerPos.x + (Number(candidate.dx) || 0),
+                y: livePlayerPos.y + (Number(candidate.dy) || 0),
+                z: livePlayerPos.z
+            } : null;
+            if (!liveNextPos || !isSafeTileForKite(liveNextPos)) {
+                stopKiteAutoWalk(
+                    "Kite safety vetoed dangerous fallback step"
+                );
                 return false;
             }
 
@@ -17039,19 +17154,25 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 return false;
             }
 
+            // Revalidate each queued step with the movement owner's own safety
+            // policy immediately before the AutoWalk packet is built. Kite must
+            // never fall back to the looser melee approach check here because a
+            // walkable hole can pass ordinary collision checks.
             const stepPassable =
-                owner === "melee" &&
-                typeof bot.isFollowRoutePositionPassable ===
-                    "function"
-                    ? bot.isFollowRoutePositionPassable(
-                        step
-                    )
-                    : isSafeTargetApproachTile(
-                        Number(step.x),
-                        Number(step.y),
-                        Number(step.z),
-                        false
-                    );
+                owner === "kite"
+                    ? isSafeTileForKite(step)
+                    : owner === "melee" &&
+                        typeof bot.isFollowRoutePositionPassable ===
+                            "function"
+                        ? bot.isFollowRoutePositionPassable(
+                            step
+                        )
+                        : isSafeTargetApproachTile(
+                            Number(step.x),
+                            Number(step.y),
+                            Number(step.z),
+                            false
+                        );
 
             if (!stepPassable) {
                 state.manualPursuitPathFailures++;
@@ -17617,9 +17738,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             const tile = window.gameClient?.world?.getTileFromWorldPosition?.(pos);
             if (!tile)
                 continue;
-            if (!tile.isWalkable())
-                continue;
-            if (tile.isOccupied())
+            // Legacy fallback must obey the exact same Kite safety gate as the
+            // scored/AutoWalk path. In particular, walkable holes/stairs can
+            // still change floor and must never be selected by Kite.
+            if (!isSafeTileForKite({ x: nx, y: ny, z: playerPos.z }))
                 continue;
 
             const newDist = Math.max(Math.abs(nx - targetPos.x), Math.abs(ny - targetPos.y));
@@ -17709,9 +17831,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 continue;
             // ---- END ----
 
-            if (!tile.isWalkable())
-                continue;
-            if (tile.isOccupied())
+            // Legacy fallback must obey the exact same Kite safety gate as the
+            // scored/AutoWalk path. In particular, walkable holes/stairs can
+            // still change floor and must never be selected by Kite.
+            if (!isSafeTileForKite({ x: nx, y: ny, z: playerPos.z }))
                 continue;
 
             const newDist = Math.max(Math.abs(nx - targetPos.x), Math.abs(ny - targetPos.y));
@@ -33824,6 +33947,14 @@ window.__minibiaBotBundle.installNotificationModule = function installNotificati
       .mb-notification.type-antibot { border-right-color: #ffdd44; }
       .mb-notification.type-playerattack { border-right-color: #ff2222; }
       .mb-notification.type-message { border-right-color: #44aaff; }
+      .mb-notification.type-audio-target-death { border-right-color: #bbbbbb; }
+      .mb-notification.type-audio-low-health { border-right-color: #ff5555; }
+      .mb-notification.type-audio-mana-full { border-right-color: #5599ff; }
+      .mb-notification.type-audio-no-target { border-right-color: #ffaa44; }
+      .mb-notification.type-audio-low-capacity { border-right-color: #ffcc44; }
+      .mb-notification[class*="type-audio-item-"] { border-right-color: #ddaa55; }
+      .mb-notification.type-audio-generic,
+      .mb-notification.type-audio-creature { border-right-color: #66ccaa; }
       
       /* Highlight for selected waypoint */
       .mb-cave-waypoint-row[data-selected="true"] {
@@ -33887,6 +34018,10 @@ window.__minibiaBotBundle.installNotificationModule = function installNotificati
         });
     }
 
+    // Public hook for non-file audio alerts and other modules that need the
+    // same top-right notification panel without invoking a spoken alarm.
+    bot.showPanelNotification = showNotification;
+
     // Wrap the existing alarm methods
     const orig = {
         playAlarm: bot.playAlarm,
@@ -33928,6 +34063,8 @@ window.__minibiaBotBundle.installNotificationModule = function installNotificati
             element.remove();
         }
         activeNotifications.clear();
+        if (bot.showPanelNotification === showNotification)
+            delete bot.showPanelNotification;
         // Timers from a previous bot instance must not keep its DOM and closures alive.
     });
     bot.log('Notification system updated – top-right, 15s, one per type.');
@@ -50746,8 +50883,13 @@ window.__minibiaBotBundle.installAntiBotCreatureModule = function installAntiBot
                     state.replyCooldown.delete(state.replyCooldown.keys().next().value);
             }
 
-            if (config.triggerAlarm)
-                bot.panic?.playGenericBeepBloop?.();
+            if (config.triggerAlarm) {
+                bot.panic?.playGenericBeepBloop?.({
+                    title: "🔔 CREATURE ALERT",
+                    message: `${this?.name || "Creature"} mentioned your name.`,
+                    type: "audio-creature"
+                });
+            }
 
             bot.log(`[AntiBotCreature] Orange message from ${this?.name || "creature"}: "${message}"`);
 
