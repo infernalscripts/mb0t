@@ -2744,7 +2744,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.31",
+        version: "1.6.32",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -49853,12 +49853,15 @@ function upgradeSectionHeaders(panel) {
             if (!status)
                 return;
             if (antiBotCreatureToggle && document.activeElement !== antiBotCreatureToggle) {
-                antiBotCreatureToggle.checked = status.running;
+                // v1.6.32: this checkbox represents the saved user preference,
+                // not transient runtime hook ownership. A client lifecycle event
+                // must not make an enabled module look/behave disabled.
+                antiBotCreatureToggle.checked = status.config?.enabled === true;
             }
         }
 
         if (antiBotCreatureToggle) {
-            antiBotCreatureToggle.checked = !!bot.antiBotCreature?.status?.().running;
+            antiBotCreatureToggle.checked = bot.antiBotCreature?.status?.().config?.enabled === true;
             antiBotCreatureToggle.addEventListener("change", function () {
                 if (this.checked) {
                     bot.antiBotCreature?.start?.();
@@ -55478,6 +55481,9 @@ window.__minibiaBotBundle.installAntiBotCreatureModule = function installAntiBot
         hookWrapper: null,
         hookRetryTimer: null,
         startTimer: null,
+        // v1.6.32: keep hook health separate from the persisted enabled setting.
+        // The client can replace Creature.prototype.say during lifecycle changes.
+        hookWatchTimer: null,
     };
 
     const config = Object.assign({
@@ -55510,9 +55516,28 @@ window.__minibiaBotBundle.installAntiBotCreatureModule = function installAntiBot
     }
 
     function installSpeechHook() {
-        if (state.patched)
-            return;
-        if (typeof Creature === "undefined" || !Creature.prototype) {
+        // Already installed and still owning the live handler.
+        if (
+            state.patched &&
+            typeof Creature !== "undefined" &&
+            Creature.prototype &&
+            state.hookOwner === Creature.prototype &&
+            Creature.prototype.say === state.hookWrapper
+        ) {
+            return true;
+        }
+
+        // If the client replaced the handler, forget only our stale ownership
+        // metadata. Never restore the old function over a newer client hook.
+        if (state.patched) {
+            state.originalSay = null;
+            state.hookOwner = null;
+            state.hookWrapper = null;
+            state.patched = false;
+        }
+
+        if (typeof Creature === "undefined" || !Creature.prototype ||
+            typeof Creature.prototype.say !== "function") {
             if (state.running && config.enabled && state.hookRetryTimer === null) {
                 state.hookRetryTimer = setTimeout(() => {
                     state.hookRetryTimer = null;
@@ -55619,6 +55644,7 @@ window.__minibiaBotBundle.installAntiBotCreatureModule = function installAntiBot
         state.hookOwner.say = wrapper;
         state.patched = true;
         bot.log("[AntiBotCreature] speech hook installed");
+        return true;
     }
 
     function uninstallSpeechHook() {
@@ -55635,6 +55661,32 @@ window.__minibiaBotBundle.installAntiBotCreatureModule = function installAntiBot
         state.hookWrapper = null;
         state.patched = false;
         bot.log("[AntiBotCreature] speech hook removed");
+    }
+
+    function startHookWatchdog() {
+        if (state.hookWatchTimer !== null)
+            return;
+        state.hookWatchTimer = setInterval(() => {
+            if (!state.running || !config.enabled)
+                return;
+            try {
+                const owned =
+                    typeof Creature !== "undefined" &&
+                    Creature.prototype &&
+                    state.patched &&
+                    state.hookOwner === Creature.prototype &&
+                    Creature.prototype.say === state.hookWrapper;
+                if (!owned)
+                    installSpeechHook();
+            } catch (e) {}
+        }, 1000);
+    }
+
+    function stopHookWatchdog() {
+        if (state.hookWatchTimer !== null) {
+            clearInterval(state.hookWatchTimer);
+            state.hookWatchTimer = null;
+        }
     }
 
     function start(overrides = {}) {
@@ -55654,6 +55706,7 @@ window.__minibiaBotBundle.installAntiBotCreatureModule = function installAntiBot
             state.replyTimer = null;
         }
         installSpeechHook();
+        startHookWatchdog();
         bot.log("[AntiBotCreature] started");
         return true;
     }
@@ -55671,6 +55724,7 @@ window.__minibiaBotBundle.installAntiBotCreatureModule = function installAntiBot
             state.replyTimer = null;
         }
 
+        stopHookWatchdog();
         uninstallSpeechHook();
         state.replyCooldown.clear();
 
@@ -55688,6 +55742,13 @@ window.__minibiaBotBundle.installAntiBotCreatureModule = function installAntiBot
             running: state.running,
             config: { ...config },
             patched: state.patched,
+            hookOwned: !!(
+                typeof Creature !== "undefined" &&
+                Creature.prototype &&
+                state.patched &&
+                state.hookOwner === Creature.prototype &&
+                Creature.prototype.say === state.hookWrapper
+            ),
             orangeColor: getOrangeColor(),
         };
     }
