@@ -2744,7 +2744,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.32",
+        version: "1.6.34",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -47966,12 +47966,49 @@ function upgradeSectionHeaders(panel) {
 }
 
 /* ── Mobile responsive ── */
+/* v1.6.34: mobile panel is capped at 500px tall. On shorter
+   screens it still shrinks to the available viewport height. */
+#minibia-bot-panel .mb-mobile-preset-arrow {
+  display: none;
+}
+/* On desktop the picker wrapper is layout-neutral so the preset select keeps
+   the exact same flex behavior it had before the mobile arrows were added. */
+#minibia-bot-panel .mb-cave-preset-picker {
+  display: contents;
+}
+
 @media (max-width: 700px) {
   #minibia-bot-panel {
     width: min(540px, calc(100vw - 16px));
-    max-height: calc(100vh - 16px);
+    max-height: 500px;
+    max-height: min(500px, calc(100vh - 16px));
     top: 8px;
     right: 8px;
+  }
+  #minibia-bot-panel .mb-cave-preset-row {
+    flex-wrap: wrap;
+  }
+  #minibia-bot-panel .mb-cave-preset-picker {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex: 1 1 100%;
+    min-width: 0;
+  }
+  #minibia-bot-panel .mb-cave-preset-picker > select {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  #minibia-bot-panel .mb-mobile-preset-arrow {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 30px;
+    min-width: 30px;
+    height: 28px;
+    padding: 0;
+    font-size: 13px;
+    line-height: 1;
   }
   #minibia-bot-panel .mb-body {
     grid-template-columns: 1fr;
@@ -48026,7 +48063,8 @@ function upgradeSectionHeaders(panel) {
     width: calc(100vw - 8px);
     top: 4px;
     right: 4px;
-    max-height: calc(100vh - 8px);
+    max-height: 500px;
+    max-height: min(500px, calc(100vh - 8px));
   }
   #minibia-bot-panel .mb-title {
     font-size: 11px;
@@ -48748,8 +48786,12 @@ function upgradeSectionHeaders(panel) {
       <div class="mb-section-title mb-section-title--sub" style="margin:0 0 5px 0;">
         <span class="mb-title-text">Presets</span>
       </div>
-      <div style="display:flex; gap:6px; align-items:center;">
-        <select id="minibia-bot-cave-preset-select" style="flex:1; padding:4px 6px; font-size:11px;"></select>
+      <div class="mb-cave-preset-row" style="display:flex; gap:6px; align-items:center;">
+        <div class="mb-cave-preset-picker">
+          <button type="button" class="mb-small-button mb-mobile-preset-arrow" id="minibia-bot-cave-preset-prev" title="Previous preset" aria-label="Previous cave preset">◀</button>
+          <select id="minibia-bot-cave-preset-select" style="flex:1; padding:4px 6px; font-size:11px;"></select>
+          <button type="button" class="mb-small-button mb-mobile-preset-arrow" id="minibia-bot-cave-preset-next" title="Next preset" aria-label="Next cave preset">▶</button>
+        </div>
         <button type="button" class="mb-small-button" id="minibia-bot-cave-preset-new" style="padding:2px 8px; font-size:10px;">New</button>
         <button type="button" class="mb-small-button" id="minibia-bot-cave-preset-delete" style="padding:2px 8px; font-size:10px;">Del</button>
         <button type="button" class="mb-small-button" id="minibia-bot-cave-preset-rename" style="padding:2px 8px; font-size:10px;">Rename</button>
@@ -52901,21 +52943,55 @@ function upgradeSectionHeaders(panel) {
 
         // Cave preset
         const presetSelect = panel.querySelector("#minibia-bot-cave-preset-select");
+        const presetPrev = panel.querySelector("#minibia-bot-cave-preset-prev");
+        const presetNext = panel.querySelector("#minibia-bot-cave-preset-next");
         const presetNew = panel.querySelector("#minibia-bot-cave-preset-new");
         const presetDelete = panel.querySelector("#minibia-bot-cave-preset-delete");
+
+        // v1.6.34: one shared preset-load path keeps dropdown selection and the
+        // mobile previous/next arrows perfectly synchronized. Arrows cycle in
+        // the same alphabetically sorted order shown by the select and wrap at
+        // either end. Loading retains the existing behavior (including stopping
+        // an actively running CaveBot before switching presets).
+        function loadCavePresetFromPanel(name) {
+            if (!name)
+                return false;
+            const loaded = bot.cave?.loadPreset?.(name);
+            if (!loaded)
+                return false;
+            refreshCavePresetControls();
+            refreshCaveStatus();
+            refreshCaveClosestStatus();
+            refreshCaveTransitionStatus();
+            refreshCaveWaypointList();
+            return true;
+        }
+
+        function cycleCavePreset(direction) {
+            if (!presetSelect || presetSelect.disabled)
+                return false;
+            const names = Array.from(presetSelect.options)
+                .map(option => String(option.value || ""))
+                .filter(Boolean);
+            if (!names.length)
+                return false;
+
+            const active = bot.cave?.getActivePresetName?.() || presetSelect.value;
+            let index = names.indexOf(active);
+            if (index < 0)
+                index = Math.max(0, names.indexOf(presetSelect.value));
+            const step = direction < 0 ? -1 : 1;
+            const nextIndex = (index + step + names.length) % names.length;
+            return loadCavePresetFromPanel(names[nextIndex]);
+        }
+
         if (presetSelect) {
             presetSelect.addEventListener("change", () => {
-                const name = presetSelect.value;
-                if (!name)
-                    return;
-                bot.cave.loadPreset(name);
-                refreshCavePresetControls();
-                refreshCaveStatus();
-                refreshCaveClosestStatus();
-                refreshCaveTransitionStatus();
-                refreshCaveWaypointList();
+                loadCavePresetFromPanel(presetSelect.value);
             });
         }
+        presetPrev?.addEventListener("click", () => cycleCavePreset(-1));
+        presetNext?.addEventListener("click", () => cycleCavePreset(1));
         if (presetNew) {
             presetNew.addEventListener("click", () => {
                 const name = window.prompt("Name the new cave preset:");
@@ -55097,6 +55173,57 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
             bot.ui.refreshLooterStatus();
     }
 
+    // v1.6.33: GM Chat must freeze movement before the human-paced reply
+    // delay begins. A fast character can otherwise keep executing an already
+    // queued native/server autowalk and leave the GM's screen before replying.
+    // This is deliberately a hard client + server movement cancellation; the
+    // shared killswitch immediately stops the owning modules afterward.
+    function hardStopGmChatMovement(reason = "GM chat killswitch") {
+        const client = window.gameClient;
+        if (!client)
+            return false;
+
+        let touched = false;
+        const pf = client.world?.pathfinder;
+        if (pf) {
+            try { pf.setPathfindCache?.(null); } catch (e) {}
+            try { pf.__pathfindCache = []; } catch (e) {}
+            try { pf.__minimapWaypoints = null; } catch (e) {}
+            try { pf.__recentMinimapStarts = []; } catch (e) {}
+            try { pf.__lastCancelPosition = null; } catch (e) {}
+            try { pf.__hybridPath = null; } catch (e) {}
+            try { pf.__finalDestination = null; } catch (e) {}
+            try { pf.__isAutoWalking = false; } catch (e) {}
+            try { pf.__autoWalkStepsRemaining = 0; } catch (e) {}
+            try { pf.__autowalkStepHistory = []; } catch (e) {}
+            touched = true;
+        }
+
+        const player = client.player;
+        try {
+            if (Array.isArray(player?.__preWalks))
+                player.__preWalks.length = 0;
+        } catch (e) {}
+
+        // Kill any mb0t movement permits/state before their stop() cleanup runs.
+        try { client.__mbTargetingAutoWalkPermit = false; } catch (e) {}
+        try { client.__mbFollowAutoWalkPermit = false; } catch (e) {}
+        try { client.__mbFollowAutoWalkActive = false; } catch (e) {}
+        try { client.__mbFollowAutoWalkTargetId = null; } catch (e) {}
+
+        // Cancel server-owned AutoWalk / Server Mapclick immediately.
+        try {
+            if (typeof StopWalkPacket === "function" &&
+                typeof client.send === "function") {
+                client.send(new StopWalkPacket());
+                touched = true;
+            }
+        } catch (e) {}
+
+        bot.log(`[GM Chat] Movement hard-stop applied (${reason})`);
+        return touched;
+    }
+
     function triggerKillswitch(sender) {
         const now = Date.now();
 
@@ -55108,6 +55235,11 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
         }
 
         state.killSwitchActive = true;
+
+        // Stop first, then alarm/snapshot/reply. This must happen before the
+        // ~1 second human reply delay so a fast character cannot run off-screen.
+        hardStopGmChatMovement("GM detected");
+
         state.lastTriggerAt = now;
         state.lastSender = sender || null;
         state.suppressUntil =
@@ -55247,7 +55379,10 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
         } catch (e) {
             bot.log("GM chat monitor error", e);
         }
-        state.timerId = setTimeout(tick, 1000);
+        // v1.6.33: 1s polling was long enough for high-speed characters to
+        // move several tiles after a GM line appeared. Keep this lightweight
+        // chat-only scan responsive; movement is hard-stopped on detection.
+        state.timerId = setTimeout(tick, 100);
     }
 
     function start() {
@@ -55369,6 +55504,7 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
                 state.duplicateSignatureSkips || 0,
             monitorStartConsumes:
                 state.monitorStartConsumes || 0,
+            scanIntervalMs: 100,
             seenKeyCount:
                 state.seenKeys.size,
             seenSignatureCount:
