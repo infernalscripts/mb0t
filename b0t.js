@@ -2744,7 +2744,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.26",
+        version: "1.6.31",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -20313,11 +20313,11 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         noWayLastText: "",
         noWayRecoveryIndex: -1,
 
-        // v1.6.21: logical route actions such as Supply Check can arm a
-        // forward-only recovery fence. While active, generic NO_WAY/stuck
-        // recovery may only select waypoints inside the intended route segment
-        // instead of jumping backward into an earlier hunt section simply
-        // because it is physically closer. Runtime-only; never persisted.
+        // v1.6.21/v1.6.29: logical route actions such as Supply Check can arm a
+        // bounded recovery fence. While active, generic NO_WAY/STAND_TIMEOUT/stuck
+        // recovery may only select waypoints inside the intended logical branch
+        // instead of crossing between hunt and resupply sections simply because
+        // another route waypoint is physically closer. Runtime-only; never persisted.
         recoveryFenceActive: false,
         recoveryFenceMinIndex: 0,
         recoveryFenceMaxIndex: -1,
@@ -20349,6 +20349,18 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         // after a temple teleport and erase the jump before Cave tick sees it.
         lastRelocationCheckPosition: null,
         lastTeleportResetAt: 0,
+
+        // v1.6.28: after a Script waypoint completes, trust the exact next
+        // sequential route waypoint briefly. A script can intentionally change
+        // position (or finish while another module has just moved the player),
+        // and the generic teleport/closest-waypoint recovery must not override
+        // that route handoff before normal navigation gets a chance to settle.
+        postScriptHandoffUntil: 0,
+        postScriptHandoffIndex: -1,
+        postScriptHandoffRevision: -1,
+        postScriptHandoffFromIndex: -1,
+        postScriptHandoffSuppressions: 0,
+        postScriptHandoffLastLogAt: 0,
 
         // Temple/GM relocations recover directly to the nearest same-floor
         // non-Script waypoint instead of sequentially skipping old-route entries.
@@ -21071,6 +21083,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     // penalties, NO_WAY quarantine, remembered blockers, and target-avoidance
     // state so an edited route gets a clean recovery context.
     function resetRecoveryContext(reason = "route changed") {
+        clearPostScriptHandoff(reason);
         // Manual jumps/route edits supersede any logical branch segment.
         // Supply Check may arm a runtime recovery fence; never carry it across
         // an explicit index change or route topology change.
@@ -26922,11 +26935,11 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         return wasActive;
     }
 
-    function armForwardRecoveryFence(reason = "route branch", startIndex = state.currentIndex + 1) {
+    function armRecoveryFence(reason = "route branch", startIndex = 0, endIndex = route.length - 1) {
         if (!route.length)
             return false;
         const minIndex = Math.max(0, Math.min(route.length - 1, Math.trunc(Number(startIndex) || 0)));
-        const maxIndex = route.length - 1;
+        const maxIndex = Math.max(0, Math.min(route.length - 1, Math.trunc(Number(endIndex) || 0)));
         if (minIndex > maxIndex)
             return false;
         state.recoveryFenceActive = true;
@@ -26935,9 +26948,13 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         state.recoveryFenceReason = String(reason || "route branch");
         state.recoveryFenceSetAt = Date.now();
         bot.log(
-            `Cave: forward recovery fence armed #${minIndex + 1}-#${maxIndex + 1} (${state.recoveryFenceReason})`
+            `Cave: recovery fence armed #${minIndex + 1}-#${maxIndex + 1} (${state.recoveryFenceReason})`
         );
         return true;
+    }
+
+    function armForwardRecoveryFence(reason = "route branch", startIndex = state.currentIndex + 1) {
+        return armRecoveryFence(reason, startIndex, route.length - 1);
     }
 
     function isRecoveryIndexAllowedByFence(index) {
@@ -27484,7 +27501,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         if (result.bestIdx < 0) {
             if (state.recoveryFenceActive) {
                 bot.log(
-                    `Cave: no valid recovery waypoint inside fenced route #${state.recoveryFenceMinIndex + 1}-#${state.recoveryFenceMaxIndex + 1} within ${limit} tiles – stopping instead of jumping backward`,
+                    `Cave: no valid recovery waypoint inside fenced route #${state.recoveryFenceMinIndex + 1}-#${state.recoveryFenceMaxIndex + 1} within ${limit} tiles – stopping instead of crossing route branches`,
                     { reason: state.recoveryFenceReason }
                 );
             } else {
@@ -27955,6 +27972,71 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
      * Returns the new waypoint (or null if none found).
      */
     // ---- TELEPORT / POSITION RESET SAFETY ----
+    // v1.6.28: Script completion is a route handoff, not evidence that the
+    // player was randomly relocated. Keep this guard short and tied to the
+    // exact route index/revision so it cannot mask later unrelated teleports.
+    function clearPostScriptHandoff(reason = null) {
+        const wasActive = Number(state.postScriptHandoffUntil || 0) > Date.now();
+        state.postScriptHandoffUntil = 0;
+        state.postScriptHandoffIndex = -1;
+        state.postScriptHandoffRevision = -1;
+        state.postScriptHandoffFromIndex = -1;
+        state.postScriptHandoffLastLogAt = 0;
+        if (wasActive && reason)
+            bot.log(`Cave: post-Script route handoff cleared (${reason})`);
+    }
+
+    function armPostScriptHandoff(fromIndex, position, now = Date.now()) {
+        if (!route.length || state.currentIndex < 0 || state.currentIndex >= route.length)
+            return false;
+        state.postScriptHandoffUntil = now + 2500;
+        state.postScriptHandoffIndex = state.currentIndex;
+        state.postScriptHandoffRevision = state.routeRevision;
+        state.postScriptHandoffFromIndex = Math.trunc(Number(fromIndex));
+        state.postScriptHandoffLastLogAt = 0;
+        if (position) {
+            state.lastRelocationCheckPosition = {
+                x: Number(position.x),
+                y: Number(position.y),
+                z: Number(position.z)
+            };
+        }
+        return true;
+    }
+
+    function isPostScriptHandoffActive(now = Date.now()) {
+        if (Number(state.postScriptHandoffUntil || 0) <= now) {
+            if (state.postScriptHandoffUntil) clearPostScriptHandoff();
+            return false;
+        }
+        if (
+            state.postScriptHandoffIndex !== state.currentIndex ||
+            state.postScriptHandoffRevision !== state.routeRevision
+        ) {
+            clearPostScriptHandoff();
+            return false;
+        }
+        return true;
+    }
+
+    function rebaseRelocationForPostScript(position) {
+        if (!position) return false;
+        const prev = state.lastRelocationCheckPosition;
+        let jumped = false;
+        if (prev) {
+            const dx = Math.abs(Number(position.x) - Number(prev.x));
+            const dy = Math.abs(Number(position.y) - Number(prev.y));
+            const dz = Math.abs(Number(position.z) - Number(prev.z));
+            jumped = dx + dy >= 20 || dz >= 2;
+        }
+        state.lastRelocationCheckPosition = {
+            x: Number(position.x),
+            y: Number(position.y),
+            z: Number(position.z)
+        };
+        return jumped;
+    }
+
     // GM teleports, temple returns, death/reconnects and other server-side
     // position changes can invalidate all special-waypoint state. Detect a
     // large position jump before CaveBot starts acting on the old waypoint.
@@ -28569,6 +28651,18 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             state.recoveryBestDistance = Infinity;
             state.recoveryNoProgressAt = now;
             state._stuckLogged = false;
+
+            // Stand's own timeout is separate from the generic movement watchdog.
+            // Time spent fighting must not count toward the 10s Stand stall timer,
+            // otherwise a long combat can make the Stand recover immediately on resume.
+            if (
+                waypoint?.stand &&
+                state.standStartAt &&
+                state.standStartAt[state.currentIndex]
+            ) {
+                state.standStartAt[state.currentIndex] = now;
+            }
+
             // Leave the native path cleared by stopMovement(). Normal routing
             // starts a new path after the cooldown, not a recovery path.
             bot.log(`cave resumed (${reason}) – cooldown 200ms`);
@@ -28726,8 +28820,17 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
             // Reset special waypoint state immediately after a GM teleport,
             // temple return, floor jump or similar server-side relocation.
-            const unexpectedJump =
-                detectUnexpectedPositionJump(position, now);
+            // A just-completed Script gets a short, exact-index handoff first:
+            // rebase the relocation detector instead of letting closest-waypoint
+            // recovery override the next sequential route point.
+            const postScriptHandoffActive =
+                isPostScriptHandoffActive(now);
+            let unexpectedJump = false;
+            let postScriptWouldBeJump = false;
+            if (postScriptHandoffActive)
+                postScriptWouldBeJump = rebaseRelocationForPostScript(position);
+            else
+                unexpectedJump = detectUnexpectedPositionJump(position, now);
             noteCircuitMovement(position, now);
 
             // ---- Helper: is the player currently targeting something? ----
@@ -28740,8 +28843,34 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
             // Consume relocation BEFORE ordinary sequential floor/distance
             // skipping. Temple recovery anchors to the nearest same-floor
-            // non-Script waypoint.
+            // non-Script waypoint. During the short post-Script handoff, only
+            // record that recovery WOULD have fired; keep the sequential route.
+            const postScriptRecoverySuppressed =
+                postScriptHandoffActive &&
+                waypoint &&
+                position &&
+                shouldRecoverAsRelocation(
+                    position,
+                    waypoint,
+                    postScriptWouldBeJump
+                );
+            if (postScriptRecoverySuppressed) {
+                state.postScriptHandoffSuppressions++;
+                if (!state.postScriptHandoffLastLogAt) {
+                    state.postScriptHandoffLastLogAt = now;
+                    bot.log(
+                        `Cave: post-Script handoff suppressed closest-waypoint recovery at waypoint #${state.currentIndex + 1}`,
+                        {
+                            fromIndex: state.postScriptHandoffFromIndex + 1,
+                            toIndex: state.currentIndex + 1,
+                            unexpectedJump: postScriptWouldBeJump,
+                            remainingMs: Math.max(0, state.postScriptHandoffUntil - now)
+                        }
+                    );
+                }
+            }
             if (
+                !postScriptHandoffActive &&
                 waypoint &&
                 position &&
                 shouldRecoverAsRelocation(
@@ -30670,6 +30799,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             waypoint = getCurrentWaypoint();
             // ---- SCRIPT-ONLY WAYPOINT ----
             if (waypoint && waypoint.x === undefined) {
+                const completedScriptIndex = state.currentIndex;
                 const scriptResult = runWaypointScript(waypoint);
                 if (scriptResult.waiting) {
                     // Keep this exact Script waypoint current while its Promise
@@ -30691,9 +30821,11 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 // Synchronous scripts, or resolved async scripts, advance now.
                 waypoint = advanceWaypoint();
                 if (!waypoint) {
+                    clearPostScriptHandoff("route ended after Script");
                     stop();
                     return;
                 }
+                armPostScriptHandoff(completedScriptIndex, position, now);
                 state.lastWaypointTarget = null;
                 state.pathAttemptStart = 0;
                 state.lastDistanceToWaypoint = null;
@@ -30736,7 +30868,9 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 state.pendingTransitionSource = null;
 
                 // ---- EXECUTE SCRIPT IF PRESENT ----
+                let completedCoordinateScriptIndex = -1;
                 if (waypoint.script) {
+                    completedCoordinateScriptIndex = state.currentIndex;
                     const scriptResult = runWaypointScript(waypoint);
                     if (scriptResult.waiting) {
                         // We are already standing on this waypoint. Hold here
@@ -30757,9 +30891,12 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 // Advance to next waypoint (normal progression)
                 waypoint = advanceWaypoint();
                 if (!waypoint) {
+                    clearPostScriptHandoff("route ended after waypoint");
                     stop();
                     return;
                 }
+                if (completedCoordinateScriptIndex >= 0)
+                    armPostScriptHandoff(completedCoordinateScriptIndex, position, now);
                 state.lastWaypointTarget = waypoint;
                 state.pathAttemptStart = now;
                 resetWaypointProgressTracking(waypoint, position, now);
@@ -31099,6 +31236,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         const pos = normalizePosition(bot.getPlayerPosition());
         state.running = true;
         clearScriptTask("CaveBot started");
+        clearPostScriptHandoff();
         // Only active navigation needs Pathfinder cancellation notifications.
         // installNoWayObserver is idempotent and its retry timer is tracked.
         installNoWayObserver();
@@ -31299,6 +31437,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         const shouldPersist = options.persistEnabled !== false;
         state.running = false;
         clearScriptTask("CaveBot stopped");
+        clearPostScriptHandoff("CaveBot stopped");
         resetOffscreenFrontierTracking();
         state.fallbackMoveRequestId++;
         stopNoWayObserver();
@@ -32083,6 +32222,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         clearTransitions,
         removeLastWaypoint,
         setCurrentIndex,
+        armRecoveryFence,
         armForwardRecoveryFence,
         clearRecoveryFence,
         getRecoveryFence: () => ({
@@ -33079,6 +33219,441 @@ window.__minibiaBotBundle.installAutoEatModule = function installAutoEatModule(b
         bot.rune.tryEat = tryEat;
         bot.rune.isSated = isSated;
     }
+};
+
+/**
+ * ==================================================================================
+ * 12B. AUTO CONJURE FOOD MODULE
+ *      When the food timer has less than 60 seconds remaining, casts
+ *      "exevo pan" (30 mana), detects which food appeared using the same
+ *      server-backed HotbarCountsRequestPacket
+ *      pipeline as the hotbar, then eats that exact food through HotbarUsePacket.
+ * ==================================================================================
+ */
+window.__minibiaBotBundle.installConjureFoodModule = function installConjureFoodModule(bot) {
+    const configStorageKey = "minibiaBot.conjureFood.config";
+    const FOOD_NAMES = Object.freeze(["ham", "meat", "bread", "fish", "cookie"]);
+    const state = {
+        running: false,
+        timerId: null,
+        inFlight: false,
+        lastAttemptAt: 0,
+        lastCastAt: 0,
+        lastEatAt: 0,
+        lastFoodName: null,
+        lastError: null,
+        lastErrorLogAt: 0,
+    };
+
+    const config = Object.assign({
+        enabled: false,
+        tickMs: 1000,
+        spellWords: "exevo pan",
+        manaCost: 30,
+        retryCooldownMs: 2500,
+        countTimeoutMs: 1800,
+        detectionWindowMs: 3500,
+        triggerBelowSeconds: 60,
+    }, bot.storage.get(configStorageKey, {}));
+
+    function normalizeConfig() {
+        config.enabled = config.enabled === true;
+        config.tickMs = 1000;
+        config.spellWords = String(config.spellWords || "exevo pan").trim() || "exevo pan";
+        config.manaCost = Math.max(0, Math.trunc(Number(config.manaCost) || 30));
+        config.retryCooldownMs = Math.max(1000, Math.min(30000, Math.trunc(Number(config.retryCooldownMs) || 2500)));
+        config.countTimeoutMs = Math.max(800, Math.min(5000, Math.trunc(Number(config.countTimeoutMs) || 1800)));
+        config.detectionWindowMs = Math.max(1500, Math.min(8000, Math.trunc(Number(config.detectionWindowMs) || 3500)));
+        config.triggerBelowSeconds = Math.max(1, Math.min(600, Math.trunc(Number(config.triggerBelowSeconds) || 60)));
+    }
+    normalizeConfig();
+
+    function persistConfig() {
+        bot.storage.set(configStorageKey, { ...config });
+    }
+
+    const sleep = ms => new Promise(resolve => window.setTimeout(resolve, Math.max(0, Number(ms) || 0)));
+
+    function getHungerState() {
+        // Prefer the exact FOOD_TIMER value already used by the normal Eat Food
+        // module. Conjure Food acts BEFORE full hunger: once fewer than the
+        // configured number of seconds remain (60s by default).
+        try {
+            const food = bot.eat?.readFoodTimer?.();
+            const seconds = Number(food?.seconds);
+            if (Number.isFinite(seconds)) {
+                const remaining = Math.max(0, seconds);
+                return {
+                    known: true,
+                    hungry: remaining <= 0,
+                    shouldConjure: remaining < config.triggerBelowSeconds,
+                    source: food?.source || "food timer",
+                    seconds: remaining,
+                };
+            }
+        } catch (e) {}
+
+        // Fallback to the SATED condition. It cannot tell us whether 1-59
+        // seconds remain, so it is only used as a safe fully-hungry fallback.
+        // If neither signal exists, fail CLOSED because conjuring costs mana.
+        try {
+            const player = window.gameClient?.player;
+            const satedId = window.ConditionManager?.prototype?.SATED;
+            if (player?.conditions?.has && typeof satedId === "number") {
+                const sated = player.conditions.has(satedId);
+                return {
+                    known: true,
+                    hungry: !sated,
+                    shouldConjure: !sated,
+                    source: "SATED condition",
+                    seconds: null,
+                };
+            }
+        } catch (e) {}
+
+        return { known: false, hungry: false, shouldConjure: false, source: "unknown", seconds: null };
+    }
+
+    function getMana() {
+        const mana = Number(window.gameClient?.player?.state?.mana);
+        return Number.isFinite(mana) ? Math.max(0, mana) : null;
+    }
+
+    function normalizeItemName(value) {
+        return String(value || "").trim().toLowerCase().replace(/\s+/g, " ");
+    }
+
+    function resolveFoodCandidates() {
+        const wanted = new Set(FOOD_NAMES);
+        const found = new Map();
+        const gc = window.gameClient;
+
+        // SID definitions are canonical for item names. Their `id` property is
+        // the client CID required by HotbarCountsRequestPacket/HotbarUsePacket.
+        try {
+            const bySid = gc?.itemDefinitionsBySid || {};
+            Object.entries(bySid).forEach(([sidKey, def]) => {
+                const name = normalizeItemName(def?.properties?.name);
+                if (!wanted.has(name) || found.has(name)) return;
+                const cid = Number(def?.id);
+                if (!Number.isFinite(cid) || cid <= 0) return;
+                found.set(name, {
+                    name,
+                    cid: Math.trunc(cid),
+                    sid: Math.max(0, Math.trunc(Number(sidKey) || 0)),
+                    fluidType: 0,
+                });
+            });
+        } catch (e) {}
+
+        // Fallback to CID definitions in case SID definitions are still being
+        // populated while the character is loading.
+        try {
+            const byCid = gc?.itemDefinitionsByCid || {};
+            Object.entries(byCid).forEach(([cidKey, def]) => {
+                const name = normalizeItemName(def?.properties?.name);
+                if (!wanted.has(name) || found.has(name)) return;
+                const cid = Number(def?.id ?? cidKey);
+                if (!Number.isFinite(cid) || cid <= 0) return;
+                const sid = Number(gc?.sidByCid?.[cid] || 0);
+                found.set(name, {
+                    name,
+                    cid: Math.trunc(cid),
+                    sid: Number.isFinite(sid) ? Math.max(0, Math.trunc(sid)) : 0,
+                    fluidType: 0,
+                });
+            });
+        } catch (e) {}
+
+        return FOOD_NAMES.map(name => found.get(name)).filter(Boolean);
+    }
+
+    function countKey(candidate) {
+        return `${Number(candidate?.cid) || 0}:${Number(candidate?.fluidType) || 0}`;
+    }
+
+    function readFreshCounts(candidates, timeoutMs = config.countTimeoutMs) {
+        return new Promise((resolve, reject) => {
+            if (!Array.isArray(candidates) || !candidates.length) {
+                reject(new Error("No conjure-food item definitions resolved"));
+                return;
+            }
+            if (typeof bot.subscribeItemCounts !== "function" || typeof bot.requestItemCounts !== "function") {
+                reject(new Error("Server item-count API unavailable"));
+                return;
+            }
+
+            const wanted = new Map();
+            candidates.forEach(candidate => wanted.set(countKey(candidate), candidate));
+            const values = new Map();
+            const startedAt = Date.now();
+            let done = false;
+            let timerId = null;
+            let off = () => {};
+
+            const finish = (fn, value) => {
+                if (done) return;
+                done = true;
+                if (timerId != null) window.clearTimeout(timerId);
+                try { off(); } catch (e) {}
+                fn(value);
+            };
+
+            off = bot.subscribeItemCounts(reading => {
+                const key = `${Number(reading?.itemId) || 0}:${Number(reading?.fluidType) || 0}`;
+                if (!wanted.has(key)) return;
+                if (Number(reading?.at || 0) + 25 < startedAt) return;
+                values.set(key, Math.max(0, Math.trunc(Number(reading?.count) || 0)));
+                if (values.size >= wanted.size) finish(resolve, values);
+            });
+
+            timerId = window.setTimeout(() => {
+                if (values.size > 0) finish(resolve, values);
+                else finish(reject, new Error("Conjure Food: server item-count timeout"));
+            }, Math.max(800, Number(timeoutMs) || 1800));
+
+            const sent = bot.requestItemCounts(candidates.map(candidate => ({
+                id: candidate.cid,
+                fluidType: candidate.fluidType || 0,
+            })));
+            if (!sent) finish(reject, new Error("Conjure Food: could not request server item counts"));
+        });
+    }
+
+    function findIncreasedFood(candidates, before, after) {
+        let best = null;
+        candidates.forEach(candidate => {
+            const key = countKey(candidate);
+            const beforeCount = Number(before?.get(key));
+            const afterCount = Number(after?.get(key));
+            if (!Number.isFinite(afterCount)) return;
+            const base = Number.isFinite(beforeCount) ? beforeCount : 0;
+            const delta = afterCount - base;
+            if (delta > 0 && (!best || delta > best.delta)) {
+                best = { candidate, before: base, after: afterCount, delta };
+            }
+        });
+        return best;
+    }
+
+    async function runSharedWhenFree(name, action, timeoutMs = 1400) {
+        const deadline = Date.now() + Math.max(100, Number(timeoutMs) || 1400);
+        while (state.running && config.enabled && Date.now() < deadline) {
+            const sent = bot.actions?.runShared?.(
+                name,
+                bot.actions?.priorities?.UTILITY ?? 20,
+                action,
+                120
+            );
+            if (sent) return true;
+            await sleep(75);
+        }
+        return false;
+    }
+
+    function logError(message) {
+        state.lastError = String(message || "Conjure Food failed");
+        const now = Date.now();
+        if (now - state.lastErrorLogAt >= 15000) {
+            state.lastErrorLogAt = now;
+            bot.log("[Conjure Food]", state.lastError);
+        }
+    }
+
+    async function waitForConjuredFood(candidates, before) {
+        const deadline = Date.now() + config.detectionWindowMs;
+        while (state.running && config.enabled && Date.now() < deadline) {
+            await sleep(250);
+
+            // If another enabled food action already fed us, the goal is met and
+            // there is no reason to consume another item.
+            const hunger = getHungerState();
+            if (hunger.known && !hunger.shouldConjure) return { sated: true, increased: null };
+
+            try {
+                const after = await readFreshCounts(candidates, config.countTimeoutMs);
+                const increased = findIncreasedFood(candidates, before, after);
+                if (increased) return { sated: false, increased };
+            } catch (e) {
+                // Keep the detection window alive; a transient count timeout can
+                // happen while the spell reply and inventory update cross paths.
+            }
+        }
+        return { sated: false, increased: null };
+    }
+
+    async function tryConjureFood() {
+        if (!state.running || !config.enabled || state.inFlight) return false;
+
+        let hunger = getHungerState();
+        if (!hunger.known || !hunger.shouldConjure) return false;
+
+        const mana = getMana();
+        if (mana == null || mana < config.manaCost) return false;
+        if (Date.now() - state.lastAttemptAt < config.retryCooldownMs) return false;
+
+        state.inFlight = true;
+        state.lastAttemptAt = Date.now();
+        state.lastError = null;
+
+        try {
+            // If normal Eat Food is also enabled, give its configured hotbar food
+            // one short chance first. If it succeeds, do not waste 30 mana.
+            if (bot.eat?.status?.().running && hunger.hungry) {
+                await sleep(1100);
+                if (!state.running || !config.enabled) return false;
+                hunger = getHungerState();
+                if (hunger.known && !hunger.shouldConjure) return true;
+            }
+
+            const candidates = resolveFoodCandidates();
+            if (!candidates.length) throw new Error("Could not resolve ham/meat/bread/fish/cookie item definitions");
+
+            const before = await readFreshCounts(candidates, config.countTimeoutMs);
+            if (!state.running || !config.enabled) return false;
+
+            hunger = getHungerState();
+            if (!hunger.known || !hunger.shouldConjure) return true;
+
+            const liveMana = getMana();
+            if (liveMana == null || liveMana < config.manaCost) return false;
+
+            const cast = await runSharedWhenFree(
+                "conjure-food-cast",
+                () => bot.sendChat?.(config.spellWords) === true,
+                1200
+            );
+            if (!cast) return false;
+
+            state.lastCastAt = Date.now();
+            bot.log(`[Conjure Food] food time low – casting ${config.spellWords}`, {
+                mana: liveMana,
+                hungerSource: hunger.source,
+                foodSeconds: hunger.seconds,
+                triggerBelowSeconds: config.triggerBelowSeconds,
+            });
+
+            const detected = await waitForConjuredFood(candidates, before);
+            if (!state.running || !config.enabled) return false;
+            if (detected.sated) return true;
+            if (!detected.increased) throw new Error("Spell sent, but no conjured food appeared in server inventory counts");
+
+            const food = detected.increased.candidate;
+            const ate = await runSharedWhenFree(
+                "conjure-food-eat",
+                () => {
+                    if (typeof HotbarUsePacket !== "function" || typeof window.gameClient?.send !== "function") return false;
+                    // Generic hotbar use (mode 0) asks the server to locate the
+                    // food in the full inventory, including closed backpacks.
+                    window.gameClient.send(new HotbarUsePacket(food.cid, food.fluidType || 0, 0, 0));
+                    return true;
+                },
+                1600
+            );
+            if (!ate) throw new Error(`Could not eat conjured ${food.name}`);
+
+            state.lastEatAt = Date.now();
+            state.lastFoodName = food.name;
+            bot.log(`[Conjure Food] ate ${food.name}`, {
+                cid: food.cid,
+                sid: food.sid || 0,
+                before: detected.increased.before,
+                after: detected.increased.after,
+            });
+            return true;
+        } catch (error) {
+            logError(error?.message || error);
+            return false;
+        } finally {
+            state.inFlight = false;
+        }
+    }
+
+    function scheduleNextTick() {
+        if (!state.running || state.timerId != null) return;
+        state.timerId = window.setTimeout(() => {
+            state.timerId = null;
+            tick();
+        }, config.tickMs);
+    }
+
+    async function tick() {
+        if (!state.running) return;
+        try {
+            await tryConjureFood();
+        } catch (error) {
+            logError(error?.message || error);
+        } finally {
+            scheduleNextTick();
+        }
+    }
+
+    function start(overrides = {}) {
+        Object.assign(config, overrides, { enabled: true });
+        normalizeConfig();
+        persistConfig();
+        if (state.running) return false;
+        state.running = true;
+        bot.log("auto conjure food started", {
+            spellWords: config.spellWords,
+            manaCost: config.manaCost,
+            foods: FOOD_NAMES.slice(),
+            triggerBelowSeconds: config.triggerBelowSeconds,
+        });
+        tick();
+        return true;
+    }
+
+    function stop(options = {}) {
+        state.running = false;
+        if (state.timerId != null) {
+            window.clearTimeout(state.timerId);
+            state.timerId = null;
+        }
+        if (options.persistEnabled !== false) {
+            config.enabled = false;
+            persistConfig();
+        }
+        bot.log("auto conjure food stopped");
+        return true;
+    }
+
+    function updateConfig(nextConfig = {}) {
+        Object.assign(config, nextConfig);
+        normalizeConfig();
+        persistConfig();
+        return { ...config };
+    }
+
+    function status() {
+        return {
+            running: state.running,
+            config: { ...config },
+            inFlight: state.inFlight,
+            hunger: getHungerState(),
+            mana: getMana(),
+            lastAttemptAt: state.lastAttemptAt,
+            lastCastAt: state.lastCastAt,
+            lastEatAt: state.lastEatAt,
+            lastFoodName: state.lastFoodName,
+            lastError: state.lastError,
+            candidates: resolveFoodCandidates(),
+        };
+    }
+
+    bot.addCleanup(() => stop({ persistEnabled: false }));
+    if (config.enabled) start();
+
+    bot.conjureFood = {
+        start,
+        stop,
+        status,
+        updateConfig,
+        tryConjureFood,
+        getHungerState,
+        resolveFoodCandidates,
+        config,
+    };
 };
 
 /**
@@ -41079,7 +41654,7 @@ window.__minibiaBotBundle.installPinkSkullDetectorModule = function installPinkS
         // Module errors must never prevent the disconnect. Preserve enabled
         // preferences so that a deliberate reload does not silently erase them.
         for (const name of ["autoPickup", "cave", "attack", "runeShooter", "rune", "heal", "invisible", "magicShield",
-                            "equipRing", "eat", "paladin", "looter"]) {
+                            "equipRing", "eat", "conjureFood", "paladin", "looter"]) {
             try { bot[name]?.stop?.({ persistEnabled: false }); }
             catch (e) { bot.log(`Pink Skull: failed to stop ${name}:`, e); }
         }
@@ -41175,6 +41750,7 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
         "minibiaBot.cave.presets",
         "minibiaBot.equipRing.config",
         "minibiaBot.eat.config",
+        "minibiaBot.conjureFood.config",
         "minibiaBot.talk.config",
         "minibiaBot.panic.config",
         "minibiaBot.xray.config",
@@ -44639,6 +45215,10 @@ window.__minibiaBotBundle.installNpcSupplyBuyerModule = function installNpcSuppl
     state.timerId=setInterval(()=>{ensureTradeOfferHook();autoTick();},1000);bot.addCleanup(()=>{if(state.timerId)clearInterval(state.timerId);state.timerId=null;stop();closeTradeWindow();detachTradeOfferHook();bot.cave?.resumeMovement?.("npc-supply-buyer");});
     async function runSupplyCheckWaypoint(okLabel=config.supplyCheckOkLabel||"start"){
         const label=String(okLabel||"start").trim()||"start";
+        // Capture the branch point before any OK goToLabel() changes Cave's index.
+        // Script waypoints remain current while checkSupplies() is pending, so this
+        // is the Supply Check waypoint index for both LOW and OK branches.
+        const sourceIndex=Number(bot.cave?.getWaypointListMeta?.().index);
         const rows=await checkSupplies();
         if(!rows.length)throw new Error("Supply Check: no enabled supply rules configured");
         const unknown=rows.filter(r=>r.low===null||r.error);
@@ -44663,6 +45243,20 @@ window.__minibiaBotBundle.installNpcSupplyBuyerModule = function installNpcSuppl
         if(route[targetIndex]&&route[targetIndex]===bot.cave?.getCurrentWaypoint?.())throw new Error(`Supply Check: OK label "${label}" points to this Supply Check waypoint`);
         bot.log(`[Supply Check WPT] OK – jumping to label "${label}"`);
         if(bot.goToLabel?.(label)!==true)throw new Error(`Supply Check: could not jump to label "${label}"`);
+
+        // OK means stay in the hunt/start branch. Generic STAND_TIMEOUT/NO_WAY
+        // recovery must not jump forward into the physically-near resupply/depot
+        // section just because those waypoints are closer. For the normal route
+        // layout (OK label before this Supply Check), fence recovery from the OK
+        // label through the waypoint immediately before the Supply Check. LOW
+        // replaces this with its forward resupply fence on the next check.
+        if(Number.isInteger(sourceIndex)&&targetIndex<sourceIndex){
+            bot.cave?.armRecoveryFence?.(
+                "supply-check-ok",
+                targetIndex,
+                Math.max(targetIndex,sourceIndex-1)
+            );
+        }
         return {result:"OK",jumpLabel:label,targetIndex};
     }
     function addCaveWaypoint(insertIndex){const script=`return bot.npcSupplyBuyer.buyNow();`;return bot.cave?.addWaypoint?.({label:"Refill Supplies",script},insertIndex);}
@@ -45743,6 +46337,12 @@ function upgradeSectionHeaders(panel) {
         }
     }
 
+    function refreshConjureFoodStatus() {
+        const toggle = document.getElementById("minibia-bot-conjure-food-enabled");
+        if (toggle)
+            toggle.checked = !!bot.conjureFood?.status?.().running;
+    }
+
     function refreshAutoInvisibleStatus() {
         const toggle = document.getElementById("minibia-bot-auto-invisible-enabled");
         if (toggle)
@@ -46570,6 +47170,34 @@ function upgradeSectionHeaders(panel) {
                 start: () => bot.equipRing?.start?.(),
                 stop: () => bot.equipRing?.stop?.()
             },
+            {
+                id: "minibia-bot-collapsed-rune-shooter",
+                headerId: "minibia-bot-rune-shooter-enabled",
+                isRunning: () => !!bot.runeShooter?.status?.().running,
+                start: () => bot.runeShooter?.start?.(),
+                stop: () => bot.runeShooter?.stop?.()
+            },
+            {
+                id: "minibia-bot-collapsed-eat",
+                headerId: "minibia-bot-auto-eat-enabled",
+                isRunning: () => !!bot.eat?.status?.().running,
+                start: () => bot.eat?.start?.(),
+                stop: () => bot.eat?.stop?.()
+            },
+            {
+                id: "minibia-bot-collapsed-invisible",
+                headerId: "minibia-bot-auto-invisible-enabled",
+                isRunning: () => !!bot.invisible?.status?.().running,
+                start: () => bot.invisible?.start?.(),
+                stop: () => bot.invisible?.stop?.()
+            },
+            {
+                id: "minibia-bot-collapsed-magic-shield",
+                headerId: "minibia-bot-auto-magic-shield-enabled",
+                isRunning: () => !!bot.magicShield?.status?.().running,
+                start: () => bot.magicShield?.start?.(),
+                stop: () => bot.magicShield?.stop?.()
+            },
         ];
     }
 
@@ -46966,7 +47594,7 @@ function upgradeSectionHeaders(panel) {
 /* ── Collapsed state ── */
 #minibia-bot-panel[data-collapsed="true"] {
   width: 192px;
-  min-height: 0;
+  min-height: 84px; /* v1.6.27: room for the third quick-button row */
   background-image: url("/png/bg2.png");
   background-color: #2a241e;
 }
@@ -47441,6 +48069,12 @@ function upgradeSectionHeaders(panel) {
     <button type="button" class="mb-run-indicator mb-collapsed-module-button" id="minibia-bot-collapsed-fisher" title="Fishing"><span class="mb-run-dot"></span><span class="mb-run-label">🎣</span></button>
     <button type="button" class="mb-run-indicator mb-collapsed-module-button" id="minibia-bot-collapsed-equip-ring" title="Equip Ring"><span class="mb-run-dot"></span><span class="mb-run-label">💍</span></button>
   </div>
+  <div class="mb-collapsed-module-row" aria-label="Combat support modules">
+    <button type="button" class="mb-run-indicator mb-collapsed-module-button" id="minibia-bot-collapsed-rune-shooter" title="Rune Shooter"><span class="mb-run-dot"></span><span class="mb-run-label">🎯</span></button>
+    <button type="button" class="mb-run-indicator mb-collapsed-module-button" id="minibia-bot-collapsed-eat" title="Eat Food"><span class="mb-run-dot"></span><span class="mb-run-label">🍖</span></button>
+    <button type="button" class="mb-run-indicator mb-collapsed-module-button" id="minibia-bot-collapsed-invisible" title="Invisible"><span class="mb-run-dot"></span><span class="mb-run-label">👻</span></button>
+    <button type="button" class="mb-run-indicator mb-collapsed-module-button" id="minibia-bot-collapsed-magic-shield" title="Utamo Vita (Mana Shield)"><span class="mb-run-dot"></span><span class="mb-run-label">🛡️</span></button>
+  </div>
 </div>
 
 <div class="mb-body">
@@ -47914,6 +48548,7 @@ function upgradeSectionHeaders(panel) {
           <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-auto-eat-enabled" /><span>Eat Food</span></label>
           <label class="mb-field" style="flex:0 0 60px;"><input type="number" id="minibia-bot-auto-eat-hotkey" min="1" max="12" placeholder="10" style="padding:4px 4px;font-size:11px;text-align:center;" /></label>
         </div>
+        <label class="mb-toggle" style="margin:0; font-size:11px;" title="When food time drops below 60 seconds and mana is at least 30, cast exevo pan and eat the conjured ham/meat/bread/fish/cookie"><input type="checkbox" id="minibia-bot-conjure-food-enabled" /><span>Conjure Food</span></label>
         <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-auto-invisible-enabled" /><span>Invisible</span></label>
         <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-light-hack-enabled" /><span>Light Hack (Full)</span></label>
         <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-light-hack-legit-enabled" /><span>Light Hack (Utevo)</span></label>
@@ -48972,6 +49607,9 @@ function upgradeSectionHeaders(panel) {
                 try { refreshLooterStatus?.(); } catch {}
                 try { refreshFisherStatus?.(); } catch {}
                 try { refreshEquipRingStatus?.(); } catch {}
+                try { refreshAutoEatStatus?.(); } catch {}
+                try { refreshAutoInvisibleStatus?.(); } catch {}
+                try { refreshAutoMagicShieldStatus?.(); } catch {}
                 try { refreshTitlebarRunIndicators?.(); } catch {}
                 try { refreshStatusTab?.(); } catch {}
             });
@@ -49010,6 +49648,7 @@ function upgradeSectionHeaders(panel) {
                 else
                     bot.invisible.stop();
                 refreshAutoInvisibleStatus();
+                refreshCollapsedQuickModules();
             });
         }
 
@@ -49023,6 +49662,7 @@ function upgradeSectionHeaders(panel) {
                 else
                     bot.magicShield.stop();
                 refreshAutoMagicShieldStatus();
+                refreshCollapsedQuickModules();
             });
         }
 
@@ -51132,6 +51772,7 @@ function upgradeSectionHeaders(panel) {
                     bot.eat.stop();
                 }
                 refreshAutoEatStatus();
+                refreshCollapsedQuickModules();
             });
         }
 
@@ -51147,6 +51788,17 @@ function upgradeSectionHeaders(panel) {
                 bot.log("Auto eat hotkey updated", {
                     slot: val
                 });
+            });
+        }
+
+        // ---- Conjure Food ----
+        const conjureFoodToggle = panel.querySelector("#minibia-bot-conjure-food-enabled");
+        if (conjureFoodToggle) {
+            conjureFoodToggle.checked = !!bot.conjureFood?.status?.().running;
+            conjureFoodToggle.addEventListener("change", function () {
+                if (this.checked) bot.conjureFood?.start?.();
+                else bot.conjureFood?.stop?.();
+                refreshConjureFoodStatus();
             });
         }
 
@@ -51584,6 +52236,7 @@ function upgradeSectionHeaders(panel) {
                 if (runeShooterToggle.checked) bot.runeShooter?.start?.();
                 else bot.runeShooter?.stop?.();
                 refreshRuneShooterStatus();
+                refreshCollapsedQuickModules();
                 refreshStatusTab();
             });
         }
@@ -52887,6 +53540,7 @@ function upgradeSectionHeaders(panel) {
                 force: true
             });
             refreshAutoEatStatus();
+            refreshConjureFoodStatus();
             refreshCaveStatus();
             refreshEquipRingStatus();
             refreshTalkStatus();
@@ -55698,6 +56352,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         ["cave", "minibiaBot.cave.config"],
         ["equipRing", "minibiaBot.equipRing.config"],
         ["eat", "minibiaBot.eat.config"],
+        ["conjureFood", "minibiaBot.conjureFood.config"],
         ["talk", "minibiaBot.talk.config"],
     ];
 
@@ -55879,6 +56534,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         currentBundle.installCaveModule(bot);
         currentBundle.installEquipRingModule(bot);
         currentBundle.installAutoEatModule(bot);
+        currentBundle.installConjureFoodModule(bot);
         currentBundle.installTalkModule(bot);
         currentBundle.installAntiBotMonitorModule(bot);
         currentBundle.installSlimeTrainerModule(bot);
@@ -55934,6 +56590,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
             cave: bot.cave.status(),
             equipRing: bot.equipRing.status(),
             eat: bot.eat.status(),
+            conjureFood: bot.conjureFood.status(),
             talk: bot.talk.status(),
             support: bot.support.status(),
             depositer: bot.depositer?.status?.(),
@@ -55957,6 +56614,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
                 ["runeShooter", "minibiaBot.runeShooter.config"],
                 ["equipRing", "minibiaBot.equipRing.config"],
                 ["eat", "minibiaBot.eat.config"],
+                ["conjureFood", "minibiaBot.conjureFood.config"],
                 ["talk", "minibiaBot.talk.config"],
                 ["panic", "minibiaBot.panic.config"],
                 ["xray", "minibiaBot.xray.config"],
