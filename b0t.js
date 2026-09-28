@@ -803,6 +803,8 @@ addCleanup(() => {
 
     // ---- FOLLOW PLAYER: CUSTOM SMOOTH AUTOWALK ----
     // v1.5.90: PvP-tab Auto Follow no longer uses native FollowPacket pathing.
+    // v1.6.07: optional Follow During Target keeps only Follow-owned A* batches
+    // alive through the combat movement guard; default remains OFF.
     // mb0t owns the route with field-aware A* and executes short AutoWalkPacket
     // batches so movement stays smooth while still reacting to a moving player.
     //
@@ -814,6 +816,9 @@ addCleanup(() => {
         active: false,
         name: "",
         mode: "pvp",
+        // Optional PvP behavior: when true, standalone Follow keeps ownership
+        // of its own short A* AutoWalk batches even while a combat target exists.
+        allowDuringTarget: false,
         targetId: null,
         targetPosKey: null,
         destinationKey: null,
@@ -990,6 +995,105 @@ addCleanup(() => {
         return result;
     }
 
+    function isFollowNonPvpPlayerPassThroughTile(
+        tile,
+        creatures
+    ) {
+        const client =
+            window.gameClient;
+
+        // Mirror Minibia's own non-PvP rule narrowly for standalone Follow:
+        // ordinary players may be stepped through, but monsters/NPCs remain
+        // blockers. Keep the client's depot-locker exception so A* does not
+        // plan a route the server is expected to reject there.
+        if (
+            !tile ||
+            client?.__worldPvp !== false ||
+            !Array.isArray(creatures) ||
+            creatures.length === 0
+        ) {
+            return false;
+        }
+
+        let playerType = null;
+        try {
+            playerType =
+                typeof CONST !== "undefined"
+                    ? CONST?.TYPES?.PLAYER
+                    : null;
+        } catch (e) {}
+
+        if (playerType == null)
+            return false;
+
+        if (
+            !creatures.every(
+                creature =>
+                    creature &&
+                    creature.type === playerType
+            )
+        ) {
+            return false;
+        }
+
+        const pos =
+            tile.__position ||
+            tile.getPosition?.();
+
+        if (!pos)
+            return false;
+
+        const world =
+            client?.world;
+
+        // Minibia intentionally disables player pass-through on/next to depot
+        // lockers (CID 3497-3500). Match that exception here.
+        for (let dx = -1; dx <= 1; dx++) {
+            for (let dy = -1; dy <= 1; dy++) {
+                let nearby = null;
+
+                if (dx === 0 && dy === 0) {
+                    nearby = tile;
+                } else {
+                    try {
+                        nearby =
+                            world
+                                ?.getTileFromWorldPosition?.(
+                                    new Position(
+                                        Number(pos.x) + dx,
+                                        Number(pos.y) + dy,
+                                        Number(pos.z)
+                                    )
+                                );
+                    } catch (e) {}
+                }
+
+                if (!nearby)
+                    continue;
+
+                const nearbyItems =
+                    Array.isArray(nearby.items)
+                        ? nearby.items
+                        : [];
+
+                if (
+                    nearbyItems.some(
+                        item => {
+                            const id =
+                                Number(item?.id);
+                            return id >= 3497 &&
+                                id <= 3500;
+                        }
+                    )
+                ) {
+                    return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
     function isFollowFieldPassableTile(
         tile,
         options = {}
@@ -1012,6 +1116,8 @@ addCleanup(() => {
                     )
             );
 
+        const tileCreatures =
+            getFollowTileCreatures(tile);
         const allowedCreatureId =
             options.allowedCreatureId != null
                 ? Number(
@@ -1020,7 +1126,7 @@ addCleanup(() => {
                 : null;
         const allowedCreaturePresent =
             allowedCreatureId != null &&
-            getFollowTileCreatures(tile)
+            tileCreatures
                 .some(
                     creature =>
                         Number(creature?.id) ===
@@ -1096,13 +1202,26 @@ addCleanup(() => {
         if (options.ignoreCreatures === true)
             return true;
 
+        // When Non-PvP follow deliberately routes onto the followed player's
+        // exact tile, allow the whole creature stack occupying that destination.
+        // The followed player being present is the authority here: other players
+        // standing on the same square must not make an otherwise valid stack
+        // destination fail A*. Item/floor-change blockers were already checked
+        // above, so this only relaxes creature occupancy on that one destination.
+        if (
+            options.allowCreatureStack === true &&
+            allowedCreaturePresent
+        ) {
+            return true;
+        }
+
         const playerId =
             Number(
                 window.gameClient?.player?.id
             );
 
         const blockers =
-            getFollowTileCreatures(tile)
+            tileCreatures
                 .filter(creature => {
                     const id =
                         Number(creature?.id);
@@ -1131,6 +1250,20 @@ addCleanup(() => {
 
                     return true;
                 });
+
+        // Non-PvP stack-follow should not get stranded behind a line of other
+        // players. Minibia itself permits player-through-player movement on
+        // non-PvP worlds, so treat those player-only occupied tiles as passable
+        // for this route. Monsters/NPCs and the depot exception still block.
+        if (
+            options.allowNonPvpPlayerPassThrough === true &&
+            isFollowNonPvpPlayerPassThroughTile(
+                tile,
+                blockers
+            )
+        ) {
+            return true;
+        }
 
         return blockers.length === 0;
     }
@@ -1224,7 +1357,16 @@ addCleanup(() => {
                                     isDestination
                                         ? options
                                             .allowedDestinationCreatureId
-                                        : null
+                                        : null,
+                                allowCreatureStack:
+                                    isDestination &&
+                                    options
+                                        .allowDestinationCreatureStack ===
+                                        true,
+                                allowNonPvpPlayerPassThrough:
+                                    options
+                                        .allowNonPvpPlayerPassThrough ===
+                                        true
                             }
                         )
                     ) {
@@ -1296,10 +1438,22 @@ addCleanup(() => {
 
                         if (
                             !isFollowFieldPassableTile(
-                                sideA
+                                sideA,
+                                {
+                                    allowNonPvpPlayerPassThrough:
+                                        options
+                                            .allowNonPvpPlayerPassThrough ===
+                                            true
+                                }
                             ) ||
                             !isFollowFieldPassableTile(
-                                sideB
+                                sideB,
+                                {
+                                    allowNonPvpPlayerPassThrough:
+                                        options
+                                            .allowNonPvpPlayerPassThrough ===
+                                            true
+                                }
                             )
                         ) {
                             continue;
@@ -1453,7 +1607,11 @@ addCleanup(() => {
                     destinationTile,
                     {
                         allowedCreatureId:
-                            target.id
+                            target.id,
+                        allowCreatureStack:
+                            true,
+                        allowNonPvpPlayerPassThrough:
+                            true
                     }
                 )
             ) {
@@ -1466,7 +1624,11 @@ addCleanup(() => {
                     destinationTile,
                     {
                         allowedDestinationCreatureId:
-                            target.id
+                            target.id,
+                        allowDestinationCreatureStack:
+                            true,
+                        allowNonPvpPlayerPassThrough:
+                            true
                     }
                 );
 
@@ -1903,7 +2065,20 @@ addCleanup(() => {
                         allowedCreatureId:
                             isFinalExactTarget
                                 ? target.id
-                                : null
+                                : null,
+                        // Non-PvP intentionally stacks on the followed player's
+                        // exact tile. The route builder already allows the whole
+                        // creature stack there; the final packet gate must apply
+                        // the same rule or an extra player on that tile rejects
+                        // the last step after A* has already found a valid route.
+                        allowCreatureStack:
+                            isFinalExactTarget,
+                        // In Non-PvP mode, every queued route step gets the
+                        // same player-through-player rule as A*. Otherwise A*
+                        // can find a route through a crowd and this final packet
+                        // gate would reject an intermediate player-occupied tile.
+                        allowNonPvpPlayerPassThrough:
+                            mode === "nonpvp"
                     }
                 )
             ) {
@@ -1989,12 +2164,23 @@ addCleanup(() => {
                 true;
             client.__mbFollowAutoWalkTargetId =
                 target.id ?? null;
+            client.__mbFollowAllowDuringTarget =
+                customFollowState.active === true &&
+                customFollowState.allowDuringTarget === true;
+            // The combat movement guard normally drops AutoWalkPacket while a
+            // target exists. This one-shot permit applies ONLY to this custom
+            // PvP/Non-PvP Follow batch when the user enabled the toggle.
+            client.__mbFollowAutoWalkPermit =
+                client.__mbFollowAllowDuringTarget === true;
 
             client.send(
                 new AutoWalkPacket(
                     directions
                 )
             );
+
+            client.__mbFollowAutoWalkPermit =
+                false;
 
             customFollowState.targetId =
                 target.id ?? null;
@@ -2031,6 +2217,8 @@ addCleanup(() => {
 
             return true;
         } catch (e) {
+            client.__mbFollowAutoWalkPermit =
+                false;
             client.__mbFollowAutoWalkActive =
                 false;
             client.__mbFollowAutoWalkTargetId =
@@ -2077,7 +2265,8 @@ addCleanup(() => {
 
     function runCustomFollow(
         name,
-        mode = "pvp"
+        mode = "pvp",
+        options = {}
     ) {
         const now =
             Date.now();
@@ -2099,14 +2288,35 @@ addCleanup(() => {
         customFollowState.mode =
             normalizedMode;
 
+        if (
+            Object.prototype.hasOwnProperty.call(
+                options || {},
+                "allowDuringTarget"
+            )
+        ) {
+            customFollowState.allowDuringTarget =
+                options.allowDuringTarget === true;
+        }
+
+        const followClient =
+            window.gameClient;
+        if (followClient) {
+            followClient.__mbFollowAllowDuringTarget =
+                customFollowState.active === true &&
+                customFollowState.allowDuringTarget === true;
+        }
+
         clearLegacyNativeFollow();
 
-        // Preserve the previous PvP-tab behavior: combat owns movement while a
-        // live combat target exists.
+        // Default remains unchanged: combat owns movement while a live target
+        // exists. The PvP UI toggle explicitly opts Follow back into movement.
         const combatTarget =
             player.__target || null;
 
-        if (combatTarget) {
+        if (
+            combatTarget &&
+            customFollowState.allowDuringTarget !== true
+        ) {
             const hp =
                 combatTarget.state?.health ??
                 combatTarget.health;
@@ -2193,15 +2403,352 @@ addCleanup(() => {
         if (client) {
             delete client.__mbFollowAutoWalkActive;
             delete client.__mbFollowAutoWalkTargetId;
+            delete client.__mbFollowAutoWalkPermit;
+            delete client.__mbFollowAllowDuringTarget;
         }
+    });
+
+    // ---- SHARED CONTAINER ACK TRACKER ----
+    // Tracks the actual PacketHandler lifecycle/item acknowledgements emitted by
+    // Minibia. Depositer/Looter can bind caches and transactions to these events
+    // instead of inferring OPEN/CLOSE/move success from polling alone.
+    const containerAckState = {
+        seq: 0,
+        events: [],
+        listeners: new Set(),
+        maxEvents: 512,
+        proto: null,
+        originalOpen: null,
+        originalClose: null,
+        originalAdd: null,
+        originalRemove: null,
+        wrappedOpen: null,
+        wrappedClose: null,
+        wrappedAdd: null,
+        wrappedRemove: null,
+        openDispatchDepth: 0,
+        lastReplyAt: 0,
+        retryTimer: null,
+    };
+
+    function recordContainerAck(kind, data = {}) {
+        const event = {
+            seq: ++containerAckState.seq,
+            kind: String(kind || "unknown"),
+            at: Date.now(),
+            ...data,
+        };
+        if (
+            event.source === "server" &&
+            ["opening", "open", "closing", "close"].includes(event.kind)
+        ) {
+            containerAckState.lastReplyAt = Math.max(
+                Number(containerAckState.lastReplyAt) || 0,
+                Number(event.at) || Date.now()
+            );
+        }
+        containerAckState.events.push(event);
+        if (containerAckState.events.length > containerAckState.maxEvents)
+            containerAckState.events.splice(0, containerAckState.events.length - containerAckState.maxEvents);
+        for (const listener of Array.from(containerAckState.listeners)) {
+            try { listener(event); }
+            catch (error) { console.error("[minibia-bot] container ACK listener failed", error); }
+        }
+        return event;
+    }
+
+    function getLiveContainerForAck(id) {
+        const numericId = Number(id);
+        if (!Number.isFinite(numericId)) return null;
+        try {
+            const c = window.gameClient?.player?.getContainer?.(numericId);
+            if (c) return c;
+        } catch (e) {}
+        const raw = window.gameClient?.player?.__openedContainers;
+        const list = Array.isArray(raw) ? raw
+            : raw instanceof Set ? Array.from(raw)
+            : raw instanceof Map ? Array.from(raw.values())
+            : raw && typeof raw === "object" ? Object.values(raw)
+            : [];
+        return list.find(c => Number(c?.__containerId) === numericId) || null;
+    }
+
+    function uninstallContainerAckTracker() {
+        const st = containerAckState;
+        const proto = st.proto;
+        if (proto) {
+            if (st.wrappedOpen && proto.handleContainerOpen === st.wrappedOpen)
+                proto.handleContainerOpen = st.originalOpen;
+            if (st.wrappedClose && proto.handleContainerClose === st.wrappedClose)
+                proto.handleContainerClose = st.originalClose;
+            if (st.wrappedAdd && proto.handleContainerAddItem === st.wrappedAdd)
+                proto.handleContainerAddItem = st.originalAdd;
+            if (st.wrappedRemove && proto.handleContainerItemRemove === st.wrappedRemove)
+                proto.handleContainerItemRemove = st.originalRemove;
+        }
+        st.proto = null;
+        st.originalOpen = st.originalClose = st.originalAdd = st.originalRemove = null;
+        st.wrappedOpen = st.wrappedClose = st.wrappedAdd = st.wrappedRemove = null;
+        st.openDispatchDepth = 0;
+    }
+
+    function installContainerAckTracker() {
+        let proto = null;
+        try {
+            if (typeof PacketHandler !== "undefined" && PacketHandler?.prototype)
+                proto = PacketHandler.prototype;
+        } catch (e) {}
+        if (!proto ||
+            typeof proto.handleContainerOpen !== "function" ||
+            typeof proto.handleContainerClose !== "function" ||
+            typeof proto.handleContainerAddItem !== "function" ||
+            typeof proto.handleContainerItemRemove !== "function") {
+            return false;
+        }
+        if (
+            containerAckState.proto === proto &&
+            proto.handleContainerOpen === containerAckState.wrappedOpen &&
+            proto.handleContainerClose === containerAckState.wrappedClose &&
+            proto.handleContainerAddItem === containerAckState.wrappedAdd &&
+            proto.handleContainerItemRemove === containerAckState.wrappedRemove
+        ) return true;
+
+        uninstallContainerAckTracker();
+        const st = containerAckState;
+        st.proto = proto;
+        st.originalOpen = proto.handleContainerOpen;
+        st.originalClose = proto.handleContainerClose;
+        st.originalAdd = proto.handleContainerAddItem;
+        st.originalRemove = proto.handleContainerItemRemove;
+
+        st.wrappedOpen = function wrappedMbotContainerOpen(packet) {
+            const id = Number(packet?.cid);
+            const packetCid = Number(packet?.id) || 0;
+            const packetParentId = Number(packet?.parentCid) || 0;
+            const packetTitle = String(packet?.title || "");
+            // Phase 1: record receipt BEFORE native UI/model mutation. This proves
+            // the server OPEN arrived even if later native container/window work
+            // throws, dedupes an old object, or replaces the JS container object.
+            recordContainerAck("opening", {
+                source: "server",
+                ok: true,
+                containerId: Number.isFinite(id) ? id : null,
+                cid: packetCid,
+                parentContainerId: packetParentId,
+                title: packetTitle,
+                container: getLiveContainerForAck(id),
+            });
+            st.openDispatchDepth++;
+            let ok = false;
+            let thrown = null;
+            try {
+                const result = st.originalOpen.apply(this, arguments);
+                ok = true;
+                return result;
+            } catch (error) {
+                thrown = error;
+                throw error;
+            } finally {
+                st.openDispatchDepth = Math.max(0, st.openDispatchDepth - 1);
+                const container = getLiveContainerForAck(id);
+                recordContainerAck("open", {
+                    source: "server",
+                    ok,
+                    nativeError: thrown ? String(thrown?.message || thrown) : null,
+                    registered: !!container,
+                    containerId: Number.isFinite(id) ? id : null,
+                    cid: packetCid || Number(container?.id) || 0,
+                    parentContainerId: packetParentId || Number(container?.__parentCid) || 0,
+                    title: packetTitle || String(container?.__title || ""),
+                    container,
+                });
+            }
+        };
+
+        st.wrappedClose = function wrappedMbotContainerClose(id) {
+            const numericId = Number(id);
+            const before = getLiveContainerForAck(numericId);
+            const source = st.openDispatchDepth > 0 ? "open-dedupe" : "server";
+            if (source === "server") {
+                recordContainerAck("closing", {
+                    source,
+                    ok: true,
+                    containerId: Number.isFinite(numericId) ? numericId : null,
+                    cid: Number(before?.id) || 0,
+                    parentContainerId: Number(before?.__parentCid) || 0,
+                    title: String(before?.__title || ""),
+                    container: before,
+                });
+            }
+            let ok = false;
+            let thrown = null;
+            try {
+                const result = st.originalClose.apply(this, arguments);
+                ok = true;
+                return result;
+            } catch (error) {
+                thrown = error;
+                throw error;
+            } finally {
+                recordContainerAck("close", {
+                    source,
+                    ok,
+                    nativeError: thrown ? String(thrown?.message || thrown) : null,
+                    containerId: Number.isFinite(numericId) ? numericId : null,
+                    cid: Number(before?.id) || 0,
+                    parentContainerId: Number(before?.__parentCid) || 0,
+                    title: String(before?.__title || ""),
+                    container: before,
+                    replacement: getLiveContainerForAck(numericId),
+                });
+            }
+        };
+
+        st.wrappedRemove = function wrappedMbotContainerRemove(packet) {
+            const containerId = Number(packet?.containerIndex);
+            const before = getLiveContainerForAck(containerId);
+            let ok = false;
+            try {
+                const result = st.originalRemove.apply(this, arguments);
+                ok = true;
+                return result;
+            } finally {
+                recordContainerAck("remove", {
+                    source: "server",
+                    ok,
+                    containerId: Number.isFinite(containerId) ? containerId : null,
+                    slot: Number(packet?.slotIndex),
+                    count: Number(packet?.count) || 0,
+                    cid: Number(before?.id) || 0,
+                    container: getLiveContainerForAck(containerId) || before,
+                });
+            }
+        };
+
+        st.wrappedAdd = function wrappedMbotContainerAdd(packet) {
+            const containerId = Number(packet?.containerId);
+            let ok = false;
+            try {
+                const result = st.originalAdd.apply(this, arguments);
+                ok = true;
+                return result;
+            } finally {
+                recordContainerAck("add", {
+                    source: "server",
+                    ok,
+                    containerId: Number.isFinite(containerId) ? containerId : null,
+                    slot: Number(packet?.slot),
+                    itemId: Number(packet?.itemId) || 0,
+                    count: Number(packet?.count) || 0,
+                    fluidType: Number(packet?.fluidType) || 0,
+                    sid: Number(packet?.sid) || 0,
+                    tintId: Number(packet?.tintId) || 0,
+                    container: getLiveContainerForAck(containerId),
+                });
+            }
+        };
+
+        proto.handleContainerOpen = st.wrappedOpen;
+        proto.handleContainerClose = st.wrappedClose;
+        proto.handleContainerItemRemove = st.wrappedRemove;
+        proto.handleContainerAddItem = st.wrappedAdd;
+        return true;
+    }
+
+    function findContainerAck(predicate, afterSeq = 0) {
+        const fn = typeof predicate === "function" ? predicate : () => true;
+        for (const event of containerAckState.events) {
+            if (Number(event.seq) <= Number(afterSeq || 0)) continue;
+            try { if (fn(event)) return event; } catch (e) {}
+        }
+        return null;
+    }
+
+    function waitForContainerAck(predicate, options = {}) {
+        const afterSeq = Math.max(0, Number(options.afterSeq) || 0);
+        const timeoutMs = Math.max(100, Number(options.timeoutMs) || 4000);
+        const existing = findContainerAck(predicate, afterSeq);
+        if (existing) return Promise.resolve(existing);
+        return new Promise((resolve, reject) => {
+            let done = false;
+            let timer = null;
+            const finish = (fn, value) => {
+                if (done) return;
+                done = true;
+                if (timer) clearTimeout(timer);
+                containerAckState.listeners.delete(listener);
+                fn(value);
+            };
+            const listener = event => {
+                if (Number(event?.seq) <= afterSeq) return;
+                let match = false;
+                try { match = !!predicate(event); } catch (e) {}
+                if (match) finish(resolve, event);
+            };
+            containerAckState.listeners.add(listener);
+            timer = setTimeout(() => finish(reject, new Error(options.errorText || "Container acknowledgement timeout")), timeoutMs);
+        });
+    }
+
+    const containerAckApi = {
+        ensureInstalled: installContainerAckTracker,
+        snapshot: () => Number(containerAckState.seq) || 0,
+        latest: (predicate = null) => {
+            const fn = typeof predicate === "function" ? predicate : () => true;
+            for (let i = containerAckState.events.length - 1; i >= 0; i--) {
+                const event = containerAckState.events[i];
+                try { if (fn(event)) return event; } catch (e) {}
+            }
+            return null;
+        },
+        findAfter: (afterSeq, predicate) => findContainerAck(predicate, afterSeq),
+        waitFor: waitForContainerAck,
+        subscribe(listener) {
+            if (typeof listener !== "function") return () => {};
+            containerAckState.listeners.add(listener);
+            return () => containerAckState.listeners.delete(listener);
+        },
+        recent(limit = 50) {
+            const n = Math.max(1, Math.min(512, Math.floor(Number(limit) || 50)));
+            return containerAckState.events.slice(-n);
+        },
+        getContainer: getLiveContainerForAck,
+        lastReplyAt: () => Number(containerAckState.lastReplyAt) || 0,
+        status: () => ({
+            installed: installContainerAckTracker(),
+            seq: containerAckState.seq,
+            buffered: containerAckState.events.length,
+            listeners: containerAckState.listeners.size,
+            lastReplyAt: Number(containerAckState.lastReplyAt) || 0,
+        }),
+    };
+
+    if (!installContainerAckTracker()) {
+        containerAckState.retryTimer = setInterval(() => {
+            if (installContainerAckTracker() && containerAckState.retryTimer) {
+                clearInterval(containerAckState.retryTimer);
+                containerAckState.retryTimer = null;
+            }
+        }, 500);
+    }
+    addCleanup(() => {
+        if (containerAckState.retryTimer) {
+            clearInterval(containerAckState.retryTimer);
+            containerAckState.retryTimer = null;
+        }
+        containerAckState.listeners.clear();
+        uninstallContainerAckTracker();
+        containerAckState.events.length = 0;
+        containerAckState.lastReplyAt = 0;
     });
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.02",
+        version: "1.6.26",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
+        containerAcks: containerAckApi,
 
         /** Destroy the bot and all its modules (call before reload) */
         destroy() {
@@ -2241,6 +2788,12 @@ addCleanup(() => {
                 });
             if (this.looter?.stop)
                 this.looter.stop();
+            if (this.depositer?.stop)
+                this.depositer.stop();
+            if (this.npcSupplyBuyer?.stop)
+                this.npcSupplyBuyer.stop();
+            if (this.bankNpc?.stop)
+                this.bankNpc.stop();
             if (this.ui?.destroy)
                 this.ui.destroy();
             stopReconnectWatcher();
@@ -2967,8 +3520,35 @@ addCleanup(() => {
 
             return runCustomFollow(
                 targetName,
-                mode
+                mode,
+                options
             );
+        },
+
+        setFollowDuringTarget(enabled) {
+            customFollowState.allowDuringTarget =
+                enabled === true;
+
+            const client =
+                window.gameClient;
+            if (client) {
+                client.__mbFollowAllowDuringTarget =
+                    customFollowState.active === true &&
+                    customFollowState.allowDuringTarget === true;
+                client.__mbFollowAutoWalkPermit =
+                    false;
+            }
+
+            if (
+                customFollowState.allowDuringTarget !== true &&
+                client?.player?.__target
+            ) {
+                stopCustomFollowAutoWalk(
+                    "combat target active"
+                );
+            }
+
+            return customFollowState.allowDuringTarget;
         },
 
         // Backward-compatible alias from v1.5.83-v1.5.89. It now executes the
@@ -3034,6 +3614,15 @@ addCleanup(() => {
             customFollowState.active =
                 false;
             customFollowState.name = "";
+
+            const client =
+                window.gameClient;
+            if (client) {
+                client.__mbFollowAllowDuringTarget =
+                    false;
+                client.__mbFollowAutoWalkPermit =
+                    false;
+            }
 
             stopCustomFollowAutoWalk(
                 "follow disabled"
@@ -19723,6 +20312,18 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         noWayLastSeenAt: 0,
         noWayLastText: "",
         noWayRecoveryIndex: -1,
+
+        // v1.6.21: logical route actions such as Supply Check can arm a
+        // forward-only recovery fence. While active, generic NO_WAY/stuck
+        // recovery may only select waypoints inside the intended route segment
+        // instead of jumping backward into an earlier hunt section simply
+        // because it is physically closer. Runtime-only; never persisted.
+        recoveryFenceActive: false,
+        recoveryFenceMinIndex: 0,
+        recoveryFenceMaxIndex: -1,
+        recoveryFenceReason: null,
+        recoveryFenceSetAt: 0,
+
         fallbackMoveTimerId: null,
         // Invalidates an old manual step whenever its waypoint/path is superseded.
         fallbackMoveRequestId: 0,
@@ -19965,6 +20566,23 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         nativePathWatchKey: null,
         nativePathWatchAt: 0,
         nativePathWatchBestDistance: Infinity,
+
+        // v1.6.25: loaded-map frontier routing is only a temporary bridge for
+        // genuinely off-screen SAME-FLOOR waypoints. Keep independent progress
+        // state so repeatedly SENDING another frontier path is never mistaken
+        // for actual route progress. This catches wall A<->B oscillations where
+        // the real route requires a down/up transition.
+        offscreenFrontierKey: null,
+        offscreenFrontierAttempts: 0,
+        offscreenFrontierBestDistance: Infinity,
+        offscreenFrontierLastDistance: Infinity,
+        offscreenFrontierLastImprovedAt: 0,
+        offscreenFrontierLastAttemptAt: 0,
+        offscreenFrontierBlockedUntil: 0,
+        offscreenFrontierRecentPositions: [],
+        offscreenFrontierRecentEndpoints: [],
+        offscreenFrontierLastLogAt: 0,
+        offscreenFrontierLastBlockLogAt: 0,
         noWayLastWaypointKey: null,
         noWayFailureKey: null,
         noWayFailureAt: 0,
@@ -20001,6 +20619,12 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         learnPendingToolUse: null, // { type: "rope"|"shovel", position, at, fromZ }
         learnRecordedCount: 0,
         learnTransitionCount: 0,
+
+        // v1.6.12: Script waypoints may return Promises. CaveBot keeps the
+        // current Script waypoint active until that Promise settles instead of
+        // advancing immediately and letting movement race an async action.
+        scriptTask: null, // { token, index, revision, status, startedAt, label, error }
+        scriptTaskSerial: 0,
     };
     const minimapOverlayState = {
         timerId: null
@@ -20447,6 +21071,12 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     // penalties, NO_WAY quarantine, remembered blockers, and target-avoidance
     // state so an edited route gets a clean recovery context.
     function resetRecoveryContext(reason = "route changed") {
+        // Manual jumps/route edits supersede any logical branch segment.
+        // Supply Check may arm a runtime recovery fence; never carry it across
+        // an explicit index change or route topology change.
+        if (state.recoveryFenceActive)
+            clearRecoveryFence(reason);
+        resetOffscreenFrontierTracking();
         // A delayed native-path fallback must never walk toward a pre-edit route.
         state.fallbackMoveRequestId++;
         if (state.fallbackMoveTimerId != null) {
@@ -23152,6 +23782,19 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             z = Number(waypoint.z);
             label = waypoint.label ? String(waypoint.label).trim() : undefined;
             script = waypoint.script !== undefined && waypoint.script !== null ? String(waypoint.script) : undefined;
+            // v1.6.13: migrate resupply WPTs created before async Script support.
+            // Those old scripts swallowed Promise rejections with .catch(...),
+            // making Cavebot believe a failed supply/depot/bank action completed.
+            if (script) {
+                const compact = script.replace(/\s+/g, " ").trim();
+                if (/^bot\.npcSupplyBuyer\.buyNow\(\)\.catch\(/.test(compact)) {
+                    script = "return bot.npcSupplyBuyer.buyNow();";
+                } else if (/^bot\.depositer\.run\(\)\.catch\(/.test(compact)) {
+                    script = "return bot.depositer.run();";
+                } else if (compact.includes("bot.bankNpc.run(") && compact.includes(".catch(")) {
+                    script = script.replace(/bot\.bankNpc\.run\(([^;]*?)\)\.catch\([\s\S]*?\);?\s*}?\s*$/, "return bot.bankNpc.run($1); }");
+                }
+            }
             stand = waypoint.stand === true;
             rope = waypoint.rope === true;
             shovel = waypoint.shovel === true;
@@ -24905,6 +25548,101 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         }
     }
 
+    const OFFSCREEN_FRONTIER_SAMPLE_LIMIT = 8;
+    const OFFSCREEN_FRONTIER_OSCILLATION_MIN_SAMPLES = 5;
+    const OFFSCREEN_FRONTIER_OSCILLATION_GRACE_MS = 2000;
+    const OFFSCREEN_FRONTIER_RETRY_GAP_MS = 3000;
+    const OFFSCREEN_FRONTIER_BLOCK_MS = 10000;
+
+    function getOffscreenFrontierKey(waypoint) {
+        return `${state.routeRevision}:${state.currentIndex}:${getWaypointKey(waypoint) || "unknown"}`;
+    }
+
+    function resetOffscreenFrontierTracking() {
+        state.offscreenFrontierKey = null;
+        state.offscreenFrontierAttempts = 0;
+        state.offscreenFrontierBestDistance = Infinity;
+        state.offscreenFrontierLastDistance = Infinity;
+        state.offscreenFrontierLastImprovedAt = 0;
+        state.offscreenFrontierLastAttemptAt = 0;
+        state.offscreenFrontierBlockedUntil = 0;
+        state.offscreenFrontierRecentPositions = [];
+        state.offscreenFrontierRecentEndpoints = [];
+        state.offscreenFrontierLastLogAt = 0;
+        state.offscreenFrontierLastBlockLogAt = 0;
+    }
+
+    function noteOffscreenFrontierState(waypoint, current, now = Date.now()) {
+        const key = getOffscreenFrontierKey(waypoint);
+        const distance = getDistanceToWaypoint(current, waypoint);
+
+        if (state.offscreenFrontierKey !== key) {
+            resetOffscreenFrontierTracking();
+            state.offscreenFrontierKey = key;
+            state.offscreenFrontierBestDistance = Number.isFinite(distance) ? distance : Infinity;
+            state.offscreenFrontierLastDistance = Number.isFinite(distance) ? distance : Infinity;
+            state.offscreenFrontierLastImprovedAt = now;
+            state.offscreenFrontierLastAttemptAt = now;
+            return { key, distance, improved: false, newWindow: true };
+        }
+
+        // A long gap is usually combat/NPC/manual interruption, not continuous
+        // failed pathing. Start a new retry window without forgetting the best
+        // distance already achieved for this waypoint.
+        const lastAttemptAt = Number(state.offscreenFrontierLastAttemptAt) || 0;
+        if (lastAttemptAt && now - lastAttemptAt > OFFSCREEN_FRONTIER_RETRY_GAP_MS) {
+            state.offscreenFrontierAttempts = 0;
+            state.offscreenFrontierRecentPositions = [];
+            state.offscreenFrontierRecentEndpoints = [];
+            state.offscreenFrontierLastImprovedAt = now;
+        }
+        state.offscreenFrontierLastAttemptAt = now;
+
+        let improved = false;
+        if (
+            Number.isFinite(distance) &&
+            (!Number.isFinite(state.offscreenFrontierBestDistance) ||
+             distance < Number(state.offscreenFrontierBestDistance))
+        ) {
+            improved = true;
+            state.offscreenFrontierBestDistance = distance;
+            state.offscreenFrontierLastImprovedAt = now;
+            state.offscreenFrontierAttempts = 0;
+            state.offscreenFrontierBlockedUntil = 0;
+            state.offscreenFrontierRecentPositions = [];
+            state.offscreenFrontierRecentEndpoints = [];
+        }
+
+        state.offscreenFrontierLastDistance = Number.isFinite(distance) ? distance : Infinity;
+        return { key, distance, improved, newWindow: false };
+    }
+
+    function isOffscreenFrontierBlocked(waypoint, now = Date.now()) {
+        if (!waypoint || state.offscreenFrontierKey !== getOffscreenFrontierKey(waypoint))
+            return false;
+
+        // Manual/other movement that genuinely gets closer immediately re-enables
+        // the fallback; the block is only for the failed frontier position cycle.
+        const current = normalizePosition(bot.getPlayerPosition());
+        const distance = current ? getDistanceToWaypoint(current, waypoint) : Infinity;
+        if (
+            Number.isFinite(distance) &&
+            Number.isFinite(state.offscreenFrontierBestDistance) &&
+            distance < Number(state.offscreenFrontierBestDistance)
+        ) {
+            state.offscreenFrontierBestDistance = distance;
+            state.offscreenFrontierLastDistance = distance;
+            state.offscreenFrontierLastImprovedAt = now;
+            state.offscreenFrontierBlockedUntil = 0;
+            state.offscreenFrontierAttempts = 0;
+            state.offscreenFrontierRecentPositions = [];
+            state.offscreenFrontierRecentEndpoints = [];
+            return false;
+        }
+
+        return Number(state.offscreenFrontierBlockedUntil) > now;
+    }
+
     function tryCaveOffscreenFrontierRecovery(waypoint, now = Date.now(), source = "off-screen fallback") {
         if (
             !state.running ||
@@ -24922,33 +25660,100 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         if (!current || !isCaveWaypointOffScreen(current, waypoint))
             return false;
 
+        const frontierState = noteOffscreenFrontierState(waypoint, current, now);
+        if (isOffscreenFrontierBlocked(waypoint, now))
+            return false;
+
         const routeInfo = findCaveLoadedFrontierPath(current, waypoint, 10);
         if (!routeInfo?.path?.length)
             return false;
 
+        state.offscreenFrontierAttempts++;
+        state.offscreenFrontierLastAttemptAt = now;
+
+        const currentKey = getPositionKey(current);
+        const endpointKey = getPositionKey(routeInfo.endpoint);
+        if (currentKey) {
+            state.offscreenFrontierRecentPositions.push(currentKey);
+            if (state.offscreenFrontierRecentPositions.length > OFFSCREEN_FRONTIER_SAMPLE_LIMIT)
+                state.offscreenFrontierRecentPositions.shift();
+        }
+        if (endpointKey) {
+            state.offscreenFrontierRecentEndpoints.push(endpointKey);
+            if (state.offscreenFrontierRecentEndpoints.length > OFFSCREEN_FRONTIER_SAMPLE_LIMIT)
+                state.offscreenFrontierRecentEndpoints.shift();
+        }
+
+        const noProgressFor = Math.max(
+            0,
+            now - (Number(state.offscreenFrontierLastImprovedAt) || now)
+        );
+        const recentPositions = state.offscreenFrontierRecentPositions;
+        const recentEndpoints = state.offscreenFrontierRecentEndpoints;
+        const uniquePositions = new Set(recentPositions).size;
+        const uniqueEndpoints = new Set(recentEndpoints).size;
+        const enoughSamples = Math.min(recentPositions.length, recentEndpoints.length) >=
+            OFFSCREEN_FRONTIER_OSCILLATION_MIN_SAMPLES;
+        const oscillating =
+            enoughSamples &&
+            noProgressFor >= OFFSCREEN_FRONTIER_OSCILLATION_GRACE_MS &&
+            uniquePositions <= 3 &&
+            uniqueEndpoints <= 2;
+        const stallLimitMs = Math.max(
+            3000,
+            Number(config.stuckTimeoutMs) || 5000
+        );
+        const stalled =
+            state.offscreenFrontierAttempts >= OFFSCREEN_FRONTIER_OSCILLATION_MIN_SAMPLES &&
+            noProgressFor >= stallLimitMs;
+
+        if (oscillating || stalled) {
+            state.offscreenFrontierBlockedUntil = now + OFFSCREEN_FRONTIER_BLOCK_MS;
+
+            // Quarantine the current unreachable-looking waypoint for the normal
+            // recovery selector too. This prevents the next generic stuck cycle
+            // from choosing the exact same ordinary waypoint simply because it
+            // is geometrically closest on the other side of the wall.
+            state.noWayRecoveryIndex = state.currentIndex;
+            state.noWayFailureAt = now;
+            state.noWayLastWaypointKey = getWaypointKey(waypoint);
+            state.noWayFailureKey = `${state.currentIndex}:${state.noWayLastWaypointKey || "frontier"}`;
+
+            const lastBlockLogAt = Number(state.offscreenFrontierLastBlockLogAt) || 0;
+            if (now - lastBlockLogAt >= 1200) {
+                state.offscreenFrontierLastBlockLogAt = now;
+                bot.log(
+                    `Cave: off-screen frontier made no route progress at waypoint #${state.currentIndex + 1} – ` +
+                    `handing off to normal recovery`,
+                    {
+                        source,
+                        attempts: state.offscreenFrontierAttempts,
+                        currentDistance: frontierState.distance,
+                        bestDistance: state.offscreenFrontierBestDistance,
+                        noProgressMs: noProgressFor,
+                        oscillating,
+                        recentPositions: recentPositions.slice(),
+                        recentEndpoints: recentEndpoints.slice()
+                    }
+                );
+            }
+            return false;
+        }
+
         if (!sendCaveLoadedFrontierPath(routeInfo, now))
             return false;
 
-        // This is progress toward the SAME waypoint, not a route recovery event.
-        // Do not poison route-health / circuit-breaker state with the native
-        // minimap failure that triggered this fallback.
-        state.recoveryActive = false;
-        if (state.recoveryReason === "NO_WAY") {
-            state.recoveryReason = null;
-            state.recoveryReasonAt = 0;
-            state.recoveryReasonIndex = -1;
-            state.recoveryReasonKey = null;
-        }
-        state.lastProgressAt = now;
+        // IMPORTANT: sending another frontier segment is NOT route progress.
+        // Do not reset lastProgressAt, NO_WAY state, or recovery counters here.
+        // The normal Cave tick resets those only after the player's measured
+        // distance to the waypoint actually improves. This lets wall oscillation
+        // age into the existing bounded stuck/NO_WAY recovery policy.
         state.nativePathWatchAt = now;
-        state.nativePathWatchBestDistance = getDistanceToWaypoint(current, waypoint);
-        state.stuckCount = 0;
-        state.stuckRecoveryAttempts = 0;
-        state.recoverySideStepAttempts = 0;
-        state.recoveryBlockerWaitAt = 0;
-        state.recoveryBlockerWaitKey = null;
+        if (frontierState.improved || !Number.isFinite(state.nativePathWatchBestDistance))
+            state.nativePathWatchBestDistance = frontierState.distance;
         state.lastWaypointTarget = waypoint;
-        state.pathAttemptStart = now;
+        if (!state.pathAttemptStart)
+            state.pathAttemptStart = now;
 
         const lastLogAt = Number(state.offscreenFrontierLastLogAt) || 0;
         if (now - lastLogAt >= 1200) {
@@ -25167,6 +25972,13 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 // destination at all, prefer a real loaded-map A* segment over
                 // the old blind one-tile fallback.
                 if (tryCaveOffscreenFrontierRecovery(waypoint, Date.now(), "native path did not start"))
+                    return;
+                // A repeated loaded-frontier loop means the direct same-floor
+                // fallback is also unsafe: it would simply walk back into the
+                // same wall. Leave movement idle so the normal 5s/NO_WAY
+                // recovery can choose another route waypoint (often the nearby
+                // Stand/hole transition) instead.
+                if (isOffscreenFrontierBlocked(waypoint, Date.now()))
                     return;
 
                 const dx = waypoint.x - current.x;
@@ -26092,7 +26904,53 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     }
 
     // ---- WAYPOINT NAVIGATION ----
+    function clearRecoveryFence(reason = "recovery fence cleared") {
+        const wasActive = state.recoveryFenceActive === true;
+        const previous = wasActive ? {
+            minIndex: state.recoveryFenceMinIndex,
+            maxIndex: state.recoveryFenceMaxIndex,
+            reason: state.recoveryFenceReason,
+        } : null;
+        state.recoveryFenceActive = false;
+        state.recoveryFenceMinIndex = 0;
+        state.recoveryFenceMaxIndex = -1;
+        state.recoveryFenceReason = null;
+        state.recoveryFenceSetAt = 0;
+        if (wasActive) {
+            bot.log(`Cave: recovery fence cleared (${reason})`, previous);
+        }
+        return wasActive;
+    }
+
+    function armForwardRecoveryFence(reason = "route branch", startIndex = state.currentIndex + 1) {
+        if (!route.length)
+            return false;
+        const minIndex = Math.max(0, Math.min(route.length - 1, Math.trunc(Number(startIndex) || 0)));
+        const maxIndex = route.length - 1;
+        if (minIndex > maxIndex)
+            return false;
+        state.recoveryFenceActive = true;
+        state.recoveryFenceMinIndex = minIndex;
+        state.recoveryFenceMaxIndex = maxIndex;
+        state.recoveryFenceReason = String(reason || "route branch");
+        state.recoveryFenceSetAt = Date.now();
+        bot.log(
+            `Cave: forward recovery fence armed #${minIndex + 1}-#${maxIndex + 1} (${state.recoveryFenceReason})`
+        );
+        return true;
+    }
+
+    function isRecoveryIndexAllowedByFence(index) {
+        if (!state.recoveryFenceActive)
+            return true;
+        const i = Math.trunc(Number(index));
+        return Number.isInteger(i) &&
+            i >= state.recoveryFenceMinIndex &&
+            i <= state.recoveryFenceMaxIndex;
+    }
+
     function advanceWaypoint() {
+        resetOffscreenFrontierTracking();
         state.noWayRecoveryIndex = -1;
         state.noWayFailureKey = null;
         state.noWayFailureAt = 0;
@@ -26116,8 +26974,13 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             return route[0];
 
         if (config.loopMode) {
-            // Always go forward, wrap around to 0 when at the end
+            // Always go forward, wrap around to 0 when at the end. A completed
+            // wrap means a Supply Check LOW return/resupply segment has ended,
+            // so its recovery fence must not leak into the next hunt cycle.
+            const previousIndex = state.currentIndex;
             let next = (state.currentIndex + 1) % route.length;
+            if (next <= previousIndex && state.recoveryFenceActive)
+                clearRecoveryFence("route wrapped");
             state.currentIndex = next;
             state.noWayRecoveryIndex = -1;
             state.direction = 1; // ensure direction is forward
@@ -26127,9 +26990,13 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             // Original non‑loop logic (go forward then backward)
             let next = state.currentIndex + state.direction;
             if (next >= route.length) {
+                if (state.recoveryFenceActive)
+                    clearRecoveryFence("non-loop route reversed at end");
                 state.direction = -1;
                 next = route.length - 2;
             } else if (next < 0) {
+                if (state.recoveryFenceActive)
+                    clearRecoveryFence("non-loop route reversed at start");
                 state.direction = 1;
                 next = 1;
             }
@@ -26470,6 +27337,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             for (let i = 0; i < route.length; i++) {
                 if (i === excludeIndex)
                     continue;
+                if (!isRecoveryIndexAllowedByFence(i))
+                    continue;
                 const wp = route[i];
                 if (skipAvoided && avoidRepeat && (i === avoidIndex || (avoidKey !== null && wp && `${wp.x},${wp.y},${wp.z}` === avoidKey)))
                     continue;
@@ -26613,7 +27482,14 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         }
 
         if (result.bestIdx < 0) {
-            bot.log(`Cave: no same-floor recovery waypoint within ${limit} tiles – stopping navigation`);
+            if (state.recoveryFenceActive) {
+                bot.log(
+                    `Cave: no valid recovery waypoint inside fenced route #${state.recoveryFenceMinIndex + 1}-#${state.recoveryFenceMaxIndex + 1} within ${limit} tiles – stopping instead of jumping backward`,
+                    { reason: state.recoveryFenceReason }
+                );
+            } else {
+                bot.log(`Cave: no same-floor recovery waypoint within ${limit} tiles – stopping navigation`);
+            }
             return null;
         }
 
@@ -26632,7 +27508,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             `Cave: recovery (${state.recoveryReason || 'UNKNOWN'}) → closest same-floor ${result.bestIsTransition ? 'transition ' : ''}waypoint #${result.bestIdx + 1} ` +
             `(${wp.x}, ${wp.y}, ${wp.z}) – ${result.bestProgress} tiles away, score ${Number(result.bestScore).toFixed(3)}` +
             `${avoidRepeat && (result.bestIdx !== avoidIndex || avoidKey !== `${wp.x},${wp.y},${wp.z}`) ? ' (avoided previous recovery target)' : ''}` +
-            `${noWayAvoidActive && result.bestIdx !== state.noWayRecoveryIndex ? ' (avoided recent NO_WAY target)' : ''}`
+            `${noWayAvoidActive && result.bestIdx !== state.noWayRecoveryIndex ? ' (avoided recent NO_WAY target)' : ''}` +
+            `${state.recoveryFenceActive ? ` (fenced #${state.recoveryFenceMinIndex + 1}-#${state.recoveryFenceMaxIndex + 1})` : ''}`
         );
         goToWaypoint(wp);
         return wp;
@@ -27409,6 +28286,145 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             info,
             reason: "slow-pull hold"
         };
+    }
+
+    // ---- SCRIPT WAYPOINT EXECUTION ----
+    function clearScriptTask(reason = "script task cleared") {
+        // Invalidate callbacks from an older Promise without trying to cancel the
+        // Promise itself. The owning module remains responsible for its own stop.
+        state.scriptTaskSerial++;
+        if (state.scriptTask && reason) {
+            state.scriptTask.lastClearReason = reason;
+        }
+        state.scriptTask = null;
+    }
+
+    function runWaypointScript(waypoint) {
+        if (!waypoint?.script)
+            return { done: true, waiting: false, failed: false };
+
+        const index = state.currentIndex;
+        const revision = state.routeRevision;
+        const existing = state.scriptTask;
+
+        // Never re-run a Script while its returned Promise is still pending.
+        if (
+            existing &&
+            existing.index === index &&
+            existing.revision === revision
+        ) {
+            if (existing.status === "pending") {
+                return { done: false, waiting: true, failed: false };
+            }
+
+            // Backward-compatible holds for older synchronous Script patterns:
+            // bot.wait(ms) and modules that pause Cave movement themselves. The
+            // main tick already suppresses navigation while these conditions are
+            // active; this marker prevents the Script from being re-executed once
+            // the condition clears.
+            if (existing.status === "hold") {
+                const stillWaitingForTimer =
+                    Number(bot._waitUntil || 0) > Date.now();
+                const stillExternallyPaused =
+                    isMovementPausedExternally();
+                if (stillWaitingForTimer || stillExternallyPaused) {
+                    return { done: false, waiting: true, failed: false };
+                }
+                existing.status = "resolved";
+            }
+
+            if (existing.status === "resolved") {
+                const elapsed = Date.now() - existing.startedAt;
+                bot.log(`Script waypoint complete: ${existing.label || 'unnamed'} (${elapsed}ms)`);
+                clearScriptTask("script resolved");
+                return { done: true, waiting: false, failed: false };
+            }
+
+            if (existing.status === "rejected") {
+                const message = existing.error || "async script rejected";
+                bot.log(`Script waypoint failed: ${existing.label || 'unnamed'} – ${message}`);
+                clearScriptTask("script rejected");
+                return { done: false, waiting: false, failed: true, error: message };
+            }
+        } else if (existing) {
+            clearScriptTask("waypoint/revision changed");
+        }
+
+        try {
+            const label = waypoint.label ||
+                (waypoint.x !== undefined
+                    ? `${waypoint.x},${waypoint.y},${waypoint.z}`
+                    : "unnamed");
+            bot.log(`Executing script for waypoint ${label}`);
+            const scriptFn = new Function('bot', 'state', waypoint.script);
+            const result = scriptFn(bot, state);
+
+            // Older Script waypoints often use bot.wait(...) or call a module
+            // that synchronously pauses Cave movement without returning its
+            // Promise. Recognize those explicit hold signals so CaveBot does not
+            // advance the route underneath the action.
+            if (!result || typeof result.then !== "function") {
+                const waitUntil = Number(bot._waitUntil || 0);
+                const holdForWait = waitUntil > Date.now();
+                const holdForExternalPause = isMovementPausedExternally();
+                if (holdForWait || holdForExternalPause) {
+                    const token = ++state.scriptTaskSerial;
+                    state.scriptTask = {
+                        token,
+                        index,
+                        revision,
+                        status: "hold",
+                        startedAt: Date.now(),
+                        label,
+                        error: null,
+                        waitUntil: holdForWait ? waitUntil : 0,
+                        externalPause: holdForExternalPause,
+                    };
+                    return { done: false, waiting: true, failed: false };
+                }
+                return { done: true, waiting: false, failed: false };
+            }
+
+            const token = ++state.scriptTaskSerial;
+            const task = {
+                token,
+                index,
+                revision,
+                status: "pending",
+                startedAt: Date.now(),
+                label,
+                error: null,
+            };
+            state.scriptTask = task;
+
+            Promise.resolve(result).then(
+                () => {
+                    if (
+                        state.scriptTask === task &&
+                        task.token === token
+                    ) {
+                        task.status = "resolved";
+                    }
+                },
+                error => {
+                    if (
+                        state.scriptTask === task &&
+                        task.token === token
+                    ) {
+                        task.status = "rejected";
+                        task.error = String(error?.message || error || "async script rejected");
+                    }
+                }
+            );
+
+            return { done: false, waiting: true, failed: false };
+        } catch (error) {
+            // Preserve the historical behavior for synchronous Script errors:
+            // log them and allow route progression. Async failures are handled
+            // above and stop CaveBot so a failed resupply action cannot run away.
+            bot.log(`Script error at waypoint: ${error?.message || error}`);
+            return { done: true, waiting: false, failed: false };
+        }
     }
 
     // ---- MAIN LOOP ----
@@ -29654,17 +30670,25 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             waypoint = getCurrentWaypoint();
             // ---- SCRIPT-ONLY WAYPOINT ----
             if (waypoint && waypoint.x === undefined) {
-                // Execute script if present
-                if (waypoint.script) {
-                    try {
-                        bot.log(`Executing script for script waypoint ${waypoint.label || 'unnamed'}`);
-                        const scriptFn = new Function('bot', 'state', waypoint.script);
-                        scriptFn(bot, state);
-                    } catch (e) {
-                        bot.log(`Script error at script waypoint: ${e.message}`);
-                    }
+                const scriptResult = runWaypointScript(waypoint);
+                if (scriptResult.waiting) {
+                    // Keep this exact Script waypoint current while its Promise
+                    // is pending. No movement/recovery checks apply to Script WPTs.
+                    state.lastProgressAt = now;
+                    state.lastPathAt = now;
+                    state.pathAttemptStart = now;
+                    state.stuckCount = 0;
+                    state.stuckRecoveryAttempts = 0;
+                    return;
                 }
-                // Advance to next waypoint immediately
+                if (scriptResult.failed) {
+                    // Async route actions are transactional. Do not continue to
+                    // the next waypoint after a failed depot/supply/bank/custom
+                    // Promise; remain at the action point and stop Cavebot.
+                    stop();
+                    return;
+                }
+                // Synchronous scripts, or resolved async scripts, advance now.
                 waypoint = advanceWaypoint();
                 if (!waypoint) {
                     stop();
@@ -29713,12 +30737,20 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
                 // ---- EXECUTE SCRIPT IF PRESENT ----
                 if (waypoint.script) {
-                    try {
-                        bot.log(`Executing script for waypoint ${waypoint.label || waypoint.x + ',' + waypoint.y + ',' + waypoint.z}`);
-                        const scriptFn = new Function('bot', 'state', waypoint.script);
-                        scriptFn(bot, state);
-                    } catch (e) {
-                        bot.log(`Script error at waypoint: ${e.message}`);
+                    const scriptResult = runWaypointScript(waypoint);
+                    if (scriptResult.waiting) {
+                        // We are already standing on this waypoint. Hold here
+                        // until the returned Promise resolves.
+                        state.lastProgressAt = now;
+                        state.lastPathAt = now;
+                        state.pathAttemptStart = now;
+                        state.stuckCount = 0;
+                        state.stuckRecoveryAttempts = 0;
+                        return;
+                    }
+                    if (scriptResult.failed) {
+                        stop();
+                        return;
                     }
                 }
 
@@ -30066,6 +31098,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         persistConfig();
         const pos = normalizePosition(bot.getPlayerPosition());
         state.running = true;
+        clearScriptTask("CaveBot started");
         // Only active navigation needs Pathfinder cancellation notifications.
         // installNoWayObserver is idempotent and its retry timer is tracked.
         installNoWayObserver();
@@ -30241,6 +31274,9 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         state.noWayLastSeenAt = 0;
         state.noWayLastText = "";
         state.noWayRecoveryIndex = -1;
+        resetOffscreenFrontierTracking();
+        if (state.recoveryFenceActive)
+            clearRecoveryFence("CaveBot started");
         state.currentIndex = findClosestWaypointIndex(pos);
         if (config.loopMode) {
             state.direction = 1; // always forward when looping
@@ -30262,6 +31298,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     function stop(options = {}) {
         const shouldPersist = options.persistEnabled !== false;
         state.running = false;
+        clearScriptTask("CaveBot stopped");
+        resetOffscreenFrontierTracking();
         state.fallbackMoveRequestId++;
         stopNoWayObserver();
         // Do not leave CaveBot's wrapped native search on the game client after
@@ -31045,6 +32083,15 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         clearTransitions,
         removeLastWaypoint,
         setCurrentIndex,
+        armForwardRecoveryFence,
+        clearRecoveryFence,
+        getRecoveryFence: () => ({
+            active: state.recoveryFenceActive === true,
+            minIndex: state.recoveryFenceMinIndex,
+            maxIndex: state.recoveryFenceMaxIndex,
+            reason: state.recoveryFenceReason,
+            setAt: state.recoveryFenceSetAt,
+        }),
         goToWaypoint,
         goToPosition,
         findClosestWaypointIndex,
@@ -31121,7 +32168,9 @@ window.__minibiaBotBundle.installEquipRingModule = function installEquipRingModu
         player: null,
         equipment: null,
         pending: null,
+        lastActionAt: 0,
         lastEquipAt: 0,
+        lastUnequipAt: 0,
         lastConfirmedAt: 0,
         retryAfter: 0,
         lastSupplyWarningAt: 0,
@@ -31141,7 +32190,8 @@ window.__minibiaBotBundle.installEquipRingModule = function installEquipRingModu
         countRefreshMs: 5000,   // Server-side full-inventory count refresh cadence.
         countFreshMs: 12000,    // A zero count only blocks equip while this reading is fresh.
         ringId: 0,              // Client/inventory ID (CID); 0 = any ring.
-        warnMissingRing: false, // Optional, throttled warning; never unequips a ring.
+        unequipRingAt98: false, // When enabled, stow the selected ring at >=98% mana.
+        warnMissingRing: false, // Optional, throttled warning.
         enabled: false,
     }, bot.storage.get(configStorageKey, {}));
 
@@ -31154,6 +32204,7 @@ window.__minibiaBotBundle.installEquipRingModule = function installEquipRingModu
         config.failedRetryMs = Math.max(3000, Math.min(60000, Number(config.failedRetryMs) || 5000));
         config.countRefreshMs = Math.max(2000, Math.min(30000, Number(config.countRefreshMs) || 5000));
         config.countFreshMs = Math.max(config.countRefreshMs, Math.min(60000, Number(config.countFreshMs) || 12000));
+        config.unequipRingAt98 = config.unequipRingAt98 === true;
         config.warnMissingRing = config.warnMissingRing === true;
     }
     normalizeConfig();
@@ -31162,6 +32213,17 @@ window.__minibiaBotBundle.installEquipRingModule = function installEquipRingModu
     function getEquippedRing() { return getEquipment()?.getSlotItem?.(RING_SLOT) || null; }
     function hasEquippedRing() { return !!getEquippedRing(); }
     function getHotbarManager() { return window.gameClient?.interface?.hotbarManager || null; }
+    function getManaPercent() {
+        const player = window.gameClient?.player;
+        const mana = Number(player?.state?.mana);
+        const maxMana = Number(player?.state?.maxMana);
+        if (!Number.isFinite(mana) || !Number.isFinite(maxMana) || maxMana <= 0) return null;
+        return Math.max(0, Math.min(100, (mana / maxMana) * 100));
+    }
+    function shouldUnequipForMana() {
+        const manaPercent = getManaPercent();
+        return config.unequipRingAt98 === true && Number.isFinite(manaPercent) && manaPercent >= 98;
+    }
 
     function getConfiguredRingSid(ringId = config.ringId) {
         if (!ringId) return 0;
@@ -31404,7 +32466,9 @@ window.__minibiaBotBundle.installEquipRingModule = function installEquipRingModu
             state.player = player;
             state.equipment = eq;
             state.pending = null;
+            state.lastActionAt = 0;
             state.lastEquipAt = 0;
+            state.lastUnequipAt = 0;
             state.retryAfter = 0;
             state.failedAttempts = 0;
             state.lastSupplyWarningAt = 0;
@@ -31417,23 +32481,47 @@ window.__minibiaBotBundle.installEquipRingModule = function installEquipRingModu
         const pending = state.pending;
         if (!pending) return;
         const worn = getEquippedRing();
-        // Compare with the ID of THAT request, even if the UI changed since.
-        if (matchesSelectedRing(worn, pending.ringId) &&
-                (!pending.ringId ? !!worn : true) &&
-                (pending.ringId || Number(worn?.id) === pending.sourceId ||
-                    worn !== pending.previousWorn)) {
-            state.pending = null;
-            state.retryAfter = 0;
-            state.failedAttempts = 0;
-            state.lastConfirmedAt = now;
-            bot.log("Equip Ring: equipped (confirmed)", { name: pending.name, id: pending.sourceId });
-        } else if (now - pending.at >= config.equipConfirmMs) {
+
+        if (pending.type === "unequip") {
+            // Compare against the ring identity that THIS request targeted, even
+            // if the configured ring ID is changed while the packet is in flight.
+            const stillWearingRequested = pending.ringId
+                ? matchesSelectedRing(worn, pending.ringId)
+                : !!worn;
+            if (!stillWearingRequested) {
+                state.pending = null;
+                state.retryAfter = 0;
+                state.failedAttempts = 0;
+                state.lastConfirmedAt = now;
+                requestSelectedRingCount(now, true);
+                bot.log("Equip Ring: unequipped at high mana (confirmed)", {
+                    name: pending.name, id: pending.sourceId
+                });
+                return;
+            }
+        } else {
+            // Equip confirmation. Compare with the ID of THAT request, even if
+            // the UI/config changed since the packet was sent.
+            if (matchesSelectedRing(worn, pending.ringId) &&
+                    (!pending.ringId ? !!worn : true) &&
+                    (pending.ringId || Number(worn?.id) === pending.sourceId ||
+                        worn !== pending.previousWorn)) {
+                state.pending = null;
+                state.retryAfter = 0;
+                state.failedAttempts = 0;
+                state.lastConfirmedAt = now;
+                bot.log("Equip Ring: equipped (confirmed)", { name: pending.name, id: pending.sourceId });
+                return;
+            }
+        }
+
+        if (now - pending.at >= config.equipConfirmMs) {
             state.pending = null;
             state.failedAttempts = Math.min(1000, state.failedAttempts + 1);
             state.retryAfter = now + config.failedRetryMs;
             if (now - state.lastFailureWarningAt >= 60000 || !state.lastFailureWarningAt) {
                 state.lastFailureWarningAt = now;
-                bot.log("Equip Ring: move not confirmed; retrying after cooldown", {
+                bot.log(`Equip Ring: ${pending.type === "unequip" ? "unequip" : "move"} not confirmed; retrying after cooldown`, {
                     id: pending.sourceId, attempts: state.failedAttempts,
                 });
             }
@@ -31474,8 +32562,12 @@ window.__minibiaBotBundle.installEquipRingModule = function installEquipRingModu
             source = findBestRingSource();
         }
 
+        const manaPercent = getManaPercent();
+        const unequipForMana = config.unequipRingAt98 === true &&
+            Number.isFinite(manaPercent) && manaPercent >= 98;
+
         const remaining = Math.max(0,
-            config.equipCooldownMs - (now - state.lastEquipAt), state.retryAfter - now);
+            config.equipCooldownMs - (now - state.lastActionAt), state.retryAfter - now);
 
         // A fresh server count of zero is authoritative. A positive count means
         // the ring exists somewhere in the full inventory, including closed
@@ -31494,16 +32586,20 @@ window.__minibiaBotBundle.installEquipRingModule = function installEquipRingModu
             serverCountFresh: countState.fresh,
             serverCount: countState.count,
             awaitingConfirmation: pending,
+            manaPercent,
+            unequipRingAt98: config.unequipRingAt98 === true,
+            shouldUnequipForMana: unequipForMana,
             cooldownReady: remaining === 0,
             cooldownRemainingMs: remaining,
             source,
-            canEquip: !!eq && !satisfied && !pending && available && remaining === 0,
+            canEquip: !!eq && !unequipForMana && !satisfied && !pending && available && remaining === 0,
+            canUnequip: !!eq && unequipForMana && satisfied && !pending && remaining === 0,
         };
     }
     function canEquipRing(now = Date.now()) { return getGateStatus(now).canEquip; }
-    function tryEquipRing(now = Date.now()) {
+    function tryEquipRing(now = Date.now(), gateOverride = null) {
         if (!state.running || !config.enabled) return false;
-        const gate = getGateStatus(now);
+        const gate = gateOverride || getGateStatus(now);
         if (gate.hasEquipment && !gate.hasSelectedRingEquipped &&
                 !gate.awaitingConfirmation && !gate.hasRingAvailable) {
             warnMissing(now, {
@@ -31538,8 +32634,10 @@ window.__minibiaBotBundle.installEquipRingModule = function installEquipRingModu
         });
         if (!moved) return false;
 
+        state.lastActionAt = now;
         state.lastEquipAt = now;
         state.pending = {
+            type: "equip",
             at: now,
             ringId: config.ringId,
             sourceId: itemConfig.id,
@@ -31551,6 +32649,54 @@ window.__minibiaBotBundle.installEquipRingModule = function installEquipRingModu
             name: state.pending.name,
             id: itemConfig.id,
             serverCount: gate.serverCount,
+        });
+        return true;
+    }
+
+    function tryUnequipRing(now = Date.now(), gateOverride = null) {
+        if (!state.running || !config.enabled || !config.unequipRingAt98) return false;
+        const gate = gateOverride || getGateStatus(now);
+        if (!gate.canUnequip) return false;
+
+        const worn = getEquippedRing();
+        if (!worn || !ringSatisfied(worn)) return false;
+
+        const hm = getHotbarManager();
+        if (!hm || typeof hm.__handleItemUseWithMode !== "function") {
+            if (now - state.lastFailureWarningAt >= 60000 || !state.lastFailureWarningAt) {
+                state.lastFailureWarningAt = now;
+                bot.log("Equip Ring: HotbarManager ring toggle is unavailable");
+            }
+            return false;
+        }
+
+        // Ring hotbar toggle useMode=5 lets the SERVER stow the worn ring into
+        // any available inventory backpack, including closed/nested bags. This
+        // is safer than picking an arbitrary visible destination slot here.
+        const requestedId = config.ringId || getCapturedRingId(worn) || Number(worn.id || 0);
+        const itemConfig = getRingItemConfig(requestedId, worn);
+        if (!itemConfig) return false;
+
+        const moved = bot.actions.runShared('equip-ring', bot.actions.priorities.UTILITY, () => {
+            hm.__handleItemUseWithMode(itemConfig, "ringtoggle");
+            return true;
+        });
+        if (!moved) return false;
+
+        state.lastActionAt = now;
+        state.lastUnequipAt = now;
+        state.pending = {
+            type: "unequip",
+            at: now,
+            ringId: config.ringId,
+            sourceId: itemConfig.id,
+            name: getItemName(worn) || getItemDefinition({ id: itemConfig.id, sid: itemConfig.sid })?.properties?.name || "ring",
+            previousWorn: worn,
+        };
+        bot.log("Equip Ring: high mana unequip requested", {
+            name: state.pending.name,
+            id: itemConfig.id,
+            manaPercent: gate.manaPercent,
         });
         return true;
     }
@@ -31584,7 +32730,18 @@ window.__minibiaBotBundle.installEquipRingModule = function installEquipRingModu
     function tick() {
         state.timerId = null;
         if (!state.running) return;
-        try { tryEquipRing(); }
+        try {
+            const now = Date.now();
+            const gate = getGateStatus(now);
+            if (gate.hasEquipment && !gate.hasSelectedRingEquipped &&
+                    !gate.awaitingConfirmation && !gate.hasRingAvailable) {
+                warnMissing(now, {
+                    known: gate.serverCountKnown, fresh: gate.serverCountFresh, count: gate.serverCount,
+                });
+            }
+            if (gate.shouldUnequipForMana) tryUnequipRing(now, gate);
+            else tryEquipRing(now, gate);
+        }
         catch (e) { bot.log("Equip Ring: tick failed", e?.message || e); }
         finally { scheduleNextTick(); }
     }
@@ -31624,6 +32781,7 @@ window.__minibiaBotBundle.installEquipRingModule = function installEquipRingModu
             gates,
             equippedRing: getEquippedRing(),
             lastEquipAt: state.lastEquipAt,
+            lastUnequipAt: state.lastUnequipAt,
             lastConfirmedAt: state.lastConfirmedAt,
             failedAttempts: state.failedAttempts,
             selectingRing: state.captureMode,
@@ -31635,7 +32793,9 @@ window.__minibiaBotBundle.installEquipRingModule = function installEquipRingModu
         normalizeConfig();
         if (config.ringId !== oldId) {
             state.pending = null;
+            state.lastActionAt = 0;
             state.lastEquipAt = 0;
+            state.lastUnequipAt = 0;
             state.retryAfter = 0;
             state.failedAttempts = 0;
             state.lastSupplyWarningAt = 0;
@@ -31655,7 +32815,8 @@ window.__minibiaBotBundle.installEquipRingModule = function installEquipRingModu
         start, stop, status, updateConfig, config,
         getEquippedRing, hasEquippedRing, findBestRingSource,
         getSelectedRingCountState, requestSelectedRingCount,
-        getGateStatus, canEquipRing, tryEquipRing,
+        getGateStatus, canEquipRing, tryEquipRing, tryUnequipRing,
+        getManaPercent, shouldUnequipForMana,
         startCaptureRing, clearCaptureMode,
     };
 };
@@ -34650,6 +35811,8 @@ window.__minibiaBotBundle.installMovementPatch = function installMovementPatch(b
                 delete client.__mbTargetingAutoWalkActive;
                 delete client.__mbTargetingAutoWalkTargetId;
                 delete client.__mbTargetingAutoWalkOwner;
+                delete client.__mbFollowAutoWalkPermit;
+                delete client.__mbFollowAllowDuringTarget;
             }
 
             // Restore the player's original __target property descriptor.
@@ -34749,11 +35912,22 @@ window.__minibiaBotBundle.installMovementPatch = function installMovementPatch(b
                             ) ===
                                 Number(value?.id);
 
+                        const followOwnsMovement =
+                            client.__mbFollowAllowDuringTarget ===
+                                true &&
+                            client.__mbFollowAutoWalkActive ===
+                                true;
+
                         // Normal combat owns movement. During Lure Mode the
                         // target is attack-only and CaveBot keeps autowalking.
                         // A same-target canonical refresh must not cancel an
                         // already-running Targeting-owned melee pursuit batch.
-                        if (!sameTargetingPursuit) {
+                        // When the PvP Follow toggle is enabled, target changes
+                        // must likewise leave the custom Follow path alone.
+                        if (
+                            !sameTargetingPursuit &&
+                            !followOwnsMovement
+                        ) {
                             stopMovement(client);
                         }
                     }
@@ -34776,6 +35950,25 @@ window.__minibiaBotBundle.installMovementPatch = function installMovementPatch(b
                 // Always allow StopWalkPacket
                 if (packetName === "StopWalkPacket") {
                     return originalSend.call(this, packet);
+                }
+
+                // PvP Follow may explicitly own a short combat AutoWalk batch
+                // when "Follow During Target" is enabled. Permit only that one
+                // marked packet; CaveBot/unrelated AutoWalk remains blocked.
+                if (
+                    packetName ===
+                        "AutoWalkPacket" &&
+                    client.__mbFollowAutoWalkPermit ===
+                        true &&
+                    client.__mbFollowAllowDuringTarget ===
+                        true
+                ) {
+                    client.__mbFollowAutoWalkPermit =
+                        false;
+                    return original.call(
+                        this,
+                        packet
+                    );
                 }
 
                 // Targeting may explicitly own a short combat AutoWalk batch
@@ -35539,6 +36732,11 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
         lastCraftAt: 0,
         lastEquipAt: 0,
         captureMode: false,
+        // v1.6.20: Ammo Crafter uses the same server-backed HOTBAR_ITEM_COUNT
+        // pipeline as the native hotbar. Never infer a full-inventory count by
+        // scanning only equipment + currently open containers.
+        lastAmmoCountRequestAt: 0,
+        ammoCountItemId: null,
     };
 
     // Load config – separate flags for craft and equip
@@ -35636,36 +36834,69 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
         return (stats.mana.current / stats.mana.max) * 100;
     }
 
-    function getAmmoCount() {
+    const AMMO_COUNT_REQUEST_MS = 1500;
+    const AMMO_COUNT_FRESH_MS = 6000;
+
+    function resolveAmmoCountItemId() {
+        const configured = Number(config.weaponId || 0);
+        if (Number.isSafeInteger(configured) && configured > 0)
+            return configured;
+
+        // Preserve the old no-ID fallback: if the user has not selected an ID,
+        // infer the ammo/weapon CID from the currently equipped hands. Once an ID
+        // is known, the actual COUNT comes from the server, not these visible slots.
         const eq = window.gameClient?.player?.equipment;
-        if (!eq)
-            return 0;
-        const leftItem = eq.getSlotItem(LEFT_HAND_SLOT);
-        const rightItem = eq.getSlotItem(RIGHT_HAND_SLOT);
-        const weaponId = config.weaponId;
-        let targetId = weaponId;
-        if (!targetId) {
-            targetId = leftItem ? leftItem.id : (rightItem ? rightItem.id : null);
-        }
-        if (!targetId)
-            return 0;
+        if (!eq) return null;
+        const leftItem = eq.getSlotItem?.(LEFT_HAND_SLOT) || null;
+        const rightItem = eq.getSlotItem?.(RIGHT_HAND_SLOT) || null;
+        const inferred = Number(leftItem?.id || rightItem?.id || 0);
+        return Number.isSafeInteger(inferred) && inferred > 0 ? inferred : null;
+    }
 
-        let total = 0;
-        if (leftItem && leftItem.id === targetId)
-            total += leftItem.count || 1;
-        if (rightItem && rightItem.id === targetId)
-            total += rightItem.count || 1;
+    function requestAmmoCount(now = Date.now(), force = false) {
+        const itemId = resolveAmmoCountItemId();
+        if (!itemId || typeof bot.requestItemCounts !== "function") return false;
 
-        for (const container of getContainersArray()) {
-            if (!container || typeof container.size !== 'number')
-                continue;
-            for (let i = 0; i < container.size; i++) {
-                const item = container.getSlotItem(i);
-                if (item && item.id === targetId)
-                    total += item.count || 1;
-            }
+        if (state.ammoCountItemId !== itemId) {
+            state.ammoCountItemId = itemId;
+            state.lastAmmoCountRequestAt = 0;
+            force = true;
         }
-        return total;
+        if (!force && now - state.lastAmmoCountRequestAt < AMMO_COUNT_REQUEST_MS)
+            return false;
+
+        const sent = !!bot.requestItemCounts([{ id: itemId, fluidType: 0 }]);
+        if (sent) state.lastAmmoCountRequestAt = now;
+        return sent;
+    }
+
+    function getAmmoCountState(now = Date.now()) {
+        const itemId = resolveAmmoCountItemId();
+        if (!itemId || typeof bot.getItemCountReading !== "function") {
+            return { itemId: itemId || null, known: false, fresh: false, count: null, at: 0 };
+        }
+        if (state.ammoCountItemId !== itemId) {
+            state.ammoCountItemId = itemId;
+            state.lastAmmoCountRequestAt = 0;
+        }
+        const reading = bot.getItemCountReading(itemId, 0);
+        if (!reading) {
+            return { itemId, known: false, fresh: false, count: null, at: 0 };
+        }
+        const at = Number(reading.at || 0);
+        const age = Math.max(0, now - at);
+        return {
+            itemId,
+            known: true,
+            fresh: age <= AMMO_COUNT_FRESH_MS,
+            count: Math.max(0, Math.trunc(Number(reading.count) || 0)),
+            at,
+        };
+    }
+
+    function getAmmoCount(now = Date.now()) {
+        const reading = getAmmoCountState(now);
+        return reading.known ? reading.count : null;
     }
 
     function findWeaponInContainers(weaponId, includeRightHand = false) {
@@ -35716,42 +36947,57 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
         return null;
     }
 
+    function getWeaponItemConfig(weaponId) {
+        const id = Number(weaponId || 0);
+        if (!Number.isSafeInteger(id) || id <= 0) return null;
+        const def = window.gameClient?.itemDefinitionsByCid?.[id] || null;
+        const sid = Number(def?.sid || def?.properties?.sid || 0);
+        return {
+            id,
+            fluidType: 0,
+            sid: Number.isSafeInteger(sid) && sid > 0 ? sid : 0,
+        };
+    }
+
     function equipWeapon(weaponId) {
-        if (!weaponId)
-            return false;
+        const itemConfig = getWeaponItemConfig(weaponId);
+        if (!itemConfig) return false;
         const eq = window.gameClient?.player?.equipment;
-        if (!eq)
+        if (!eq) return false;
+
+        // v1.6.20: route Weapon Equipper through the same native hotbar equip
+        // machinery used by safe equipment hotkeys. It selects the largest live
+        // stack from open bags, handles stale slots/debounce, and falls back to
+        // HotbarUsePacket useMode=4 so the SERVER can find the item in closed or
+        // nested backpacks. Keep mb0t's shared action lock around the send so it
+        // cannot race Looter/Depositer/Ring Equipper/healing inventory actions.
+        const hm = window.gameClient?.interface?.hotbarManager;
+        if (!hm || typeof hm.__moveItemToEquipSlot !== "function") {
+            bot.log("Paladin equipper: HotbarManager safe equip path is unavailable");
             return false;
-        const source = findWeaponInContainers(weaponId, true);
-        if (!source)
-            return false;
-        const from = {
-            which: source.container,
-            index: source.slot
-        };
-        const to = {
-            which: eq,
-            index: LEFT_HAND_SLOT
-        };
-        const count = source.item.count || 1;
-        try {
-            if (window.gameClient?.send) {
-                const sent = bot.actions.runShared('paladin-equip',
-                    bot.actions.priorities.UTILITY, () => {
-                        window.gameClient.send(new ItemMovePacket(from, to, count));
-                        return true;
-                    });
-                if (!sent) return false;
-                state.lastEquipAt = Date.now();
-                bot.log("Paladin: equipped weapon (moved from slot " + source.slot + " to left hand)", {
-                    weaponId
-                });
-                return true;
-            }
-        } catch (e) {
-            bot.log("Paladin: ItemMovePacket failed", e);
         }
-        return false;
+
+        try {
+            const sent = bot.actions.runShared(
+                'paladin-equip',
+                bot.actions.priorities.UTILITY,
+                () => {
+                    hm.__moveItemToEquipSlot(itemConfig, LEFT_HAND_SLOT, "weapon");
+                    return true;
+                },
+                120
+            );
+            if (!sent) return false;
+            state.lastEquipAt = Date.now();
+            bot.log("Paladin: safe weapon equip requested", {
+                weaponId: itemConfig.id,
+                destination: "left-hand",
+            });
+            return true;
+        } catch (e) {
+            bot.log("Paladin: safe weapon equip failed", e?.message || e);
+            return false;
+        }
     }
 
     function startCaptureWeapon() {
@@ -35848,10 +37094,16 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
         const stats = readStats();
         if (!stats)
             return false;
+        const now = Date.now();
         const manaPercent = getManaPercent(stats);
-        const ammo = getAmmoCount();
 
-        // High mana spell
+        // Keep a current server-backed full-inventory count in the same cache
+        // populated by HOTBAR_ITEM_COUNT. The request is harmless if the hotbar
+        // already refreshed the same CID; both paths converge on one reading.
+        requestAmmoCount(now, false);
+        const ammoState = getAmmoCountState(now);
+
+        // High mana spell is independent of inventory-count availability.
         if (manaPercent > config.highManaThreshold && config.highManaSpellWords) {
             const sent = bot.actions.runShared('paladin-high-mana',
                 bot.actions.priorities.UTILITY, () => bot.sendChat(config.highManaSpellWords.trim()));
@@ -35859,14 +37111,25 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
                 return true;
         }
 
-        // Craft ammo
+        // Never treat an unknown/stale full-inventory count as zero. Wait for a
+        // fresh server reply before deciding that more ammo needs to be crafted.
+        if (!ammoState.known || !ammoState.fresh)
+            return false;
+
+        const ammo = ammoState.count;
         if (ammo <= config.ammoThreshold) {
             if (stats.mana.current >= config.craftManaCost && config.craftSpellWords) {
                 const sent = bot.actions.runShared('paladin-craft',
                     bot.actions.priorities.UTILITY, () => bot.sendChat(config.craftSpellWords.trim()));
                 if (sent) {
+                    state.lastCraftAt = now;
+                    // Ask for a fresh authoritative count after the spell result
+                    // arrives; the normal next tick will consume the reply.
+                    state.lastAmmoCountRequestAt = 0;
                     bot.log("Paladin: crafted ammo", {
                         ammo,
+                        ammoItemId: ammoState.itemId,
+                        source: "server-hotbar-count",
                         mana: stats.mana.current
                     });
                     return true;
@@ -35947,8 +37210,12 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
         if (state.running)
             return false;
         state.running = true;
+        state.lastAmmoCountRequestAt = 0;
+        state.ammoCountItemId = null;
+        requestAmmoCount(Date.now(), true);
         bot.log("Paladin crafter started", {
-            craftSpellWords: config.craftSpellWords
+            craftSpellWords: config.craftSpellWords,
+            countSource: "server-hotbar-count",
         });
         craftTick();
         return true;
@@ -36032,6 +37299,7 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
 
     function status() {
         const stats = readStats();
+        const ammoState = getAmmoCountState();
         return {
             running: state.running,
             equipRunning: state.equipRunning,
@@ -36040,7 +37308,12 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
             },
             stats,
             manaPercent: stats ? getManaPercent(stats) : 0,
-            ammoCount: getAmmoCount(),
+            ammoCount: ammoState.known ? ammoState.count : null,
+            ammoCountKnown: ammoState.known,
+            ammoCountFresh: ammoState.fresh,
+            ammoCountAt: ammoState.at,
+            ammoCountItemId: ammoState.itemId,
+            ammoCountSource: "server-hotbar-count",
             lastCraftAt: state.lastCraftAt,
             lastEquipAt: state.lastEquipAt,
             killSwitchSnapshot: getKillSwitchSnapshot(),
@@ -36096,6 +37369,7 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
     }
 
     function updateConfig(nextConfig = {}) {
+        const oldWeaponId = Number(config.weaponId || 0) || null;
         Object.assign(config, nextConfig);
         config.ammoThreshold = Math.max(0, Number(config.ammoThreshold) || 0);
         config.craftManaCost = Math.max(0, Number(config.craftManaCost) || 0);
@@ -36106,6 +37380,12 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
             config.weaponId = Number(config.weaponId) || null;
         }
         persistConfig();
+        const newWeaponId = Number(config.weaponId || 0) || null;
+        if (newWeaponId !== oldWeaponId) {
+            state.ammoCountItemId = null;
+            state.lastAmmoCountRequestAt = 0;
+            if (state.running) requestAmmoCount(Date.now(), true);
+        }
         bot.log("Paladin config updated", {
             ...config
         });
@@ -36141,6 +37421,8 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
         tryEquip,
         // Helpers
         getAmmoCount,
+        getAmmoCountState,
+        requestAmmoCount,
         startCaptureWeapon,
         getKillSwitchSnapshot,
         restoreKillSwitchSnapshot,
@@ -36225,7 +37507,17 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         corpseCombatAbandonQueueSkips: 0,
         corpseCombatLastAbandonedKey: null,
         corpseCombatLastAbandonedAt: 0,
+
+        // v1.6.17: runtime-only stable container bindings + ACK-driven invalidation. The Looter runs for
+        // long periods, so selected destination and in-flight source/target
+        // references are rebound only when Minibia actually replaces them.
+        containerCacheHits: 0,
+        containerCacheMisses: 0,
+        containerCacheRebinds: 0,
+        containerCacheInvalidations: 0,
     };
+
+    const looterContainerCache = new Map();
 
     // Load config
     const stored = bot.storage.get(configStorageKey, {});
@@ -36347,25 +37639,135 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         return [];
     }
 
-    // ---- Get destination container (fallback to title if ID fails) ----
-    function getDestinationContainer() {
-        let dest = null;
+    function resetLooterContainerCache() {
+        looterContainerCache.clear();
+        state.containerCacheHits = 0;
+        state.containerCacheMisses = 0;
+        state.containerCacheRebinds = 0;
+        state.containerCacheInvalidations = 0;
+    }
 
-        // 1) Try by ID
-        if (state.destinationId != null) {
-            dest = getContainerById(state.destinationId);
-            if (dest)
-                return dest;
+    function invalidateLooterContainer(path) {
+        if (looterContainerCache.delete(String(path || "")))
+            state.containerCacheInvalidations++;
+    }
+
+    function bindLooterContainer(path, container, meta = {}) {
+        if (!container) return null;
+        const key = String(path || "");
+        looterContainerCache.set(key, {
+            key,
+            container,
+            containerId: Number(container.__containerId),
+            cid: Number(container.id) || 0,
+            title: String(container.__title || ""),
+            expectedId: meta.expectedId == null ? null : Number(meta.expectedId),
+            expectedTitle: meta.expectedTitle == null ? "" : String(meta.expectedTitle),
+        });
+        return container;
+    }
+
+    function getLooterContainer(path, meta = {}) {
+        const key = String(path || "");
+        const entry = looterContainerCache.get(key);
+        if (!entry) {
+            state.containerCacheMisses++;
+            return null;
         }
 
-        // 2) Try by title (if we have one)
-        if (state.destinationTitle) {
-            const containers = getContainersArray();
-            dest = containers.find(c => c.__title === state.destinationTitle);
+        let container = entry.container;
+        const current = getContainerById(entry.containerId);
+        if (current !== container) {
+            if (
+                current &&
+                (!entry.cid || Number(current.id) === Number(entry.cid))
+            ) {
+                container = current;
+                entry.container = current;
+                entry.containerId = Number(current.__containerId);
+                entry.cid = Number(current.id) || 0;
+                entry.title = String(current.__title || entry.title || "");
+                state.containerCacheRebinds++;
+            } else {
+                invalidateLooterContainer(key);
+                state.containerCacheMisses++;
+                return null;
+            }
+        }
+
+        const expectedId = meta.expectedId == null ? entry.expectedId : Number(meta.expectedId);
+        const expectedTitle = meta.expectedTitle == null ? entry.expectedTitle : String(meta.expectedTitle);
+        if (
+            expectedId != null &&
+            Number.isFinite(Number(expectedId)) &&
+            Number(container.__containerId) !== Number(expectedId)
+        ) {
+            invalidateLooterContainer(key);
+            state.containerCacheMisses++;
+            return null;
+        }
+        if (expectedTitle && String(container.__title || "") !== expectedTitle) {
+            invalidateLooterContainer(key);
+            state.containerCacheMisses++;
+            return null;
+        }
+
+        state.containerCacheHits++;
+        return container;
+    }
+
+    const unsubscribeLooterContainerAcks = bot.containerAcks?.subscribe?.(event => {
+        if (!event || event.ok === false) return;
+        const id = Number(event.containerId);
+        if (!Number.isFinite(id)) return;
+        for (const [key, entry] of Array.from(looterContainerCache.entries())) {
+            if (Number(entry?.containerId) !== id) continue;
+            if (event.kind === "open" && event.container && (!entry.cid || Number(event.cid) === Number(entry.cid))) {
+                if (entry.container !== event.container) {
+                    entry.container = event.container;
+                    entry.containerId = Number(event.container.__containerId);
+                    entry.cid = Number(event.container.id) || entry.cid;
+                    entry.title = String(event.container.__title || entry.title || "");
+                    state.containerCacheRebinds++;
+                }
+            } else if (event.kind === "close" && event.source === "server") {
+                looterContainerCache.delete(key);
+                state.containerCacheInvalidations++;
+            }
+        }
+    }) || (() => {});
+
+    // ---- Get destination container (stable per-run binding + fallback lookup) ----
+    function getDestinationContainer() {
+        let dest = getLooterContainer("destination", {
+            expectedTitle: state.destinationTitle || ""
+        });
+        if (dest)
+            return dest;
+
+        // 1) Try by the captured protocol container ID.
+        if (state.destinationId != null) {
+            dest = getContainerById(state.destinationId);
             if (dest) {
-                // Update stored ID to the new one for future lookups
+                bindLooterContainer("destination", dest, {
+                    expectedId: Number(dest.__containerId),
+                    expectedTitle: state.destinationTitle || String(dest.__title || "")
+                });
+                return dest;
+            }
+        }
+
+        // 2) Rebind by title after reconnect/window replacement.
+        if (state.destinationTitle) {
+            const matches = getContainersArray().filter(c => c.__title === state.destinationTitle);
+            if (matches.length === 1) {
+                dest = matches[0];
                 state.destinationId = dest.__containerId;
                 persistConfig();
+                bindLooterContainer("destination", dest, {
+                    expectedId: Number(dest.__containerId),
+                    expectedTitle: state.destinationTitle
+                });
                 return dest;
             }
         }
@@ -36655,10 +38057,18 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             return false;
         }
 
+        const sourceCacheKey = `source:${Number(container.__containerId)}`;
+        bindLooterContainer(sourceCacheKey, container, {
+            expectedId: Number(container.__containerId),
+            expectedTitle: String(container.__title || "")
+        });
         state.pendingMove = {
             kind: "drop",
             sourceId:
                 container.__containerId,
+            sourceCacheKey,
+            sourceCid: Number(container.id) || 0,
+            sourceTitle: String(container.__title || ""),
             slot,
             itemId: item.id,
             count: item.count,
@@ -38717,6 +40127,20 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             const pending =
                 state.pendingMove;
             const source =
+                (
+                    pending.sourceCacheKey
+                        ? getLooterContainer(
+                            pending.sourceCacheKey,
+                            {
+                                expectedId:
+                                    pending.sourceId,
+                                expectedTitle:
+                                    pending.sourceTitle ||
+                                    ""
+                            }
+                        )
+                        : null
+                ) ||
                 getContainerById(
                     pending.sourceId
                 );
@@ -38753,6 +40177,20 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                 state.pendingMove = null;
             } else {
                 const destination =
+                    (
+                        pending.destCacheKey
+                            ? getLooterContainer(
+                                pending.destCacheKey,
+                                {
+                                    expectedId:
+                                        pending.destId,
+                                    expectedTitle:
+                                        pending.destTitle ||
+                                        ""
+                                }
+                            )
+                            : null
+                    ) ||
                     getContainerById(
                         pending.destId
                     );
@@ -38955,16 +40393,50 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                 if (!sent)
                     return false;
 
+                const sourceCacheKey =
+                    `source:${Number(container.__containerId)}`;
+                bindLooterContainer(
+                    sourceCacheKey,
+                    container,
+                    {
+                        expectedId:
+                            Number(container.__containerId),
+                        expectedTitle:
+                            String(container.__title || "")
+                    }
+                );
+                bindLooterContainer(
+                    "destination",
+                    dest,
+                    {
+                        expectedId:
+                            Number(dest.__containerId),
+                        expectedTitle:
+                            state.destinationTitle ||
+                            String(dest.__title || "")
+                    }
+                );
+
                 state.pendingMove = {
                     kind: "move",
                     sourceId:
                         container
                             .__containerId,
+                    sourceCacheKey,
+                    sourceCid:
+                        Number(container.id) || 0,
+                    sourceTitle:
+                        String(container.__title || ""),
                     slot,
                     itemId: item.id,
                     count: item.count,
                     destId:
                         dest.__containerId,
+                    destCacheKey:
+                        "destination",
+                    destTitle:
+                        state.destinationTitle ||
+                        String(dest.__title || ""),
                     targetSlot,
                     at: now
                 };
@@ -39038,6 +40510,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             return false;
         state.running = true;
         state.pendingMove = null;
+        resetLooterContainerCache();
         state.corpseQueue = [];
         state.corpseJob = null;
         state.corpseApproachStalls = 0;
@@ -39084,6 +40557,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
     function stop() {
         state.running = false;
         state.pendingMove = null;
+        looterContainerCache.clear();
 
         const activeCorpseJob =
             state.corpseJob;
@@ -39221,16 +40695,31 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                 state.corpseDeathsQueued,
             corpseDeathsIgnored:
                 state.corpseDeathsIgnored,
+            containerCacheSize:
+                looterContainerCache.size,
+            containerCacheHits:
+                state.containerCacheHits,
+            containerCacheMisses:
+                state.containerCacheMisses,
+            containerCacheRebinds:
+                state.containerCacheRebinds,
+            containerCacheInvalidations:
+                state.containerCacheInvalidations,
         };
     }
 
     function updateConfig(next) {
+        let destinationChanged = false;
         if (next.destinationId !== undefined) {
             state.destinationId = next.destinationId;
+            destinationChanged = true;
         }
         if (next.destinationTitle !== undefined) {
             state.destinationTitle = next.destinationTitle;
+            destinationChanged = true;
         }
+        if (destinationChanged)
+            invalidateLooterContainer("destination");
         if (Array.isArray(next.trackedItems)) {
             state.trackedItems =
                 new Map(
@@ -39483,6 +40972,8 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
     bot.addCleanup(() => stop());
 
     // ---- Public API ----
+    bot.addCleanup(() => unsubscribeLooterContainerAcks());
+
     bot.looter = {
         start,
         stop,
@@ -41633,6 +43124,1595 @@ window.__minibiaBotBundle.installSupportModule = function installSupportModule(b
  *     Provides real‑time controls, status indicators, and refresh functions.
  * ==================================================================================
  */
+
+/**
+ * ==================================================================================
+ * ITEM DEPOSITER / DEPOT ROOM MODULE
+ *     v1.6.06: full depot workflow adapted from the user's reference bot.
+ *     Supports autonomous Loot-BP discovery, nearby depot locker discovery,
+ *     named destination bags, split/NPC sorting, per-item keep/group rules,
+ *     nested destination bags and acknowledged one-at-a-time item moves.
+ *
+ *     The old captured-BP transfer remains available as "manual" workflow.
+ * ==================================================================================
+ */
+window.__minibiaBotBundle.installDepositerModule = function installDepositerModule(bot) {
+    const configStorageKey = "minibiaBot.depositer.config";
+    const DEFAULT_BAGS = {
+        all: "Loot",
+        stackables: "Stackables",
+        unstackables: "Unstackables",
+        green: "Green Djinn",
+        blue: "Blue Djinn",
+        rashid: "Rashid",
+        other: "Other",
+        unsorted: "Unsorted",
+    };
+    const GROUP_LABELS = {
+        all: "All loot",
+        stackables: "Stackables",
+        unstackables: "Unstackables",
+        green: "Green Djinn",
+        blue: "Blue Djinn",
+        rashid: "Rashid",
+        other: "Other",
+        unsorted: "Unsorted",
+    };
+
+    // Reviewed NPC buyer table from the attached reference bot. Live Minibia
+    // npcTrades data takes precedence when present.
+    const DEPOT_BUYERS = {"2110":[{"name":"Rashid","price":200}],"2123":[{"name":"Rashid","price":30000}],"2125":[{"name":"Rashid","price":400}],"2127":[{"name":"Rashid","price":800}],"2133":[{"name":"Rashid","price":2000}],"2134":[{"name":"Rashid","price":150}],"2135":[{"name":"Rashid","price":200}],"2136":[{"name":"Rashid","price":32000}],"2142":[{"name":"Rashid","price":200}],"2161":[{"name":"Yaman","price":30}],"2163":[{"name":"Haroun","price":35}],"2164":[{"name":"Yaman","price":250}],"2165":[{"name":"Haroun","price":200}],"2166":[{"name":"Haroun","price":50}],"2167":[{"name":"Yaman","price":100}],"2168":[{"name":"Yaman","price":50}],"2169":[{"name":"Yaman","price":100}],"2170":[{"name":"Yaman","price":50}],"2171":[{"name":"Rashid","price":2500}],"2172":[{"name":"Haroun","price":50}],"2176":[{"name":"Haroun","price":750}],"2177":[{"name":"Haroun","price":50}],"2178":[{"name":"Haroun","price":100}],"2179":[{"name":"Rashid","price":8000}],"2181":[{"name":"Yaman","price":2000}],"2182":[{"name":"Yaman","price":100}],"2183":[{"name":"Yaman","price":3000}],"2185":[{"name":"Yaman","price":1000}],"2186":[{"name":"Yaman","price":200}],"2187":[{"name":"Haroun","price":3000}],"2188":[{"name":"Haroun","price":1000}],"2189":[{"name":"Haroun","price":2000}],"2190":[{"name":"Haroun","price":100}],"2191":[{"name":"Haroun","price":200}],"2193":[{"name":"Yaman","price":100}],"2194":[{"name":"Yaman","price":50}],"2195":[{"name":"Nah'bob","price":30000}],"2197":[{"name":"Haroun","price":500}],"2198":[{"name":"Haroun","price":100}],"2199":[{"name":"Haroun","price":50}],"2200":[{"name":"Yaman","price":100}],"2201":[{"name":"Yaman","price":100}],"2207":[{"name":"Haroun","price":100}],"2208":[{"name":"Haroun","price":100}],"2209":[{"name":"Haroun","price":100}],"2213":[{"name":"Yaman","price":100}],"2214":[{"name":"Yaman","price":100}],"2383":[{"name":"Nah'bob","price":1000}],"2391":[{"name":"Nah'bob","price":1200}],"2392":[{"name":"Nah'bob","price":4000}],"2393":[{"name":"Alesar","price":17000}],"2396":[{"name":"Nah'bob","price":1000}],"2402":[{"name":"Rashid","price":500}],"2409":[{"name":"Alesar","price":900}],"2411":[{"name":"Alesar","price":50}],"2413":[{"name":"Nah'bob","price":500}],"2414":[{"name":"Nah'bob","price":9000}],"2419":[{"name":"Alesar","price":150}],"2425":[{"name":"Nah'bob","price":500}],"2426":[{"name":"Rashid","price":2000}],"2427":[{"name":"Rashid","price":11000}],"2430":[{"name":"Alesar","price":2000}],"2432":[{"name":"Nah'bob","price":8000}],"2434":[{"name":"Alesar","price":2000}],"2436":[{"name":"Alesar","price":6000}],"2439":[{"name":"Rashid","price":110}],"2440":[{"name":"Rashid","price":1000}],"2442":[{"name":"Rashid","price":90}],"2444":[{"name":"Rashid","price":30000}],"2454":[{"name":"Rashid","price":12000}],"2462":[{"name":"Rashid","price":1000}],"2466":[{"name":"Rashid","price":20000}],"2470":[{"name":"Rashid","price":30000}],"2475":[{"name":"Alesar","price":5000}],"2476":[{"name":"Alesar","price":5000}],"2477":[{"name":"Alesar","price":5000}],"2479":[{"name":"Alesar","price":500}],"2486":[{"name":"Nah'bob","price":900}],"2487":[{"name":"Nah'bob","price":12000}],"2488":[{"name":"Nah'bob","price":12000}],"2489":[{"name":"Alesar","price":400}],"2490":[{"name":"Alesar","price":250}],"2491":[{"name":"Nah'bob","price":2500}],"2492":[{"name":"Rashid","price":40000}],"2497":[{"name":"Nah'bob","price":6000}],"2498":[{"name":"Nah'bob","price":30000}],"2503":[{"name":"Rashid","price":30000}],"2514":[{"name":"Rashid","price":50000}],"2515":[{"name":"Nah'bob","price":2000}],"2516":[{"name":"Nah'bob","price":4000}],"2518":[{"name":"Nah'bob","price":1200}],"2519":[{"name":"Nah'bob","price":8000}],"2520":[{"name":"Rashid","price":30000}],"2521":[{"name":"Rashid","price":400}],"2528":[{"name":"Alesar","price":8000}],"2529":[{"name":"Alesar","price":800}],"2532":[{"name":"Alesar","price":900}],"2534":[{"name":"Alesar","price":15000}],"2535":[{"name":"Rashid","price":5000}],"2536":[{"name":"Rashid","price":9000}],"2539":[{"name":"Nah'bob","price":16000}],"2540":[{"name":"Rashid","price":2000}],"2541":[{"name":"Rashid","price":80}],"2645":[{"name":"Rashid","price":30000}],"2656":[{"name":"Nah'bob","price":10000}],"2663":[{"name":"Alesar","price":150}],"3955":[{"name":"Rashid","price":400}],"3962":[{"name":"Rashid","price":1500}],"3968":[{"name":"Rashid","price":1000}],"3982":[{"name":"Rashid","price":1000}],"5741":[{"name":"Rashid","price":25000}],"7379":[{"name":"Rashid","price":1500}],"7381":[{"name":"Rashid","price":600}],"7382":[{"name":"Rashid","price":36000}],"7402":[{"name":"Rashid","price":15000}],"7408":[{"name":"Rashid","price":1500}],"7416":[{"name":"Rashid","price":2000}],"7424":[{"name":"Rashid","price":5000}],"7425":[{"name":"Rashid","price":500}],"7426":[{"name":"Rashid","price":8000}],"7427":[{"name":"Rashid","price":9000}],"7430":[{"name":"Rashid","price":3000}],"7437":[{"name":"Rashid","price":7000}],"7438":[{"name":"Rashid","price":2000}],"7449":[{"name":"Rashid","price":300}],"7456":[{"name":"Rashid","price":10000}],"7457":[{"name":"Rashid","price":2000}],"7460":[{"name":"Rashid","price":1500}],"7461":[{"name":"Rashid","price":200}],"7462":[{"name":"Rashid","price":400}],"7463":[{"name":"Rashid","price":6000}],"7464":[{"name":"Rashid","price":850}],"8873":[{"name":"Rashid","price":3000}]};
+
+    const config = Object.assign({
+        workflow: "depot-room", // depot-room | manual
+        sourceTitle: "Loot",
+        manualSourceId: null,
+        manualSourceTitle: "",
+        destinationTitle: "",
+        destinationId: null,
+        mode: "npc", // npc | split | all
+        radius: 14,
+        waitMs: 60000,
+        exploreSteps: 8,
+        ackMs: 4000,
+        moveDelayMs: 220,
+        skipContainers: true,
+        keepItemIds: [],
+        bags: { ...DEFAULT_BAGS },
+        rules: [], // [{sid,keep,group}]
+    }, bot.storage.get(configStorageKey, {}));
+
+    const state = {
+        running: false,
+        stopRequested: false,
+        phase: "idle",
+        message: "Idle",
+        movedStacks: 0,
+        movedItems: 0,
+        skipped: 0,
+        groups: {},
+        plan: [],
+        lastError: null,
+        lastRunAt: 0,
+        captureMode: null,
+        captureHandler: null,
+        locker: null,
+        currentGroup: null,
+    };
+
+    // v1.6.17: one depot visit owns a stable path -> live-container cache, ACK-driven.
+    // Once a bag path has been verified, later tree walks reuse that exact
+    // container instead of "using" the parent slot again (which would toggle
+    // an already-open backpack closed). Replacements with the same protocol
+    // container id may be rebound only after identity/parent validation.
+    const runContainerCache = new Map();
+    const runCacheStats = {
+        hits: 0,
+        misses: 0,
+        binds: 0,
+        rebinds: 0,
+        invalidations: 0,
+    };
+
+    function normalizeConfig() {
+        config.workflow = config.workflow === "manual" ? "manual" : "depot-room";
+        config.mode = ["npc", "split", "all"].includes(config.mode) ? config.mode : "npc";
+        config.sourceTitle = String(config.sourceTitle || "Loot").trim() || "Loot";
+        config.manualSourceId = Number.isFinite(Number(config.manualSourceId)) ? Number(config.manualSourceId) : null;
+        config.manualSourceTitle = String(config.manualSourceTitle || "").trim();
+        config.destinationTitle = String(config.destinationTitle || "").trim();
+        config.destinationId = Number.isFinite(Number(config.destinationId)) ? Number(config.destinationId) : null;
+        config.radius = Math.max(3, Math.min(30, Math.floor(Number(config.radius) || 14)));
+        config.waitMs = Math.max(5000, Math.min(300000, Math.floor(Number(config.waitMs) || 60000)));
+        config.exploreSteps = Math.max(0, Math.min(30, Math.floor(Number(config.exploreSteps) || 8)));
+        config.ackMs = Math.max(1500, Math.min(15000, Math.floor(Number(config.ackMs) || 4000)));
+        config.moveDelayMs = Math.max(80, Math.min(2000, Math.floor(Number(config.moveDelayMs) || 220)));
+        config.skipContainers = config.skipContainers !== false;
+        config.keepItemIds = Array.isArray(config.keepItemIds)
+            ? [...new Set(config.keepItemIds.map(Number).filter(x => Number.isInteger(x) && x > 0))]
+            : [];
+        config.bags = Object.fromEntries(Object.entries(DEFAULT_BAGS).map(([k, v]) => [k, String(config.bags?.[k] ?? v).trim()]));
+        config.rules = Array.isArray(config.rules) ? config.rules.map((r, i) => ({
+            id: String(r?.id || `rule-${i}-${Math.random().toString(36).slice(2, 7)}`),
+            sid: Math.max(0, Math.floor(Number(r?.sid) || 0)),
+            keep: Math.max(0, Math.floor(Number(r?.keep) || 0)),
+            group: ["auto", ...Object.keys(DEFAULT_BAGS)].includes(String(r?.group || "auto")) ? String(r.group || "auto") : "auto",
+        })).filter(r => r.sid > 0) : [];
+    }
+    normalizeConfig();
+
+    function persistConfig() {
+        bot.storage.set(configStorageKey, {
+            ...config,
+            bags: { ...config.bags },
+            rules: config.rules.map(r => ({ ...r })),
+            keepItemIds: [...config.keepItemIds],
+        });
+    }
+
+    const sleep = ms => new Promise(resolve => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
+    function stopCheck() { if (state.stopRequested) throw new Error("Depositer stopped"); }
+    function statusMessage(phase, message) {
+        state.phase = phase;
+        state.message = String(message || phase);
+        return state.message;
+    }
+
+    function containerAckSeq() {
+        try {
+            bot.containerAcks?.ensureInstalled?.();
+            return Number(bot.containerAcks?.snapshot?.()) || 0;
+        } catch (e) { return 0; }
+    }
+    async function waitContainerAck(predicate, afterSeq, errorText, timeoutMs = config.ackMs) {
+        if (typeof bot.containerAcks?.waitFor === "function") {
+            return bot.containerAcks.waitFor(predicate, {
+                afterSeq,
+                timeoutMs,
+                errorText,
+            });
+        }
+        return waitUntil(() => {
+            const event = bot.containerAcks?.findAfter?.(afterSeq, predicate);
+            return event || null;
+        }, timeoutMs, errorText);
+    }
+
+    function openedContainers() {
+        const raw = window.gameClient?.player?.__openedContainers;
+        if (!raw) return [];
+        if (Array.isArray(raw)) return raw.filter(Boolean);
+        if (raw instanceof Set) return Array.from(raw).filter(Boolean);
+        if (raw instanceof Map) return Array.from(raw.values()).filter(Boolean);
+        if (typeof raw === "object") return Object.values(raw).filter(Boolean);
+        return [];
+    }
+    function getContainerById(id) {
+        const wanted = Number(id);
+        if (!Number.isFinite(wanted)) return null;
+        try { const c = window.gameClient?.player?.getContainer?.(wanted); if (c) return c; } catch (e) {}
+        return openedContainers().find(c => Number(c?.__containerId) === wanted) || null;
+    }
+    function containerTitle(c) { return String(c?.__title || c?.window?.state?.title || c?.window?.title || "").trim(); }
+    function findOpenContainer(id, title) {
+        const byId = getContainerById(id); if (byId) return byId;
+        const wanted = String(title || "").trim().toLowerCase();
+        return wanted ? openedContainers().find(c => containerTitle(c).toLowerCase() === wanted) || null : null;
+    }
+    function slots(c) {
+        const n = Number(c?.size ?? c?.slots?.length);
+        return Number.isInteger(n) && n >= 0 && n <= 255 ? n : 0;
+    }
+    function peek(c, i) {
+        try { return c?.peekItem ? c.peekItem(i) : c?.getSlotItem ? c.getSlotItem(i) : c?.slots?.[i]?.item || null; }
+        catch (e) { return null; }
+    }
+    function count(it) { try { return it ? Math.max(1, Math.floor(Number(it.getCount?.() ?? it.count) || 1)) : 0; } catch (e) { return it ? 1 : 0; } }
+    function isBag(it) { try { return !!it?.isContainer?.(); } catch (e) { return false; } }
+    function isStackable(it) { try { return !!it?.isStackable?.(); } catch (e) { return false; } }
+    function bagSlots(c) { const out = []; for (let i = 0; i < slots(c); i++) if (isBag(peek(c, i))) out.push(i); return out; }
+    function itemSig(it) { return it ? [Number(it.id)||0, Number(it.sid)||0, Number(it.fluidType)||0, Number(it.tintId)||0].join(":") : ""; }
+    function sameIdentity(it, id) {
+        if (!it || !id) return false;
+        const info = identify(it);
+        return Number(info.cid) === Number(id.cid) && Number(info.sid || 0) === Number(id.sid || 0) &&
+            Number(info.fluidType || 0) === Number(id.fluidType || 0) && Number(info.tintId || 0) === Number(id.tintId || 0);
+    }
+    function itemDef(cid) {
+        const gc = window.gameClient;
+        return gc?.itemDefinitionsByCid?.[Number(cid)] || gc?.itemDefinitions?.[Number(cid)] || null;
+    }
+    function sidForCid(cid) {
+        const gc = window.gameClient;
+        const direct = Number(gc?.sidByCid?.[Number(cid)]);
+        if (Number.isFinite(direct) && direct > 0) return direct;
+        const def = itemDef(cid);
+        const sid = Number(def?.sid || def?.properties?.sid);
+        return Number.isFinite(sid) && sid > 0 ? sid : 0;
+    }
+    function identify(it) {
+        const cid = Number(it?.id) || 0;
+        const sid = Number(it?.sid) > 0 ? Number(it.sid) : sidForCid(cid);
+        const def = itemDef(cid);
+        return {
+            cid, sid, fluidType: Number(it?.fluidType)||0, tintId: Number(it?.tintId)||0,
+            stackable: isStackable(it),
+            name: String(def?.properties?.name || it?.name || `CID ${cid}`),
+        };
+    }
+    function classify(it) {
+        const info = identify(it);
+        const rule = config.rules.find(r => Number(r.sid) === Number(info.sid));
+        if (rule && rule.group !== "auto") return { ...info, group: rule.group, reason: "item-rule" };
+        if (config.mode === "all") return { ...info, group: "all", reason: "all" };
+        if (info.stackable) return { ...info, group: "stackables", reason: "stackable" };
+        if (config.mode === "split") return { ...info, group: "unstackables", reason: "split" };
+        const live = window.gameClient?.npcTrades;
+        const buyers = live && Object.keys(live).length ? (live[info.sid] || []) : (DEPOT_BUYERS[info.sid] || []);
+        const group = { Alesar: "green", Yaman: "green", "Nah'bob": "blue", Haroun: "blue", Rashid: "rashid" };
+        const priority = { green: 0, blue: 1, rashid: 2 };
+        const choices = (Array.isArray(buyers) ? buyers : []).filter(b => group[b.name] && Number.isFinite(Number(b.price)))
+            .sort((a,b) => Number(b.price)-Number(a.price) || priority[group[a.name]]-priority[group[b.name]] || String(a.name).localeCompare(String(b.name)));
+        const best = choices[0];
+        return { ...info, group: best ? group[best.name] : "other", buyer: best?.name || null, price: best ? Number(best.price) : null, reason: best ? "npc-buyer" : "other" };
+    }
+
+    async function waitUntil(fn, timeoutMs, errorText) {
+        const end = Date.now() + Math.max(100, Number(timeoutMs) || 1000);
+        while (Date.now() < end) {
+            stopCheck();
+            let v = null; try { v = fn(); } catch (e) {}
+            if (v) return v;
+            await sleep(40);
+        }
+        throw new Error(errorText || "Timed out");
+    }
+
+    async function requestBagNames(c, options = {}) {
+        const gc = window.gameClient;
+        if (!c) return {};
+        if (typeof gc?.networkManager?.__requestBagNames !== "function")
+            return gc?.__bagNames?.[c.__containerId] || {};
+        const requireFresh = options?.requireFresh === true;
+        const old = gc.__bagNames;
+        try {
+            gc.networkManager.__requestBagNames();
+        } catch (e) {
+            if (requireFresh) throw new Error("Could not request fresh backpack names");
+            return gc?.__bagNames?.[c.__containerId] || {};
+        }
+
+        try {
+            await waitUntil(
+                () => gc.__bagNames && gc.__bagNames !== old,
+                Math.max(config.ackMs, 1800),
+                "Bag-name refresh timeout"
+            );
+        } catch (e) {
+            // Normal tree discovery may safely use a cached name map. The
+            // toggle-close reopen barrier may NOT: it needs an actual later
+            // server reply so a delayed OPEN from attempt 1 cannot race attempt 2.
+            if (requireFresh) throw e;
+        }
+        return gc?.__bagNames?.[c.__containerId] || {};
+    }
+
+    function linkedChildren(parent, cid) {
+        return openedContainers().filter(c => {
+            if (!c || Number(c.id) !== Number(cid)) return false;
+            if (c.__openedFromParent === parent || c.__replacedParent === parent) return true;
+            if (Number(c.__parentCid) > 0 && Number(c.__parentCid) === Number(parent?.__containerId)) return true;
+            return false;
+        });
+    }
+    function childLinkedTo(parent, cid) { const m=linkedChildren(parent,cid); return m.length===1?m[0]:null; }
+    async function closeContainer(c) {
+        if (!c || typeof ContainerClosePacket !== "function" || !window.gameClient?.send) return false;
+        const id = Number(c.__containerId);
+        const afterSeq = containerAckSeq();
+        window.gameClient.send(new ContainerClosePacket(id));
+        try {
+            await waitContainerAck(
+                event => event?.kind === "close" && event?.source === "server" && event?.ok !== false && Number(event?.containerId) === id,
+                afterSeq,
+                "Container close was not confirmed"
+            );
+            return true;
+        } catch (e) {
+            // Compatibility fallback if the client hook was replaced after send.
+            try { await waitUntil(() => getContainerById(id) !== c, Math.min(config.ackMs, 1200), "Container close was not confirmed"); return true; }
+            catch (_) { return false; }
+        }
+    }
+    function isLiveContainer(c) {
+        if (!c) return false;
+        const id = Number(c.__containerId);
+        return Number.isFinite(id) && getContainerById(id) === c;
+    }
+
+    function hasParentLink(c, parent) {
+        if (!c || !parent) return false;
+        if (c.__openedFromParent === parent || c.__replacedParent === parent) return true;
+        const childParentId = Number(c.__parentCid);
+        const parentId = Number(parent.__containerId);
+        return Number.isFinite(childParentId) && childParentId > 0 &&
+            Number.isFinite(parentId) && childParentId === parentId;
+    }
+
+    function runPathKey(rootKey, path = []) {
+        const root = String(rootKey || "tree");
+        const parts = Array.isArray(path) ? path : [];
+        return `${root}:${parts.length ? parts.map(n => `b${Number(n)}`).join("/") : "root"}`;
+    }
+
+    function resetRunContainerCache() {
+        runContainerCache.clear();
+        runCacheStats.hits = 0;
+        runCacheStats.misses = 0;
+        runCacheStats.binds = 0;
+        runCacheStats.rebinds = 0;
+        runCacheStats.invalidations = 0;
+    }
+
+    function invalidateRunContainer(rootKey, path) {
+        const key = runPathKey(rootKey, path);
+        if (runContainerCache.delete(key))
+            runCacheStats.invalidations++;
+    }
+
+    function bindRunContainer(rootKey, path, container, parent = null, sourceItem = null) {
+        if (!container) return null;
+        const key = runPathKey(rootKey, path);
+        runContainerCache.set(key, {
+            key,
+            container,
+            containerId: Number(container.__containerId),
+            cid: Number(container.id) || 0,
+            parentContainerId: parent ? Number(parent.__containerId) : 0,
+            sourceSig: sourceItem ? itemSig(sourceItem) : "",
+            title: containerTitle(container),
+        });
+        runCacheStats.binds++;
+        return container;
+    }
+
+    function getRunContainer(rootKey, path, parent = null, sourceItem = null) {
+        const key = runPathKey(rootKey, path);
+        const entry = runContainerCache.get(key);
+        if (!entry) {
+            runCacheStats.misses++;
+            return null;
+        }
+
+        let container = entry.container;
+        if (!isLiveContainer(container)) {
+            const replacement = getContainerById(entry.containerId);
+            if (
+                replacement &&
+                Number(replacement.id) === Number(entry.cid) &&
+                (!entry.title || !containerTitle(replacement) || containerTitle(replacement) === entry.title)
+            ) {
+                container = replacement;
+                entry.container = replacement;
+                entry.containerId = Number(replacement.__containerId);
+                runCacheStats.rebinds++;
+            } else {
+                invalidateRunContainer(rootKey, path);
+                runCacheStats.misses++;
+                return null;
+            }
+        }
+
+        if (sourceItem) {
+            if (
+                Number(container.id) !== Number(sourceItem.id) ||
+                (entry.sourceSig && entry.sourceSig !== itemSig(sourceItem))
+            ) {
+                invalidateRunContainer(rootKey, path);
+                runCacheStats.misses++;
+                return null;
+            }
+        }
+
+        if (parent) {
+            const parentId = Number(parent.__containerId);
+            if (
+                entry.parentContainerId &&
+                Number(entry.parentContainerId) !== parentId
+            ) {
+                invalidateRunContainer(rootKey, path);
+                runCacheStats.misses++;
+                return null;
+            }
+
+            // Native parent metadata is useful when present. If absent, the
+            // verified per-run path binding remains authoritative.
+            const nativeParentId = Number(container.__parentCid) || 0;
+            if (
+                nativeParentId &&
+                nativeParentId !== parentId &&
+                container.__openedFromParent !== parent &&
+                container.__replacedParent !== parent
+            ) {
+                invalidateRunContainer(rootKey, path);
+                runCacheStats.misses++;
+                return null;
+            }
+        }
+
+        runCacheStats.hits++;
+        return container;
+    }
+
+    function refreshCachedReference(ref) {
+        if (!ref?.c) return null;
+        if (isLiveContainer(ref.c)) return ref.c;
+
+        const replacement = getContainerById(ref.c.__containerId);
+        if (!replacement || Number(replacement.id) !== Number(ref.c.id))
+            return null;
+
+        ref.c = replacement;
+        if (ref.rootKey && Array.isArray(ref.path)) {
+            const key = runPathKey(ref.rootKey, ref.path);
+            const entry = runContainerCache.get(key);
+            if (entry) {
+                entry.container = replacement;
+                entry.containerId = Number(replacement.__containerId);
+                entry.cid = Number(replacement.id) || 0;
+                entry.title = containerTitle(replacement);
+                runCacheStats.rebinds++;
+            }
+        }
+        return replacement;
+    }
+
+    const unsubscribeDepositerContainerAcks = bot.containerAcks?.subscribe?.(event => {
+        if (!event) return;
+        if (event.ok === false && !(event.kind === "open" && (event.registered === true || event.container))) return;
+        const id = Number(event.containerId);
+        if (!Number.isFinite(id)) return;
+        for (const [key, entry] of Array.from(runContainerCache.entries())) {
+            if (Number(entry?.containerId) !== id) continue;
+            if (event.kind === "open" && event.container && Number(event.cid) === Number(entry.cid)) {
+                if (entry.container !== event.container) {
+                    entry.container = event.container;
+                    entry.containerId = Number(event.container.__containerId);
+                    entry.title = containerTitle(event.container) || entry.title;
+                    runCacheStats.rebinds++;
+                }
+            } else if (event.kind === "close" && event.source === "server") {
+                // A later OPEN with the same container id can rebind this entry;
+                // until then, do not reuse the closed object.
+                runContainerCache.delete(key);
+                runCacheStats.invalidations++;
+            }
+        }
+    }) || (() => {});
+
+    function findFreshOpenedChild(beforeById, parent, cid) {
+        const wantedCid = Number(cid);
+        const parentId = Number(parent?.__containerId);
+        const fresh = openedContainers().filter(c => {
+            if (!c || Number(c.id) !== wantedCid) return false;
+            const id = Number(c.__containerId);
+            const old = Number.isFinite(id) ? beforeById.get(id) : null;
+            return !old || old !== c;
+        });
+
+        // Prefer the authoritative parent relationship supplied by Minibia's
+        // CONTAINER_OPEN packet. This also handles a reopened container that
+        // reuses the same protocol container id but creates a new object.
+        const linked = fresh.filter(c => hasParentLink(c, parent));
+        if (linked.length === 1) return linked[0];
+        if (linked.length > 1) return null;
+
+        // Older/edge open packets may not carry a parent link. Accept one
+        // unambiguous fresh bag only when it does not explicitly point at a
+        // different parent.
+        if (fresh.length === 1) {
+            const c = fresh[0];
+            const childParentId = Number(c.__parentCid) || 0;
+            if (!childParentId || !Number.isFinite(parentId) || childParentId === parentId)
+                return c;
+        }
+        return null;
+    }
+
+    function findToggledClosedChild(beforeById, parent, cid) {
+        const wantedCid = Number(cid);
+        const allClosed = Array.from(beforeById.values()).filter(c =>
+            c && Number(c.id) === wantedCid && !isLiveContainer(c)
+        );
+        const linkedClosed = allClosed.filter(c => hasParentLink(c, parent));
+        if (linkedClosed.length === 1) return linkedClosed[0];
+        if (linkedClosed.length > 1) return null;
+        // The server can close an already-open copy that lacked parent metadata.
+        // Only accept that fallback when exactly one same-CID container vanished.
+        return allClosed.length === 1 ? allClosed[0] : null;
+    }
+
+    let lastBagUseAt=0;
+    async function sendBackpackUse(parent, slot, expectedSig) {
+        stopCheck();
+        const current = peek(parent, slot);
+        if (!current || !isBag(current) || itemSig(current) !== expectedSig)
+            throw new Error("Backpack tree changed before open; start the depot visit again");
+        if (typeof ItemUsePacket !== "function" || !window.gameClient?.send)
+            throw new Error("ItemUsePacket is unavailable");
+
+        // Match the reference depositer's conservative pacing: wait at least
+        // 1200 ms after BOTH our last backpack USE and the most recent server
+        // container reply. Sending immediately after an OPEN/CLOSE can race the
+        // server's toggle state and intermittently produce no usable response.
+        while (true) {
+            stopCheck();
+            const lastReplyAt = Number(bot.containerAcks?.lastReplyAt?.()) || 0;
+            const notBefore = Math.max(Number(lastBagUseAt) || 0, lastReplyAt) + 1200;
+            const waitGap = notBefore - Date.now();
+            if (waitGap <= 0) break;
+            await sleep(Math.min(waitGap, 120));
+        }
+
+        // Serialize the actual USE send against mb0t modules that participate in
+        // the shared item-action coordinator. Do not hold the lock while waiting
+        // for the server ACK.
+        let release = null;
+        const acquireEnd = Date.now() + 2000;
+        while (!release && Date.now() < acquireEnd) {
+            release = bot.actions?.tryAcquireShared?.(
+                "depositer-open",
+                bot.actions?.priorities?.UTILITY ?? 20,
+                150
+            ) || null;
+            if (!release) await sleep(40);
+        }
+        if (!release) throw new Error("Inventory use channel is busy");
+
+        let committed = false;
+        try {
+            stopCheck();
+            const liveCurrent = peek(parent, slot);
+            if (!liveCurrent || !isBag(liveCurrent) || itemSig(liveCurrent) !== expectedSig)
+                throw new Error("Backpack tree changed before open; start the depot visit again");
+            window.gameClient.send(new ItemUsePacket({ which: parent, index: Number(slot) }));
+            lastBagUseAt = Date.now();
+            committed = true;
+        } finally {
+            release(committed);
+        }
+    }
+
+    function logBackpackOpenTimeout(label, afterSeq, parent, slot, expectedCid) {
+        try {
+            const recent = (bot.containerAcks?.recent?.(24) || [])
+                .filter(event => Number(event?.seq) > Number(afterSeq || 0))
+                .map(event => ({
+                    seq: event.seq, kind: event.kind, source: event.source,
+                    ok: event.ok, registered: event.registered,
+                    containerId: event.containerId, cid: event.cid,
+                    parentContainerId: event.parentContainerId, at: event.at,
+                }));
+            bot.log("[Depositer] " + label, {
+                parentId: Number(parent?.__containerId) || null,
+                slot: Number(slot), cid: Number(expectedCid) || null,
+                afterSeq: Number(afterSeq) || 0,
+                lastReplyAt: Number(bot.containerAcks?.lastReplyAt?.()) || 0,
+                recentAcks: recent,
+            });
+        } catch (e) {}
+    }
+
+    async function openChild(parent, slot) {
+        stopCheck();
+        const it = peek(parent, slot);
+        if (!it || !isBag(it)) throw new Error("Requested child backpack is no longer in that slot");
+        const expectedCid = Number(it.id);
+        const expectedSig = itemSig(it);
+        const parentId = Number(parent?.__containerId) || 0;
+        const sameCidSlots = bagSlots(parent).filter(i => Number(peek(parent, i)?.id) === expectedCid);
+        const linked = linkedChildren(parent, expectedCid);
+        if (sameCidSlots.length === 1 && linked.length === 1) return linked[0];
+
+        // One requested slot -> one ACK transaction. Because openings are paced
+        // and serialized, the first matching server OPEN/CLOSE after this USE is
+        // authoritative even when several identical backpack CIDs share a parent.
+        const afterSeq = containerAckSeq();
+        await sendBackpackUse(parent, slot, expectedSig);
+        let outcome;
+        try {
+            outcome = await waitContainerAck(event => {
+                if (!event || event.source !== "server") return false;
+                if (event.kind === "open") {
+                    if (Number(event.cid) !== expectedCid) return false;
+                    const ep = Number(event.parentContainerId) || 0;
+                    if (ep && parentId && ep !== parentId) return false;
+                    return event.ok !== false || event.registered === true || !!event.container;
+                }
+                if (event.kind === "close") {
+                    if (Number(event.cid) !== expectedCid) return false;
+                    const ep = Number(event.parentContainerId) || 0;
+                    return (!ep || !parentId || ep === parentId) && event.ok !== false;
+                }
+                return false;
+            }, afterSeq, "Backpack open was not confirmed");
+        } catch (error) {
+            logBackpackOpenTimeout("Backpack open was not confirmed", afterSeq, parent, slot, expectedCid);
+            throw error;
+        }
+
+        if (outcome.kind === "open") {
+            const child = outcome.container || getContainerById(outcome.containerId);
+            if (!child) throw new Error("Backpack OPEN was acknowledged but the live container was not registered");
+            await sleep(80);
+            return child;
+        }
+
+        bot.log("[Depositer] Backpack was already open; confirmed CLOSE, reopening requested slot", {
+            parentId: parentId || null,
+            slot: Number(slot),
+            cid: expectedCid,
+            closedContainerId: Number(outcome.containerId) || null,
+            ackSeq: Number(outcome.seq) || null,
+        });
+
+        // Mirror the reference depositer: use a fresh bag-name reply as an
+        // ordering barrier after the confirmed toggle-close. If a late OPEN has
+        // already arrived, consume it rather than sending another USE.
+        await requestBagNames(parent, { requireFresh: true });
+        const lateOpen = bot.containerAcks?.findAfter?.(afterSeq, event =>
+            event?.kind === "open" && event?.source === "server" &&
+            (event?.ok !== false || event?.registered === true || !!event?.container) &&
+            Number(event?.cid) === expectedCid &&
+            (!(Number(event?.parentContainerId) || 0) || !parentId || Number(event.parentContainerId) === parentId)
+        );
+        if (lateOpen) {
+            const child = lateOpen.container || getContainerById(lateOpen.containerId);
+            if (child) return child;
+        }
+
+        const reopenSeq = containerAckSeq();
+        await sendBackpackUse(parent, slot, expectedSig);
+        let opened;
+        try {
+            opened = await waitContainerAck(event => {
+                if (!event || event.kind !== "open" || event.source !== "server") return false;
+                if (Number(event.cid) !== expectedCid) return false;
+                const ep = Number(event.parentContainerId) || 0;
+                if (ep && parentId && ep !== parentId) return false;
+                return event.ok !== false || event.registered === true || !!event.container;
+            }, reopenSeq, "Backpack reopen was not confirmed after toggle-close");
+        } catch (error) {
+            logBackpackOpenTimeout("Backpack reopen was not confirmed after toggle-close", reopenSeq, parent, slot, expectedCid);
+            throw error;
+        }
+        const child = opened.container || getContainerById(opened.containerId);
+        if (!child) throw new Error("Backpack reopen ACK arrived but the live container was not registered");
+        await sleep(80);
+        return child;
+    }
+
+    function findLikelyMainBackpack(item) {
+        const expectedCid = Number(item?.id) || 0;
+        let exact = openedContainers().find(c => /main backpack/i.test(containerTitle(c))) || null;
+        if (exact) return exact;
+        exact = openedContainers().find(c => /\[E\]$/.test(containerTitle(c))) || null;
+        if (exact && (!expectedCid || Number(exact.id) === expectedCid)) return exact;
+        const candidates = openedContainers().filter(c =>
+            (!expectedCid || Number(c?.id) === expectedCid) &&
+            !(Number(c?.__parentCid) > 0) &&
+            !c?.__openedFromParent && !c?.__replacedParent
+        );
+        return candidates.length === 1 ? candidates[0] : null;
+    }
+
+    async function ensureMainBackpack() {
+        const eq = window.gameClient?.player?.equipment;
+        if (!eq) throw new Error("Equipment is unavailable");
+        const backpackSlot = Number(CONST?.EQUIPMENT?.BACKPACK ?? 6);
+        const it = peek(eq, backpackSlot);
+        if (!it || !isBag(it)) throw new Error("No backpack equipped");
+
+        let main = findLikelyMainBackpack(it);
+        if (main) return main;
+        if (typeof ItemUsePacket !== "function" || !window.gameClient?.send)
+            throw new Error("ItemUsePacket is unavailable");
+
+        const expectedCid = Number(it.id);
+        while (true) {
+            const lastReplyAt = Number(bot.containerAcks?.lastReplyAt?.()) || 0;
+            const waitGap = Math.max(Number(lastBagUseAt) || 0, lastReplyAt) + 1200 - Date.now();
+            if (waitGap <= 0) break;
+            await sleep(Math.min(waitGap, 120));
+        }
+        const afterSeq = containerAckSeq();
+        let release = null;
+        const acquireEnd = Date.now() + 2000;
+        while (!release && Date.now() < acquireEnd) {
+            release = bot.actions?.tryAcquireShared?.(
+                "depositer-main-bp",
+                bot.actions?.priorities?.UTILITY ?? 20,
+                150
+            ) || null;
+            if (!release) await sleep(40);
+        }
+        if (!release) throw new Error("Inventory use channel is busy");
+        let committed = false;
+        try {
+            window.gameClient.send(new ItemUsePacket({ which: eq, index: backpackSlot }));
+            lastBagUseAt = Date.now();
+            committed = true;
+        } finally {
+            release(committed);
+        }
+        let outcome;
+        try {
+            outcome = await waitContainerAck(event => {
+                if (!event || event.source !== "server" || Number(event?.cid) !== expectedCid) return false;
+                if (event.kind === "open")
+                    return event.ok !== false || event.registered === true || !!event.container;
+                if (event.kind === "close")
+                    return event.ok !== false;
+                return false;
+            }, afterSeq, "Main Backpack did not open");
+        } catch (error) {
+            logBackpackOpenTimeout("Main Backpack did not open", afterSeq, eq, backpackSlot, expectedCid);
+            throw error;
+        }
+
+        if (outcome.kind === "open") {
+            main = outcome.container || getContainerById(outcome.containerId) || findLikelyMainBackpack(it);
+            if (main) return main;
+            throw new Error("Main Backpack OPEN was acknowledged but no live container was registered");
+        }
+
+        // The equipment use toggled an already-open backpack closed. Reopen it
+        // exactly once after the confirmed CLOSE instead of timing out/polling.
+        bot.log("[Depositer] Main Backpack toggle-close confirmed; reopening", {
+            closedContainerId: Number(outcome.containerId) || null,
+            cid: expectedCid,
+            ackSeq: Number(outcome.seq) || null,
+        });
+        while (true) {
+            const lastReplyAt = Number(bot.containerAcks?.lastReplyAt?.()) || 0;
+            const waitGap = Math.max(Number(lastBagUseAt) || 0, lastReplyAt) + 1200 - Date.now();
+            if (waitGap <= 0) break;
+            await sleep(Math.min(waitGap, 120));
+        }
+        const reopenSeq = containerAckSeq();
+        let reopenRelease = null;
+        const reopenAcquireEnd = Date.now() + 2000;
+        while (!reopenRelease && Date.now() < reopenAcquireEnd) {
+            reopenRelease = bot.actions?.tryAcquireShared?.(
+                "depositer-main-bp",
+                bot.actions?.priorities?.UTILITY ?? 20,
+                150
+            ) || null;
+            if (!reopenRelease) await sleep(40);
+        }
+        if (!reopenRelease) throw new Error("Inventory use channel is busy");
+        let reopenCommitted = false;
+        try {
+            window.gameClient.send(new ItemUsePacket({ which: eq, index: backpackSlot }));
+            lastBagUseAt = Date.now();
+            reopenCommitted = true;
+        } finally {
+            reopenRelease(reopenCommitted);
+        }
+        try {
+            outcome = await waitContainerAck(event =>
+                event?.kind === "open" && event?.source === "server" &&
+                Number(event?.cid) === expectedCid &&
+                (event.ok !== false || event.registered === true || !!event.container),
+                reopenSeq,
+                "Main Backpack reopen was not confirmed"
+            );
+        } catch (error) {
+            logBackpackOpenTimeout("Main Backpack reopen was not confirmed", reopenSeq, eq, backpackSlot, expectedCid);
+            throw error;
+        }
+        main = outcome.container || getContainerById(outcome.containerId) || findLikelyMainBackpack(it);
+        if (!main) throw new Error("Main Backpack reopen ACK arrived but no live container was registered");
+        return main;
+    }
+
+    // Node paths use bag ordinal (not absolute item slot) so ordinary loot slot
+    // compaction does not invalidate a path while items are being removed.
+    async function resolvePath(rootProvider, path, rootKey = "tree") {
+        let c = getRunContainer(rootKey, []);
+        if (!c) {
+            c = await rootProvider();
+            if (!c) throw new Error("Container root is unavailable");
+            bindRunContainer(rootKey, [], c);
+        }
+
+        const resolved = [];
+        for (const ordinal of path) {
+            const bs = bagSlots(c);
+            if (ordinal < 0 || ordinal >= bs.length) throw new Error("Backpack tree changed while depositing");
+            const slot = bs[ordinal];
+            const sourceItem = peek(c, slot);
+            if (!sourceItem || !isBag(sourceItem))
+                throw new Error("Backpack tree changed while depositing");
+
+            resolved.push(Number(ordinal));
+            let child = getRunContainer(rootKey, resolved, c, sourceItem);
+            if (!child) {
+                child = await openChild(c, slot);
+                bindRunContainer(rootKey, resolved, child, c, sourceItem);
+            }
+            c = child;
+        }
+        return c;
+    }
+
+    async function findNamedPath(rootProvider, wantedName, boundaries = [], rootKey = "tree") {
+        const wanted = String(wantedName || "").trim().toLowerCase();
+        if (!wanted) return null;
+        const stopAt = new Set(boundaries.map(x => String(x || "").trim().toLowerCase()).filter(Boolean));
+        const queue = [[]];
+        let visits = 0;
+        while (queue.length) {
+            stopCheck();
+            if (++visits > 256) throw new Error(`Bag search limit reached while looking for ${wantedName}`);
+            const path = queue.shift();
+            const c = await resolvePath(rootProvider, path, rootKey);
+            const names = await requestBagNames(c);
+            const bs = bagSlots(c);
+            for (let ordinal = 0; ordinal < bs.length; ordinal++) {
+                const slot = bs[ordinal];
+                const label = String(names?.[slot] || "").trim();
+                const lower = label.toLowerCase();
+                const childPath = path.concat([ordinal]);
+                if (lower === wanted) return childPath;
+                if (!lower || !stopAt.has(lower)) queue.push(childPath);
+            }
+        }
+        return null;
+    }
+
+    async function walkTree(rootProvider, rootPath, visitor, max = 256, rootKey = "tree") {
+        const queue = [rootPath.slice()];
+        let visits = 0;
+        while (queue.length) {
+            stopCheck();
+            if (++visits > max) throw new Error("Backpack tree search limit reached");
+            const path = queue.shift();
+            const c = await resolvePath(rootProvider, path, rootKey);
+            const descend = await visitor(c, path);
+            if (descend === false) continue;
+            const bs = bagSlots(c);
+            for (let ordinal = 0; ordinal < bs.length; ordinal++) queue.push(path.concat([ordinal]));
+        }
+    }
+
+    async function buildManifest(rootProvider, sourcePath, rootKey = "tree") {
+        const totals = new Map();
+        const legacyKeep = new Set(config.keepItemIds.map(Number));
+        await walkTree(rootProvider, sourcePath, async c => {
+            for (let slot = 0; slot < slots(c); slot++) {
+                const it = peek(c, slot);
+                if (!it || isBag(it)) continue;
+                if (legacyKeep.has(Number(it.id))) continue;
+                const info = classify(it);
+                const key = [info.cid, info.sid||0, info.fluidType||0, info.tintId||0, info.group].join(":");
+                const row = totals.get(key) || { info, total: 0, amount: 0, key };
+                row.total += count(it);
+                totals.set(key, row);
+            }
+            return true;
+        }, 256, rootKey);
+        for (const row of totals.values()) {
+            const rule = config.rules.find(r => Number(r.sid) === Number(row.info.sid));
+            row.amount = Math.max(0, row.total - Math.max(0, Number(rule?.keep) || 0));
+        }
+        return [...totals.values()].filter(r => r.amount > 0);
+    }
+
+    async function findSourceStack(rootProvider, sourcePath, identity, rootKey = "tree") {
+        let hit = null;
+        await walkTree(rootProvider, sourcePath, async (c, path) => {
+            for (let slot = 0; slot < slots(c); slot++) {
+                const it = peek(c, slot);
+                if (!it || isBag(it)) continue;
+                if (sameIdentity(it, identity)) { hit = { c, path, slot, it, rootKey }; return false; }
+            }
+            return !hit;
+        }, 256, rootKey);
+        return hit;
+    }
+
+    async function findTargetSlot(rootProvider, targetPath, identity, rootKey = "tree") {
+        const queue = [targetPath.slice()];
+        let visits = 0;
+        while (queue.length) {
+            stopCheck();
+            if (++visits > 256) throw new Error("Destination backpack search limit reached");
+            const path = queue.shift();
+            const c = await resolvePath(rootProvider, path, rootKey);
+            let empty = null;
+            for (let slot = 0; slot < slots(c); slot++) {
+                const it = peek(c, slot);
+                if (!it && empty === null) empty = slot;
+                if (it && !isBag(it) && identity.stackable && sameIdentity(it, identity) && count(it) < 255) {
+                    return { c, path, slot, kind: "stack", rootKey };
+                }
+            }
+            if (empty !== null) return { c, path, slot: empty, kind: "empty", rootKey };
+            const bs = bagSlots(c);
+            for (let ordinal = 0; ordinal < bs.length; ordinal++) queue.push(path.concat([ordinal]));
+        }
+        return null;
+    }
+
+    function stampSlot(c, slot) { const it = peek(c, slot); return `${itemSig(it)}:${count(it)}`; }
+    async function moveConfirmed(source, target, amount) {
+        stopCheck();
+        if (!source?.c || !target?.c) throw new Error("Move source/destination unavailable");
+        if (typeof ItemMovePacket !== "function" || !window.gameClient?.send) throw new Error("ItemMovePacket is unavailable");
+
+        const liveSourceBefore = refreshCachedReference(source) || source.c;
+        const liveTargetBefore = refreshCachedReference(target) || target.c;
+        const srcBefore = stampSlot(liveSourceBefore, source.slot);
+        const dstBefore = stampSlot(liveTargetBefore, target.slot);
+        const n = Math.max(1, Math.min(255, Math.floor(Number(amount) || 1)));
+
+        let release = null;
+        const acquireEnd = Date.now() + 1800;
+        while (!release && Date.now() < acquireEnd) {
+            release = bot.actions?.tryAcquireShared?.("depositer", bot.actions?.priorities?.UTILITY ?? 20, 150) || null;
+            if (!release) await sleep(40);
+        }
+        if (!release) throw new Error("Inventory action channel is busy");
+
+        const beforeMoveAckSeq = containerAckSeq();
+        let sent = false;
+        try {
+            window.gameClient.send(new ItemMovePacket(
+                { which: liveSourceBefore, index: Number(source.slot) },
+                { which: liveTargetBefore, index: Number(target.slot) },
+                n
+            ));
+            sent = true;
+        } finally { release(sent); }
+
+        if (!sent) throw new Error("Item move was not sent");
+
+        // Prefer the actual server CONTAINER_REMOVE acknowledgement. Slot-state
+        // polling alone can false-negative when compaction moves an identical
+        // stack into the same source slot after a successful move.
+        const moveAckSeq = beforeMoveAckSeq;
+        let sourceAck = null;
+        try {
+            sourceAck = await waitContainerAck(event =>
+                event?.kind === "remove" && event?.source === "server" && event?.ok !== false &&
+                Number(event?.containerId) === Number(liveSourceBefore.__containerId) &&
+                Number(event?.slot) === Number(source.slot),
+                moveAckSeq,
+                "Source did not acknowledge the item move; no resend was made"
+            );
+        } catch (ackError) {
+            // Compatibility fallback if a reconnect replaced the PacketHandler
+            // hook mid-transaction: accept a verified live slot change.
+            await waitUntil(() => {
+                const live = refreshCachedReference(source);
+                return !!live && stampSlot(live, source.slot) !== srcBefore;
+            }, Math.min(config.ackMs, 1200), "Source did not confirm the item move; no resend was made");
+        }
+
+        // Destination ADD is useful telemetry/confirmation when its window stays
+        // open, but source REMOVE is already authoritative proof the move was
+        // processed. Do not fail a successful move merely because the target
+        // window was evicted/replaced before its ADD could be observed.
+        const liveTarget = refreshCachedReference(target);
+        if (liveTarget && typeof bot.containerAcks?.findAfter === "function") {
+            const addAck = bot.containerAcks.findAfter(moveAckSeq, event =>
+                event?.kind === "add" && event?.source === "server" && event?.ok !== false &&
+                Number(event?.containerId) === Number(liveTargetBefore.__containerId)
+            );
+            if (!addAck && stampSlot(liveTarget, target.slot) === dstBefore) {
+                // Briefly allow the destination packet to arrive, but never turn
+                // this into a blind resend/failure after source REMOVE succeeded.
+                try { await sleep(Math.min(160, config.moveDelayMs)); } catch (e) {}
+            }
+        }
+
+        state.movedStacks++;
+        state.movedItems += n;
+        await sleep(config.moveDelayMs);
+        return n;
+    }
+
+    function isDepotContainer(c) {
+        if (!c) return false;
+        try {
+            const ids = [CONST?.CONTAINER?.DEPOT, CONST?.CONTAINER?.STARFISH_DEPOT].filter(x => x !== undefined).map(Number);
+            if (ids.includes(Number(c.__containerId))) return true;
+        } catch (e) {}
+        return /depot/i.test(containerTitle(c));
+    }
+    function isLockerItem(it) {
+        if (!it) return false;
+        if ([3497,3498,3499,3500].includes(Number(it.id))) return true;
+        return String(itemDef(it.id)?.properties?.type || "").toLowerCase() === "depot";
+    }
+    function tileAt(pos) {
+        try { return window.gameClient?.world?.getTileFromWorldPosition?.(new Position(pos.x, pos.y, pos.z)) || null; }
+        catch (e) { return null; }
+    }
+    function tilePos(tile) {
+        const p = tile?.getPosition?.() || tile?.__position || tile?.position;
+        return p ? { x:Number(p.x), y:Number(p.y), z:Number(p.z) } : null;
+    }
+    function topItem(tile) {
+        try { return tile?.peekItem?.(0xFF) || tile?.items?.[tile.items.length - 1] || null; }
+        catch (e) { return null; }
+    }
+    function safeStand(pos) {
+        const tile = tileAt(pos); if (!tile) return false;
+        try { if (!tile.isWalkable?.() || tile.isItemBlocked?.() || tile.isOccupied?.()) return false; } catch (e) { return false; }
+        // Never choose a floor transition as the depot standing tile.
+        try {
+            const things = [tile, ...(tile.items || [])];
+            if (things.some(t => itemDef(t?.id)?.properties?.floorchange)) return false;
+        } catch (e) {}
+        return true;
+    }
+    function playerPos() {
+        const p = bot.getPlayerPosition?.() || window.gameClient?.player?.getPosition?.();
+        return p ? { x:Number(p.x), y:Number(p.y), z:Number(p.z) } : null;
+    }
+    function distance(a,b) { return a && b && a.z===b.z ? Math.max(Math.abs(a.x-b.x),Math.abs(a.y-b.y)) : Infinity; }
+
+    function findLockerCandidates() {
+        const me = playerPos(); if (!me) return [];
+        const out = [];
+        for (let dx=-config.radius; dx<=config.radius; dx++) for (let dy=-config.radius; dy<=config.radius; dy++) {
+            const p = {x:me.x+dx,y:me.y+dy,z:me.z};
+            const tile = tileAt(p); if (!tile) continue;
+            const it = topItem(tile); if (!isLockerItem(it)) continue;
+            const stands = [];
+            for (let sx=-1;sx<=1;sx++) for (let sy=-1;sy<=1;sy++) if (sx||sy) {
+                const s={x:p.x+sx,y:p.y+sy,z:p.z}; if (safeStand(s)) stands.push(s);
+            }
+            if (!stands.length) continue;
+            stands.sort((a,b)=>distance(me,a)-distance(me,b));
+            out.push({position:p,tile,item:it,stand:stands[0],distance:distance(me,stands[0])});
+        }
+        return out.sort((a,b)=>a.distance-b.distance);
+    }
+
+    async function walkTo(pos) {
+        const me = playerPos(); if (!me || !pos || me.z !== pos.z) return false;
+        if (distance(me,pos) === 0) return true;
+        const pf = window.gameClient?.world?.pathfinder;
+        if (!pf?.findPath) throw new Error("Pathfinder unavailable");
+        pf.findPath(new Position(me.x,me.y,me.z), new Position(pos.x,pos.y,pos.z), true);
+        await waitUntil(() => { const p=playerPos(); return p && distance(p,pos)===0; }, Math.max(6000, Math.min(config.waitMs, 30000)), "Could not reach depot locker");
+        return true;
+    }
+
+    async function openDepotLocker(locker) {
+        if (!locker?.tile) throw new Error("Depot locker unavailable");
+        const existing = openedContainers().find(isDepotContainer);
+        if (existing) return existing;
+        if (typeof ItemUsePacket !== "function") throw new Error("ItemUsePacket unavailable");
+        const afterSeq = containerAckSeq();
+        window.gameClient.send(new ItemUsePacket({ which: locker.tile, index: 0xFF }));
+        const ack = await waitContainerAck(event => {
+            if (event?.kind !== "open" || event?.source !== "server" || event?.ok === false) return false;
+            const c = event.container || getContainerById(event.containerId);
+            return !!c && isDepotContainer(c);
+        }, afterSeq, "Depot locker did not open");
+        return ack.container || getContainerById(ack.containerId);
+    }
+
+    function findDepotFrontier(anchor, visited=new Set()) {
+        const me=playerPos();if(!me||!anchor||me.z!==anchor.z)return null;
+        const candidates=[];
+        for(let dx=-config.radius;dx<=config.radius;dx++)for(let dy=-config.radius;dy<=config.radius;dy++){
+            const p={x:anchor.x+dx,y:anchor.y+dy,z:anchor.z};if(!safeStand(p))continue;
+            const key=`${p.x},${p.y},${p.z}`;if(visited.has(key))continue;
+            const frontier=[[1,0],[-1,0],[0,1],[0,-1]].some(([sx,sy])=>!tileAt({x:p.x+sx,y:p.y+sy,z:p.z}));
+            if(frontier)candidates.push({p,d:distance(me,p)});
+        }
+        candidates.sort((a,b)=>a.d-b.d);return candidates[0]?.p||null;
+    }
+    async function getDepotRoot() {
+        let depot = openedContainers().find(isDepotContainer) || null;
+        if (depot) return depot;
+        const start = Date.now(), anchor=playerPos(), visited=new Set();let explored=0;
+        while (Date.now() - start < config.waitMs) {
+            stopCheck();
+            const candidate = findLockerCandidates()[0];
+            if (candidate) {
+                statusMessage("seek", `Walking to depot locker (${candidate.position.x},${candidate.position.y})`);
+                await walkTo(candidate.stand);
+                state.locker = { ...candidate.position };
+                depot = await openDepotLocker(candidate);
+                if (depot) return depot;
+            }
+            if(explored<config.exploreSteps){
+                const frontier=findDepotFrontier(anchor,visited);
+                if(frontier){const key=`${frontier.x},${frontier.y},${frontier.z}`;visited.add(key);statusMessage("explore",`Exploring depot room ${explored+1}/${config.exploreSteps}`);try{await walkTo(frontier);explored++;continue;}catch(e){visited.add(key);}}
+            }
+            statusMessage("wait", "No reachable depot locker loaded; waiting for one to become visible");
+            await sleep(250);
+        }
+        throw new Error("No reachable depot locker found within the configured wait time");
+    }
+
+    async function runManual() {
+        const source = findOpenContainer(config.manualSourceId, config.manualSourceTitle);
+        const destination = findOpenContainer(config.destinationId, config.destinationTitle);
+        if (!source) throw new Error("Manual source backpack is not open/captured");
+        if (!destination) throw new Error("Manual destination backpack is not open/captured");
+        if (source === destination) throw new Error("Source and destination cannot be the same backpack");
+        const keep = new Set(config.keepItemIds.map(Number));
+        while (true) {
+            stopCheck();
+            let row = null;
+            for (const c of openedContainers().filter(x => x===source || x.__openedFromParent===source || x.__replacedParent===source || Number(x.__parentCid)===Number(source.__containerId))) {
+                for (let slot=0;slot<slots(c);slot++) {
+                    const it=peek(c,slot); if(!it || (config.skipContainers&&isBag(it)) || keep.has(Number(it.id))) continue;
+                    row={c,slot,it}; break;
+                }
+                if(row)break;
+            }
+            if(!row)break;
+            const id=identify(row.it);
+            let target=null;
+            for(const c of openedContainers().filter(x=>x===destination||x.__openedFromParent===destination||x.__replacedParent===destination||Number(x.__parentCid)===Number(destination.__containerId))) {
+                for(let slot=0;slot<slots(c);slot++){
+                    const it=peek(c,slot);
+                    if(it && id.stackable && sameIdentity(it,id) && count(it)<255){target={c,slot};break;}
+                    if(!it && !target)target={c,slot};
+                }
+                if(target)break;
+            }
+            if(!target)throw new Error("Manual destination tree is full");
+            await moveConfirmed(row,target,Math.min(255,count(row.it)));
+        }
+    }
+
+    async function runDepotRoom() {
+        statusMessage("source", `Finding inventory bag \"${config.sourceTitle}\"`);
+        const inventoryRootProvider = async () => ensureMainBackpack();
+        const sourcePath = await findNamedPath(inventoryRootProvider, config.sourceTitle, [], "inventory");
+        if (!sourcePath) throw new Error(`Could not find inventory BP named \"${config.sourceTitle}\"`);
+        const manifest = await buildManifest(inventoryRootProvider, sourcePath, "inventory");
+        if (!manifest.length) { statusMessage("complete", "Loot is empty or only contains kept items"); return true; }
+
+        const required = [...new Set(manifest.map(r=>r.info.group))];
+        for (const group of required) if (!config.bags[group]) throw new Error(`Destination bag is blank for ${GROUP_LABELS[group] || group}`);
+        if (new Set(required.map(g=>config.bags[g].toLowerCase())).size !== required.length) throw new Error("Each active depot group needs a different destination BP name");
+        state.plan = required.map(group=>({group,bag:config.bags[group],count:manifest.filter(r=>r.info.group===group).reduce((n,r)=>n+r.amount,0)}));
+        statusMessage("planned", state.plan.map(p=>`${p.bag}: ${p.count}`).join(" · "));
+
+        const depotRootProvider = async () => getDepotRoot();
+        const boundaries = Object.values(config.bags).filter(Boolean);
+        const targetPaths = new Map();
+        for (const group of required) {
+            stopCheck(); state.currentGroup = group;
+            statusMessage("destination", `Finding depot BP \"${config.bags[group]}\"`);
+            const path = await findNamedPath(depotRootProvider, config.bags[group], boundaries, "depot");
+            if (!path) throw new Error(`Depot BP \"${config.bags[group]}\" was not found`);
+            targetPaths.set(group, path);
+        }
+
+        for (const row of manifest) {
+            let remaining = row.amount;
+            while (remaining > 0) {
+                stopCheck();
+                state.currentGroup = row.info.group;
+                statusMessage("sort", `${row.info.name} → ${config.bags[row.info.group]} (${remaining} left)`);
+                const target = await findTargetSlot(depotRootProvider, targetPaths.get(row.info.group), row.info, "depot");
+                if (!target) throw new Error(`Destination BP \"${config.bags[row.info.group]}\" and its child bags are full`);
+                // Resolve source after target so an evicted source window is always fresh.
+                const source = await findSourceStack(inventoryRootProvider, sourcePath, row.info, "inventory");
+                if (!source) throw new Error(`Source item disappeared while depositing: ${row.info.name}`);
+                // If target was evicted while reopening source, resolve it again.
+                let liveTarget = target;
+                if (getContainerById(target.c.__containerId) !== target.c) {
+                    liveTarget = await findTargetSlot(depotRootProvider, targetPaths.get(row.info.group), row.info, "depot");
+                    if (!liveTarget) throw new Error(`Destination became unavailable: ${config.bags[row.info.group]}`);
+                }
+                const n = Math.min(remaining, count(source.it), 255);
+                await moveConfirmed(source, liveTarget, n);
+                remaining -= n;
+                state.groups[row.info.group] = (state.groups[row.info.group] || 0) + n;
+            }
+        }
+        state.currentGroup = null;
+        statusMessage("complete", `Depot complete · ${state.movedItems} items moved`);
+        return true;
+    }
+
+    async function run(options={}) {
+        if (state.running) return false;
+        if (window.gameClient?.player?.getTarget?.() || window.gameClient?.player?.__target) throw new Error("Cannot deposit while a combat target is active");
+        state.running=true; state.stopRequested=false; state.phase="starting"; state.message="Starting"; state.lastError=null;
+        state.movedStacks=0; state.movedItems=0; state.skipped=0; state.groups={}; state.plan=[]; state.lastRunAt=Date.now(); state.locker=null; state.currentGroup=null;
+        resetRunContainerCache();
+        bot.cave?.pauseMovement?.("depositer");
+        try {
+            if (config.workflow === "manual") await runManual();
+            else await runDepotRoom();
+            bot.log("[Depositer] Complete", {moved:state.movedItems,groups:state.groups});
+            if(typeof bot.showPanelNotification==="function")bot.showPanelNotification("📦 DEPOT COMPLETE",`${state.movedItems} items moved`,"depositer",8000);else bot.sendServerMessage?.(`Depot complete: ${state.movedItems} items moved`);
+            return true;
+        } catch (e) {
+            state.lastError=String(e?.message||e); statusMessage("error",state.lastError); bot.log("[Depositer]",state.lastError);
+            if(options.silent)return false; throw e;
+        } finally {
+            state.running=false; state.stopRequested=false;
+            runContainerCache.clear();
+            bot.cave?.resumeMovement?.("depositer");
+        }
+    }
+    function stop(){ if(!state.running)return false; state.stopRequested=true; state.phase="stopping"; state.message="Stopping"; return true; }
+
+    function updateConfig(patch={}) {
+        Object.keys(patch).forEach(k=>{
+            if(k==="bags")config.bags={...config.bags,...patch.bags};
+            else if(k==="rules")config.rules=patch.rules;
+            else if(Object.prototype.hasOwnProperty.call(config,k))config[k]=patch[k];
+        }); normalizeConfig(); persistConfig(); return status();
+    }
+    function addRule(sid, keep=0, group="auto") {
+        const n=Math.max(0,Math.floor(Number(sid)||0)); if(!n)return null;
+        const r={id:`rule-${Date.now()}-${Math.random().toString(36).slice(2,7)}`,sid:n,keep:Math.max(0,Math.floor(Number(keep)||0)),group};
+        config.rules.push(r); normalizeConfig(); persistConfig(); return {...r};
+    }
+    function updateRule(id,patch={}){const i=config.rules.findIndex(r=>r.id===id);if(i<0)return false;config.rules[i]={...config.rules[i],...patch,id};normalizeConfig();persistConfig();return true;}
+    function removeRule(id){const i=config.rules.findIndex(r=>r.id===id);if(i<0)return false;config.rules.splice(i,1);persistConfig();return true;}
+
+    function startCapture(kind) {
+        cancelCapture(); state.captureMode=kind;
+        const handler=e=>{
+            const el=e.target?.closest?.(".container-window, .window, [data-container-id]");
+            let c=null;
+            if(el){const id=Number(el.dataset?.containerId);if(Number.isFinite(id))c=getContainerById(id);}
+            if(!c){
+                const title=String(e.target?.closest?.(".window")?.querySelector?.(".window-title,.title")?.textContent||"").trim();
+                if(title)c=openedContainers().find(x=>containerTitle(x)===title)||null;
+            }
+            if(!c)return;
+            e.preventDefault();e.stopPropagation();
+            const patch=kind==="source"?{manualSourceId:Number(c.__containerId),manualSourceTitle:containerTitle(c)||config.manualSourceTitle}:{destinationId:Number(c.__containerId),destinationTitle:containerTitle(c)||config.destinationTitle};
+            updateConfig(patch); cancelCapture();
+        };
+        state.captureHandler=handler; document.addEventListener("click",handler,true);
+    }
+    function cancelCapture(){if(state.captureHandler)document.removeEventListener("click",state.captureHandler,true);state.captureHandler=null;state.captureMode=null;}
+
+    function status(){return{running:state.running,phase:state.phase,message:state.message,movedStacks:state.movedStacks,movedItems:state.movedItems,skipped:state.skipped,groups:{...state.groups},plan:state.plan.map(x=>({...x})),lastError:state.lastError,lastRunAt:state.lastRunAt,locker:state.locker?{...state.locker}:null,currentGroup:state.currentGroup,workflow:config.workflow,containerCacheSize:runContainerCache.size,containerCacheHits:runCacheStats.hits,containerCacheMisses:runCacheStats.misses,containerCacheBinds:runCacheStats.binds,containerCacheRebinds:runCacheStats.rebinds,containerCacheInvalidations:runCacheStats.invalidations};}
+    function addCaveWaypoint(insertIndex){const script=`return bot.depositer.run();`;return bot.cave?.addWaypoint?.({label:"Depot",script},insertIndex);}
+    bot.addCleanup(()=>{unsubscribeDepositerContainerAcks();cancelCapture();stop();bot.cave?.resumeMovement?.("depositer");});
+    bot.depositer={config,labels:GROUP_LABELS,updateConfig,addRule,updateRule,removeRule,run,runDepot:()=>{updateConfig({workflow:"depot-room"});return run();},runManual:()=>{updateConfig({workflow:"manual"});return run();},stop,status,selectSource:()=>startCapture("source"),selectDestination:()=>startCapture("destination"),cancelCapture,identify,classify,findLockerCandidates,addCaveWaypoint};
+};
+
+/**
+ * ==================================================================================
+ * NPC SUPPLY / TRADE MODULE
+ *     Full reference-style trade flow: Hi -> Trade -> live Offer window, exact
+ *     server count reads, fixed/fill-to buying, refill profiles and sell rows.
+ *     No purchase is resent until the expected inventory increase is confirmed.
+ * ==================================================================================
+ */
+window.__minibiaBotBundle.installNpcSupplyBuyerModule = function installNpcSupplyBuyerModule(bot) {
+    const configStorageKey="minibiaBot.npcSupplyBuyer.config";
+    const config=Object.assign({enabled:false,npcName:"",greeting:"hi",tradeKeyword:"trade",buyDelayMs:250,countTimeoutMs:5000,autoCooldownMs:15000,closeTradeAfter:true,supplyCheckOkLabel:"start",rules:[]},bot.storage.get(configStorageKey,{}));
+    const state={running:false,stopRequested:false,phase:"idle",lastError:null,lastRunAt:0,lastNpc:null,purchases:[],sales:[],lastAutoAttemptAt:0,timerId:null,lastTradeOffer:null,activeTrade:null,tradeSeq:0,tradeHookOwner:null,tradeHookOriginal:null,tradeHookWrapper:null,tradeHookRetryTimer:null};
+    const sleep=ms=>new Promise(r=>setTimeout(r,Math.max(0,Number(ms)||0)));
+    function makeRule(r={}){const name=String(r.name||"").trim();if(!name)return null;return{id:String(r.id||`supply-${Date.now()}-${Math.random().toString(36).slice(2,7)}`),enabled:r.enabled!==false,name,tradeName:String(r.tradeName||name).trim()||name,minCount:Math.max(0,Math.floor(Number(r.minCount)||0)),target:Math.max(0,Math.floor(Number(r.target??r.refillTarget)||0))};}
+    function normalize(){config.enabled=config.enabled===true;config.npcName=String(config.npcName||"").trim();config.greeting=String(config.greeting||"hi").trim()||"hi";config.tradeKeyword=String(config.tradeKeyword||"trade").trim()||"trade";config.buyDelayMs=Math.max(140,Math.min(3000,Number(config.buyDelayMs)||250));config.countTimeoutMs=Math.max(1200,Math.min(15000,Number(config.countTimeoutMs)||5000));config.autoCooldownMs=Math.max(5000,Math.min(300000,Number(config.autoCooldownMs)||15000));config.closeTradeAfter=config.closeTradeAfter!==false;config.supplyCheckOkLabel=String(config.supplyCheckOkLabel||"start").trim()||"start";config.rules=(Array.isArray(config.rules)?config.rules:[]).map(makeRule).filter(Boolean);}
+    normalize();
+    function persist(){bot.storage.set(configStorageKey,{...config,rules:config.rules.map(r=>({...r}))});}
+    function creatures(){const a=window.gameClient?.world?.activeCreatures||{};return a instanceof Map?Array.from(a.values()):Object.values(a);}
+    function findNpc(name=config.npcName){const wanted=String(name||"").trim().toLowerCase();const me=bot.getPlayerPosition?.();const list=creatures().filter(c=>{if(!c)return false;let npc=false;try{npc=Number(c.type)===Number(CONST?.TYPES?.NPC??2);}catch(e){npc=Number(c.type)===2;}return npc&&(!wanted||String(c.name||"").trim().toLowerCase()===wanted);});list.sort((a,b)=>{const pa=a.getPosition?.()||a.__position,pb=b.getPosition?.()||b.__position;const d=p=>p&&me?Math.max(Math.abs(p.x-me.x),Math.abs(p.y-me.y)):999;return d(pa)-d(pb);});return list[0]||null;}
+    // v1.6.22: modalManager.get("offer-modal") returns the registered reusable
+    // OfferModal even while it is CLOSED, and that object can retain __offers
+    // from the previous NPC. Only the modal manager's actual opened modal is a
+    // live trade. Optionally require the offer to belong to the NPC we are
+    // currently talking to so a different NPC's open/stale offer cannot satisfy
+    // the transaction.
+    function tradeModal(expectedNpcId=null){
+        try{
+            const mm=window.gameClient?.interface?.modalManager;
+            if(!mm)return null;
+            const registered=mm?.get?.("offer-modal")||null;
+            const opened=mm.__openedModal||null;
+            const isOpened=typeof mm.isOpened==="function"?!!mm.isOpened():!!opened;
+            if(!isOpened||!registered||opened!==registered)return null;
+            if(!Array.isArray(opened.__offers)||!opened.__offers.length)return null;
+            // The TRADE_OFFER packet id is authoritative for purchase packets,
+            // but it is not a safe hard equality check against the visible
+            // Creature.id on every Minibia build. A genuinely OPEN OfferModal is
+            // therefore accepted; any id mismatch is diagnostic only.
+            return opened;
+        }catch(e){return null;}
+    }
+    // v1.6.23: TRADE_OFFER is the authoritative acknowledgement that the server
+    // opened/closed an NPC trade. The UI modal can be visible while a polling
+    // check briefly fails (or its registered object identity differs), so record
+    // the packet before native UI handling and let the buyer consume that fresh
+    // server snapshot just like Depositer consumes container ACKs.
+    function cloneTradeOffers(offers){return(Array.isArray(offers)?offers:[]).map(o=>({...o}));}
+    function recordTradeOfferAck(packet){
+        const event={seq:++state.tradeSeq,at:Date.now(),npcId:Number(packet?.id)||0,offers:cloneTradeOffers(packet?.offers),source:"server"};
+        if(event.offers.length){state.lastTradeOffer=event;state.activeTrade=event;}
+        else{state.activeTrade=null;}
+        return event;
+    }
+    function detachTradeOfferHook(){
+        if(state.tradeHookRetryTimer!=null){window.clearTimeout(state.tradeHookRetryTimer);state.tradeHookRetryTimer=null;}
+        const owner=state.tradeHookOwner;
+        if(owner&&state.tradeHookWrapper&&owner.handleTradeOffer===state.tradeHookWrapper){
+            try{owner.handleTradeOffer=state.tradeHookOriginal;}catch(e){}
+        }
+        state.tradeHookOwner=null;state.tradeHookOriginal=null;state.tradeHookWrapper=null;
+    }
+    function ensureTradeOfferHook(){
+        const handler=window.gameClient?.networkManager?.packetHandler;
+        if(!handler||typeof handler.handleTradeOffer!=="function"){
+            if(state.tradeHookRetryTimer==null){state.tradeHookRetryTimer=window.setTimeout(()=>{state.tradeHookRetryTimer=null;ensureTradeOfferHook();},500);}
+            return false;
+        }
+        if(state.tradeHookOwner===handler&&state.tradeHookWrapper&&handler.handleTradeOffer===state.tradeHookWrapper)return true;
+        detachTradeOfferHook();
+        const original=handler.handleTradeOffer;
+        const wrapper=function(packet){
+            let ack=null;
+            try{ack=recordTradeOfferAck(packet);}catch(e){}
+            const result=original.call(this,packet);
+            if(ack&&ack.offers.length){
+                try{ack.modal=tradeModal();}catch(e){}
+                if(state.running)bot.log("[NPC Trade] TRADE_OFFER acknowledged",{seq:ack.seq,npcId:ack.npcId,offers:ack.offers.length,modalDetected:!!ack.modal});
+            }
+            return result;
+        };
+        state.tradeHookOwner=handler;state.tradeHookOriginal=original;state.tradeHookWrapper=wrapper;handler.handleTradeOffer=wrapper;
+        return true;
+    }
+    function sessionFromModal(modal){
+        if(!modal)return null;
+        return{seq:state.activeTrade?.seq||state.tradeSeq,at:Date.now(),npcId:Number(modal.__id)||0,offers:cloneTradeOffers(modal.__offers),modal,source:"modal"};
+    }
+    function tradeSession(expectedNpcId=null,{afterSeq=0,allowExistingAck=true}={}){
+        const modal=tradeModal(expectedNpcId);
+        if(modal)return sessionFromModal(modal);
+        const ack=state.activeTrade;
+        if(!allowExistingAck||!ack||!Array.isArray(ack.offers)||!ack.offers.length)return null;
+        if(Number(ack.seq)<=Number(afterSeq||0))return null;
+        // A fresh server TRADE_OFFER received during this transaction is the
+        // authoritative acknowledgement. Do not reject it merely because the
+        // client Creature.id and trade-service npcId differ.
+        return ack;
+    }
+    function currentTradeSession(){
+        const modal=tradeModal();
+        if(modal)return sessionFromModal(modal);
+        if(state.running&&state.activeTrade&&Array.isArray(state.activeTrade.offers)&&state.activeTrade.offers.length)return state.activeTrade;
+        return null;
+    }
+    function closeTradeWindow(){
+        try{
+            const mm=window.gameClient?.interface?.modalManager;
+            const registered=mm?.get?.("offer-modal")||null;
+            const opened=mm?.__openedModal||null;
+            const looksLikeOffer=!!opened&&(opened===registered||opened?.element?.id==="offer-modal");
+            if(looksLikeOffer)mm.close?.();
+        }catch(e){}
+        state.activeTrade=null;
+    }
+    ensureTradeOfferHook();
+    function dialog(){const d=window.gameClient?.interface?.npcDialog;const t=d?.__turn||{};return d?{visible:d.isVisible?.(),npc:t.npc||null,at:Number(t.at)||0,lines:Array.isArray(t.lines)?t.lines:[],keywords:Array.isArray(t.keywords)?t.keywords:[]}:null;}
+    function keywordAvailable(keyword,npcName,maxAge=6000){const wanted=String(keyword||"").trim().toLowerCase();const d=dialog();if(!d||!wanted)return false;if(npcName&&d.npc&&String(d.npc).toLowerCase()!==String(npcName).toLowerCase())return false;if(d.at&&Date.now()-d.at>maxAge)return false;return d.keywords.some(k=>String(k||"").replace(/'/g," ").trim().toLowerCase()===wanted)||d.lines.some(x=>new RegExp("\\{"+wanted.replace(/[.*+?^${}()|[\\]\\]/g,"\\$&")+"\\}","i").test(String(x||"")));}
+    async function waitFor(fn,timeout,msg){const end=Date.now()+timeout;while(Date.now()<end){if(state.stopRequested)throw new Error("NPC trade stopped");const v=fn();if(v)return v;await sleep(40);}throw new Error(msg||"NPC wait timeout");}
+    function say(text){return bot.sendChatToChannel?.(String(text||""),"Default")===true;}
+    async function greetAndOpenTrade(npc){
+        ensureTradeOfferHook();
+        const expectedNpcId=npc?.id??null;
+        const transactionSeq=state.tradeSeq;
+        let session=tradeSession(expectedNpcId,{afterSeq:0,allowExistingAck:false});
+        if(session)return session;
+
+        // Reuse an already-open live OfferModal only when it belongs to this NPC.
+        const alreadyLive=tradeModal(expectedNpcId);
+        if(alreadyLive)return sessionFromModal(alreadyLive);
+
+        // If some other NPC's trade is genuinely still open, close it first.
+        const otherLive=tradeModal();
+        if(otherLive){
+            // A genuinely open trade is usable regardless of the client-side
+            // creature-id representation. Closed/stale modals are already
+            // rejected by tradeModal().
+            return sessionFromModal(otherLive);
+        }
+
+        state.lastTradeOffer=null;
+        state.activeTrade=null;
+        const npcName=npc?.name||config.npcName||null;
+        const dialogBeforeHi=Number(dialog()?.at)||0;
+        state.phase="npc-hi";
+        bot.log(`[NPC Trade] sending ${config.greeting} to ${npcName||"nearby NPC"}`);
+        if(!say(config.greeting))throw new Error("Could not send NPC greeting");
+
+        let gotFreshTradeKeyword=false;
+        const firstEnd=Date.now()+2200;
+        while(Date.now()<firstEnd){
+            if(state.stopRequested)throw new Error("NPC trade stopped");
+            session=tradeSession(expectedNpcId,{afterSeq:transactionSeq,allowExistingAck:true});
+            if(session){bot.log("[NPC Trade] trade acknowledged after greeting");return session;}
+            const d=dialog();
+            if(Number(d?.at||0)>dialogBeforeHi&&keywordAvailable(config.tradeKeyword,npcName,4000)){
+                gotFreshTradeKeyword=true;
+                break;
+            }
+            await sleep(40);
+        }
+
+        if(!gotFreshTradeKeyword&&npc&&typeof NPCInteractPacket==="function"){
+            const dialogBeforeInteract=Number(dialog()?.at)||0;
+            state.phase="npc-greet-recovery";
+            bot.log(`[NPC Trade] greeting had no fresh trade reply – interacting with ${npcName||"NPC"}`);
+            try{window.gameClient.send(new NPCInteractPacket(npc.id));}catch(e){}
+            const recoveryEnd=Date.now()+1400;
+            while(Date.now()<recoveryEnd){
+                if(state.stopRequested)throw new Error("NPC trade stopped");
+                session=tradeSession(expectedNpcId,{afterSeq:transactionSeq,allowExistingAck:true});
+                if(session){bot.log("[NPC Trade] trade acknowledged after NPC interaction");return session;}
+                const d=dialog();
+                if(Number(d?.at||0)>dialogBeforeInteract&&keywordAvailable(config.tradeKeyword,npcName,5000)){
+                    gotFreshTradeKeyword=true;
+                    break;
+                }
+                await sleep(40);
+            }
+        }
+
+        session=tradeSession(expectedNpcId,{afterSeq:transactionSeq,allowExistingAck:true});
+        if(session)return session;
+        state.phase="npc-trade";
+        const beforeTradeSeq=state.tradeSeq;
+        bot.log(`[NPC Trade] sending ${config.tradeKeyword} to ${npcName||"nearby NPC"}`);
+        if(!say(config.tradeKeyword))throw new Error("Could not send NPC trade keyword");
+        session=await waitFor(()=>tradeSession(expectedNpcId,{afterSeq:beforeTradeSeq,allowExistingAck:true}),Math.max(8000,config.countTimeoutMs),"Trade offer timeout");
+        state.lastTradeOffer=session;
+        state.activeTrade=session;
+        bot.log("[NPC Trade] live trade offer acknowledged",{npc:npcName,npcId:Number(session?.npcId)||0,offers:Array.isArray(session?.offers)?session.offers.length:0,source:session?.source||"unknown",modalDetected:!!session?.modal});
+        return session;
+    }
+    function namedFluidType(name){
+        const q=String(name||"").trim().toLowerCase().replace(/\s+/g," ");
+        const fluids={"mana fluid":7,"mana fluids":7,"mana":7,"manas":7,"life fluid":10,"life fluids":10};
+        return Object.prototype.hasOwnProperty.call(fluids,q)?fluids[q]:0;
+    }
+    function offerFluidType(offer,requestedName=""){
+        const cid=Number(offer?.id)||0;
+        const explicit=namedFluidType(requestedName)||namedFluidType(offer?.name);
+        // Minibia's canonical supply fluids are vial subtypes. Keep an explicit
+        // name mapping so a missing/partial item-definition cannot collapse
+        // Mana Fluid 2874:7 or Life Fluid 2874:10 into an empty vial (2874:0).
+        if(cid===2874&&explicit)return explicit;
+        const def=window.gameClient?.itemDefinitionsByCid?.[cid];
+        const p=def?.properties||{};
+        if(p.fluidContainer||p.splash||p.type==="fluid")return Number(offer?.count)||explicit||0;
+        // Match the reference bot / native OfferModal: if definitions do not
+        // expose the fluid flag, ask Thing itself. Offer.count is the fluid
+        // subtype for FluidThing offers, not the purchase quantity.
+        try{
+            if(typeof Thing!=="undefined"){
+                const thing=new Thing(cid,Number(offer?.count)||0);
+                if(thing?.isFluidContainer?.()||thing?.isSplash?.())return Number(offer?.count)||explicit||0;
+            }
+        }catch(e){}
+        return explicit||0;
+    }
+    function findOffer(name,type="sell"){const session=currentTradeSession();if(!session)return null;const offers=Array.isArray(session.offers)?session.offers:[];const q=String(name||"").trim().toLowerCase();let rows=offers.map((o,i)=>({o,i})).filter(x=>!type||String(x.o.type||"").toLowerCase()===String(type).toLowerCase());let hit=rows.find(x=>String(x.o.name||"").trim().toLowerCase()===q);if(!hit){const fuzzy=rows.filter(x=>String(x.o.name||"").toLowerCase().includes(q));if(fuzzy.length===1)hit=fuzzy[0];}if(!hit)return null;const cid=Number(hit.o.id)||0;const fluidType=offerFluidType(hit.o,name);return{session,modal:session.modal||null,npcId:Number(session.npcId)||0,index:hit.i,offer:hit.o,cid,fluidType,name:String(hit.o.name||name)};}
+    function readExactCount(cid,fluidType=0,timeoutMs=config.countTimeoutMs){return new Promise((resolve,reject)=>{const id=Number(cid),fluid=Number(fluidType)||0,started=Date.now();let done=false,timer=null,off=()=>{};const finish=(fn,v)=>{if(done)return;done=true;if(timer)clearTimeout(timer);try{off();}catch(e){}fn(v);};off=bot.subscribeItemCounts?.(r=>{if(Number(r?.itemId)!==id||Number(r?.fluidType||0)!==fluid)return;if(Number(r?.at||0)+25<started)return;finish(resolve,Math.max(0,Math.floor(Number(r.count)||0)));})||(()=>{});timer=setTimeout(()=>finish(reject,new Error(`Supply count timeout for ${id}:${fluid}`)),timeoutMs);if(!bot.requestItemCounts?.([{id,fluidType:fluid}]))finish(reject,new Error("Server item-count request unavailable"));});}
+    async function waitCount(identity,expected){const end=Date.now()+config.countTimeoutMs;let last=null;while(Date.now()<end){if(state.stopRequested)throw new Error("NPC trade stopped");await sleep(config.buyDelayMs);last=await readExactCount(identity.cid,identity.fluidType);if(last>=expected)return last;}throw new Error(`${identity.name} purchase was not confirmed (got ${last??"?"}, expected ${expected})`);}
+    async function sendTrade(identity,count){const n=Math.max(1,Math.min(100,Math.floor(Number(count)||1)));if(typeof OfferBuyPacket!=="function")throw new Error("OfferBuyPacket unavailable");const npcId=Number(identity?.npcId||identity?.session?.npcId||identity?.modal?.__id)||0;if(!npcId)throw new Error("NPC trade identity has no NPC id");window.gameClient.send(new OfferBuyPacket(npcId,Number(identity.index),n));return n;}
+    async function buyToTarget(name,target){const identity=findOffer(name,"sell");if(!identity)throw new Error(`NPC does not sell: ${name}`);bot.log("[NPC Trade] resolved supply",{requested:name,offer:identity.name,cid:identity.cid,fluidType:identity.fluidType,offerCount:Number(identity.offer?.count)||0,offerIndex:identity.index,target:Math.max(0,Math.floor(Number(target)||0))});let current=await readExactCount(identity.cid,identity.fluidType);const result={name:identity.name,before:current,target,bought:0,cid:identity.cid,fluidType:identity.fluidType};while(current<target){const live=findOffer(name,"sell");if(!live||live.cid!==identity.cid||live.fluidType!==identity.fluidType)throw new Error(`NPC trade offer changed while buying ${name}`);const chunk=Math.min(100,target-current),expected=current+chunk;state.phase=`buying ${identity.name} (${current}/${target})`;await sendTrade(live,chunk);const confirmed=await waitCount(identity,expected);if(confirmed!==expected)throw new Error(`Inventory count changed unexpectedly while buying ${name}; stopped before another purchase`);result.bought+=confirmed-current;current=confirmed;}return result;}
+    async function buyFixed(name,amount){const identity=findOffer(name,"sell");if(!identity)throw new Error(`NPC does not sell: ${name}`);const before=await readExactCount(identity.cid,identity.fluidType);return buyToTarget(name,before+Math.max(0,Math.floor(Number(amount)||0)));}
+    function resolveInventoryIdentity(name){
+        const q=String(name||"").trim().toLowerCase().replace(/\s+/g," ");
+        const fluids={"mana fluid":7,"mana fluids":7,"mana":7,"manas":7,"life fluid":10,"life fluids":10};
+        if(Object.prototype.hasOwnProperty.call(fluids,q))return{cid:2874,fluidType:fluids[q],name};
+        const defs=window.gameClient?.itemDefinitionsByCid||{};const hits=Object.values(defs).filter(d=>String(d?.properties?.name||"").trim().toLowerCase()===q);
+        return hits.length===1?{cid:Number(hits[0].id),fluidType:0,name}:null;
+    }
+    function sellAmount(row,current){const mode=String(row?.mode||"all");if(mode==="all")return current;if(mode==="amount")return Math.min(current,Math.max(0,Math.floor(Number(row?.amount)||0)));if(mode==="keep")return Math.max(0,current-Math.max(0,Math.floor(Number(row?.keep)||0)));throw new Error("Invalid sell mode");}
+    async function sellItems(rows=[]){const out=[];for(const row of rows){const name=String(row?.name||row?.itemName||"").trim();if(!name)continue;const id=findOffer(name,"buy");if(!id){out.push({name,status:"not-offered",sold:0});continue;}const current=await readExactCount(id.cid,id.fluidType),amount=sellAmount(row,current);let remaining=amount,sold=0;while(remaining>0){const chunk=Math.min(100,remaining);await sendTrade(findOffer(name,"buy"),chunk);sold+=chunk;remaining-=chunk;await sleep(config.buyDelayMs);}out.push({name,before:current,requested:amount,sold,status:"sent"});}state.sales=out;return out;}
+    async function withTrade(fn,options={}){if(state.running)return false;ensureTradeOfferHook();if(window.gameClient?.player?.getTarget?.()||window.gameClient?.player?.__target)throw new Error("Cannot trade while a combat target is active");const npc=findNpc();if(config.npcName&&!npc)throw new Error(`Configured NPC is not nearby: ${config.npcName}`);if(!npc&&!tradeModal())throw new Error("No nearby NPC found");state.running=true;state.stopRequested=false;state.lastError=null;state.lastRunAt=Date.now();state.lastNpc=npc?.name||config.npcName||null;state.purchases=[];state.sales=[];state.activeTrade=null;bot.cave?.pauseMovement?.("npc-supply-buyer");try{const session=await greetAndOpenTrade(npc);state.activeTrade=session;return await fn();}catch(e){state.lastError=String(e?.message||e);state.phase="error";bot.log("[NPC Trade]",state.lastError);if(options.auto)return false;throw e;}finally{if(config.closeTradeAfter)closeTradeWindow();state.activeTrade=null;state.running=false;state.stopRequested=false;bot.cave?.resumeMovement?.("npc-supply-buyer");}}
+    async function buyNow(options={}){return withTrade(async()=>{const rules=config.rules.filter(r=>r.enabled!==false&&r.tradeName&&r.target>0);if(!rules.length)throw new Error("No enabled supply rules configured");for(const r of rules){const p=await buyToTarget(r.tradeName,r.target);p.ruleId=r.id;p.name=r.name;state.purchases.push(p);await sleep(config.buyDelayMs);}state.phase="complete";return true;},options);}
+    async function checkSupplies(){const rows=[];for(const r of config.rules.filter(x=>x.enabled!==false)){let identity=null,count=null,error=null;try{identity=currentTradeSession()?findOffer(r.tradeName,"sell"):null;if(!identity)identity=resolveInventoryIdentity(r.name);if(identity)count=await readExactCount(identity.cid,identity.fluidType);else error="item identity unresolved";}catch(e){error=String(e?.message||e);}rows.push({...r,count,low:Number.isFinite(count)?count<r.minCount:null,error});}return rows;}
+    function stop(){if(!state.running)return false;state.stopRequested=true;state.phase="stopping";return true;}
+    function setEnabled(v){config.enabled=v===true;persist();return config.enabled;}
+    function updateConfig(p={}){Object.keys(p).forEach(k=>{if(k==="rules")config.rules=p.rules;else if(Object.prototype.hasOwnProperty.call(config,k))config[k]=p[k];});normalize();persist();return status();}
+    function addRule(name,target=100,minCount=10,tradeName=null){const r=makeRule({name,target,minCount,tradeName:tradeName||name});if(!r)return null;config.rules.push(r);persist();return{...r};}
+    function updateRule(id,p={}){const i=config.rules.findIndex(r=>r.id===id);if(i<0)return false;const n=makeRule({...config.rules[i],...p,id});if(!n)return false;config.rules[i]=n;persist();return true;}
+    function removeRule(id){const i=config.rules.findIndex(r=>r.id===id);if(i<0)return false;config.rules.splice(i,1);persist();return true;}
+    function status(){return{running:state.running,enabled:config.enabled,phase:state.phase,lastError:state.lastError,lastRunAt:state.lastRunAt,lastNpc:state.lastNpc,purchases:state.purchases.map(x=>({...x})),sales:state.sales.map(x=>({...x})),nearbyNpc:findNpc()?.name||null,tradeOpen:!!currentTradeSession()};}
+    function autoTick(){if(!config.enabled||state.running||state.stopRequested)return;if(Date.now()-state.lastAutoAttemptAt<config.autoCooldownMs)return;if(window.gameClient?.player?.getTarget?.()||window.gameClient?.player?.__target)return;const npc=findNpc();if(!npc)return;state.lastAutoAttemptAt=Date.now();buyNow({auto:true}).catch(()=>{});}
+    state.timerId=setInterval(()=>{ensureTradeOfferHook();autoTick();},1000);bot.addCleanup(()=>{if(state.timerId)clearInterval(state.timerId);state.timerId=null;stop();closeTradeWindow();detachTradeOfferHook();bot.cave?.resumeMovement?.("npc-supply-buyer");});
+    async function runSupplyCheckWaypoint(okLabel=config.supplyCheckOkLabel||"start"){
+        const label=String(okLabel||"start").trim()||"start";
+        const rows=await checkSupplies();
+        if(!rows.length)throw new Error("Supply Check: no enabled supply rules configured");
+        const unknown=rows.filter(r=>r.low===null||r.error);
+        if(unknown.length){
+            const detail=unknown.map(r=>`${r.name}: ${r.error||"count unknown"}`).join(", ");
+            throw new Error(`Supply Check: ${detail}`);
+        }
+        const low=rows.filter(r=>r.low===true);
+        if(low.length){
+            // This branch deliberately continues into the resupply/return leg.
+            // Fence generic recovery to the remaining forward route so a local
+            // NO_WAY cannot snap back to a physically-close hunt waypoint that
+            // lies before this Supply Check. The Cave engine clears the fence on
+            // a legitimate wrap/manual jump/goToLabel.
+            bot.cave?.armForwardRecoveryFence?.("supply-check-low");
+            bot.log("[Supply Check WPT] LOW – continuing to next waypoint",low.map(r=>({name:r.name,count:r.count,minCount:r.minCount})));
+            return {result:"LOW",low:low.map(r=>({name:r.name,count:r.count,minCount:r.minCount}))};
+        }
+        const targetIndex=bot.getWaypointIndexByLabel?.(label)??-1;
+        if(targetIndex<0)throw new Error(`Supply Check: OK label "${label}" was not found`);
+        const route=bot.cave?.getRoute?.()||[];
+        if(route[targetIndex]&&route[targetIndex]===bot.cave?.getCurrentWaypoint?.())throw new Error(`Supply Check: OK label "${label}" points to this Supply Check waypoint`);
+        bot.log(`[Supply Check WPT] OK – jumping to label "${label}"`);
+        if(bot.goToLabel?.(label)!==true)throw new Error(`Supply Check: could not jump to label "${label}"`);
+        return {result:"OK",jumpLabel:label,targetIndex};
+    }
+    function addCaveWaypoint(insertIndex){const script=`return bot.npcSupplyBuyer.buyNow();`;return bot.cave?.addWaypoint?.({label:"Refill Supplies",script},insertIndex);}
+    function addSupplyCheckCaveWaypoint(okLabel=config.supplyCheckOkLabel||"start",insertIndex){
+        const label=String(okLabel||"start").trim()||"start";
+        updateConfig({supplyCheckOkLabel:label});
+        const script=`return bot.npcSupplyBuyer.runSupplyCheckWaypoint(${JSON.stringify(label)});`;
+        return bot.cave?.addWaypoint?.({label:`Supply Check OK → ${label}`,script},insertIndex);
+    }
+    bot.npcSupplyBuyer={config,setEnabled,updateConfig,addRule,updateRule,removeRule,buyNow,run:buyNow,buyFixed:(name,amount)=>withTrade(()=>buyFixed(name,amount)),buyTo:(name,target)=>withTrade(()=>buyToTarget(name,target)),sellItems:(rows)=>withTrade(()=>sellItems(rows)),checkSupplies,runSupplyCheckWaypoint,start:()=>setEnabled(true),stopAuto:()=>setEnabled(false),stop,status,findNpc,getTradeOffers:()=>{const session=currentTradeSession();return(Array.isArray(session?.offers)?session.offers:[]).map((offer,index)=>({index,...offer}));},tradeStatus:()=>({seq:state.tradeSeq,active:state.activeTrade?{seq:state.activeTrade.seq,at:state.activeTrade.at,npcId:state.activeTrade.npcId,offers:state.activeTrade.offers.length,source:state.activeTrade.source}:null,last:state.lastTradeOffer?{seq:state.lastTradeOffer.seq,at:state.lastTradeOffer.at,npcId:state.lastTradeOffer.npcId,offers:state.lastTradeOffer.offers.length}:null,modal:!!tradeModal()}),addCaveWaypoint,addSupplyCheckCaveWaypoint};
+};
+
+/**
+ * ==================================================================================
+ * BANK NPC TALKING MODULE
+ *     Reference-style bank dialogue recipes with Default-chat sends and reply/turn
+ *     acknowledgement between every line.
+ * ==================================================================================
+ */
+window.__minibiaBotBundle.installBankNpcModule = function installBankNpcModule(bot) {
+    const key="minibiaBot.bankNpc.config";
+    const config=Object.assign({npcName:"",greeting:"hi",npcDelayMs:250,actionTimeoutMs:5000,customLines:""},bot.storage.get(key,{}));
+    const state={running:false,stopRequested:false,phase:"idle",lastError:null,lastRunAt:0,lastNpc:null,lastPreset:null};
+    const sleep=ms=>new Promise(r=>setTimeout(r,Math.max(0,Number(ms)||0)));
+    function normalize(){config.npcName=String(config.npcName||"").trim();config.greeting=String(config.greeting||"hi").trim()||"hi";config.npcDelayMs=Math.max(0,Math.min(3000,Number(config.npcDelayMs)||250));config.actionTimeoutMs=Math.max(350,Math.min(30000,Number(config.actionTimeoutMs)||5000));config.customLines=String(config.customLines||"");}
+    normalize();const persist=()=>bot.storage.set(key,{...config});
+    function creatures(){const a=window.gameClient?.world?.activeCreatures||{};return a instanceof Map?Array.from(a.values()):Object.values(a);}
+    function findNpc(){const q=config.npcName.toLowerCase(),me=bot.getPlayerPosition?.();const list=creatures().filter(c=>{let npc=false;try{npc=Number(c?.type)===Number(CONST?.TYPES?.NPC??2);}catch(e){npc=Number(c?.type)===2;}return npc&&(!q||String(c.name||"").toLowerCase()===q);});list.sort((a,b)=>{const d=c=>{const p=c.getPosition?.()||c.__position;return p&&me?Math.max(Math.abs(p.x-me.x),Math.abs(p.y-me.y)):999};return d(a)-d(b)});return list[0]||null;}
+    function dialog(){const d=window.gameClient?.interface?.npcDialog,t=d?.__turn||{};return d?{npc:t.npc||null,at:Number(t.at)||0,lines:Array.isArray(t.lines)?t.lines:[]}:null;}
+    function say(text){return bot.sendChatToChannel?.(String(text||""),"Default")===true;}
+    async function waitTurnAfter(at){const end=Date.now()+config.actionTimeoutMs;while(Date.now()<end){if(state.stopRequested)throw new Error("Bank NPC action stopped");const d=dialog();if(d&&Number(d.at)>Number(at||0))return true;await sleep(40);}return false;}
+    function recipe(preset,amount,custom){if(preset==="deposit-all")return["deposit","all","yes"];if(preset==="withdraw")return["withdraw",String(Math.max(1,Math.floor(Number(amount)||1))),"yes"];if(preset==="custom")return String(custom??config.customLines).split(/\r?\n/).map(x=>x.trim()).filter(Boolean);throw new Error(`Unknown bank preset: ${preset}`);}
+    async function run(preset="deposit-all",amount=0,custom=null){if(state.running)return false;if(window.gameClient?.player?.getTarget?.()||window.gameClient?.player?.__target)throw new Error("Cannot use bank while a combat target is active");const npc=findNpc();if(config.npcName&&!npc)throw new Error(`Configured bank NPC is not nearby: ${config.npcName}`);state.running=true;state.stopRequested=false;state.phase="greet";state.lastError=null;state.lastRunAt=Date.now();state.lastNpc=npc?.name||config.npcName||null;state.lastPreset=preset;bot.cave?.pauseMovement?.("bank-npc");try{
+        if(npc&&typeof NPCInteractPacket==="function"){
+            const before=dialog()?.at||0;window.gameClient.send(new NPCInteractPacket(npc.id));await waitTurnAfter(before);
+        }else{
+            const before=dialog()?.at||0;if(!say(config.greeting))throw new Error("Could not send bank greeting");if(!await waitTurnAfter(before))await sleep(config.npcDelayMs);
+        }
+        const lines=recipe(preset,amount,custom);if(!lines.length)throw new Error("Bank dialogue recipe is empty");
+        for(let i=0;i<lines.length;i++){if(state.stopRequested)throw new Error("Bank NPC action stopped");state.phase=`line ${i+1}/${lines.length}`;const before=dialog()?.at||0;if(!say(lines[i]))throw new Error(`Could not send bank line: ${lines[i]}`);const got=await waitTurnAfter(before);if(!got)await sleep(config.npcDelayMs);}
+        await sleep(Math.max(120,config.npcDelayMs));state.phase="complete";bot.log(`[Bank NPC] ${preset} complete`);return true;
+    }catch(e){state.lastError=String(e?.message||e);state.phase="error";bot.log("[Bank NPC]",state.lastError);throw e;}finally{state.running=false;state.stopRequested=false;bot.cave?.resumeMovement?.("bank-npc");}}
+    function stop(){if(!state.running)return false;state.stopRequested=true;state.phase="stopping";return true;}
+    function updateConfig(p={}){Object.keys(p).forEach(k=>{if(Object.prototype.hasOwnProperty.call(config,k))config[k]=p[k];});normalize();persist();return status();}
+    function status(){return{running:state.running,phase:state.phase,lastError:state.lastError,lastRunAt:state.lastRunAt,lastNpc:state.lastNpc,lastPreset:state.lastPreset,nearbyNpc:findNpc()?.name||null};}
+    function addCaveWaypoint(preset="deposit-all",amount=0,custom="",insertIndex){const args=JSON.stringify([preset,Number(amount)||0,String(custom||"")]);const script=`{ const [preset,amount,custom] = ${args}; return bot.bankNpc.run(preset, amount, custom); }`;return bot.cave?.addWaypoint?.({label:preset==="withdraw"?`Bank Withdraw ${Number(amount)||0}`:preset==="custom"?"Bank Custom":"Bank Deposit All",script},insertIndex);}
+    bot.addCleanup(()=>{stop();bot.cave?.resumeMovement?.("bank-npc");});
+    bot.bankNpc={config,updateConfig,run,depositAll:()=>run("deposit-all"),withdraw:amount=>run("withdraw",amount),custom:lines=>run("custom",0,lines),stop,status,findNpc,addCaveWaypoint};
+};
+
 window.__minibiaBotBundle.installPanel = function installPanel(bot) {
     const panelPositionKey = "minibiaBot.ui.panelPosition";
     const panelCollapsedKey = "minibiaBot.ui.panelCollapsed";
@@ -41879,7 +44959,7 @@ function upgradeSectionHeaders(panel) {
                 status?.corpseMaxDistance ?? 12;
         }
         if (ammoLabel) {
-            ammoLabel.textContent = status?.ammoCount ?? 0;
+            ammoLabel.textContent = status?.ammoCountKnown === false ? "?" : (status?.ammoCount ?? 0);
         }
         if (handCountLabel) {
             // Get left hand count
@@ -42704,6 +45784,8 @@ function upgradeSectionHeaders(panel) {
                 countLabel.title = "Waiting for the server item count.";
             }
         }
+        const unequip98Toggle = document.getElementById("minibia-bot-equip-ring-unequip-98");
+        if (unequip98Toggle) unequip98Toggle.checked = !!bot.equipRing?.config?.unequipRingAt98;
         const warnToggle = document.getElementById("minibia-bot-equip-ring-warn");
         if (warnToggle) warnToggle.checked = !!bot.equipRing?.config?.warnMissingRing;
     }
@@ -44365,6 +47447,7 @@ function upgradeSectionHeaders(panel) {
   <div class="mb-tab-menu">
     <button type="button" class="mb-tab-button" data-tab-button="status">📊 Status</button>
     <button type="button" class="mb-tab-button" data-tab-button="cave">🏃‍♂️‍➡️ Cave Bot</button>
+    <button type="button" class="mb-tab-button" data-tab-button="resupply">📦 Resupply</button>
     <button type="button" class="mb-tab-button" data-tab-button="targeting">️⚔️ Targeting</button>
     <button type="button" class="mb-tab-button" data-tab-button="healing">💚 Healing</button>
     <button type="button" class="mb-tab-button" data-tab-button="looter">💰 Looter</button>
@@ -44847,6 +47930,7 @@ function upgradeSectionHeaders(panel) {
             <button type="button" class="mb-small-button" id="minibia-bot-equip-ring-select" title="Click, then click a ring in an open backpack or equipment slot" aria-label="Select ring item ID" aria-pressed="false" style="padding:3px 4px; min-width:22px; font-size:11px; line-height:1.2;">🔍</button>
             <span id="minibia-bot-equip-ring-count" title="Set a ring ID to use the server-side item count." style="font-size:10px; color:#aaa; min-width:24px; white-space:nowrap;"> </span>
           </div>
+          <label class="mb-toggle" style="margin:0; font-size:11px;" title="When mana is 98% or higher, safely stow the selected ring in inventory"><input type="checkbox" id="minibia-bot-equip-ring-unequip-98" /><span>Unequip Ring 98%</span></label>
           <label class="mb-toggle" style="margin:0; font-size:11px;" title="Alert at most once per minute when the server reports no matching ring in your full inventory"><input type="checkbox" id="minibia-bot-equip-ring-warn" /><span>Alert missing ring</span></label>
         </div>
         <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-pink-skull-enabled" /><span>Pink Skull</span></label>
@@ -44855,6 +47939,7 @@ function upgradeSectionHeaders(panel) {
       </div>
     </div>
   </div>
+
 
   <!-- Fisher -->
   <div class="mb-section">
@@ -44891,6 +47976,115 @@ function upgradeSectionHeaders(panel) {
       <button type="button" class="mb-small-button" id="minibia-bot-outfit-randomizer-now" style="padding:4px 14px;font-size:11px;">Randomize Now</button>
       <span style="font-size:11px; color:#cdbb8b;" id="minibia-bot-outfit-randomizer-status">Idle</span>
     </div>
+  </div>
+
+</div>
+
+<!-- Resupply Tab -->
+<div class="mb-tab-panel" data-tab-panel="resupply">
+  <div class="mb-small-note" style="margin:0 0 8px 2px;">Depot, NPC supplies and bank actions. These settings are shared with the Cavebot WPT shortcuts.</div>
+  <!-- Item Depositer / Depot Room -->
+  <div class="mb-section">
+    <div class="mb-section-title"><span class="mb-title-text">📦 Depositer / Depot Room</span></div>
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px 8px;align-items:end;">
+      <label class="mb-field"><span class="mb-field-label">Workflow</span><select id="minibia-bot-depositer-workflow"><option value="depot-room">Depot Room (auto)</option><option value="manual">Open BP → BP</option></select></label>
+      <label class="mb-field"><span class="mb-field-label">Sorting</span><select id="minibia-bot-depositer-mode"><option value="npc">Stackables + NPC</option><option value="split">Stackables / Unstackables</option><option value="all">All together</option></select></label>
+      <label class="mb-field"><span class="mb-field-label">Loot BP name</span><input id="minibia-bot-depositer-source" placeholder="Loot" /></label>
+      <label class="mb-field"><span class="mb-field-label">Move delay ms</span><input type="number" id="minibia-bot-depositer-delay" min="80" max="2000" step="20" value="220" /></label>
+      <label class="mb-field"><span class="mb-field-label">Locker radius</span><input type="number" id="minibia-bot-depositer-radius" min="3" max="30" value="14" /></label>
+      <label class="mb-field"><span class="mb-field-label">Explore steps</span><input type="number" id="minibia-bot-depositer-explore" min="0" max="30" value="8" /></label>
+      <label class="mb-field"><span class="mb-field-label">Locker wait sec</span><input type="number" id="minibia-bot-depositer-wait" min="5" max="300" value="60" /></label>
+      <label class="mb-field"><span class="mb-field-label">ACK timeout ms</span><input type="number" id="minibia-bot-depositer-ack" min="1500" max="15000" step="250" value="4000" /></label>
+      <label class="mb-field"><span class="mb-field-label">Legacy keep CIDs</span><input id="minibia-bot-depositer-keep" placeholder="3031, 3492" /></label>
+    </div>
+    <div class="mb-small-note" style="margin:7px 0 4px;">Depot destination BP names</div>
+    <div id="minibia-bot-depositer-bags" style="display:grid;grid-template-columns:repeat(4,1fr);gap:5px 8px;"></div>
+    <div class="mb-small-note" style="margin:8px 0 4px;">Per-item rules (SID · keep amount · forced group). Leave group on Auto to use the selected sorting mode.</div>
+    <div id="minibia-bot-depositer-rules" style="display:flex;flex-direction:column;gap:4px;"></div>
+    <div style="display:grid;grid-template-columns:90px 80px 1fr auto;gap:5px;margin-top:5px;">
+      <input type="number" id="minibia-bot-depositer-new-sid" placeholder="SID" min="1" />
+      <input type="number" id="minibia-bot-depositer-new-keep" placeholder="Keep" min="0" value="0" />
+      <select id="minibia-bot-depositer-new-group"><option value="auto">Auto</option><option value="all">All loot</option><option value="stackables">Stackables</option><option value="unstackables">Unstackables</option><option value="green">Green Djinn</option><option value="blue">Blue Djinn</option><option value="rashid">Rashid</option><option value="other">Other</option><option value="unsorted">Unsorted</option></select>
+      <button type="button" class="mb-small-button" id="minibia-bot-depositer-add-rule">Add rule</button>
+    </div>
+    <div style="border-top:1px solid rgba(255,255,255,.08);margin-top:8px;padding-top:7px;display:grid;grid-template-columns:1fr 1fr;gap:6px 10px;align-items:end;">
+      <label class="mb-field"><span class="mb-field-label">Manual source BP</span><div style="display:flex;gap:4px;"><input id="minibia-bot-depositer-manual-source" style="min-width:0;flex:1;"/><button type="button" class="mb-small-button" id="minibia-bot-depositer-source-pick">Pick</button></div></label>
+      <label class="mb-field"><span class="mb-field-label">Manual destination BP</span><div style="display:flex;gap:4px;"><input id="minibia-bot-depositer-destination" style="min-width:0;flex:1;"/><button type="button" class="mb-small-button" id="minibia-bot-depositer-destination-pick">Pick</button></div></label>
+    </div>
+    <div style="display:flex;gap:6px;align-items:center;margin-top:7px;flex-wrap:wrap;">
+      <button type="button" class="mb-small-button" id="minibia-bot-depositer-run">Run Depositer</button>
+      <button type="button" class="mb-small-button" id="minibia-bot-depositer-stop">Stop</button>
+      <button type="button" class="mb-small-button" id="minibia-bot-depositer-add-wp">+ Cave WP</button>
+      <span class="mb-small-note" id="minibia-bot-depositer-status" style="margin:0;">Idle</span>
+    </div>
+    <div class="mb-small-note" style="margin-top:5px;">Depot Room mode finds the named Loot BP, inventories it first, finds a reachable depot locker, opens the configured destination BPs and continues into child bags when full. Every item move is acknowledged before another packet is sent.</div>
+  </div>
+
+  <!-- NPC Supply Buyer / Seller -->
+  <div class="mb-section">
+    <div class="mb-section-title"><input type="checkbox" id="minibia-bot-npc-supply-enabled" class="mb-title-toggle" /><span class="mb-title-text">🛒 NPC Supply / Trade</span></div>
+    <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:6px 8px;align-items:end;">
+      <label class="mb-field"><span class="mb-field-label">NPC name</span><input id="minibia-bot-npc-supply-name" placeholder="Sandra" /></label>
+      <label class="mb-field"><span class="mb-field-label">Greeting</span><input id="minibia-bot-npc-supply-greeting" value="hi" /></label>
+      <label class="mb-field"><span class="mb-field-label">Trade word</span><input id="minibia-bot-npc-supply-trade" value="trade" /></label>
+      <label class="mb-field"><span class="mb-field-label">Delay ms</span><input type="number" id="minibia-bot-npc-supply-delay" min="140" max="3000" step="20" value="250" /></label>
+      <label class="mb-field"><span class="mb-field-label">Count timeout ms</span><input type="number" id="minibia-bot-npc-supply-timeout" min="1200" max="15000" step="250" value="5000" /></label>
+    </div>
+    <div class="mb-small-note" style="margin:7px 0 4px;">Supply profile: LOW threshold is informational; Refill To is the total inventory count to buy up to.</div>
+    <div id="minibia-bot-npc-supply-rules" style="display:flex;flex-direction:column;gap:4px;"></div>
+    <div style="display:grid;grid-template-columns:1fr 80px 80px 1fr auto;gap:5px;margin-top:6px;align-items:center;">
+      <input id="minibia-bot-npc-supply-new-name" placeholder="Item name" />
+      <input type="number" id="minibia-bot-npc-supply-new-min" min="0" value="10" title="LOW below" />
+      <input type="number" id="minibia-bot-npc-supply-new-target" min="0" value="100" title="Refill target" />
+      <input id="minibia-bot-npc-supply-new-trade" placeholder="NPC offer name (optional)" />
+      <button type="button" class="mb-small-button" id="minibia-bot-npc-supply-add">Add</button>
+    </div>
+    <div style="display:flex;gap:6px;align-items:center;margin-top:7px;flex-wrap:wrap;">
+      <button type="button" class="mb-small-button" id="minibia-bot-npc-supply-run">Refill Now</button>
+      <button type="button" class="mb-small-button" id="minibia-bot-npc-supply-check">Check Supplies</button>
+      <button type="button" class="mb-small-button" id="minibia-bot-npc-supply-stop">Stop</button>
+      <button type="button" class="mb-small-button" id="minibia-bot-npc-supply-add-wp">+ Resupply WPT</button>
+      <label class="mb-toggle" style="margin:0;font-size:11px;"><input type="checkbox" id="minibia-bot-npc-supply-close" checked /> Close trade after</label>
+      <span class="mb-small-note" id="minibia-bot-npc-supply-status" style="margin:0;">Idle</span>
+    </div>
+    <div style="display:flex;gap:6px;align-items:center;margin-top:6px;flex-wrap:wrap;">
+      <label style="display:flex;gap:5px;align-items:center;font-size:11px;color:#e9d39b;"><span>Supply Check OK → label</span><input id="minibia-bot-npc-supply-check-ok-label" value="start" style="width:110px;padding:3px 5px;font-size:11px;" /></label>
+      <button type="button" class="mb-small-button" id="minibia-bot-npc-supply-add-check-wp">+ Supply Check WPT</button>
+      <span class="mb-small-note" style="margin:0;">LOW continues to the next waypoint. OK jumps with bot.goToLabel(label).</span>
+    </div>
+    <div style="border-top:1px solid rgba(255,255,255,.08);margin-top:8px;padding-top:7px;">
+      <div class="mb-small-note" style="margin-bottom:4px;">One-off trade actions</div>
+      <div style="display:grid;grid-template-columns:1fr 100px 100px 90px auto auto;gap:5px;align-items:center;">
+        <input id="minibia-bot-npc-oneoff-name" placeholder="Item name" />
+        <input type="number" id="minibia-bot-npc-oneoff-value" min="0" value="100" />
+        <select id="minibia-bot-npc-oneoff-buy-mode"><option value="fill">Buy to total</option><option value="fixed">Buy fixed</option></select>
+        <select id="minibia-bot-npc-oneoff-sell-mode"><option value="all">Sell all</option><option value="amount">Sell amount</option><option value="keep">Sell, keep X</option></select>
+        <button type="button" class="mb-small-button" id="minibia-bot-npc-oneoff-buy">Buy</button>
+        <button type="button" class="mb-small-button" id="minibia-bot-npc-oneoff-sell">Sell</button>
+      </div>
+    </div>
+    <div class="mb-small-note" style="margin-top:5px;">Uses the normal Default-chat NPC conversation: Hi → Trade → live structured offer. Purchases use exact server inventory counts and are confirmed before another purchase is sent.</div>
+  </div>
+
+  <!-- Bank NPC -->
+  <div class="mb-section">
+    <div class="mb-section-title"><span class="mb-title-text">🏦 Bank NPC</span></div>
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px 8px;align-items:end;">
+      <label class="mb-field"><span class="mb-field-label">NPC name</span><input id="minibia-bot-bank-name" placeholder="Banker name (blank = nearest NPC)" /></label>
+      <label class="mb-field"><span class="mb-field-label">Greeting</span><input id="minibia-bot-bank-greeting" value="hi" /></label>
+      <label class="mb-field"><span class="mb-field-label">Fallback delay ms</span><input type="number" id="minibia-bot-bank-delay" min="0" max="3000" value="250" /></label>
+      <label class="mb-field"><span class="mb-field-label">Reply timeout ms</span><input type="number" id="minibia-bot-bank-timeout" min="350" max="30000" value="5000" /></label>
+      <label class="mb-field"><span class="mb-field-label">Preset</span><select id="minibia-bot-bank-preset"><option value="deposit-all">Deposit all</option><option value="withdraw">Withdraw amount</option><option value="custom">Custom dialogue</option></select></label>
+      <label class="mb-field"><span class="mb-field-label">Amount</span><input type="number" id="minibia-bot-bank-amount" min="1" value="1000" /></label>
+      <label class="mb-field" style="grid-column:span 2;"><span class="mb-field-label">Custom lines (one per line)</span><textarea id="minibia-bot-bank-custom" rows="2" style="resize:vertical;"></textarea></label>
+    </div>
+    <div style="display:flex;gap:6px;align-items:center;margin-top:7px;flex-wrap:wrap;">
+      <button type="button" class="mb-small-button" id="minibia-bot-bank-run">Run Bank Action</button>
+      <button type="button" class="mb-small-button" id="minibia-bot-bank-stop">Stop</button>
+      <button type="button" class="mb-small-button" id="minibia-bot-bank-add-wp">+ Cave WP</button>
+      <span class="mb-small-note" id="minibia-bot-bank-status" style="margin:0;">Idle</span>
+    </div>
+    <div class="mb-small-note" style="margin-top:5px;">Deposit all recipe: deposit → all → yes. Withdraw recipe: withdraw → amount → yes. Each line waits for a new NPC turn/reply before continuing and always sends through Default chat.</div>
   </div>
 
 </div>
@@ -44943,21 +48137,35 @@ function upgradeSectionHeaders(panel) {
             <option value="SW">SW</option><option value="S">S</option><option value="SE">SE</option>
           </select>
         </div>
-
-        <span style="color:#666;">|</span>
-        <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-cave-stand" /> Stand</label>
-        <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-cave-rope" /> Rope</label>
-        <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-cave-shovel" /> Shovel</label>
-        <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-cave-ladder" /> Ladder</label>
       </div>
 
       <div style="display:grid; grid-template-columns:repeat(5, 1fr); gap:4px;">
-        <button type="button" class="mb-small-button" id="minibia-bot-cave-add" style="padding:4px;">+ Add</button>
+        <button type="button" class="mb-small-button" id="minibia-bot-cave-add" style="padding:4px;">+ Walk</button>
+        <button type="button" class="mb-small-button" id="minibia-bot-cave-add-stand" style="padding:4px;">+ Stand</button>
+        <button type="button" class="mb-small-button" id="minibia-bot-cave-add-rope" style="padding:4px;">+ Rope</button>
+        <button type="button" class="mb-small-button" id="minibia-bot-cave-add-shovel" style="padding:4px;">+ Shovel</button>
+        <button type="button" class="mb-small-button" id="minibia-bot-cave-add-ladder" style="padding:4px;">+ Ladder</button>
+      </div>
+
+      <div style="display:grid; grid-template-columns:repeat(5, 1fr); gap:4px; margin-top:5px;">
         <button type="button" class="mb-small-button" id="minibia-bot-cave-add-script" style="padding:4px;">+ Script</button>
+        <button type="button" class="mb-small-button" id="minibia-bot-cave-add-use" style="padding:4px;">USE</button>
         <button type="button" class="mb-small-button" id="minibia-bot-cave-move-up" style="padding:4px;">▲</button>
         <button type="button" class="mb-small-button" id="minibia-bot-cave-move-down" style="padding:4px;">▼</button>
         <button type="button" class="mb-small-button" id="minibia-bot-cave-delete-selected" style="padding:4px; background:#5a2020; border-color:#883030;">✕</button>
       </div>
+
+      <div style="display:grid; grid-template-columns:repeat(4, 1fr); gap:4px; margin-top:5px;">
+        <button type="button" class="mb-small-button" id="minibia-bot-cave-add-depot-wp" style="padding:4px;">📦 Depot WPT</button>
+        <button type="button" class="mb-small-button" id="minibia-bot-cave-add-supply-wp" style="padding:4px;">🛒 Resupply WPT</button>
+        <button type="button" class="mb-small-button" id="minibia-bot-cave-add-supply-check-wp" style="padding:4px;">✅ Supply Check WPT</button>
+        <button type="button" class="mb-small-button" id="minibia-bot-cave-add-bank-wp" style="padding:4px;">🏦 Bank NPC WPT</button>
+      </div>
+      <div style="display:flex;gap:6px;align-items:center;margin-top:5px;flex-wrap:wrap;">
+        <label style="display:flex;gap:5px;align-items:center;font-size:11px;color:#e9d39b;"><span>Supply Check OK → label</span><input id="minibia-bot-cave-supply-check-ok-label" value="start" style="width:110px;padding:3px 5px;font-size:11px;" /></label>
+        <span class="mb-small-note" style="margin:0;">LOW = continue · OK = bot.goToLabel(label)</span>
+      </div>
+      <div class="mb-small-note" style="margin-top:4px;">Uses the current settings from the Resupply tab and inserts after the selected waypoint.</div>
     </div>
 
     <!-- Waypoints -->
@@ -45592,6 +48800,10 @@ function upgradeSectionHeaders(panel) {
         <input type="checkbox" id="minibia-bot-follow-nonpvp" />
         <span>Non-PvP: walk inside player</span>
       </label>
+      <label class="mb-toggle">
+        <input type="checkbox" id="minibia-bot-follow-during-target" />
+        <span>Follow During Target</span>
+      </label>
       <div class="mb-small-note" id="minibia-bot-follow-status">Status: idle</div>
     </div>
   </div>
@@ -45818,6 +49030,7 @@ function upgradeSectionHeaders(panel) {
         const equipRingToggle = panel.querySelector("#minibia-bot-equip-ring-enabled");
         const equipRingId = panel.querySelector("#minibia-bot-equip-ring-id");
         const equipRingSelect = panel.querySelector("#minibia-bot-equip-ring-select");
+        const equipRingUnequip98 = panel.querySelector("#minibia-bot-equip-ring-unequip-98");
         const equipRingWarn = panel.querySelector("#minibia-bot-equip-ring-warn");
         if (equipRingToggle) {
             equipRingToggle.checked = !!bot.equipRing?.status?.().running;
@@ -45839,6 +49052,13 @@ function upgradeSectionHeaders(panel) {
         if (equipRingSelect) {
             equipRingSelect.addEventListener("click", function () {
                 bot.equipRing?.startCaptureRing?.();
+                refreshEquipRingStatus();
+            });
+        }
+        if (equipRingUnequip98) {
+            equipRingUnequip98.checked = !!bot.equipRing?.config?.unequipRingAt98;
+            equipRingUnequip98.addEventListener("change", function () {
+                bot.equipRing?.updateConfig?.({ unequipRingAt98: this.checked });
                 refreshEquipRingStatus();
             });
         }
@@ -46318,6 +49538,10 @@ function upgradeSectionHeaders(panel) {
             panel.querySelector(
                 "#minibia-bot-follow-nonpvp"
             );
+        const followDuringTargetToggle =
+            panel.querySelector(
+                "#minibia-bot-follow-during-target"
+            );
         const followStatus =
             panel.querySelector(
                 "#minibia-bot-follow-status"
@@ -46331,6 +49555,11 @@ function upgradeSectionHeaders(panel) {
                 ?.checked
                 ? "nonpvp"
                 : "pvp";
+        }
+
+        function getFollowDuringTarget() {
+            return followDuringTargetToggle
+                ?.checked === true;
         }
 
         function refreshFollowStatus() {
@@ -46351,8 +49580,16 @@ function upgradeSectionHeaders(panel) {
                     followStatus.textContent =
                         getFollowMode() ===
                             "nonpvp"
-                            ? "Following (Non-PvP stack)"
-                            : "Following (PvP adjacent)";
+                            ? `Following (Non-PvP stack${
+                                getFollowDuringTarget()
+                                    ? " + target"
+                                    : ""
+                            })`
+                            : `Following (PvP adjacent${
+                                getFollowDuringTarget()
+                                    ? " + target"
+                                    : ""
+                            })`;
                 }
             }
         }
@@ -46418,6 +49655,15 @@ function upgradeSectionHeaders(panel) {
                 JSON.stringify(
                     mode === "nonpvp"
                 )
+            );
+            localStorage.setItem(
+                "minibiaBot.follow.duringTarget",
+                JSON.stringify(
+                    getFollowDuringTarget()
+                )
+            );
+            bot.setFollowDuringTarget?.(
+                getFollowDuringTarget()
             );
 
             function isLeaderAlive(
@@ -46500,7 +49746,11 @@ function upgradeSectionHeaders(panel) {
             // FollowPacket is used to start or maintain PvP-tab Auto Follow.
             bot.follow(
                 name,
-                { mode }
+                {
+                    mode,
+                    allowDuringTarget:
+                        getFollowDuringTarget()
+                }
             );
 
             followInterval =
@@ -46521,8 +49771,12 @@ function upgradeSectionHeaders(panel) {
                             return;
                         }
 
-                        // Preserve the existing behavior: combat owns movement.
-                        if (hasTarget()) {
+                        // Default behavior stays unchanged unless the user
+                        // explicitly allows Follow to keep moving during combat.
+                        if (
+                            hasTarget() &&
+                            !getFollowDuringTarget()
+                        ) {
                             bot.stopFollowMovement?.();
                             return;
                         }
@@ -46531,7 +49785,9 @@ function upgradeSectionHeaders(panel) {
                             name,
                             {
                                 mode:
-                                    getFollowMode()
+                                    getFollowMode(),
+                                allowDuringTarget:
+                                    getFollowDuringTarget()
                             }
                         );
                     },
@@ -46555,6 +49811,10 @@ function upgradeSectionHeaders(panel) {
                     localStorage.getItem(
                         "minibiaBot.follow.nonpvp"
                     );
+                const savedDuringTarget =
+                    localStorage.getItem(
+                        "minibiaBot.follow.duringTarget"
+                    );
 
                 if (
                     followNonPvpToggle
@@ -46562,6 +49822,17 @@ function upgradeSectionHeaders(panel) {
                     followNonPvpToggle.checked =
                         savedNonPvp ===
                         "true";
+                }
+
+                if (
+                    followDuringTargetToggle
+                ) {
+                    followDuringTargetToggle.checked =
+                        savedDuringTarget ===
+                        "true";
+                    bot.setFollowDuringTarget?.(
+                        followDuringTargetToggle.checked
+                    );
                 }
 
                 if (saved === "true") {
@@ -46604,6 +49875,33 @@ function upgradeSectionHeaders(panel) {
                             // Cancel the old adjacent/stack route immediately
                             // and restart with the new destination semantics.
                             bot.stopFollow();
+                            startFollow();
+                        } else {
+                            refreshFollowStatus();
+                        }
+                    }
+                );
+        }
+
+        if (followDuringTargetToggle) {
+            followDuringTargetToggle
+                .addEventListener(
+                    "change",
+                    function () {
+                        localStorage.setItem(
+                            "minibiaBot.follow.duringTarget",
+                            JSON.stringify(
+                                this.checked
+                            )
+                        );
+
+                        bot.setFollowDuringTarget?.(
+                            this.checked
+                        );
+
+                        if (followEnabled) {
+                            // Re-evaluate immediately so enabling this while a
+                            // target is already active starts Follow right away.
                             startFollow();
                         } else {
                             refreshFollowStatus();
@@ -47950,7 +51248,7 @@ function upgradeSectionHeaders(panel) {
                 paladinEquipperStatus.textContent = status.equipRunning ? "Equipper: running" : "Equipper: idle";
             }
             if (paladinAmmoDisplay) {
-                paladinAmmoDisplay.textContent = status.ammoCount ?? 0;
+                paladinAmmoDisplay.textContent = status.ammoCountKnown === false ? "?" : (status.ammoCount ?? 0);
             }
 
             // Input values (only if not focused)
@@ -48591,64 +51889,279 @@ function upgradeSectionHeaders(panel) {
             });
         }
 
+
+        // ---- Item Depositer / full Depot Room ----
+        const depositerWorkflow=panel.querySelector("#minibia-bot-depositer-workflow");
+        const depositerMode=panel.querySelector("#minibia-bot-depositer-mode");
+        const depositerSource=panel.querySelector("#minibia-bot-depositer-source");
+        const depositerManualSource=panel.querySelector("#minibia-bot-depositer-manual-source");
+        const depositerDestination=panel.querySelector("#minibia-bot-depositer-destination");
+        const depositerKeep=panel.querySelector("#minibia-bot-depositer-keep");
+        const depositerDelay=panel.querySelector("#minibia-bot-depositer-delay");
+        const depositerRadius=panel.querySelector("#minibia-bot-depositer-radius");
+        const depositerExplore=panel.querySelector("#minibia-bot-depositer-explore");
+        const depositerWait=panel.querySelector("#minibia-bot-depositer-wait");
+        const depositerAck=panel.querySelector("#minibia-bot-depositer-ack");
+        const depositerBags=panel.querySelector("#minibia-bot-depositer-bags");
+        const depositerRules=panel.querySelector("#minibia-bot-depositer-rules");
+        const depositerNewSid=panel.querySelector("#minibia-bot-depositer-new-sid");
+        const depositerNewKeep=panel.querySelector("#minibia-bot-depositer-new-keep");
+        const depositerNewGroup=panel.querySelector("#minibia-bot-depositer-new-group");
+        const depositerAddRule=panel.querySelector("#minibia-bot-depositer-add-rule");
+        const depositerSourcePick=panel.querySelector("#minibia-bot-depositer-source-pick");
+        const depositerDestinationPick=panel.querySelector("#minibia-bot-depositer-destination-pick");
+        const depositerRun=panel.querySelector("#minibia-bot-depositer-run");
+        const depositerStop=panel.querySelector("#minibia-bot-depositer-stop");
+        const depositerAddWp=panel.querySelector("#minibia-bot-depositer-add-wp");
+        const depositerStatus=panel.querySelector("#minibia-bot-depositer-status");
+        const depotBagInputs={};
+
+        function renderDepositerBags(){
+            if(!depositerBags||!bot.depositer)return;depositerBags.innerHTML="";
+            Object.entries(bot.depositer.labels||{}).forEach(([key,label])=>{
+                const wrap=document.createElement("label");wrap.className="mb-field";
+                const span=document.createElement("span");span.className="mb-field-label";span.textContent=label;
+                const input=document.createElement("input");input.value=bot.depositer.config?.bags?.[key]||"";input.dataset.depotBag=key;
+                input.addEventListener("change",()=>bot.depositer.updateConfig({bags:{[key]:input.value}}));
+                wrap.append(span,input);depositerBags.appendChild(wrap);depotBagInputs[key]=input;
+            });
+        }
+        function renderDepositerRules(){
+            if(!depositerRules||!bot.depositer)return;depositerRules.innerHTML="";
+            const rows=bot.depositer.config?.rules||[];
+            if(!rows.length){const x=document.createElement("div");x.className="mb-small-note";x.textContent="No per-item rules.";depositerRules.appendChild(x);return;}
+            rows.forEach(rule=>{
+                const row=document.createElement("div");row.style.cssText="display:grid;grid-template-columns:90px 80px 1fr auto;gap:5px;align-items:center;";
+                const sid=document.createElement("input");sid.type="number";sid.min="1";sid.value=String(rule.sid||0);
+                const keep=document.createElement("input");keep.type="number";keep.min="0";keep.value=String(rule.keep||0);
+                const group=document.createElement("select");
+                [["auto","Auto"],["all","All loot"],["stackables","Stackables"],["unstackables","Unstackables"],["green","Green Djinn"],["blue","Blue Djinn"],["rashid","Rashid"],["other","Other"],["unsorted","Unsorted"]].forEach(([v,t])=>{const o=document.createElement("option");o.value=v;o.textContent=t;group.appendChild(o);});group.value=rule.group||"auto";
+                const del=document.createElement("button");del.type="button";del.className="mb-small-button";del.textContent="✕";del.style.cssText="padding:2px 6px;background:#5a2020;border-color:#883030;";
+                const save=()=>bot.depositer.updateRule(rule.id,{sid:Number(sid.value)||0,keep:Number(keep.value)||0,group:group.value});
+                sid.addEventListener("change",save);keep.addEventListener("change",save);group.addEventListener("change",save);del.addEventListener("click",()=>{bot.depositer.removeRule(rule.id);renderDepositerRules();});
+                row.append(sid,keep,group,del);depositerRules.appendChild(row);
+            });
+        }
+        function saveDepositerInputs(){
+            bot.depositer?.updateConfig?.({workflow:depositerWorkflow?.value||"depot-room",mode:depositerMode?.value||"npc",sourceTitle:depositerSource?.value||"Loot",destinationTitle:depositerDestination?.value||"",manualSourceId:bot.depositer?.config?.manualSourceId,manualSourceTitle:depositerManualSource?.value||"",destinationId:depositerDestination?.value===bot.depositer?.config?.destinationTitle?bot.depositer?.config?.destinationId:bot.depositer?.config?.destinationId,keepItemIds:String(depositerKeep?.value||"").split(/[\s,;]+/).map(Number).filter(x=>Number.isInteger(x)&&x>0),moveDelayMs:Number(depositerDelay?.value)||220,radius:Number(depositerRadius?.value)||14,exploreSteps:Number(depositerExplore?.value)||0,waitMs:(Number(depositerWait?.value)||60)*1000,ackMs:Number(depositerAck?.value)||4000});
+        }
+        function refreshDepositerStatus(){
+            const mod=bot.depositer;if(!mod)return;const st=mod.status?.()||{};
+            if(depositerWorkflow&&document.activeElement!==depositerWorkflow)depositerWorkflow.value=mod.config?.workflow||"depot-room";
+            if(depositerMode&&document.activeElement!==depositerMode)depositerMode.value=mod.config?.mode||"npc";
+            if(depositerSource&&document.activeElement!==depositerSource)depositerSource.value=mod.config?.sourceTitle||"Loot";
+            if(depositerManualSource&&document.activeElement!==depositerManualSource)depositerManualSource.value=mod.config?.manualSourceTitle||"";
+            if(depositerDestination&&document.activeElement!==depositerDestination)depositerDestination.value=mod.config?.destinationTitle||"";
+            if(depositerKeep&&document.activeElement!==depositerKeep)depositerKeep.value=(mod.config?.keepItemIds||[]).join(",");
+            if(depositerDelay&&document.activeElement!==depositerDelay)depositerDelay.value=mod.config?.moveDelayMs??220;
+            if(depositerRadius&&document.activeElement!==depositerRadius)depositerRadius.value=mod.config?.radius??14;
+            if(depositerExplore&&document.activeElement!==depositerExplore)depositerExplore.value=mod.config?.exploreSteps??8;
+            if(depositerWait&&document.activeElement!==depositerWait)depositerWait.value=Math.round((mod.config?.waitMs??60000)/1000);
+            if(depositerAck&&document.activeElement!==depositerAck)depositerAck.value=mod.config?.ackMs??4000;
+            if(depositerStatus){const groups=Object.entries(st.groups||{}).filter(([,n])=>n>0).map(([g,n])=>`${g}:${n}`).join(" ");depositerStatus.textContent=`${st.running?"Running":(st.phase||"idle")} · ${st.message||""}${st.movedItems?` · moved ${st.movedItems}`:""}${groups?` · ${groups}`:""}${st.lastError?` · ${st.lastError}`:""}`;}
+        }
+        [depositerWorkflow,depositerMode,depositerSource,depositerKeep,depositerDelay,depositerRadius,depositerExplore,depositerWait,depositerAck].forEach(el=>el?.addEventListener("change",()=>{saveDepositerInputs();refreshDepositerStatus();}));
+        depositerManualSource?.addEventListener("change",()=>bot.depositer?.updateConfig?.({manualSourceTitle:depositerManualSource.value,manualSourceId:null}));
+        depositerDestination?.addEventListener("change",()=>bot.depositer?.updateConfig?.({destinationTitle:depositerDestination.value,destinationId:null}));
+        depositerSourcePick?.addEventListener("click",()=>bot.depositer?.selectSource?.());depositerDestinationPick?.addEventListener("click",()=>bot.depositer?.selectDestination?.());
+        depositerAddRule?.addEventListener("click",()=>{const sid=Number(depositerNewSid?.value)||0;if(!sid)return;bot.depositer?.addRule?.(sid,Number(depositerNewKeep?.value)||0,depositerNewGroup?.value||"auto");if(depositerNewSid)depositerNewSid.value="";renderDepositerRules();});
+        depositerRun?.addEventListener("click",async()=>{saveDepositerInputs();try{await bot.depositer?.run?.();}catch(e){bot.log("[Depositer] run failed",e?.message||e);}refreshDepositerStatus();});
+        depositerStop?.addEventListener("click",()=>{bot.depositer?.stop?.();refreshDepositerStatus();});
+        depositerAddWp?.addEventListener("click",()=>{saveDepositerInputs();bot.depositer?.addCaveWaypoint?.();});
+        renderDepositerBags();renderDepositerRules();
+
+        // ---- NPC Supply / Trade ----
+        const npcSupplyEnabled=panel.querySelector("#minibia-bot-npc-supply-enabled"),npcSupplyName=panel.querySelector("#minibia-bot-npc-supply-name"),npcSupplyGreeting=panel.querySelector("#minibia-bot-npc-supply-greeting"),npcSupplyTrade=panel.querySelector("#minibia-bot-npc-supply-trade"),npcSupplyDelay=panel.querySelector("#minibia-bot-npc-supply-delay"),npcSupplyTimeout=panel.querySelector("#minibia-bot-npc-supply-timeout"),npcSupplyClose=panel.querySelector("#minibia-bot-npc-supply-close"),npcSupplyRules=panel.querySelector("#minibia-bot-npc-supply-rules"),npcSupplyNewName=panel.querySelector("#minibia-bot-npc-supply-new-name"),npcSupplyNewMin=panel.querySelector("#minibia-bot-npc-supply-new-min"),npcSupplyNewTarget=panel.querySelector("#minibia-bot-npc-supply-new-target"),npcSupplyNewTrade=panel.querySelector("#minibia-bot-npc-supply-new-trade"),npcSupplyAdd=panel.querySelector("#minibia-bot-npc-supply-add"),npcSupplyRun=panel.querySelector("#minibia-bot-npc-supply-run"),npcSupplyCheck=panel.querySelector("#minibia-bot-npc-supply-check"),npcSupplyStop=panel.querySelector("#minibia-bot-npc-supply-stop"),npcSupplyAddWp=panel.querySelector("#minibia-bot-npc-supply-add-wp"),npcSupplyAddCheckWp=panel.querySelector("#minibia-bot-npc-supply-add-check-wp"),npcSupplyCheckOkLabel=panel.querySelector("#minibia-bot-npc-supply-check-ok-label"),npcSupplyStatus=panel.querySelector("#minibia-bot-npc-supply-status");
+        const oneName=panel.querySelector("#minibia-bot-npc-oneoff-name"),oneValue=panel.querySelector("#minibia-bot-npc-oneoff-value"),oneBuyMode=panel.querySelector("#minibia-bot-npc-oneoff-buy-mode"),oneSellMode=panel.querySelector("#minibia-bot-npc-oneoff-sell-mode"),oneBuy=panel.querySelector("#minibia-bot-npc-oneoff-buy"),oneSell=panel.querySelector("#minibia-bot-npc-oneoff-sell");
+        function renderNpcSupplyRules(){if(!npcSupplyRules||!bot.npcSupplyBuyer)return;npcSupplyRules.innerHTML="";const rules=bot.npcSupplyBuyer.config?.rules||[];if(!rules.length){const e=document.createElement("div");e.className="mb-small-note";e.textContent="No supply rows yet.";npcSupplyRules.appendChild(e);return;}rules.forEach(rule=>{const row=document.createElement("div");row.style.cssText="display:grid;grid-template-columns:auto 1fr 75px 75px 1fr auto;gap:5px;align-items:center;";const enabled=document.createElement("input");enabled.type="checkbox";enabled.checked=rule.enabled!==false;const name=document.createElement("input");name.value=rule.name||"";const min=document.createElement("input");min.type="number";min.min="0";min.value=String(rule.minCount??0);min.title="LOW below";const target=document.createElement("input");target.type="number";target.min="0";target.value=String(rule.target??0);target.title="Refill target";const trade=document.createElement("input");trade.value=rule.tradeName||rule.name||"";trade.title="NPC offer name";const del=document.createElement("button");del.type="button";del.className="mb-small-button";del.textContent="✕";del.style.cssText="padding:2px 6px;background:#5a2020;border-color:#883030;";const save=()=>bot.npcSupplyBuyer.updateRule(rule.id,{enabled:enabled.checked,name:name.value,minCount:Number(min.value)||0,target:Number(target.value)||0,tradeName:trade.value});[enabled,name,min,target,trade].forEach(x=>x.addEventListener("change",save));del.addEventListener("click",()=>{bot.npcSupplyBuyer.removeRule(rule.id);renderNpcSupplyRules();});row.append(enabled,name,min,target,trade,del);npcSupplyRules.appendChild(row);});}
+        function saveNpcSupplyInputs(){bot.npcSupplyBuyer?.updateConfig?.({npcName:npcSupplyName?.value||"",greeting:npcSupplyGreeting?.value||"hi",tradeKeyword:npcSupplyTrade?.value||"trade",buyDelayMs:Number(npcSupplyDelay?.value)||250,countTimeoutMs:Number(npcSupplyTimeout?.value)||5000,closeTradeAfter:npcSupplyClose?.checked!==false,supplyCheckOkLabel:npcSupplyCheckOkLabel?.value||bot.npcSupplyBuyer?.config?.supplyCheckOkLabel||"start"});}
+        function refreshNpcSupplyStatus(){const mod=bot.npcSupplyBuyer;if(!mod)return;const st=mod.status?.()||{};if(npcSupplyEnabled&&document.activeElement!==npcSupplyEnabled)npcSupplyEnabled.checked=!!mod.config?.enabled;if(npcSupplyName&&document.activeElement!==npcSupplyName)npcSupplyName.value=mod.config?.npcName||"";if(npcSupplyGreeting&&document.activeElement!==npcSupplyGreeting)npcSupplyGreeting.value=mod.config?.greeting||"hi";if(npcSupplyTrade&&document.activeElement!==npcSupplyTrade)npcSupplyTrade.value=mod.config?.tradeKeyword||"trade";if(npcSupplyDelay&&document.activeElement!==npcSupplyDelay)npcSupplyDelay.value=mod.config?.buyDelayMs??250;if(npcSupplyTimeout&&document.activeElement!==npcSupplyTimeout)npcSupplyTimeout.value=mod.config?.countTimeoutMs??5000;if(npcSupplyClose&&document.activeElement!==npcSupplyClose)npcSupplyClose.checked=mod.config?.closeTradeAfter!==false;if(npcSupplyCheckOkLabel&&document.activeElement!==npcSupplyCheckOkLabel)npcSupplyCheckOkLabel.value=mod.config?.supplyCheckOkLabel||"start";const caveOkLabel=panel.querySelector("#minibia-bot-cave-supply-check-ok-label");if(caveOkLabel&&document.activeElement!==caveOkLabel)caveOkLabel.value=mod.config?.supplyCheckOkLabel||"start";if(npcSupplyStatus){const bought=(st.purchases||[]).map(p=>`${p.name}+${p.bought}`).join(", ");npcSupplyStatus.textContent=`${st.running?"Running":(st.phase||"idle")}${st.nearbyNpc?` · NPC ${st.nearbyNpc}`:""}${bought?` · ${bought}`:""}${st.lastError?` · ${st.lastError}`:""}`;}}
+        npcSupplyEnabled?.addEventListener("change",function(){saveNpcSupplyInputs();bot.npcSupplyBuyer?.setEnabled?.(this.checked);refreshNpcSupplyStatus();});[npcSupplyName,npcSupplyGreeting,npcSupplyTrade,npcSupplyDelay,npcSupplyTimeout,npcSupplyClose].forEach(el=>el?.addEventListener("change",saveNpcSupplyInputs));
+        npcSupplyAdd?.addEventListener("click",()=>{const name=npcSupplyNewName?.value?.trim();if(!name)return;bot.npcSupplyBuyer?.addRule?.(name,Number(npcSupplyNewTarget?.value)||0,Number(npcSupplyNewMin?.value)||0,npcSupplyNewTrade?.value?.trim()||name);if(npcSupplyNewName)npcSupplyNewName.value="";if(npcSupplyNewTrade)npcSupplyNewTrade.value="";renderNpcSupplyRules();});
+        npcSupplyRun?.addEventListener("click",async()=>{saveNpcSupplyInputs();try{await bot.npcSupplyBuyer?.buyNow?.();}catch(e){bot.log("[NPC Supply]",e?.message||e);}refreshNpcSupplyStatus();});
+        npcSupplyCheck?.addEventListener("click",async()=>{saveNpcSupplyInputs();try{const rows=await bot.npcSupplyBuyer?.checkSupplies?.();const low=(rows||[]).filter(r=>r.low===true).map(r=>`${r.name} ${r.count}/${r.minCount}`);if(typeof bot.showPanelNotification==="function")bot.showPanelNotification("🛒 SUPPLY CHECK",low.length?`LOW: ${low.join(", ")}`:"All configured supplies OK","npc-supply-check",10000);else bot.sendServerMessage?.(low.length?`LOW: ${low.join(", ")}`:"All configured supplies OK");}catch(e){bot.log("[Supply Check]",e?.message||e);}});
+        npcSupplyStop?.addEventListener("click",()=>{bot.npcSupplyBuyer?.stop?.();refreshNpcSupplyStatus();});
+        npcSupplyAddWp?.addEventListener("click",()=>{saveNpcSupplyInputs();bot.npcSupplyBuyer?.addCaveWaypoint?.();});
+        npcSupplyCheckOkLabel?.addEventListener("change",()=>{saveNpcSupplyInputs();refreshNpcSupplyStatus();});
+        npcSupplyAddCheckWp?.addEventListener("click",()=>{saveNpcSupplyInputs();bot.npcSupplyBuyer?.addSupplyCheckCaveWaypoint?.(npcSupplyCheckOkLabel?.value||"start");});
+        oneBuy?.addEventListener("click",async()=>{saveNpcSupplyInputs();const name=oneName?.value?.trim();if(!name)return;try{if(oneBuyMode?.value==="fixed")await bot.npcSupplyBuyer?.buyFixed?.(name,Number(oneValue?.value)||0);else await bot.npcSupplyBuyer?.buyTo?.(name,Number(oneValue?.value)||0);}catch(e){bot.log("[NPC Buy]",e?.message||e);}refreshNpcSupplyStatus();});
+        oneSell?.addEventListener("click",async()=>{saveNpcSupplyInputs();const name=oneName?.value?.trim();if(!name)return;const mode=oneSellMode?.value||"all",v=Number(oneValue?.value)||0;try{await bot.npcSupplyBuyer?.sellItems?.([{name,mode,amount:v,keep:v}]);}catch(e){bot.log("[NPC Sell]",e?.message||e);}refreshNpcSupplyStatus();});
+        renderNpcSupplyRules();
+
+        // ---- Bank NPC ----
+        const bankName=panel.querySelector("#minibia-bot-bank-name"),bankGreeting=panel.querySelector("#minibia-bot-bank-greeting"),bankDelay=panel.querySelector("#minibia-bot-bank-delay"),bankTimeout=panel.querySelector("#minibia-bot-bank-timeout"),bankPreset=panel.querySelector("#minibia-bot-bank-preset"),bankAmount=panel.querySelector("#minibia-bot-bank-amount"),bankCustom=panel.querySelector("#minibia-bot-bank-custom"),bankRun=panel.querySelector("#minibia-bot-bank-run"),bankStop=panel.querySelector("#minibia-bot-bank-stop"),bankAddWp=panel.querySelector("#minibia-bot-bank-add-wp"),bankStatus=panel.querySelector("#minibia-bot-bank-status");
+        function saveBankInputs(){bot.bankNpc?.updateConfig?.({npcName:bankName?.value||"",greeting:bankGreeting?.value||"hi",npcDelayMs:Number(bankDelay?.value)||0,actionTimeoutMs:Number(bankTimeout?.value)||5000,customLines:bankCustom?.value||""});}
+        function refreshBankStatus(){const mod=bot.bankNpc;if(!mod)return;const st=mod.status?.()||{};if(bankName&&document.activeElement!==bankName)bankName.value=mod.config?.npcName||"";if(bankGreeting&&document.activeElement!==bankGreeting)bankGreeting.value=mod.config?.greeting||"hi";if(bankDelay&&document.activeElement!==bankDelay)bankDelay.value=mod.config?.npcDelayMs??250;if(bankTimeout&&document.activeElement!==bankTimeout)bankTimeout.value=mod.config?.actionTimeoutMs??5000;if(bankCustom&&document.activeElement!==bankCustom)bankCustom.value=mod.config?.customLines||"";if(bankStatus)bankStatus.textContent=`${st.running?"Running":(st.phase||"idle")}${st.nearbyNpc?` · NPC ${st.nearbyNpc}`:""}${st.lastError?` · ${st.lastError}`:""}`;}
+        [bankName,bankGreeting,bankDelay,bankTimeout,bankCustom].forEach(el=>el?.addEventListener("change",saveBankInputs));
+        bankRun?.addEventListener("click",async()=>{saveBankInputs();try{await bot.bankNpc?.run?.(bankPreset?.value||"deposit-all",Number(bankAmount?.value)||0,bankCustom?.value||"");}catch(e){bot.log("[Bank NPC]",e?.message||e);}refreshBankStatus();});bankStop?.addEventListener("click",()=>{bot.bankNpc?.stop?.();refreshBankStatus();});bankAddWp?.addEventListener("click",()=>{saveBankInputs();bot.bankNpc?.addCaveWaypoint?.(bankPreset?.value||"deposit-all",Number(bankAmount?.value)||0,bankCustom?.value||"");});
+
+        refreshDepositerStatus();refreshNpcSupplyStatus();refreshBankStatus();
+        const inventoryToolsTimer=window.setInterval(()=>{refreshDepositerStatus();refreshNpcSupplyStatus();refreshBankStatus();},750);bot.addCleanup(()=>window.clearInterval(inventoryToolsTimer));
+
+        // ---- Cavebot Resupply WPT shortcuts ----
+        const caveDepotWpBtn=panel.querySelector("#minibia-bot-cave-add-depot-wp");
+        const caveSupplyWpBtn=panel.querySelector("#minibia-bot-cave-add-supply-wp");
+        const caveSupplyCheckWpBtn=panel.querySelector("#minibia-bot-cave-add-supply-check-wp");
+        const caveSupplyCheckOkLabel=panel.querySelector("#minibia-bot-cave-supply-check-ok-label");
+        const caveBankWpBtn=panel.querySelector("#minibia-bot-cave-add-bank-wp");
+        if(caveSupplyCheckOkLabel)caveSupplyCheckOkLabel.value=bot.npcSupplyBuyer?.config?.supplyCheckOkLabel||"start";
+        caveSupplyCheckOkLabel?.addEventListener("change",()=>{bot.npcSupplyBuyer?.updateConfig?.({supplyCheckOkLabel:caveSupplyCheckOkLabel.value||"start"});refreshNpcSupplyStatus();});
+        function getResupplyWaypointInsertIndex(){
+            const route=bot.cave?.getRoute?.()||[];
+            if(selectedWaypointIndex!==null&&selectedWaypointIndex>=0&&selectedWaypointIndex<route.length)return selectedWaypointIndex+1;
+            return route.length;
+        }
+        function finishResupplyWaypointInsert(added,insertIndex,label){
+            if(!added)return false;
+            bot.cave?.setCurrentIndex?.(insertIndex);
+            selectedWaypointIndex=insertIndex;
+            refreshCaveWaypointList();
+            refreshCaveStatus();
+            refreshCaveClosestStatus();
+            refreshCaveTransitionStatus();
+            refreshCavePresetControls();
+            scrollToWaypointIndex(insertIndex,true);
+            bot.log(`${label} waypoint added at #${insertIndex}.`);
+            return true;
+        }
+        caveDepotWpBtn?.addEventListener("click",()=>{
+            saveDepositerInputs();
+            const insertIndex=getResupplyWaypointInsertIndex();
+            const added=bot.depositer?.addCaveWaypoint?.(insertIndex);
+            finishResupplyWaypointInsert(added,insertIndex,"Depot");
+        });
+        caveSupplyWpBtn?.addEventListener("click",()=>{
+            saveNpcSupplyInputs();
+            const insertIndex=getResupplyWaypointInsertIndex();
+            const added=bot.npcSupplyBuyer?.addCaveWaypoint?.(insertIndex);
+            finishResupplyWaypointInsert(added,insertIndex,"Resupply");
+        });
+        caveSupplyCheckWpBtn?.addEventListener("click",()=>{
+            const okLabel=String(caveSupplyCheckOkLabel?.value||"start").trim()||"start";
+            bot.npcSupplyBuyer?.updateConfig?.({supplyCheckOkLabel:okLabel});
+            const insertIndex=getResupplyWaypointInsertIndex();
+            const added=bot.npcSupplyBuyer?.addSupplyCheckCaveWaypoint?.(okLabel,insertIndex);
+            finishResupplyWaypointInsert(added,insertIndex,"Supply Check");
+            refreshNpcSupplyStatus();
+        });
+        caveBankWpBtn?.addEventListener("click",()=>{
+            saveBankInputs();
+            const insertIndex=getResupplyWaypointInsertIndex();
+            const preset=bankPreset?.value||"deposit-all";
+            const amount=Number(bankAmount?.value)||0;
+            const custom=bankCustom?.value||"";
+            const added=bot.bankNpc?.addCaveWaypoint?.(preset,amount,custom,insertIndex);
+            finishResupplyWaypointInsert(added,insertIndex,"Bank NPC");
+        });
+
         // Cave bot waypoint actions
         const addBtn = panel.querySelector("#minibia-bot-cave-add");
+        const addStandBtn = panel.querySelector("#minibia-bot-cave-add-stand");
+        const addRopeBtn = panel.querySelector("#minibia-bot-cave-add-rope");
+        const addShovelBtn = panel.querySelector("#minibia-bot-cave-add-shovel");
+        const addLadderBtn = panel.querySelector("#minibia-bot-cave-add-ladder");
+        const useBtn = panel.querySelector("#minibia-bot-cave-add-use");
         const moveUpBtn = panel.querySelector("#minibia-bot-cave-move-up");
         const moveDownBtn = panel.querySelector("#minibia-bot-cave-move-down");
         const delBtn = panel.querySelector("#minibia-bot-cave-delete-selected");
-        if (addBtn) {
-            addBtn.addEventListener("click", () => {
+
+        // v1.6.26: waypoint type is selected directly by the button instead of
+        // persistent Stand/Rope/Shovel/Ladder checkboxes. All five movement
+        // buttons share the same Direction selector and insertion behavior.
+        function addDirectionalCaveWaypoint(type = "walk") {
+            const pos = bot.getPlayerPosition();
+            if (!pos) {
+                bot.log("Cannot get player position.");
+                return;
+            }
+
+            const dirSelect = document.getElementById("minibia-bot-cave-direction");
+            const dir = dirSelect ? dirSelect.value : "C";
+            const offset = getDirectionOffset(dir);
+            const x = Number(pos.x) + Number(offset.dx || 0);
+            const y = Number(pos.y) + Number(offset.dy || 0);
+            const z = Number(pos.z);
+            const kind = String(type || "walk").toLowerCase();
+            const labels = {
+                stand: "Stand",
+                rope: "Rope",
+                shovel: "Shovel",
+                ladder: "Ladder"
+            };
+            const waypoint = { x, y, z };
+
+            if (Object.prototype.hasOwnProperty.call(labels, kind)) {
+                waypoint.label = labels[kind];
+                waypoint[kind] = true;
+            }
+
+            const route = bot.cave.getRoute();
+            let insertIndex = route.length;
+            if (selectedWaypointIndex !== null && selectedWaypointIndex >= 0 && selectedWaypointIndex < route.length)
+                insertIndex = selectedWaypointIndex + 1;
+
+            const added = bot.cave.addWaypoint(waypoint, insertIndex);
+            if (!added) return;
+
+            bot.cave.setCurrentIndex(insertIndex);
+            selectedWaypointIndex = insertIndex;
+            refreshCaveWaypointList();
+            refreshCaveStatus();
+            refreshCaveClosestStatus();
+            refreshCaveTransitionStatus();
+            refreshCavePresetControls();
+            scrollToWaypointIndex(insertIndex, true);
+            bot.log(`${labels[kind] || "Walk"} waypoint added at #${insertIndex + 1} (${x}, ${y}, ${z}).`);
+        }
+
+        addBtn?.addEventListener("click", () => addDirectionalCaveWaypoint("walk"));
+        addStandBtn?.addEventListener("click", () => addDirectionalCaveWaypoint("stand"));
+        addRopeBtn?.addEventListener("click", () => addDirectionalCaveWaypoint("rope"));
+        addShovelBtn?.addEventListener("click", () => addDirectionalCaveWaypoint("shovel"));
+        addLadderBtn?.addEventListener("click", () => addDirectionalCaveWaypoint("ladder"));
+        // USE is a script-only waypoint: capture the tile selected by the same
+        // C/N/E/... direction control as + Add, then use that exact position when
+        // Cavebot reaches this action in the route. Script waypoints deliberately
+        // carry no x/y/z navigation target, so Cavebot performs no reachability,
+        // floor or distance checks on the action itself.
+        if (useBtn) {
+            useBtn.addEventListener("click", () => {
                 const pos = bot.getPlayerPosition();
                 if (!pos) {
-                    bot.log("Cannot get player position.");
+                    bot.log("Cannot get player position for USE waypoint.");
                     return;
                 }
+
                 const dirSelect = document.getElementById("minibia-bot-cave-direction");
-                const standCheck = document.getElementById("minibia-bot-cave-stand");
-                const ropeCheck = document.getElementById("minibia-bot-cave-rope");
-                const shovelCheck = document.getElementById("minibia-bot-cave-shovel");
-                const ladderCheck = document.getElementById("minibia-bot-cave-ladder");
                 const dir = dirSelect ? dirSelect.value : "C";
                 const offset = getDirectionOffset(dir);
-                const x = pos.x + offset.dx;
-                const y = pos.y + offset.dy;
-                const z = pos.z;
-                const stand = !!(standCheck && standCheck.checked);
-                const rope = !!(ropeCheck && ropeCheck.checked);
-                const shovel = !!(shovelCheck && shovelCheck.checked);
-                const ladder = !!(ladderCheck && ladderCheck.checked);
-                const label = stand ? "Stand" : (rope ? "Rope" : (shovel ? "Shovel" : ""));
-                const waypoint = {
-                    x,
-                    y,
-                    z,
-                    label: label || undefined,
-                    stand: stand,
-                    rope: rope,
-                    shovel: shovel,
-                    ladder: ladder
-                };
-                const route = bot.cave.getRoute();
-                let insertIndex = route.length; // append
-                if (selectedWaypointIndex !== null && selectedWaypointIndex >= 0 && selectedWaypointIndex < route.length) {
+                const x = Number(pos.x) + Number(offset.dx || 0);
+                const y = Number(pos.y) + Number(offset.dy || 0);
+                const z = Number(pos.z);
+                const route = bot.cave?.getRoute?.() || [];
+                let insertIndex = route.length;
+                if (selectedWaypointIndex !== null && selectedWaypointIndex >= 0 && selectedWaypointIndex < route.length)
                     insertIndex = selectedWaypointIndex + 1;
-                }
-                const added = bot.cave.addWaypoint(waypoint, insertIndex);
-                if (added) {
-                    bot.cave.setCurrentIndex(insertIndex);
-                    selectedWaypointIndex = insertIndex;
-                    // ... update label/script inputs ...
-                    refreshCaveWaypointList();
-                    refreshCaveStatus();
-                    refreshCaveClosestStatus();
-                    refreshCaveTransitionStatus();
-                    refreshCavePresetControls();
-                    // Force‑scroll to the new waypoint (even if cavebot is not running)
-                    scrollToWaypointIndex(insertIndex, true);
-                    bot.log("Waypoint added after selected index " + (insertIndex - 1) + " and set as current.");
-                }
+
+                const waypoint = {
+                    label: "USE",
+                    script: `return bot.usePosition(${x}, ${y}, ${z});`
+                };
+                const added = bot.cave?.addWaypoint?.(waypoint, insertIndex);
+                if (!added) return;
+
+                bot.cave?.setCurrentIndex?.(insertIndex);
+                selectedWaypointIndex = insertIndex;
+                refreshCaveWaypointList();
+                refreshCaveStatus();
+                refreshCaveClosestStatus();
+                refreshCaveTransitionStatus();
+                refreshCavePresetControls();
+                scrollToWaypointIndex(insertIndex, true);
+                bot.log(`USE waypoint added at #${insertIndex} for ${x}, ${y}, ${z}.`);
             });
         }
+
         if (moveUpBtn)
             moveUpBtn.addEventListener("click", () => moveSelectedWaypoint("up"));
         if (moveDownBtn)
@@ -52388,6 +55901,9 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         currentBundle.installExoriModule(bot);
         currentBundle.installSupportModule(bot);
         currentBundle.installUiTweaksModule(bot);
+        currentBundle.installDepositerModule(bot);
+        currentBundle.installNpcSupplyBuyerModule(bot);
+        currentBundle.installBankNpcModule(bot);
 
         currentBundle.installPanel(bot);
         currentBundle.installCustomNotificationModule(bot);
@@ -52420,6 +55936,9 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
             eat: bot.eat.status(),
             talk: bot.talk.status(),
             support: bot.support.status(),
+            depositer: bot.depositer?.status?.(),
+            npcSupplyBuyer: bot.npcSupplyBuyer?.status?.(),
+            bankNpc: bot.bankNpc?.status?.(),
         });
 
         window.minibiaBot = bot;
@@ -52463,6 +55982,9 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
                 ["antiBotCreature", "minibiaBot.antiBotCreature.config"],
                 ["keyringToggle", "minibiaBot.keyringToggle.config"],
                 ["itemIdDisplay", "minibiaBot.itemIdDisplay.config"],
+                ["depositer", "minibiaBot.depositer.config"],
+                ["npcSupplyBuyer", "minibiaBot.npcSupplyBuyer.config"],
+                ["bankNpc", "minibiaBot.bankNpc.config"],
             ];
 
             let saved = 0;
