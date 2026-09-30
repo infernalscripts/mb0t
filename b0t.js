@@ -638,9 +638,22 @@ function requestItemCounts(items = []) {
     });
     if (!unique.length) return false;
     if (typeof HotbarCountsRequestPacket !== "function") return false;
-    if (!window.gameClient?.networkManager?.isConnected?.()) return false;
+    const networkManager = window.gameClient?.networkManager;
+    if (!networkManager?.isConnected?.()) return false;
     try {
-        installItemCountObserver();
+        // Every built-in item-count consumer relies on this shared observer.
+        // Do not send a request we cannot observe.
+        if (!installItemCountObserver()) return false;
+
+        // Mirror Minibia's native refresh bookkeeping so solicited count replies
+        // seed the client's supply cache silently instead of being mistaken for
+        // an item-use count drop by NetworkManager.__maybeSupplyMessage().
+        if (!networkManager.__supplySeedExpect) networkManager.__supplySeedExpect = {};
+        const expiresAt = Date.now() + 3000;
+        unique.forEach(({ id, fluidType }) => {
+            networkManager.__supplySeedExpect[`${id}:${fluidType}`] = expiresAt;
+        });
+
         window.gameClient.send(new HotbarCountsRequestPacket(unique));
         return true;
     } catch (error) {
@@ -2744,7 +2757,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.34",
+        version: "1.6.52",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -5419,14 +5432,16 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
             for (const a of config.itemAlerts) {
                 if (!a || !Number.isFinite(a.id) || !a.threshold) continue;
 
-                // Prefer server-counted reading for this exact (id, fluidType).
-                // Fall back to open-container scan when fluidType is undefined.
-                let count = 0;
-                try {
-                    count = (a.fluidType != null)
-                        ? bot.itemCount(a.id, a.fluidType)
-                        : bot.itemCount(a.id);
-                } catch { continue; }
+                // v1.6.35: built-in alerts always use the shared server count.
+                // Ordinary items are the exact (CID, 0) pair; fluid alerts keep
+                // their configured fluid type. Never treat an unknown reading as
+                // zero and never fall back to only-open-container totals.
+                const fluidType = Math.max(0, Math.trunc(Number(a.fluidType) || 0));
+                const reading = typeof bot.getItemCountReading === "function"
+                    ? bot.getItemCountReading(a.id, fluidType)
+                    : null;
+                if (!reading) continue;
+                const count = Math.max(0, Math.trunc(Number(reading.count) || 0));
 
                 if (count < a.threshold) {
                     const alertKey = `${a.id}:${Number(a.fluidType) || 0}`;
@@ -6143,8 +6158,8 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
         unconfirmedBySlot: {},
         lastUnconfirmedNoticeAt: {},
 
-        // v1.5.93: item-based heal rules use the native server-backed hotbar
-        // item counts. Unknown/zero supply is never clicked blindly.
+        // v1.6.35: item-based heal rules use mb0t's shared server item-count
+        // observer. Unknown/zero supply is never clicked blindly.
         lastItemCountRefreshAt: 0,
         lastNoSupplyNoticeAt: {},
         lastItemSupplyBySlot: {},
@@ -6233,22 +6248,44 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
         return n;
     }
 
-    function requestHealHotbarItemCounts(
-        now = Date.now(),
-        force = false
-    ) {
+    function getHealItemCountRequests() {
         const hm =
             window.gameClient
                 ?.interface
                 ?.hotbarManager;
 
-        if (
-            !hm ||
-            typeof hm.refreshAllItemCounts !==
-                "function"
-        ) {
-            return false;
+        if (!hm?.slots || typeof bot.requestItemCounts !== "function")
+            return [];
+
+        const requests = [];
+        const seen = new Set();
+
+        for (const rule of config.healRules || []) {
+            // Spell-word rules do not consume the configured hotbar item.
+            if (rule?.spellWords && String(rule.spellWords).trim())
+                continue;
+
+            const slot = normalizeHotbarSlot(rule?.slot);
+            const item = slot ? hm.slots?.[slot - 1]?.item : null;
+            const itemId = Number(item?.id) || 0;
+            const fluidType = Math.max(0, Math.trunc(Number(item?.fluidType) || 0));
+            if (!itemId) continue;
+
+            const key = `${itemId}:${fluidType}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            requests.push({ id: itemId, fluidType });
         }
+
+        return requests;
+    }
+
+    function requestHealHotbarItemCounts(
+        now = Date.now(),
+        force = false
+    ) {
+        if (typeof bot.requestItemCounts !== "function")
+            return false;
 
         if (
             !force &&
@@ -6259,15 +6296,14 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
             return false;
         }
 
-        state.lastItemCountRefreshAt =
-            now;
-
-        try {
-            hm.refreshAllItemCounts();
-            return true;
-        } catch (e) {
+        const requests = getHealItemCountRequests();
+        if (!requests.length)
             return false;
-        }
+
+        const sent = !!bot.requestItemCounts(requests);
+        if (sent)
+            state.lastItemCountRefreshAt = now;
+        return sent;
     }
 
     function getHotbarItemSupply(
@@ -6301,101 +6337,24 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
             Number(
                 slot.item.fluidType || 0
             ) || 0;
-        const supplyKey =
-            `${itemId}:${fluidType}`;
 
         let count = null;
         let known = false;
 
-        // Primary source: NetworkManager caches every HOTBAR_ITEM_COUNT packet,
-        // including zero. The native refresh searches the full inventory,
-        // including nested/closed backpacks.
-        const supplyCounts =
-            window.gameClient
-                ?.networkManager
-                ?.__supplyCounts;
+        // Single source of truth for built-in item-count consumers: mb0t's
+        // shared observer, populated by HOTBAR_ITEM_COUNT replies for the exact
+        // (CID, fluidType) pair. This covers nested/closed backpacks because the
+        // server performs the inventory count.
+        const reading =
+            typeof bot.getItemCountReading === "function"
+                ? bot.getItemCountReading(itemId, fluidType)
+                : null;
 
-        if (
-            supplyCounts &&
-            Object.prototype.hasOwnProperty.call(
-                supplyCounts,
-                supplyKey
-            )
-        ) {
-            const raw =
-                Number(
-                    supplyCounts[
-                        supplyKey
-                    ]
-                );
-
+        if (reading) {
+            const raw = Number(reading.count);
             if (Number.isFinite(raw)) {
-                count =
-                    Math.max(
-                        0,
-                        Math.trunc(raw)
-                    );
+                count = Math.max(0, Math.trunc(raw));
                 known = true;
-            }
-        }
-
-        // Rune-specific native cache is another authoritative server reply.
-        if (
-            !known &&
-            hm?.__runeCountCache &&
-            Object.prototype.hasOwnProperty.call(
-                hm.__runeCountCache,
-                supplyKey
-            )
-        ) {
-            const raw =
-                Number(
-                    hm.__runeCountCache[
-                        supplyKey
-                    ]
-                );
-
-            if (Number.isFinite(raw)) {
-                count =
-                    Math.max(
-                        0,
-                        Math.trunc(raw)
-                    );
-                known = true;
-            }
-        }
-
-        // Positive desktop count is safe as a fallback. A blank duration is
-        // NOT interpreted as zero here because it can also mean the initial
-        // server count has not arrived yet.
-        if (
-            !known &&
-            slot.duration
-        ) {
-            const attr =
-                slot.duration.getAttribute?.(
-                    "data-count"
-                );
-
-            if (
-                attr !== null &&
-                attr !== undefined &&
-                String(attr).trim() !==
-                    ""
-            ) {
-                const raw =
-                    Number(attr);
-
-                if (
-                    Number.isFinite(raw)
-                ) {
-                    count =
-                        Math.max(
-                            0,
-                            Math.trunc(raw)
-                        );
-                    known = true;
-                }
             }
         }
 
@@ -7506,8 +7465,9 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         lastChaseAt: 0,
         lastChaseDestinationKey: null,
 
-        // v1.5.75: Client Chase is optional. Targeting can still pursue a
-        // fleeing engaged target with normal movement packets when it is OFF.
+        // v1.6.47: Melee is the master pursuit permission. When Melee is ON,
+        // Client Chase selects native chase; when it is OFF, Targeting uses its
+        // field-aware A* pursuit. With Melee OFF, ordinary target pursuit stops.
         lastManualPursuitAt: 0,
         lastManualPursuitTargetId: null,
         lastManualPursuitReason: null,
@@ -7523,6 +7483,13 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         manualPursuitAutoWalkTargetId: null,
         manualPursuitAutoWalkTargetPosKey: null,
         manualPursuitAutoWalkDestinationKey: null,
+        // v1.6.52: remember the actual in-flight melee batch so a monster that
+        // walks into the queued route can invalidate it immediately. Without
+        // this, a stationary preferred target could leave Targeting waiting on
+        // a stale AutoWalk batch even when a fresh A* detour existed.
+        manualPursuitAutoWalkStartKey: null,
+        manualPursuitAutoWalkPathPositions: [],
+        manualPursuitObstacleReplans: 0,
 
         // v1.5.79: with Melee + Client Chase enabled, native chase can keep
         // attacking a wall-separated target without walking the valid route
@@ -7607,6 +7574,45 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         offscreenLureHoldClears: 0,
         offscreenLastMobClears: 0,
         offscreenEngagedRejects: 0,
+
+        // v1.6.37: optional off-screen hunt. This never sends TargetPacket for
+        // an invisible creature. Targeting only owns movement toward the last
+        // known same-floor position, then hands back to normal acquisition.
+        offscreenHuntActive: false,
+        offscreenHuntTargetId: null,
+        offscreenHuntTargetName: null,
+        offscreenHuntStartedAt: 0,
+        offscreenHuntLastKnownPosition: null,
+        offscreenHuntBestDistance: Number.POSITIVE_INFINITY,
+        offscreenHuntLastDistance: Number.POSITIVE_INFINITY,
+        offscreenHuntLastProgressAt: 0,
+        offscreenHuntLastMoveAt: 0,
+        offscreenHuntConsecutivePathFailures: 0,
+        offscreenHuntActivations: 0,
+        offscreenHuntHandoffs: 0,
+        offscreenHuntAborts: 0,
+        offscreenHuntPathFailures: 0,
+        offscreenHuntLastReason: null,
+
+        // v1.6.45: optional Lure-only off-screen pull. Unlike Off-screen Hunt,
+        // this never changes CaveBot's waypoint index and never attacks the
+        // invisible creature. Cave movement is paused temporarily while Targeting
+        // walks toward a nearby known mob until it enters normal lure radius.
+        lureOffscreenPullActive: false,
+        lureOffscreenPullTargetId: null,
+        lureOffscreenPullTargetName: null,
+        lureOffscreenPullStartedAt: 0,
+        lureOffscreenPullLastKnownPosition: null,
+        lureOffscreenPullBestDistance: Number.POSITIVE_INFINITY,
+        lureOffscreenPullLastDistance: Number.POSITIVE_INFINITY,
+        lureOffscreenPullLastProgressAt: 0,
+        lureOffscreenPullLastMoveAt: 0,
+        lureOffscreenPullConsecutivePathFailures: 0,
+        lureOffscreenPullActivations: 0,
+        lureOffscreenPullHandoffs: 0,
+        lureOffscreenPullAborts: 0,
+        lureOffscreenPullPathFailures: 0,
+        lureOffscreenPullLastReason: null,
 
         canonicalTargetRefreshes: 0,
         canonicalFollowRefreshes: 0,
@@ -7704,6 +7710,14 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         lurePreferredSuppressedTargets: 0,
         lurePreferredHandoffs: 0,
         lurePreferredLastReason: null,
+
+        // v1.6.51: once Lure hands a preferred target to normal Targeting,
+        // keep Lure out of the way for as long as that exact preferred mob
+        // remains the selected target. A kiting preferred mob must not drop
+        // back into "preferred pending" and disable A* pursuit again.
+        lurePreferredHandoffLockId: null,
+        lurePreferredHandoffLockName: null,
+        lurePreferredHandoffLockAt: 0,
 
         // v1.5.21: preferred-pending keeps safe basic attack-through instead
         // of disabling all combat while CaveBot moves toward the preferred.
@@ -7969,6 +7983,11 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         targetHotbarSlot: 3,
         targetCooldownMs: 1200,
         maxTargetDistance: 5,
+        // v1.6.37: walk toward known same-floor monsters outside the rendered
+        // playfield. OFF by default so existing CaveBot routes are unchanged.
+        offscreenHuntEnabled: false,
+        offscreenHuntRange: 20,
+        offscreenHuntNoProgressMs: 5000,
         meleeMode: true,
         enabled: false,
         preferredTargetNames: [],
@@ -8016,6 +8035,13 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         // Only creatures inside this Chebyshev tile radius participate in
         // lure counting, preferred detection, attack-through and pack leash.
         lureRadius: 5,
+
+        // v1.6.45: while Lure is active but below threshold, optionally step
+        // toward a known same-floor off-screen mob and pull it into lure range.
+        // Separate from Off-screen Hunt; OFF by default.
+        lureOffscreenPullEnabled: false,
+        lureOffscreenPullRange: 10,
+        lureOffscreenPullNoProgressMs: 4500,
 
         // Smart Lure only affects attack-through while mob count is below the
         // lure threshold. Normal combat keeps the existing finish-the-kill
@@ -8080,6 +8106,15 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     config.useClientChase = !!config.useClientChase;
     if (config.kiteMode)
         config.useClientChase = false;
+    config.offscreenHuntEnabled = config.offscreenHuntEnabled === true;
+    config.offscreenHuntRange = Math.max(
+        5,
+        Math.min(50, Math.trunc(Number(config.offscreenHuntRange) || 20))
+    );
+    config.offscreenHuntNoProgressMs = Math.max(
+        2000,
+        Math.min(15000, Number(config.offscreenHuntNoProgressMs) || 5000)
+    );
 
     // Defensive normalization for the retarget guard. These are intentionally
     // conservative and do not alter how the initial target is selected.
@@ -8118,6 +8153,9 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         config.lureMode = !!config.lureMode;
         config.lureMobThreshold = Math.max(1, Math.min(20, Math.trunc(Number(config.lureMobThreshold) || 3)));
         config.lureRadius = Math.max(1, Math.min(8, Math.trunc(Number(config.lureRadius) || 5)));
+        config.lureOffscreenPullEnabled = config.lureOffscreenPullEnabled === true;
+        config.lureOffscreenPullRange = Math.max(3, Math.min(20, Math.trunc(Number(config.lureOffscreenPullRange) || 10)));
+        config.lureOffscreenPullNoProgressMs = Math.max(2000, Math.min(12000, Number(config.lureOffscreenPullNoProgressMs) || 4500));
         config.lureSmartTargeting = config.lureSmartTargeting !== false;
         config.lurePreserveHpPct = Math.max(5, Math.min(90, Number(config.lurePreserveHpPct) || 30));
         config.lureSmartSwitchCooldownMs = Math.max(300, Math.min(3000, Number(config.lureSmartSwitchCooldownMs) || 900));
@@ -10982,6 +11020,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         // ordinary mobs while CaveBot continues pulling toward the waypoint.
         // Targeting is forbidden from owning movement in this branch.
         if (syncLureMode(now)) {
+            clearOffscreenHunt(
+                "lure mode active",
+                { quiet: true }
+            );
             if (state.ordinaryAccessBlocked) {
                 clearOrdinaryAccessState(
                     "lure mode took movement/combat ownership",
@@ -11106,7 +11148,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             !getEngagedTarget() &&
             window.gameClient
                 ?.__mbTargetingAutoWalkActive ===
-                true
+                true &&
+            window.gameClient
+                ?.__mbTargetingAutoWalkOwner !==
+                "hunt"
         ) {
             stopManualTargetPursuitAutoWalk(
                 "combat target cleared"
@@ -11123,8 +11168,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 return true;
         }
 
-        // Melee OFF means Targeting does not move toward the monster.
-        // It stands still and attacks only from the current tile.
+        // v1.6.47: Melee is the master permission for pursuit movement.
+        // Client Chase only selects the engine used while Melee is enabled:
+        // ON = native client chase, OFF = mb0t field-aware A* pursuit.
+        // With Melee OFF, Targeting never moves toward the target.
 
         // 3) Validate current target
         let current = getCurrentTarget(); // use 'let' so we can reassign later if needed
@@ -11142,6 +11189,13 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             state.lastTargetPos = null;
             state.lastChaseProgressReason = null;
             state.unreachableStart = 0;
+
+            // v1.6.37: when there is no normal target, optionally move toward a
+            // known same-floor off-screen monster. No TargetPacket is sent until
+            // the established visible-target filters can acquire it normally.
+            if (syncOffscreenHunt(now))
+                return true;
+
             return triggerAttack(now);
         }
         const playerPos = normalizePosition(bot.getPlayerPosition());
@@ -11155,12 +11209,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         const dist = getTileDistance(playerPos, targetPos);
         const maxDist = Math.max(1, Number(config.maxTargetDistance) || 5);
 
-        // ★ NEW: For melee mode without client chase, skip target as soon as it's out of melee range
-        if (config.meleeMode && !config.useClientChase && dist > maxDist) {
-            handoffTarget(current, "melee target out of range (no chase)", now, 500);
-            state.unreachableStart = 0;
-            return false;
-        }
+        // v1.6.50: Client Chase OFF no longer means "no chase". With Melee
+        // enabled it means mb0t A* chase, so do not discard the target merely
+        // for stepping just beyond the acquisition radius. The common
+        // resetTargetIfTooFar() guard above owns the bounded give-up distance.
 
         // Skip only if clearly out of range (maxDist + 1)
         if (dist > maxDist + 1) {
@@ -12557,6 +12609,885 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         return sortByDistance ? sortMonstersByPriority(monsters) : monsters;
     }
 
+    // v1.6.37: looser monster identity check used only by Off-screen Hunt.
+    // Unlike isNativeVisibleMonster(), this intentionally does NOT require the
+    // creature to be inside the rendered playfield. It still enforces same
+    // floor, alive monster type, activeCreatures membership and own-summon veto.
+    function isKnownMonsterForOffscreenHunt(creature) {
+        const client = window.gameClient;
+        const player = client?.player;
+        const world = client?.world;
+        if (!creature || !player || !world)
+            return false;
+        if (creature === player || creature.id === player.id)
+            return false;
+
+        const monsterType =
+            (typeof CONST !== "undefined" && CONST.TYPES)
+                ? CONST.TYPES.MONSTER
+                : undefined;
+        if (monsterType !== undefined && creature.type !== monsterType)
+            return false;
+        if (monsterType === undefined && creature.type === 0)
+            return false;
+        if (creature.masterId === player.id)
+            return false;
+
+        const playerPos = normalizePosition(player.getPosition?.());
+        const creaturePos = normalizePosition(
+            creature.getPosition?.() || creature.__position
+        );
+        if (!playerPos || !creaturePos || creaturePos.z !== playerPos.z)
+            return false;
+
+        const hp = Number(creature.state?.health ?? creature.health);
+        if (Number.isFinite(hp) && hp <= 0)
+            return false;
+
+        if (
+            world.activeCreatures &&
+            creature.id != null &&
+            !Object.prototype.hasOwnProperty.call(
+                world.activeCreatures,
+                creature.id
+            )
+        ) {
+            return false;
+        }
+
+        return true;
+    }
+
+    function getOffscreenHuntCandidates(now = Date.now()) {
+        if (!config.offscreenHuntEnabled)
+            return [];
+
+        const me = normalizePosition(bot.getPlayerPosition());
+        if (!me)
+            return [];
+
+        const range = Math.max(
+            5,
+            Math.min(50, Math.trunc(Number(config.offscreenHuntRange) || 20))
+        );
+
+        return Object.values(
+            window.gameClient?.world?.activeCreatures || {}
+        )
+            .filter(creature => {
+                if (!isKnownMonsterForOffscreenHunt(creature))
+                    return false;
+                if (isIgnoredTargetCreature(creature))
+                    return false;
+                if (isTargetSkipped(creature, now))
+                    return false;
+
+                // Initial acquisition is only for a creature that is actually
+                // outside the rendered playfield. Once a hunt starts it may
+                // remain active while the creature is visible but still outside
+                // the normal Targeting envelope.
+                if (getNativeSmallScreenInfo(creature).visible)
+                    return false;
+
+                const pos = normalizePosition(
+                    creature.getPosition?.() || creature.__position
+                );
+                return !!pos &&
+                    pos.z === me.z &&
+                    getTileDistance(me, pos) <= range;
+            })
+            .sort((a, b) => {
+                const aPreferred = isPreferredCreature(a) ? 1 : 0;
+                const bPreferred = isPreferredCreature(b) ? 1 : 0;
+                if (aPreferred !== bPreferred)
+                    return bPreferred - aPreferred;
+
+                const ap = normalizePosition(
+                    a.getPosition?.() || a.__position
+                );
+                const bp = normalizePosition(
+                    b.getPosition?.() || b.__position
+                );
+                const ad = ap ? getTileDistance(me, ap) : Number.POSITIVE_INFINITY;
+                const bd = bp ? getTileDistance(me, bp) : Number.POSITIVE_INFINITY;
+                if (ad !== bd)
+                    return ad - bd;
+                return Number(a.id || 0) - Number(b.id || 0);
+            });
+    }
+
+    function clearOffscreenHunt(
+        reason = "hunt cleared",
+        options = {}
+    ) {
+        const wasActive = state.offscreenHuntActive === true;
+        const oldId = state.offscreenHuntTargetId;
+        const oldName = state.offscreenHuntTargetName;
+
+        if (
+            window.gameClient?.__mbTargetingAutoWalkOwner === "hunt"
+        ) {
+            stopManualTargetPursuitAutoWalk(
+                `Off-screen Hunt: ${reason}`
+            );
+        }
+
+        state.offscreenHuntActive = false;
+        state.offscreenHuntTargetId = null;
+        state.offscreenHuntTargetName = null;
+        state.offscreenHuntStartedAt = 0;
+        state.offscreenHuntLastKnownPosition = null;
+        state.offscreenHuntBestDistance = Number.POSITIVE_INFINITY;
+        state.offscreenHuntLastDistance = Number.POSITIVE_INFINITY;
+        state.offscreenHuntLastProgressAt = 0;
+        state.offscreenHuntLastMoveAt = 0;
+        state.offscreenHuntConsecutivePathFailures = 0;
+        state.offscreenHuntLastReason = reason;
+
+        if (
+            state.movementOwner === "offscreen-hunt" ||
+            state.movementOwner === "offscreen-hunt-autowalk"
+        ) {
+            state.movementOwner = null;
+            state.movementOwnedUntil = 0;
+        }
+
+        if (wasActive) {
+            if (options.handoff === true)
+                state.offscreenHuntHandoffs++;
+            else
+                state.offscreenHuntAborts++;
+
+            if (options.quiet !== true) {
+                bot.log(
+                    options.handoff === true
+                        ? "Off-screen Hunt: target entered normal Targeting range"
+                        : "Off-screen Hunt: stopped",
+                    {
+                        id: oldId,
+                        name: oldName || "Mob",
+                        reason
+                    }
+                );
+            }
+        }
+
+        return wasActive;
+    }
+
+    function beginOffscreenHunt(target, now = Date.now()) {
+        const playerPos = normalizePosition(bot.getPlayerPosition());
+        const targetPos = normalizePosition(
+            target?.getPosition?.() || target?.__position
+        );
+        if (!playerPos || !targetPos || playerPos.z !== targetPos.z)
+            return false;
+
+        const distance = getTileDistance(playerPos, targetPos);
+        state.offscreenHuntActive = true;
+        state.offscreenHuntTargetId = target.id ?? null;
+        state.offscreenHuntTargetName = target.name || "Mob";
+        state.offscreenHuntStartedAt = now;
+        state.offscreenHuntLastKnownPosition = { ...targetPos };
+        state.offscreenHuntBestDistance = distance;
+        state.offscreenHuntLastDistance = distance;
+        state.offscreenHuntLastProgressAt = now;
+        state.offscreenHuntLastMoveAt = 0;
+        state.offscreenHuntConsecutivePathFailures = 0;
+        state.offscreenHuntLastReason = "acquired off-screen creature";
+        state.offscreenHuntActivations++;
+
+        bot.log("Off-screen Hunt: pursuing known creature", {
+            id: target.id ?? null,
+            name: target.name || "Mob",
+            distance,
+            range: config.offscreenHuntRange,
+            position: { ...targetPos },
+            preferred: isPreferredCreature(target)
+        });
+        return true;
+    }
+
+    function getActiveOffscreenHuntTarget() {
+        if (
+            !state.offscreenHuntActive ||
+            state.offscreenHuntTargetId == null
+        ) {
+            return null;
+        }
+
+        return window.gameClient?.world?.activeCreatures?.[
+            state.offscreenHuntTargetId
+        ] || null;
+    }
+
+    function syncOffscreenHunt(now = Date.now()) {
+        if (
+            !state.running ||
+            !config.enabled ||
+            !config.offscreenHuntEnabled
+        ) {
+            clearOffscreenHunt(
+                "disabled",
+                { quiet: true }
+            );
+            return false;
+        }
+
+        // A real combat target always outranks hunting.
+        if (getCurrentTarget() || getEngagedTarget()) {
+            clearOffscreenHunt(
+                "combat target active",
+                { quiet: true }
+            );
+            return false;
+        }
+
+        if (isLureActive()) {
+            clearOffscreenHunt(
+                "lure owns route movement",
+                { quiet: true }
+            );
+            return false;
+        }
+
+        // If normal Targeting can already attack anything, stop hunting and let
+        // the established selection/Anti-KS/reachability logic decide.
+        const normalCandidates = getMonsterCandidates(now);
+        if (normalCandidates.length > 0) {
+            clearOffscreenHunt(
+                "visible actionable target available",
+                { handoff: true }
+            );
+            invalidateCandidateSnapshot();
+            return false;
+        }
+
+        let target = getActiveOffscreenHuntTarget();
+
+        if (target && !isKnownMonsterForOffscreenHunt(target)) {
+            clearOffscreenHunt("creature disappeared or changed floor");
+            target = null;
+        }
+
+        if (target && isIgnoredTargetCreature(target)) {
+            clearOffscreenHunt("creature is ignored");
+            target = null;
+        }
+
+        if (target && isTargetSkipped(target, now)) {
+            clearOffscreenHunt("creature temporarily skipped", { quiet: true });
+            target = null;
+        }
+
+        if (!target) {
+            const candidates = getOffscreenHuntCandidates(now);
+            target = candidates[0] || null;
+            if (!target)
+                return false;
+            if (!beginOffscreenHunt(target, now))
+                return false;
+        }
+
+        const playerPos = normalizePosition(bot.getPlayerPosition());
+        const targetPos = normalizePosition(
+            target.getPosition?.() || target.__position
+        );
+
+        if (
+            !playerPos ||
+            !targetPos ||
+            playerPos.z !== targetPos.z
+        ) {
+            clearOffscreenHunt("invalid hunt position/floor");
+            return false;
+        }
+
+        const range = Math.max(
+            5,
+            Math.min(50, Math.trunc(Number(config.offscreenHuntRange) || 20))
+        );
+        const distance = getTileDistance(playerPos, targetPos);
+
+        if (distance > range) {
+            rememberSkippedTarget(target, now, 2000);
+            clearOffscreenHunt(
+                `creature left hunt range (${distance} > ${range})`
+            );
+            return false;
+        }
+
+        // Once the hunted creature is visible, Anti-KS becomes authoritative.
+        // "Self range" only means we still need to approach; another player's
+        // proximity is a real veto and ends the hunt immediately.
+        const huntScreen = getNativeSmallScreenInfo(target);
+        if (huntScreen.visible && config.antiKSEnabled) {
+            const antiKSReason =
+                getAntiKSBlockReason(
+                    target,
+                    getAntiKSContext(now),
+                    now
+                );
+            if (
+                antiKSReason &&
+                !String(antiKSReason).startsWith(
+                    "Anti-KS self range"
+                )
+            ) {
+                rememberSkippedTarget(target, now, 5000);
+                clearOffscreenHunt(
+                    `Anti-KS blocked hunted creature: ${antiKSReason}`
+                );
+                return false;
+            }
+        }
+
+        state.offscreenHuntLastKnownPosition = { ...targetPos };
+        state.offscreenHuntLastDistance = distance;
+
+        if (
+            !Number.isFinite(state.offscreenHuntBestDistance) ||
+            distance < state.offscreenHuntBestDistance
+        ) {
+            state.offscreenHuntBestDistance = distance;
+            state.offscreenHuntLastProgressAt = now;
+            state.offscreenHuntConsecutivePathFailures = 0;
+        }
+
+        const noProgressMs = Math.max(
+            2000,
+            Math.min(15000, Number(config.offscreenHuntNoProgressMs) || 5000)
+        );
+        if (
+            state.offscreenHuntLastProgressAt &&
+            now - state.offscreenHuntLastProgressAt >= noProgressMs
+        ) {
+            rememberSkippedTarget(target, now, 3000);
+            clearOffscreenHunt(
+                `no movement progress for ${Math.round(noProgressMs / 1000)}s`
+            );
+            return false;
+        }
+
+        // If the last known position is stale, getting right beside it without
+        // the creature becoming normally actionable is the end of this hunt.
+        if (distance <= 1) {
+            rememberSkippedTarget(target, now, 3000);
+            clearOffscreenHunt(
+                "reached last known position but target is not actionable"
+            );
+            return false;
+        }
+
+        const route =
+            typeof bot.getFollowRouteForCreature === "function"
+                ? bot.getFollowRouteForCreature(target, "pvp")
+                : findReachableAdjacentPath(targetPos, playerPos);
+
+        if (
+            !route ||
+            route.atGoal === true ||
+            !Array.isArray(route.pathPositions) ||
+            route.pathPositions.length === 0
+        ) {
+            state.offscreenHuntPathFailures++;
+            state.offscreenHuntConsecutivePathFailures++;
+
+            if (state.offscreenHuntConsecutivePathFailures >= 2) {
+                rememberSkippedTarget(target, now, 2500);
+                clearOffscreenHunt("no safe path to last known position");
+            }
+            return false;
+        }
+
+        const moved = sendManualTargetPursuitAutoWalk(
+            playerPos,
+            route,
+            target,
+            targetPos,
+            "Off-screen Hunt – moving toward last known creature position",
+            now,
+            {
+                owner: "hunt",
+                // v1.6.48: let a Hunt-owned A* batch actually run instead of
+                // rebuilding a 3-step route every time the PLAYER advances one
+                // tile. The batch is still refreshed immediately if the mob's
+                // own last-known position changes.
+                maxSteps: 5,
+                refreshOnDestinationChange: false
+            }
+        );
+
+        if (moved) {
+            state.offscreenHuntLastMoveAt = now;
+            state.offscreenHuntConsecutivePathFailures = 0;
+            state.movementOwner = "offscreen-hunt";
+            state.movementOwnedUntil = now + 500;
+            return true;
+        }
+
+        state.offscreenHuntPathFailures++;
+        state.offscreenHuntConsecutivePathFailures++;
+        if (state.offscreenHuntConsecutivePathFailures >= 2) {
+            rememberSkippedTarget(target, now, 2500);
+            clearOffscreenHunt("hunt movement packet/path failed");
+        }
+        return false;
+    }
+
+    const LURE_OFFSCREEN_PULL_PAUSE_REASON = "offscreen-lure-pull";
+
+    function isPlainLurePullWaypoint(waypoint) {
+        return !!waypoint &&
+            Number.isFinite(Number(waypoint.x)) &&
+            Number.isFinite(Number(waypoint.y)) &&
+            Number.isFinite(Number(waypoint.z)) &&
+            !waypoint.script &&
+            waypoint.stand !== true &&
+            waypoint.rope !== true &&
+            waypoint.shovel !== true &&
+            waypoint.ladder !== true;
+    }
+
+    function getLureOffscreenPullCandidates(now = Date.now()) {
+        if (!config.lureOffscreenPullEnabled)
+            return [];
+
+        const me = normalizePosition(bot.getPlayerPosition());
+        if (!me)
+            return [];
+
+        const range = Math.max(
+            3,
+            Math.min(20, Math.trunc(Number(config.lureOffscreenPullRange) || 10))
+        );
+        const antiKS = getAntiKSContext(now);
+
+        return Object.values(
+            window.gameClient?.world?.activeCreatures || {}
+        )
+            .filter(creature => {
+                if (!isKnownMonsterForOffscreenHunt(creature))
+                    return false;
+                if (isIgnoredTargetCreature(creature))
+                    return false;
+                if (isTargetSkipped(creature, now))
+                    return false;
+
+                // Acquisition is strictly off-screen. Once acquired, sync may
+                // continue approaching after it becomes visible until it enters
+                // the configured normal lure radius.
+                if (getNativeSmallScreenInfo(creature).visible)
+                    return false;
+
+                const pos = normalizePosition(
+                    creature.getPosition?.() || creature.__position
+                );
+                if (!pos || pos.z !== me.z)
+                    return false;
+
+                const distance = getTileDistance(me, pos);
+                if (!Number.isFinite(distance) || distance > range)
+                    return false;
+
+                if (config.antiKSEnabled) {
+                    const reason = getAntiKSBlockReason(creature, antiKS, now);
+                    if (
+                        reason &&
+                        !String(reason).startsWith("Anti-KS self range")
+                    ) {
+                        return false;
+                    }
+                }
+
+                return true;
+            })
+            .sort((a, b) => {
+                const ap = normalizePosition(
+                    a.getPosition?.() || a.__position
+                );
+                const bp = normalizePosition(
+                    b.getPosition?.() || b.__position
+                );
+                const ad = ap ? getTileDistance(me, ap) : Number.POSITIVE_INFINITY;
+                const bd = bp ? getTileDistance(me, bp) : Number.POSITIVE_INFINITY;
+
+                // Pull the nearest useful mob first so this remains a small
+                // route excursion. Preferred status only breaks distance ties.
+                if (ad !== bd)
+                    return ad - bd;
+                const aPreferred = isPreferredCreature(a) ? 1 : 0;
+                const bPreferred = isPreferredCreature(b) ? 1 : 0;
+                if (aPreferred !== bPreferred)
+                    return bPreferred - aPreferred;
+                return Number(a.id || 0) - Number(b.id || 0);
+            });
+    }
+
+    function clearLureOffscreenPull(
+        reason = "pull cleared",
+        options = {}
+    ) {
+        const wasActive = state.lureOffscreenPullActive === true;
+        const oldId = state.lureOffscreenPullTargetId;
+        const oldName = state.lureOffscreenPullTargetName;
+        const ownedPullAutoWalk =
+            window.gameClient?.__mbTargetingAutoWalkOwner === "pull";
+
+        if (ownedPullAutoWalk) {
+            stopManualTargetPursuitAutoWalk(
+                `Off-screen Pull: ${reason}`
+            );
+        }
+
+        // External Cave pause is reason-scoped. Only release it when Pull
+        // actually owned the excursion. Calling resumeMovement on every normal
+        // preferred-target tick created an unnecessary Cave/Targeting handoff
+        // race after Lure had already finished.
+        if (
+            wasActive ||
+            ownedPullAutoWalk ||
+            state.movementOwner === "offscreen-lure-pull" ||
+            state.movementOwner === "offscreen-lure-pull-autowalk"
+        ) {
+            bot.cave?.resumeMovement?.(
+                LURE_OFFSCREEN_PULL_PAUSE_REASON
+            );
+        }
+
+        state.lureOffscreenPullActive = false;
+        state.lureOffscreenPullTargetId = null;
+        state.lureOffscreenPullTargetName = null;
+        state.lureOffscreenPullStartedAt = 0;
+        state.lureOffscreenPullLastKnownPosition = null;
+        state.lureOffscreenPullBestDistance = Number.POSITIVE_INFINITY;
+        state.lureOffscreenPullLastDistance = Number.POSITIVE_INFINITY;
+        state.lureOffscreenPullLastProgressAt = 0;
+        state.lureOffscreenPullLastMoveAt = 0;
+        state.lureOffscreenPullConsecutivePathFailures = 0;
+        state.lureOffscreenPullLastReason = reason;
+
+        if (
+            state.movementOwner === "offscreen-lure-pull" ||
+            state.movementOwner === "offscreen-lure-pull-autowalk"
+        ) {
+            state.movementOwner = null;
+            state.movementOwnedUntil = 0;
+        }
+
+        if (wasActive) {
+            if (options.handoff === true)
+                state.lureOffscreenPullHandoffs++;
+            else
+                state.lureOffscreenPullAborts++;
+
+            if (options.quiet !== true) {
+                bot.log(
+                    options.handoff === true
+                        ? "Off-screen Pull: mob entered lure range"
+                        : "Off-screen Pull: stopped",
+                    {
+                        id: oldId,
+                        name: oldName || "Mob",
+                        reason
+                    }
+                );
+            }
+        }
+
+        return wasActive;
+    }
+
+    function beginLureOffscreenPull(target, now = Date.now()) {
+        const playerPos = normalizePosition(bot.getPlayerPosition());
+        const targetPos = normalizePosition(
+            target?.getPosition?.() || target?.__position
+        );
+        const caveStatus = bot.cave?.status?.();
+        const waypoint = bot.cave?.getCurrentWaypoint?.() || null;
+
+        if (
+            !playerPos ||
+            !targetPos ||
+            playerPos.z !== targetPos.z ||
+            !caveStatus?.running ||
+            !isPlainLurePullWaypoint(waypoint)
+        ) {
+            return false;
+        }
+
+        if (
+            bot.cave?.pauseMovement?.(
+                LURE_OFFSCREEN_PULL_PAUSE_REASON
+            ) !== true
+        ) {
+            return false;
+        }
+
+        const distance = getTileDistance(playerPos, targetPos);
+        state.lureOffscreenPullActive = true;
+        state.lureOffscreenPullTargetId = target.id ?? null;
+        state.lureOffscreenPullTargetName = target.name || "Mob";
+        state.lureOffscreenPullStartedAt = now;
+        state.lureOffscreenPullLastKnownPosition = { ...targetPos };
+        state.lureOffscreenPullBestDistance = distance;
+        state.lureOffscreenPullLastDistance = distance;
+        state.lureOffscreenPullLastProgressAt = now;
+        state.lureOffscreenPullLastMoveAt = 0;
+        state.lureOffscreenPullConsecutivePathFailures = 0;
+        state.lureOffscreenPullLastReason = "acquired nearby off-screen lure mob";
+        state.lureOffscreenPullActivations++;
+
+        bot.log("Off-screen Pull: approaching nearby known mob", {
+            id: target.id ?? null,
+            name: target.name || "Mob",
+            distance,
+            range: config.lureOffscreenPullRange,
+            lureRadius: config.lureRadius,
+            position: { ...targetPos },
+            preferred: isPreferredCreature(target)
+        });
+        return true;
+    }
+
+    function getActiveLureOffscreenPullTarget() {
+        if (
+            !state.lureOffscreenPullActive ||
+            state.lureOffscreenPullTargetId == null
+        ) {
+            return null;
+        }
+
+        return window.gameClient?.world?.activeCreatures?.[
+            state.lureOffscreenPullTargetId
+        ] || null;
+    }
+
+    function syncLureOffscreenPull(context, now = Date.now()) {
+        const eligible =
+            state.running &&
+            config.enabled &&
+            config.lureMode &&
+            config.lureOffscreenPullEnabled &&
+            context?.active === true;
+
+        if (!eligible) {
+            clearLureOffscreenPull("disabled/inactive", { quiet: true });
+            return false;
+        }
+
+        const threshold = Math.max(
+            1,
+            Math.min(20, Math.trunc(Number(context.threshold) || Number(config.lureMobThreshold) || 3))
+        );
+        const visibleCount = Array.isArray(context.visibleMonsters)
+            ? context.visibleMonsters.length
+            : 0;
+
+        // Pulling is only useful while the pack is still below threshold.
+        if (visibleCount >= threshold) {
+            clearLureOffscreenPull("lure threshold reached", { handoff: true });
+            return false;
+        }
+
+        // Never leave a required action/transition waypoint for an excursion.
+        if (!isPlainLurePullWaypoint(context.waypoint)) {
+            clearLureOffscreenPull("special Cave waypoint is current", { quiet: true });
+            return false;
+        }
+
+        // Hard pack safety always outranks looking for one more mob.
+        if (state.lureMovementHeld) {
+            clearLureOffscreenPull("existing lure pack needs to catch up", { quiet: true });
+            return false;
+        }
+
+        // The dedicated last-mob finish behavior is authoritative. Do not leave
+        // a nearly-dead final mob behind to fetch another creature.
+        if (state.lureLastMobActive) {
+            clearLureOffscreenPull("last-mob finish active", { quiet: true });
+            return false;
+        }
+
+        let target = getActiveLureOffscreenPullTarget();
+
+        if (target && !isKnownMonsterForOffscreenHunt(target)) {
+            clearLureOffscreenPull("creature disappeared or changed floor");
+            target = null;
+        }
+        if (target && isIgnoredTargetCreature(target)) {
+            clearLureOffscreenPull("creature is ignored");
+            target = null;
+        }
+        if (target && isTargetSkipped(target, now)) {
+            clearLureOffscreenPull("creature temporarily skipped", { quiet: true });
+            target = null;
+        }
+
+        if (!target) {
+            const candidates = getLureOffscreenPullCandidates(now);
+            target = candidates[0] || null;
+            if (!target)
+                return false;
+            if (!beginLureOffscreenPull(target, now))
+                return false;
+        }
+
+        const playerPos = normalizePosition(bot.getPlayerPosition());
+        const targetPos = normalizePosition(
+            target.getPosition?.() || target.__position
+        );
+        if (!playerPos || !targetPos || playerPos.z !== targetPos.z) {
+            clearLureOffscreenPull("invalid pull position/floor");
+            return false;
+        }
+
+        const range = Math.max(
+            3,
+            Math.min(20, Math.trunc(Number(config.lureOffscreenPullRange) || 10))
+        );
+        const lureRadius = Math.max(
+            1,
+            Math.min(8, Math.trunc(Number(config.lureRadius) || 5))
+        );
+        const distance = getTileDistance(playerPos, targetPos);
+
+        if (!Number.isFinite(distance) || distance > range) {
+            rememberSkippedTarget(target, now, 1800);
+            clearLureOffscreenPull(
+                `creature left pull range (${distance} > ${range})`
+            );
+            return false;
+        }
+
+        if (config.antiKSEnabled) {
+            const antiKSReason = getAntiKSBlockReason(
+                target,
+                getAntiKSContext(now),
+                now
+            );
+            if (
+                antiKSReason &&
+                !String(antiKSReason).startsWith("Anti-KS self range")
+            ) {
+                rememberSkippedTarget(target, now, 4000);
+                clearLureOffscreenPull(
+                    `Anti-KS blocked pull: ${antiKSReason}`
+                );
+                return false;
+            }
+        }
+
+        const screen = getNativeSmallScreenInfo(target);
+        if (screen.visible && distance <= lureRadius) {
+            clearLureOffscreenPull(
+                "creature entered normal lure radius",
+                { handoff: true }
+            );
+            invalidateCandidateSnapshot();
+            return false;
+        }
+
+        state.lureOffscreenPullLastKnownPosition = { ...targetPos };
+        state.lureOffscreenPullLastDistance = distance;
+        if (
+            !Number.isFinite(state.lureOffscreenPullBestDistance) ||
+            distance < state.lureOffscreenPullBestDistance
+        ) {
+            state.lureOffscreenPullBestDistance = distance;
+            state.lureOffscreenPullLastProgressAt = now;
+            state.lureOffscreenPullConsecutivePathFailures = 0;
+        }
+
+        const noProgressMs = Math.max(
+            2000,
+            Math.min(12000, Number(config.lureOffscreenPullNoProgressMs) || 4500)
+        );
+        if (
+            state.lureOffscreenPullLastProgressAt &&
+            now - state.lureOffscreenPullLastProgressAt >= noProgressMs
+        ) {
+            rememberSkippedTarget(target, now, 2500);
+            clearLureOffscreenPull(
+                `no pull progress for ${Math.round(noProgressMs / 1000)}s`
+            );
+            return false;
+        }
+
+        if (distance <= 1) {
+            rememberSkippedTarget(target, now, 2500);
+            clearLureOffscreenPull(
+                "reached last known position but mob did not enter lure range"
+            );
+            return false;
+        }
+
+        // v1.6.49: Off-screen Pull must feel like a continuous A* walk, not
+        // keyboard tapping. The old implementation deliberately sent only one
+        // tile every ~650ms when a lure pack already existed; that made the
+        // approach visibly choppy. Let the Targeting-owned AutoWalk queue run
+        // short multi-step batches instead. Pack safety remains authoritative:
+        // syncLureOffscreenPull() is cancelled immediately when the normal lure
+        // leash raises state.lureMovementHeld, and clearLureOffscreenPull()
+        // stops any currently queued Pull-owned AutoWalk batch.
+
+        const route =
+            typeof bot.getFollowRouteForCreature === "function"
+                ? bot.getFollowRouteForCreature(target, "pvp")
+                : findReachableAdjacentPath(targetPos, playerPos);
+
+        if (
+            !route ||
+            route.atGoal === true ||
+            !Array.isArray(route.pathPositions) ||
+            route.pathPositions.length === 0
+        ) {
+            state.lureOffscreenPullPathFailures++;
+            state.lureOffscreenPullConsecutivePathFailures++;
+            if (state.lureOffscreenPullConsecutivePathFailures >= 2) {
+                rememberSkippedTarget(target, now, 2500);
+                clearLureOffscreenPull("no safe route toward nearby lure mob");
+            }
+            return false;
+        }
+
+        const moved = sendManualTargetPursuitAutoWalk(
+            playerPos,
+            route,
+            target,
+            targetPos,
+            "Off-screen Pull – bringing nearby mob into lure range",
+            now,
+            {
+                owner: "pull",
+                // Keep a live pack a little more conservative, but still send
+                // enough directions for smooth server AutoWalk. With no pack
+                // yet, use the same longer travel batch as Off-screen Hunt.
+                maxSteps: visibleCount > 0 ? 3 : 5,
+                // Do not rebuild merely because our own position changed and
+                // therefore the next short batch destination changed. A moved
+                // monster still refreshes immediately through targetPosKey.
+                refreshOnDestinationChange: false
+            }
+        );
+
+        if (moved) {
+            state.lureOffscreenPullLastMoveAt = now;
+            state.lureOffscreenPullConsecutivePathFailures = 0;
+            state.movementOwner = "offscreen-lure-pull";
+            state.movementOwnedUntil = now + 750;
+            return true;
+        }
+
+        state.lureOffscreenPullPathFailures++;
+        state.lureOffscreenPullConsecutivePathFailures++;
+        if (state.lureOffscreenPullConsecutivePathFailures >= 2) {
+            rememberSkippedTarget(target, now, 2500);
+            clearLureOffscreenPull("pull movement packet/path failed");
+        }
+        return false;
+    }
+
     function getLureVisibleMonsters() {
         const ignoredNames = new Set(
             (config.ignoredTargetNames || [])
@@ -12575,8 +13506,19 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         // v1.5.11: Lure has its own radius, independent of Max Target Dist.
         // Only mobs inside this Chebyshev tile radius participate in any lure
         // decisions. Native visibility is still required by getNearbyMonsters.
+        //
+        // v1.6.46: be deliberately strict here. Known creatures outside the
+        // rendered playfield are useful Off-screen Pull candidates, but they
+        // must NEVER satisfy the lure threshold before they are actually on
+        // screen and inside the configured lure radius. Counting those cached
+        // off-screen creatures made Lure believe the pack was already full and
+        // stop route/pull movement before the mobs were truly acquired.
         return getNearbyMonsters(false).filter(monster => {
             if (ignoredNames.has(normalizeCreatureName(monster?.name)))
+                return false;
+
+            const screen = getNativeSmallScreenInfo(monster);
+            if (!screen.visible)
                 return false;
 
             const pos = normalizePosition(monster?.getPosition?.() || monster?.__position);
@@ -12820,6 +13762,30 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         const liveApproach = getTargetApproachInfo(target);
         if (liveApproach?.reachable)
             return null;
+
+        // v1.6.52: getTargetApproachInfo() is intentionally cached for a short
+        // window. A monster can step into (or out of) the route during that
+        // cache lifetime. Before deciding that a creature must be killed to
+        // reach a preferred target, run one fresh combat A* probe. If there is
+        // room around the blocker, normal pursuit should detour instead.
+        const freshDetour = findReachableAdjacentPath(
+            targetPos,
+            playerPos
+        );
+        if (
+            freshDetour &&
+            (
+                Number(freshDetour.pathSteps) === 0 ||
+                (
+                    Array.isArray(freshDetour.pathPositions) &&
+                    freshDetour.pathPositions.length > 0
+                )
+            )
+        ) {
+            state.preferredAccessLastReason =
+                "fresh A* detour exists around creature blocker";
+            return null;
+        }
 
         // A static route proves walls/map geometry are not the problem.
         const staticRoute = findStaticTargetAccessRoute(
@@ -13819,6 +14785,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         if (state.lureActive && reason === "threshold reached")
             state.lureThresholdReachedAt = now;
 
+        clearLureOffscreenPull(reason || "lure state cleared", { quiet: true });
         clearLureMovementHold(reason, now);
         clearLureLastMobState(reason);
         state.lureMotionHistory.clear();
@@ -13849,6 +14816,22 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         const trackedPreferred = trackedPreferredEntry?.creature || null;
         const trackedDistance = Number(trackedPreferredEntry?.distance);
         const preferredActionable = !!actionablePreferred;
+
+        // v1.6.46: once Targeting has actually selected a preferred mob,
+        // Lure must get out of the way even if the preferred target is not yet
+        // considered fully "actionable" by the stricter handoff probe on this
+        // tick. Otherwise Lure remains active, keeps Client Chase disabled, and
+        // ranged/preferred mobs that kite the player leave the bot standing
+        // still with the right target selected. Treat a live, visible selected
+        // preferred target as a normal-mode handoff trigger.
+        const currentPreferredTarget =
+            current &&
+            isPreferredCreature(current) &&
+            !isIgnoredTargetCreature(current) &&
+            isStrictPreferredScreenVisible(current) &&
+            ((state.skippedTargetIds.get(current.id) || 0) <= now)
+                ? current
+                : null;
 
         if (trackedPreferred) {
             state.lurePreferredLastSeenAt = now;
@@ -13897,16 +14880,56 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             };
         }
 
-        // Preferred only exits lure when it passes the SAME real checks normal
-        // targeting needs: strict screen, max distance, reachability, Anti-KS.
-        if (actionablePreferred) {
+        // v1.6.51: preferred handoff is sticky while that exact preferred mob
+        // remains selected. Before this latch, a kiting Necromancer could be
+        // handed to normal Targeting on one tick, move slightly, then be seen as
+        // merely "preferred pending" on the next tick. Lure would reactivate,
+        // disable pursuit, and leave the bot standing with the correct target.
+        const handoffLockId = Number(state.lurePreferredHandoffLockId || 0);
+        if (handoffLockId > 0) {
+            const lockStillSelected = !!(
+                current &&
+                Number(current.id) === handoffLockId &&
+                isPreferredCreature(current) &&
+                !isIgnoredTargetCreature(current) &&
+                Number(current?.state?.health ?? current?.health ?? 1) > 0
+            );
+
+            if (lockStillSelected) {
+                return {
+                    active: false,
+                    reason: "preferred handoff locked",
+                    threshold,
+                    visibleMonsters,
+                    preferredVisible: true,
+                    preferredActionableTarget: current,
+                    preferredCurrentTarget: current,
+                    preferredTrackedTarget: trackedPreferred || current
+                };
+            }
+
+            // The handed-off preferred is no longer the selected live target.
+            // Release the latch so ordinary lure logic may operate again.
+            state.lurePreferredHandoffLockId = null;
+            state.lurePreferredHandoffLockName = null;
+            state.lurePreferredHandoffLockAt = 0;
+        }
+
+        // Preferred exits lure either when it passes the SAME real checks normal
+        // targeting needs, or when Targeting has already selected a live visible
+        // preferred mob and now needs normal chase movement to take over.
+        const preferredHandoffTarget = actionablePreferred || currentPreferredTarget;
+        if (preferredHandoffTarget) {
             return {
                 active: false,
-                reason: "preferred mob actionable",
+                reason: actionablePreferred
+                    ? "preferred mob actionable"
+                    : "selected preferred mob",
                 threshold,
                 visibleMonsters,
                 preferredVisible: true,
-                preferredActionableTarget: actionablePreferred,
+                preferredActionableTarget: preferredHandoffTarget,
+                preferredCurrentTarget: currentPreferredTarget || null,
                 preferredTrackedTarget: trackedPreferred
             };
         }
@@ -14616,26 +15639,139 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         if (!context.active) {
             const wasActive = state.lureActive;
             const preferredTarget = context.preferredActionableTarget || null;
+            const currentBeforeClear = getCurrentTarget();
+            const samePreferredAlreadySelected = !!(
+                preferredTarget &&
+                currentBeforeClear &&
+                currentBeforeClear.id === preferredTarget.id
+            );
+            const hadLureTransitionState = !!(
+                wasActive ||
+                state.lurePreferredPending ||
+                state.lureOffscreenPullActive ||
+                state.lureMovementHeld ||
+                state.lureLastMobActive
+            );
+
+            // v1.6.48: once a preferred mob has already been handed to normal
+            // Targeting and every lure-owned state is gone, do NOT run the
+            // handoff again on every 150ms attack tick. Re-entering this branch
+            // repeatedly was resetting movement ownership while the normal A*
+            // chase was trying to pursue a kiting preferred mob, producing the
+            // repeated "Lure handed off" log and occasional stationary target.
+            if (
+                preferredTarget &&
+                samePreferredAlreadySelected &&
+                !hadLureTransitionState
+            ) {
+                state.lureReason = context.reason;
+                return false;
+            }
+
             clearLureState(context.reason, now);
 
-            // Preferred handoff is now atomic: once the preferred mob becomes
+            // Preferred handoff is atomic: once the preferred mob becomes
             // truly actionable, select it immediately instead of giving normal
             // targeting a frame where it can keep/finish an ordinary lure mob.
             if (preferredTarget) {
                 const current = getCurrentTarget();
-                if (!current || current.id !== preferredTarget.id) {
+                let selectedPreferred = current && current.id === preferredTarget.id;
+
+                if (!selectedPreferred) {
                     if (current && state.autoTargetId === current.id)
                         clearCurrentFollowTarget();
 
-                    if (setCurrentTarget(preferredTarget)) {
-                        state.lurePreferredHandoffs++;
-                        state.lurePreferredActionableId = preferredTarget.id;
-                        state.lurePreferredLastReason = "preferred became actionable";
-                        bot.log("Lure handed off to actionable preferred mob", {
-                            id: preferredTarget.id,
-                            name: preferredTarget.name || "Preferred"
-                        });
+                    selectedPreferred = setCurrentTarget(preferredTarget);
+                }
+
+                if (selectedPreferred) {
+                    state.lurePreferredHandoffs++;
+                    state.lurePreferredActionableId = preferredTarget.id;
+                    state.lurePreferredLastReason = context.reason || "preferred became actionable";
+                    state.lurePreferredHandoffLockId = preferredTarget.id;
+                    state.lurePreferredHandoffLockName = preferredTarget.name || "Preferred";
+                    state.lurePreferredHandoffLockAt = now;
+                    clearLurePreferredPending("preferred handoff to normal targeting");
+                    clearLureOffscreenPull("preferred handoff to normal targeting", { quiet: true });
+                    clearLureMovementHold("preferred handoff to normal targeting", now);
+                    clearLureLastMobState("preferred handoff to normal targeting");
+
+                    // v1.6.47: Lure forcibly disables Client Chase while it owns
+                    // movement. On preferred handoff, restore pursuit only when
+                    // Melee is enabled. Client Chase merely chooses the pursuit
+                    // engine: native chase when ON, mb0t A* when OFF. With Melee
+                    // OFF the preferred target may still be selected/attacked,
+                    // but Targeting must not chase it.
+                    const handoffPlayerPos = normalizePosition(
+                        bot.getPlayerPosition()
+                    );
+                    const handoffTargetPos = normalizePosition(
+                        preferredTarget.getPosition?.() ||
+                        preferredTarget.__position
+                    );
+                    const handoffDistance =
+                        handoffPlayerPos &&
+                        handoffTargetPos &&
+                        handoffPlayerPos.z === handoffTargetPos.z
+                            ? getTileDistance(
+                                handoffPlayerPos,
+                                handoffTargetPos
+                            )
+                            : null;
+
+                    let handoffPursuitStarted = null;
+
+                    if (
+                        config.meleeMode &&
+                        config.useClientChase &&
+                        Number.isFinite(handoffDistance) &&
+                        handoffDistance > 1
+                    ) {
+                        setClientChaseMode(true);
+                        state._chaseEnabledForDistance = true;
+                        state.movementOwner = "client-chase";
+                        state.movementOwnedUntil = now + 900;
+                    } else if (
+                        config.meleeMode &&
+                        !config.useClientChase &&
+                        Number.isFinite(handoffDistance) &&
+                        handoffDistance > 1
+                    ) {
+                        // v1.6.50: start the field-aware A* pursuit atomically
+                        // with the preferred handoff. Merely reserving movement
+                        // ownership left a window where CaveBot was paused but no
+                        // Targeting AutoWalk had actually been issued.
+                        setClientChaseMode(false);
+                        state._chaseEnabledForDistance = false;
+                        handoffPursuitStarted = syncManualTargetPursuit(now);
+                        if (!handoffPursuitStarted) {
+                            // Keep CaveBot from racing the handoff for one short
+                            // retry window; the normal targeting tick will retry.
+                            state.movementOwner = "melee";
+                            state.movementOwnedUntil = now + 300;
+                        }
+                    } else {
+                        setClientChaseMode(false);
+                        state._chaseEnabledForDistance = false;
+                        state.movementOwner = null;
+                        state.movementOwnedUntil = 0;
                     }
+
+                    bot.log("Lure handed off to actionable preferred mob", {
+                        id: preferredTarget.id,
+                        name: preferredTarget.name || "Preferred",
+                        reason: context.reason || null,
+                        alreadySelected: !!(current && current.id === preferredTarget.id),
+                        distance: Number.isFinite(handoffDistance)
+                            ? handoffDistance
+                            : null,
+                        melee: !!config.meleeMode,
+                        clientChase: !!config.useClientChase,
+                        pursuitEngine: !config.meleeMode
+                            ? "none"
+                            : (config.useClientChase ? "client-chase" : "a-star"),
+                        pursuitStarted: handoffPursuitStarted
+                    });
                 }
             }
 
@@ -14718,14 +15854,22 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             updateLureLastMobState(context, now);
         }
         updateLureScreenLeash(context, now);
+        const offscreenPullActive =
+            syncLureOffscreenPull(context, now);
 
-        // v1.5.08: Lure no longer clears Auto Attack's target. Keep attacking
-        // while moving, but never allow Targeting to chase/kite or own movement.
-        // CaveBot remains the sole movement owner during the pull.
+        // v1.5.08: normal Lure keeps combat attack-only while CaveBot owns
+        // route movement. v1.6.45 adds one explicit exception: Off-screen Pull
+        // temporarily pauses CaveBot and owns only the short approach packets
+        // needed to bring a nearby known mob into normal lure radius.
         setClientChaseMode(false);
         state._chaseEnabledForDistance = false;
-        state.movementOwner = null;
-        state.movementOwnedUntil = 0;
+        if (!offscreenPullActive) {
+            state.movementOwner = null;
+            state.movementOwnedUntil = 0;
+        } else {
+            state.movementOwner = "offscreen-lure-pull";
+            state.movementOwnedUntil = now + 750;
+        }
         resetRetargetCandidate();
 
         return true;
@@ -14745,10 +15889,14 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         const antiKS = getAntiKSContext(now);
 
         const lureBlockedIds = new Set(
-            bot.cave?.getLureBlockedCreatureIds?.() ||
-            (bot.cave?.getLureBlockerId?.() != null
-                ? [bot.cave.getLureBlockerId()]
-                : [])
+            (
+                bot.cave?.getLureBlockedCreatureIds?.() ||
+                (bot.cave?.getLureBlockerId?.() != null
+                    ? [bot.cave.getLureBlockerId()]
+                    : [])
+            )
+                .map(id => Number(id))
+                .filter(Number.isFinite)
         );
 
         const candidates = getLureVisibleMonsters()
@@ -14756,7 +15904,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 // v1.5.14: keep route/corridor blockers alive while CaveBot is
                 // intentionally waiting for the local lane to open.
                 if (
-                    lureBlockedIds.has(monster?.id) &&
+                    lureBlockedIds.has(Number(monster?.id)) &&
                     !(
                         state.lureLastMobActive &&
                         state.lureLastMobId != null &&
@@ -15110,8 +16258,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         // live Client Chase toggle or combat helper from stealing the route.
         setClientChaseMode(false);
         state._chaseEnabledForDistance = false;
-        state.movementOwner = null;
-        state.movementOwnedUntil = 0;
+        if (!state.lureOffscreenPullActive) {
+            state.movementOwner = null;
+            state.movementOwnedUntil = 0;
+        }
 
         let current = getCurrentTarget();
 
@@ -15153,14 +16303,18 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         }
 
         const lureBlockedIds = new Set(
-            bot.cave?.getLureBlockedCreatureIds?.() ||
-            (bot.cave?.getLureBlockerId?.() != null
-                ? [bot.cave.getLureBlockerId()]
-                : [])
+            (
+                bot.cave?.getLureBlockedCreatureIds?.() ||
+                (bot.cave?.getLureBlockerId?.() != null
+                    ? [bot.cave.getLureBlockerId()]
+                    : [])
+            )
+                .map(id => Number(id))
+                .filter(Number.isFinite)
         );
         if (
             current &&
-            lureBlockedIds.has(current.id) &&
+            lureBlockedIds.has(Number(current.id)) &&
             !(
                 state.lureLastMobActive &&
                 state.lureLastMobId != null &&
@@ -15901,6 +17055,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         invalidateCandidateSnapshot();
 
         // Never chase/kite/cast while the target packet is PZ-blocked.
+        clearOffscreenHunt(
+            "protection zone",
+            { quiet: true }
+        );
         setClientChaseMode(false);
         state._chaseEnabledForDistance = false;
         state.movementOwner = null;
@@ -16068,6 +17226,18 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     function refreshMovementOwnership(now = Date.now()) {
         if (!state.running || !config.enabled)
             return false;
+
+        // Off-screen Hunt intentionally has no combat target yet. Keep CaveBot
+        // paused while this Targeting-owned movement is active anyway.
+        if (
+            config.offscreenHuntEnabled &&
+            state.offscreenHuntActive
+        ) {
+            state.movementOwner = "offscreen-hunt";
+            state.movementOwnedUntil = now + 500;
+            return true;
+        }
+
         const current = getCurrentTarget();
         const follow = getCurrentFollowTarget();
         const engaged = current ||
@@ -16076,11 +17246,24 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         if (!engaged)
             return state.movementOwnedUntil > now;
         if (config.kiteMode || config.meleeMode) {
-            state.movementOwner = config.kiteMode ? "kite" : (config.useClientChase ? "melee-chase" : "melee");
-            // Small grace window prevents CaveBot taking movement on the same
-            // frame that the client is finishing a combat chase step.
+            state.movementOwner = config.kiteMode
+                ? "kite"
+                : (config.useClientChase ? "client-chase" : "melee");
+            // v1.6.47: Melee is the master pursuit permission. Client Chase
+            // only selects native-vs-A* movement while Melee is ON.
             state.movementOwnedUntil = now + 400;
             return true;
+        }
+
+        // A selected target with Melee OFF must not pause CaveBot or retain a
+        // stale pursuit owner from an earlier configuration.
+        if (
+            state.movementOwner === "client-chase" ||
+            state.movementOwner === "melee" ||
+            state.movementOwner === "manual-target-pursuit"
+        ) {
+            state.movementOwner = null;
+            state.movementOwnedUntil = 0;
         }
         if (state.movementOwner === "manual-target-pursuit" && state.movementOwnedUntil > now)
             return true;
@@ -16117,6 +17300,11 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function resetAttackSessionState(reason = "session changed") {
+        clearOffscreenHunt(
+            reason,
+            { quiet: true }
+        );
+
         // Kite mode temporarily moves CaveBot's route index backwards. Never
         // strand the route at that temporary retreat index across reconnects.
         if (state.kiteOriginalIndex !== null) {
@@ -16139,6 +17327,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         state.manualPursuitAutoWalkTargetId = null;
         state.manualPursuitAutoWalkTargetPosKey = null;
         state.manualPursuitAutoWalkDestinationKey = null;
+        state.manualPursuitAutoWalkStartKey = null;
+        state.manualPursuitAutoWalkPathPositions = [];
         state.lastSelectedTargetId = null;
         state.targetSelectedAt = 0;
         state.lastTargetChangeAt = 0;
@@ -16175,6 +17365,11 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         state.offscreenLureHoldClears = 0;
         state.offscreenLastMobClears = 0;
         state.offscreenEngagedRejects = 0;
+        state.lureOffscreenPullActivations = 0;
+        state.lureOffscreenPullHandoffs = 0;
+        state.lureOffscreenPullAborts = 0;
+        state.lureOffscreenPullPathFailures = 0;
+        state.lureOffscreenPullLastReason = null;
         state.canonicalTargetRefreshes = 0;
         state.canonicalFollowRefreshes = 0;
         state.candidateSnapshotAt = 0;
@@ -16245,6 +17440,9 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         state.lurePreferredSuppressedTargets = 0;
         state.lurePreferredHandoffs = 0;
         state.lurePreferredLastReason = null;
+        state.lurePreferredHandoffLockId = null;
+        state.lurePreferredHandoffLockName = null;
+        state.lurePreferredHandoffLockAt = 0;
         state.lurePreferredSoftAttackTicks = 0;
         state.lurePreferredSoftAttackAcquires = 0;
         state.lurePreferredSoftAttackReleases = 0;
@@ -16444,14 +17642,25 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
             if (config.kiteMode)
                 enforceKiteClientChaseOff();
-            else if (config.useClientChase)
+            else if (config.meleeMode && config.useClientChase)
                 setClientChaseMode(2);
+            else
+                setClientChaseMode(0);
         }
         return true;
     }
 
     function clearEngagedTarget() {
+        const clearedEngagedId = state.engagedTargetId;
         state.engagedTargetId = null;
+        if (
+            clearedEngagedId != null &&
+            Number(state.lurePreferredHandoffLockId) === Number(clearedEngagedId)
+        ) {
+            state.lurePreferredHandoffLockId = null;
+            state.lurePreferredHandoffLockName = null;
+            state.lurePreferredHandoffLockAt = 0;
+        }
         state.combatStartedAt = 0;
         state.lastSelectedTargetId = null;
         state.targetSelectedAt = 0;
@@ -17473,8 +18682,16 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                     "pvp"
                 );
 
-            if (!followRoute)
-                return null;
+            if (!followRoute) {
+                // v1.6.50: shared Follow A* is intentionally strict about
+                // creature occupancy. If it cannot build a route, fall back to
+                // Targeting's adjacent-tile A* instead of leaving a selected
+                // preferred mob with no pursuit movement.
+                return findReachableAdjacentPath(
+                    targetPos,
+                    playerPos
+                );
+            }
 
             if (followRoute.atGoal) {
                 return {
@@ -17588,8 +18805,111 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             null;
         state.manualPursuitAutoWalkDestinationKey =
             null;
+        state.manualPursuitAutoWalkStartKey =
+            null;
+        state.manualPursuitAutoWalkPathPositions =
+            [];
         state.lastManualPursuitReason =
             reason;
+
+        return true;
+    }
+
+    // v1.6.52: validate the REMAINING part of an in-flight melee A* batch.
+    // Creature positions can change after AutoWalkPacket is sent. If another
+    // monster steps into that queued path, do not wait for the old batch to
+    // time out or for the server to eventually cancel it; the fresh A* route
+    // calculated by this tick should replace it immediately.
+    function isStoredMeleeAutoWalkBatchPassable(playerPos) {
+        const stored =
+            Array.isArray(state.manualPursuitAutoWalkPathPositions)
+                ? state.manualPursuitAutoWalkPathPositions
+                : [];
+        if (!playerPos || stored.length === 0)
+            return true;
+
+        const keyOf = pos =>
+            pos
+                ? `${Number(pos.x)},${Number(pos.y)},${Number(pos.z)}`
+                : "";
+        const playerKey = keyOf(playerPos);
+        const startKey =
+            state.manualPursuitAutoWalkStartKey || "";
+
+        let remainingIndex = 0;
+        if (playerKey !== startKey) {
+            const occupiedIndex = stored.findIndex(
+                pos => keyOf(pos) === playerKey
+            );
+            if (occupiedIndex >= 0) {
+                remainingIndex = occupiedIndex + 1;
+            } else {
+                // We are no longer on the queued path (manual displacement,
+                // server correction, side-step, etc.). Replan from reality.
+                return false;
+            }
+        }
+
+        let previous = {
+            x: Number(playerPos.x),
+            y: Number(playerPos.y),
+            z: Number(playerPos.z)
+        };
+
+        for (let i = remainingIndex; i < stored.length; i++) {
+            const step = stored[i];
+            if (!step || Number(step.z) !== previous.z)
+                return false;
+
+            const dx = Number(step.x) - previous.x;
+            const dy = Number(step.y) - previous.y;
+            if (
+                Math.abs(dx) > 1 ||
+                Math.abs(dy) > 1 ||
+                (dx === 0 && dy === 0)
+            ) {
+                return false;
+            }
+
+            if (
+                !isSafeTargetApproachTile(
+                    Number(step.x),
+                    Number(step.y),
+                    Number(step.z),
+                    false
+                )
+            ) {
+                return false;
+            }
+
+            // A monster occupying either corner side also invalidates a
+            // diagonal move. searchTargetPathIgnoringFields() uses the same
+            // rule when constructing a fresh route.
+            if (dx !== 0 && dy !== 0) {
+                if (
+                    !isSafeTargetApproachTile(
+                        previous.x + dx,
+                        previous.y,
+                        previous.z,
+                        false
+                    ) ||
+                    !isSafeTargetApproachTile(
+                        previous.x,
+                        previous.y + dy,
+                        previous.z,
+                        false
+                    )
+                ) {
+                    return false;
+                }
+            }
+
+            previous = {
+                x: Number(step.x),
+                y: Number(step.y),
+                z: Number(step.z)
+            };
+        }
 
         return true;
     }
@@ -17639,7 +18959,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             Math.max(
                 1,
                 Math.min(
-                    3,
+                    8,
                     Number(options.maxSteps) || 3
                 )
             );
@@ -17647,8 +18967,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             options.refreshOnDestinationChange ===
                 true;
 
-        // Keep combat AutoWalk batches intentionally short because the target
-        // can move while the server is executing them.
+        // Keep ordinary combat AutoWalk batches intentionally short because
+        // visible targets can move while the server is executing them. Off-screen
+        // Hunt may explicitly request a slightly longer batch for smooth travel;
+        // it is still invalidated immediately when the mob position changes.
         const batch =
             pathPositions.slice(
                 0,
@@ -17681,19 +19003,71 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             client.__mbTargetingAutoWalkOwner ===
                 owner;
 
+        // v1.6.50: do not tear down an in-flight A* batch every time a
+        // moving/kiting target changes by one tile. That caused preferred
+        // ranged mobs to produce StopWalk/replan churn faster than the player
+        // could actually move. Let the short current batch finish for small
+        // target motion; replan immediately only after a material displacement.
+        let targetMovedTiles = Number.POSITIVE_INFINITY;
+        if (sameTarget && state.manualPursuitAutoWalkTargetPosKey) {
+            const parts = String(state.manualPursuitAutoWalkTargetPosKey)
+                .split(',')
+                .map(Number);
+            if (parts.length >= 3 && parts.every(Number.isFinite)) {
+                targetMovedTiles = Math.max(
+                    Math.abs(Number(targetPos.x) - parts[0]),
+                    Math.abs(Number(targetPos.y) - parts[1]),
+                    Math.abs(Number(targetPos.z) - parts[2]) * 20
+                );
+            }
+        }
+
+        const tolerateMovingTarget =
+            owner === "melee" &&
+            targetMovedTiles <= 2;
+
+        const storedMeleeBatchPassable =
+            owner !== "melee" ||
+            isStoredMeleeAutoWalkBatchPassable(playerPos);
+
         if (
             client.__mbTargetingAutoWalkActive ===
                 true &&
             sameTarget &&
-            sameTargetPos &&
             sameOwner &&
+            (
+                sameTargetPos ||
+                tolerateMovingTarget
+            ) &&
             (
                 !refreshOnDestinationChange ||
                 sameDestination
             ) &&
-            pf.__isAutoWalking
+            pf.__isAutoWalking &&
+            storedMeleeBatchPassable
         ) {
             return true;
+        }
+
+        if (
+            client.__mbTargetingAutoWalkActive === true &&
+            sameTarget &&
+            sameOwner &&
+            owner === "melee" &&
+            !storedMeleeBatchPassable
+        ) {
+            state.manualPursuitObstacleReplans++;
+            stopManualTargetPursuitAutoWalk(
+                "melee pursuit route dynamically blocked – replanning around creature"
+            );
+            bot.log(
+                "Targeting: chase path blocked – taking A* detour",
+                {
+                    id: target.id ?? null,
+                    name: target.name || "Mob",
+                    replans: state.manualPursuitObstacleReplans
+                }
+            );
         }
 
         if (
@@ -17750,7 +19124,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             const stepPassable =
                 owner === "kite"
                     ? isSafeTileForKite(step)
-                    : owner === "melee" &&
+                    : (owner === "melee" || owner === "hunt" || owner === "pull") &&
                         typeof bot.isFollowRoutePositionPassable ===
                             "function"
                         ? bot.isFollowRoutePositionPassable(
@@ -17888,6 +19262,14 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 targetPosKey;
             state.manualPursuitAutoWalkDestinationKey =
                 destinationKey;
+            state.manualPursuitAutoWalkStartKey =
+                `${Number(playerPos.x)},${Number(playerPos.y)},${Number(playerPos.z)}`;
+            state.manualPursuitAutoWalkPathPositions =
+                batch.map(step => ({
+                    x: Number(step.x),
+                    y: Number(step.y),
+                    z: Number(step.z)
+                }));
             state.lastChaseAt =
                 now;
             state.lastMoveAt =
@@ -17895,13 +19277,25 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             state.movementOwner =
                 owner === "kite"
                     ? "kite-autowalk"
-                    : "manual-target-autowalk";
+                    : (
+                        owner === "hunt"
+                            ? "offscreen-hunt-autowalk"
+                            : (
+                                owner === "pull"
+                                    ? "offscreen-lure-pull-autowalk"
+                                    : "manual-target-autowalk"
+                            )
+                    );
             state.movementOwnedUntil =
                 now +
                 (
                     owner === "kite"
                         ? 650
-                        : 900
+                        : (
+                            owner === "hunt"
+                                ? 500
+                                : (owner === "pull" ? 750 : 900)
+                        )
                 );
 
             return true;
@@ -18051,8 +19445,14 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             return false;
         }
 
-        const route =
-            getManualMeleeFollowRoute(
+        // v1.6.51: preferred targets use Targeting's own adjacent-tile A*
+        // directly. The shared Follow route is excellent for ordinary pursuit,
+        // but its stricter occupancy semantics could intermittently return a
+        // route that failed the Targeting send-time validation during a lure
+        // handoff. Preferred mobs must get the most direct combat-specific path.
+        const route = isPreferredCreature(target)
+            ? findReachableAdjacentPath(targetPos, playerPos)
+            : getManualMeleeFollowRoute(
                 target,
                 targetPos,
                 playerPos
@@ -18081,18 +19481,45 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function syncMeleeChase(now = Date.now()) {
+        // v1.6.47: Melee is the ONLY permission for ordinary target pursuit.
+        // Client Chase is an engine selector, not an independent permission.
+        // Melee ON + Client Chase ON  => native client chase.
+        // Melee ON + Client Chase OFF => mb0t field-aware A* pursuit.
+        // Melee OFF                    => no chase movement.
         if (!config.meleeMode) {
-            stopManualTargetPursuitAutoWalk(
-                "Melee disabled"
-            );
+            if (
+                !["hunt", "pull"].includes(
+                    window.gameClient?.__mbTargetingAutoWalkOwner
+                )
+            ) {
+                stopManualTargetPursuitAutoWalk(
+                    "Melee disabled"
+                );
+            }
+            setClientChaseMode(false);
+            state._chaseEnabledForDistance = false;
+            if (
+                state.movementOwner === "client-chase" ||
+                state.movementOwner === "melee" ||
+                state.movementOwner === "manual-target-pursuit"
+            ) {
+                state.movementOwner = null;
+                state.movementOwnedUntil = 0;
+            }
             return false;
         }
 
         const target = getEngagedTarget();
         if (!target) {
-            stopManualTargetPursuitAutoWalk(
-                "no engaged melee target"
-            );
+            if (
+                !["hunt", "pull"].includes(
+                    window.gameClient?.__mbTargetingAutoWalkOwner
+                )
+            ) {
+                stopManualTargetPursuitAutoWalk(
+                    "no engaged melee target"
+                );
+            }
             return false;
         }
 
@@ -18116,8 +19543,13 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         const dist = getTileDistance(playerPos, targetPos);
         const maxDist = Math.max(1, Number(config.maxTargetDistance) || 5);
 
-        if (dist > maxDist) {
-            handoffTarget(target, "too far for melee", now, 3000);
+        // v1.6.50: allow one tile of chase grace beyond the configured
+        // acquisition distance. Ranged/kiting preferred mobs commonly step
+        // away while we are already pursuing them; dropping the target at the
+        // exact max distance made A* chase look like it had stalled. The main
+        // resetTargetIfTooFar() guard uses the same maxDist + 1 boundary.
+        if (dist > maxDist + 1) {
+            handoffTarget(target, "too far for melee chase", now, 3000);
             return false;
         }
 
@@ -18589,7 +20021,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         if (config.kiteMode) {
             setClientChaseMode(0);
             state._chaseEnabledForDistance = false;
-        } else if (config.useClientChase) {
+        } else if (config.meleeMode && config.useClientChase) {
             setClientChaseMode(2);
         } else {
             setClientChaseMode(0);
@@ -18629,6 +20061,14 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         }
         clearEngagedTarget();
         state.lastChaseAt = 0;
+        clearOffscreenHunt(
+            "Auto Attack stopped",
+            { quiet: true }
+        );
+        clearLureOffscreenPull(
+            "Auto Attack stopped",
+            { quiet: true }
+        );
         stopManualTargetPursuitAutoWalk(
             "Auto Attack stopped"
         );
@@ -18638,6 +20078,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         state.manualPursuitAutoWalkTargetId = null;
         state.manualPursuitAutoWalkTargetPosKey = null;
         state.manualPursuitAutoWalkDestinationKey = null;
+        state.manualPursuitAutoWalkStartKey = null;
+        state.manualPursuitAutoWalkPathPositions = [];
         clearCurrentFollowTarget();
         state.kiteWaypointIndex = null;
         state.skippedTargetIds.clear();
@@ -18730,6 +20172,9 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         state.lurePreferredSuppressedTargets = 0;
         state.lurePreferredHandoffs = 0;
         state.lurePreferredLastReason = null;
+        state.lurePreferredHandoffLockId = null;
+        state.lurePreferredHandoffLockName = null;
+        state.lurePreferredHandoffLockAt = 0;
         state.lurePreferredSoftAttackTicks = 0;
         state.lurePreferredSoftAttackAcquires = 0;
         state.lurePreferredSoftAttackReleases = 0;
@@ -18957,6 +20402,68 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 state.offscreenLastMobClears || 0,
             offscreenEngagedRejects:
                 state.offscreenEngagedRejects || 0,
+            offscreenHuntActive:
+                state.offscreenHuntActive === true,
+            offscreenHuntTargetId:
+                state.offscreenHuntTargetId,
+            offscreenHuntTargetName:
+                state.offscreenHuntTargetName,
+            offscreenHuntStartedAt:
+                state.offscreenHuntStartedAt || 0,
+            offscreenHuntLastKnownPosition:
+                state.offscreenHuntLastKnownPosition
+                    ? { ...state.offscreenHuntLastKnownPosition }
+                    : null,
+            offscreenHuntBestDistance:
+                Number.isFinite(state.offscreenHuntBestDistance)
+                    ? state.offscreenHuntBestDistance
+                    : null,
+            offscreenHuntLastDistance:
+                Number.isFinite(state.offscreenHuntLastDistance)
+                    ? state.offscreenHuntLastDistance
+                    : null,
+            offscreenHuntLastProgressAt:
+                state.offscreenHuntLastProgressAt || 0,
+            offscreenHuntActivations:
+                state.offscreenHuntActivations || 0,
+            offscreenHuntHandoffs:
+                state.offscreenHuntHandoffs || 0,
+            offscreenHuntAborts:
+                state.offscreenHuntAborts || 0,
+            offscreenHuntPathFailures:
+                state.offscreenHuntPathFailures || 0,
+            offscreenHuntLastReason:
+                state.offscreenHuntLastReason,
+            lureOffscreenPullActive:
+                state.lureOffscreenPullActive === true,
+            lureOffscreenPullTargetId:
+                state.lureOffscreenPullTargetId,
+            lureOffscreenPullTargetName:
+                state.lureOffscreenPullTargetName,
+            lureOffscreenPullStartedAt:
+                state.lureOffscreenPullStartedAt || 0,
+            lureOffscreenPullLastKnownPosition:
+                state.lureOffscreenPullLastKnownPosition
+                    ? { ...state.lureOffscreenPullLastKnownPosition }
+                    : null,
+            lureOffscreenPullBestDistance:
+                Number.isFinite(state.lureOffscreenPullBestDistance)
+                    ? state.lureOffscreenPullBestDistance
+                    : null,
+            lureOffscreenPullLastDistance:
+                Number.isFinite(state.lureOffscreenPullLastDistance)
+                    ? state.lureOffscreenPullLastDistance
+                    : null,
+            lureOffscreenPullActivations:
+                state.lureOffscreenPullActivations || 0,
+            lureOffscreenPullHandoffs:
+                state.lureOffscreenPullHandoffs || 0,
+            lureOffscreenPullAborts:
+                state.lureOffscreenPullAborts || 0,
+            lureOffscreenPullPathFailures:
+                state.lureOffscreenPullPathFailures || 0,
+            lureOffscreenPullLastReason:
+                state.lureOffscreenPullLastReason,
             canonicalTargetRefreshes: state.canonicalTargetRefreshes || 0,
             canonicalFollowRefreshes: state.canonicalFollowRefreshes || 0,
             candidateSnapshotBuilds: state.candidateSnapshotBuilds || 0,
@@ -19037,6 +20544,9 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             lurePreferredSuppressedTargets: state.lurePreferredSuppressedTargets || 0,
             lurePreferredHandoffs: state.lurePreferredHandoffs || 0,
             lurePreferredLastReason: state.lurePreferredLastReason,
+            lurePreferredHandoffLockId: state.lurePreferredHandoffLockId,
+            lurePreferredHandoffLockName: state.lurePreferredHandoffLockName,
+            lurePreferredHandoffLockAt: state.lurePreferredHandoffLockAt || 0,
             lurePreferredSoftAttackTicks: state.lurePreferredSoftAttackTicks || 0,
             lurePreferredSoftAttackAcquires: state.lurePreferredSoftAttackAcquires || 0,
             lurePreferredSoftAttackReleases: state.lurePreferredSoftAttackReleases || 0,
@@ -19282,6 +20792,11 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
         let chaseSettingChanged =
             nextConfig.useClientChase !== undefined;
+        const meleeSettingChanged =
+            nextConfig.meleeMode !== undefined;
+
+        if (nextConfig.meleeMode !== undefined)
+            nextConfig.meleeMode = !!nextConfig.meleeMode;
 
         if (nextConfig.kiteMode !== undefined)
             nextConfig.kiteMode = !!nextConfig.kiteMode;
@@ -19310,6 +20825,34 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         }
         if (nextConfig.maxTargetDistance !== undefined) {
             nextConfig.maxTargetDistance = Math.max(1, Math.trunc(Number(nextConfig.maxTargetDistance) || config.maxTargetDistance || 5));
+        }
+        if (nextConfig.offscreenHuntEnabled !== undefined) {
+            nextConfig.offscreenHuntEnabled =
+                nextConfig.offscreenHuntEnabled === true;
+        }
+        if (nextConfig.offscreenHuntRange !== undefined) {
+            nextConfig.offscreenHuntRange = Math.max(
+                5,
+                Math.min(
+                    50,
+                    Math.trunc(
+                        Number(nextConfig.offscreenHuntRange) ||
+                        config.offscreenHuntRange ||
+                        20
+                    )
+                )
+            );
+        }
+        if (nextConfig.offscreenHuntNoProgressMs !== undefined) {
+            nextConfig.offscreenHuntNoProgressMs = Math.max(
+                2000,
+                Math.min(
+                    15000,
+                    Number(nextConfig.offscreenHuntNoProgressMs) ||
+                    config.offscreenHuntNoProgressMs ||
+                    5000
+                )
+            );
         }
         if (nextConfig.antiKSEnabled !== undefined) {
             nextConfig.antiKSEnabled = !!nextConfig.antiKSEnabled;
@@ -19418,6 +20961,22 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             nextConfig.lureRadius = Number.isFinite(value)
                 ? Math.max(1, Math.min(8, Math.trunc(value)))
                 : config.lureRadius;
+        }
+        if (nextConfig.lureOffscreenPullEnabled !== undefined) {
+            nextConfig.lureOffscreenPullEnabled =
+                nextConfig.lureOffscreenPullEnabled === true;
+        }
+        if (nextConfig.lureOffscreenPullRange !== undefined) {
+            const value = Number(nextConfig.lureOffscreenPullRange);
+            nextConfig.lureOffscreenPullRange = Number.isFinite(value)
+                ? Math.max(3, Math.min(20, Math.trunc(value)))
+                : config.lureOffscreenPullRange;
+        }
+        if (nextConfig.lureOffscreenPullNoProgressMs !== undefined) {
+            const value = Number(nextConfig.lureOffscreenPullNoProgressMs);
+            nextConfig.lureOffscreenPullNoProgressMs = Number.isFinite(value)
+                ? Math.max(2000, Math.min(12000, value))
+                : config.lureOffscreenPullNoProgressMs;
         }
         if (nextConfig.lureSmartTargeting !== undefined) {
             nextConfig.lureSmartTargeting = !!nextConfig.lureSmartTargeting;
@@ -19568,6 +21127,20 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                  : [];
         }
         Object.assign(config, nextConfig);
+
+        if (!config.offscreenHuntEnabled) {
+            clearOffscreenHunt(
+                "Off-screen Hunt disabled",
+                { quiet: true }
+            );
+        }
+        if (!config.lureOffscreenPullEnabled || !config.lureMode) {
+            clearLureOffscreenPull(
+                "Off-screen Pull disabled",
+                { quiet: true }
+            );
+        }
+
         invalidateCandidateSnapshot();
         invalidateAntiKSSnapshot();
 
@@ -19579,7 +21152,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
         if (config.kiteMode) {
             enforceKiteClientChaseOff();
-        } else if (chaseSettingChanged) {
+        } else if (chaseSettingChanged || meleeSettingChanged) {
             const target = getCurrentTarget();
             const playerPos =
                 normalizePosition(
@@ -19592,6 +21165,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 );
 
             const shouldChase =
+                !!config.meleeMode &&
                 !!config.useClientChase &&
                 !!playerPos &&
                 !!targetPos &&
@@ -19604,6 +21178,20 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             setClientChaseMode(shouldChase);
             state._chaseEnabledForDistance =
                 shouldChase;
+
+            if (!config.meleeMode) {
+                stopManualTargetPursuitAutoWalk(
+                    "Melee disabled by config"
+                );
+                if (
+                    state.movementOwner === "client-chase" ||
+                    state.movementOwner === "melee" ||
+                    state.movementOwner === "manual-target-pursuit"
+                ) {
+                    state.movementOwner = null;
+                    state.movementOwnedUntil = 0;
+                }
+            }
         }
 
         persistConfig();
@@ -19642,6 +21230,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         isEnabled: () => !!config.enabled,
         isLureActive,
         isLureMovementHeld,
+        isLureOffscreenPullActive: () => state.lureOffscreenPullActive === true,
         getLureLastMobInfo,
         getLureContext,
         isPreferredAccessBlocked,
@@ -20529,6 +22118,16 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         lureLastMobKillHolds: 0,
         lureLastMobMoveResets: 0,
 
+        // v1.6.43: pace ordinary lure movement too. Previously only the last
+        // low-HP lure mob was slowed, so CaveBot could sprint at full route
+        // speed until the screen leash finally caught a trailing monster.
+        lurePackMoveActive: false,
+        lurePackMovePhase: "run",
+        lurePackMovePhaseUntil: 0,
+        lurePackPacedRuns: 0,
+        lurePackPacedHolds: 0,
+        lurePackMoveResets: 0,
+
         // A missing player/position is not a navigation stall. Avoid counting
         // offline/character-load time against the stuck watchdog.
         positionUnavailable: false,
@@ -20608,6 +22207,14 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         bestDistanceToWaypoint: Infinity,
         waypointProgressKey: null,
         positionHistory: [],
+        // v1.6.40: real occupied-tile history for generic CaveBot movement.
+        // Unlike positionHistory, this is NOT cleared on every tile change, so
+        // repeated A<->B movement can be recognized as an actual oscillation.
+        movementOscillationHistory: [],
+        movementOscillationWaypointKey: null,
+        movementOscillationRepeatCount: 0,
+        movementOscillationLastAt: 0,
+        movementOscillationDetections: 0,
         _stuckLogged: false,
         standReached: {},
         _standAttempt: null, // { index: number, adjacentAt: number }
@@ -20768,6 +22375,13 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         // normal 500ms CaveBot tick so the pattern stays stable.
         lureLastMobSlowRunMs: 500,
         lureLastMobSlowHoldMs: 500,
+
+        // v1.6.43: ordinary lure packs move in short bursts instead of
+        // continuously sprinting away from monsters. One normal CaveBot tick
+        // of movement followed by roughly two ticks of hold is intentionally
+        // conservative; the screen/predictive leash remains the hard stop.
+        lurePackRunMs: 500,
+        lurePackHoldMs: 1000,
     },
             bot.storage.get(configStorageKey, {}));
     // Auto transitions are opt-in. A missing/stale setting defaults safely to OFF.
@@ -20815,6 +22429,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     );
     config.lureLastMobSlowRunMs = Math.max(350, Math.min(2000, Math.trunc(Number(config.lureLastMobSlowRunMs) || 500)));
     config.lureLastMobSlowHoldMs = Math.max(350, Math.min(2500, Math.trunc(Number(config.lureLastMobSlowHoldMs) || 500)));
+    config.lurePackRunMs = Math.max(350, Math.min(1500, Math.trunc(Number(config.lurePackRunMs) || 500)));
+    config.lurePackHoldMs = Math.max(500, Math.min(3000, Math.trunc(Number(config.lurePackHoldMs) || 1000)));
     config.recoveryObstacleMemoryMs = Math.max(1000, Math.trunc(Number(config.recoveryObstacleMemoryMs) || 10000));
     config.routeHealthWarningThreshold = Math.max(1, Math.trunc(Number(config.routeHealthWarningThreshold) || 3));
     config.recoveryHotspotAvoidMs = Math.max(1000, Math.min(60000, Math.trunc(Number(config.recoveryHotspotAvoidMs) || 10000)));
@@ -22807,22 +24423,56 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             Math.trunc(Number(config.maxRecoverySideSteps ?? 2) || 0)
         );
 
+        // v1.6.36: a native NO_WAY is already a hard pathfinding failure.
+        // The old code only primed the generic stuck counters and waited for a
+        // later tick to enter closest-waypoint recovery. If that later tick was
+        // rebased by another movement/watchdog gate, CaveBot could remain idle
+        // indefinitely until the player moved manually. Perform the recovery
+        // transaction here, in the same turn that consumed the NO_WAY event.
         state.stuckRecoveryAttempts = maxRepathRecoveries;
         state.recoverySideStepAttempts = maxRecoverySideSteps;
-        state.recoveryBlockerWaitAt = now;
+        state.recoveryBlockerWaitAt = 0;
         state.recoveryBlockerWaitKey = null;
         state.recoveryBestDistance = Infinity;
         state.recoveryNoProgressAt = now;
-        state.lastRecoveryAt = 0;
-        state.lastProgressAt =
-            now - Math.max(1000, Number(config.stuckTimeoutMs) || 5000) - 1;
+        state.lastRecoveryAt = now;
         state._stuckLogged = false;
 
+        const failedIndex = state.currentIndex;
         bot.log(
             `Cave: Pathfinder reported "There is no way." at waypoint #` +
-            `${state.currentIndex + 1} – forcing waypoint recovery (${source})`
+            `${failedIndex + 1} – forcing waypoint recovery (${source})`
         );
-        return false;
+
+        // Cancel every part of the failed native route before choosing a new
+        // recovery waypoint. This also clears lastWaypointTarget/lastPathAt so
+        // the newly selected waypoint always starts a fresh path immediately.
+        stopCaveMovementNow();
+
+        const allowTransitionFallback =
+            isRecoveryTransitionWaypoint(currentWp);
+        const recovered = skipToClosestWaypoint({
+            allowTransitionFallback,
+            excludeIndex: allowTransitionFallback ? failedIndex : -1,
+            avoidIndex: state.recoveryLastTargetIndex,
+            avoidKey: state.recoveryLastTargetKey
+        });
+
+        if (recovered) {
+            state.lastProgressAt = now;
+            state.lastPathAt = 0;
+            state.pathAttemptStart = now;
+            state._stuckLogged = false;
+            return false;
+        }
+
+        // Never leave CaveBot enabled but motionless after a hard NO_WAY when
+        // there is no safe same-floor recovery target.
+        bot.log(
+            `Cave: NO_WAY recovery found no safe waypoint after #${failedIndex + 1} – stopping CaveBot`
+        );
+        stop();
+        return true;
     }
 
     function processLureNoWayArbitration(position, waypoint, now = Date.now()) {
@@ -23322,6 +24972,116 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         return state.lureDetourPlan[1] || null;
     }
 
+    // v1.6.44: fallback for the common "one mob in an open room" case.
+    // The original blocker bypass insists on rejoining the exact static route
+    // that was chosen before creatures were considered. That is conservative,
+    // but it can reject a perfectly valid live route that goes around the mob
+    // and approaches the waypoint from a different lane. In that case use the
+    // existing live CaveBot A* (creatures are blockers) and keep only a short
+    // prefix as a persisted lure detour plan. Normal CaveBot routing resumes
+    // after the prefix, so this cannot drag the lure along an unbounded route.
+    function buildLiveLureWaypointBypassPlan(
+        position,
+        waypoint,
+        blockerPosition,
+        blockerId = null,
+        now = Date.now()
+    ) {
+        if (!position || !waypoint || position.z !== waypoint.z)
+            return null;
+
+        const routeInfo = findCaveFieldAwarePath(
+            position,
+            waypoint
+        );
+        const rawPath = Array.isArray(routeInfo?.path)
+            ? routeInfo.path
+            : [];
+        if (!rawPath.length)
+            return null;
+
+        const path = rawPath
+            .map(tile => normalizePosition(tile?.__position || tile))
+            .filter(Boolean);
+        if (!path.length)
+            return null;
+
+        // Validate every candidate step again against live occupancy. This is
+        // intentionally redundant with findCaveFieldAwarePath(): lure blocker
+        // handling should fail safe if creature/tile state changed mid-search.
+        const safe = [];
+        let previous = normalizePosition(position);
+        for (const next of path) {
+            if (!previous || !isLiveLureDetourStepValid(previous, next))
+                break;
+            safe.push(next);
+            previous = next;
+            if (safe.length >= 6)
+                break;
+        }
+        if (!safe.length)
+            return null;
+
+        const blockerPos = normalizePosition(blockerPosition);
+        let endCount = Math.min(safe.length, 6);
+
+        // Prefer a short prefix that has actually cleared the blocker by at
+        // least two tiles. If the route is shorter, simply use what is proven.
+        if (blockerPos) {
+            for (let i = 0; i < safe.length; i++) {
+                const dist = Math.max(
+                    Math.abs(safe[i].x - blockerPos.x),
+                    Math.abs(safe[i].y - blockerPos.y)
+                );
+                if (i >= 1 && dist >= 2) {
+                    endCount = i + 1;
+                    break;
+                }
+            }
+        }
+
+        const prefix = safe.slice(0, Math.max(1, endCount));
+        const plan = [
+            normalizePosition(position),
+            ...prefix
+        ].filter(Boolean);
+        if (plan.length < 2)
+            return null;
+
+        const waypointKey = getWaypointKey(waypoint);
+        const end = plan[plan.length - 1];
+        state.lureDetourPlan = plan.map(pos => ({
+            x: pos.x,
+            y: pos.y,
+            z: pos.z
+        }));
+        state.lureDetourPlanWaypointKey = waypointKey;
+        state.lureDetourPlanBlockerId = blockerId ?? null;
+        state.lureDetourPlanCreatedAt = now;
+        state.lureDetourPlanRejoinKey =
+            `${end.x},${end.y},${end.z}`;
+        state.lureDetourPlanLastStepAt = 0;
+        state.lureDetourPlanLastReason =
+            "live route-to-waypoint fallback around creature blocker";
+        state.lureDetourPlanBuilds++;
+
+        bot.log(
+            "Cave: lure blocker – live route around mob selected",
+            {
+                blockerId,
+                blockerPosition: blockerPos,
+                steps: plan.length - 1,
+                temporaryDestination: {
+                    x: end.x,
+                    y: end.y,
+                    z: end.z
+                }
+            }
+        );
+
+        return state.lureDetourPlan[1] || null;
+    }
+
     function getNextLureDetourPlanStep(
         position,
         waypoint,
@@ -23384,7 +25144,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
         if (index >= plan.length - 1) {
             clearLureDetourPlan(
-                "rejoined static route"
+                "completed lure bypass plan"
             );
             return null;
         }
@@ -23728,7 +25488,17 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         blockerId = null,
         now = Date.now()
     ) {
-        return buildLureBlockerDetourPlan(
+        const exactRejoin = buildLureBlockerDetourPlan(
+            position,
+            waypoint,
+            blockerPosition,
+            blockerId,
+            now
+        );
+        if (exactRejoin)
+            return exactRejoin;
+
+        return buildLiveLureWaypointBypassPlan(
             position,
             waypoint,
             blockerPosition,
@@ -24736,6 +26506,138 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         return d <= Math.max(0, Number(config.waypointTolerance) || 0);
     }
 
+    // v1.6.39: while Targeting owns movement, CaveBot may passively complete
+    // only ordinary Walk waypoints that the chase physically reaches/passes.
+    // Action/transition waypoints are authoritative and MUST remain current:
+    // Stand, Rope, Shovel, Ladder and Script are never consumed here.
+    function isPassiveChaseAdvanceWaypoint(waypoint) {
+        return !!waypoint &&
+            Number.isFinite(Number(waypoint.x)) &&
+            Number.isFinite(Number(waypoint.y)) &&
+            Number.isFinite(Number(waypoint.z)) &&
+            !waypoint.script &&
+            waypoint.stand !== true &&
+            waypoint.rope !== true &&
+            waypoint.shovel !== true &&
+            waypoint.ladder !== true;
+    }
+
+    function passivelyAdvanceChaseWaypoints(
+        position,
+        previousPosition = null,
+        now = Date.now()
+    ) {
+        if (!state.running || !position || route.length <= 1)
+            return 0;
+
+        const waypoint = getCurrentWaypoint();
+        if (!isPassiveChaseAdvanceWaypoint(waypoint))
+            return 0;
+
+        // v1.6.41: use the same Skip SQM setting as normal CaveBot waypoint
+        // completion. This checks the ACTUAL sampled player position only; it
+        // does not infer a straight path between samples, so the v1.6.39
+        // through-wall chord bug stays fixed. Skip SQM 0 requires the exact
+        // Walk tile; 1..5 accepts the configured nearby tolerance. Protected
+        // Stand/Rope/Shovel/Ladder/Script waypoints never enter this path.
+        const reached = isAtWaypoint(position, waypoint);
+        if (!reached)
+            return 0;
+
+        const oldIndex = state.currentIndex;
+        advanceWaypoint();
+        if (state.currentIndex === oldIndex)
+            return 0;
+
+        const passiveTolerance = Math.max(0, Number(config.waypointTolerance) || 0);
+        bot.log(
+            `Cave: chase reached Walk waypoint #${oldIndex + 1}` +
+            (passiveTolerance > 0 ? ` within ${passiveTolerance} SQM` : "") +
+            ` – advanced to #${state.currentIndex + 1}`
+        );
+
+        resetWaypointProgressTracking(
+            getCurrentWaypoint(),
+            position,
+            now
+        );
+        state.lastPositionKey = getPositionKey(position);
+        state.stuckCount = 0;
+        state.stuckRecoveryAttempts = 0;
+        return 1;
+    }
+
+    // v1.6.40: detect repeated physical A<->B movement under ordinary CaveBot
+    // navigation. This is independent of Targeting and catches native/custom
+    // path loops where packets keep moving the character but the route makes no
+    // real progress toward the current waypoint.
+    function observeMovementOscillation(position, waypoint, now = Date.now()) {
+        if (!position || !waypoint)
+            return { detected: false, repeat: 0 };
+
+        const positionKey = getPositionKey(position);
+        const waypointKey = getWaypointKey(waypoint);
+        if (!positionKey || !waypointKey)
+            return { detected: false, repeat: 0 };
+
+        if (state.movementOscillationWaypointKey !== waypointKey) {
+            state.movementOscillationWaypointKey = waypointKey;
+            state.movementOscillationHistory = [];
+            state.movementOscillationRepeatCount = 0;
+            state.movementOscillationLastAt = 0;
+        }
+
+        const history = state.movementOscillationHistory ||
+            (state.movementOscillationHistory = []);
+        const last = history[history.length - 1];
+        if (!last || last.key !== positionKey) {
+            history.push({ key: positionKey, at: now });
+        } else {
+            last.at = now;
+        }
+
+        const windowMs = 4500;
+        while (history.length && now - history[0].at > windowMs)
+            history.shift();
+        while (history.length > 8)
+            history.shift();
+
+        if (history.length < 6)
+            return { detected: false, repeat: state.movementOscillationRepeatCount || 0 };
+
+        const h = history.slice(-6).map(entry => entry.key);
+        const alternating =
+            h[0] !== h[1] &&
+            h[0] === h[2] &&
+            h[0] === h[4] &&
+            h[1] === h[3] &&
+            h[1] === h[5];
+        if (!alternating)
+            return { detected: false, repeat: state.movementOscillationRepeatCount || 0 };
+
+        // Do not count the same six samples repeatedly without fresh movement.
+        if (now - Number(state.movementOscillationLastAt || 0) < 900)
+            return { detected: false, repeat: state.movementOscillationRepeatCount || 0 };
+
+        if (now - Number(state.movementOscillationLastAt || 0) > 10000)
+            state.movementOscillationRepeatCount = 0;
+
+        state.movementOscillationLastAt = now;
+        state.movementOscillationRepeatCount =
+            Math.max(0, Number(state.movementOscillationRepeatCount) || 0) + 1;
+        state.movementOscillationDetections =
+            Math.max(0, Number(state.movementOscillationDetections) || 0) + 1;
+        // Require another full alternating sequence before a repeat detection.
+        state.movementOscillationHistory = history.slice(-2);
+
+        return {
+            detected: true,
+            repeat: state.movementOscillationRepeatCount,
+            a: h[0],
+            b: h[1]
+        };
+    }
+
     // ---- FIELD-IGNORING CAVEBOT PATHFINDER ----
     // Native Pathfinder treats some magic-field sprites as blocking. CaveBot can
     // optionally override that decision without weakening normal wall/item
@@ -24854,6 +26756,21 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
         if (blockers.length)
             return false;
+
+        // v1.6.44: tile.monsters can lag the authoritative active-creature
+        // positions for a frame. The lure bypass planner must never route
+        // through a creature just because that tile collection is stale.
+        const tilePos = normalizePosition(tile?.__position);
+        if (
+            tilePos &&
+            isTileOccupiedByCreature(
+                tilePos.x,
+                tilePos.y,
+                tilePos.z
+            )
+        ) {
+            return false;
+        }
 
         return true;
     }
@@ -27312,6 +29229,12 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         const key = getWaypointKey(waypoint);
         const distance = getDistanceToWaypoint(position, waypoint);
         state.waypointProgressKey = key;
+        if (state.movementOscillationWaypointKey !== key) {
+            state.movementOscillationWaypointKey = key;
+            state.movementOscillationHistory = [];
+            state.movementOscillationRepeatCount = 0;
+            state.movementOscillationLastAt = 0;
+        }
         state.lastDistanceToWaypoint = Number.isFinite(distance) ? distance : null;
         state.bestDistanceToWaypoint = Number.isFinite(distance) ? distance : Infinity;
         state.lastProgressAt = now;
@@ -27795,6 +29718,10 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         state.lastDistanceToWaypoint = null;
         state.bestDistanceToWaypoint = Infinity;
         state.waypointProgressKey = null;
+        state.movementOscillationHistory = [];
+        state.movementOscillationWaypointKey = null;
+        state.movementOscillationRepeatCount = 0;
+        state.movementOscillationLastAt = 0;
         state.nativePathWatchKey = null;
         state.nativePathWatchAt = 0;
         state.nativePathWatchBestDistance = Infinity;
@@ -28160,6 +30087,41 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         return true;
     }
 
+    // v1.6.38: CaveBot deliberately yields movement to Targeting during
+    // combat chase and Off-screen Hunt. Keep the relocation baseline moving
+    // with those small, intentional steps so a long chase is not mistaken for
+    // one giant teleport when CaveBot resumes. A real single-tick jump still
+    // goes through the normal teleport reset path.
+    function observeTargetingOwnedRelocation(position, now = Date.now()) {
+        if (!position)
+            return false;
+
+        const prev = state.lastRelocationCheckPosition;
+        if (!prev) {
+            state.lastRelocationCheckPosition = {
+                x: Number(position.x),
+                y: Number(position.y),
+                z: Number(position.z)
+            };
+            return false;
+        }
+
+        const dx = Math.abs(Number(position.x) - Number(prev.x));
+        const dy = Math.abs(Number(position.y) - Number(prev.y));
+        const dz = Math.abs(Number(position.z) - Number(prev.z));
+        const jumped = dx + dy >= 20 || dz >= 2;
+
+        if (jumped)
+            return detectUnexpectedPositionJump(position, now);
+
+        state.lastRelocationCheckPosition = {
+            x: Number(position.x),
+            y: Number(position.y),
+            z: Number(position.z)
+        };
+        return false;
+    }
+
     // ---- DISTANCE SAFETY ----
     // A waypoint more than the configured maxWaypointDistance away cannot be reached reliably from the
     // current loaded area (and can happen after a GM teleport / temple return).
@@ -28268,6 +30230,85 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         state.lureLastMobMoveMode = null;
         state.lureLastMobMovePhase = "run";
         state.lureLastMobMovePhaseUntil = 0;
+    }
+
+    function resetLurePackMovement(reason = null) {
+        if (state.lurePackMoveActive)
+            state.lurePackMoveResets++;
+
+        state.lurePackMoveActive = false;
+        state.lurePackMovePhase = "run";
+        state.lurePackMovePhaseUntil = 0;
+    }
+
+    function getLurePackMovementDecision(now = Date.now()) {
+        if (!bot.attack?.isLureActive?.()) {
+            resetLurePackMovement("lure inactive");
+            return { active: false, hold: false, phase: null };
+        }
+
+        // Do not slow ordinary CaveBot travel just because Lure is armed.
+        // Pace only while there is at least one real visible lure mob to keep
+        // with us; when the pack is empty CaveBot may search at normal speed.
+        const packSnapshot =
+            bot.attack?.getLureVisibleMonsterSnapshot?.() || [];
+        if (!Array.isArray(packSnapshot) || packSnapshot.length === 0) {
+            resetLurePackMovement("no visible lure mobs");
+            return { active: false, hold: false, phase: null };
+        }
+
+        const runMs = Math.max(350, Number(config.lurePackRunMs) || 500);
+        const holdMs = Math.max(500, Number(config.lurePackHoldMs) || 1000);
+
+        if (!state.lurePackMoveActive) {
+            state.lurePackMoveActive = true;
+            state.lurePackMovePhase = "run";
+            state.lurePackMovePhaseUntil = now + runMs;
+            noteIntentionalLureNavigation("lure pack paced run started", now);
+        }
+
+        if (state.lurePackMovePhase === "run") {
+            if (now >= state.lurePackMovePhaseUntil) {
+                state.lurePackMovePhase = "hold";
+                state.lurePackMovePhaseUntil = now + holdMs;
+                state.lurePackPacedHolds++;
+                noteIntentionalLureNavigation("lure pack paced hold", now);
+                return {
+                    active: true,
+                    hold: true,
+                    phase: "hold",
+                    reason: "let lure pack catch up"
+                };
+            }
+
+            return {
+                active: true,
+                hold: false,
+                phase: "run",
+                reason: "paced lure run"
+            };
+        }
+
+        if (now >= state.lurePackMovePhaseUntil) {
+            state.lurePackMovePhase = "run";
+            state.lurePackMovePhaseUntil = now + runMs;
+            state.lurePackPacedRuns++;
+            noteIntentionalLureNavigation("lure pack paced run resumed", now);
+            return {
+                active: true,
+                hold: false,
+                phase: "run",
+                reason: "paced lure run"
+            };
+        }
+
+        state.lurePackPacedHolds++;
+        return {
+            active: true,
+            hold: true,
+            phase: "hold",
+            reason: "let lure pack catch up"
+        };
     }
 
     function getLastMobMovementDecision(now = Date.now()) {
@@ -28639,6 +30680,13 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             const position = normalizePosition(bot.getPlayerPosition());
             const waypoint = getCurrentWaypoint();
             resetWaypointProgressTracking(waypoint, position, now);
+            if (position) {
+                state.lastRelocationCheckPosition = {
+                    x: Number(position.x),
+                    y: Number(position.y),
+                    z: Number(position.z)
+                };
+            }
             state.lastPositionKey = getPositionKey(position);
             state.stuckCount = 0;
             state.stuckRecoveryAttempts = 0;
@@ -28724,6 +30772,39 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
         const shouldPause = hasValidTarget();
         if (shouldPause) {
+            // v1.6.38: Targeting-owned movement is intentional navigation.
+            // Rebase CaveBot's teleport detector on every paused tick instead
+            // of comparing the post-hunt/post-chase position with the position
+            // from before Targeting took control. detectUnexpectedPositionJump
+            // is still used if one individual tick crosses the real jump
+            // threshold, so genuine teleports remain detectable.
+            if (bot.attack?.isMovementOwned?.() === true) {
+                const chaseNow = Date.now();
+                const targetingPosition =
+                    normalizePosition(bot.getPlayerPosition());
+                const previousTargetingPosition =
+                    state.lastRelocationCheckPosition
+                        ? { ...state.lastRelocationCheckPosition }
+                        : null;
+                const relocationDetected =
+                    observeTargetingOwnedRelocation(
+                        targetingPosition,
+                        chaseNow
+                    );
+
+                // v1.6.39: Targeting stays the sole movement owner, but CaveBot
+                // can keep its route index in sync with ordinary Walk WPTs that
+                // the chase physically reaches. Never treat a real teleport as
+                // route progress, and never consume special/Stand waypoints.
+                if (!relocationDetected) {
+                    passivelyAdvanceChaseWaypoints(
+                        targetingPosition,
+                        previousTargetingPosition,
+                        chaseNow
+                    );
+                }
+            }
+
             if (!state.pausedForCombat) {
                 state.pausedForCombat = true;
                 stopMovement();
@@ -28739,6 +30820,10 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         const lureLeashHeld = bot.attack?.isLureMovementHeld?.() === true;
         if (lureLeashHeld) {
             const holdNow = Date.now();
+
+            // v1.6.43: a hard screen/predictive leash supersedes the softer
+            // run/hold cadence. Restart with a fresh short run after catch-up.
+            resetLurePackMovement("screen leash owns pacing");
 
             noteIntentionalLureNavigation(
                 "screen leash holding",
@@ -28962,10 +31047,12 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             // hold completely and finish it. In Slow mode, alternate normal
             // CaveBot movement windows with intentional holds so auto-attacks
             // can keep landing without sprinting away from the target.
+            let lastMobMove = { active: false, hold: false, mode: null };
             if (bot.attack?.isLureActive?.() && isOrdinaryLureWaypoint(waypoint)) {
-                const lastMobMove = getLastMobMovementDecision(now);
+                lastMobMove = getLastMobMovementDecision(now);
 
                 if (lastMobMove.active && lastMobMove.hold) {
+                    resetLurePackMovement("last low-HP mob owns pacing");
                     clearLureRouteBlocker("last low-HP mob movement hold");
                     clearLureCrowdBlock("last low-HP mob movement hold");
                     stopMovement();
@@ -28992,6 +31079,54 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 }
             } else {
                 resetLureLastMobMovement("not ordinary lure movement");
+            }
+
+            // ---- ORDINARY LURE PACK PACING ----
+            // v1.6.43: before this, a normal lure pack moved at full CaveBot
+            // speed and only stopped once a trailing monster reached the hard
+            // screen/predictive leash. Pace every ordinary lure pull so mobs
+            // get time to close the gap before they approach that safety edge.
+            if (
+                bot.attack?.isLureActive?.() &&
+                isOrdinaryLureWaypoint(waypoint) &&
+                !lastMobMove.active
+            ) {
+                const packMove = getLurePackMovementDecision(now);
+                if (packMove.active && packMove.hold) {
+                    // v1.6.44: a pacing hold is not a route-clear event. Keep
+                    // the remembered blocker and any already-built bypass plan
+                    // alive while the pack catches up. Clearing them here used
+                    // to reset lureBlockerSince every hold, making blockedForMs
+                    // stay at 0 and allowing Targeting to reacquire the same
+                    // route blocker over and over.
+                    stopMovement();
+
+                    resetWaypointProgressTracking(waypoint, position, now);
+                    state.lastPositionKey = positionKey;
+                    state.lastProgressAt = now;
+                    state.lastRecoveryAt = 0;
+                    state.lastPathAt = now;
+                    state.pathAttemptStart = now;
+                    state.stuckCount = 0;
+                    state.stuckRecoveryAttempts = 0;
+                    state.recoverySideStepAttempts = 0;
+                    state.recoveryBlockerWaitAt = 0;
+                    state.recoveryBlockerWaitKey = null;
+                    state.recoveryBestDistance = getDistanceToWaypoint(position, waypoint);
+                    state.recoveryNoProgressAt = now;
+                    state.nativePathWatchAt = now;
+                    state.nativePathWatchBestDistance = state.recoveryBestDistance;
+                    state._stuckLogged = false;
+
+                    scheduleNextTick();
+                    return;
+                }
+            } else {
+                resetLurePackMovement(
+                    lastMobMove.active
+                        ? "last low-HP mob owns pacing"
+                        : "not ordinary lure movement"
+                );
             }
 
             // ---- LURE CROWD CONGESTION HOLD ----
@@ -30425,6 +32560,38 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                     state.positionHistory.shift();
             }
 
+            const movementOscillation = observeMovementOscillation(
+                position,
+                getCurrentWaypoint(),
+                now
+            );
+            if (movementOscillation.detected) {
+                const maxRepathRecoveries = Math.max(
+                    0,
+                    Math.trunc(Number(config.maxRepathRecoveries ?? 2) || 0)
+                );
+                stopMovement();
+                state.lastWaypointTarget = null;
+                state.lastPathAt = 0;
+                state.nativePathWatchAt = 0;
+                // First A<->B incident gets one clean native repath. A repeated
+                // incident on the same waypoint skips directly to the existing
+                // bounded closest-waypoint recovery on this tick.
+                state.stuckRecoveryAttempts = movementOscillation.repeat >= 2
+                    ? maxRepathRecoveries
+                    : Math.max(0, maxRepathRecoveries - 1);
+                state.lastProgressAt = Math.min(
+                    Number(state.lastProgressAt) || now,
+                    now - Math.max(1000, Number(config.stuckTimeoutMs) || 5000) - 1
+                );
+                bot.log(
+                    `Cave: A↔B movement oscillation detected (${movementOscillation.a} ↔ ${movementOscillation.b})` +
+                    (movementOscillation.repeat >= 2
+                        ? " – forcing waypoint recovery"
+                        : " – forcing clean repath")
+                );
+            }
+
             // Check if we've moved to a new tile. Movement by itself is not
             // necessarily route progress: creatures can push the player around,
             // and a failed Pathfinder route can make the character shuffle between
@@ -30441,7 +32608,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                     resetWaypointProgressTracking(progressWaypoint, position, now);
                 }
                 const previousBestDistance = Number(state.bestDistanceToWaypoint);
-                const distanceImproved = Number.isFinite(currentWaypointDistance) &&
+                const distanceImproved = !movementOscillation.detected &&
+                    Number.isFinite(currentWaypointDistance) &&
                     (!Number.isFinite(previousBestDistance) || currentWaypointDistance < previousBestDistance);
 
                 madeProgress = distanceImproved;
@@ -30528,7 +32696,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 : Infinity;
             if (currentProgressKey !== state.waypointProgressKey) {
                 resetWaypointProgressTracking(currentProgressWaypoint, position, now);
-            } else if (Number.isFinite(currentProgressDistance) && currentProgressDistance < Number(state.bestDistanceToWaypoint)) {
+            } else if (!movementOscillation.detected && Number.isFinite(currentProgressDistance) && currentProgressDistance < Number(state.bestDistanceToWaypoint)) {
                 state.bestDistanceToWaypoint = currentProgressDistance;
                 state.recoveryActive = false;
                 state.lastDistanceToWaypoint = currentProgressDistance;
@@ -31052,7 +33220,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                     (!lureAttackThrough && (
                         window.gameClient?.player?.__target ||
                         window.gameClient?.player?.getTarget?.() ||
-                        bot.attack?.isCombatActive?.()
+                        bot.attack?.isCombatActive?.() ||
+                        bot.attack?.isMovementOwned?.()
                     ))
                 )
                     return;
@@ -31406,6 +33575,12 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         state.lureLastMobSlowHolds = 0;
         state.lureLastMobKillHolds = 0;
         state.lureLastMobMoveResets = 0;
+        state.lurePackMoveActive = false;
+        state.lurePackMovePhase = "run";
+        state.lurePackMovePhaseUntil = 0;
+        state.lurePackPacedRuns = 0;
+        state.lurePackPacedHolds = 0;
+        state.lurePackMoveResets = 0;
         state.lureLastMobBlockerHolds = 0;
         state.positionUnavailable = false;
         state.pathAttemptStart = 0;
@@ -31886,6 +34061,14 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             lureLastMobSlowHolds: state.lureLastMobSlowHolds || 0,
             lureLastMobKillHolds: state.lureLastMobKillHolds || 0,
             lureLastMobMoveResets: state.lureLastMobMoveResets || 0,
+            lurePackMoveActive: !!state.lurePackMoveActive,
+            lurePackMovePhase: state.lurePackMovePhase || "run",
+            lurePackMovePhaseUntil: state.lurePackMovePhaseUntil || 0,
+            lurePackRunMs: Math.max(350, Number(config.lurePackRunMs) || 500),
+            lurePackHoldMs: Math.max(500, Number(config.lurePackHoldMs) || 1000),
+            lurePackPacedRuns: state.lurePackPacedRuns || 0,
+            lurePackPacedHolds: state.lurePackPacedHolds || 0,
+            lurePackMoveResets: state.lurePackMoveResets || 0,
             lureLastMobBlockerHolds:
                 state.lureLastMobBlockerHolds || 0,
             movement: getMovementSummary(),
@@ -42514,12 +44697,15 @@ window.__minibiaBotBundle.installFisherModule = function installFisherModule(bot
     const configStorageKey = "minibiaBot.fisher.config";
     const FISHING_ROD_ID = 3483;
     const FISH_ITEM_ID = 3578;
+    const FISH_COUNT_REQUEST_MS = 1500;
+    const FISH_COUNT_FRESH_MS = 5000;
 
     const state = {
         running: false,
         timerId: null,
         captureMode: false,
         lastFishAt: 0,
+        lastFishCountRequestAt: 0,
     };
 
     const config = Object.assign({
@@ -42608,29 +44794,43 @@ window.__minibiaBotBundle.installFisherModule = function installFisherModule(bot
         return null;
     }
 
-    // ---- Count fish (item 3578) in all containers and equipment ----
-    function getFishCount() {
-        let count = 0;
-        const eq = getEquipment();
-        if (eq) {
-            for (let i = 0; i < eq.slots.length; i++) {
-                const item = eq.getSlotItem(i);
-                if (item && item.id === FISH_ITEM_ID) {
-                    count += item.count || 1;
-                }
-            }
+    // ---- Server-backed fish count (item 3578) ----
+    // v1.6.35: use the same shared HOTBAR_ITEM_COUNT observer as the rest of
+    // mb0t. The server count sees nested/closed backpacks; unknown/stale counts
+    // pause fishing instead of pretending the visible-container total is final.
+    function requestFishCount(now = Date.now(), force = false) {
+        if (typeof bot.requestItemCounts !== "function") return false;
+        if (!force && now - state.lastFishCountRequestAt < FISH_COUNT_REQUEST_MS)
+            return false;
+        const sent = !!bot.requestItemCounts([{ id: FISH_ITEM_ID, fluidType: 0 }]);
+        if (sent) state.lastFishCountRequestAt = now;
+        return sent;
+    }
+
+    function getFishCountState(now = Date.now()) {
+        const reading = typeof bot.getItemCountReading === "function"
+            ? bot.getItemCountReading(FISH_ITEM_ID, 0)
+            : null;
+        if (!reading) {
+            return { known: false, fresh: false, count: null, at: 0 };
         }
-        for (const container of getContainersArray()) {
-            if (!container || typeof container.size !== 'number')
-                continue;
-            for (let i = 0; i < container.size; i++) {
-                const item = container.getSlotItem(i);
-                if (item && item.id === FISH_ITEM_ID) {
-                    count += item.count || 1;
-                }
-            }
-        }
-        return count;
+        const at = Number(reading.at || 0);
+        return {
+            known: true,
+            // After each fishing attempt require a newer server reply before
+            // another cast. Otherwise a still-fresh pre-cast count could allow
+            // one extra cast before the periodic refresh lands.
+            fresh: now - at <= FISH_COUNT_FRESH_MS && at > state.lastFishAt,
+            count: Math.max(0, Math.trunc(Number(reading.count) || 0)),
+            at,
+        };
+    }
+
+    function getFishCount(now = Date.now()) {
+        const stateNow = getFishCountState(now);
+        if (!stateNow.known || !stateNow.fresh)
+            requestFishCount(now, false);
+        return stateNow.known ? stateNow.count : null;
     }
 
     // ---- Use fishing rod on the selected tile ----
@@ -42704,8 +44904,13 @@ window.__minibiaBotBundle.installFisherModule = function installFisherModule(bot
             return;
         }
 
-        const fishCount = getFishCount();
-        if (fishCount >= config.fishThreshold) {
+        requestFishCount(now, false);
+        const fishState = getFishCountState(now);
+        if (!fishState.known || !fishState.fresh) {
+            scheduleNextTick();
+            return;
+        }
+        if (fishState.count >= config.fishThreshold) {
             scheduleNextTick();
             return;
         }
@@ -42745,6 +44950,8 @@ window.__minibiaBotBundle.installFisherModule = function installFisherModule(bot
         }
         state.running = true;
         state.lastFishAt = 0;
+        state.lastFishCountRequestAt = 0;
+        requestFishCount(Date.now(), true);
         bot.log("Fisher started", {
             tile: config.tile,
             delayMs: config.delayMs,
@@ -42770,12 +44977,17 @@ window.__minibiaBotBundle.installFisherModule = function installFisherModule(bot
     }
 
     function status() {
+        const fishCountState = getFishCountState();
+        if (!fishCountState.known || !fishCountState.fresh)
+            requestFishCount(Date.now(), false);
         return {
             running: state.running,
             config: {
                 ...config
             },
-            fishCount: getFishCount(),
+            fishCount: fishCountState.known ? fishCountState.count : null,
+            fishCountKnown: fishCountState.known,
+            fishCountFresh: fishCountState.fresh,
             hasRod: !!findFishingRod(),
         };
     }
@@ -42894,6 +45106,8 @@ window.__minibiaBotBundle.installFisherModule = function installFisherModule(bot
         }
          : null,
         getFishCount,
+        getFishCountState,
+        requestFishCount,
         findFishingRod,
         config,
     };
@@ -46022,12 +48236,16 @@ function upgradeSectionHeaders(panel) {
             melee: document.getElementById("minibia-bot-auto-attack-melee"),
             hotkey: document.getElementById("minibia-bot-auto-attack-hotkey"),
             maxDist: document.getElementById("minibia-bot-auto-attack-maxdist"),
+            offscreenHunt: document.getElementById("minibia-bot-auto-attack-offscreen-hunt"),
+            offscreenHuntRange: document.getElementById("minibia-bot-auto-attack-offscreen-hunt-range"),
             antiKS: document.getElementById("minibia-bot-auto-attack-antiks"),
             antiKSSelf: document.getElementById("minibia-bot-auto-attack-antiks-self"),
             antiKSOther: document.getElementById("minibia-bot-auto-attack-antiks-other"),
             lure: document.getElementById("minibia-bot-auto-attack-lure"),
             lureCount: document.getElementById("minibia-bot-auto-attack-lure-count"),
             lureRadius: document.getElementById("minibia-bot-auto-attack-lure-radius"),
+            lureOffscreenPull: document.getElementById("minibia-bot-auto-attack-lure-offscreen-pull"),
+            lureOffscreenPullRange: document.getElementById("minibia-bot-auto-attack-lure-offscreen-pull-range"),
             lureSmart: document.getElementById("minibia-bot-auto-attack-lure-smart"),
             lurePreserveHp: document.getElementById("minibia-bot-auto-attack-lure-preserve-hp"),
             lureLastHp: document.getElementById("minibia-bot-auto-attack-lure-last-hp"),
@@ -46069,6 +48287,17 @@ function upgradeSectionHeaders(panel) {
         if (inputs.maxDist && document.activeElement !== inputs.maxDist) {
             inputs.maxDist.value = attackConfig.maxTargetDistance ?? 5;
         }
+        if (inputs.offscreenHunt) {
+            inputs.offscreenHunt.checked =
+                attackConfig.offscreenHuntEnabled === true;
+        }
+        if (
+            inputs.offscreenHuntRange &&
+            document.activeElement !== inputs.offscreenHuntRange
+        ) {
+            inputs.offscreenHuntRange.value =
+                attackConfig.offscreenHuntRange ?? 20;
+        }
         if (inputs.antiKS)
             inputs.antiKS.checked = attackConfig.antiKSEnabled !== false;
         if (inputs.antiKSSelf && document.activeElement !== inputs.antiKSSelf) {
@@ -46084,6 +48313,17 @@ function upgradeSectionHeaders(panel) {
         }
         if (inputs.lureRadius && document.activeElement !== inputs.lureRadius) {
             inputs.lureRadius.value = attackConfig.lureRadius ?? 5;
+        }
+        if (inputs.lureOffscreenPull) {
+            inputs.lureOffscreenPull.checked =
+                attackConfig.lureOffscreenPullEnabled === true;
+        }
+        if (
+            inputs.lureOffscreenPullRange &&
+            document.activeElement !== inputs.lureOffscreenPullRange
+        ) {
+            inputs.lureOffscreenPullRange.value =
+                attackConfig.lureOffscreenPullRange ?? 10;
         }
         if (inputs.lureSmart)
             inputs.lureSmart.checked = attackConfig.lureSmartTargeting !== false;
@@ -46107,7 +48347,16 @@ function upgradeSectionHeaders(panel) {
                 const wp = status.lureWaypointIndex != null
                     ? ` → WP ${status.lureWaypointIndex + 1}`
                     : "";
-                if (status.preferredAccessBlocked) {
+                if (status.lureOffscreenPullActive) {
+                    const name = status.lureOffscreenPullTargetName
+                        ? ` • ${status.lureOffscreenPullTargetName}`
+                        : "";
+                    const dist = Number.isFinite(Number(status.lureOffscreenPullLastDistance))
+                        ? ` ${Math.round(Number(status.lureOffscreenPullLastDistance))}t`
+                        : "";
+                    inputs.lureStatus.textContent =
+                        `Off-screen Pull${dist}${name} • bringing mob into @${status.lureRadius}t`;
+                } else if (status.preferredAccessBlocked) {
                     const pref = status.preferredAccess?.preferredName
                         ? ` • ${status.preferredAccess.preferredName}`
                         : "";
@@ -48986,6 +51235,16 @@ function upgradeSectionHeaders(panel) {
           <span>Keep Diagonal</span>
         </label>
 
+        <label class="mb-toggle" style="margin:0; font-size:11px;">
+          <input type="checkbox" id="minibia-bot-auto-attack-offscreen-hunt" />
+          <span>Off-screen Hunt</span>
+        </label>
+
+        <label class="mb-field" style="flex:0 0 78px;">
+          <span class="mb-field-label" style="font-size:10px;">Hunt Range</span>
+          <input type="number" id="minibia-bot-auto-attack-offscreen-hunt-range" min="5" max="50" value="20" style="padding:3px 4px;font-size:11px;" />
+        </label>
+
       </div>
     </div>
 
@@ -49047,6 +51306,20 @@ function upgradeSectionHeaders(panel) {
           <input type="checkbox" id="minibia-bot-auto-attack-lure-smart" checked />
           <span>Smart Lure</span>
         </label>
+      </div>
+
+      <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-top:7px;">
+        <label class="mb-toggle" style="margin:0; font-size:11px;">
+          <input type="checkbox" id="minibia-bot-auto-attack-lure-offscreen-pull" />
+          <span>Off-screen Pull</span>
+        </label>
+
+        <label class="mb-field" style="flex:0 0 82px;">
+          <span class="mb-field-label" style="font-size:10px;">Pull Range</span>
+          <input type="number" id="minibia-bot-auto-attack-lure-offscreen-pull-range" min="3" max="20" value="10" style="padding:3px 4px;font-size:11px;" />
+        </label>
+
+        <span class="mb-small-note" style="font-size:10px;">Pauses the current Walk waypoint briefly to grab a nearby known mob.</span>
       </div>
 
       <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-top:7px;">
@@ -51167,7 +53440,7 @@ function upgradeSectionHeaders(panel) {
                 fisherStatus.textContent = status.running ? "Status: running" : "Status: idle";
             }
             if (fisherCountDisplay) {
-                fisherCountDisplay.textContent = status.fishCount;
+                fisherCountDisplay.textContent = status.fishCountKnown ? status.fishCount : "?";
             }
             const tile = bot.fisher.getTile();
             const tileDisplay = document.getElementById("minibia-bot-fisher-tile-display");
@@ -52295,12 +54568,16 @@ function upgradeSectionHeaders(panel) {
         const autoAttackMeleeInput = panel.querySelector("#minibia-bot-auto-attack-melee");
         const autoAttackHotkeyInput = panel.querySelector("#minibia-bot-auto-attack-hotkey");
         const maxDistInput = panel.querySelector("#minibia-bot-auto-attack-maxdist");
+        const offscreenHuntInput = panel.querySelector("#minibia-bot-auto-attack-offscreen-hunt");
+        const offscreenHuntRangeInput = panel.querySelector("#minibia-bot-auto-attack-offscreen-hunt-range");
         const antiKSInput = panel.querySelector("#minibia-bot-auto-attack-antiks");
         const antiKSSelfInput = panel.querySelector("#minibia-bot-auto-attack-antiks-self");
         const antiKSOtherInput = panel.querySelector("#minibia-bot-auto-attack-antiks-other");
         const lureInput = panel.querySelector("#minibia-bot-auto-attack-lure");
         const lureCountInput = panel.querySelector("#minibia-bot-auto-attack-lure-count");
         const lureRadiusInput = panel.querySelector("#minibia-bot-auto-attack-lure-radius");
+        const lureOffscreenPullInput = panel.querySelector("#minibia-bot-auto-attack-lure-offscreen-pull");
+        const lureOffscreenPullRangeInput = panel.querySelector("#minibia-bot-auto-attack-lure-offscreen-pull-range");
         const lureSmartInput = panel.querySelector("#minibia-bot-auto-attack-lure-smart");
         const lurePreserveHpInput = panel.querySelector("#minibia-bot-auto-attack-lure-preserve-hp");
         const lureLastHpInput = panel.querySelector("#minibia-bot-auto-attack-lure-last-hp");
@@ -52349,6 +54626,34 @@ function upgradeSectionHeaders(panel) {
                 bot.attack.updateConfig({
                     maxTargetDistance: val
                 });
+            });
+        }
+        if (offscreenHuntInput) {
+            offscreenHuntInput.checked =
+                bot.attack?.config?.offscreenHuntEnabled === true;
+            offscreenHuntInput.addEventListener("change", () => {
+                bot.attack.updateConfig({
+                    offscreenHuntEnabled: offscreenHuntInput.checked
+                });
+                refreshAutoAttackStatus();
+            });
+        }
+        if (offscreenHuntRangeInput) {
+            offscreenHuntRangeInput.value =
+                bot.attack?.config?.offscreenHuntRange ?? 20;
+            offscreenHuntRangeInput.addEventListener("change", () => {
+                const val = Math.min(
+                    50,
+                    Math.max(
+                        5,
+                        Math.trunc(Number(offscreenHuntRangeInput.value) || 20)
+                    )
+                );
+                offscreenHuntRangeInput.value = String(val);
+                bot.attack.updateConfig({
+                    offscreenHuntRange: val
+                });
+                refreshAutoAttackStatus();
             });
         }
         if (antiKSInput) {
@@ -52409,6 +54714,36 @@ function upgradeSectionHeaders(panel) {
                 lureRadiusInput.value = String(val);
                 bot.attack.updateConfig({
                     lureRadius: val
+                });
+                refreshAutoAttackStatus();
+            });
+        }
+
+        if (lureOffscreenPullInput) {
+            lureOffscreenPullInput.checked =
+                bot.attack?.config?.lureOffscreenPullEnabled === true;
+            lureOffscreenPullInput.addEventListener("change", () => {
+                bot.attack.updateConfig({
+                    lureOffscreenPullEnabled: lureOffscreenPullInput.checked
+                });
+                refreshAutoAttackStatus();
+            });
+        }
+
+        if (lureOffscreenPullRangeInput) {
+            lureOffscreenPullRangeInput.value =
+                bot.attack?.config?.lureOffscreenPullRange ?? 10;
+            lureOffscreenPullRangeInput.addEventListener("change", () => {
+                const val = Math.min(
+                    20,
+                    Math.max(
+                        3,
+                        Math.trunc(Number(lureOffscreenPullRangeInput.value) || 10)
+                    )
+                );
+                lureOffscreenPullRangeInput.value = String(val);
+                bot.attack.updateConfig({
+                    lureOffscreenPullRange: val
                 });
                 refreshAutoAttackStatus();
             });
