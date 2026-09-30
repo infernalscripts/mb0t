@@ -2757,7 +2757,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.63",
+        version: "1.6.72",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -4453,6 +4453,16 @@ window.__minibiaBotBundle.installXrayModule = function installXrayModule(bot) {
 #minibia-bot-panel .mb-titlebar {
   background: #0a0a0a !important;
   background-color: #0a0a0a !important;
+}
+
+/* v1.6.64: restore gold heading accents */
+#minibia-bot-panel .mb-label,
+#minibia-bot-panel .mb-section-title,
+#minibia-bot-panel .mb-title-text,
+#minibia-bot-panel .mb-field-label,
+#minibia-bot-panel .mb-subheader,
+#minibia-bot-panel .mb-section-header {
+  color: #ffcc00 !important;
 }
     `;
         document.head.appendChild(style);
@@ -50219,7 +50229,7 @@ function upgradeSectionHeaders(panel) {
   min-width: 0;
 }
 #minibia-bot-panel .mb-status-card-name {
-  color: #e6e6e6;
+  color: #ffcc00;
   font-weight: bold;
   font-size: 11px;
   text-shadow: 0 0 2px #000;
@@ -50253,7 +50263,7 @@ function upgradeSectionHeaders(panel) {
   border-bottom: 1px solid rgba(224, 200, 148, 0.18);
 }
 #minibia-bot-panel .mb-section-title .mb-title-text {
-  color: #e6e6e6;
+  color: #ffcc00;
   font-weight: bold;
   font-size: 12px;
   text-shadow: 0 0 2px #000;
@@ -50265,7 +50275,7 @@ function upgradeSectionHeaders(panel) {
   height: 14px;
   flex: 0 0 14px;
   margin: 0;
-  accent-color: #a8a8a8;
+  accent-color: #dbc691;
   cursor: pointer;
 }
 
@@ -50277,7 +50287,7 @@ function upgradeSectionHeaders(panel) {
   border-bottom-color: rgba(224, 200, 148, 0.10);
 }
 #minibia-bot-panel .mb-section-title--sub .mb-title-text {
-  color: #d6d6d6;
+  color: #ffcc00;
   font-size: 11px;
   letter-spacing: 0.3px;
 }
@@ -50471,9 +50481,14 @@ function upgradeSectionHeaders(panel) {
 #minibia-bot-panel .mb-collapsed-module-button .mb-run-dot {
   flex: 0 0 auto;
 }
+/* v1.6.72: nudge collapsed quick buttons down without resizing them */
+#minibia-bot-panel[data-collapsed="true"] .mb-collapsed-module-button {
+  position: relative;
+  top: 2px;
+}
 #minibia-bot-panel[data-collapsed="true"] .mb-collapsed-module-rows {
   display: flex;
-  padding-bottom: 2px; /* v1.6.60: +2px height filled with the same collapsed gray */
+  padding-bottom: 1px; /* v1.6.72: collapsed panel 1px shorter */
   background: #0a0a0a !important;
 }
 
@@ -50542,7 +50557,6 @@ function upgradeSectionHeaders(panel) {
   background-image: none;
   background-color: #242424;
   border-right: 1px solid #000;
-  padding: 4px 0;
   overflow-y: auto;
   flex-shrink: 0;
 }
@@ -50570,8 +50584,8 @@ function upgradeSectionHeaders(panel) {
 #minibia-bot-panel .mb-tab-button[data-active="true"] {
   background-image: none;
   background-color: #464646;
-  color: #f2f2f2;
-  border-right: 2px solid #bdbdbd;
+  color: #ffcc00;
+  border-right: 2px solid #ffcc00;
   box-shadow: inset 0 0 6px rgba(0, 0, 0, 0.5);
 }
 
@@ -50580,7 +50594,7 @@ function upgradeSectionHeaders(panel) {
   padding: 8px 10px;
   overflow-y: auto;
   background-image: none;
-  background-color: #161616;
+  background-color: #444444;
   flex: 1 1 auto;
   min-height: 0;
 }
@@ -50605,7 +50619,7 @@ function upgradeSectionHeaders(panel) {
 }
 #minibia-bot-panel .mb-label {
   margin: 0 0 8px 0;
-  color: #e6e6e6;
+  color: #ffcc00;
   font-weight: bold;
   font-size: 12px;
   text-shadow: 0 0 2px #000;
@@ -50694,7 +50708,7 @@ function upgradeSectionHeaders(panel) {
   height: 14px;
   margin: 0;
   flex: 0 0 14px;
-  accent-color: #a8a8a8;
+  accent-color: #dbc691;
   cursor: pointer;
   background: transparent;
   border: 1px solid #555;
@@ -50923,7 +50937,6 @@ function upgradeSectionHeaders(panel) {
   #minibia-bot-panel .mb-tab-menu {
     flex-direction: row;
     flex-wrap: wrap;
-    padding: 2px 4px;
     border-right: none;
     border-bottom: 1px solid #000;
     overflow-x: auto;
@@ -50931,7 +50944,6 @@ function upgradeSectionHeaders(panel) {
     background-image: none;
   }
   #minibia-bot-panel .mb-tab-button {
-    padding: 4px 8px;
     font-size: 9px;
     border-bottom: none;
     border-right: 1px solid rgba(0, 0, 0, 0.3);
@@ -50940,11 +50952,11 @@ function upgradeSectionHeaders(panel) {
     text-align: center;
   }
   #minibia-bot-panel .mb-tab-button[data-active="true"] {
-    border-right: 2px solid #e6e6e6;
-    border-bottom: none;
+    color: #ffcc00;
+    border-right: 1px solid rgba(0, 0, 0, 0.35);
+    border-bottom: 2px solid #ffcc00;
   }
   #minibia-bot-panel .mb-tab-content {
-    padding: 6px 8px;
   }
   #minibia-bot-panel .mb-form-grid,
   #minibia-bot-panel .mb-button-grid {
@@ -50981,6 +50993,41 @@ function upgradeSectionHeaders(panel) {
   #minibia-bot-panel .mb-section {
     padding: 6px 8px;
   }
+}
+
+
+/* v1.6.65: final gold heading colors — deliberately last in main panel stylesheet */
+#minibia-bot-panel .mb-section-title > .mb-title-text,
+#minibia-bot-panel .mb-section-title--sub > .mb-title-text,
+#minibia-bot-panel .mb-section-header > .mb-label,
+#minibia-bot-panel .mb-section > .mb-label,
+#minibia-bot-panel .mb-status-card-name {
+  color: #ffcc00 !important;
+}
+
+
+/* v1.6.66: light-gold field labels */
+#minibia-bot-panel .mb-field-label {
+  color: #e6cf8a !important;
+}
+
+
+/* v1.6.66: keep field labels lighter than main section headers */
+#minibia-bot-panel .mb-field-label {
+  color: #e6cf8a !important;
+}
+
+
+/* v1.6.67: checked checkboxes use the same green as running-state indicators */
+#minibia-bot-panel input[type="checkbox"] {
+  accent-color: #dbc691 !important;
+}
+
+
+/* v1.6.70: gold selected-tab highlight */
+#minibia-bot-panel .mb-tab-button[data-active="true"] {
+  color: #ffcc00 !important;
+  border-color: #ffcc00;
 }
     `;
         document.head.appendChild(style);
