@@ -2757,7 +2757,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.52",
+        version: "1.6.54",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -9398,10 +9398,18 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     // ---- Simple walkability ----
     function isTileOccupiedByCreature(x, y, z) {
         const creatures = window.gameClient?.world?.activeCreatures || {};
-        for (const id in creatures) {
-            const c = creatures[id];
+        const values = creatures instanceof Map
+            ? Array.from(creatures.values())
+            : Object.values(creatures);
+        const selfId = window.gameClient?.player?.id;
+        for (const c of values) {
+            if (!c || c.id === selfId)
+                continue;
+            const hp = Number(c.state?.health ?? c.health);
+            if (Number.isFinite(hp) && hp <= 0)
+                continue;
             const pos = c.getPosition?.() || c.__position;
-            if (pos && pos.x === x && pos.y === y && pos.z === z) {
+            if (pos && Number(pos.x) === Number(x) && Number(pos.y) === Number(y) && Number(pos.z) === Number(z)) {
                 return true;
             }
         }
@@ -10720,10 +10728,35 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         }
 
         // Position-sensitive cache: moving monsters get fresh route data.
+        // v1.6.54: reachability must also change when OTHER creatures move.
+        // In particular, ignored monsters are non-targetable but remain hard
+        // movement blockers. A position-only cache could keep a route marked
+        // reachable for 900ms after an ignored mob stepped into it.
+        const occupancyKey = (() => {
+            const active = window.gameClient?.world?.activeCreatures || {};
+            const rows = [];
+            const values = active instanceof Map
+                ? Array.from(active.values())
+                : Object.values(active);
+            for (const c of values) {
+                if (!c || c.id === window.gameClient?.player?.id || c.id === target.id)
+                    continue;
+                const p = normalizePosition(c.getPosition?.() || c.__position);
+                if (!p || p.z !== playerPos.z)
+                    continue;
+                if (Math.max(Math.abs(p.x - playerPos.x), Math.abs(p.y - playerPos.y)) > 12 &&
+                    Math.max(Math.abs(p.x - targetPos.x), Math.abs(p.y - targetPos.y)) > 12)
+                    continue;
+                rows.push(`${c.id}:${p.x},${p.y},${p.z}`);
+            }
+            rows.sort();
+            return rows.join("|");
+        })();
         const cacheKey = [
             target.id,
             playerPos.x, playerPos.y, playerPos.z,
-            targetPos.x, targetPos.y, targetPos.z
+            targetPos.x, targetPos.y, targetPos.z,
+            occupancyKey
         ].join(":");
         const cached = reachCache.get(cacheKey);
         if (cached && cached.expires > now)
@@ -13555,23 +13588,25 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             .filter(Boolean);
     }
 
-    function getNativeMonsterAtTile(x, y, z, excludeId = null) {
+    function getNativeMonsterAtTile(x, y, z, excludeId = null, includeIgnored = false) {
         const creatures = window.gameClient?.world?.activeCreatures || {};
+        const values = creatures instanceof Map
+            ? Array.from(creatures.values())
+            : Object.values(creatures);
         const player = window.gameClient?.player;
         const monsterType =
             (typeof CONST !== "undefined" && CONST.TYPES)
                 ? CONST.TYPES.MONSTER
                 : undefined;
 
-        for (const id in creatures) {
-            const creature = creatures[id];
+        for (const creature of values) {
             if (!creature || creature.id === player?.id || creature.id === excludeId)
                 continue;
             if (monsterType !== undefined && creature.type !== monsterType)
                 continue;
             if (creature.masterId === player?.id)
                 continue;
-            if (isIgnoredTargetCreature(creature)) {
+            if (!includeIgnored && isIgnoredTargetCreature(creature)) {
                 state.ignoredAccessBlockersSkipped++;
                 continue;
             }
@@ -13805,7 +13840,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 step.x,
                 step.y,
                 step.z,
-                target.id
+                target.id,
+                true
             );
             if (!blocker || seen.has(blocker.id))
                 continue;
@@ -13820,6 +13856,21 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         // make a wall-separated preferred target look creature-blocked.
         if (!blockers.length)
             return null;
+
+        // Ignored creatures are hard movement blockers but must never become
+        // preferred-access clear targets. If one occupies the static route,
+        // drop any stale pursuit batch/cache and let the fresh/grid A* detour
+        // around it. If no detour exists yet, simply wait/retry; never attack it.
+        const ignoredBlockers = blockers.filter(entry => isIgnoredTargetCreature(entry.monster));
+        if (ignoredBlockers.length) {
+            stopManualTargetPursuitAutoWalk(
+                "ignored creature blocked preferred route – forcing detour"
+            );
+            reachCache.clear();
+            state.preferredAccessLastReason =
+                `${ignoredBlockers.length} ignored creature blocker${ignoredBlockers.length === 1 ? "" : "s"} – detour only`;
+            return null;
+        }
 
         blockers.sort((a, b) => {
             if (a.routeIndex !== b.routeIndex)
@@ -18497,6 +18548,81 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         return window.gameClient?.world?.getTileFromWorldPosition?.(new Position(position.x, position.y, position.z)) || null;
     }
 
+    function findGridAdjacentTargetDetour(targetPos, playerPos) {
+        if (!targetPos || !playerPos || Number(targetPos.z) !== Number(playerPos.z))
+            return null;
+
+        const z = Number(playerPos.z);
+        const radius = Math.max(8, Math.min(16, Number(config.preferredAccessSearchRadius) || 12));
+        const minX = Number(playerPos.x) - radius;
+        const maxX = Number(playerPos.x) + radius;
+        const minY = Number(playerPos.y) - radius;
+        const maxY = Number(playerPos.y) + radius;
+        const key = (x, y) => `${x},${y}`;
+        const startKey = key(Number(playerPos.x), Number(playerPos.y));
+        const queue = [{ x: Number(playerPos.x), y: Number(playerPos.y) }];
+        const seen = new Set([startKey]);
+        const parent = new Map();
+        const offsets = [
+            [0,-1],[1,0],[0,1],[-1,0],
+            [-1,-1],[1,-1],[-1,1],[1,1]
+        ];
+        let goal = null;
+
+        for (let qi = 0; qi < queue.length && qi < 700; qi++) {
+            const cur = queue[qi];
+            if (Math.max(Math.abs(cur.x - Number(targetPos.x)), Math.abs(cur.y - Number(targetPos.y))) <= 1) {
+                goal = cur;
+                break;
+            }
+            const ordered = offsets.slice().sort((a,b) => {
+                const ad = Math.abs(Number(targetPos.x) - (cur.x+a[0])) + Math.abs(Number(targetPos.y) - (cur.y+a[1]));
+                const bd = Math.abs(Number(targetPos.x) - (cur.x+b[0])) + Math.abs(Number(targetPos.y) - (cur.y+b[1]));
+                return ad - bd;
+            });
+            for (const [dx,dy] of ordered) {
+                const nx = cur.x + dx, ny = cur.y + dy;
+                if (nx < minX || nx > maxX || ny < minY || ny > maxY)
+                    continue;
+                if (nx === Number(targetPos.x) && ny === Number(targetPos.y))
+                    continue;
+                const nk = key(nx,ny);
+                if (seen.has(nk))
+                    continue;
+                if (!isSafeTargetApproachTile(nx, ny, z, false))
+                    continue;
+                if (dx !== 0 && dy !== 0) {
+                    if (!isSafeTargetApproachTile(cur.x + dx, cur.y, z, false) ||
+                        !isSafeTargetApproachTile(cur.x, cur.y + dy, z, false))
+                        continue;
+                }
+                seen.add(nk);
+                parent.set(nk, cur);
+                queue.push({x:nx,y:ny});
+            }
+        }
+        if (!goal)
+            return null;
+        const positions = [];
+        let cur = goal;
+        while (cur && key(cur.x,cur.y) !== startKey) {
+            positions.push({x:cur.x,y:cur.y,z});
+            cur = parent.get(key(cur.x,cur.y)) || null;
+        }
+        positions.reverse();
+        if (!positions.length)
+            return { position: goal, pathSteps: 0, pathCost: 0, nextStep: null, pathPositions: [], pathHasMagicField: false, fieldTileCount: 0 };
+        return {
+            position: {x:goal.x,y:goal.y,z},
+            pathSteps: positions.length,
+            pathCost: positions.length * 100,
+            nextStep: positions[0],
+            pathPositions: positions,
+            pathHasMagicField: positions.some(p => tileHasTargetMagicField(getTileFromPosition(p))),
+            fieldTileCount: positions.reduce((n,p) => n + (tileHasTargetMagicField(getTileFromPosition(p)) ? 1 : 0), 0)
+        };
+    }
+
     function findReachableAdjacentPath(targetPos, playerPos) {
         if (!targetPos || !playerPos)
             return null;
@@ -18662,7 +18788,23 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                     break;
             } catch (e) { /* ignore */ }
         }
-        return best;
+        if (best)
+            return best;
+
+        // v1.6.54: fallback grid A* independent of the native tile-neighbour
+        // graph. This is specifically useful when a moving/ignored creature
+        // invalidates the cached/native route but there is open floor around
+        // it. Ignored mobs are NEVER attack candidates here; they are simply
+        // occupied squares the detour must avoid.
+        const fallback = findGridAdjacentTargetDetour(targetPos, playerPos);
+        if (fallback) {
+            bot.log("Targeting: preferred chase using live grid detour around creature blocker", {
+                target: `${targetPos.x},${targetPos.y},${targetPos.z}`,
+                steps: fallback.pathSteps
+            });
+            return fallback;
+        }
+        return null;
     }
 
     function findReachableAdjacentPosition(targetPos, playerPos) {
@@ -18871,7 +19013,16 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 return false;
             }
 
+            // v1.6.53: world.activeCreatures is authoritative enough for
+            // dynamic chase blocking even when the tile's own creature stack is
+            // a frame behind. This deliberately includes ignored monsters: they
+            // may never be auto-targeted, but Targeting must detour around them.
             if (
+                isTileOccupiedByCreature(
+                    Number(step.x),
+                    Number(step.y),
+                    Number(step.z)
+                ) ||
                 !isSafeTargetApproachTile(
                     Number(step.x),
                     Number(step.y),
@@ -19061,7 +19212,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 "melee pursuit route dynamically blocked – replanning around creature"
             );
             bot.log(
-                "Targeting: chase path blocked – taking A* detour",
+                "Targeting: chase path blocked by creature – taking A* detour",
                 {
                     id: target.id ?? null,
                     name: target.name || "Mob",
@@ -19121,21 +19272,37 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             // policy immediately before the AutoWalk packet is built. Kite must
             // never fall back to the looser melee approach check here because a
             // walkable hole can pass ordinary collision checks.
+            // v1.6.53: melee/preferred pursuit must use Targeting's own
+            // activeCreatures-aware occupancy check. The shared Follow validator
+            // primarily reads the tile creature stack, which can lag one update
+            // behind world.activeCreatures. That let an ignored creature occupy
+            // a queued chase tile while the sender still considered it passable,
+            // so the client kept trying to walk THROUGH a mob that Targeting was
+            // correctly refusing to attack. Ignored creatures are not targets,
+            // but they are still hard movement obstacles and must force A* to
+            // route around them.
             const stepPassable =
                 owner === "kite"
                     ? isSafeTileForKite(step)
-                    : (owner === "melee" || owner === "hunt" || owner === "pull") &&
-                        typeof bot.isFollowRoutePositionPassable ===
-                            "function"
-                        ? bot.isFollowRoutePositionPassable(
-                            step
-                        )
-                        : isSafeTargetApproachTile(
+                    : owner === "melee"
+                        ? isSafeTargetApproachTile(
                             Number(step.x),
                             Number(step.y),
                             Number(step.z),
                             false
-                        );
+                        )
+                        : (owner === "hunt" || owner === "pull") &&
+                            typeof bot.isFollowRoutePositionPassable ===
+                                "function"
+                            ? bot.isFollowRoutePositionPassable(
+                                step
+                            )
+                            : isSafeTargetApproachTile(
+                                Number(step.x),
+                                Number(step.y),
+                                Number(step.z),
+                                false
+                            );
 
             if (!stepPassable) {
                 state.manualPursuitPathFailures++;
@@ -49230,8 +49397,16 @@ function upgradeSectionHeaders(panel) {
         const toggle = panel.querySelector("#minibia-bot-collapse");
         const next = !!collapsed;
         panel.dataset.collapsed = next ? "true" : "false";
+        // v1.6.54: old mobile builds could leave an expanded fixed height on
+        // the panel. Never carry that compositor-sized rectangle into the
+        // collapsed state (or back out of it). CSS owns height now.
+        panel.style.height = "";
+        panel.style.maxHeight = "";
         if (body)
             body.hidden = next;
+        // Force geometry to settle now so the browser invalidates the panel's
+        // old covered rectangle before the next drag/paint.
+        void panel.offsetHeight;
         if (toggle) {
             toggle.textContent = next ? "+" : "−";
             toggle.setAttribute("aria-label", next ? "Maximize panel" : "Minimize panel");
@@ -49302,8 +49477,17 @@ function upgradeSectionHeaders(panel) {
             const rect = panel.getBoundingClientRect();
             dragState = {
                 offsetX: pos.clientX - rect.left,
-                offsetY: pos.clientY - rect.top
+                offsetY: pos.clientY - rect.top,
+                startLeft: rect.left,
+                startTop: rect.top,
+                dx: 0,
+                dy: 0
             };
+            // v1.6.54: move only the overlay compositor layer during drag.
+            // Repeated left/top layout paints over WebGL were leaving stale
+            // exposed rectangles on some mobile browsers.
+            panel.style.willChange = "transform";
+            panel.style.transform = "translate3d(0px, 0px, 0px)";
             // Prevent scrolling on touch
             if (e.type === 'touchstart') {
                 e.preventDefault();
@@ -49316,9 +49500,9 @@ function upgradeSectionHeaders(panel) {
                 return;
             const pos = getClientPos(e);
             const next = clampPanelPosition(panel, pos.clientX - dragState.offsetX, pos.clientY - dragState.offsetY);
-            panel.style.left = `${next.left}px`;
-            panel.style.top = `${next.top}px`;
-            panel.style.right = "auto";
+            dragState.dx = next.left - dragState.startLeft;
+            dragState.dy = next.top - dragState.startTop;
+            panel.style.transform = `translate3d(${dragState.dx}px, ${dragState.dy}px, 0px)`;
             if (e.type === 'touchmove') {
                 e.preventDefault(); // Prevent page scroll while dragging
             }
@@ -49328,8 +49512,16 @@ function upgradeSectionHeaders(panel) {
         function onDragEnd(e) {
             if (!dragState)
                 return;
-            dragState = null;
             const rect = panel.getBoundingClientRect();
+            // Commit the visual transform back to layout once, at drag end.
+            // Doing this in one task prevents a visible jump while avoiding
+            // continuous WebGL-underlay invalidation during the drag itself.
+            panel.style.left = `${rect.left}px`;
+            panel.style.top = `${rect.top}px`;
+            panel.style.right = "auto";
+            panel.style.transform = "";
+            panel.style.willChange = "";
+            dragState = null;
             savePanelPosition({
                 left: rect.left,
                 top: rect.top
@@ -50215,8 +50407,9 @@ function upgradeSectionHeaders(panel) {
 }
 
 /* ── Mobile responsive ── */
-/* v1.6.34: mobile panel is capped at 500px tall. On shorter
-   screens it still shrinks to the available viewport height. */
+/* v1.6.54: do NOT force/cap the expanded mobile panel to a fixed 500px
+   compositor surface. Let it size naturally and only clamp to the live
+   viewport. This avoids stale WebGL regions when the panel collapses/moves. */
 #minibia-bot-panel .mb-mobile-preset-arrow {
   display: none;
 }
@@ -50229,8 +50422,9 @@ function upgradeSectionHeaders(panel) {
 @media (max-width: 700px) {
   #minibia-bot-panel {
     width: min(540px, calc(100vw - 16px));
-    max-height: 500px;
-    max-height: min(500px, calc(100vh - 16px));
+    height: auto;
+    max-height: calc(100vh - 16px);
+    max-height: calc(100dvh - 16px);
     top: 8px;
     right: 8px;
   }
@@ -50304,16 +50498,19 @@ function upgradeSectionHeaders(panel) {
   }
   #minibia-bot-panel[data-collapsed="true"] {
     width: 192px;
+    height: auto !important;
+    max-height: none !important;
   }
 }
 
 @media (max-width: 420px) {
   #minibia-bot-panel {
     width: calc(100vw - 8px);
+    height: auto;
     top: 4px;
     right: 4px;
-    max-height: 500px;
-    max-height: min(500px, calc(100vh - 8px));
+    max-height: calc(100vh - 8px);
+    max-height: calc(100dvh - 8px);
   }
   #minibia-bot-panel .mb-title {
     font-size: 11px;
@@ -51865,7 +52062,11 @@ function upgradeSectionHeaders(panel) {
   </div> <!-- end mb-tab-content -->
 </div> <!-- end mb-body -->
 `;
-        document.body.appendChild(panel);
+        // v1.6.54: keep mb0t outside the game's zoomed <body> so Interface
+        // Scale cannot rescale the bot overlay. Mobile height/drag invalidation
+        // is handled separately above; this remains only a zoom isolation.
+        const panelRoot = document.documentElement || document.body;
+        panelRoot.appendChild(panel);
 
         // ---- SETUP UI BEHAVIOR ----
         // Tab switching
