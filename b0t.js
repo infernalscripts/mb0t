@@ -2757,7 +2757,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.54",
+        version: "1.6.63",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -4185,7 +4185,276 @@ window.__minibiaBotBundle.installXrayModule = function installXrayModule(bot) {
                 background: rgba(11,61,43,0.8);
                 color: #d8ffea;
             }
-        `;
+    
+
+/* ── v1.6.59 Game-window skin ──────────────────────────────────────────────
+   Inspired by Minibia's container/window chrome + Settings modal: neutral
+   dark/light greys, beveled borders made with border colors (NOT shadows),
+   square symbol controls, and a clearly separated tab/content body.
+   Root box-shadow stays disabled because it caused WebGL compositor artifacts. */
+#minibia-bot-panel {
+  background: #202020;
+  border: 2px solid #505050;
+  border-top-color: #666;
+  border-left-color: #666;
+  border-right-color: #161616;
+  border-bottom-color: #161616;
+  outline: 1px solid #090909;
+  box-shadow: none !important;
+  color: #dedede;
+}
+
+#minibia-bot-panel .mb-titlebar {
+  min-height: 27px;
+  padding: 3px 6px;
+  background: #3b3b3b;
+  border-top: 1px solid #686868;
+  border-bottom: 1px solid #141414;
+}
+#minibia-bot-panel .mb-title {
+  color: #f0f0f0;
+  text-shadow: 1px 1px 0 #111;
+  letter-spacing: 0.5px;
+}
+#minibia-bot-panel .mb-title-version {
+  color: #c7c7c7;
+  opacity: 0.85;
+}
+
+/* Container-like square chrome buttons. */
+#minibia-bot-panel .mb-title-actions button {
+  width: 23px;
+  min-width: 23px;
+  height: 21px;
+  border-radius: 0;
+  border-top: 1px solid #707070;
+  border-left: 1px solid #707070;
+  border-right: 1px solid #171717;
+  border-bottom: 1px solid #171717;
+  background: #353535;
+  color: #e0e0e0;
+  box-shadow: none;
+}
+#minibia-bot-panel .mb-title-actions button:hover {
+  background: #474747;
+  border-top-color: #8a8a8a;
+  border-left-color: #8a8a8a;
+  color: #fff;
+}
+#minibia-bot-panel .mb-title-actions button:active {
+  border-top-color: #171717;
+  border-left-color: #171717;
+  border-right-color: #707070;
+  border-bottom-color: #707070;
+  transform: none;
+}
+
+/* Settings-modal style split between tabs and page body. */
+#minibia-bot-panel .mb-body {
+  background: #1d1d1d;
+  border-top: 1px solid #4a4a4a;
+}
+#minibia-bot-panel .mb-tab-menu {
+  background: #292929;
+  border-right: 1px solid #111;
+  padding: 4px;
+  gap: 2px;
+}
+#minibia-bot-panel .mb-tab-button {
+  padding: 5px 7px;
+  color: #bebebe;
+  background: #303030;
+  border-top: 1px solid #4e4e4e;
+  border-left: 1px solid #4e4e4e;
+  border-right: 1px solid #171717;
+  border-bottom: 1px solid #171717;
+}
+#minibia-bot-panel .mb-tab-button:hover {
+  background: #3b3b3b;
+  color: #ededed;
+}
+#minibia-bot-panel .mb-tab-button[data-active="true"] {
+  background: #505050;
+  color: #fff;
+  border-top-color: #777;
+  border-left-color: #777;
+  border-right-color: #181818;
+  border-bottom-color: #181818;
+  box-shadow: none;
+}
+#minibia-bot-panel .mb-tab-content {
+  background: #202020;
+  border-left: 1px solid #454545;
+  padding: 8px;
+}
+
+/* Window/body panels: raised edge without any CSS shadow. */
+#minibia-bot-panel .mb-section,
+#minibia-bot-panel .mb-status-card {
+  background: #2a2a2a;
+  border-top: 1px solid #555;
+  border-left: 1px solid #555;
+  border-right: 1px solid #141414;
+  border-bottom: 1px solid #141414;
+  box-shadow: none;
+}
+#minibia-bot-panel .mb-status-card[data-running="true"] {
+  border-top-color: #4f7558;
+  border-left-color: #4f7558;
+  border-right-color: #17301d;
+  border-bottom-color: #17301d;
+  box-shadow: none;
+}
+#minibia-bot-panel .mb-status-card-icon {
+  border-radius: 0;
+  background: #1a1a1a;
+  border-top: 1px solid #4c4c4c;
+  border-left: 1px solid #4c4c4c;
+  border-right: 1px solid #111;
+  border-bottom: 1px solid #111;
+}
+
+#minibia-bot-panel .mb-section-title {
+  margin: -3px -4px 9px -4px;
+  padding: 4px 5px 6px 5px;
+  min-height: 20px;
+  background: #333;
+  border-top: 1px solid #484848;
+  border-bottom: 1px solid #171717;
+}
+#minibia-bot-panel .mb-section-title .mb-title-text,
+#minibia-bot-panel .mb-label {
+  color: #ededed;
+  text-shadow: 1px 1px 0 #111;
+}
+#minibia-bot-panel .mb-section-title--sub {
+  margin: 7px 0 7px 0;
+  padding: 2px 0 5px 0;
+  background: transparent;
+  border-top: 0;
+  border-bottom: 1px solid #4b4b4b;
+}
+
+/* Game-style recessed fields. Keep selects arrowless per v1.6.58 request. */
+#minibia-bot-panel input,
+#minibia-bot-panel textarea,
+#minibia-bot-panel select {
+  background: #151515;
+  color: #eee;
+  border-top: 1px solid #111;
+  border-left: 1px solid #111;
+  border-right: 1px solid #555;
+  border-bottom: 1px solid #555;
+  box-shadow: none;
+}
+#minibia-bot-panel input:focus,
+#minibia-bot-panel textarea:focus,
+#minibia-bot-panel select:focus {
+  border: 1px solid #8a8a8a;
+  box-shadow: none;
+}
+#minibia-bot-panel select {
+  appearance: none;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  background-image: none !important;
+  padding-right: 8px;
+}
+
+/* Raised game buttons, using borders rather than shadows. */
+#minibia-bot-panel button {
+  background: #3a3a3a;
+  color: #ededed;
+  border-top: 1px solid #666;
+  border-left: 1px solid #666;
+  border-right: 1px solid #171717;
+  border-bottom: 1px solid #171717;
+  border-radius: 0;
+  box-shadow: none;
+}
+#minibia-bot-panel button:hover {
+  background: #484848;
+  color: #fff;
+  border-top-color: #7c7c7c;
+  border-left-color: #7c7c7c;
+  border-right-color: #202020;
+  border-bottom-color: #202020;
+}
+#minibia-bot-panel button:active {
+  background: #303030;
+  border-top-color: #171717;
+  border-left-color: #171717;
+  border-right-color: #666;
+  border-bottom-color: #666;
+  transform: none;
+}
+
+/* Preserve functional start/stop colors but give them the same beveled frame. */
+#minibia-bot-panel .mb-status-toggle {
+  border-top-color: #607a60;
+  border-left-color: #607a60;
+  border-right-color: #172317;
+  border-bottom-color: #172317;
+  box-shadow: none;
+}
+#minibia-bot-panel .mb-status-card[data-running="true"] .mb-status-toggle {
+  border-top-color: #8b4a4a;
+  border-left-color: #8b4a4a;
+  border-right-color: #2a1111;
+  border-bottom-color: #2a1111;
+}
+
+/* Collapsed window should read like a tiny in-game container. Solid/opaque
+   surfaces are retained because that is what eliminated the WebGL artifact. */
+#minibia-bot-panel[data-collapsed="true"] {
+  background: #0a0a0a !important;
+  border-top-color: #666;
+  border-left-color: #666;
+  border-right-color: #151515;
+  border-bottom-color: #151515;
+  outline: 1px solid #090909;
+  box-shadow: none !important;
+}
+#minibia-bot-panel[data-collapsed="true"] .mb-titlebar {
+  background: #0a0a0a !important;
+  border-bottom: 1px solid #171717;
+}
+#minibia-bot-panel[data-collapsed="true"] .mb-collapsed-module-rows,
+#minibia-bot-panel[data-collapsed="true"] .mb-collapsed-module-row {
+  background: #0a0a0a !important;
+}
+#minibia-bot-panel[data-collapsed="true"] .mb-collapsed-module-button {
+  background: #161616 !important;
+  border-top: 1px solid #555;
+  border-left: 1px solid #555;
+  border-right: 1px solid #161616;
+  border-bottom: 1px solid #161616;
+  box-shadow: none !important;
+}
+#minibia-bot-panel[data-collapsed="true"] .mb-title-actions button {
+  background: #161616 !important;
+}
+
+/* Neutral game-style separators / scrollbars. */
+#minibia-bot-panel hr {
+  height: 1px;
+  background: #111;
+  border-top: 1px solid #4b4b4b;
+}
+#minibia-bot-panel ::-webkit-scrollbar-thumb,
+#minibia-bot-panel .mb-list::-webkit-scrollbar-thumb,
+#minibia-bot-panel .mb-tab-content::-webkit-scrollbar-thumb,
+#minibia-bot-panel .mb-tab-menu::-webkit-scrollbar-thumb {
+  background: #4a4a4a;
+  border: 1px solid #171717;
+}
+
+/* v1.6.62: dark titlebar in both expanded and collapsed states */
+#minibia-bot-panel .mb-titlebar {
+  background: #0a0a0a !important;
+  background-color: #0a0a0a !important;
+}
+    `;
         document.head.appendChild(style);
     }
 
@@ -7490,6 +7759,13 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         manualPursuitAutoWalkStartKey: null,
         manualPursuitAutoWalkPathPositions: [],
         manualPursuitObstacleReplans: 0,
+        // v1.6.56: server/native AutoWalk can remain flagged active even when
+        // the character has not moved. Track real occupied-tile progress so a
+        // blocked preferred chase is replanned in ~1.4s instead of waiting for
+        // the target/blocker to move and accidentally wake it up.
+        manualPursuitAutoWalkProgressKey: null,
+        manualPursuitAutoWalkProgressAt: 0,
+        manualPursuitAutoWalkStallReplans: 0,
 
         // v1.5.79: with Melee + Client Chase enabled, native chase can keep
         // attacking a wall-separated target without walking the valid route
@@ -18548,12 +18824,28 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         return window.gameClient?.world?.getTileFromWorldPosition?.(new Position(position.x, position.y, position.z)) || null;
     }
 
-    function findGridAdjacentTargetDetour(targetPos, playerPos) {
+    function findGridAdjacentTargetDetour(targetPos, playerPos, options = {}) {
         if (!targetPos || !playerPos || Number(targetPos.z) !== Number(playerPos.z))
             return null;
 
         const z = Number(playerPos.z);
-        const radius = Math.max(8, Math.min(16, Number(config.preferredAccessSearchRadius) || 12));
+        const requestedRadius = Number(options.radius);
+        const radius = Math.max(
+            8,
+            Math.min(
+                24,
+                Number.isFinite(requestedRadius)
+                    ? requestedRadius
+                    : (Number(config.preferredAccessSearchRadius) || 12)
+            )
+        );
+        const maxNodes = Math.max(
+            700,
+            Math.min(
+                2200,
+                Math.trunc(Number(options.maxNodes) || (radius > 16 ? 1800 : 900))
+            )
+        );
         const minX = Number(playerPos.x) - radius;
         const maxX = Number(playerPos.x) + radius;
         const minY = Number(playerPos.y) - radius;
@@ -18569,7 +18861,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         ];
         let goal = null;
 
-        for (let qi = 0; qi < queue.length && qi < 700; qi++) {
+        for (let qi = 0; qi < queue.length && qi < maxNodes; qi++) {
             const cur = queue[qi];
             if (Math.max(Math.abs(cur.x - Number(targetPos.x)), Math.abs(cur.y - Number(targetPos.y))) <= 1) {
                 goal = cur;
@@ -18797,13 +19089,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         // it. Ignored mobs are NEVER attack candidates here; they are simply
         // occupied squares the detour must avoid.
         const fallback = findGridAdjacentTargetDetour(targetPos, playerPos);
-        if (fallback) {
-            bot.log("Targeting: preferred chase using live grid detour around creature blocker", {
-                target: `${targetPos.x},${targetPos.y},${targetPos.z}`,
-                steps: fallback.pathSteps
-            });
+        if (fallback)
             return fallback;
-        }
         return null;
     }
 
@@ -18951,6 +19238,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             null;
         state.manualPursuitAutoWalkPathPositions =
             [];
+        state.manualPursuitAutoWalkProgressKey =
+            null;
+        state.manualPursuitAutoWalkProgressAt =
+            0;
         state.lastManualPursuitReason =
             reason;
 
@@ -19181,6 +19472,37 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             owner !== "melee" ||
             isStoredMeleeAutoWalkBatchPassable(playerPos);
 
+        // v1.6.56: __isAutoWalking is not proof that the server is actually
+        // moving us. A creature can block the first queued step while the
+        // client keeps the AutoWalk flag alive. Rebase on REAL player tiles;
+        // if the same melee batch makes no physical progress for ~1.4s, stop
+        // the stale queue and let the fresh route/fallback below replace it.
+        let staleMeleeAutoWalk = false;
+        if (
+            owner === "melee" &&
+            client.__mbTargetingAutoWalkActive === true &&
+            sameTarget &&
+            sameOwner
+        ) {
+            const playerProgressKey =
+                `${Number(playerPos.x)},${Number(playerPos.y)},${Number(playerPos.z)}`;
+            if (
+                state.manualPursuitAutoWalkProgressKey !==
+                    playerProgressKey
+            ) {
+                state.manualPursuitAutoWalkProgressKey =
+                    playerProgressKey;
+                state.manualPursuitAutoWalkProgressAt =
+                    now;
+            } else if (
+                state.manualPursuitAutoWalkProgressAt > 0 &&
+                now - state.manualPursuitAutoWalkProgressAt >= 1400
+            ) {
+                staleMeleeAutoWalk = true;
+                state.manualPursuitAutoWalkStallReplans++;
+            }
+        }
+
         if (
             client.__mbTargetingAutoWalkActive ===
                 true &&
@@ -19195,7 +19517,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 sameDestination
             ) &&
             pf.__isAutoWalking &&
-            storedMeleeBatchPassable
+            storedMeleeBatchPassable &&
+            !staleMeleeAutoWalk
         ) {
             return true;
         }
@@ -19205,19 +19528,16 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             sameTarget &&
             sameOwner &&
             owner === "melee" &&
-            !storedMeleeBatchPassable
+            (
+                !storedMeleeBatchPassable ||
+                staleMeleeAutoWalk
+            )
         ) {
             state.manualPursuitObstacleReplans++;
             stopManualTargetPursuitAutoWalk(
-                "melee pursuit route dynamically blocked – replanning around creature"
-            );
-            bot.log(
-                "Targeting: chase path blocked by creature – taking A* detour",
-                {
-                    id: target.id ?? null,
-                    name: target.name || "Mob",
-                    replans: state.manualPursuitObstacleReplans
-                }
+                staleMeleeAutoWalk
+                    ? "melee pursuit made no physical progress – forcing fresh A*"
+                    : "melee pursuit route dynamically blocked – replanning around creature"
             );
         }
 
@@ -19431,6 +19751,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 destinationKey;
             state.manualPursuitAutoWalkStartKey =
                 `${Number(playerPos.x)},${Number(playerPos.y)},${Number(playerPos.z)}`;
+            state.manualPursuitAutoWalkProgressKey =
+                state.manualPursuitAutoWalkStartKey;
+            state.manualPursuitAutoWalkProgressAt =
+                now;
             state.manualPursuitAutoWalkPathPositions =
                 batch.map(step => ({
                     x: Number(step.x),
@@ -19637,7 +19961,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             return false;
         }
 
-        return sendManualTargetPursuitAutoWalk(
+        let sent = sendManualTargetPursuitAutoWalk(
             playerPos,
             route,
             target,
@@ -19645,6 +19969,61 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             "Melee enabled; Client Chase disabled – smooth A* autowalk",
             now
         );
+
+        // v1.6.56: route discovery and packet validation happen at slightly
+        // different moments. If the first route became blocked (commonly by an
+        // ignored creature), do not wait for that creature/target to move.
+        // Immediately search a wider activeCreatures-aware grid and send the
+        // replacement batch in THIS targeting tick.
+        if (!sent) {
+            const liveDetour =
+                findGridAdjacentTargetDetour(
+                    targetPos,
+                    playerPos,
+                    {
+                        radius: Math.max(
+                            18,
+                            Number(config.preferredAccessSearchRadius) || 12
+                        ),
+                        maxNodes: 1800
+                    }
+                );
+
+            if (
+                liveDetour &&
+                Array.isArray(liveDetour.pathPositions) &&
+                liveDetour.pathPositions.length > 0
+            ) {
+                sent = sendManualTargetPursuitAutoWalk(
+                    playerPos,
+                    liveDetour,
+                    target,
+                    targetPos,
+                    "Preferred/melee chase – live blocker detour",
+                    now,
+                    {
+                        owner: "melee",
+                        maxSteps: 3,
+                        refreshOnDestinationChange: true
+                    }
+                );
+
+                if (sent) {
+                    bot.log(
+                        "Targeting: chase path blocked by creature – A* detour sent",
+                        {
+                            id: target.id ?? null,
+                            name: target.name || "Mob",
+                            steps: liveDetour.pathSteps,
+                            replans: state.manualPursuitObstacleReplans,
+                            stallReplans: state.manualPursuitAutoWalkStallReplans
+                        }
+                    );
+                }
+            }
+        }
+
+        return sent;
     }
 
     function syncMeleeChase(now = Date.now()) {
@@ -30359,6 +30738,75 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         return null;
     }
 
+    // v1.6.56: the main distance guard normally runs after combat/external
+    // movement arbitration. That let a stale Targeting ownership/cooldown keep
+    // CaveBot parked on a plain Walk waypoint 80+ tiles away. Enforce the same
+    // configured limit for ordinary Walk waypoints BEFORE those early returns.
+    // Special/Stand/Script waypoints are deliberately NOT consumed here; their
+    // normal CaveBot semantics remain authoritative.
+    function skipEarlyOverlongWalkWaypoints(position) {
+        if (!position || !route.length)
+            return getCurrentWaypoint();
+
+        const limit = boundedWaypointDistance(config.maxWaypointDistance);
+        let passes = 0;
+
+        while (passes < route.length) {
+            const wp = getCurrentWaypoint();
+            if (
+                !wp ||
+                wp.script ||
+                wp.stand ||
+                wp.rope ||
+                wp.shovel ||
+                wp.ladder ||
+                wp.x === undefined ||
+                wp.y === undefined ||
+                wp.z === undefined
+            ) {
+                return wp;
+            }
+
+            const distance = Math.max(
+                Math.abs(Number(position.x) - Number(wp.x)),
+                Math.abs(Number(position.y) - Number(wp.y))
+            );
+
+            if (distance <= limit)
+                return wp;
+
+            const oldIndex = state.currentIndex;
+            bot.log(
+                `Cave: skipping waypoint #${oldIndex + 1} – ${distance} tiles away (limit ${limit}, early guard)`
+            );
+
+            state.lastWaypointTarget = null;
+            state.pathAttemptStart = 0;
+            state.lastDistanceToWaypoint = null;
+            state.bestDistanceToWaypoint = Infinity;
+            state.waypointProgressKey = null;
+            state.nativePathWatchKey = null;
+            state.nativePathWatchAt = 0;
+            state.nativePathWatchBestDistance = Infinity;
+            state.lastPathAt = 0;
+            state.stuckCount = 0;
+            state.stuckRecoveryAttempts = 0;
+
+            const next = advanceWaypoint();
+            passes++;
+
+            if (!next)
+                return null;
+            if (state.currentIndex === oldIndex) {
+                bot.log("Cave: no ordinary waypoint within distance limit – stopping");
+                haltCaveNavigationForSafety();
+                return null;
+            }
+        }
+
+        return getCurrentWaypoint();
+    }
+
     function noteIntentionalLureNavigation(
         reason,
         now = Date.now()
@@ -30800,6 +31248,23 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         if (bot._waitUntil && Date.now() < bot._waitUntil) {
             scheduleNextTick();
             return;
+        }
+
+        // v1.6.56: enforce Max Waypoint Distance even while Targeting has left
+        // a short ownership/cooldown flag behind. Only ordinary Walk WPTs are
+        // eligible here, so Stand/Rope/Shovel/Ladder/Script cannot be skipped
+        // by this early guard.
+        const earlyDistancePosition =
+            normalizePosition(bot.getPlayerPosition());
+        if (earlyDistancePosition) {
+            const earlyWaypoint =
+                skipEarlyOverlongWalkWaypoints(
+                    earlyDistancePosition
+                );
+            if (!earlyWaypoint) {
+                scheduleNextTick();
+                return;
+            }
         }
 
         if (state.combatCooldownUntil && Date.now() < state.combatCooldownUntil) {
@@ -49397,16 +49862,8 @@ function upgradeSectionHeaders(panel) {
         const toggle = panel.querySelector("#minibia-bot-collapse");
         const next = !!collapsed;
         panel.dataset.collapsed = next ? "true" : "false";
-        // v1.6.54: old mobile builds could leave an expanded fixed height on
-        // the panel. Never carry that compositor-sized rectangle into the
-        // collapsed state (or back out of it). CSS owns height now.
-        panel.style.height = "";
-        panel.style.maxHeight = "";
         if (body)
             body.hidden = next;
-        // Force geometry to settle now so the browser invalidates the panel's
-        // old covered rectangle before the next drag/paint.
-        void panel.offsetHeight;
         if (toggle) {
             toggle.textContent = next ? "+" : "−";
             toggle.setAttribute("aria-label", next ? "Maximize panel" : "Minimize panel");
@@ -49477,17 +49934,8 @@ function upgradeSectionHeaders(panel) {
             const rect = panel.getBoundingClientRect();
             dragState = {
                 offsetX: pos.clientX - rect.left,
-                offsetY: pos.clientY - rect.top,
-                startLeft: rect.left,
-                startTop: rect.top,
-                dx: 0,
-                dy: 0
+                offsetY: pos.clientY - rect.top
             };
-            // v1.6.54: move only the overlay compositor layer during drag.
-            // Repeated left/top layout paints over WebGL were leaving stale
-            // exposed rectangles on some mobile browsers.
-            panel.style.willChange = "transform";
-            panel.style.transform = "translate3d(0px, 0px, 0px)";
             // Prevent scrolling on touch
             if (e.type === 'touchstart') {
                 e.preventDefault();
@@ -49500,9 +49948,9 @@ function upgradeSectionHeaders(panel) {
                 return;
             const pos = getClientPos(e);
             const next = clampPanelPosition(panel, pos.clientX - dragState.offsetX, pos.clientY - dragState.offsetY);
-            dragState.dx = next.left - dragState.startLeft;
-            dragState.dy = next.top - dragState.startTop;
-            panel.style.transform = `translate3d(${dragState.dx}px, ${dragState.dy}px, 0px)`;
+            panel.style.left = `${next.left}px`;
+            panel.style.top = `${next.top}px`;
+            panel.style.right = "auto";
             if (e.type === 'touchmove') {
                 e.preventDefault(); // Prevent page scroll while dragging
             }
@@ -49512,16 +49960,8 @@ function upgradeSectionHeaders(panel) {
         function onDragEnd(e) {
             if (!dragState)
                 return;
-            const rect = panel.getBoundingClientRect();
-            // Commit the visual transform back to layout once, at drag end.
-            // Doing this in one task prevents a visible jump while avoiding
-            // continuous WebGL-underlay invalidation during the drag itself.
-            panel.style.left = `${rect.left}px`;
-            panel.style.top = `${rect.top}px`;
-            panel.style.right = "auto";
-            panel.style.transform = "";
-            panel.style.willChange = "";
             dragState = null;
+            const rect = panel.getBoundingClientRect();
             savePanelPosition({
                 left: rect.left,
                 top: rect.top
@@ -49745,8 +50185,8 @@ function upgradeSectionHeaders(panel) {
   gap: 8px;
   padding: 10px;
   border: 1px solid rgba(0, 0, 0, 0.6);
-  background-image: url("/png/bg2.png");
-  background-color: #1e1a16;
+  background-image: none;
+  background-color: #242424;
   box-shadow: inset 0 0 4px rgba(0, 0, 0, 0.4);
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
@@ -49766,7 +50206,7 @@ function upgradeSectionHeaders(panel) {
   height: 32px;
   display: grid;
   place-items: center;
-  border: 1px solid rgba(200, 168, 78, 0.28);
+  border: 1px solid rgba(205, 205, 205, 0.24);
   border-radius: 6px;
   background: rgba(0, 0, 0, 0.35);
   font-size: 18px;
@@ -49779,7 +50219,7 @@ function upgradeSectionHeaders(panel) {
   min-width: 0;
 }
 #minibia-bot-panel .mb-status-card-name {
-  color: #ffcc00;
+  color: #e6e6e6;
   font-weight: bold;
   font-size: 11px;
   text-shadow: 0 0 2px #000;
@@ -49813,7 +50253,7 @@ function upgradeSectionHeaders(panel) {
   border-bottom: 1px solid rgba(224, 200, 148, 0.18);
 }
 #minibia-bot-panel .mb-section-title .mb-title-text {
-  color: #ffcc00;
+  color: #e6e6e6;
   font-weight: bold;
   font-size: 12px;
   text-shadow: 0 0 2px #000;
@@ -49825,7 +50265,7 @@ function upgradeSectionHeaders(panel) {
   height: 14px;
   flex: 0 0 14px;
   margin: 0;
-  accent-color: #c8a84e;
+  accent-color: #a8a8a8;
   cursor: pointer;
 }
 
@@ -49837,7 +50277,7 @@ function upgradeSectionHeaders(panel) {
   border-bottom-color: rgba(224, 200, 148, 0.10);
 }
 #minibia-bot-panel .mb-section-title--sub .mb-title-text {
-  color: #e9d39b;
+  color: #d6d6d6;
   font-size: 11px;
   letter-spacing: 0.3px;
 }
@@ -49863,7 +50303,7 @@ function upgradeSectionHeaders(panel) {
   font-weight: bold;
   font-size: 11px;
   border: 1px solid #222;
-  background-image: url("/png/bg3.png");
+  background-image: none;
   background-color: #2a4a2a;
   color: #cfc;
   cursor: pointer;
@@ -49895,9 +50335,12 @@ function upgradeSectionHeaders(panel) {
   max-height: calc(100vh - 32px);
   border: 1px solid #000;
   border-radius: 0;
-  box-shadow: 0px 0px 10px 0px #000;
-  background-image: url("/png/bg.png");
-  background-color: #1a1612;
+  /* v1.6.58: keep the root drop shadow disabled. On the WebGL/mobile compositor the large
+     fixed-panel shadow could retain a stale copy of the canvas underneath
+     the expanded panel while it moved. Collapsed mode was already shadowless. */
+  box-shadow: none;
+  background-image: none;
+  background-color: #161616;
   color: #dcdcdc;
   font: 12px/1.35 Verdana, "Sans-Serif", sans-serif;
   user-select: none;
@@ -49912,8 +50355,8 @@ function upgradeSectionHeaders(panel) {
   align-items: center;
   gap: 6px;
   padding: 3px 8px;
-  background-image: url("/png/bg2.png");
-  background-color: #2a241e;
+  background-image: none;
+  background-color: #0a0a0a;
   border-bottom: 1px solid #000;
   flex-shrink: 0;
   cursor: grab;
@@ -49923,7 +50366,7 @@ function upgradeSectionHeaders(panel) {
   margin: 0;
   font-weight: bold;
   font-size: 13px;
-  color: #ffcc00;
+  color: #e6e6e6;
   text-shadow: 0 0 2px #000, 0 0 2px #000;
   letter-spacing: 1px;
   flex: 0 0 auto;
@@ -50001,8 +50444,8 @@ function upgradeSectionHeaders(panel) {
   display: none;
   flex-direction: column;
   gap: 0;
-  background-image: url("/png/bg2.png");
-  background-color: #2a241e;
+  background-image: none;
+  background-color: #303030;
   border-bottom: 1px solid #000;
   flex-shrink: 0;
 }
@@ -50030,14 +50473,35 @@ function upgradeSectionHeaders(panel) {
 }
 #minibia-bot-panel[data-collapsed="true"] .mb-collapsed-module-rows {
   display: flex;
+  padding-bottom: 2px; /* v1.6.60: +2px height filled with the same collapsed gray */
+  background: #0a0a0a !important;
 }
 
 /* ── Collapsed state ── */
 #minibia-bot-panel[data-collapsed="true"] {
   width: 192px;
-  min-height: 84px; /* v1.6.27: room for the third quick-button row */
-  background-image: url("/png/bg2.png");
-  background-color: #2a241e;
+  min-height: 0;
+  height: auto;
+  max-height: none;
+  padding-bottom: 0;
+  overflow: visible;
+  box-shadow: none;
+  background-image: none !important;
+  background-color: #0a0a0a !important;
+  opacity: 1;
+}
+/* v1.6.56: keep every collapsed surface fully opaque. The game canvas is
+   WebGL; translucent/repeating game PNG backgrounds made Chrome/Android
+   occasionally retain a stale canvas damage rectangle under the draggable
+   fixed panel. Solid CSS-only surfaces remove that backdrop dependency. */
+#minibia-bot-panel[data-collapsed="true"] .mb-titlebar,
+#minibia-bot-panel[data-collapsed="true"] .mb-collapsed-module-rows,
+#minibia-bot-panel[data-collapsed="true"] .mb-collapsed-module-row,
+#minibia-bot-panel[data-collapsed="true"] .mb-collapsed-module-button,
+#minibia-bot-panel[data-collapsed="true"] .mb-title-actions button {
+  background-image: none !important;
+  background-color: #161616 !important;
+  opacity: 1 !important;
 }
 #minibia-bot-panel[data-collapsed="true"] .mb-body {
   display: none !important;
@@ -50056,6 +50520,8 @@ function upgradeSectionHeaders(panel) {
   }
   #minibia-bot-panel[data-collapsed="true"] .mb-titlebar {
   border-bottom: none;
+  background: #0a0a0a !important;
+  background-color: #0a0a0a !important;
 }
 
 /* ── Body (tabs + content) ── */
@@ -50073,8 +50539,8 @@ function upgradeSectionHeaders(panel) {
   display: flex;
   flex-direction: column;
   gap: 0;
-  background-image: url("/png/bg2.png");
-  background-color: #1e1a16;
+  background-image: none;
+  background-color: #242424;
   border-right: 1px solid #000;
   padding: 4px 0;
   overflow-y: auto;
@@ -50102,10 +50568,10 @@ function upgradeSectionHeaders(panel) {
   color: #ddd;
 }
 #minibia-bot-panel .mb-tab-button[data-active="true"] {
-  background-image: url("/png/bg.png");
-  background-color: #2a241e;
-  color: #ffcc00;
-  border-right: 2px solid #ffcc00;
+  background-image: none;
+  background-color: #464646;
+  color: #f2f2f2;
+  border-right: 2px solid #bdbdbd;
   box-shadow: inset 0 0 6px rgba(0, 0, 0, 0.5);
 }
 
@@ -50113,8 +50579,8 @@ function upgradeSectionHeaders(panel) {
 #minibia-bot-panel .mb-tab-content {
   padding: 8px 10px;
   overflow-y: auto;
-  background-image: url("/png/bg.png");
-  background-color: #1a1612;
+  background-image: none;
+  background-color: #161616;
   flex: 1 1 auto;
   min-height: 0;
 }
@@ -50132,14 +50598,14 @@ function upgradeSectionHeaders(panel) {
 #minibia-bot-panel .mb-section {
   padding: 10px 12px;
   border: 1px solid rgba(0, 0, 0, 0.6);
-  background-image: url("/png/bg2.png");
-  background-color: #1e1a16;
+  background-image: none;
+  background-color: #242424;
   box-shadow: inset 0 0 4px rgba(0, 0, 0, 0.4);
   border-radius: 0;
 }
 #minibia-bot-panel .mb-label {
   margin: 0 0 8px 0;
-  color: #ffcc00;
+  color: #e6e6e6;
   font-weight: bold;
   font-size: 12px;
   text-shadow: 0 0 2px #000;
@@ -50165,7 +50631,7 @@ function upgradeSectionHeaders(panel) {
   min-width: 0;
 }
 #minibia-bot-panel .mb-field-label {
-  color: #c8b88a;
+  color: #bdbdbd;
   font-size: 10px;
   font-weight: bold;
   text-transform: uppercase;
@@ -50179,8 +50645,8 @@ function upgradeSectionHeaders(panel) {
   padding: 5px 8px;
   border: 1px solid #222;
   border-radius: 0;
-  background-image: url("/png/bg3.png");
-  background-color: #0d0b0a;
+  background-image: none;
+  background-color: #111111;
   color: #eee;
   font: inherit;
   font-size: 11px;
@@ -50191,8 +50657,8 @@ function upgradeSectionHeaders(panel) {
 #minibia-bot-panel input:focus,
 #minibia-bot-panel textarea:focus,
 #minibia-bot-panel select:focus {
-  border-color: #c8a84e;
-  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.6), 0 0 4px rgba(200, 168, 78, 0.3);
+  border-color: #a8a8a8;
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.6), 0 0 4px rgba(190, 190, 190, 0.24);
 }
 #minibia-bot-panel input::placeholder,
 #minibia-bot-panel textarea::placeholder {
@@ -50206,10 +50672,9 @@ function upgradeSectionHeaders(panel) {
 #minibia-bot-panel select {
   appearance: none;
   -webkit-appearance: none;
-  background-image: url("/png/bg3.png"), url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='6'%3E%3Cpath d='M0 0l4 6 4-6z' fill='%23999'/%3E%3C/svg%3E");
-  background-repeat: repeat, no-repeat;
-  background-position: 0 0, right 8px center;
-  padding-right: 24px;
+  -moz-appearance: none;
+  background-image: none !important;
+  padding-right: 8px;
   cursor: pointer;
 }
 
@@ -50229,7 +50694,7 @@ function upgradeSectionHeaders(panel) {
   height: 14px;
   margin: 0;
   flex: 0 0 14px;
-  accent-color: #c8a84e;
+  accent-color: #a8a8a8;
   cursor: pointer;
   background: transparent;
   border: 1px solid #555;
@@ -50247,8 +50712,8 @@ function upgradeSectionHeaders(panel) {
   padding: 6px 12px;
   border: 1px solid #222;
   border-radius: 0;
-  background-image: url("/png/bg3.png");
-  background-color: #2a241e;
+  background-image: none;
+  background-color: #383838;
   color: #eee;
   font-size: 10px;
   font-weight: bold;
@@ -50260,8 +50725,8 @@ function upgradeSectionHeaders(panel) {
 }
 #minibia-bot-panel button:hover {
   border-color: #888;
-  background-image: url("/png/bg2.png");
-  background-color: #3a322a;
+  background-image: none;
+  background-color: #484848;
   color: #fff;
 }
 #minibia-bot-panel button:active {
@@ -50344,12 +50809,12 @@ function upgradeSectionHeaders(panel) {
   gap: 8px;
 }
 #minibia-bot-panel .mb-creature-name {
-  color: #e8e0d0;
+  color: #e0e0e0;
   font-weight: bold;
   font-size: 11px;
 }
 #minibia-bot-panel .mb-floor-label {
-  color: #c8a84e;
+  color: #a8a8a8;
   font-size: 10px;
   font-weight: bold;
   text-transform: uppercase;
@@ -50407,9 +50872,8 @@ function upgradeSectionHeaders(panel) {
 }
 
 /* ── Mobile responsive ── */
-/* v1.6.54: do NOT force/cap the expanded mobile panel to a fixed 500px
-   compositor surface. Let it size naturally and only clamp to the live
-   viewport. This avoids stale WebGL regions when the panel collapses/moves. */
+/* v1.6.56: mobile panel uses a 500px MAXIMUM only; it never forces
+   the expanded panel to occupy a fixed 500px backing layer. */
 #minibia-bot-panel .mb-mobile-preset-arrow {
   display: none;
 }
@@ -50422,9 +50886,8 @@ function upgradeSectionHeaders(panel) {
 @media (max-width: 700px) {
   #minibia-bot-panel {
     width: min(540px, calc(100vw - 16px));
-    height: auto;
-    max-height: calc(100vh - 16px);
-    max-height: calc(100dvh - 16px);
+    /* Keep the requested 500px mobile CAP, but never force a fixed height. */
+    max-height: min(500px, calc(100dvh - 16px));
     top: 8px;
     right: 8px;
   }
@@ -50465,7 +50928,7 @@ function upgradeSectionHeaders(panel) {
     border-bottom: 1px solid #000;
     overflow-x: auto;
     gap: 2px;
-    background-image: url("/png/bg2.png");
+    background-image: none;
   }
   #minibia-bot-panel .mb-tab-button {
     padding: 4px 8px;
@@ -50477,7 +50940,7 @@ function upgradeSectionHeaders(panel) {
     text-align: center;
   }
   #minibia-bot-panel .mb-tab-button[data-active="true"] {
-    border-right: 2px solid #ffcc00;
+    border-right: 2px solid #e6e6e6;
     border-bottom: none;
   }
   #minibia-bot-panel .mb-tab-content {
@@ -50498,19 +50961,15 @@ function upgradeSectionHeaders(panel) {
   }
   #minibia-bot-panel[data-collapsed="true"] {
     width: 192px;
-    height: auto !important;
-    max-height: none !important;
   }
 }
 
 @media (max-width: 420px) {
   #minibia-bot-panel {
     width: calc(100vw - 8px);
-    height: auto;
+    max-height: min(500px, calc(100dvh - 8px));
     top: 4px;
     right: 4px;
-    max-height: calc(100vh - 8px);
-    max-height: calc(100dvh - 8px);
   }
   #minibia-bot-panel .mb-title {
     font-size: 11px;
@@ -51101,7 +51560,6 @@ function upgradeSectionHeaders(panel) {
 
 <!-- Resupply Tab -->
 <div class="mb-tab-panel" data-tab-panel="resupply">
-  <div class="mb-small-note" style="margin:0 0 8px 2px;">Depot, NPC supplies and bank actions. These settings are shared with the Cavebot WPT shortcuts.</div>
   <!-- Item Depositer / Depot Room -->
   <div class="mb-section">
     <div class="mb-section-title"><span class="mb-title-text">📦 Depositer / Depot Room</span></div>
@@ -52062,11 +52520,9 @@ function upgradeSectionHeaders(panel) {
   </div> <!-- end mb-tab-content -->
 </div> <!-- end mb-body -->
 `;
-        // v1.6.54: keep mb0t outside the game's zoomed <body> so Interface
-        // Scale cannot rescale the bot overlay. Mobile height/drag invalidation
-        // is handled separately above; this remains only a zoom isolation.
-        const panelRoot = document.documentElement || document.body;
-        panelRoot.appendChild(panel);
+        // v1.6.56: keep the pre-v1.6.34 panel host. Keeping the panel in
+        // document.body matches the last known-good mobile UI compositor path.
+        document.body.appendChild(panel);
 
         // ---- SETUP UI BEHAVIOR ----
         // Tab switching
