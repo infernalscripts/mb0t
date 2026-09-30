@@ -278,13 +278,10 @@ window.__minibiaBotBundle.createBot = function createBot() {
                 console.error("[minibia-bot] reconnect watcher failed", e);
             }
         };
-        reconnectObserver = new MutationObserver(runCheck);
-        reconnectObserver.observe(document.documentElement || document.body, {
-            childList: true,
-            subtree: true,
-            attributes: true,
-            attributeFilter: ["class", "style", "hidden", "aria-hidden", "value"]
-        });
+        // v1.6.80: polling is sufficient here. The previous document-wide
+        // MutationObserver watched essentially every UI mutation and created a
+        // continuous stream of short-lived mutation records.
+        reconnectObserver = null;
         reconnectPollTimerId = window.setInterval(runCheck, 2000);
         runCheck();
     }
@@ -573,9 +570,27 @@ function syncItemCountPlayer() {
     return player;
 }
 
+function pruneItemCountCache(now = Date.now()) {
+    const maxAgeMs = 10 * 60 * 1000;
+    for (const [key, reading] of itemCountState.counts.entries()) {
+        if (!reading || now - Number(reading.at || 0) > maxAgeMs) {
+            itemCountState.counts.delete(key);
+        }
+    }
+    const maxEntries = 512;
+    if (itemCountState.counts.size > maxEntries) {
+        const ordered = Array.from(itemCountState.counts.entries())
+            .sort((a, b) => Number(a[1]?.at || 0) - Number(b[1]?.at || 0));
+        for (let i = 0; i < ordered.length - maxEntries; i++) {
+            itemCountState.counts.delete(ordered[i][0]);
+        }
+    }
+}
+
 function recordItemCount(itemId, fluidType, count) {
     // Ignore a late inventory update while no character is available.
     if (!syncItemCountPlayer()) return false;
+    pruneItemCountCache();
     const key = getItemCountKey(itemId, fluidType);
     const numericCount = Number(count);
     if (!key || !Number.isFinite(numericCount)) return false;
@@ -649,7 +664,13 @@ function requestItemCounts(items = []) {
         // seed the client's supply cache silently instead of being mistaken for
         // an item-use count drop by NetworkManager.__maybeSupplyMessage().
         if (!networkManager.__supplySeedExpect) networkManager.__supplySeedExpect = {};
-        const expiresAt = Date.now() + 3000;
+        const now = Date.now();
+        for (const [seedKey, seedExpiresAt] of Object.entries(networkManager.__supplySeedExpect)) {
+            if (!Number.isFinite(Number(seedExpiresAt)) || Number(seedExpiresAt) <= now) {
+                delete networkManager.__supplySeedExpect[seedKey];
+            }
+        }
+        const expiresAt = now + 3000;
         unique.forEach(({ id, fluidType }) => {
             networkManager.__supplySeedExpect[`${id}:${fluidType}`] = expiresAt;
         });
@@ -664,6 +685,7 @@ function requestItemCounts(items = []) {
 
 function getItemCountReading(itemId, fluidType = 0) {
     if (!syncItemCountPlayer()) return null;
+    pruneItemCountCache();
     const key = getItemCountKey(itemId, fluidType);
     return key ? itemCountState.counts.get(key) || null : null;
 }
@@ -1107,6 +1129,15 @@ addCleanup(() => {
         return true;
     }
 
+    function isKnownFollowWalkableObject(item) {
+        if (!item) return false;
+        const cid = Number(item.id ?? item.cid);
+        const sid = Number(item.sid);
+        if (cid === 2471 || sid === 1739) return true;
+        try { return Number(window.gameClient?.itemDefinitionsByCid?.[cid]?.sid) === 1739; } catch (e) {}
+        return false;
+    }
+
     function isFollowFieldPassableTile(
         tile,
         options = {}
@@ -1125,6 +1156,13 @@ addCleanup(() => {
             items.some(
                 item =>
                     isFollowMagicFieldItem(
+                        item
+                    )
+            );
+        const hasKnownWalkableObject =
+            items.some(
+                item =>
+                    isKnownFollowWalkableObject(
                         item
                     )
             );
@@ -1153,6 +1191,7 @@ addCleanup(() => {
             !tile.isWalkable?.() &&
             !tile.__hasWalkableGroundItem?.() &&
             !hasMagicField &&
+            !hasKnownWalkableObject &&
             !allowedCreaturePresent
         ) {
             return false;
@@ -1182,7 +1221,8 @@ addCleanup(() => {
                 !item ||
                 isFollowMagicFieldItem(
                     item
-                )
+                ) ||
+                isKnownFollowWalkableObject(item)
             ) {
                 continue;
             }
@@ -1477,12 +1517,46 @@ addCleanup(() => {
                         diagonal
                             ? 3
                             : 1;
+                    const neighbourPosForPolicy =
+                        normalizePosition(
+                            neighbourNode.__position
+                        );
+                    let policyCost = 0;
+                    if (
+                        options.specialAreaPurpose &&
+                        neighbourPosForPolicy &&
+                        window.minibiaBot?.specialAreas?.hasActiveAreasForFloor?.(
+                            neighbourPosForPolicy.z,
+                            { purpose: options.specialAreaPurpose }
+                        )
+                    ) {
+                        const policy =
+                            window.minibiaBot?.specialAreas?.getPositionPolicy?.(
+                                neighbourPosForPolicy,
+                                { purpose: options.specialAreaPurpose }
+                            );
+                        if (policy?.allowed === false) {
+                            continue;
+                        }
+                        const rawPolicyCost =
+                            Number(policy?.cost);
+                        policyCost =
+                            Number.isFinite(rawPolicyCost)
+                                ? rawPolicyCost
+                                : 0;
+                    }
+                    const nativeStepCost =
+                        penalty *
+                        neighbourNode.getCost(
+                            currentNode
+                        );
                     const gScore =
                         currentNode.__g +
-                        penalty *
-                            neighbourNode.getCost(
-                                currentNode
-                            );
+                        Math.max(
+                            10,
+                            nativeStepCost +
+                                policyCost
+                        );
                     const visited =
                         neighbourNode.__visited;
 
@@ -1533,7 +1607,8 @@ addCleanup(() => {
 
     function getFollowCustomRoute(
         target,
-        mode = "pvp"
+        mode = "pvp",
+        routeOptions = {}
     ) {
         const player =
             window.gameClient?.player;
@@ -1585,6 +1660,12 @@ addCleanup(() => {
             mode === "nonpvp"
                 ? "nonpvp"
                 : "pvp";
+        const specialAreaPurpose =
+            routeOptions?.specialAreaPurpose === "lure"
+                ? "lure"
+                : routeOptions?.specialAreaPurpose === "combat"
+                    ? "combat"
+                    : null;
 
         if (normalizedMode === "nonpvp") {
             if (
@@ -1641,7 +1722,8 @@ addCleanup(() => {
                         allowDestinationCreatureStack:
                             true,
                         allowNonPvpPlayerPassThrough:
-                            true
+                            true,
+                        specialAreaPurpose
                     }
                 );
 
@@ -1768,10 +1850,27 @@ addCleanup(() => {
                 continue;
             }
 
+            if (
+                specialAreaPurpose &&
+                window.minibiaBot?.specialAreas?.hasActiveAreasForFloor?.(
+                    z,
+                    { purpose: specialAreaPurpose }
+                ) &&
+                window.minibiaBot?.specialAreas?.isPositionAllowed?.(
+                    { x, y, z },
+                    { purpose: specialAreaPurpose }
+                ) === false
+            ) {
+                continue;
+            }
+
             const path =
                 searchFollowPathIgnoringFields(
                     startTile,
-                    destinationTile
+                    destinationTile,
+                    {
+                        specialAreaPurpose
+                    }
                 );
 
             if (!path.length)
@@ -2757,7 +2856,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.72",
+        version: "1.6.81",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -2811,12 +2910,37 @@ addCleanup(() => {
                 this.ui.destroy();
             stopReconnectWatcher();
             destroyAlarmAudio();
+            if (this._waitTimerId) {
+                clearTimeout(this._waitTimerId);
+                this._waitTimerId = null;
+            }
+            this._waitUntil = 0;
             this.actions?.clear?.();
             runCleanups();
         },
 
         log(...args) {
-            console.log("[mbot]", ...args);
+            const safeArgs = args.map((value) => {
+                if (value == null || typeof value !== "object") return value;
+                try {
+                    const seen = new WeakSet();
+                    let json = JSON.stringify(value, (key, item) => {
+                        if (typeof item === "object" && item !== null) {
+                            if (seen.has(item)) return "[Circular]";
+                            seen.add(item);
+                        }
+                        if (typeof item === "function") {
+                            return `[Function ${item.name || "anonymous"}]`;
+                        }
+                        return item;
+                    });
+                    if (json.length > 4000) json = json.slice(0, 4000) + "…";
+                    return json;
+                } catch (error) {
+                    return String(value?.message || value);
+                }
+            });
+            console.log("[mbot]", ...safeArgs);
         },
 
         /** Simple localStorage wrapper with JSON serialisation */
@@ -3445,9 +3569,14 @@ addCleanup(() => {
                 this.log('wait() requires a positive number of milliseconds.');
                 return false;
             }
+            if (this._waitTimerId) {
+                clearTimeout(this._waitTimerId);
+                this._waitTimerId = null;
+            }
             this._waitUntil = Date.now() + ms;
             this.log(`Cavebot paused for ${ms}ms until ${new Date(this._waitUntil).toLocaleTimeString()}`);
-            setTimeout(() => {
+            this._waitTimerId = setTimeout(() => {
+                this._waitTimerId = null;
                 this._waitUntil = 0;
                 this.log('Cavebot wait expired, resuming.');
             }, ms);
@@ -3582,12 +3711,13 @@ addCleanup(() => {
         // Shared field-aware A* route builder used by PvP Follow and by
         // Targeting's manual Melee Chase. This does NOT alter follow state
         // and does NOT send FollowPacket; it only returns the route.
-        getFollowRouteForCreature(target, mode = "pvp") {
+        getFollowRouteForCreature(target, mode = "pvp", routeOptions = {}) {
             if (!target)
                 return null;
             return getFollowCustomRoute(
                 target,
-                mode === "nonpvp" ? "nonpvp" : "pvp"
+                mode === "nonpvp" ? "nonpvp" : "pvp",
+                routeOptions
             );
         },
 
@@ -6166,6 +6296,14 @@ window.__minibiaBotBundle.installPlayerAttackMonitorModule = function installPla
         status,
         config
     };
+
+    bot.addCleanup(() => {
+        state.running = false;
+        if (state.timerId) {
+            clearTimeout(state.timerId);
+            state.timerId = null;
+        }
+    });
 };
 
 /**
@@ -7723,6 +7861,15 @@ window.__minibiaBotBundle.installAutoMagicShieldModule = function installAutoMag
         tryCastMagicShield,
         config,
     };
+
+    bot.addCleanup(() => {
+        state.running = false;
+        if (state.timerId != null) {
+            window.clearTimeout(state.timerId);
+            state.timerId = null;
+        }
+        detachResumeListeners();
+    });
 };
 
 /**
@@ -7893,7 +8040,13 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         lureOffscreenPullLastDistance: Number.POSITIVE_INFINITY,
         lureOffscreenPullLastProgressAt: 0,
         lureOffscreenPullLastMoveAt: 0,
+        lureOffscreenPullPauseHeld: false,
+        lureOffscreenPullPlayerProgressKey: null,
+        lureOffscreenPullPlayerProgressAt: 0,
         lureOffscreenPullConsecutivePathFailures: 0,
+        lureOffscreenPullRetryAfter: 0,
+        lureOffscreenPullLastFailureLogAt: 0,
+        lureOffscreenPullLastApproachLogAt: 0,
         lureOffscreenPullActivations: 0,
         lureOffscreenPullHandoffs: 0,
         lureOffscreenPullAborts: 0,
@@ -8156,6 +8309,14 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         lureLeashResumes: 0,
         lureLeashLostTimeouts: 0,
         lureLeashReason: null,
+        lureLeashHoldLogged: false,
+        lureLeashCooldownUntil: 0,
+
+        // v1.6.79: hard Special Area target barrier diagnostics.
+        specialAreaTargetRejects: 0,
+        specialAreaPreferredRejects: 0,
+        specialAreaPullRejects: 0,
+        specialAreaHuntRejects: 0,
 
         // v1.4.97: distinguish mb0t-selected targets from a monster the user
         // clicked manually so optional retargeting can respect user intent.
@@ -8570,6 +8731,20 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         return false;
     }
 
+    // Server-walkable crate reported by the client as a blocking stack item.
+    // Look-at: SID 1739 / CID 2471. Keep the exception exact so walls/furniture
+    // remain real blockers.
+    function isKnownTargetWalkableObject(item) {
+        if (!item) return false;
+        const cid = Number(item.id ?? item.cid);
+        const sid = Number(item.sid);
+        if (cid === 2471 || sid === 1739) return true;
+        try {
+            return Number(window.gameClient?.itemDefinitionsByCid?.[cid]?.sid) === 1739;
+        } catch (e) {}
+        return false;
+    }
+
     // Safe walkable check: walkable AND not a floor-change tile
     function isSafeToWalkTile(x, y, z, ignoreCreatures = false) {
         const pos = new Position(x, y, z);
@@ -8578,8 +8753,14 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             return false;
         if (!tile.isWalkable())
             return false;
-        if (tile.isItemBlocked())
-            return false;
+        if (tile.isItemBlocked()) {
+            const hardItemBlock = (Array.isArray(tile.items) ? tile.items : []).some(item =>
+                item && !isKnownTargetWalkableObject(item) &&
+                typeof item.isWalkable === "function" && !item.isWalkable()
+            );
+            if (hardItemBlock)
+                return false;
+        }
         // Enhanced check: fallback to manual creature detection
         if (!ignoreCreatures && (tile.isOccupied() || isTileOccupiedByCreature(x, y, z)))
             return false;
@@ -8654,13 +8835,20 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 item =>
                     isTargetMagicFieldItem(item)
             );
+        const hasKnownWalkableObject =
+            items.some(
+                item =>
+                    isKnownTargetWalkableObject(item)
+            );
 
-        // A native false walkability result is tolerated ONLY when a field is
+        // A native false walkability result is tolerated when a field or a
+        // known server-walkable object makes the tile stack look blocked.
         // the thing making otherwise valid ground appear blocked.
         if (
             !tile.isWalkable?.() &&
             !tile.__hasWalkableGroundItem?.() &&
-            !hasMagicField
+            !hasMagicField &&
+            !hasKnownWalkableObject
         ) {
             return false;
         }
@@ -8685,7 +8873,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         for (const item of items) {
             if (
                 !item ||
-                isTargetMagicFieldItem(item)
+                isTargetMagicFieldItem(item) ||
+                isKnownTargetWalkableObject(item)
             ) {
                 continue;
             }
@@ -8714,15 +8903,24 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             } catch (e) {}
         }
 
+        const tilePosition = normalizePosition(tile.__position);
+        if (tilePosition && bot.specialAreas?.hasActiveAreasForFloor?.(tilePosition.z, { purpose: isLureActive?.() ? "lure" : "combat" })) {
+            const purpose = isLureActive?.() ? "lure" : "combat";
+            if (!bot.specialAreas.isPositionAllowed(tilePosition, { purpose }))
+                return false;
+        }
+
+        // Item collision was already validated above (including the exact
+        // server-walkable crate exception). Do not call Tile.isOccupied() here:
+        // Minibia's implementation folds item.isWalkable() into occupancy and
+        // would turn SID 1739 / CID 2471 back into a false wall. Check creatures
+        // only at this stage.
         if (
             !ignoreCreatures &&
-            (
-                tile.isOccupied?.() ||
-                isTileOccupiedByCreature(
-                    tile.__position?.x,
-                    tile.__position?.y,
-                    tile.__position?.z
-                )
+            isTileOccupiedByCreature(
+                tile.__position?.x,
+                tile.__position?.y,
+                tile.__position?.z
             )
         ) {
             return false;
@@ -10958,6 +11156,120 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
     // ---- REACHABILITY CACHE ----
     const reachCache = new Map();
+    const specialAreaTargetReachCache = new Map();
+
+    function setSpecialAreaTargetReachCache(key, value, now = Date.now()) {
+        for (const [cachedKey, cached] of specialAreaTargetReachCache) {
+            if (!cached || cached.expires <= now)
+                specialAreaTargetReachCache.delete(cachedKey);
+        }
+        specialAreaTargetReachCache.set(key, value);
+        while (specialAreaTargetReachCache.size > 96) {
+            const oldestKey = specialAreaTargetReachCache.keys().next().value;
+            if (oldestKey === undefined) break;
+            specialAreaTargetReachCache.delete(oldestKey);
+        }
+    }
+
+    function isTargetPolicyReachable(
+        target,
+        purpose = "combat",
+        now = Date.now(),
+        options = {}
+    ) {
+        if (!target)
+            return false;
+
+        const playerPos = normalizePosition(bot.getPlayerPosition());
+        const targetPos = normalizePosition(target.getPosition?.() || target.__position);
+        if (!playerPos || !targetPos || playerPos.z !== targetPos.z)
+            return false;
+
+        const specialAreas = bot.specialAreas;
+        if (
+            !specialAreas?.hasHardAreasForFloor?.(
+                playerPos.z,
+                { purpose }
+            )
+        ) {
+            return true;
+        }
+
+        const allowLoadedFrontier =
+            options.allowLoadedFrontier === true;
+        const revision = Number(specialAreas.getRevision?.()) || 0;
+        const cacheKey = [
+            purpose,
+            allowLoadedFrontier ? "frontier" : "complete",
+            revision,
+            target.id ?? "none",
+            playerPos.x, playerPos.y, playerPos.z,
+            targetPos.x, targetPos.y, targetPos.z
+        ].join(":");
+        const cached = specialAreaTargetReachCache.get(cacheKey);
+        if (cached && cached.expires > now)
+            return cached.reachable === true;
+
+        let reachable = false;
+        try {
+            reachable =
+                specialAreas.hasPolicySafeApproach?.(
+                    playerPos,
+                    targetPos,
+                    {
+                        purpose,
+                        maxNodes: 2200
+                    }
+                ) === true;
+
+            // Off-screen creatures can sit at the edge of Minibia's loaded
+            // tile ring. In that case a complete adjacent-tile proof is
+            // impossible even though there is safe progress available.
+            //
+            // Only accept an INCOMPLETE policy path here. searchPolicyPath()
+            // returns incomplete success specifically when the destination is
+            // not loaded yet. If the target area is loaded and a Never Step
+            // wall genuinely blocks it, this remains false.
+            if (
+                !reachable &&
+                allowLoadedFrontier &&
+                typeof specialAreas.searchPolicyPath === "function"
+            ) {
+                const frontier =
+                    specialAreas.searchPolicyPath(
+                        playerPos,
+                        targetPos,
+                        {
+                            purpose,
+                            force: true,
+                            fieldAware: true,
+                            ignoreCreatures: true,
+                            maxNodes: 3200
+                        }
+                    );
+
+                reachable =
+                    frontier?.success === true &&
+                    frontier?.complete === false &&
+                    Array.isArray(frontier.path) &&
+                    frontier.path.length > 0;
+            }
+        } catch (e) {
+            // Visible/fully-loaded combat remains fail-closed. For off-screen
+            // frontier mode we also require an explicit safe partial path.
+            reachable = false;
+        }
+
+        setSpecialAreaTargetReachCache(
+            cacheKey,
+            {
+                reachable,
+                expires: now + 850
+            },
+            now
+        );
+        return reachable;
+    }
 
     function setReachCache(key, value, now = Date.now()) {
         // Remove expired entries opportunistically and keep a hard cap. This
@@ -11000,6 +11312,20 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 reachable: false,
                 pathSteps: Number.POSITIVE_INFINITY,
                 pathCost: Number.POSITIVE_INFINITY
+            };
+        }
+
+        // v1.6.79: hard Special Areas are targeting geometry. A Never Step /
+        // No Combat barrier must make a monster unreachable before creature-
+        // blocker recovery or preferred-target handoff can claim it.
+        if (!isTargetPolicyReachable(target, "combat", now)) {
+            return {
+                reachable: false,
+                pathSteps: Number.POSITIVE_INFINITY,
+                pathCost: Number.POSITIVE_INFINITY,
+                geometricDistance: dist,
+                blockedBySpecialArea: true,
+                expires: now + 850
             };
         }
 
@@ -11421,6 +11747,20 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                         ? 300
                         : 1200;
                 handoffTarget(liveTarget, `invalid current target: ${liveInfo.reason}`, now, invalidSkipMs);
+                return true;
+            }
+
+            if (
+                state.lastTargetOwner !== "manual" &&
+                !isTargetPolicyReachable(liveTarget, "combat", now)
+            ) {
+                state.specialAreaTargetRejects++;
+                handoffTarget(
+                    liveTarget,
+                    "target moved behind hard Special Area",
+                    now,
+                    5000
+                );
                 return true;
             }
         }
@@ -13011,9 +13351,19 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 const pos = normalizePosition(
                     creature.getPosition?.() || creature.__position
                 );
-                return !!pos &&
-                    pos.z === me.z &&
-                    getTileDistance(me, pos) <= range;
+                if (
+                    !pos ||
+                    pos.z !== me.z ||
+                    getTileDistance(me, pos) > range
+                ) {
+                    return false;
+                }
+
+                if (!isTargetPolicyReachable(creature, "combat", now, { allowLoadedFrontier: true })) {
+                    state.specialAreaHuntRejects++;
+                    return false;
+                }
+                return true;
             })
             .sort((a, b) => {
                 const aPreferred = isPreferredCreature(a) ? 1 : 0;
@@ -13236,6 +13586,16 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             return false;
         }
 
+        if (!isTargetPolicyReachable(target, "combat", now, { allowLoadedFrontier: true })) {
+            state.specialAreaHuntRejects++;
+            rememberSkippedTarget(target, now, 5000);
+            clearOffscreenHunt(
+                "target is behind a hard Special Area",
+                { quiet: true }
+            );
+            return false;
+        }
+
         // Once the hunted creature is visible, Anti-KS becomes authoritative.
         // "Self range" only means we still need to approach; another player's
         // proximity is a real veto and ends the hunt immediately.
@@ -13298,10 +13658,72 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             return false;
         }
 
-        const route =
+        let route =
             typeof bot.getFollowRouteForCreature === "function"
-                ? bot.getFollowRouteForCreature(target, "pvp")
-                : findReachableAdjacentPath(targetPos, playerPos);
+                ? bot.getFollowRouteForCreature(
+                    target,
+                    "pvp",
+                    { specialAreaPurpose: "combat" }
+                )
+                : null;
+
+        // v1.6.81: the exact PvP Follow planner requires a loaded, reachable
+        // attack-adjacent destination. Off-screen Hunt often targets creatures
+        // near the edge of loaded map data, where that exact destination is not
+        // available yet. Fall back to Special Areas' policy A*: it may return
+        // an INCOMPLETE path to the closest loaded safe frontier, which is
+        // exactly what Hunt needs. As more tiles load, the next tick extends it.
+        //
+        // Never Step / No Combat remain hard blockers because this fallback
+        // uses the same policy search rather than bypassing Special Areas.
+        if (
+            !route ||
+            route.atGoal === true ||
+            !Array.isArray(route.pathPositions) ||
+            route.pathPositions.length === 0
+        ) {
+            try {
+                const frontier =
+                    bot.specialAreas?.searchPolicyPath?.(
+                        playerPos,
+                        targetPos,
+                        {
+                            purpose: "combat",
+                            force: true,
+                            fieldAware: true,
+                            ignoreCreatures: true,
+                            maxNodes: 5000
+                        }
+                    );
+
+                if (
+                    frontier?.success === true &&
+                    Array.isArray(frontier.path) &&
+                    frontier.path.length > 0
+                ) {
+                    const pathPositions =
+                        frontier.path
+                            .map(normalizePosition)
+                            .filter(Boolean);
+
+                    if (pathPositions.length > 0) {
+                        route = {
+                            atGoal: false,
+                            mode: "pvp",
+                            pathPositions,
+                            pathSteps: pathPositions.length,
+                            destination:
+                                pathPositions[pathPositions.length - 1],
+                            targetPosition: { ...targetPos },
+                            complete:
+                                frontier.complete === true,
+                            policyFrontier:
+                                frontier.complete !== true
+                        };
+                    }
+                }
+            } catch (e) {}
+        }
 
         if (
             !route ||
@@ -13313,7 +13735,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             state.offscreenHuntConsecutivePathFailures++;
 
             if (state.offscreenHuntConsecutivePathFailures >= 2) {
-                rememberSkippedTarget(target, now, 2500);
+                rememberSkippedTarget(target, now, 6000);
                 clearOffscreenHunt("no safe path to last known position");
             }
             return false;
@@ -13372,6 +13794,12 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         if (!config.lureOffscreenPullEnabled)
             return [];
 
+        if (
+            Number(state.lureOffscreenPullRetryAfter) > now
+        ) {
+            return [];
+        }
+
         const me = normalizePosition(bot.getPlayerPosition());
         if (!me)
             return [];
@@ -13408,6 +13836,11 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 const distance = getTileDistance(me, pos);
                 if (!Number.isFinite(distance) || distance > range)
                     return false;
+
+                if (!isTargetPolicyReachable(creature, "lure", now)) {
+                    state.specialAreaPullRejects++;
+                    return false;
+                }
 
                 if (config.antiKSEnabled) {
                     const reason = getAntiKSBlockReason(creature, antiKS, now);
@@ -13459,12 +13892,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             );
         }
 
-        // External Cave pause is reason-scoped. Only release it when Pull
-        // actually owned the excursion. Calling resumeMovement on every normal
-        // preferred-target tick created an unnecessary Cave/Targeting handoff
-        // race after Lure had already finished.
+        // v1.6.78: acquisition no longer pauses Cave immediately. Release
+        // the reason-scoped pause only when Pull actually took movement.
         if (
-            wasActive ||
+            state.lureOffscreenPullPauseHeld ||
             ownedPullAutoWalk ||
             state.movementOwner === "offscreen-lure-pull" ||
             state.movementOwner === "offscreen-lure-pull-autowalk"
@@ -13483,6 +13914,9 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         state.lureOffscreenPullLastDistance = Number.POSITIVE_INFINITY;
         state.lureOffscreenPullLastProgressAt = 0;
         state.lureOffscreenPullLastMoveAt = 0;
+        state.lureOffscreenPullPauseHeld = false;
+        state.lureOffscreenPullPlayerProgressKey = null;
+        state.lureOffscreenPullPlayerProgressAt = 0;
         state.lureOffscreenPullConsecutivePathFailures = 0;
         state.lureOffscreenPullLastReason = reason;
 
@@ -13535,14 +13969,6 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             return false;
         }
 
-        if (
-            bot.cave?.pauseMovement?.(
-                LURE_OFFSCREEN_PULL_PAUSE_REASON
-            ) !== true
-        ) {
-            return false;
-        }
-
         const distance = getTileDistance(playerPos, targetPos);
         state.lureOffscreenPullActive = true;
         state.lureOffscreenPullTargetId = target.id ?? null;
@@ -13553,19 +13979,14 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         state.lureOffscreenPullLastDistance = distance;
         state.lureOffscreenPullLastProgressAt = now;
         state.lureOffscreenPullLastMoveAt = 0;
+        state.lureOffscreenPullPauseHeld = false;
+        state.lureOffscreenPullPlayerProgressKey =
+            `${Number(playerPos.x)},${Number(playerPos.y)},${Number(playerPos.z)}`;
+        state.lureOffscreenPullPlayerProgressAt = now;
         state.lureOffscreenPullConsecutivePathFailures = 0;
         state.lureOffscreenPullLastReason = "acquired nearby off-screen lure mob";
         state.lureOffscreenPullActivations++;
 
-        bot.log("Off-screen Pull: approaching nearby known mob", {
-            id: target.id ?? null,
-            name: target.name || "Mob",
-            distance,
-            range: config.lureOffscreenPullRange,
-            lureRadius: config.lureRadius,
-            position: { ...targetPos },
-            preferred: isPreferredCreature(target)
-        });
         return true;
     }
 
@@ -13621,6 +14042,16 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             return false;
         }
 
+        if (
+            Number(state.lureLeashCooldownUntil) > now
+        ) {
+            clearLureOffscreenPull(
+                "recent screen-leash release cooldown",
+                { quiet: true }
+            );
+            return false;
+        }
+
         // The dedicated last-mob finish behavior is authoritative. Do not leave
         // a nearly-dead final mob behind to fetch another creature.
         if (state.lureLastMobActive) {
@@ -13671,10 +14102,53 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         );
         const distance = getTileDistance(playerPos, targetPos);
 
+        // v1.6.78: target-distance progress is not enough to prove Pull
+        // movement works; the monster itself can move while our character is
+        // completely stationary. Once Pull has actually sent movement, require
+        // the player's occupied tile to change within a short window.
+        if (
+            state.lureOffscreenPullPauseHeld &&
+            state.lureOffscreenPullLastMoveAt > 0
+        ) {
+            const playerProgressKey =
+                `${Number(playerPos.x)},${Number(playerPos.y)},${Number(playerPos.z)}`;
+
+            if (
+                playerProgressKey !==
+                    state.lureOffscreenPullPlayerProgressKey
+            ) {
+                state.lureOffscreenPullPlayerProgressKey =
+                    playerProgressKey;
+                state.lureOffscreenPullPlayerProgressAt =
+                    now;
+            } else if (
+                state.lureOffscreenPullPlayerProgressAt > 0 &&
+                now - state.lureOffscreenPullPlayerProgressAt >= 2200
+            ) {
+                rememberSkippedTarget(target, now, 10000);
+                state.lureOffscreenPullRetryAfter =
+                    now + 1800;
+                clearLureOffscreenPull(
+                    "Pull AutoWalk started but player made no physical progress for 2.2s"
+                );
+                return false;
+            }
+        }
+
         if (!Number.isFinite(distance) || distance > range) {
             rememberSkippedTarget(target, now, 1800);
             clearLureOffscreenPull(
                 `creature left pull range (${distance} > ${range})`
+            );
+            return false;
+        }
+
+        if (!isTargetPolicyReachable(target, "lure", now)) {
+            state.specialAreaPullRejects++;
+            rememberSkippedTarget(target, now, 7500);
+            clearLureOffscreenPull(
+                "target is behind a hard Special Area",
+                { quiet: true }
             );
             return false;
         }
@@ -13722,6 +14196,20 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             2000,
             Math.min(12000, Number(config.lureOffscreenPullNoProgressMs) || 4500)
         );
+        const pullLifetimeMs =
+            state.lureOffscreenPullStartedAt
+                ? now - state.lureOffscreenPullStartedAt
+                : 0;
+
+        if (pullLifetimeMs >= 15000) {
+            rememberSkippedTarget(target, now, 5000);
+            state.lureOffscreenPullRetryAfter = now + 1800;
+            clearLureOffscreenPull(
+                "pull excursion exceeded 15s safety limit"
+            );
+            return false;
+        }
+
         if (
             state.lureOffscreenPullLastProgressAt &&
             now - state.lureOffscreenPullLastProgressAt >= noProgressMs
@@ -13750,10 +14238,36 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         // leash raises state.lureMovementHeld, and clearLureOffscreenPull()
         // stops any currently queued Pull-owned AutoWalk batch.
 
-        const route =
+        let route =
             typeof bot.getFollowRouteForCreature === "function"
-                ? bot.getFollowRouteForCreature(target, "pvp")
-                : findReachableAdjacentPath(targetPos, playerPos);
+                ? bot.getFollowRouteForCreature(
+                    target,
+                    "pvp",
+                    { specialAreaPurpose: "lure" }
+                )
+                : null;
+
+        if (
+            !route ||
+            route.atGoal === true ||
+            !Array.isArray(route.pathPositions) ||
+            route.pathPositions.length === 0
+        ) {
+            const fallbackRoute =
+                findReachableAdjacentPath(
+                    targetPos,
+                    playerPos
+                );
+            if (
+                fallbackRoute &&
+                Array.isArray(
+                    fallbackRoute.pathPositions
+                ) &&
+                fallbackRoute.pathPositions.length > 0
+            ) {
+                route = fallbackRoute;
+            }
+        }
 
         if (
             !route ||
@@ -13762,13 +14276,42 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             route.pathPositions.length === 0
         ) {
             state.lureOffscreenPullPathFailures++;
-            state.lureOffscreenPullConsecutivePathFailures++;
-            if (state.lureOffscreenPullConsecutivePathFailures >= 2) {
-                rememberSkippedTarget(target, now, 2500);
-                clearLureOffscreenPull("no safe route toward nearby lure mob");
-            }
+            rememberSkippedTarget(target, now, 5000);
+            state.lureOffscreenPullRetryAfter =
+                now + 1200;
+            clearLureOffscreenPull(
+                "no safe route toward nearby lure mob",
+                { quiet: true }
+            );
             return false;
         }
+
+        // Do not freeze CaveBot merely because an off-screen candidate exists.
+        // Take the reason-scoped Cave pause only when a real route is ready to
+        // be handed to Targeting.
+        if (!state.lureOffscreenPullPauseHeld) {
+            if (
+                bot.cave?.pauseMovement?.(
+                    LURE_OFFSCREEN_PULL_PAUSE_REASON
+                ) !== true
+            ) {
+                rememberSkippedTarget(target, now, 2500);
+                clearLureOffscreenPull(
+                    "could not acquire Cave movement pause",
+                    { quiet: true }
+                );
+                return false;
+            }
+
+            state.lureOffscreenPullPauseHeld = true;
+            state.lureOffscreenPullPlayerProgressKey =
+                `${Number(playerPos.x)},${Number(playerPos.y)},${Number(playerPos.z)}`;
+            state.lureOffscreenPullPlayerProgressAt =
+                now;
+        }
+
+        const firstPullBatch =
+            state.lureOffscreenPullLastMoveAt <= 0;
 
         const moved = sendManualTargetPursuitAutoWalk(
             playerPos,
@@ -13795,15 +14338,41 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             state.lureOffscreenPullConsecutivePathFailures = 0;
             state.movementOwner = "offscreen-lure-pull";
             state.movementOwnedUntil = now + 750;
+
+            if (
+                firstPullBatch &&
+                (
+                    !state.lureOffscreenPullLastApproachLogAt ||
+                    now - state.lureOffscreenPullLastApproachLogAt >= 3000
+                )
+            ) {
+                state.lureOffscreenPullLastApproachLogAt = now;
+                bot.log(
+                    "Off-screen Pull: approaching nearby known mob",
+                    {
+                        id: target.id ?? null,
+                        name: target.name || "Mob",
+                        distance,
+                        range,
+                        lureRadius,
+                        position: { ...targetPos },
+                        preferred: isPreferredCreature(target)
+                    }
+                );
+            }
             return true;
         }
 
+        // The route existed but Targeting could not actually send/start the
+        // Pull batch. Release Cave immediately; never wait for a second failed
+        // tick while the route is externally paused.
         state.lureOffscreenPullPathFailures++;
-        state.lureOffscreenPullConsecutivePathFailures++;
-        if (state.lureOffscreenPullConsecutivePathFailures >= 2) {
-            rememberSkippedTarget(target, now, 2500);
-            clearLureOffscreenPull("pull movement packet/path failed");
-        }
+        rememberSkippedTarget(target, now, 7500);
+        state.lureOffscreenPullRetryAfter =
+            now + 1500;
+        clearLureOffscreenPull(
+            "pull movement packet/path failed"
+        );
         return false;
     }
 
@@ -13915,6 +14484,19 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         if (!isTileWalkable(to.x, to.y, z, true))
             return false;
 
+        if (
+            bot.specialAreas?.hasHardAreasForFloor?.(
+                z,
+                { purpose: "combat" }
+            ) &&
+            bot.specialAreas?.isPositionAllowed?.(
+                { x: to.x, y: to.y, z },
+                { purpose: "combat" }
+            ) === false
+        ) {
+            return false;
+        }
+
         const tile = getTileAtPosition({ x: to.x, y: to.y, z });
         if (tile && isFloorChangeTile(tile))
             return false;
@@ -13929,6 +14511,25 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             if (
                 !isTileWalkable(sideA.x, sideA.y, z, true) ||
                 !isTileWalkable(sideB.x, sideB.y, z, true)
+            ) {
+                return false;
+            }
+
+            if (
+                bot.specialAreas?.hasHardAreasForFloor?.(
+                    z,
+                    { purpose: "combat" }
+                ) &&
+                (
+                    bot.specialAreas?.isPositionAllowed?.(
+                        sideA,
+                        { purpose: "combat" }
+                    ) === false ||
+                    bot.specialAreas?.isPositionAllowed?.(
+                        sideB,
+                        { purpose: "combat" }
+                    ) === false
+                )
             ) {
                 return false;
             }
@@ -15008,6 +15609,11 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             if (distance > radius)
                 continue;
 
+            if (!isTargetPolicyReachable(creature, "combat", now)) {
+                state.specialAreaPreferredRejects++;
+                continue;
+            }
+
             tracked.push({ creature, distance });
         }
 
@@ -15104,8 +15710,15 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function clearLureMovementHold(reason = null, now = Date.now()) {
-        if (state.lureMovementHeld)
+        const wasHeld = state.lureMovementHeld === true;
+        if (wasHeld) {
             state.lureLeashResumes++;
+            state.lureLeashCooldownUntil =
+                Math.max(
+                    Number(state.lureLeashCooldownUntil) || 0,
+                    now + 1500
+                );
+        }
 
         state.lureMovementHeld = false;
         state.lureLeashMobId = null;
@@ -15116,6 +15729,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         state.lureLeashStartedAt = 0;
         state.lureLeashLastSeenAt = 0;
         state.lureLeashReason = reason;
+        state.lureLeashHoldLogged = false;
     }
 
     function clearLureState(reason = null, now = Date.now()) {
@@ -15166,6 +15780,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             isPreferredCreature(current) &&
             !isIgnoredTargetCreature(current) &&
             isStrictPreferredScreenVisible(current) &&
+            isTargetPolicyReachable(current, "combat", now) &&
             ((state.skippedTargetIds.get(current.id) || 0) <= now)
                 ? current
                 : null;
@@ -15229,6 +15844,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 Number(current.id) === handoffLockId &&
                 isPreferredCreature(current) &&
                 !isIgnoredTargetCreature(current) &&
+                isTargetPolicyReachable(current, "combat", now) &&
                 Number(current?.state?.health ?? current?.health ?? 1) > 0
             );
 
@@ -15779,6 +16395,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             state.lureLeashReason = danger.predictive
                 ? "trailing mob losing ground"
                 : "trailing mob near screen edge";
+            state.lureLeashHoldLogged = false;
             state.lureLeashActivations++;
 
             if (danger.predictive) {
@@ -15789,23 +16406,38 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 state.lurePredictiveLastAwaySteps = danger.awaySteps || 0;
             }
 
+            // Do not log a hold immediately. Most leash holds last only a
+            // fraction of a second; logging both hold/resume on those short
+            // hysteresis pulses floods DevTools and retains large console
+            // object graphs. A sustained hold is logged once below.
+            return true;
+        }
+
+        // Log only sustained leash holds. Short 100-600 ms hold/resume pulses
+        // are normal hysteresis and should stay silent.
+        if (
+            !state.lureLeashHoldLogged &&
+            state.lureLeashStartedAt > 0 &&
+            now - state.lureLeashStartedAt >= 750
+        ) {
+            state.lureLeashHoldLogged = true;
+            const predictiveHold =
+                state.lureLeashReason === "trailing mob losing ground";
             bot.log(
-                danger.predictive
+                predictiveHold
                     ? "Lure predictive leash holding movement"
                     : "Lure screen leash holding movement",
                 {
-                mobId: state.lureLeashMobId,
-                mobName: state.lureLeashMobName,
-                screenX: state.lureLeashScreenX,
-                screenY: state.lureLeashScreenY,
-                tileDistance: state.lureLeashTileDistance,
-                lureRadius,
-                predictive: !!danger.predictive,
-                awaySteps: danger.awaySteps || 0,
-                waypointIndex: context.waypointIndex
+                    mobId: state.lureLeashMobId,
+                    mobName: state.lureLeashMobName,
+                    screenX: state.lureLeashScreenX,
+                    screenY: state.lureLeashScreenY,
+                    tileDistance: state.lureLeashTileDistance,
+                    lureRadius,
+                    predictive: predictiveHold,
+                    waypointIndex: context.waypointIndex
                 }
             );
-            return true;
         }
 
         // Prefer the originally-held mob for hysteresis. If it is gone, fall
@@ -15903,6 +16535,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                             state.lureLeashMobName;
                         const watchedId =
                             watched?.id;
+                        const holdWasLogged =
+                            state.lureLeashHoldLogged === true;
 
                         resetLureMotionSample(
                             watchedId
@@ -15912,13 +16546,15 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                             now
                         );
 
-                        bot.log(
-                            "Lure screen leash resumed movement",
-                            {
-                                mobName,
-                                heldForMs
-                            }
-                        );
+                        if (holdWasLogged) {
+                            bot.log(
+                                "Lure screen leash resumed movement",
+                                {
+                                    mobName,
+                                    heldForMs
+                                }
+                            );
+                        }
                         return false;
                     }
 
@@ -15951,21 +16587,25 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             state.lureLeashMobId;
         const lostMobName =
             state.lureLeashMobName;
+        const holdWasLogged =
+            state.lureLeashHoldLogged === true;
 
         clearLureMovementHold(
             "off-screen lure grace expired",
             now
         );
 
-        bot.log(
-            "Lure leash released – mob remained off-screen",
-            {
-                mobId: lostMobId,
-                mobName: lostMobName,
-                unseenForMs,
-                lostGraceMs
-            }
-        );
+        if (holdWasLogged) {
+            bot.log(
+                "Lure leash released – mob remained off-screen",
+                {
+                    mobId: lostMobId,
+                    mobName: lostMobName,
+                    unseenForMs,
+                    lostGraceMs
+                }
+            );
+        }
 
         return false;
     }
@@ -16278,6 +16918,11 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 });
                 if (!info.valid)
                     return false;
+
+                if (!isTargetPolicyReachable(monster, "combat", now)) {
+                    state.specialAreaTargetRejects++;
+                    return false;
+                }
 
                 const pos = normalizePosition(monster.getPosition?.() || monster.__position);
                 if (!pos || pos.z !== me.z)
@@ -16696,6 +17341,14 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
             if (!info.valid) {
                 clearLureCombatTarget(current, now, `invalid lure target: ${info.reason}`);
+                current = null;
+            } else if (!isTargetPolicyReachable(current, "combat", now)) {
+                state.specialAreaTargetRejects++;
+                clearLureCombatTarget(
+                    current,
+                    now,
+                    "lure target moved behind hard Special Area"
+                );
                 current = null;
             }
         }
@@ -17949,6 +18602,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         state.movementOwnedUntil = 0;
         state.skippedTargetIds.clear();
         reachCache.clear();
+        specialAreaTargetReachCache.clear();
         resetFollowProgress();
         bot.log(`auto attack runtime reset (${reason})`);
     }
@@ -18352,6 +19006,13 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         }
         if (typeof TargetPacket !== "function")
             return false;
+
+        if (!isTargetPolicyReachable(target, "combat", now)) {
+            state.specialAreaTargetRejects++;
+            rememberSkippedTarget(target, now, 5000);
+            return false;
+        }
+
         const info = isTargetValidAndOnScreen(target, {
             returnDetails: true,
             maxDx: 8,
@@ -19109,6 +19770,9 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function getManualMeleeFollowRoute(target, targetPos, playerPos) {
+        if (bot.specialAreas?.hasActiveAreasForFloor?.(playerPos?.z, { purpose: "combat" })) {
+            return findReachableAdjacentPath(targetPos, playerPos);
+        }
         if (
             config.meleeMode &&
             !config.kiteMode &&
@@ -19482,20 +20146,31 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             owner !== "melee" ||
             isStoredMeleeAutoWalkBatchPassable(playerPos);
 
-        // v1.6.56: __isAutoWalking is not proof that the server is actually
-        // moving us. A creature can block the first queued step while the
-        // client keeps the AutoWalk flag alive. Rebase on REAL player tiles;
-        // if the same melee batch makes no physical progress for ~1.4s, stop
-        // the stale queue and let the fresh route/fallback below replace it.
-        let staleMeleeAutoWalk = false;
+        // v1.6.77: __isAutoWalking is not proof that the server is actually
+        // moving us. The old watchdog covered only melee, which meant
+        // Off-screen Pull/Hunt could remain stuck forever with a stale native
+        // AutoWalk flag. Track REAL occupied player tiles for all pursuit
+        // AutoWalk owners except Kite and force a fresh route when the queued
+        // batch makes no physical progress.
+        const progressTrackedOwner =
+            owner === "melee" ||
+            owner === "hunt" ||
+            owner === "pull";
+        const progressStallMs =
+            owner === "melee"
+                ? 1400
+                : 1700;
+        let stalePursuitAutoWalk = false;
+
         if (
-            owner === "melee" &&
+            progressTrackedOwner &&
             client.__mbTargetingAutoWalkActive === true &&
             sameTarget &&
             sameOwner
         ) {
             const playerProgressKey =
                 `${Number(playerPos.x)},${Number(playerPos.y)},${Number(playerPos.z)}`;
+
             if (
                 state.manualPursuitAutoWalkProgressKey !==
                     playerProgressKey
@@ -19506,9 +20181,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                     now;
             } else if (
                 state.manualPursuitAutoWalkProgressAt > 0 &&
-                now - state.manualPursuitAutoWalkProgressAt >= 1400
+                now - state.manualPursuitAutoWalkProgressAt >=
+                    progressStallMs
             ) {
-                staleMeleeAutoWalk = true;
+                stalePursuitAutoWalk = true;
                 state.manualPursuitAutoWalkStallReplans++;
             }
         }
@@ -19528,7 +20204,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             ) &&
             pf.__isAutoWalking &&
             storedMeleeBatchPassable &&
-            !staleMeleeAutoWalk
+            !stalePursuitAutoWalk
         ) {
             return true;
         }
@@ -19537,18 +20213,37 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             client.__mbTargetingAutoWalkActive === true &&
             sameTarget &&
             sameOwner &&
-            owner === "melee" &&
             (
-                !storedMeleeBatchPassable ||
-                staleMeleeAutoWalk
+                (
+                    owner === "melee" &&
+                    !storedMeleeBatchPassable
+                ) ||
+                stalePursuitAutoWalk
             )
         ) {
-            state.manualPursuitObstacleReplans++;
+            if (owner === "melee") {
+                state.manualPursuitObstacleReplans++;
+            }
+
             stopManualTargetPursuitAutoWalk(
-                staleMeleeAutoWalk
-                    ? "melee pursuit made no physical progress – forcing fresh A*"
+                stalePursuitAutoWalk
+                    ? (
+                        owner === "pull"
+                            ? "Off-screen Pull made no physical progress – forcing fresh A*"
+                            : owner === "hunt"
+                                ? "Off-screen Hunt made no physical progress – forcing fresh A*"
+                                : "melee pursuit made no physical progress – forcing fresh A*"
+                    )
                     : "melee pursuit route dynamically blocked – replanning around creature"
             );
+
+            // Rebase the watchdog at the real current tile. If the fresh batch
+            // also fails to move, it will be invalidated again instead of being
+            // mistaken for a healthy in-flight AutoWalk indefinitely.
+            state.manualPursuitAutoWalkProgressKey =
+                `${Number(playerPos.x)},${Number(playerPos.y)},${Number(playerPos.z)}`;
+            state.manualPursuitAutoWalkProgressAt =
+                now;
         }
 
         if (
@@ -23176,6 +23871,14 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         return value ? JSON.parse(JSON.stringify(value)) : null;
     }
 
+    function normalizePresetAreas(value) {
+        if (!Array.isArray(value))
+            return [];
+        return value
+            .filter(area => area && typeof area === "object" && !Array.isArray(area))
+            .map(area => cloneValue(area));
+    }
+
     function normalizePreset(value) {
         if (!value)
             return null;
@@ -23186,6 +23889,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             name,
             route: normalizeRoute(value.route),
             transitions: normalizeTransitions(value.transitions),
+            areas: normalizePresetAreas(value.areas),
         };
     }
 
@@ -23204,6 +23908,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 name: defaultPresetName,
                 route: route.map(w => cloneValue(w)),
                 transitions: transitions.map(t => cloneValue(t)),
+                areas: [],
             }
         ];
     }
@@ -23234,6 +23939,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                             ...w
                         })),
                     transitions: p.transitions.map(t => cloneValue(t)),
+                    areas: normalizePresetAreas(p.areas),
                 })));
     }
 
@@ -23367,16 +24073,18 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             bot.log(`Cave: recovery context reset (${reason})`);
     }
 
-    function upsertPreset(name, nextRoute = route, nextTransitions = transitions) {
+    function upsertPreset(name, nextRoute = route, nextTransitions = transitions, nextAreas = undefined) {
         const norm = normalizePresetName(name);
         if (!norm)
             return null;
+        const idx = presets.findIndex(p => p.name.toLowerCase() === norm.toLowerCase());
+        const existingAreas = idx >= 0 ? presets[idx].areas : [];
         const preset = {
             name: norm,
             route: normalizeRoute(nextRoute).map(w => cloneValue(w)),
             transitions: normalizeTransitions(nextTransitions).map(t => cloneValue(t)),
+            areas: normalizePresetAreas(nextAreas === undefined ? existingAreas : nextAreas),
         };
-        const idx = presets.findIndex(p => p.name.toLowerCase() === norm.toLowerCase());
         if (idx >= 0)
             presets[idx] = preset;
         else
@@ -26197,6 +26905,24 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     function getTransitions() {
         return transitions.map(t => cloneValue(t));
     }
+    function getPresetAreas(name = getActivePresetName()) {
+        const preset = getPresetByName(name);
+        return preset ? normalizePresetAreas(preset.areas) : [];
+    }
+    function setPresetAreas(name, nextAreas) {
+        const normalizedName = normalizePresetName(name) || getActivePresetName();
+        let preset = getPresetByName(normalizedName);
+        if (!preset) {
+            preset = upsertPreset(normalizedName,
+                normalizedName.toLowerCase() === getActivePresetName().toLowerCase() ? route : [],
+                normalizedName.toLowerCase() === getActivePresetName().toLowerCase() ? transitions : [],
+                nextAreas);
+        } else {
+            preset.areas = normalizePresetAreas(nextAreas);
+            persistPresets();
+        }
+        return preset ? normalizePresetAreas(preset.areas) : null;
+    }
     function persistTransitions() {
         persistActivePreset();
     }
@@ -26220,7 +26946,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         return {
             name: preset.name,
             route: preset.route.map(w => cloneValue(w)),
-            transitions: preset.transitions.map(t => cloneValue(t))
+            transitions: preset.transitions.map(t => cloneValue(t)),
+            areas: normalizePresetAreas(preset.areas)
         };
     }
 
@@ -26238,7 +26965,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         }
         if (state.running)
             stop();
-        const preset = upsertPreset(norm, [], []);
+        const preset = upsertPreset(norm, [], [], []);
         if (!preset)
             return null;
         loadPresetState(preset.name);
@@ -26248,7 +26975,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         return {
             name: preset.name,
             route: [],
-            transitions: []
+            transitions: [],
+            areas: []
         };
     }
 
@@ -26271,7 +26999,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         return {
             name: preset.name,
             route: getRoute(),
-            transitions: getTransitions()
+            transitions: getTransitions(),
+            areas: getPresetAreas(preset.name)
         };
     }
 
@@ -26333,6 +27062,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             name: newN,
             route: preset.route.map(w => cloneValue(w)),
             transitions: preset.transitions.map(t => cloneValue(t)),
+            areas: normalizePresetAreas(preset.areas),
         };
         // Remove old and add new
         presets = presets.filter(p => p.name.toLowerCase() !== old.toLowerCase());
@@ -26379,7 +27109,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             }
 
             // Add or replace (replace shouldn't happen because we skip existing)
-            upsertPreset(norm.name, norm.route, norm.transitions);
+            upsertPreset(norm.name, norm.route, norm.transitions, norm.areas);
             added++;
         }
 
@@ -28391,6 +29121,31 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         if (!from || !waypoint)
             return false;
         const to = new Position(waypoint.x, waypoint.y, waypoint.z);
+
+        // v1.6.74 Special Areas: ordinary same-floor Cave travel uses the
+        // weighted/hard policy path when at least one area exists on this floor.
+        // Manual transition/action waypoints remain authoritative and bypass it.
+        const isSpecialWaypoint = !!(waypoint.stand || waypoint.rope || waypoint.shovel || waypoint.ladder || waypoint.script);
+        if (!isSpecialWaypoint && Number(from.z) === Number(waypoint.z) &&
+            bot.specialAreas?.hasActiveAreasForFloor?.(from.z, { purpose: "route" })) {
+            const policyMove = bot.specialAreas.walkTo(from, waypoint, {
+                purpose: "route",
+                fieldAware: config.ignoreFields === true,
+                maxNodes: 8000
+            });
+            if (policyMove?.handled) {
+                state.lastPathAt = Date.now();
+                if (policyMove.success) {
+                    state.lastWaypointTarget = { x: waypoint.x, y: waypoint.y, z: waypoint.z };
+                    return true;
+                }
+                bot.log("Cave: Special Area policy blocked route", {
+                    waypoint: state.currentIndex + 1,
+                    reason: policyMove.reason || "no policy-safe path"
+                });
+                return false;
+            }
+        }
 
         // When the local route contains a magic field, do not ask native
         // findPath() to generate it. Its passability logic can still refuse the
@@ -35025,6 +35780,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         isMovementPaused:
             isMovementPausedExternally,
         getTransitions,
+        getPresetAreas,
+        setPresetAreas,
         getPresetNames,
         getActivePresetName,
         getCurrentWaypoint,
@@ -35069,6 +35826,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         setLoopMode,
         getLoopMode,
         inspectNearbyTiles,
+        isFloorChangeTile,
         isAtWaypoint,
         getRouteHealth,
         getRecoveryHistory,
@@ -35095,6 +35853,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                     name: getActivePresetName(),
                     route: getRoute(),
                     transitions: getTransitions(),
+                    areas: getPresetAreas(getActivePresetName()),
                 };
             }
 
@@ -35113,6 +35872,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 transitions: Array.isArray(found.transitions)
                  ? found.transitions.map(t => JSON.parse(JSON.stringify(t)))
                  : [],
+                areas: normalizePresetAreas(found.areas),
             };
         },
     };
@@ -37294,6 +38054,20 @@ window.__minibiaBotBundle.installMessageAlertModule = function installMessageAle
         checkForNewMessages, // <-- now exposed
         config,
     };
+
+    bot.addCleanup(() => {
+        state.running = false;
+        if (state.timerId) {
+            clearTimeout(state.timerId);
+            state.timerId = null;
+        }
+        for (const id of state.replyTimerIds || []) {
+            clearTimeout(id);
+        }
+        state.replyTimerIds = [];
+        state.seenKeys.clear();
+        state.killSwitchActive = false;
+    });
 };
 
 //*********************
@@ -37417,6 +38191,14 @@ window.__minibiaBotBundle.installAntiBotMonitorModule = function installAntiBotM
         status,
         config,
     };
+
+    bot.addCleanup(() => {
+        state.running = false;
+        if (state.timerId) {
+            clearTimeout(state.timerId);
+            state.timerId = null;
+        }
+    });
 };
 
 //***************
@@ -37971,6 +38753,14 @@ window.__minibiaBotBundle.installExoriModule = function installExoriModule(bot) 
         getNativeSpellCooldownState,
         config,
     };
+
+    bot.addCleanup(() => {
+        state.running = false;
+        if (state.timerId) {
+            clearTimeout(state.timerId);
+            state.timerId = null;
+        }
+    });
 };
 
 window.__minibiaBotBundle.installSlimeTrainerModule = function installSlimeTrainerModule(bot) {
@@ -37980,6 +38770,7 @@ window.__minibiaBotBundle.installSlimeTrainerModule = function installSlimeTrain
         timerId: null,
         lastAttackAt: 0,
         captureMode: false,
+        captureHandler: null,
     };
 
     const config = Object.assign({
@@ -38116,12 +38907,22 @@ window.__minibiaBotBundle.installSlimeTrainerModule = function installSlimeTrain
             bot.log(`Mother Slime set: ${config.motherSlimeName} (ID: ${config.motherSlimeId})`);
             state.captureMode = false;
             document.removeEventListener("click", handler, true);
+            if (state.captureHandler === handler) state.captureHandler = null;
             if (typeof bot.ui?.refreshSlimeTrainerStatus === "function") {
                 bot.ui.refreshSlimeTrainerStatus();
             }
         };
 
+        state.captureHandler = handler;
         document.addEventListener("click", handler, true);
+    }
+
+    function cancelCaptureMotherSlime() {
+        if (state.captureHandler) {
+            document.removeEventListener("click", state.captureHandler, true);
+            state.captureHandler = null;
+        }
+        state.captureMode = false;
     }
 
     function tick() {
@@ -38251,6 +39052,15 @@ window.__minibiaBotBundle.installSlimeTrainerModule = function installSlimeTrain
         startCaptureMotherSlime,
         config,
     };
+
+    bot.addCleanup(() => {
+        state.running = false;
+        if (state.timerId) {
+            clearTimeout(state.timerId);
+            state.timerId = null;
+        }
+        cancelCaptureMotherSlime();
+    });
 };
 
 //Monk
@@ -38548,6 +39358,15 @@ window.__minibiaBotBundle.installMonkTrainerModule = function installMonkTrainer
         updateConfig,
         config,
     };
+
+    bot.addCleanup(() => {
+        state.running = false;
+        if (state.timerId != null) {
+            clearTimeout(state.timerId);
+            state.timerId = null;
+        }
+        clearTarget();
+    });
 };
 
 // Light hack
@@ -38558,6 +39377,8 @@ window.__minibiaBotBundle.installLightHackModule = function installLightHackModu
         enabled: false,
         originalIsLightingEnabled: null,
         patched: false,
+        canvasRestoreTimer: null,
+        initialRenderTimer: null,
     };
 
     const config = Object.assign({
@@ -38617,7 +39438,7 @@ window.__minibiaBotBundle.installLightHackModule = function installLightHackModu
             settings.isLightingEnabled = state.originalIsLightingEnabled;
         }
         // Restore prototype if we patched it
-        const proto = Object.getPrototypeOf(settings);
+        const proto = settings ? Object.getPrototypeOf(settings) : null;
         if (proto && proto.__minibia_light_hack_original) {
             proto.isLightingEnabled = proto.__minibia_light_hack_original;
             delete proto.__minibia_light_hack_original;
@@ -38641,7 +39462,9 @@ window.__minibiaBotBundle.installLightHackModule = function installLightHackModu
                 h = canvas.height;
                 canvas.width = w + 1;
                 canvas.height = h + 1;
-                setTimeout(() => {
+                if (state.canvasRestoreTimer) clearTimeout(state.canvasRestoreTimer);
+                state.canvasRestoreTimer = setTimeout(() => {
+                    state.canvasRestoreTimer = null;
                     canvas.width = w;
                     canvas.height = h;
                 }, 10);
@@ -38719,7 +39542,10 @@ window.__minibiaBotBundle.installLightHackModule = function installLightHackModu
     // Auto‑apply on init if enabled
     if (config.enabled) {
         ensurePatched();
-        setTimeout(forceRender, 200);
+        state.initialRenderTimer = setTimeout(() => {
+            state.initialRenderTimer = null;
+            forceRender();
+        }, 200);
     }
 
     bot.lightHack = {
@@ -38730,6 +39556,22 @@ window.__minibiaBotBundle.installLightHackModule = function installLightHackModu
         config,
         forceRender,
     };
+
+    bot.addCleanup(() => {
+        if (ensurePatchedTimer) {
+            clearTimeout(ensurePatchedTimer);
+            ensurePatchedTimer = null;
+        }
+        if (state.initialRenderTimer) {
+            clearTimeout(state.initialRenderTimer);
+            state.initialRenderTimer = null;
+        }
+        if (state.canvasRestoreTimer) {
+            clearTimeout(state.canvasRestoreTimer);
+            state.canvasRestoreTimer = null;
+        }
+        restore();
+    });
 };
 
 window.__minibiaBotBundle.installLightHackLegitModule = function installLightHackLegitModule(bot) {
@@ -38738,6 +39580,9 @@ window.__minibiaBotBundle.installLightHackLegitModule = function installLightHac
         running: false,
         originalRenderFBOLighting: null,
         renderer: null,
+        rendererWaitTimer: null,
+        hookPrototype: null,
+        hookWrapper: null,
     };
 
     const config = Object.assign({
@@ -38758,10 +39603,24 @@ window.__minibiaBotBundle.installLightHackLegitModule = function installLightHac
         if (state.running)
             return;
         const proto = Object.getPrototypeOf(renderer);
+
+        // If a previous mb0t runtime left a tagged wrapper behind, unwrap it
+        // before installing the new one. This prevents closure chains across
+        // hot reloads.
+        if (
+            proto?.__mb0tLightHackLegitWrapper &&
+            proto.__renderFBOLighting === proto.__mb0tLightHackLegitWrapper &&
+            typeof proto.__mb0tLightHackLegitOriginal === "function"
+        ) {
+            proto.__renderFBOLighting = proto.__mb0tLightHackLegitOriginal;
+            renderer.__renderFBOLighting = proto.__mb0tLightHackLegitOriginal;
+        }
+
         state.originalRenderFBOLighting = proto.__renderFBOLighting;
         state.renderer = renderer;
+        state.hookPrototype = proto;
 
-        proto.__renderFBOLighting = function (playerLightSize, playerLightColor) {
+        const wrapper = function (playerLightSize, playerLightColor) {
             if (window.LightHack && window.LightHack.enabled) {
                 const hack = window.LightHack;
                 if (hack.playerLight.enabled) {
@@ -38774,7 +39633,11 @@ window.__minibiaBotBundle.installLightHackLegitModule = function installLightHac
                 this.__injectExtraLights();
             }
         };
-        renderer.__renderFBOLighting = proto.__renderFBOLighting;
+        state.hookWrapper = wrapper;
+        proto.__mb0tLightHackLegitOriginal = state.originalRenderFBOLighting;
+        proto.__mb0tLightHackLegitWrapper = wrapper;
+        proto.__renderFBOLighting = wrapper;
+        renderer.__renderFBOLighting = wrapper;
 
         // Add helper methods if not present
         if (!proto.__injectExtraLights) {
@@ -38815,6 +39678,10 @@ window.__minibiaBotBundle.installLightHackLegitModule = function installLightHac
                 },
                 extraLights: [],
                 addLight: function (x, y, z, size, color) {
+                    const maxExtraLights = 256;
+                    if (this.extraLights.length >= maxExtraLights) {
+                        this.extraLights.splice(0, this.extraLights.length - maxExtraLights + 1);
+                    }
                     this.extraLights.push({
                         x,
                         y,
@@ -38858,14 +39725,24 @@ window.__minibiaBotBundle.installLightHackLegitModule = function installLightHac
         if (!state.running)
             return;
         const renderer = state.renderer;
-        if (renderer && state.originalRenderFBOLighting) {
-            const proto = Object.getPrototypeOf(renderer);
-            proto.__renderFBOLighting = state.originalRenderFBOLighting;
-            renderer.__renderFBOLighting = state.originalRenderFBOLighting;
+        const proto = state.hookPrototype || (renderer ? Object.getPrototypeOf(renderer) : null);
+        if (renderer && proto && state.originalRenderFBOLighting) {
+            if (!state.hookWrapper || proto.__renderFBOLighting === state.hookWrapper) {
+                proto.__renderFBOLighting = state.originalRenderFBOLighting;
+            }
+            if (!state.hookWrapper || renderer.__renderFBOLighting === state.hookWrapper) {
+                renderer.__renderFBOLighting = state.originalRenderFBOLighting;
+            }
+            if (proto.__mb0tLightHackLegitWrapper === state.hookWrapper) {
+                delete proto.__mb0tLightHackLegitWrapper;
+                delete proto.__mb0tLightHackLegitOriginal;
+            }
         }
         state.running = false;
         state.originalRenderFBOLighting = null;
         state.renderer = null;
+        state.hookPrototype = null;
+        state.hookWrapper = null;
         if (window.LightHack) {
             window.LightHack.enabled = false;
         }
@@ -38957,6 +39834,17 @@ window.__minibiaBotBundle.installLightHackLegitModule = function installLightHac
         updateConfig,
         config,
     };
+
+    bot.addCleanup(() => {
+        if (state.rendererWaitTimer) {
+            clearTimeout(state.rendererWaitTimer);
+            state.rendererWaitTimer = null;
+        }
+        uninstallHook();
+        if (window.LightHack?.extraLights) {
+            window.LightHack.extraLights.length = 0;
+        }
+    });
 };
 
 /**
@@ -39587,6 +40475,14 @@ window.__minibiaBotBundle.installOutfitRandomizerModule = function installOutfit
         randomizeNow: randomizeOutfit,
         config,
     };
+
+    bot.addCleanup(() => {
+        state.running = false;
+        if (state.timerId) {
+            clearTimeout(state.timerId);
+            state.timerId = null;
+        }
+    });
 };
 
 // ---- ComboBot Module ----
@@ -39607,6 +40503,7 @@ window.__minibiaBotBundle.installComboBotModule = function installComboBotModule
         retryCount: 0,
         followInterval: null, // rune spam interval
         requestInterval: null, // target request interval (every 500ms)
+        autoStartTimer: null,
         currentTargetId: null, // the target we are currently following
     };
 
@@ -40010,10 +40907,14 @@ window.__minibiaBotBundle.installComboBotModule = function installComboBotModule
         return true;
     }
 
-    function stop() {
-        if (!state.running)
-            return false;
+    function stop(options = {}) {
+        const shouldPersist = options.persistEnabled !== false;
+        const wasRunning = state.running;
 
+        if (state.autoStartTimer) {
+            clearTimeout(state.autoStartTimer);
+            state.autoStartTimer = null;
+        }
         if (state.retryTimer) {
             clearTimeout(state.retryTimer);
             state.retryTimer = null;
@@ -40049,10 +40950,14 @@ window.__minibiaBotBundle.installComboBotModule = function installComboBotModule
         }
 
         state.running = false;
-        config.enabled = false;
-        persistConfig();
-        log('Stopped.');
-        return true;
+        if (shouldPersist) {
+            config.enabled = false;
+            persistConfig();
+        }
+        if (options.quiet !== true && wasRunning) {
+            log('Stopped.');
+        }
+        return wasRunning;
     }
 
     function status() {
@@ -40101,7 +41006,8 @@ window.__minibiaBotBundle.installComboBotModule = function installComboBotModule
     }
 
     if (config.enabled) {
-        setTimeout(() => {
+        state.autoStartTimer = setTimeout(() => {
+            state.autoStartTimer = null;
             if (!state.running)
                 start();
         }, 1000);
@@ -40115,6 +41021,10 @@ window.__minibiaBotBundle.installComboBotModule = function installComboBotModule
         config,
         followLeaderNow,
     };
+
+    bot.addCleanup(() => {
+        stop({ persistEnabled: false, quiet: true });
+    });
 };
 
 // Paladin
@@ -40132,6 +41042,7 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
         lastCraftAt: 0,
         lastEquipAt: 0,
         captureMode: false,
+        captureHandler: null,
         // v1.6.20: Ammo Crafter uses the same server-backed HOTBAR_ITEM_COUNT
         // pipeline as the native hotbar. Never infer a full-inventory count by
         // scanning only equipment + currently open containers.
@@ -40436,6 +41347,7 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
                                     bot.ui.refreshPaladinStatus();
                                 state.captureMode = false;
                                 document.removeEventListener("click", handler, true);
+                                if (state.captureHandler === handler) state.captureHandler = null;
                                 return;
                             }
                         }
@@ -40444,6 +41356,7 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
                 bot.log("Paladin: no container or equipment slot found");
                 state.captureMode = false;
                 document.removeEventListener("click", handler, true);
+                if (state.captureHandler === handler) state.captureHandler = null;
                 return;
             }
 
@@ -40457,6 +41370,7 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
                 bot.log("Available containers:", available);
                 state.captureMode = false;
                 document.removeEventListener("click", handler, true);
+                if (state.captureHandler === handler) state.captureHandler = null;
                 return;
             }
 
@@ -40466,6 +41380,7 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
                 bot.log("Paladin: no item in slot");
                 state.captureMode = false;
                 document.removeEventListener("click", handler, true);
+                if (state.captureHandler === handler) state.captureHandler = null;
                 return;
             }
 
@@ -40484,7 +41399,16 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
             document.removeEventListener("click", handler, true);
         };
 
+        state.captureHandler = handler;
         document.addEventListener("click", handler, true);
+    }
+
+    function cancelCaptureWeapon() {
+        if (state.captureHandler) {
+            document.removeEventListener("click", state.captureHandler, true);
+            state.captureHandler = null;
+        }
+        state.captureMode = false;
     }
 
     // ---- Crafter functions ----
@@ -40827,6 +41751,11 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
         getKillSwitchSnapshot,
         restoreKillSwitchSnapshot,
     };
+
+    bot.addCleanup(() => {
+        stop({ persistEnabled: false });
+        cancelCaptureWeapon();
+    });
 };
 
 // Looter
@@ -42392,10 +43321,17 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                 ) || 45000
             );
 
+        pruneCombatAbandonedCorpses(now);
         state.corpseCombatAbandoned.set(
             job.key,
             blockUntil
         );
+        const maxAbandonedCorpses = 256;
+        while (state.corpseCombatAbandoned.size > maxAbandonedCorpses) {
+            const oldestKey = state.corpseCombatAbandoned.keys().next().value;
+            if (oldestKey == null) break;
+            state.corpseCombatAbandoned.delete(oldestKey);
+        }
         state.corpseCombatAbandonCount++;
         state.corpseCombatLastAbandonedKey =
             job.key;
@@ -44585,7 +45521,7 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
         "minibiaBot.pinkSkull.config",
         "minibiaBot.paladin.config",
         "minibiaBot.looter.config",
-        "minibiaBot.blacklist.config",
+        "minibiaBot.specialAreas.config",
         "minibiaBot.support.config",
         "minibiaBot.combo.config",
         "minibiaBot.autoPickup.config",
@@ -45058,98 +45994,388 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
 
 /**
  * ==================================================================================
- * BLACKLIST MODULE – Avoid walking on specific tiles
+ * SPECIAL AREAS MODULE – full per-Cave-preset path policy system
+ * Ported from Massebot Special Areas. Replaces the old single-tile blacklist.
  * ==================================================================================
  */
-window.__minibiaBotBundle.installBlacklistModule = function installBlacklistModule(bot) {
-    const configStorageKey = "minibiaBot.blacklist.config";
+window.__minibiaBotBundle.installSpecialAreasModule = function installSpecialAreasModule(bot) {
+    // v1.6.79: tear down a stale Special Areas runtime from a prior userscript
+    // injection even if the previous bundle cleanup did not complete.
+    const runtimeKey = "__mb0tSpecialAreasRuntime";
+    try {
+        window[runtimeKey]?.destroy?.();
+    } catch (e) {}
 
-    let tiles = [];
+    const configStorageKey = "minibiaBot.specialAreas.config";
+    const legacyBlacklistStorageKey = "minibiaBot.blacklist.config";
+    const schemaVersion = 1;
+    const overlayId = "minibia-bot-special-areas-overlay";
+    const areaTypeDefinitions = [
+        { value: "avoid", label: "Avoid", color: "#f4b84c", defaultWeight: 6, description: "Adds a high movement cost but remains passable." },
+        { value: "never-step", label: "Never Step", color: "#ff6f78", defaultWeight: 10, description: "Blocks both route and combat movement." },
+        { value: "prefer", label: "Prefer", color: "#45dec0", defaultWeight: 3, description: "Makes the pathfinder prefer these tiles." },
+        { value: "combat-only", label: "Combat Only", color: "#b59cff", defaultWeight: 10, description: "Blocked for Cave Bot travel but allowed during combat." },
+        { value: "no-combat", label: "No Combat", color: "#5fc9ff", defaultWeight: 10, description: "Allowed for Cave Bot travel but blocked for combat movement." },
+        { value: "lure-destination", label: "Lure Destination", color: "#ff8ee7", defaultWeight: 5, description: "Makes combat/lure positioning prefer this destination area." },
+    ];
+    const areaTypes = new Set(areaTypeDefinitions.map(d => d.value));
+    const areaTypeMap = new Map(areaTypeDefinitions.map(d => [d.value, d]));
+    const config = Object.assign({ enabled: true, overlayEnabled: true, legacyBlacklistMigrated: false }, bot.storage.get(configStorageKey, {}));
+    config.enabled = config.enabled !== false;
+    config.overlayEnabled = config.overlayEnabled !== false;
 
-    function persist() {
-        bot.storage.set(configStorageKey, {
-            tiles: tiles.map(t => ({
-                    ...t
-                }))
+    let nextAreaId = 1;
+    let areaRevision = 1;
+    const areaCache = new Map();
+    const runtimeToken = {};
+    const state = {
+        captureArmed: false,
+        captureMode: null,
+        captureCanvas: null,
+        captureHandler: null,
+        captureOptions: null,
+        captureCorners: [],
+        captureMessage: "Pick two corners to record an area.",
+        overlayCanvas: null,
+        overlayTimerId: null,
+        testPath: [],
+        testDestination: null,
+        lastTestResult: null,
+        lastPathResult: null,
+    };
+
+    const cloneValue = value => value == null ? value : JSON.parse(JSON.stringify(value));
+    function normalizePosition(value) {
+        if (!value || value.x == null || value.y == null || value.z == null) return null;
+        const p = { x: Math.trunc(Number(value.x)), y: Math.trunc(Number(value.y)), z: Math.trunc(Number(value.z)) };
+        return Object.values(p).every(Number.isFinite) ? p : null;
+    }
+    const positionKey = p => p ? `${p.x},${p.y},${p.z}` : null;
+    const samePosition = (a,b) => !!a && !!b && Number(a.x)===Number(b.x) && Number(a.y)===Number(b.y) && Number(a.z)===Number(b.z);
+    const normalizePresetName = value => String(value || "Default").trim().replace(/\s+/g," ") || "Default";
+    const getActivePresetName = () => normalizePresetName(bot.cave?.getActivePresetName?.() || "Default");
+    function normalizeAreaType(value) { const v=String(value||"avoid").trim().toLowerCase(); return areaTypes.has(v)?v:"avoid"; }
+    function normalizeWeight(value,type="avoid") {
+        const def=areaTypeMap.get(normalizeAreaType(type));
+        const n=Number(value); const fallback=def?.defaultWeight || 1;
+        return Math.max(1,Math.min(20,Math.trunc(Number.isFinite(n)?n:fallback)));
+    }
+    function createAreaId(){ return `area-${Date.now().toString(36)}-${(nextAreaId++).toString(36)}`; }
+    function normalizeArea(value,index=0){
+        if(!value || typeof value!=="object" || Array.isArray(value)) return null;
+        const first=normalizePosition(value.from||value.start||{x:value.x1??value.x,y:value.y1??value.y,z:value.z});
+        const second=normalizePosition(value.to||value.end||{x:value.x2??value.x1??value.x,y:value.y2??value.y1??value.y,z:value.z??first?.z});
+        if(!first||!second||first.z!==second.z) return null;
+        const type=normalizeAreaType(value.type); const def=areaTypeMap.get(type);
+        const name=String(value.name||"").trim().replace(/\s+/g," ").slice(0,64);
+        return { schemaVersion, id:String(value.id||"").trim().slice(0,96)||createAreaId(), name:name||`${def?.label||"Area"} ${index+1}`, type, enabled:value.enabled!==false, weight:normalizeWeight(value.weight,type), x1:Math.min(first.x,second.x), y1:Math.min(first.y,second.y), x2:Math.max(first.x,second.x), y2:Math.max(first.y,second.y), z:first.z };
+    }
+    function normalizeAreas(value){
+        const ids=new Set();
+        return (Array.isArray(value)?value:[]).map(normalizeArea).filter(Boolean).map(a=>{ if(ids.has(a.id)) a.id=createAreaId(); ids.add(a.id); return a; });
+    }
+    function invalidateAreaCache(presetName=null){
+        if(presetName==null) areaCache.clear();
+        else areaCache.delete(normalizePresetName(presetName));
+        areaRevision++;
+    }
+    function getAreasInternal(presetName=getActivePresetName()){
+        const name=normalizePresetName(presetName);
+        if(!areaCache.has(name)){
+            areaCache.set(name,normalizeAreas(bot.cave?.getPresetAreas?.(name)||[]));
+        }
+        return areaCache.get(name)||[];
+    }
+    function getAreas(presetName=getActivePresetName()){
+        return getAreasInternal(presetName).map(cloneValue);
+    }
+    function persistAreas(areas,presetName=getActivePresetName()){
+        const name=normalizePresetName(presetName);
+        const saved=bot.cave?.setPresetAreas?.(name,normalizeAreas(areas));
+        if(!Array.isArray(saved))return null;
+        const normalized=normalizeAreas(saved);
+        areaCache.set(name,normalized);
+        areaRevision++;
+        return normalized.map(cloneValue);
+    }
+    function persistConfig(){ bot.storage.set(configStorageKey,{...config}); }
+    function updateConfig(next={}){
+        const oldEnabled=config.enabled;
+        if(Object.prototype.hasOwnProperty.call(next,"enabled")) config.enabled=next.enabled!==false;
+        if(Object.prototype.hasOwnProperty.call(next,"overlayEnabled")) config.overlayEnabled=next.overlayEnabled!==false;
+        if(oldEnabled!==config.enabled) areaRevision++;
+        persistConfig(); renderOverlay(); return {...config};
+    }
+    function addArea(value,presetName=getActivePresetName()){
+        const areas=getAreas(presetName); const area=normalizeArea(value,areas.length);
+        if(!area){ state.captureMessage="The area coordinates are invalid."; return null; }
+        areas.push(area);
+        if(!persistAreas(areas,presetName)){ state.captureMessage="The active Cave preset could not be updated."; return null; }
+        state.captureMessage=`Recorded ${areaTypeMap.get(area.type)?.label||area.type}: ${area.x1}, ${area.y1} to ${area.x2}, ${area.y2}, floor ${area.z}.`;
+        renderOverlay(); return cloneValue(area);
+    }
+    function addAreaCurrentTile(options={}){ const p=normalizePosition(bot.getPlayerPosition?.()); if(!p){state.captureMessage="The current player tile is unavailable.";return null;} return addArea({...options,from:p,to:p}); }
+    function updateArea(id,updates={},presetName=getActivePresetName()){
+        const areas=getAreas(presetName), idx=areas.findIndex(a=>a.id===id); if(idx<0)return null;
+        const next=normalizeArea({...areas[idx],...updates,id:areas[idx].id},idx); if(!next)return null;
+        areas[idx]=next; if(!persistAreas(areas,presetName))return null; renderOverlay(); return cloneValue(next);
+    }
+    function removeArea(id,presetName=getActivePresetName()){
+        const areas=getAreas(presetName), idx=areas.findIndex(a=>a.id===id); if(idx<0)return null;
+        const [removed]=areas.splice(idx,1); if(!persistAreas(areas,presetName))return null; renderOverlay(); return cloneValue(removed);
+    }
+    function clearAreas(presetName=getActivePresetName()){ const old=getAreas(presetName); if(!persistAreas([],presetName))return null; renderOverlay(); return old; }
+    const containsPosition=(a,p)=>!!a&&!!p&&a.z===p.z&&p.x>=a.x1&&p.x<=a.x2&&p.y>=a.y1&&p.y<=a.y2;
+    function normalizePurpose(value){ const v=String(value||"route").trim().toLowerCase(); return ["route","combat","lure"].includes(v)?v:"route"; }
+    function getPositionPolicy(positionValue,options={}){
+        const position=normalizePosition(positionValue), purpose=normalizePurpose(options.purpose), presetName=normalizePresetName(options.presetName||getActivePresetName());
+        if(!position||!config.enabled)return {allowed:true,cost:0,purpose,matches:[],blockedBy:[]};
+        let cost=0; const matches=[],blockedBy=[]; const areas=Array.isArray(options.areas)?options.areas:getAreasInternal(presetName);
+        areas.filter(a=>a.enabled&&containsPosition(a,position)).forEach(a=>{
+            matches.push(a.id);
+            if(a.type==="never-step" || (a.type==="combat-only"&&purpose==="route") || (a.type==="no-combat"&&["combat","lure"].includes(purpose))){ blockedBy.push(a.id); return; }
+            if(a.type==="avoid") cost+=a.weight*120;
+            else if(a.type==="prefer") cost-=a.weight*25;
+            else if(a.type==="lure-destination"&&["combat","lure"].includes(purpose)) cost-=a.weight*50;
+        });
+        return {allowed:blockedBy.length===0,cost,purpose,matches,blockedBy};
+    }
+    const isPositionAllowed=(p,o={})=>getPositionPolicy(p,o).allowed;
+    const getPositionCost=(p,o={})=>{const policy=getPositionPolicy(p,o);return policy.allowed?policy.cost:Number.POSITIVE_INFINITY;};
+    function hasAreaTypeAt(pv,tv,options={}){ const p=normalizePosition(pv),t=normalizeAreaType(tv); if(!p||!config.enabled)return false; return getAreasInternal(options.presetName||getActivePresetName()).some(a=>a.enabled&&a.type===t&&containsPosition(a,p)); }
+    function hasActiveAreasForFloor(z,options={}){ const floor=Math.trunc(Number(z)); if(!config.enabled||!Number.isFinite(floor))return false; return getAreasInternal(options.presetName||getActivePresetName()).some(a=>a.enabled&&a.z===floor); }
+    function hasHardAreasForFloor(z,options={}){
+        const floor=Math.trunc(Number(z)),purpose=normalizePurpose(options.purpose);
+        if(!config.enabled||!Number.isFinite(floor))return false;
+        return getAreasInternal(options.presetName||getActivePresetName()).some(a=>{
+            if(!a.enabled||a.z!==floor)return false;
+            return a.type==="never-step" ||
+                (a.type==="combat-only"&&purpose==="route") ||
+                (a.type==="no-combat"&&["combat","lure"].includes(purpose));
         });
     }
 
-    function load() {
-        const data = bot.storage.get(configStorageKey, {});
-        tiles = Array.isArray(data.tiles) ? data.tiles.map(t => ({
-                    x: Number(t.x),
-                    y: Number(t.y),
-                    z: Number(t.z)
-                })).filter(t => Number.isFinite(t.x) && Number.isFinite(t.y) && Number.isFinite(t.z)) : [];
+    function getTileAt(p){ if(!p||typeof Position!=="function")return null; return window.gameClient?.world?.getTileFromWorldPosition?.(new Position(p.x,p.y,p.z))||null; }
+    const getTilePosition=tile=>normalizePosition(tile?.__position||tile?.position||tile?.getPosition?.());
+    function isKnownWalkableCrate(item){
+        if(!item)return false;
+        const cid=Number(item.id??item.cid), sid=Number(item.sid);
+        if(cid===2471||sid===1739)return true;
+        try{
+            const def=window.gameClient?.itemDefinitionsByCid?.[cid];
+            return Number(def?.sid)===1739;
+        }catch(e){return false;}
     }
-
-    function isBlacklisted(x, y, z) {
-        return tiles.some(t => t.x === x && t.y === y && t.z === z);
+    function isMagicFieldItem(item){
+        if(!item)return false;
+        try{
+            const cidDef=window.gameClient?.itemDefinitionsByCid?.[item.id];
+            if(cidDef?.properties?.type==="magicfield")return true;
+            const sidDef=item.sid!=null?window.gameClient?.itemDefinitionsBySid?.[item.sid]:null;
+            return sidDef?.properties?.type==="magicfield";
+        }catch(e){return false;}
     }
-
-    function add(x, y, z) {
-        x = Math.trunc(x);
-        y = Math.trunc(y);
-        z = Math.trunc(z);
-        if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z))
-            return false;
-        if (isBlacklisted(x, y, z))
-            return false;
-        tiles.push({
-            x,
-            y,
-            z
-        });
-        persist();
-        return true;
+    function isPhysicallyPassable(tile,destination=null,options={}){
+        if(!tile||tile.id===0)return false;
+        if(tile!==destination && bot.cave?.isFloorChangeTile?.(tile))return false;
+        const items=Array.isArray(tile.items)?tile.items:[];
+        const hasField=items.some(isMagicFieldItem);
+        const hasKnownWalkableObject=items.some(isKnownWalkableCrate);
+        if(!tile.isWalkable?.() && !tile.__hasWalkableGroundItem?.() && !(options.fieldAware===true&&hasField) && !hasKnownWalkableObject)return false;
+        try{
+            if(typeof PropBitFlag!=="undefined"&&typeof tile.hasFlag==="function"&&tile.hasFlag(PropBitFlag.prototype.flags.DatFlagNotPathable)&&tile!==destination)return false;
+        }catch(e){}
+        for(const item of items){
+            if(!item || (options.fieldAware===true&&isMagicFieldItem(item)) || isKnownWalkableCrate(item))continue;
+            if(typeof item.isWalkable==="function"&&!item.isWalkable())return false;
+            try{ if(typeof PropBitFlag!=="undefined"&&typeof item.hasFlag==="function"&&item.hasFlag(PropBitFlag.prototype.flags.DatFlagNotPathable)&&tile!==destination)return false; }catch(e){}
+        }
+        if(options.ignoreCreatures===true)return true;
+        const player=window.gameClient?.player;
+        const blockers=Array.from(tile.monsters||[]).filter(c=>c&&c!==player&&!(typeof c.isMoving==="function"&&c.isMoving())&&c.outfit?.verifiedGhost!==true);
+        return blockers.length===0;
     }
+    function heuristic(a,b){ return (Math.abs(a.x-b.x)+Math.abs(a.y-b.y))*10; }
+    function heapPush(heap,node){ heap.push(node);let i=heap.length-1;while(i>0){const p=Math.floor((i-1)/2);if(heap[p].f<=node.f)break;heap[i]=heap[p];i=p;}heap[i]=node; }
+    function heapPop(heap){ if(!heap.length)return null;const root=heap[0],end=heap.pop();if(heap.length&&end){let i=0;while(true){const l=i*2+1,r=l+1;if(l>=heap.length)break;let c=l;if(r<heap.length&&heap[r].f<heap[l].f)c=r;if(heap[c].f>=end.f)break;heap[i]=heap[c];i=c;}heap[i]=end;}return root; }
+    function reconstruct(node){const path=[];let cur=node;while(cur?.parent){path.unshift(cur.position);cur=cur.parent;}return path;}
+    function searchPolicyPath(fromValue,toValue,options={}){
+        const from=normalizePosition(fromValue),to=normalizePosition(toValue),purpose=normalizePurpose(options.purpose),maxNodes=Math.max(100,Math.min(20000,Number(options.maxNodes)||8000));
+        if(!from||!to||from.z!==to.z)return {success:false,complete:false,path:[],reason:"The start and destination must be on the same floor."};
+        if(samePosition(from,to))return {success:true,complete:true,path:[],reason:null};
+        const areas=getAreasInternal(options.presetName||getActivePresetName());
+        const policyOptions={...options,purpose,areas};
+        const destPolicy=getPositionPolicy(to,policyOptions); if(!destPolicy.allowed)return {success:false,complete:false,path:[],reason:"The destination is blocked by a Special Area.",blockedBy:destPolicy.blockedBy};
+        const startTile=getTileAt(from), destinationTile=getTileAt(to); if(!startTile)return {success:false,complete:false,path:[],reason:"The current tile is not loaded."};
+        const open=[],bestCost=new Map(); const start={tile:startTile,position:from,g:0,f:heuristic(from,to),parent:null};heapPush(open,start);bestCost.set(positionKey(from),0);
+        let best=start,bestH=heuristic(from,to),processed=0;
+        while(open.length&&processed<maxNodes){
+            const cur=heapPop(open),ck=positionKey(cur.position);if(cur.g!==bestCost.get(ck))continue;processed++;
+            if(samePosition(cur.position,to))return {success:true,complete:true,path:reconstruct(cur),reason:null,processedNodes:processed};
+            const h=heuristic(cur.position,to);if(h<bestH||(h===bestH&&cur.g<best.g)){best=cur;bestH=h;}
+            for(const nt of Array.from(cur.tile?.neighbours||[])){
+                const np=getTilePosition(nt);if(!np||np.z!==from.z)continue;const isDest=samePosition(np,to);
+                if(!isPhysicallyPassable(nt,isDest?nt:destinationTile,options))continue;
+                const policy=getPositionPolicy(np,policyOptions);if(!policy.allowed)continue;
+                const dx=np.x-cur.position.x,dy=np.y-cur.position.y;
+                if(dx!==0&&dy!==0){
+                    const sideA=getTileAt({x:cur.position.x+dx,y:cur.position.y,z:from.z}), sideB=getTileAt({x:cur.position.x,y:cur.position.y+dy,z:from.z});
+                    if(!isPhysicallyPassable(sideA,null,options)||!isPhysicallyPassable(sideB,null,options))continue;
+                    if(!getPositionPolicy({x:cur.position.x+dx,y:cur.position.y,z:from.z},policyOptions).allowed||!getPositionPolicy({x:cur.position.x,y:cur.position.y+dy,z:from.z},policyOptions).allowed)continue;
+                }
+                let base=100;try{const c=Number(nt.getCost?.(cur.tile));if(Number.isFinite(c)&&c>0)base=c;}catch(e){}
+                if(dx!==0&&dy!==0)base*=3;
+                const ng=cur.g+Math.max(10,base+Number(policy.cost||0));const nk=positionKey(np);if(ng>=(bestCost.get(nk)??Infinity))continue;
+                bestCost.set(nk,ng);heapPush(open,{tile:nt,position:np,g:ng,f:ng+heuristic(np,to),parent:cur});
+            }
+        }
+        if(!destinationTile&&best?.parent)return {success:true,complete:false,path:reconstruct(best),reason:"Walking to the closest loaded policy-safe tile.",processedNodes:processed};
+        return {success:false,complete:false,path:[],reason:processed>=maxNodes?"The policy path search reached its safety limit.":"No policy-safe path is currently available.",processedNodes:processed};
+    }
+    function hasPolicySafeApproach(fromValue,targetValue,options={}){
+        const from=normalizePosition(fromValue),target=normalizePosition(targetValue);
+        const purpose=normalizePurpose(options.purpose||"combat");
+        if(!from||!target||from.z!==target.z)return false;
+        if(!hasHardAreasForFloor(from.z,{...options,purpose}))return true;
+        if(Math.max(Math.abs(from.x-target.x),Math.abs(from.y-target.y))<=1)return true;
 
-    function remove(x, y, z) {
-        x = Math.trunc(x);
-        y = Math.trunc(y);
-        z = Math.trunc(z);
-        const before = tiles.length;
-        tiles = tiles.filter(t => !(t.x === x && t.y === y && t.z === z));
-        if (tiles.length !== before) {
-            persist();
-            return true;
+        const offsets=[
+            [0,-1],[1,0],[0,1],[-1,0],
+            [-1,-1],[1,-1],[-1,1],[1,1]
+        ].map(([dx,dy])=>({x:target.x+dx,y:target.y+dy,z:target.z}))
+         .sort((a,b)=>
+            Math.max(Math.abs(a.x-from.x),Math.abs(a.y-from.y))-
+            Math.max(Math.abs(b.x-from.x),Math.abs(b.y-from.y))
+         );
+
+        for(const destination of offsets){
+            const policy=getPositionPolicy(destination,{...options,purpose});
+            if(!policy.allowed)continue;
+            const tile=getTileAt(destination);
+            if(!tile||!isPhysicallyPassable(tile,null,{...options,fieldAware:true,ignoreCreatures:true}))continue;
+            const result=searchPolicyPath(from,destination,{
+                ...options,
+                purpose,
+                force:true,
+                fieldAware:true,
+                ignoreCreatures:true,
+                maxNodes:Math.max(500,Math.min(5000,Number(options.maxNodes)||2200))
+            });
+            if(result?.success&&result?.complete)return true;
         }
         return false;
     }
 
-    function clear() {
-        tiles = [];
-        persist();
+    function findPolicyPath(from,to,options={}){
+        const s=normalizePosition(from),d=normalizePosition(to),active=s&&d&&s.z===d.z&&hasActiveAreasForFloor(s.z,options);
+        if(!options.force&&!active)return {handled:false,success:false,complete:false,path:[],reason:null};
+        return {handled:true,...searchPolicyPath(s,d,options)};
+    }
+    function getDirection(from,to){
+        if(typeof Position==="function"){try{const d=new Position(from.x,from.y,from.z).getLookDirection?.(new Position(to.x,to.y,to.z));if(d!=null)return d;}catch(e){}}
+        const D=window.CONST?.DIRECTION||{},dx=to.x-from.x,dy=to.y-from.y,key=`${dx},${dy}`;
+        return ({"0,-1":D.NORTH,"1,-1":D.NORTH_EAST??D.NORTHEAST,"1,0":D.EAST,"1,1":D.SOUTH_EAST??D.SOUTHEAST,"0,1":D.SOUTH,"-1,1":D.SOUTH_WEST??D.SOUTHWEST,"-1,0":D.WEST,"-1,-1":D.NORTH_WEST??D.NORTHWEST})[key]??null;
+    }
+    function sendPolicyPath(fromValue,pathValue){
+        const from=normalizePosition(fromValue),path=(Array.isArray(pathValue)?pathValue:[]).map(normalizePosition).filter(Boolean).slice(0,255);
+        if(!from||!path.length)return {sent:true,steps:0,reason:null};
+        if(typeof AutoWalkPacket!=="function"||typeof window.gameClient?.send!=="function")return {sent:false,steps:0,reason:"The client AutoWalk packet is unavailable."};
+        const dirs=[];let cur=from;for(const next of path){const dir=getDirection(cur,next);if(dir==null)return {sent:false,steps:dirs.length,reason:"The policy path contains an invalid movement step."};dirs.push(dir);cur=next;}
+        const pf=window.gameClient?.world?.pathfinder;
+        try{
+            if(pf?.__isAutoWalking&&typeof StopWalkPacket==="function")window.gameClient.send(new StopWalkPacket());
+            if(pf){pf.__pathfindCache=[];pf.__finalDestination=path[path.length-1];pf.__minimapWaypoints=null;pf.__recentMinimapStarts=[];pf.__isAutoWalking=true;pf.__autoWalkStepsRemaining=dirs.length;}
+            window.gameClient.send(new AutoWalkPacket(dirs));return {sent:true,steps:dirs.length,reason:null};
+        }catch(error){if(pf){pf.__isAutoWalking=false;pf.__autoWalkStepsRemaining=0;}return {sent:false,steps:0,reason:error?.message||"The policy path could not be sent."};}
+    }
+    function walkTo(from,to,options={}){
+        const result=findPolicyPath(from,to,options);if(!result.handled)return result;
+        if(!result.success){state.lastPathResult={success:false,purpose:normalizePurpose(options.purpose),reason:result.reason,at:Date.now()};return result;}
+        const sent=sendPolicyPath(from,result.path);const response={...result,success:sent.sent,pathLength:result.path.length,sentSteps:sent.steps,reason:sent.sent?result.reason:sent.reason};
+        state.lastPathResult={success:response.success,purpose:normalizePurpose(options.purpose),pathLength:response.pathLength,sentSteps:response.sentSteps,complete:response.complete,reason:response.reason,at:Date.now()};return response;
     }
 
-    function getTiles() {
-        return tiles.map(t => ({
-                ...t
-            }));
+    function getClickedTilePosition(event){ const mouse=window.gameClient?.mouse;if(typeof mouse?.getWorldObject!=="function")return null;return getTilePosition(mouse.getWorldObject(event)?.which); }
+    function cancelCapture(message="Area selection cancelled."){
+        const armed=state.captureArmed;if(state.captureCanvas&&state.captureHandler)state.captureCanvas.removeEventListener?.("mousedown",state.captureHandler,true);
+        state.captureArmed=false;state.captureMode=null;state.captureCanvas=null;state.captureHandler=null;state.captureOptions=null;state.captureCorners=[];if(message!=null)state.captureMessage=String(message);window.gameClient?.mouse?.setCursor?.("auto");renderOverlay();return armed;
     }
+    function beginCapture(mode,options={}){
+        if(bot.cave?.isRunning?.()||bot.cave?.status?.().running){state.captureMessage="Stop Cave Bot before recording or testing an area.";return false;}
+        const canvas=window.gameClient?.renderer?.screen?.canvas,mouse=window.gameClient?.mouse;if(!canvas?.addEventListener||typeof mouse?.getWorldObject!=="function"){state.captureMessage="The game screen is unavailable for tile selection.";return false;}
+        cancelCapture(null);state.captureArmed=true;state.captureMode=mode;state.captureCanvas=canvas;state.captureOptions={...options};state.captureCorners=[];state.captureMessage=mode==="test"?"Click a destination tile. mb0t will only draw the intended path.":"Click the first corner of the Special Area.";mouse.setCursor?.("crosshair");
+        const handler=event=>{
+            if(event?.button!==0)return;event.preventDefault?.();event.stopPropagation?.();event.stopImmediatePropagation?.();const p=getClickedTilePosition(event);if(!p){state.captureMessage="Could not read that tile. Click a game tile again.";return;}
+            if(mode==="test"){
+                const from=normalizePosition(bot.getPlayerPosition?.());if(!from||from.z!==p.z){state.captureMessage="The test destination must be on your current floor.";return;}
+                const result=findPolicyPath(from,p,{purpose:"route",force:true,fieldAware:true});state.testDestination=p;state.testPath=result.success?[from,...result.path]:[];state.lastTestResult={success:!!result.success,complete:!!result.complete,pathLength:result.path?.length||0,reason:result.reason,destination:p,at:Date.now()};cancelCapture(result.success?`Test path: ${result.path.length} step${result.path.length===1?"":"s"}${result.complete?" to destination.":" to the loaded frontier."}`:`Test path blocked: ${result.reason}`);return;
+            }
+            if(!state.captureCorners.length){state.captureCorners=[p];state.captureMessage=`First corner: ${p.x}, ${p.y}, ${p.z}. Click the opposite corner.`;renderOverlay();return;}
+            const first=state.captureCorners[0];if(first.z!==p.z){state.captureMessage="Both area corners must be on the same floor.";return;}const area=addArea({...state.captureOptions,from:first,to:p});if(area){const msg=state.captureMessage;cancelCapture(msg);}
+        };
+        state.captureHandler=handler;canvas.addEventListener("mousedown",handler,true);renderOverlay();return true;
+    }
+    const beginAreaCapture=options=>beginCapture("area",options);
+    const beginTestPathCapture=()=>beginCapture("test",{});
+    function clearTestPath(){state.testPath=[];state.testDestination=null;state.lastTestResult=null;state.captureMessage="Test path cleared.";renderOverlay();return true;}
+    function ensureOverlayCanvas(){
+        const screen=window.gameClient?.renderer?.screen?.canvas;if(!screen?.getBoundingClientRect||!document?.body)return null;if(state.overlayCanvas?.isConnected)return state.overlayCanvas;document.getElementById(overlayId)?.remove();const c=document.createElement("canvas");c.id=overlayId;c.setAttribute("aria-hidden","true");Object.assign(c.style,{position:"fixed",pointerEvents:"none",zIndex:"2147482400",display:"none"});document.body.appendChild(c);state.overlayCanvas=c;return c;
+    }
+    function hexToRgba(hex,alpha){const n=String(hex||"#fff").replace("#","");const v=parseInt(n.length===3?n.split("").map(x=>x+x).join(""):n,16);return `rgba(${(v>>16)&255}, ${(v>>8)&255}, ${v&255}, ${alpha})`;}
+    function getScreenTilePosition(p,player){const r=window.gameClient?.renderer;if(typeof r?.getStaticScreenPosition==="function"&&typeof Position==="function"){try{return r.getStaticScreenPosition(new Position(p.x,p.y,p.z));}catch(e){}}return {x:7+p.x-player.x,y:5+p.y-player.y};}
+    function renderOverlay(){
+        const player=normalizePosition(bot.getPlayerPosition?.()),screen=window.gameClient?.renderer?.screen?.canvas,show=config.overlayEnabled||state.captureArmed||state.testPath.length>0;if(!player||!screen?.getBoundingClientRect||!show){if(state.overlayCanvas)state.overlayCanvas.style.display="none";return false;}
+        const areas=getAreasInternal().filter(a=>a.z===player.z);if(!areas.length&&!state.captureCorners.length&&!state.testPath.length){if(state.overlayCanvas)state.overlayCanvas.style.display="none";return false;}
+        const overlay=ensureOverlayCanvas(),rect=screen.getBoundingClientRect();if(!overlay||!rect.width||!rect.height)return false;const ctx=overlay.getContext?.("2d");if(!ctx)return false;const pr=Math.max(1,Number(window.devicePixelRatio)||1),w=Math.max(1,Math.round(rect.width*pr)),h=Math.max(1,Math.round(rect.height*pr));if(overlay.width!==w||overlay.height!==h){overlay.width=w;overlay.height=h;}Object.assign(overlay.style,{display:"block",left:`${rect.left}px`,top:`${rect.top}px`,width:`${rect.width}px`,height:`${rect.height}px`});ctx.setTransform(pr,0,0,pr,0,0);ctx.clearRect(0,0,rect.width,rect.height);
+        const scaling=window.gameClient?.interface?.getSpriteScalingVector?.()||{x:rect.width/15,y:rect.height/11},sx=Number(scaling.x)||rect.width/15,sy=Number(scaling.y)||rect.height/11;
+        areas.forEach(area=>{const def=areaTypeMap.get(area.type),start=getScreenTilePosition({x:area.x1,y:area.y1,z:area.z},player),x=start.x*sx,y=start.y*sy,aw=(area.x2-area.x1+1)*sx,ah=(area.y2-area.y1+1)*sy;if(x>=rect.width||y>=rect.height||x+aw<=0||y+ah<=0)return;ctx.save();ctx.fillStyle=hexToRgba(def?.color,area.enabled?.22:.08);ctx.strokeStyle=hexToRgba(def?.color,area.enabled?.92:.35);ctx.lineWidth=2;if(!area.enabled)ctx.setLineDash([5,4]);ctx.fillRect(x+1,y+1,aw-2,ah-2);ctx.strokeRect(x+1,y+1,aw-2,ah-2);if(aw>=58&&ah>=22){ctx.fillStyle="rgba(255,255,255,.92)";ctx.font="bold 10px sans-serif";ctx.fillText(area.name,x+5,y+14,Math.max(30,aw-10));}ctx.restore();});
+        const visible=state.testPath.filter(p=>p.z===player.z);if(visible.length){ctx.save();ctx.beginPath();visible.forEach((p,i)=>{const s=getScreenTilePosition(p,player),x=(s.x+.5)*sx,y=(s.y+.5)*sy;i?ctx.lineTo(x,y):ctx.moveTo(x,y);});ctx.strokeStyle="rgba(255,255,255,.96)";ctx.lineWidth=5;ctx.stroke();ctx.strokeStyle="rgba(69,222,192,.98)";ctx.lineWidth=2;ctx.stroke();ctx.restore();}
+        const corner=state.captureCorners[0];if(corner&&corner.z===player.z){const s=getScreenTilePosition(corner,player);ctx.save();ctx.strokeStyle="rgba(255,255,255,.98)";ctx.lineWidth=3;ctx.strokeRect(s.x*sx+2,s.y*sy+2,sx-4,sy-4);ctx.restore();}return true;
+    }
+    function startOverlay(){if(state.overlayTimerId!=null)return;state.overlayTimerId=window.setInterval(renderOverlay,250);renderOverlay();}
+    function stopOverlay(){if(state.overlayTimerId!=null){window.clearInterval(state.overlayTimerId);state.overlayTimerId=null;}state.overlayCanvas?.remove?.();state.overlayCanvas=null;}
+    function status(){const p=normalizePosition(bot.getPlayerPosition?.()),areas=getAreas();return {schemaVersion,revision:areaRevision,config:{...config},activePresetName:getActivePresetName(),areas,enabledAreaCount:areas.filter(a=>a.enabled).length,currentFloorAreaCount:p?areas.filter(a=>a.z===p.z).length:0,capture:{armed:state.captureArmed,mode:state.captureMode,corners:state.captureCorners.map(cloneValue),message:state.captureMessage},testPath:{visible:state.testPath.length>0,path:state.testPath.map(cloneValue),destination:cloneValue(state.testDestination),result:cloneValue(state.lastTestResult)},lastPathResult:cloneValue(state.lastPathResult)};}
 
-    function addCurrentPosition() {
-        const pos = bot.getPlayerPosition();
-        if (!pos) {
-            bot.log("Could not read current position.");
-            return false;
+    function destroySpecialAreasRuntime(){
+        cancelCapture(null);
+        stopOverlay();
+        areaCache.clear();
+        if(window[runtimeKey]?.token===runtimeToken){
+            try{delete window[runtimeKey];}catch(e){window[runtimeKey]=null;}
         }
-        return add(pos.x, pos.y, pos.z);
     }
 
-    // Load on init
-    load();
+    bot.specialAreas={status,config,updateConfig,getRevision:()=>areaRevision,getAreaTypeDefinitions:()=>areaTypeDefinitions.map(cloneValue),getAreas,addArea,addAreaCurrentTile,updateArea,removeArea,clearAreas,normalizeArea,normalizeAreas,getPositionPolicy,isPositionAllowed,getPositionCost,hasAreaTypeAt,hasActiveAreasForFloor,hasHardAreasForFloor,hasPolicySafeApproach,searchPolicyPath,findPolicyPath,walkTo,sendPolicyPath,beginAreaCapture,beginTestPathCapture,cancelCapture,clearTestPath,renderOverlay,destroy:destroySpecialAreasRuntime};
+    window[runtimeKey]={token:runtimeToken,destroy:destroySpecialAreasRuntime};
 
-    // Public API
-    bot.blacklist = {
-        isBlacklisted,
-        add,
-        remove,
-        clear,
-        getTiles,
-        addCurrentPosition,
-        persist,
+    // Compatibility facade for old mb0t code paths that still ask "blacklist?".
+    // Hard route policy (Never Step / Combat Only) is the replacement meaning.
+    bot.blacklist={
+        config,
+        isBlacklisted(x,y,z){return !isPositionAllowed({x,y,z},{purpose:"route"});},
+        add(x,y,z){return !!addArea({name:"Never Step",type:"never-step",weight:10,from:{x,y,z},to:{x,y,z}});},
+        remove(x,y,z){const p=normalizePosition({x,y,z});if(!p)return false;const area=getAreas().find(a=>a.type==="never-step"&&a.x1===p.x&&a.x2===p.x&&a.y1===p.y&&a.y2===p.y&&a.z===p.z);return area?!!removeArea(area.id):false;},
+        clear(){const areas=getAreas(),keep=areas.filter(a=>a.type!=="never-step");return !!persistAreas(keep);},
+        getTiles(){return getAreas().filter(a=>a.type==="never-step"&&a.x1===a.x2&&a.y1===a.y2).map(a=>({x:a.x1,y:a.y1,z:a.z}));},
+        addCurrentPosition(){return !!addAreaCurrentTile({name:"Never Step",type:"never-step",weight:10});},
+        persist:persistConfig,
     };
+
+    // One-time migration: preserve the user's old blacklisted SQMs as one-tile
+    // Never Step areas in the currently active Cave preset.
+    if(config.legacyBlacklistMigrated!==true){
+        const legacy=bot.storage.get(legacyBlacklistStorageKey,{})||{};
+        const oldTiles=Array.isArray(legacy.tiles)?legacy.tiles:[];
+        if(oldTiles.length){
+            const areas=getAreas();
+            for(const t of oldTiles){const p=normalizePosition(t);if(!p)continue;const exists=areas.some(a=>a.type==="never-step"&&a.x1===p.x&&a.x2===p.x&&a.y1===p.y&&a.y2===p.y&&a.z===p.z);if(!exists)areas.push(normalizeArea({name:`Legacy blocked ${p.x},${p.y}`,type:"never-step",weight:10,from:p,to:p},areas.length));}
+            persistAreas(areas);
+        }
+        config.legacyBlacklistMigrated=true;persistConfig();
+    }
+
+    startOverlay();
+    bot.addCleanup(()=>bot.specialAreas?.destroy?.());
 };
 
 /**
@@ -45328,6 +46554,14 @@ window.__minibiaBotBundle.installAntiAfkModule = function installAntiAfkModule(b
         config,
         performTurn
     };
+
+    bot.addCleanup(() => {
+        state.running = false;
+        if (state.timerId) {
+            clearTimeout(state.timerId);
+            state.timerId = null;
+        }
+    });
 };
 
 /**
@@ -45346,6 +46580,7 @@ window.__minibiaBotBundle.installFisherModule = function installFisherModule(bot
         running: false,
         timerId: null,
         captureMode: false,
+        captureHandler: null,
         lastFishAt: 0,
         lastFishCountRequestAt: 0,
     };
@@ -45707,12 +46942,22 @@ window.__minibiaBotBundle.installFisherModule = function installFisherModule(bot
                 updateFisherUI(tilePos);
                 state.captureMode = false;
                 document.removeEventListener("click", handler, true);
+                if (state.captureHandler === handler) state.captureHandler = null;
             } else {
                 bot.log("Fisher: Could not determine tile. Try again or enter coordinates manually.");
             }
         };
 
+        state.captureHandler = handler;
         document.addEventListener("click", handler, true);
+    }
+
+    function cancelTileCapture() {
+        if (state.captureHandler) {
+            document.removeEventListener("click", state.captureHandler, true);
+            state.captureHandler = null;
+        }
+        state.captureMode = false;
     }
 
     // Helper to update the UI elements
@@ -45753,6 +46998,15 @@ window.__minibiaBotBundle.installFisherModule = function installFisherModule(bot
         findFishingRod,
         config,
     };
+
+    bot.addCleanup(() => {
+        state.running = false;
+        if (state.timerId) {
+            clearTimeout(state.timerId);
+            state.timerId = null;
+        }
+        cancelTileCapture();
+    });
 };
 
 /**
@@ -45767,6 +47021,7 @@ window.__minibiaBotBundle.installAutoStackerModule = function installAutoStacker
         running: false,
         timerId: null,
         convertTimerId: null,
+        convertLoopRunning: false,
     };
 
     const config = Object.assign({
@@ -45977,7 +47232,7 @@ window.__minibiaBotBundle.installAutoStackerModule = function installAutoStacker
     }
 
     function scheduleConvertTick() {
-        if (!config.convertCurrency)
+        if (!state.convertLoopRunning)
             return;
         state.convertTimerId = window.setTimeout(() => {
             try {
@@ -45990,22 +47245,29 @@ window.__minibiaBotBundle.installAutoStackerModule = function installAutoStacker
     }
 
     function startConvertLoop() {
-        if (state.convertTimerId)
+        if (state.convertLoopRunning)
             return;
+        state.convertLoopRunning = true;
         config.convertCurrency = true;
         persistConfig();
         bot.log("ConvertCurrency loop started");
         scheduleConvertTick();
     }
 
-    function stopConvertLoop() {
+    function stopConvertLoop(options = {}) {
+        const shouldPersist = options.persistEnabled !== false;
+        state.convertLoopRunning = false;
         if (state.convertTimerId) {
             clearTimeout(state.convertTimerId);
             state.convertTimerId = null;
         }
-        config.convertCurrency = false;
-        persistConfig();
-        bot.log("ConvertCurrency loop stopped");
+        if (shouldPersist) {
+            config.convertCurrency = false;
+            persistConfig();
+        }
+        if (options.quiet !== true) {
+            bot.log("ConvertCurrency loop stopped");
+        }
     }
 
     function scheduleStackTick() {
@@ -46054,7 +47316,7 @@ window.__minibiaBotBundle.installAutoStackerModule = function installAutoStacker
             config: {
                 ...config
             },
-            convertLoopRunning: !!state.convertTimerId,
+            convertLoopRunning: state.convertLoopRunning,
         };
     }
 
@@ -46097,6 +47359,15 @@ window.__minibiaBotBundle.installAutoStackerModule = function installAutoStacker
         stackItems,
         convertCurrencyNow,
     };
+
+    bot.addCleanup(() => {
+        state.running = false;
+        if (state.timerId) {
+            clearTimeout(state.timerId);
+            state.timerId = null;
+        }
+        stopConvertLoop({ persistEnabled: false, quiet: true });
+    });
 };
 
 /**
@@ -51029,6 +52300,44 @@ function upgradeSectionHeaders(panel) {
   color: #ffcc00 !important;
   border-color: #ffcc00;
 }
+
+
+/* v1.6.74: full Special Areas editor */
+#minibia-bot-panel .mb-special-area-actions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+#minibia-bot-panel .mb-special-area-list {
+  display: grid;
+  max-height: 310px;
+  gap: 8px;
+  overflow-y: auto;
+  padding-right: 3px;
+}
+#minibia-bot-panel .mb-special-area-row {
+  display: grid;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid #2b2b2b;
+  background: #303030;
+}
+#minibia-bot-panel .mb-special-area-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+#minibia-bot-panel .mb-special-area-header button { width: auto; }
+#minibia-bot-panel .mb-special-area-fields {
+  display: grid;
+  grid-template-columns: minmax(120px,1.2fr) minmax(110px,1fr) minmax(70px,.45fr);
+  gap: 7px;
+}
+@media (max-width:700px) {
+  #minibia-bot-panel .mb-special-area-actions { grid-template-columns: repeat(2, minmax(0,1fr)); }
+  #minibia-bot-panel .mb-special-area-fields { grid-template-columns: 1fr; }
+}
     `;
         document.head.appendChild(style);
 
@@ -52317,25 +53626,30 @@ function upgradeSectionHeaders(panel) {
   </div>
 </div>
 
-<!-- Special Area -->
+<!-- Special Areas -->
 <div class="mb-tab-panel" data-tab-panel="blacklist">
   <div class="mb-section">
-    <div class="mb-section-title">
-      <span class="mb-title-text">🗺️ Special Area (Avoid SQM)</span>
-    </div>
+    <div class="mb-section-title"><span class="mb-title-text">🗺️ Special Areas</span></div>
     <div class="mb-stack">
-      <div style="display:flex; gap:6px; flex-wrap:wrap;">
-        <button type="button" class="mb-small-button" id="minibia-bot-blacklist-add-current">Add Current Tile</button>
-        <button type="button" class="mb-small-button" id="minibia-bot-blacklist-clear" style="background:#5a2020;border-color:#883030;">Clear All</button>
+      <div class="mb-small-note">Areas belong to the active Cave preset and floor. Avoid / Prefer change path cost; Never Step, Combat Only and No Combat are hard movement rules.</div>
+      <label class="mb-toggle"><input type="checkbox" id="minibia-bot-special-area-enabled" checked /><span>Enable Special Area policies</span></label>
+      <div class="mb-form-grid">
+        <label class="mb-field"><span class="mb-field-label">Area Name</span><input type="text" id="minibia-bot-special-area-name" maxlength="64" placeholder="Optional name" /></label>
+        <label class="mb-field"><span class="mb-field-label">Area Type</span><select id="minibia-bot-special-area-type"><option value="avoid">Avoid</option><option value="never-step">Never Step</option><option value="prefer">Prefer</option><option value="combat-only">Combat Only</option><option value="no-combat">No Combat</option><option value="lure-destination">Lure Destination</option></select></label>
+        <label class="mb-field"><span class="mb-field-label">Strength (1-20)</span><input type="number" id="minibia-bot-special-area-weight" min="1" max="20" value="6" /></label>
       </div>
-      <div style="display:grid; grid-template-columns:70px 70px 70px auto; gap:6px; align-items:end;">
-        <label class="mb-field"><span class="mb-field-label">X</span><input type="number" id="minibia-bot-blacklist-x" step="1" /></label>
-        <label class="mb-field"><span class="mb-field-label">Y</span><input type="number" id="minibia-bot-blacklist-y" step="1" /></label>
-        <label class="mb-field"><span class="mb-field-label">Z</span><input type="number" id="minibia-bot-blacklist-z" step="1" /></label>
-        <button type="button" class="mb-small-button" id="minibia-bot-blacklist-add">Add Tile</button>
+      <div class="mb-special-area-actions">
+        <button type="button" class="mb-small-button" id="minibia-bot-special-area-pick">Pick Two Corners</button>
+        <button type="button" class="mb-small-button" id="minibia-bot-special-area-current">Current Tile</button>
+        <button type="button" class="mb-small-button" id="minibia-bot-special-area-test">Test Path</button>
+        <button type="button" class="mb-small-button" id="minibia-bot-special-area-overlay">Hide Overlay</button>
+        <button type="button" class="mb-small-button" id="minibia-bot-special-area-test-clear">Clear Test Path</button>
       </div>
-      <div class="mb-small-note" id="minibia-bot-blacklist-count">0 tiles blocked</div>
-      <div id="minibia-bot-blacklist-list" style="max-height:200px; overflow-y:auto; border:1px solid rgba(224,200,148,0.2); border-radius:4px; padding:4px; font-size:11px;"></div>
+      <div class="mb-small-note" id="minibia-bot-special-area-summary">Special Areas: loading</div>
+      <div class="mb-small-note" id="minibia-bot-special-area-capture">Pick two corners to record an area.</div>
+      <div class="mb-small-note" id="minibia-bot-special-area-test-status">Test path: none</div>
+      <div class="mb-special-area-list" id="minibia-bot-special-area-list"></div>
+      <div class="mb-small-note">Test Path only draws the route from your current tile to the clicked destination. It does not start CaveBot or move the character.</div>
     </div>
   </div>
 </div>
@@ -52570,6 +53884,339 @@ function upgradeSectionHeaders(panel) {
         // v1.6.56: keep the pre-v1.6.34 panel host. Keeping the panel in
         // document.body matches the last known-good mobile UI compositor path.
         document.body.appendChild(panel);
+
+        // v1.6.75: Special Areas bind immediately after the panel exists.
+        const __mbSpecialAreaUi = (() => {
+            const q = id => panel.querySelector(`#${id}`);
+            const c = {
+                enabled: q("minibia-bot-special-area-enabled"),
+                name: q("minibia-bot-special-area-name"),
+                type: q("minibia-bot-special-area-type"),
+                weight: q("minibia-bot-special-area-weight"),
+                pick: q("minibia-bot-special-area-pick"),
+                current: q("minibia-bot-special-area-current"),
+                test: q("minibia-bot-special-area-test"),
+                overlay: q("minibia-bot-special-area-overlay"),
+                clear: q("minibia-bot-special-area-test-clear"),
+                summary: q("minibia-bot-special-area-summary"),
+                capture: q("minibia-bot-special-area-capture"),
+                testStatus: q("minibia-bot-special-area-test-status"),
+                list: q("minibia-bot-special-area-list")
+            };
+            let renderKey = "";
+
+            const newAreaOptions = () => ({
+                name: c.name?.value || "",
+                type: c.type?.value || "avoid",
+                weight: Math.max(
+                    1,
+                    Math.min(
+                        20,
+                        Math.trunc(
+                            Number(c.weight?.value) || 1
+                        )
+                    )
+                ),
+                enabled: true
+            });
+
+            const render = status => {
+                if (!c.list || !status) return;
+                const key = JSON.stringify({
+                    preset: status.activePresetName,
+                    areas: status.areas
+                });
+                if (key === renderKey) return;
+                renderKey = key;
+
+                const defs =
+                    bot.specialAreas?.getAreaTypeDefinitions?.() || [];
+                const defMap =
+                    new Map(defs.map(def => [def.value, def]));
+                c.list.replaceChildren();
+
+                if (!status.areas?.length) {
+                    const empty = document.createElement("div");
+                    empty.className = "mb-small-note";
+                    empty.textContent =
+                        "No Special Areas in this Cave preset.";
+                    c.list.appendChild(empty);
+                    return;
+                }
+
+                for (const area of status.areas) {
+                    const row = document.createElement("div");
+                    row.className = "mb-special-area-row";
+
+                    const header = document.createElement("div");
+                    header.className = "mb-special-area-header";
+                    const toggle = document.createElement("label");
+                    toggle.className = "mb-toggle";
+                    const enabled = document.createElement("input");
+                    enabled.type = "checkbox";
+                    enabled.checked = !!area.enabled;
+                    const title = document.createElement("span");
+                    title.textContent = area.name;
+                    const def = defMap.get(area.type);
+                    if (def?.color) title.style.color = def.color;
+                    toggle.append(enabled, title);
+
+                    const remove = document.createElement("button");
+                    remove.type = "button";
+                    remove.className = "mb-small-button";
+                    remove.textContent = "Remove";
+                    header.append(toggle, remove);
+
+                    const fields = document.createElement("div");
+                    fields.className = "mb-special-area-fields";
+                    const field = (label, input) => {
+                        const wrap = document.createElement("label");
+                        wrap.className = "mb-field";
+                        const caption = document.createElement("span");
+                        caption.className = "mb-field-label";
+                        caption.textContent = label;
+                        wrap.append(caption, input);
+                        return wrap;
+                    };
+
+                    const name = document.createElement("input");
+                    name.type = "text";
+                    name.maxLength = 64;
+                    name.value = area.name;
+
+                    const type = document.createElement("select");
+                    for (const entry of defs) {
+                        const option = document.createElement("option");
+                        option.value = entry.value;
+                        option.textContent = entry.label;
+                        option.selected = entry.value === area.type;
+                        type.appendChild(option);
+                    }
+
+                    const weight = document.createElement("input");
+                    weight.type = "number";
+                    weight.min = "1";
+                    weight.max = "20";
+                    weight.value = String(area.weight);
+
+                    fields.append(
+                        field("Name", name),
+                        field("Type", type),
+                        field("Strength", weight)
+                    );
+
+                    const coords = document.createElement("div");
+                    coords.className = "mb-small-note";
+                    coords.textContent =
+                        `${def?.label || area.type} • floor ${area.z} • ` +
+                        `${area.x1}, ${area.y1} to ${area.x2}, ${area.y2}`;
+                    row.append(header, fields, coords);
+                    c.list.appendChild(row);
+
+                    const save = updates => {
+                        bot.specialAreas?.updateArea?.(
+                            area.id,
+                            updates
+                        );
+                        renderKey = "";
+                        refresh();
+                    };
+                    enabled.addEventListener(
+                        "change",
+                        () => save({ enabled: enabled.checked })
+                    );
+                    name.addEventListener(
+                        "change",
+                        () => save({ name: name.value })
+                    );
+                    type.addEventListener("change", () => {
+                        const nextDef = defMap.get(type.value);
+                        save({
+                            type: type.value,
+                            weight:
+                                nextDef?.defaultWeight ||
+                                area.weight
+                        });
+                    });
+                    weight.addEventListener(
+                        "change",
+                        () => save({
+                            weight: Math.max(
+                                1,
+                                Math.min(
+                                    20,
+                                    Math.trunc(
+                                        Number(weight.value) ||
+                                        area.weight ||
+                                        1
+                                    )
+                                )
+                            )
+                        })
+                    );
+                    remove.addEventListener("click", () => {
+                        bot.specialAreas?.removeArea?.(area.id);
+                        renderKey = "";
+                        refresh();
+                    });
+                }
+            };
+
+            function refresh() {
+                const status =
+                    bot.specialAreas?.status?.();
+                if (!status) return;
+
+                if (c.enabled) {
+                    c.enabled.checked =
+                        status.config.enabled !== false;
+                }
+                if (c.summary) {
+                    c.summary.textContent =
+                        `Preset: ${status.activePresetName} • ` +
+                        `${status.areas.length} area` +
+                        `${status.areas.length === 1 ? "" : "s"} • ` +
+                        `${status.currentFloorAreaCount} on current floor`;
+                }
+                if (c.capture) {
+                    c.capture.textContent =
+                        status.capture.message;
+                }
+                if (c.pick) {
+                    const active =
+                        status.capture.armed &&
+                        status.capture.mode === "area";
+                    c.pick.textContent =
+                        active
+                            ? "Cancel Area Pick"
+                            : "Pick Two Corners";
+                    c.pick.classList.toggle("mb-danger", active);
+                }
+                if (c.test) {
+                    const active =
+                        status.capture.armed &&
+                        status.capture.mode === "test";
+                    c.test.textContent =
+                        active
+                            ? "Cancel Test Pick"
+                            : "Test Path";
+                    c.test.classList.toggle("mb-danger", active);
+                }
+                if (c.overlay) {
+                    c.overlay.textContent =
+                        status.config.overlayEnabled
+                            ? "Hide Overlay"
+                            : "Show Overlay";
+                }
+                if (c.testStatus) {
+                    const r = status.testPath.result;
+                    c.testStatus.textContent =
+                        !r
+                            ? "Test path: none"
+                            : r.success
+                                ? `Test path: ${r.pathLength} step` +
+                                  `${r.pathLength === 1 ? "" : "s"}` +
+                                  `${r.complete ? " • destination reached" : " • loaded frontier"}`
+                                : `Test path: blocked • ${r.reason || "no path"}`;
+                }
+                if (c.clear) {
+                    c.clear.disabled =
+                        !status.testPath.visible &&
+                        !status.testPath.result;
+                }
+                render(status);
+            }
+
+            c.enabled?.addEventListener("change", () => {
+                bot.specialAreas?.updateConfig?.({
+                    enabled: c.enabled.checked
+                });
+                refresh();
+            });
+
+            c.type?.addEventListener("change", () => {
+                const def =
+                    bot.specialAreas
+                        ?.getAreaTypeDefinitions?.()
+                        .find(
+                            entry =>
+                                entry.value === c.type.value
+                        );
+                if (def && c.weight) {
+                    c.weight.value =
+                        String(def.defaultWeight);
+                }
+            });
+
+            c.weight?.addEventListener("change", () => {
+                c.weight.value =
+                    String(
+                        Math.max(
+                            1,
+                            Math.min(
+                                20,
+                                Math.trunc(
+                                    Number(c.weight.value) ||
+                                    1
+                                )
+                            )
+                        )
+                    );
+            });
+
+            c.pick?.addEventListener("click", () => {
+                const status =
+                    bot.specialAreas?.status?.();
+                if (status?.capture?.armed) {
+                    bot.specialAreas?.cancelCapture?.();
+                } else {
+                    bot.specialAreas?.beginAreaCapture?.(
+                        newAreaOptions()
+                    );
+                }
+                refresh();
+            });
+
+            c.current?.addEventListener("click", () => {
+                bot.specialAreas?.cancelCapture?.(null);
+                bot.specialAreas?.addAreaCurrentTile?.(
+                    newAreaOptions()
+                );
+                renderKey = "";
+                refresh();
+            });
+
+            c.test?.addEventListener("click", () => {
+                const status =
+                    bot.specialAreas?.status?.();
+                if (status?.capture?.armed) {
+                    bot.specialAreas?.cancelCapture?.();
+                } else {
+                    bot.specialAreas?.beginTestPathCapture?.();
+                }
+                refresh();
+            });
+
+            c.overlay?.addEventListener("click", () => {
+                const enabled =
+                    !!bot.specialAreas
+                        ?.status?.()
+                        ?.config
+                        ?.overlayEnabled;
+                bot.specialAreas?.updateConfig?.({
+                    overlayEnabled: !enabled
+                });
+                refresh();
+            });
+
+            c.clear?.addEventListener("click", () => {
+                bot.specialAreas?.clearTestPath?.();
+                refresh();
+            });
+
+            refresh();
+            return { refresh };
+        })();
 
         // ---- SETUP UI BEHAVIOR ----
         // Tab switching
@@ -54238,95 +55885,89 @@ function upgradeSectionHeaders(panel) {
             });
         }
 
-        // ---- Blacklist ----
-        const blacklistX = panel.querySelector("#minibia-bot-blacklist-x");
-        const blacklistY = panel.querySelector("#minibia-bot-blacklist-y");
-        const blacklistZ = panel.querySelector("#minibia-bot-blacklist-z");
-        const blacklistAddBtn = panel.querySelector("#minibia-bot-blacklist-add");
-        const blacklistAddCurrentBtn = panel.querySelector("#minibia-bot-blacklist-add-current");
-        const blacklistClearBtn = panel.querySelector("#minibia-bot-blacklist-clear");
-        const blacklistList = panel.querySelector("#minibia-bot-blacklist-list");
-        const blacklistCount = panel.querySelector("#minibia-bot-blacklist-count");
+        // ---- Special Areas ----
+        const specialAreaEnabled = panel.querySelector("#minibia-bot-special-area-enabled");
+        const specialAreaName = panel.querySelector("#minibia-bot-special-area-name");
+        const specialAreaType = panel.querySelector("#minibia-bot-special-area-type");
+        const specialAreaWeight = panel.querySelector("#minibia-bot-special-area-weight");
+        const specialAreaPick = panel.querySelector("#minibia-bot-special-area-pick");
+        const specialAreaCurrent = panel.querySelector("#minibia-bot-special-area-current");
+        const specialAreaTest = panel.querySelector("#minibia-bot-special-area-test");
+        const specialAreaOverlay = panel.querySelector("#minibia-bot-special-area-overlay");
+        const specialAreaTestClear = panel.querySelector("#minibia-bot-special-area-test-clear");
+        const specialAreaSummary = panel.querySelector("#minibia-bot-special-area-summary");
+        const specialAreaCapture = panel.querySelector("#minibia-bot-special-area-capture");
+        const specialAreaTestStatus = panel.querySelector("#minibia-bot-special-area-test-status");
+        const specialAreaList = panel.querySelector("#minibia-bot-special-area-list");
+        let specialAreaRenderKey = "";
 
-        function refreshBlacklist() {
-            if (!blacklistList)
+        function getNewSpecialAreaOptions() {
+            return {
+                name: specialAreaName?.value || "",
+                type: specialAreaType?.value || "avoid",
+                weight: Math.max(1, Math.min(20, Math.trunc(Number(specialAreaWeight?.value) || 1))),
+                enabled: true,
+            };
+        }
+
+        function renderSpecialAreas(status = bot.specialAreas?.status?.()) {
+            if (typeof __mbSpecialAreaUi !== "undefined" && __mbSpecialAreaUi?.refresh) {
+                __mbSpecialAreaUi.refresh();
                 return;
-            const tiles = bot.blacklist?.getTiles?.() || [];
-            blacklistList.innerHTML = "";
-            if (!tiles.length) {
-                const empty = document.createElement("div");
-                empty.className = "mb-small-note";
-                empty.textContent = "No tiles blacklisted.";
-                blacklistList.appendChild(empty);
-            } else {
-                tiles.forEach((t, idx) => {
-                    const row = document.createElement("div");
-                    row.style.cssText = "display:flex;justify-content:space-between;align-items:center;padding:2px 0;border-bottom:1px solid rgba(255,255,255,0.05);";
-                    const label = document.createElement("span");
-                    label.textContent = `${t.x}, ${t.y}, ${t.z}`;
-                    const removeBtn = document.createElement("button");
-                    removeBtn.type = "button";
-                    removeBtn.className = "mb-small-button";
-                    removeBtn.textContent = "✕";
-                    removeBtn.style.cssText = "width:24px;padding:2px;background:#5a2020;color:#ff8888;border-color:#883030;";
-                    removeBtn.addEventListener("click", () => {
-                        bot.blacklist.remove(t.x, t.y, t.z);
-                        refreshBlacklist();
-                    });
-                    row.appendChild(label);
-                    row.appendChild(removeBtn);
-                    blacklistList.appendChild(row);
-                });
             }
-            if (blacklistCount) {
-                blacklistCount.textContent = `${tiles.length} tile${tiles.length !== 1 ? 's' : ''} blocked`;
+            if (!specialAreaList || !status) return;
+            const key = JSON.stringify({ preset: status.activePresetName, areas: status.areas });
+            if (key === specialAreaRenderKey) return;
+            specialAreaRenderKey = key;
+            const defs = bot.specialAreas.getAreaTypeDefinitions();
+            const defMap = new Map(defs.map(d => [d.value,d]));
+            specialAreaList.replaceChildren();
+            if (!status.areas.length) {
+                const empty = document.createElement("div"); empty.className="mb-small-note"; empty.textContent="No Special Areas in this Cave preset."; specialAreaList.appendChild(empty); return;
             }
-        }
-
-        // Add manually
-        if (blacklistAddBtn) {
-            blacklistAddBtn.addEventListener("click", () => {
-                const x = parseInt(blacklistX?.value, 10);
-                const y = parseInt(blacklistY?.value, 10);
-                const z = parseInt(blacklistZ?.value, 10);
-                if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) {
-                    bot.log("Please enter valid X, Y, Z coordinates.");
-                    return;
-                }
-                bot.blacklist.add(x, y, z);
-                refreshBlacklist();
-                if (blacklistX)
-                    blacklistX.value = "";
-                if (blacklistY)
-                    blacklistY.value = "";
-                if (blacklistZ)
-                    blacklistZ.value = "";
+            status.areas.forEach(area => {
+                const row=document.createElement("div");row.className="mb-special-area-row";
+                const header=document.createElement("div");header.className="mb-special-area-header";
+                const toggle=document.createElement("label");toggle.className="mb-toggle";
+                const enabled=document.createElement("input");enabled.type="checkbox";enabled.checked=!!area.enabled;
+                const title=document.createElement("span");title.textContent=area.name;const def=defMap.get(area.type);if(def?.color)title.style.color=def.color;
+                toggle.append(enabled,title);
+                const remove=document.createElement("button");remove.type="button";remove.className="mb-small-button";remove.textContent="Remove";
+                header.append(toggle,remove);
+                const fields=document.createElement("div");fields.className="mb-special-area-fields";
+                const makeField=(label,node)=>{const l=document.createElement("label");l.className="mb-field";const s=document.createElement("span");s.className="mb-field-label";s.textContent=label;l.append(s,node);return l;};
+                const name=document.createElement("input");name.type="text";name.maxLength=64;name.value=area.name;
+                const type=document.createElement("select");defs.forEach(d=>{const o=document.createElement("option");o.value=d.value;o.textContent=d.label;o.selected=d.value===area.type;type.appendChild(o);});
+                const weight=document.createElement("input");weight.type="number";weight.min="1";weight.max="20";weight.value=String(area.weight);
+                fields.append(makeField("Name",name),makeField("Type",type),makeField("Strength",weight));
+                const coords=document.createElement("div");coords.className="mb-small-note";coords.textContent=`${def?.label||area.type} • floor ${area.z} • ${area.x1}, ${area.y1} to ${area.x2}, ${area.y2}`;
+                row.append(header,fields,coords);specialAreaList.appendChild(row);
+                const save=updates=>{bot.specialAreas.updateArea(area.id,updates);specialAreaRenderKey="";refreshSpecialAreas();};
+                enabled.addEventListener("change",()=>save({enabled:enabled.checked}));
+                name.addEventListener("change",()=>save({name:name.value}));
+                type.addEventListener("change",()=>save({type:type.value,weight:defMap.get(type.value)?.defaultWeight||area.weight}));
+                weight.addEventListener("change",()=>save({weight:Math.max(1,Math.min(20,Math.trunc(Number(weight.value)||area.weight||1)))}));
+                remove.addEventListener("click",()=>{bot.specialAreas.removeArea(area.id);specialAreaRenderKey="";refreshSpecialAreas();});
             });
         }
 
-        // Add current position
-        if (blacklistAddCurrentBtn) {
-            blacklistAddCurrentBtn.addEventListener("click", () => {
-                const added = bot.blacklist.addCurrentPosition();
-                if (added) {
-                    refreshBlacklist();
-                    bot.log("Current tile added to blacklist.");
-                } else {
-                    bot.log("Could not add current position.");
-                }
-            });
+        function refreshSpecialAreas() {
+            if (typeof __mbSpecialAreaUi !== "undefined" && __mbSpecialAreaUi?.refresh) {
+                __mbSpecialAreaUi.refresh();
+                return;
+            }
+            const status=bot.specialAreas?.status?.(); if(!status)return;
+            if (specialAreaEnabled) specialAreaEnabled.checked=status.config.enabled!==false;
+            if (specialAreaSummary) specialAreaSummary.textContent=`Preset: ${status.activePresetName} • ${status.areas.length} area${status.areas.length===1?"":"s"} • ${status.currentFloorAreaCount} on current floor`;
+            if (specialAreaCapture) specialAreaCapture.textContent=status.capture.message;
+            if (specialAreaPick) {const armed=status.capture.armed&&status.capture.mode==="area";specialAreaPick.textContent=armed?"Cancel Area Pick":"Pick Two Corners";}
+            if (specialAreaTest) {const armed=status.capture.armed&&status.capture.mode==="test";specialAreaTest.textContent=armed?"Cancel Test Pick":"Test Path";}
+            if (specialAreaOverlay) specialAreaOverlay.textContent=status.config.overlayEnabled?"Hide Overlay":"Show Overlay";
+            if (specialAreaTestStatus) {const r=status.testPath.result;specialAreaTestStatus.textContent=!r?"Test path: none":r.success?`Test path: ${r.pathLength} step${r.pathLength===1?"":"s"}${r.complete?" • destination reached":" • loaded frontier"}`:`Test path: blocked • ${r.reason||"no path"}`;}
+            if (specialAreaTestClear) specialAreaTestClear.disabled=!status.testPath.visible&&!status.testPath.result;
+            renderSpecialAreas(status);
         }
 
-        // Clear all
-        if (blacklistClearBtn) {
-            blacklistClearBtn.addEventListener("click", () => {
-                if (!confirm("Remove ALL blacklisted tiles?"))
-                    return;
-                bot.blacklist.clear();
-                refreshBlacklist();
-                bot.log("Blacklist cleared.");
-            });
-        }
 
         // ---- Profile Manager ----
 
@@ -56672,7 +58313,7 @@ function upgradeSectionHeaders(panel) {
             refreshPaladinStatus();
             refreshLooterStatus();
             refreshProfileList();
-            refreshBlacklist();
+            refreshSpecialAreas();
             refreshAntiAfkStatus();
             refreshSlimeTrainerStatus();
             refreshAutoStackerStatus();
@@ -56729,8 +58370,8 @@ function upgradeSectionHeaders(panel) {
             if (learnToggle && document.activeElement !== learnToggle)
                 learnToggle.checked = bot.cave?.getLearnMode?.() === true;
         }, 1000);
-        const blacklistTimer = window.setInterval(refreshBlacklist, 2000);
-        bot.addCleanup(() => window.clearInterval(blacklistTimer));
+        const specialAreaTimer = window.setInterval(refreshSpecialAreas, 1000);
+        bot.addCleanup(() => window.clearInterval(specialAreaTimer));
         bot.addCleanup(() => window.clearInterval(caveTimer));
         const titleTimer = window.setInterval(refreshTitlebarRunIndicators, 500);
         bot.addCleanup(() => window.clearInterval(titleTimer));
@@ -59725,6 +61366,51 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         });
     }
 
+    function cleanupLegacyLeakyModules(previousBot) {
+        if (!previousBot) return;
+
+        const entries = [
+            ["playerAttackMonitor", "minibiaBot.playerAttack.config", []],
+            ["magicShield", "minibiaBot.magicShield.config", [{ persistEnabled: false }]],
+            ["messageAlert", "minibiaBot.messageAlert.config", []],
+            ["antiBotMonitor", "minibiaBot.antibot.config", []],
+            ["exori", "minibiaBot.exori.config", []],
+            ["slimeTrainer", "minibiaBot.slimeTrainer.config", [{ persistEnabled: false }]],
+            ["monkTrainer", "minibiaBot.monkTrainer.config", [{ persistEnabled: false }]],
+            ["lightHack", "minibiaBot.lightHack.config", []],
+            ["lightHackLegit", "minibiaBot.lightHackLegit.config", []],
+            ["outfitRandomizer", "minibiaBot.outfitRandomizer.config", []],
+            ["comboBot", "minibiaBot.combo.config", []],
+            ["paladin", "minibiaBot.paladin.config", [{ persistEnabled: false }]],
+            ["antiAfk", "minibiaBot.antiAfk.config", [{ persistEnabled: false }]],
+            ["fisher", "minibiaBot.fisher.config", [{ persistEnabled: false }]],
+            ["autoStacker", "minibiaBot.autostacker.config", [{ persistEnabled: false }]],
+        ];
+
+        for (const [apiName, storageKey, stopArgs] of entries) {
+            const api = previousBot?.[apiName];
+            if (!api || typeof api.stop !== "function") continue;
+
+            let raw = null;
+            try { raw = window.localStorage.getItem(storageKey); } catch (e) {}
+            try {
+                if (
+                    apiName === "autoStacker" &&
+                    typeof api.updateConfig === "function"
+                ) {
+                    api.updateConfig({ convertCurrency: false });
+                }
+                api.stop(...stopArgs);
+            } catch (error) {
+                console.error("[minibia-bot] legacy leak cleanup failed", apiName, error);
+            } finally {
+                if (raw != null) {
+                    try { window.localStorage.setItem(storageKey, raw); } catch (e) {}
+                }
+            }
+        }
+    }
+
     // ============================================================
     // BOOT
     // ============================================================
@@ -59743,10 +61429,17 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         const skipRestore = !!window.__minibiaBotSkipEnabledRestore || nameChanged;
         window.__minibiaBotSkipEnabledRestore = false;
 
+        const previousBot = window.minibiaBot;
         const prevSnapshot = skipRestore ? {}
-         : getPersistedEnabledSnapshot(window.minibiaBot);
-        if (window.minibiaBot?.destroy) {
-            window.minibiaBot.destroy();
+         : getPersistedEnabledSnapshot(previousBot);
+
+        // v1.6.80 can be injected over older builds that did not register
+        // cleanup callbacks for these modules. Unhook them once while their
+        // public APIs are still reachable, preserving their saved settings.
+        cleanupLegacyLeakyModules(previousBot);
+
+        if (previousBot?.destroy) {
+            previousBot.destroy();
         }
         if (!skipRestore) {
             restorePersistedEnabledSnapshot(prevSnapshot);
@@ -59764,10 +61457,10 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         currentBundle.installHealModule(bot);
         currentBundle.installAutoInvisibleModule(bot);
         currentBundle.installAutoMagicShieldModule(bot);
-        currentBundle.installBlacklistModule(bot);
         currentBundle.installAutoAttackModule(bot);
         currentBundle.installRuneShooterModule(bot);
         currentBundle.installCaveModule(bot);
+        currentBundle.installSpecialAreasModule(bot);
         currentBundle.installEquipRingModule(bot);
         currentBundle.installAutoEatModule(bot);
         currentBundle.installConjureFoodModule(bot);
@@ -59824,6 +61517,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
             attack: bot.attack.status(),
             runeShooter: bot.runeShooter.status(),
             cave: bot.cave.status(),
+            specialAreas: bot.specialAreas?.status?.(),
             equipRing: bot.equipRing.status(),
             eat: bot.eat.status(),
             conjureFood: bot.conjureFood.status(),
@@ -59864,7 +61558,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
                 ["antiAfk", "minibiaBot.antiafk.config"],
                 ["fisher", "minibiaBot.fisher.config"],
                 ["slimeTrainer", "minibiaBot.slimeTrainer.config"],
-                ["blacklist", "minibiaBot.blacklist.config"],
+                ["specialAreas", "minibiaBot.specialAreas.config"],
                 ["lightHack", "minibiaBot.lightHack.config"],
                 ["lightHackLegit", "minibiaBot.lightHackLegit.config"],
                 ["pinkSkull", "minibiaBot.pinkSkull.config"],
@@ -60035,6 +61729,11 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
     // FIRST-LOAD WAIT (only used on initial page load)
     // ============================================================
     function bootWhenReady(currentBundle) {
+        if (window.__minibiaBotBootWaitTimer) {
+            clearInterval(window.__minibiaBotBootWaitTimer);
+            window.__minibiaBotBootWaitTimer = null;
+        }
+
         const name = readCharacterName();
         if (name) {
             boot(currentBundle, name);
@@ -60046,15 +61745,22 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
             const detected = readCharacterName();
             if (detected) {
                 clearInterval(timer);
+                if (window.__minibiaBotBootWaitTimer === timer) {
+                    window.__minibiaBotBootWaitTimer = null;
+                }
                 boot(currentBundle, detected);
                 return;
             }
             if (++ticks >= maxTicks) {
                 clearInterval(timer);
+                if (window.__minibiaBotBootWaitTimer === timer) {
+                    window.__minibiaBotBootWaitTimer = null;
+                }
                 console.warn("[minibia-bot] Character name not detected; using shared (global) storage.");
                 boot(currentBundle, null);
             }
         }, 500);
+        window.__minibiaBotBootWaitTimer = timer;
     }
 
     // ============================================================
