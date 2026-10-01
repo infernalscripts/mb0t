@@ -862,8 +862,123 @@ addCleanup(() => {
         stops: 0,
         failures: 0,
         lastBatchAt: 0,
-        lastLogAt: 0
+        lastLogAt: 0,
+        continuous: false,
+        waitingForArrival: false,
+        cavePauseHeld: false,
+        retryAt: 0,
+        progressKey: null,
+        progressAt: 0,
+        batchPathPositions: []
     };
+    let customFollowTimer = null;
+    let customFollowDestroyed = false;
+    let customFollowBot = null;
+    let followDecisionCreatures = null;
+
+    function withFollowDecision(callback) {
+        if (followDecisionCreatures)
+            return callback();
+        const byPosition = new Map();
+        for (const creature of Object.values(window.gameClient?.world?.activeCreatures || {})) {
+            const pos = creature?.getPosition?.() || creature?.__position;
+            if (!pos)
+                continue;
+            const key = `${Number(pos.x)},${Number(pos.y)},${Number(pos.z)}`;
+            if (!byPosition.has(key))
+                byPosition.set(key, []);
+            byPosition.get(key).push(creature);
+        }
+        followDecisionCreatures = byPosition;
+        try {
+            return callback();
+        } finally {
+            followDecisionCreatures = null;
+        }
+    }
+
+    function scheduleCustomFollow() {
+        if (customFollowDestroyed || !customFollowState.active ||
+            !customFollowState.continuous || customFollowTimer != null)
+            return;
+        const timerId = window.setTimeout(() => {
+            if (customFollowTimer !== timerId)
+                return;
+            customFollowTimer = null;
+            if (customFollowDestroyed || !customFollowState.active || !customFollowState.continuous)
+                return;
+            if (customFollowState.waitingForArrival && !customFollowBot?.cave?.isWaypointScriptActive?.()) {
+                endCustomFollow("Script waypoint changed before Follow arrival");
+                return;
+            }
+            try {
+                withFollowDecision(() => runCustomFollow(customFollowState.name, customFollowState.mode));
+            } catch (error) {
+                stopCustomFollowAutoWalk("follow tick failed");
+                customFollowState.retryAt = Date.now() + 500;
+            } finally {
+                scheduleCustomFollow();
+            }
+        }, 120);
+        customFollowTimer = timerId;
+    }
+
+    function startCustomFollow(name, mode, options = {}, owner = null) {
+        if (customFollowDestroyed)
+            return false;
+        customFollowBot = owner || window.minibiaBot;
+        mode = mode === "nonpvp" && window.gameClient?.__worldPvp === false ? "nonpvp" : "pvp";
+        if (customFollowState.name !== name || customFollowState.mode !== mode)
+            customFollowState.retryAt = 0;
+        customFollowState.active = true;
+        customFollowState.name = name;
+        customFollowState.mode = mode;
+        // The panel already owns a refresh interval. A one-time script call
+        // needs its own continuation, but must not create a second panel loop.
+        customFollowState.continuous = options.continuous !== false;
+        if (customFollowState.continuous && customFollowBot?.cave?.isWaypointScriptActive?.()) {
+            customFollowState.waitingForArrival = true;
+            if (!customFollowState.cavePauseHeld)
+                customFollowState.cavePauseHeld = customFollowBot.cave.pauseMovement("script-follow-arrival") === true;
+        }
+        if (!customFollowState.continuous && customFollowTimer != null) {
+            window.clearTimeout(customFollowTimer);
+            customFollowTimer = null;
+        }
+        const result = withFollowDecision(() => runCustomFollow(name, mode, options));
+        scheduleCustomFollow();
+        return result;
+    }
+
+    function endCustomFollow(reason) {
+        customFollowState.active = false;
+        customFollowState.name = "";
+        customFollowState.continuous = false;
+        customFollowState.retryAt = 0;
+        releaseCustomFollowArrivalHold();
+        customFollowBot = null;
+        if (customFollowTimer != null) {
+            window.clearTimeout(customFollowTimer);
+            customFollowTimer = null;
+        }
+        stopCustomFollowAutoWalk(reason);
+        customFollowState.batchPathPositions = [];
+        customFollowState.progressKey = null;
+        customFollowState.progressAt = 0;
+        const client = window.gameClient;
+        if (client) {
+            client.__mbFollowAllowDuringTarget = false;
+            client.__mbFollowAutoWalkPermit = false;
+        }
+    }
+
+    function releaseCustomFollowArrivalHold() {
+        customFollowState.waitingForArrival = false;
+        if (customFollowState.cavePauseHeld) {
+            customFollowState.cavePauseHeld = false;
+            customFollowBot?.cave?.resumeMovement?.("script-follow-arrival");
+        }
+    }
 
     function findFollowCreatureByName(name) {
         const targetName =
@@ -997,6 +1112,8 @@ addCleanup(() => {
 
         if (!pos)
             return [];
+        if (followDecisionCreatures)
+            return followDecisionCreatures.get(`${Number(pos.x)},${Number(pos.y)},${Number(pos.z)}`) || [];
 
         const creatures =
             window.gameClient?.world
@@ -1517,10 +1634,14 @@ addCleanup(() => {
                         diagonal
                             ? 3
                             : 1;
-                    const neighbourPosForPolicy =
-                        normalizePosition(
-                            neighbourNode.__position
-                        );
+                    // Core Follow has no module-scoped normalizePosition.
+                    // Keep this conversion local instead of silently aborting
+                    // A* with a caught ReferenceError on its first neighbour.
+                    const neighbourPosForPolicy = neighbourNode.__position ? {
+                        x: Number(neighbourNode.__position.x),
+                        y: Number(neighbourNode.__position.y),
+                        z: Number(neighbourNode.__position.z)
+                    } : null;
                     let policyCost = 0;
                     if (
                         options.specialAreaPurpose &&
@@ -1581,11 +1702,10 @@ addCleanup(() => {
                             neighbourNode.__g +
                             neighbourNode.__h;
 
-                        pf.__dirtyNodes.push(
-                            neighbourNode
-                        );
-
                         if (!visited) {
+                            // Each touched tile needs cleaning once, even if
+                            // its score is improved several times in this search.
+                            pf.__dirtyNodes.push(neighbourNode);
                             openHeap.push(
                                 neighbourNode
                             );
@@ -1666,6 +1786,9 @@ addCleanup(() => {
                 : routeOptions?.specialAreaPurpose === "combat"
                     ? "combat"
                     : null;
+
+        const allowNonPvpPlayerPassThrough =
+            normalizedMode === "nonpvp" || routeOptions.allowNonPvpPlayerPassThrough === true;
 
         if (normalizedMode === "nonpvp") {
             if (
@@ -1844,7 +1967,8 @@ addCleanup(() => {
 
             if (
                 !isFollowFieldPassableTile(
-                    destinationTile
+                    destinationTile,
+                    { allowNonPvpPlayerPassThrough }
                 )
             ) {
                 continue;
@@ -1869,7 +1993,8 @@ addCleanup(() => {
                     startTile,
                     destinationTile,
                     {
-                        specialAreaPurpose
+                        specialAreaPurpose,
+                        allowNonPvpPlayerPassThrough
                     }
                 );
 
@@ -2026,6 +2151,9 @@ addCleanup(() => {
             null;
         customFollowState.destinationKey =
             null;
+        customFollowState.batchPathPositions = [];
+        customFollowState.progressKey = null;
+        customFollowState.progressAt = 0;
         customFollowState.stops++;
         customFollowState.lastStopReason =
             reason;
@@ -2185,12 +2313,10 @@ addCleanup(() => {
                         // the last step after A* has already found a valid route.
                         allowCreatureStack:
                             isFinalExactTarget,
-                        // In Non-PvP mode, every queued route step gets the
-                        // same player-through-player rule as A*. Otherwise A*
-                        // can find a route through a crowd and this final packet
-                        // gate would reject an intermediate player-occupied tile.
+                        // Player pass-through depends on the world, even when
+                        // the requested destination mode is PvP-style adjacent.
                         allowNonPvpPlayerPassThrough:
-                            mode === "nonpvp"
+                            client.__worldPvp === false
                     }
                 )
             ) {
@@ -2300,6 +2426,11 @@ addCleanup(() => {
                 targetPosKey;
             customFollowState.destinationKey =
                 destinationKey;
+            customFollowState.batchPathPositions = batch.map(step => ({
+                x: Number(step.x), y: Number(step.y), z: Number(step.z)
+            }));
+            customFollowState.progressKey = `${playerPos.x},${playerPos.y},${playerPos.z}`;
+            customFollowState.progressAt = now;
             customFollowState.batches++;
             customFollowState.lastBatchAt =
                 now;
@@ -2375,6 +2506,69 @@ addCleanup(() => {
         }
     }
 
+    function isCustomFollowBatchUsable(target, mode, now) {
+        const client = window.gameClient;
+        const player = client?.player;
+        const pf = client?.world?.pathfinder;
+        const pos = player?.getPosition?.();
+        const targetPos = target?.getPosition?.() || target?.__position;
+        if (!pos || !targetPos || client.__mbFollowAutoWalkActive !== true ||
+            !pf?.__isAutoWalking || customFollowState.targetId !== target.id ||
+            customFollowState.targetPosKey !== `${targetPos.x},${targetPos.y},${targetPos.z}`)
+            return false;
+
+        const key = `${pos.x},${pos.y},${pos.z}`;
+        if (customFollowState.progressKey !== key) {
+            customFollowState.progressKey = key;
+            customFollowState.progressAt = now;
+        }
+        let stallMs = 1500;
+        try {
+            const stepMs = Number(player.getStepDuration?.(player.getTile?.())) *
+                Number(client.getTickInterval?.());
+            if (Number.isFinite(stepMs) && stepMs > 0)
+                stallMs = Math.max(stallMs, stepMs * 2 + 250);
+        } catch (e) {}
+        if (now - customFollowState.progressAt >= stallMs)
+            return false;
+
+        const batch = customFollowState.batchPathPositions;
+        const passed = batch.findIndex(step =>
+            step.x === Number(pos.x) && step.y === Number(pos.y) && step.z === Number(pos.z));
+        const remaining = batch.slice(passed + 1);
+        if (!remaining.length)
+            return false;
+        let previous = pos;
+        for (const step of remaining) {
+            const dx = step.x - Number(previous.x);
+            const dy = step.y - Number(previous.y);
+            if (step.z !== Number(previous.z) || Math.abs(dx) > 1 || Math.abs(dy) > 1 ||
+                (dx === 0 && dy === 0))
+                return false;
+            const exact = mode === "nonpvp" && step.x === Number(targetPos.x) &&
+                step.y === Number(targetPos.y);
+            const options = {
+                allowedCreatureId: exact ? target.id : null,
+                allowCreatureStack: exact,
+                allowNonPvpPlayerPassThrough: client.__worldPvp === false
+            };
+            if (!isFollowFieldPassableTile(client.world.getTileFromWorldPosition?.(
+                new Position(step.x, step.y, step.z)), options))
+                return false;
+            if (dx && dy) {
+                const sideOptions = { allowNonPvpPlayerPassThrough: client.__worldPvp === false };
+                for (const [x, y] of [[Number(previous.x) + dx, Number(previous.y)],
+                    [Number(previous.x), Number(previous.y) + dy]]) {
+                    if (!isFollowFieldPassableTile(client.world.getTileFromWorldPosition?.(
+                        new Position(x, y, step.z)), sideOptions))
+                        return false;
+                }
+            }
+            previous = step;
+        }
+        return true;
+    }
+
     function runCustomFollow(
         name,
         mode = "pvp",
@@ -2389,7 +2583,7 @@ addCleanup(() => {
             return false;
 
         const normalizedMode =
-            mode === "nonpvp"
+            mode === "nonpvp" && window.gameClient?.__worldPvp === false
                 ? "nonpvp"
                 : "pvp";
 
@@ -2473,13 +2667,23 @@ addCleanup(() => {
             return false;
         }
 
+        if (now < customFollowState.retryAt)
+            return false;
+        // Check at most three queued steps against live occupants. An unchanged,
+        // progressing batch needs no new A* searches and no stop/re-send churn.
+        if (isCustomFollowBatchUsable(target, normalizedMode, now))
+            return true;
+        stopCustomFollowAutoWalk("follow batch finished, changed or blocked");
+
         const route =
             getFollowCustomRoute(
                 target,
-                normalizedMode
+                normalizedMode,
+                { allowNonPvpPlayerPassThrough: window.gameClient?.__worldPvp === false }
             );
 
         if (!route) {
+            customFollowState.retryAt = now + 500;
             stopCustomFollowAutoWalk(
                 "no safe custom follow route"
             );
@@ -2487,6 +2691,7 @@ addCleanup(() => {
         }
 
         if (route.atGoal) {
+            releaseCustomFollowArrivalHold();
             stopCustomFollowAutoWalk(
                 normalizedMode ===
                     "nonpvp"
@@ -2496,18 +2701,15 @@ addCleanup(() => {
             return true;
         }
 
-        return sendCustomFollowAutoWalk(
-            target,
-            route,
-            normalizedMode,
-            now
-        );
+        const sent = sendCustomFollowAutoWalk(target, route, normalizedMode, now);
+        if (!sent)
+            customFollowState.retryAt = now + 500;
+        return sent;
     }
 
     addCleanup(() => {
-        stopCustomFollowAutoWalk(
-            "bot cleanup"
-        );
+        customFollowDestroyed = true;
+        endCustomFollow("bot cleanup");
 
         const client =
             window.gameClient;
@@ -2856,7 +3058,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.84",
+        version: "1.6.96",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -3654,16 +3856,14 @@ addCleanup(() => {
                 return false;
             }
 
-            const mode =
-                options?.mode ===
-                    "nonpvp"
-                    ? "nonpvp"
-                    : "pvp";
+            const mode = options?.mode === "nonpvp" && window.gameClient?.__worldPvp === false
+                ? "nonpvp" : "pvp";
 
-            return runCustomFollow(
+            return startCustomFollow(
                 targetName,
                 mode,
-                options
+                options,
+                this
             );
         },
 
@@ -3696,10 +3896,7 @@ addCleanup(() => {
         // Backward-compatible alias from v1.5.83-v1.5.89. It now executes the
         // full custom follow route rather than only assisting native follow.
         followThroughFields(name) {
-            return runCustomFollow(
-                name,
-                customFollowState.mode
-            );
+            return this.follow(name, { mode: customFollowState.mode });
         },
 
         followStatus() {
@@ -3753,29 +3950,19 @@ addCleanup(() => {
             );
         },
 
+        // Script Follow lasts until the next Cave navigation request. Panel
+        // Follow retains its separate, explicitly enabled movement policy.
+        stopScriptFollowForCaveNavigation() {
+            if (!customFollowState.active || !customFollowState.continuous)
+                return false;
+            endCustomFollow("Cavebot resumed waypoint movement");
+            return true;
+        },
+
         stopFollow: function () {
-            customFollowState.active =
-                false;
-            customFollowState.name = "";
-
-            const client =
-                window.gameClient;
-            if (client) {
-                client.__mbFollowAllowDuringTarget =
-                    false;
-                client.__mbFollowAutoWalkPermit =
-                    false;
-            }
-
-            stopCustomFollowAutoWalk(
-                "follow disabled"
-            );
-
+            endCustomFollow("follow disabled");
             clearLegacyNativeFollow();
-
-            this.log(
-                "Stopped following."
-            );
+            this.log("Stopped following.");
             return true;
         },
 
@@ -4343,7 +4530,7 @@ window.__minibiaBotBundle.installXrayModule = function installXrayModule(bot) {
 }
 #minibia-bot-panel .mb-title {
   color: #f0f0f0;
-  text-shadow: 1px 1px 0 #111;
+  text-shadow: none;
   letter-spacing: 0.5px;
 }
 #minibia-bot-panel .mb-title-version {
@@ -4455,7 +4642,7 @@ window.__minibiaBotBundle.installXrayModule = function installXrayModule(bot) {
 #minibia-bot-panel .mb-section-title .mb-title-text,
 #minibia-bot-panel .mb-label {
   color: #ededed;
-  text-shadow: 1px 1px 0 #111;
+  text-shadow: none;
 }
 #minibia-bot-panel .mb-section-title--sub {
   margin: 7px 0 7px 0;
@@ -8819,7 +9006,42 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         );
     }
 
-    function isTargetFieldPassableTile(
+    // v1.6.85: share geometry/occupancy only inside a synchronous decision.
+    // Pack movement, death, floor changes and DOM resizing are observed afresh
+    // on the next call; no creature or tile graph is retained between ticks.
+    let targetingSnapshot = null;
+    function withTargetingSnapshot(callback) {
+        if (targetingSnapshot)
+            return callback();
+        targetingSnapshot = {
+            occupied: null,
+            passable: new WeakMap(),
+            viewport: null
+        };
+        try {
+            return callback();
+        } finally {
+            targetingSnapshot = null;
+        }
+    }
+
+    function isTargetFieldPassableTile(tile, ignoreCreatures = false) {
+        if (!targetingSnapshot || !tile)
+            return evaluateTargetFieldPassableTile(tile, ignoreCreatures);
+        const mode = `${ignoreCreatures ? "static" : "live"}:${isLureActive() ? "lure" : "combat"}`;
+        let cached = targetingSnapshot.passable.get(tile);
+        if (cached && Object.prototype.hasOwnProperty.call(cached, mode))
+            return cached[mode];
+        const result = evaluateTargetFieldPassableTile(tile, ignoreCreatures);
+        if (!cached) {
+            cached = Object.create(null);
+            targetingSnapshot.passable.set(tile, cached);
+        }
+        cached[mode] = result;
+        return result;
+    }
+
+    function evaluateTargetFieldPassableTile(
         tile,
         ignoreCreatures = false
     ) {
@@ -8954,7 +9176,11 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         );
     }
 
-    function searchTargetPathIgnoringFields(
+    function searchTargetPathIgnoringFields(from, to) {
+        return withTargetingSnapshot(() => buildTargetPathIgnoringFields(from, to));
+    }
+
+    function buildTargetPathIgnoringFields(
         from,
         to
     ) {
@@ -9137,11 +9363,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                             neighbourNode.__g +
                             neighbourNode.__h;
 
-                        pf.__dirtyNodes.push(
-                            neighbourNode
-                        );
-
                         if (!visited) {
+                            // Each touched tile needs cleaning once, even if
+                            // its score is improved several times in this search.
+                            pf.__dirtyNodes.push(neighbourNode);
                             openHeap.push(
                                 neighbourNode
                             );
@@ -9885,6 +10110,23 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
     // ---- Simple walkability ----
     function isTileOccupiedByCreature(x, y, z) {
+        if (targetingSnapshot) {
+            if (!targetingSnapshot.occupied) {
+                const active = window.gameClient?.world?.activeCreatures || {};
+                const values = active instanceof Map ? active.values() : Object.values(active);
+                const selfId = window.gameClient?.player?.id;
+                const occupied = new Set();
+                for (const creature of values) {
+                    if (!creature || creature.id === selfId) continue;
+                    const hp = Number(creature.state?.health ?? creature.health);
+                    if (Number.isFinite(hp) && hp <= 0) continue;
+                    const pos = creature.getPosition?.() || creature.__position;
+                    if (pos) occupied.add(`${Number(pos.x)},${Number(pos.y)},${Number(pos.z)}`);
+                }
+                targetingSnapshot.occupied = occupied;
+            }
+            return targetingSnapshot.occupied.has(`${Number(x)},${Number(y)},${Number(z)}`);
+        }
         const creatures = window.gameClient?.world?.activeCreatures || {};
         const values = creatures instanceof Map
             ? Array.from(creatures.values())
@@ -11160,6 +11402,18 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
     // ---- REACHABILITY CACHE ----
     const reachCache = new Map();
+    const targetApproachReadings = new Map();
+    function getApproachReadingKey(target) {
+        const me = normalizePosition(bot.getPlayerPosition());
+        const pos = normalizePosition(target?.getPosition?.() || target?.__position);
+        if (!me || !pos) return null;
+        return `${me.x},${me.y},${me.z}:${pos.x},${pos.y},${pos.z}`;
+    }
+    function getLastTargetApproachInfo(target, now = Date.now()) {
+        const reading = targetApproachReadings.get(target?.id);
+        return reading && reading.expires > now &&
+            reading.key === getApproachReadingKey(target) ? reading : null;
+    }
     const specialAreaTargetReachCache = new Map();
 
     // v1.6.84: a rejected creature used to be printed every Targeting tick.
@@ -11332,6 +11586,23 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function getTargetApproachInfo(target) {
+        return withTargetingSnapshot(() => {
+            const result = buildTargetApproachInfo(target);
+            if (target?.id != null) {
+                targetApproachReadings.set(target.id, {
+                    key: getApproachReadingKey(target),
+                    pathSteps: result.pathSteps,
+                    pathCost: result.pathCost,
+                    expires: result.expires || Date.now() + 900
+                });
+                while (targetApproachReadings.size > 64)
+                    targetApproachReadings.delete(targetApproachReadings.keys().next().value);
+            }
+            return result;
+        });
+    }
+
+    function buildTargetApproachInfo(target) {
         if (!target)
             return {
                 reachable: false,
@@ -11687,6 +11958,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function tryAttack() {
+        return withTargetingSnapshot(tryAttackDecision);
+    }
+
+    function tryAttackDecision() {
         if (!config.enabled)
             return false;
         const now = Date.now();
@@ -11712,6 +11987,11 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         // v1.5.44: ignored names are an unconditional veto for mb0t-owned
         // targets. This also handles changing the Ignore list mid-fight.
         releaseIgnoredAutoTarget(now);
+
+        // v1.6.87: a hunt destination is not a combat target. Resolve visible
+        // priority before normal chase/access logic can consume this tick.
+        if (syncVisibleHuntPriority(now))
+            return true;
 
         // v1.5.08: below the requested on-screen mob count, keep attacking
         // ordinary mobs while CaveBot continues pulling toward the waypoint.
@@ -12789,21 +13069,18 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                     .getCreatureScreenPosition(
                         creature
                     );
-            canvasRect =
-                canvas.getBoundingClientRect();
-
-            const upper =
-                document.querySelector(
-                    ".main .upper"
-                );
-
-            upperRect =
-                upper &&
-                typeof upper
-                    .getBoundingClientRect ===
-                    "function"
-                    ? upper.getBoundingClientRect()
-                    : null;
+            const cachedViewport = targetingSnapshot?.viewport;
+            if (cachedViewport?.canvas === canvas) {
+                canvasRect = cachedViewport.canvasRect;
+                upperRect = cachedViewport.upperRect;
+            } else {
+                canvasRect = canvas.getBoundingClientRect();
+                const upper = document.querySelector(".main .upper");
+                upperRect = upper && typeof upper.getBoundingClientRect === "function"
+                    ? upper.getBoundingClientRect() : null;
+                if (targetingSnapshot)
+                    targetingSnapshot.viewport = { canvas, canvasRect, upperRect };
+            }
         } catch (e) {
             state.viewportVisibilityFallbacks++;
 
@@ -13371,7 +13648,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
     const OFFSCREEN_HUNT_PAUSE_REASON = "offscreen-hunt";
 
-    function getOffscreenHuntCandidates(now = Date.now()) {
+    function getOffscreenHuntCandidates(now = Date.now(), options = {}) {
         if (!config.offscreenHuntEnabled)
             return [];
 
@@ -13387,6 +13664,9 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             Math.min(50, Math.trunc(Number(config.offscreenHuntRange) || 20))
         );
 
+        const normalRange = Math.max(1, Number(config.maxTargetDistance) || 5);
+        const visibleCandidates = new WeakSet();
+        const antiKS = getAntiKSContext(now);
         return Object.values(
             window.gameClient?.world?.activeCreatures || {}
         )
@@ -13398,11 +13678,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 if (isTargetSkipped(creature, now))
                     return false;
 
-                // Initial acquisition is only for a creature that is actually
-                // outside the rendered playfield. Once a hunt starts it may
-                // remain active while the creature is visible but still outside
-                // the normal Targeting envelope.
-                if (getNativeSmallScreenInfo(creature).visible)
+                const visible = getNativeSmallScreenInfo(creature).visible;
+                if (options.visibleOnly === true && !visible)
                     return false;
 
                 const pos = normalizePosition(
@@ -13416,6 +13693,19 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                     return false;
                 }
 
+                // v1.6.86: visible mobs beyond Max Target Distance used to
+                // fall between normal acquisition and Off-screen Hunt. Approach
+                // them under the hunt range; normal Targeting still owns mobs
+                // already in its acquisition range and all attack validation.
+                if (visible) {
+                    if (getTileDistance(me, pos) <= normalRange)
+                        return false;
+                    const antiKSReason = getAntiKSBlockReason(creature, antiKS, now);
+                    if (antiKSReason && !String(antiKSReason).startsWith("Anti-KS self range"))
+                        return false;
+                    visibleCandidates.add(creature);
+                }
+
                 if (!isTargetPolicyReachable(creature, "combat", now, { allowLoadedFrontier: true })) {
                     state.specialAreaHuntRejects++;
                     return false;
@@ -13423,6 +13713,11 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 return true;
             })
             .sort((a, b) => {
+                // Deal with the visible playfield before pulling a radar mob.
+                const aVisible = visibleCandidates.has(a) ? 1 : 0;
+                const bVisible = visibleCandidates.has(b) ? 1 : 0;
+                if (aVisible !== bVisible)
+                    return bVisible - aVisible;
                 const aPreferred = isPreferredCreature(a) ? 1 : 0;
                 const bPreferred = isPreferredCreature(b) ? 1 : 0;
                 if (aPreferred !== bPreferred)
@@ -13455,7 +13750,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
         if (ownedHuntAutoWalk) {
             stopManualTargetPursuitAutoWalk(
-                `Off-screen Hunt: ${reason}`
+                `Off-screen Hunt: ${reason}`,
+                { forceHunt: true }
             );
         }
 
@@ -13534,7 +13830,9 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             `${Number(playerPos.x)},${Number(playerPos.y)},${Number(playerPos.z)}`;
         state.offscreenHuntPlayerProgressAt = now;
         state.offscreenHuntConsecutivePathFailures = 0;
-        state.offscreenHuntLastReason = "acquired off-screen creature";
+        state.offscreenHuntLastReason = getNativeSmallScreenInfo(target).visible
+            ? "approaching visible creature outside normal target range"
+            : "acquired off-screen creature";
         state.offscreenHuntActivations++;
         return true;
     }
@@ -13550,6 +13848,66 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         return window.gameClient?.world?.activeCreatures?.[
             state.offscreenHuntTargetId
         ] || null;
+    }
+
+    function getVisibleHuntPreemptionTarget(now = Date.now()) {
+        const hunted = getActiveOffscreenHuntTarget();
+        const candidates = getOffscreenHuntCandidates(now, { visibleOnly: true });
+        const oldVisible = hunted && getNativeSmallScreenInfo(hunted).visible;
+        const me = normalizePosition(bot.getPlayerPosition());
+        const oldPos = normalizePosition(hunted?.getPosition?.() || hunted?.__position);
+        if (oldVisible && (!me || !oldPos))
+            return null;
+        for (const visible of candidates) {
+            if (visible.id === hunted?.id)
+                continue;
+            const newPos = normalizePosition(visible.getPosition?.() || visible.__position);
+            if (!newPos)
+                continue;
+            // An edge-of-screen hunt destination must not make us pass a
+            // nearer visible mob. Require two tiles of advantage so adjacent
+            // pack members do not repeatedly exchange the hunt destination.
+            if (oldVisible && getTileDistance(me, newPos) + 2 > getTileDistance(me, oldPos))
+                continue;
+            return visible;
+        }
+        return null;
+    }
+
+    function syncVisibleHuntPriority(now = Date.now()) {
+        if (!state.running || !config.enabled || !config.offscreenHuntEnabled || config.lureMode)
+            return false;
+        const client = window.gameClient;
+        if (!state.offscreenHuntActive && !state.offscreenHuntPauseHeld &&
+            client?.__mbTargetingAutoWalkOwner !== "hunt")
+            return false;
+
+        const current = getCurrentTarget();
+        if (current && getNativeSmallScreenInfo(current).visible)
+            return false;
+        if (current)
+            releaseCurrentTargetIfOffScreen(now);
+        // If a client API could not clear the old selection, do not silently
+        // transfer a manual/combat target through a hunt-only override.
+        if (getCurrentTarget())
+            return false;
+
+        const candidates = getMonsterCandidates(now);
+        if (candidates.length > 0) {
+            clearOffscreenHunt("visible combat takes hunt priority", { handoff: true });
+            triggerAttack(now, candidates);
+            // Acquisition cooldown may defer TargetPacket to the next tick.
+            // The old hunt walk must already be stopped during that wait.
+            return true;
+        }
+
+        const visible = getVisibleHuntPreemptionTarget(now);
+        if (!visible)
+            return false;
+        clearOffscreenHunt("nearby visible mob takes hunt priority", { quiet: true });
+        if (beginOffscreenHunt(visible, now))
+            syncOffscreenHunt(now);
+        return true;
     }
 
     function syncOffscreenHunt(now = Date.now()) {
@@ -13609,6 +13967,14 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         if (target && isTargetSkipped(target, now)) {
             clearOffscreenHunt("creature temporarily skipped", { quiet: true });
             target = null;
+        }
+
+        if (target) {
+            const visibleApproach = getVisibleHuntPreemptionTarget(now);
+            if (visibleApproach) {
+                clearOffscreenHunt("visible mob takes hunt priority", { quiet: true });
+                target = beginOffscreenHunt(visibleApproach, now) ? visibleApproach : null;
+            }
         }
 
         if (!target) {
@@ -14896,6 +15262,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 "ignored creature blocked preferred route – forcing detour"
             );
             reachCache.clear();
+            targetApproachReadings.clear();
             state.preferredAccessLastReason =
                 `${ignoredBlockers.length} ignored creature blocker${ignoredBlockers.length === 1 ? "" : "s"} – detour only`;
             return null;
@@ -18744,6 +19111,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         state.movementOwnedUntil = 0;
         state.skippedTargetIds.clear();
         reachCache.clear();
+        targetApproachReadings.clear();
         specialAreaTargetReachCache.clear();
         targetRejectLogCache.clear();
         resetFollowProgress();
@@ -19555,6 +19923,16 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             if (ignoredNames.has(monsterName))
                 return false;
 
+            // Check the acquisition radius before any approach search. A mob
+            // outside this radius belongs to Hunt, so normal acquisition must
+            // not add a reachability skip to it while inspecting the screen.
+            const monsterPos = monster.getPosition?.() || monster.__position;
+            if (!monsterPos)
+                return false;
+            const dist = Math.max(Math.abs(me.x - monsterPos.x), Math.abs(me.y - monsterPos.y));
+            if (dist > maxDist)
+                return false;
+
             const info = isTargetValidAndOnScreen(monster, {
                 returnDetails: true,
                 maxDx: 8,
@@ -19570,13 +19948,6 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 }
                 return false;
             }
-
-            const monsterPos = monster.getPosition?.() || monster.__position;
-            if (!monsterPos)
-                return false;
-            const dist = Math.max(Math.abs(me.x - monsterPos.x), Math.abs(me.y - monsterPos.y));
-            if (dist > maxDist)
-                return false;
 
             if (getAntiKSBlockReason(monster, antiKS, now))
                 return false;
@@ -19743,6 +20114,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function findReachableAdjacentPath(targetPos, playerPos) {
+        return withTargetingSnapshot(() => buildReachableAdjacentPath(targetPos, playerPos));
+    }
+
+    function buildReachableAdjacentPath(targetPos, playerPos) {
         if (!targetPos || !playerPos)
             return null;
         const offsets = [{
@@ -20000,15 +20375,17 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function stopManualTargetPursuitAutoWalk(
-        reason = "manual pursuit stopped"
+        reason = "manual pursuit stopped",
+        options = {}
     ) {
         const client =
             window.gameClient;
 
         const ownsAutoWalk =
-            client
-                ?.__mbTargetingAutoWalkActive ===
-                true;
+            client?.__mbTargetingAutoWalkActive === true ||
+            (options.forceHunt === true &&
+                client?.__mbTargetingAutoWalkOwner === "hunt" &&
+                (state.offscreenHuntActive || state.offscreenHuntPauseHeld));
         const stoppedOwner =
             client
                 ?.__mbTargetingAutoWalkOwner ||
@@ -21491,6 +21868,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         state.kiteWaypointIndex = null;
         state.skippedTargetIds.clear();
         reachCache.clear();
+        targetApproachReadings.clear();
+        specialAreaTargetReachCache.clear();
+        targetRejectLogCache.clear();
+        state.retargetScoreHistory.clear();
         state.movementOwner = null;
         state.movementOwnedUntil = 0;
         state.lastSelectedTargetId = null;
@@ -21691,10 +22072,26 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function status() {
+        return withTargetingSnapshot(buildTargetingStatus);
+    }
+
+    // Small polling API: no full monster list or diagnostic object construction.
+    function getCombatSnapshot() {
+        return withTargetingSnapshot(() => {
+            const now = Date.now();
+            return {
+                combatActive: syncCombatState(now),
+                combatDurationMs: state.combatStartedAt ? Math.max(0, now - state.combatStartedAt) : 0,
+                engagedTargetId: state.engagedTargetId
+            };
+        });
+    }
+
+    function buildTargetingStatus() {
         const now = Date.now();
         const combatActive = syncCombatState(now);
         const currentTarget = getCurrentTarget();
-        const currentApproach = currentTarget ? getTargetApproachInfo(currentTarget) : null;
+        const currentApproach = currentTarget ? getLastTargetApproachInfo(currentTarget, now) : null;
         const currentHealthPct = currentTarget ? getCreatureHealthPercent(currentTarget) : null;
         const damageAgeMs = state.lastDamageAt ? Math.max(0, now - state.lastDamageAt) : null;
         const pzInfo = getProtectionZoneBlockInfo(now);
@@ -22621,6 +23018,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         start,
         stop,
         status,
+        getCombatSnapshot,
         updateConfig,
         tryAttack,
         canAttack,
@@ -23307,6 +23705,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         noWayElements: null, // Current DOM nodes, to detect replacements after reconnect.
         noWayLastSeenAt: 0,
         noWayLastText: "",
+        noWayCrowdProbeKey: null,
+        noWayCrowdProbeAt: 0,
         noWayRecoveryIndex: -1,
 
         // v1.6.21/v1.6.29: logical route actions such as Supply Check can arm a
@@ -23654,7 +24054,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         scriptTaskSerial: 0,
     };
     const minimapOverlayState = {
-        timerId: null
+        timerId: null,
+        destroyed: false
     };
 
     let learnToolMouse = null;
@@ -23667,6 +24068,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         tickMs: 250,
         repathMs: 500,
         waypointTolerance: 0,
+        minimapOverlayEnabled: true,
         enabled: false,
         activePresetName: defaultPresetName,
         loopMode: true,
@@ -23792,6 +24194,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         lurePackHoldMs: 1000,
     },
             bot.storage.get(configStorageKey, {}));
+    // Preserve the existing overlay by default; an explicit saved OFF stays OFF.
+    config.minimapOverlayEnabled = config.minimapOverlayEnabled !== false;
     // Auto transitions are opt-in. A missing/stale setting defaults safely to OFF.
     config.autoTransitions = config.autoTransitions === true;
     config.autoTransitionRadius = Math.max(2, Math.min(8,
@@ -25019,90 +25423,28 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         return result;
     }
 
-    function isStaticLureStepValid(from, to) {
-        if (!from || !to || from.z !== to.z)
-            return false;
+    function isStaticLureTileValid(position, cache = null) {
+        const key = `${position.x},${position.y},${position.z}`;
+        if (cache?.has(key)) return cache.get(key);
+        const tile = getTileAt(position);
+        const walkable = config.ignoreFields === true
+            ? caveFieldPassableStatic(tile, null)
+            : isTileWalkable(position.x, position.y, position.z, true);
+        const valid = !!walkable && !(tile && isFloorChangeTile(tile));
+        cache?.set(key, valid);
+        return valid;
+    }
 
-        const tile = getTileAt(to);
-        const destinationWalkable =
-            config.ignoreFields === true
-                ? caveFieldPassableStatic(
-                    tile,
-                    null
-                )
-                : isTileWalkable(
-                    to.x,
-                    to.y,
-                    to.z,
-                    true
-                );
-
-        if (!destinationWalkable)
-            return false;
-
-        if (tile && isFloorChangeTile(tile))
-            return false;
-
+    function isStaticLureStepValid(from, to, cache = null) {
+        if (!from || !to || from.z !== to.z) return false;
+        if (!isStaticLureTileValid(to, cache)) return false;
         const dx = to.x - from.x;
         const dy = to.y - from.y;
-
-        // Never cut diagonally through a wall corner. In field mode, magic
-        // fields on the orthogonal side tiles are allowed too.
         if (dx !== 0 && dy !== 0) {
-            const sideA = {
-                x: from.x + dx,
-                y: from.y,
-                z: from.z
-            };
-            const sideB = {
-                x: from.x,
-                y: from.y + dy,
-                z: from.z
-            };
-
-            const tileA = getTileAt(sideA);
-            const tileB = getTileAt(sideB);
-
-            const sideAWalkable =
-                config.ignoreFields === true
-                    ? caveFieldPassableStatic(
-                        tileA,
-                        null
-                    )
-                    : isTileWalkable(
-                        sideA.x,
-                        sideA.y,
-                        sideA.z,
-                        true
-                    );
-            const sideBWalkable =
-                config.ignoreFields === true
-                    ? caveFieldPassableStatic(
-                        tileB,
-                        null
-                    )
-                    : isTileWalkable(
-                        sideB.x,
-                        sideB.y,
-                        sideB.z,
-                        true
-                    );
-
-            if (
-                !sideAWalkable ||
-                !sideBWalkable
-            ) {
+            if (!isStaticLureTileValid({ x: from.x + dx, y: from.y, z: from.z }, cache) ||
+                !isStaticLureTileValid({ x: from.x, y: from.y + dy, z: from.z }, cache))
                 return false;
-            }
-
-            if (
-                (tileA && isFloorChangeTile(tileA)) ||
-                (tileB && isFloorChangeTile(tileB))
-            ) {
-                return false;
-            }
         }
-
         return true;
     }
 
@@ -25321,6 +25663,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             { dx: -1, dy: 1 }, { dx: -1, dy: -1 }
         ];
 
+        const staticPassability = new Map();
         while (head < queue.length && seen.size <= maxNodes) {
             const current = queue[head++];
 
@@ -25358,7 +25701,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 if (seen.has(key))
                     continue;
 
-                if (!isStaticLureStepValid(current, next))
+                if (!isStaticLureStepValid(current, next, staticPassability))
                     continue;
 
                 seen.add(key);
@@ -27663,6 +28006,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     }
 
     function renderMinimapOverlay() {
+        if (!config.minimapOverlayEnabled || minimapOverlayState.destroyed)
+            return;
         const viewport = getMinimapViewport();
         const minimap = window.gameClient?.renderer?.minimap;
         const playerPos = normalizePosition(bot.getPlayerPosition());
@@ -27740,6 +28085,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     }
 
     function startMinimapOverlay() {
+        if (!config.minimapOverlayEnabled || minimapOverlayState.destroyed)
+            return;
         if (minimapOverlayState.timerId != null)
             return;
         ensureMinimapOverlayStyle();
@@ -28447,6 +28794,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         if (!pf)
             return false;
 
+        bot.stopScriptFollowForCaveNavigation?.();
         const lastTile =
             path[path.length - 1];
 
@@ -28855,6 +29203,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             return false;
         }
 
+        bot.stopScriptFollowForCaveNavigation?.();
         const directions = [];
         let previous = current;
 
@@ -29421,6 +29770,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         const from = bot.getPlayerPosition();
         if (!from || !waypoint)
             return false;
+        bot.stopScriptFollowForCaveNavigation?.();
         const to = new Position(waypoint.x, waypoint.y, waypoint.z);
 
         // v1.6.74 Special Areas: ordinary same-floor Cave travel uses the
@@ -32103,6 +32453,14 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     }
 
     // ---- SCRIPT WAYPOINT EXECUTION ----
+    let scriptExecutionDepth = 0;
+    function isWaypointScriptActive() {
+        return state.running && (scriptExecutionDepth > 0 ||
+            (state.scriptTask?.index === state.currentIndex &&
+             state.scriptTask?.revision === state.routeRevision &&
+             (state.scriptTask.status === "pending" || state.scriptTask.status === "hold")));
+    }
+
     function clearScriptTask(reason = "script task cleared") {
         // Invalidate callbacks from an older Promise without trying to cancel the
         // Promise itself. The owning module remains responsible for its own stop.
@@ -32171,7 +32529,13 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                     : "unnamed");
             bot.log(`Executing script for waypoint ${label}`);
             const scriptFn = new Function('bot', 'state', waypoint.script);
-            const result = scriptFn(bot, state);
+            let result;
+            scriptExecutionDepth++;
+            try {
+                result = scriptFn(bot, state);
+            } finally {
+                scriptExecutionDepth--;
+            }
 
             // Older Script waypoints often use bot.wait(...) or call a module
             // that synchronously pauses Cave movement without returning its
@@ -32324,6 +32688,20 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         if (bot._waitUntil && Date.now() < bot._waitUntil) {
             scheduleNextTick();
             return;
+        }
+
+        // v1.6.89: Off-screen Hunt owns movement through an external pause,
+        // so it returns before the ordinary combat-chase progress branch.
+        // Still consume a physically reached Walk waypoint using Skip SQM;
+        // never send movement, run actions, or bypass another owner's pause.
+        if (state.externalPauseReasons.size === 1 &&
+            state.externalPauseReasons.has("offscreen-hunt")) {
+            const huntProgressNow = Date.now();
+            const relocationDetected = observeTargetingOwnedRelocation(
+                livePosition, huntProgressNow
+            );
+            if (!relocationDetected)
+                passivelyAdvanceChaseWaypoints(livePosition, null, huntProgressNow);
         }
 
         // v1.6.56: enforce Max Waypoint Distance even while Targeting has left
@@ -34249,6 +34627,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                     if (!bot.blacklist.isBlacklisted(nx, ny, position.z) && isTileWalkable(nx, ny, position.z, true)) {
                         const dir = getDirection(dx, dy);
                         if (dir !== null && window.gameClient?.keyboard) {
+                            bot.stopScriptFollowForCaveNavigation?.();
                             window.gameClient.keyboard.handleMoveKey(dir);
                             return;
                         }
@@ -34945,6 +35324,28 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 if (!currentWp || currentWp.script || currentWp.x === undefined || currentWp.y === undefined || currentWp.z === undefined)
                     return;
 
+                const waypointKey = getWaypointKey(currentWp);
+                const failureKey = `${state.currentIndex}:${waypointKey || 'script'}`;
+
+                // MutationObserver can report several mutations for one message.
+                // Treat the DOM message as a fresh failure only when either the
+                // waypoint changed or the same waypoint has been quiet long enough.
+                if (text === state.noWayLastText && now - state.noWayLastSeenAt < 1000 &&
+                    state.noWayFailureKey === failureKey)
+                    return;
+
+                state.noWayLastText = text;
+                state.noWayLastSeenAt = now;
+
+                if (state.noWayFailureKey === failureKey && now - state.noWayFailureAt < 1500)
+                    return;
+
+                const crowdProbeKey = `${failureKey}:${text}`;
+                if (state.noWayCrowdProbeKey === crowdProbeKey &&
+                    now - state.noWayCrowdProbeAt < 250)
+                    return;
+                state.noWayCrowdProbeKey = crowdProbeKey;
+                state.noWayCrowdProbeAt = now;
                 const crowdPos = normalizePosition(bot.getPlayerPosition());
 
                 // Tight lure corridors can make native Pathfinder report
@@ -34969,22 +35370,6 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                     );
                     return;
                 }
-
-                const waypointKey = getWaypointKey(currentWp);
-                const failureKey = `${state.currentIndex}:${waypointKey || 'script'}`;
-
-                // MutationObserver can report several mutations for one message.
-                // Treat the DOM message as a fresh failure only when either the
-                // waypoint changed or the same waypoint has been quiet long enough.
-                if (text === state.noWayLastText && now - state.noWayLastSeenAt < 1000 &&
-                    state.noWayFailureKey === failureKey)
-                    return;
-
-                state.noWayLastText = text;
-                state.noWayLastSeenAt = now;
-
-                if (state.noWayFailureKey === failureKey && now - state.noWayFailureAt < 1500)
-                    return;
 
                 state.noWayFailureKey = failureKey;
                 state.noWayFailureAt = now;
@@ -35038,6 +35423,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         }
         // Never keep a detached game-client DOM tree reachable from CaveBot.
         state.noWayElements = null;
+        state.noWayCrowdProbeKey = null;
+        state.noWayCrowdProbeAt = 0;
     }
 
     function ensureNoWayObserver() {
@@ -35319,6 +35706,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     function stop(options = {}) {
         const shouldPersist = options.persistEnabled !== false;
         state.running = false;
+        bot.stopScriptFollowForCaveNavigation?.();
         clearScriptTask("CaveBot stopped");
         clearPostScriptHandoff("CaveBot stopped");
         resetOffscreenFrontierTracking();
@@ -35800,6 +36188,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             ...nextConfig
         };
 
+        if (cleanConfig.minimapOverlayEnabled !== undefined)
+            cleanConfig.minimapOverlayEnabled = cleanConfig.minimapOverlayEnabled === true;
         if (cleanConfig.autoTransitions !== undefined)
             cleanConfig.autoTransitions = cleanConfig.autoTransitions === true;
         if (cleanConfig.autoTransitionRadius !== undefined)
@@ -35915,6 +36305,12 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         config.recoveryHealthPenalty = Number.isFinite(penalty)
             ? Math.max(0, Math.min(10, penalty)) : 0.75;
         clearLureStaticRouteCache("CaveBot config updated");
+        if (cleanConfig.minimapOverlayEnabled !== undefined) {
+            if (config.minimapOverlayEnabled)
+                startMinimapOverlay();
+            else
+                stopMinimapOverlay();
+        }
         persistConfig();
         bot.log("cave config updated", {
             ...config
@@ -36067,7 +36463,10 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     startObserver();
     bot.addCleanup(stopObserver);
     startMinimapOverlay();
-    bot.addCleanup(stopMinimapOverlay);
+    bot.addCleanup(() => {
+        minimapOverlayState.destroyed = true;
+        stopMinimapOverlay();
+    });
     if (config.enabled && route.length)
         start();
 
@@ -36088,6 +36487,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         isRunning: () => state.running,
         pauseMovement,
         resumeMovement,
+        isWaypointScriptActive,
         isMovementPaused:
             isMovementPausedExternally,
         getTransitions,
@@ -40190,7 +40590,7 @@ window.__minibiaBotBundle.installNotificationModule = function installNotificati
         border-right: 4px solid #ffcc00;
         padding: 12px 16px;
         border-radius: 6px;
-        box-shadow: 0 4px 16px rgba(0,0,0,0.6);
+        box-shadow: none;
         color: #eee;
         font: 14px/1.5 Verdana, sans-serif;
         pointer-events: auto;
@@ -52004,12 +52404,12 @@ function upgradeSectionHeaders(panel) {
   border: 1px solid rgba(0, 0, 0, 0.6);
   background-image: none;
   background-color: #242424;
-  box-shadow: inset 0 0 4px rgba(0, 0, 0, 0.4);
-  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  box-shadow: none;
+  transition: border-color 0.15s ease;
 }
 #minibia-bot-panel .mb-status-card[data-running="true"] {
   border-color: rgba(60, 200, 120, 0.55);
-  box-shadow: inset 0 0 8px rgba(60, 200, 120, 0.15);
+  box-shadow: none;
 }
 #minibia-bot-panel .mb-status-card-top {
   display: flex;
@@ -52039,7 +52439,7 @@ function upgradeSectionHeaders(panel) {
   color: #ffcc00;
   font-weight: bold;
   font-size: 11px;
-  text-shadow: 0 0 2px #000;
+  text-shadow: none;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -52073,7 +52473,7 @@ function upgradeSectionHeaders(panel) {
   color: #ffcc00;
   font-weight: bold;
   font-size: 12px;
-  text-shadow: 0 0 2px #000;
+  text-shadow: none;
   letter-spacing: 0.5px;
   line-height: 1.2;
 }
@@ -52104,12 +52504,12 @@ function upgradeSectionHeaders(panel) {
   height: 8px;
   border-radius: 50%;
   background: #555;
-  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.85);
-  transition: background 0.2s ease, box-shadow 0.2s ease;
+  box-shadow: none;
+  transition: background 0.2s ease;
 }
 #minibia-bot-panel .mb-status-card[data-running="true"] .mb-status-dot {
   background: #39e86f;
-  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.85), 0 0 8px rgba(57, 232, 111, 0.7);
+  box-shadow: none;
 }
 #minibia-bot-panel .mb-status-card[data-running="true"] .mb-status-text {
   color: #b8f5c8;
@@ -52184,7 +52584,7 @@ function upgradeSectionHeaders(panel) {
   font-weight: bold;
   font-size: 13px;
   color: #e6e6e6;
-  text-shadow: 0 0 2px #000, 0 0 2px #000;
+  text-shadow: none;
   letter-spacing: 1px;
   flex: 0 0 auto;
 }
@@ -52218,8 +52618,8 @@ function upgradeSectionHeaders(panel) {
   height: 7px;
   border-radius: 50%;
   background: #555;
-  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.6);
-  transition: background 0.2s, box-shadow 0.2s;
+  box-shadow: none;
+  transition: background 0.2s;
 }
 #minibia-bot-panel .mb-run-indicator[data-running="true"] {
   color: #c8ffc8;
@@ -52228,7 +52628,7 @@ function upgradeSectionHeaders(panel) {
 }
 #minibia-bot-panel .mb-run-indicator[data-running="true"] .mb-run-dot {
   background: #39e86f;
-  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.6), 0 0 8px rgba(57, 232, 111, 0.7);
+  box-shadow: none;
 }
 #minibia-bot-panel .mb-title-actions {
   display: flex;
@@ -52393,7 +52793,7 @@ function upgradeSectionHeaders(panel) {
   background-color: #464646;
   color: #ffcc00;
   border-right: 2px solid #ffcc00;
-  box-shadow: inset 0 0 6px rgba(0, 0, 0, 0.5);
+  box-shadow: none;
 }
 
 /* ── Tab Content ── */
@@ -52421,7 +52821,7 @@ function upgradeSectionHeaders(panel) {
   border: 1px solid rgba(0, 0, 0, 0.6);
   background-image: none;
   background-color: #242424;
-  box-shadow: inset 0 0 4px rgba(0, 0, 0, 0.4);
+  box-shadow: none;
   border-radius: 0;
 }
 #minibia-bot-panel .mb-label {
@@ -52429,7 +52829,7 @@ function upgradeSectionHeaders(panel) {
   color: #ffcc00;
   font-weight: bold;
   font-size: 12px;
-  text-shadow: 0 0 2px #000;
+  text-shadow: none;
   letter-spacing: 0.5px;
 }
 #minibia-bot-panel .mb-small-note {
@@ -52471,7 +52871,7 @@ function upgradeSectionHeaders(panel) {
   color: #eee;
   font: inherit;
   font-size: 11px;
-  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.6);
+  box-shadow: none;
   outline: none;
   transition: border-color 0.15s;
 }
@@ -52479,7 +52879,7 @@ function upgradeSectionHeaders(panel) {
 #minibia-bot-panel textarea:focus,
 #minibia-bot-panel select:focus {
   border-color: #a8a8a8;
-  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.6), 0 0 4px rgba(190, 190, 190, 0.24);
+  box-shadow: none;
 }
 #minibia-bot-panel input::placeholder,
 #minibia-bot-panel textarea::placeholder {
@@ -52542,7 +52942,7 @@ function upgradeSectionHeaders(panel) {
   cursor: pointer;
   margin: 0;
   transition: border-color 0.15s, background 0.15s, color 0.15s;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+  box-shadow: none;
 }
 #minibia-bot-panel button:hover {
   border-color: #888;
@@ -52874,7 +53274,312 @@ function upgradeSectionHeaders(panel) {
   #minibia-bot-panel .mb-special-area-actions { grid-template-columns: repeat(2, minmax(0,1fr)); }
   #minibia-bot-panel .mb-special-area-fields { grid-template-columns: 1fr; }
 }
-    `;
+/* v1.6.91: keep all bot panel surfaces and controls shadowless, including
+   running/focus states and the separately injected game-window skin. */
+#minibia-bot-panel,
+#minibia-bot-panel *,
+#minibia-bot-panel::before,
+#minibia-bot-panel::after,
+#minibia-bot-panel *::before,
+#minibia-bot-panel *::after {
+  box-shadow: none !important;
+  text-shadow: none !important;
+}
+    
+
+/* v1.6.92: isolate the fixed panel from the live game canvas when a tall
+   tab scrolls. Promote only the root, not individual controls; no repaint
+   timer or changes to the client's canvas/context are needed. */
+#minibia-bot-panel {
+  isolation: isolate;
+  transform: translateZ(0);
+}
+#minibia-bot-panel .mb-body {
+  contain: paint;
+  grid-template-columns: 110px minmax(0, 1fr);
+}
+#minibia-bot-panel .mb-tab-menu,
+#minibia-bot-panel .mb-tab-content {
+  min-width: 0;
+  min-height: 0;
+  overscroll-behavior: contain;
+}
+@media (max-width: 700px) {
+  #minibia-bot-panel .mb-body {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+}
+
+
+/* v1.6.94: Hub palette and surfaces from the supplied client styles.
+   Scoped to mb0t, with opaque fallbacks and no shadows or hover transforms.
+   Keep the existing layout, collapsed solid surfaces and scroll isolation. */
+#minibia-bot-panel {
+  --mb-hub-gold: #e5c46a;
+  --mb-hub-gold-soft: #e2c470;
+  --mb-hub-text: #efe9da;
+  --mb-hub-text-2: #cfc8b8;
+  --mb-hub-muted: #a39d90;
+  --mb-hub-edge: rgba(0, 0, 0, 0.8);
+  --mb-hub-hover-edge: rgba(229, 196, 106, 0.75);
+  --mb-hub-sheen: linear-gradient(180deg, rgba(255, 255, 255, 0.06), rgba(0, 0, 0, 0.26));
+  --mb-hub-sheen-hover: linear-gradient(180deg, rgba(255, 255, 255, 0.11), rgba(0, 0, 0, 0.16));
+  --mb-hub-sheen-active: linear-gradient(180deg, rgba(255, 255, 255, 0.15), rgba(0, 0, 0, 0.12));
+  --mb-hub-surface: url("/png/bg3.png");
+  --mb-hub-surface-hover: url("/png/bg2.png");
+  color: var(--mb-hub-text-2);
+}
+#minibia-bot-panel:not([data-collapsed="true"]) {
+  background: var(--mb-hub-surface) #202020 !important;
+  border: 1px solid var(--mb-hub-edge) !important;
+  border-radius: 6px;
+  outline: none !important;
+}
+#minibia-bot-panel:not([data-collapsed="true"]) .mb-titlebar {
+  background: var(--mb-hub-sheen), var(--mb-hub-surface) #202020 !important;
+  border-top: 0 !important;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.85) !important;
+}
+#minibia-bot-panel .mb-title {
+  color: var(--mb-hub-text) !important;
+  font-weight: 700;
+}
+#minibia-bot-panel .mb-title-version { color: var(--mb-hub-muted) !important; }
+#minibia-bot-panel .mb-body,
+#minibia-bot-panel .mb-tab-content {
+  background: var(--mb-hub-surface) #202020 !important;
+  border-color: var(--mb-hub-edge) !important;
+}
+#minibia-bot-panel .mb-tab-menu {
+  background: linear-gradient(rgba(0, 0, 0, 0.32), rgba(0, 0, 0, 0.32)), var(--mb-hub-surface) #202020 !important;
+  border-color: var(--mb-hub-edge) !important;
+}
+#minibia-bot-panel .mb-section,
+#minibia-bot-panel .mb-status-card {
+  background: var(--mb-hub-sheen), var(--mb-hub-surface) #202020 !important;
+  border: 1px solid var(--mb-hub-edge) !important;
+  border-radius: 6px !important;
+}
+#minibia-bot-panel .mb-status-card[data-running="true"] { border-color: rgba(90, 180, 110, 0.55) !important; }
+#minibia-bot-panel .mb-status-card-icon {
+  background: rgba(0, 0, 0, 0.32) !important;
+  border: 1px solid rgba(0, 0, 0, 0.75) !important;
+  border-radius: 6px !important;
+}
+/* Hub captions: spaced gold capitals with a fine trailing rule. */
+#minibia-bot-panel .mb-section-title,
+#minibia-bot-panel .mb-section-title--sub {
+  background: none !important;
+  border: 0 !important;
+}
+#minibia-bot-panel .mb-section-title::after {
+  content: "";
+  flex: 1 1 8px;
+  height: 1px;
+  background: linear-gradient(to right, rgba(255, 255, 255, 0.16), transparent);
+}
+#minibia-bot-panel .mb-section-title > .mb-title-text,
+#minibia-bot-panel .mb-section-title--sub > .mb-title-text,
+#minibia-bot-panel .mb-section-header > .mb-label,
+#minibia-bot-panel .mb-section > .mb-label {
+  color: var(--mb-hub-gold-soft) !important;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+#minibia-bot-panel .mb-status-card-name { color: var(--mb-hub-gold-soft) !important; }
+#minibia-bot-panel .mb-field-label { color: var(--mb-hub-text-2) !important; }
+#minibia-bot-panel .mb-small-note,
+#minibia-bot-panel .mb-status-card-sub { color: var(--mb-hub-muted); }
+#minibia-bot-panel .mb-note,
+#minibia-bot-panel .mb-toggle,
+#minibia-bot-panel .mb-toggle-main,
+#minibia-bot-panel .mb-creature-name { color: var(--mb-hub-text-2); }
+/* Normal buttons exclude controls with a deliberate inline meaning colour. */
+#minibia-bot-panel:not([data-collapsed="true"]) button:where(:not(.mb-status-toggle):not([style*="background"])) {
+  background: var(--mb-hub-sheen), var(--mb-hub-surface) #202020 !important;
+  border: 1px solid var(--mb-hub-edge) !important;
+  border-radius: 5px !important;
+  color: var(--mb-hub-text) !important;
+}
+#minibia-bot-panel:not([data-collapsed="true"]) button:where(:not(.mb-status-toggle):not([style*="background"])):hover {
+  background: var(--mb-hub-sheen-hover), var(--mb-hub-surface-hover) #303030 !important;
+  border-color: var(--mb-hub-hover-edge) !important;
+  color: #fff3d2 !important;
+}
+#minibia-bot-panel:not([data-collapsed="true"]) button.mb-tab-button:not(:hover) {
+  color: var(--mb-hub-text-2) !important;
+}
+#minibia-bot-panel:not([data-collapsed="true"]) button.mb-tab-button[data-active="true"],
+#minibia-bot-panel:not([data-collapsed="true"]) button.mb-tab-button[data-active="true"]:hover {
+  background: var(--mb-hub-sheen-active), var(--mb-hub-surface-hover) #303030 !important;
+  border-color: var(--mb-hub-gold) !important;
+  color: var(--mb-hub-gold) !important;
+}
+#minibia-bot-panel button:focus-visible {
+  outline: 2px solid #e0a030;
+  outline-offset: 1px;
+}
+#minibia-bot-panel:not([data-collapsed="true"]) button:where(:not(.mb-status-toggle):not([style*="background"])):disabled,
+#minibia-bot-panel:not([data-collapsed="true"]) button:where(:not(.mb-status-toggle):not([style*="background"])):disabled:hover {
+  background: var(--mb-hub-sheen), var(--mb-hub-surface) #202020 !important;
+  border-color: var(--mb-hub-edge) !important;
+  color: var(--mb-hub-muted) !important;
+  cursor: default;
+}
+#minibia-bot-panel:not([data-collapsed="true"]) .mb-title-actions button:not([style*="background"]) {
+  border-radius: 4px !important;
+}
+/* Start/stop buttons use the Hub's green/red action treatment. */
+#minibia-bot-panel .mb-status-toggle {
+  background: linear-gradient(180deg, rgba(110, 190, 80, 0.24), rgba(0, 0, 0, 0.26)), var(--mb-hub-surface) #202020 !important;
+  border: 1px solid rgba(40, 90, 30, 0.95) !important;
+  border-radius: 5px !important;
+  color: #cdeec0 !important;
+}
+#minibia-bot-panel .mb-status-toggle:hover {
+  background: linear-gradient(180deg, rgba(120, 210, 90, 0.34), rgba(0, 0, 0, 0.2)), var(--mb-hub-surface-hover) #303030 !important;
+  border-color: #79b964 !important;
+  color: #fff !important;
+}
+#minibia-bot-panel .mb-status-card[data-running="true"] .mb-status-toggle {
+  background: linear-gradient(180deg, rgba(210, 80, 60, 0.26), rgba(0, 0, 0, 0.28)), var(--mb-hub-surface) #202020 !important;
+  border-color: rgba(110, 32, 24, 0.95) !important;
+  color: #f6c0b3 !important;
+}
+#minibia-bot-panel .mb-status-card[data-running="true"] .mb-status-toggle:hover {
+  background: linear-gradient(180deg, rgba(230, 90, 66, 0.38), rgba(0, 0, 0, 0.22)), var(--mb-hub-surface-hover) #303030 !important;
+  border-color: #d0604f !important;
+  color: #fff !important;
+}
+#minibia-bot-panel input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+#minibia-bot-panel textarea,
+#minibia-bot-panel select {
+  background: rgba(0, 0, 0, 0.42) !important;
+  border: 1px solid rgba(0, 0, 0, 0.9) !important;
+  border-radius: 4px !important;
+  color: var(--mb-hub-text) !important;
+}
+#minibia-bot-panel input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):focus,
+#minibia-bot-panel textarea:focus,
+#minibia-bot-panel select:focus { border-color: var(--mb-hub-hover-edge) !important; }
+#minibia-bot-panel input::placeholder,
+#minibia-bot-panel textarea::placeholder { color: #8a8478; }
+#minibia-bot-panel input[type="checkbox"],
+#minibia-bot-panel input[type="radio"],
+#minibia-bot-panel input[type="range"] { accent-color: #d9a441 !important; }
+#minibia-bot-panel .mb-list {
+  background: rgba(0, 0, 0, 0.32);
+  border: 1px solid rgba(0, 0, 0, 0.75);
+  border-radius: 6px;
+}
+#minibia-bot-panel .mb-list-row,
+#minibia-bot-panel .mb-creature-row { color: var(--mb-hub-text-2); border-bottom-color: rgba(255, 255, 255, 0.05); }
+#minibia-bot-panel .mb-list-row:hover,
+#minibia-bot-panel .mb-creature-row:hover { background: rgba(255, 255, 255, 0.07); color: #fff3d2; }
+#minibia-bot-panel hr {
+  border: 0 !important;
+  background: linear-gradient(to right, transparent, rgba(255, 255, 255, 0.2), transparent) !important;
+}
+#minibia-bot-panel,
+#minibia-bot-panel * { scrollbar-width: thin; scrollbar-color: #6c6c6c rgba(0, 0, 0, 0.25); }
+#minibia-bot-panel ::-webkit-scrollbar { width: 8px; height: 8px; background: rgba(0, 0, 0, 0.25); }
+#minibia-bot-panel ::-webkit-scrollbar-track { background: rgba(0, 0, 0, 0.25); }
+#minibia-bot-panel ::-webkit-scrollbar-thumb,
+#minibia-bot-panel .mb-list::-webkit-scrollbar-thumb,
+#minibia-bot-panel .mb-tab-content::-webkit-scrollbar-thumb,
+#minibia-bot-panel .mb-tab-menu::-webkit-scrollbar-thumb { background: #6c6c6c !important; border: 0; border-radius: 4px; }
+#minibia-bot-panel:not([data-collapsed="true"]) .mb-title-status .mb-run-indicator {
+  background: var(--mb-hub-sheen), var(--mb-hub-surface) #202020;
+  border-radius: 4px;
+  color: var(--mb-hub-text-2);
+}
+#minibia-bot-panel:not([data-collapsed="true"]) .mb-title-status .mb-run-indicator[data-running="true"] {
+  background: #1c5e2a;
+  border-color: rgba(90, 220, 120, 0.5);
+  color: #c8ffc8;
+}
+
+
+/* v1.6.95: compact Hub chrome, using solid opaque surfaces for the earlier
+   collapsed-panel canvas fix. Dimensions, module rows and handlers stay intact. */
+#minibia-bot-panel[data-collapsed="true"] {
+  background: #202020 !important;
+  border: 1px solid var(--mb-hub-edge) !important;
+  border-radius: 6px;
+  outline: none !important;
+}
+#minibia-bot-panel[data-collapsed="true"] .mb-titlebar {
+  background: #262626 !important;
+  border-top: 0 !important;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.85) !important;
+  border-radius: 5px 5px 0 0;
+}
+#minibia-bot-panel[data-collapsed="true"] .mb-collapsed-module-rows,
+#minibia-bot-panel[data-collapsed="true"] .mb-collapsed-module-row {
+  background: #161616 !important;
+  border-bottom: 0;
+}
+#minibia-bot-panel[data-collapsed="true"] .mb-collapsed-module-rows,
+#minibia-bot-panel[data-collapsed="true"] .mb-collapsed-module-row:last-child {
+  border-radius: 0 0 5px 5px;
+}
+#minibia-bot-panel[data-collapsed="true"] .mb-collapsed-module-button,
+#minibia-bot-panel[data-collapsed="true"] .mb-title-actions button {
+  background: #282828 !important;
+  border: 1px solid var(--mb-hub-edge) !important;
+  border-radius: 5px !important;
+  color: var(--mb-hub-text-2) !important;
+}
+#minibia-bot-panel[data-collapsed="true"] .mb-title-actions button {
+  border-radius: 4px !important;
+}
+#minibia-bot-panel[data-collapsed="true"] .mb-collapsed-module-button[data-running="true"] {
+  background: #1c5e2a !important;
+  border-color: rgba(90, 180, 110, 0.55) !important;
+  color: #c8ffc8 !important;
+}
+#minibia-bot-panel[data-collapsed="true"] .mb-collapsed-module-button:hover,
+#minibia-bot-panel[data-collapsed="true"] .mb-title-actions button:hover {
+  background: #383838 !important;
+  border-color: var(--mb-hub-hover-edge) !important;
+  color: #fff3d2 !important;
+}
+#minibia-bot-panel[data-collapsed="true"] .mb-collapsed-module-button[data-running="true"]:hover {
+  background: #246d34 !important;
+  border-color: var(--mb-hub-hover-edge) !important;
+  color: #fff3d2 !important;
+}
+
+
+/* v1.6.96: both titlebars use the expanded Hub chrome. The first-child
+   selector outranks the older collapsed rules in the separate window skin.
+   Collapsed module rows keep their solid backgrounds and compact layout. */
+#minibia-bot-panel[data-collapsed="true"] > .mb-titlebar:first-child,
+#minibia-bot-panel:not([data-collapsed="true"]) > .mb-titlebar:first-child {
+  background: var(--mb-hub-sheen), var(--mb-hub-surface) #202020 !important;
+  border-top: 0 !important;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.85) !important;
+  border-radius: 5px 5px 0 0;
+}
+#minibia-bot-panel .mb-titlebar:first-child .mb-title-actions button {
+  background: var(--mb-hub-sheen), var(--mb-hub-surface) #202020 !important;
+  border: 1px solid var(--mb-hub-edge) !important;
+  border-radius: 4px !important;
+  color: var(--mb-hub-text) !important;
+}
+#minibia-bot-panel .mb-titlebar:first-child .mb-title-actions button:hover {
+  background: var(--mb-hub-sheen-hover), var(--mb-hub-surface-hover) #303030 !important;
+  border-color: var(--mb-hub-hover-edge) !important;
+  color: #fff3d2 !important;
+}
+#minibia-bot-panel[data-collapsed="true"] .mb-collapsed-module-rows {
+  padding-bottom: 3px; /* previously 1px: add 2px to the collapsed panel */
+}
+
+`;
         document.head.appendChild(style);
 
         // ---- PANEL HTML (full) ----
@@ -53573,6 +54278,7 @@ function upgradeSectionHeaders(panel) {
       <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-cave-auto-transitions" /> Auto Transitions</label>
       <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-cave-learn" /> Learn</label>
       <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-cave-ignore-fields" /> Walk Through Fields</label>
+      <label class="mb-toggle" style="margin:0; font-size:11px;" title="Show waypoint numbers and route lines on the minimap"><input type="checkbox" id="minibia-bot-cave-minimap-overlay-enabled" /> Minimap Overlay</label>
     </div>
 
     <div id="minibia-bot-cave-status" style="font-size:10px; color:#cdbb8b; margin-top:6px;">Status: no waypoints</div>
@@ -53782,6 +54488,9 @@ function upgradeSectionHeaders(panel) {
           <span>Keep Diagonal</span>
         </label>
 
+      </div>
+
+      <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-top:6px;">
         <label class="mb-toggle" style="margin:0; font-size:11px;">
           <input type="checkbox" id="minibia-bot-auto-attack-offscreen-hunt" />
           <span>Off-screen Hunt</span>
@@ -55593,6 +56302,7 @@ function upgradeSectionHeaders(panel) {
                 name,
                 {
                     mode,
+                    continuous: false,
                     allowDuringTarget:
                         getFollowDuringTarget()
                 }
@@ -55631,6 +56341,7 @@ function upgradeSectionHeaders(panel) {
                             {
                                 mode:
                                     getFollowMode(),
+                                continuous: false,
                                 allowDuringTarget:
                                     getFollowDuringTarget()
                             }
@@ -58403,6 +59114,14 @@ function upgradeSectionHeaders(panel) {
             });
         }
 
+        const minimapOverlayToggle = panel.querySelector("#minibia-bot-cave-minimap-overlay-enabled");
+        if (minimapOverlayToggle) {
+            minimapOverlayToggle.checked = bot.cave?.config?.minimapOverlayEnabled !== false;
+            minimapOverlayToggle.addEventListener("change", () => {
+                bot.cave.updateConfig({ minimapOverlayEnabled: minimapOverlayToggle.checked });
+            });
+        }
+
         // Circuit-breaker controls persist through the CaveBot config.
         const breakerEnabled = panel.querySelector('#minibia-bot-cave-breaker-enabled');
         const breakerFailures = panel.querySelector('#minibia-bot-cave-breaker-failures');
@@ -58981,6 +59700,13 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
         bot.storage.set(configStorageKey, config);
     }
 
+    // v1.6.85: own every deferred UI retry so an old bot cannot re-hook
+    // the new client after hot reload (or create parallel retry chains).
+    let uiTweaksDestroyed = false;
+    let nameSpoofRetryTimer = null;
+    let floatingTextRetryTimer = null;
+    let nameplateRefreshTimer = null;
+
     // ---- TTL state ----
     const ttlState = {
         installed: false,
@@ -59151,7 +59877,12 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
         return null;
     }
 
+    let ttlLastUpdateAt = 0;
     function updateTTLRow() {
+        if (uiTweaksDestroyed) return;
+        const now = Date.now();
+        if (ttlLastUpdateAt && now - ttlLastUpdateAt < 1000) return;
+        ttlLastUpdateAt = now;
         const overlay = document.getElementById("debug-statistics")
              || document.getElementById("debugger-statistics")
              || document.getElementById("debug-overlay")
@@ -59193,6 +59924,7 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
     let ttlInstallTimer = null;
 
     function installTTL() {
+        if (uiTweaksDestroyed || !config.ttlEnabled) return;
         if (ttlState.installed)
             return;
         const debuggerInstance = gameClient?.renderer?.debugger;
@@ -59226,6 +59958,7 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
     }
 
     function uninstallTTL() {
+        ttlLastUpdateAt = 0;
         if (ttlInstallTimer) {
             clearTimeout(ttlInstallTimer);
             ttlInstallTimer = null;
@@ -59263,6 +59996,7 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
     let __originalCreateTextElement = null;
     let __originalCreateTextElementMethod = null;
     let __floatingTextWrapper = null;
+    let __floatingTextProto = null;
 
     // ---- Food consumption messages ----
     const CONSUMPTION_MSGS = new Set([
@@ -59278,9 +60012,19 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
 
     // ---- Name spoofer for nameplate & chat ----
     function applyNameSpoof() {
+        if (uiTweaksDestroyed) return;
+        if (nameSpoofRetryTimer != null) {
+            clearTimeout(nameSpoofRetryTimer);
+            nameSpoofRetryTimer = null;
+        }
         const player = window.gameClient?.player;
         if (!player) {
-            setTimeout(applyNameSpoof, 500);
+            if (config.nameSpooferEnabled) {
+                nameSpoofRetryTimer = setTimeout(() => {
+                    nameSpoofRetryTimer = null;
+                    applyNameSpoof();
+                }, 500);
+            }
             return;
         }
 
@@ -59351,6 +60095,7 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
     }
 
     function forceRefreshNameplates() {
+        if (uiTweaksDestroyed) return;
         const player = window.gameClient?.player;
         if (!player)
             return;
@@ -59398,14 +60143,30 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
 
     // ---- Combined patch for floating text: spoof name + hide popups ----
     function applyFloatingTextPatch() {
-        const mgr = gameClient?.interface?.screenElementManager;
+        if (uiTweaksDestroyed) return;
+        if (floatingTextRetryTimer != null) {
+            clearTimeout(floatingTextRetryTimer);
+            floatingTextRetryTimer = null;
+        }
+        const mgr = window.gameClient?.interface?.screenElementManager;
         if (!mgr) {
-            bot.log("[UI] Floating text patch: ScreenElementManager not ready, will retry");
-            setTimeout(applyFloatingTextPatch, 500);
+            floatingTextRetryTimer = setTimeout(() => {
+                floatingTextRetryTimer = null;
+                applyFloatingTextPatch();
+            }, 500);
             return;
         }
 
         const proto = Object.getPrototypeOf(mgr);
+        if (__floatingTextProto === proto && proto.createTextElement === __floatingTextWrapper)
+            return;
+        if (__floatingTextProto && __floatingTextProto !== proto) {
+            if (__floatingTextProto.createTextElement === __floatingTextWrapper)
+                __floatingTextProto.createTextElement = __originalCreateTextElementMethod;
+            __originalCreateTextElement = null;
+            __originalCreateTextElementMethod = null;
+        }
+        __floatingTextProto = proto;
 
         if (!__originalCreateTextElement) {
             __originalCreateTextElement = proto.__createTextElement;
@@ -59418,8 +60179,8 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
             let hide = false;
             if (config.hideFloatingPopups) {
                 let isSpell = false;
-                if (typeof mgr.isSpellCastMessage === 'function') {
-                    isSpell = mgr.isSpellCastMessage(message);
+                if (typeof this.isSpellCastMessage === 'function') {
+                    isSpell = this.isSpellCastMessage(message);
                 } else {
                     const lower = String(message).toLowerCase().trim();
                     isSpell = /^[a-z ]+$/.test(lower) && lower.length < 30;
@@ -59433,7 +60194,7 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
                 try {
                     shouldHideLog = gameClient.interface.settings
                          && gameClient.interface.settings.isHideSpellCastsEnabled()
-                         && mgr.isSpellCastMessage && mgr.isSpellCastMessage(message);
+                         && this.isSpellCastMessage && this.isSpellCastMessage(message);
                 } catch (e) {}
                 if (!shouldHideLog) {
                     gameClient.interface.channelManager.getChannel("Default").addMessage(
@@ -59538,9 +60299,14 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
     }
 
     function applyAll() {
+        if (uiTweaksDestroyed) return;
         persistConfig();
         applyStyles();
-        setTimeout(forceRefreshNameplates, 100);
+        if (nameplateRefreshTimer != null) clearTimeout(nameplateRefreshTimer);
+        nameplateRefreshTimer = setTimeout(() => {
+            nameplateRefreshTimer = null;
+            forceRefreshNameplates();
+        }, 100);
     }
 
 // ---- Bind controls to the panel's UI Tweaks tab ----
@@ -59674,6 +60440,13 @@ function bindControls(panel) {
 
     // ---- Cleanup on bot destroy ----
     bot.addCleanup(() => {
+        uiTweaksDestroyed = true;
+        for (const timer of [nameSpoofRetryTimer, floatingTextRetryTimer, nameplateRefreshTimer]) {
+            if (timer != null) clearTimeout(timer);
+        }
+        nameSpoofRetryTimer = null;
+        floatingTextRetryTimer = null;
+        nameplateRefreshTimer = null;
         uninstallTTL();
         uninstallLootFilter();
         if (__originalNameDescriptor && typeof Creature !== "undefined") {
@@ -59684,12 +60457,11 @@ function bindControls(panel) {
             Channel.prototype.addMessage = __originalChannelAddMessage;
             __originalChannelAddMessage = null;
         }
-        const mgr = window.gameClient?.interface?.screenElementManager;
-        if (mgr && __originalCreateTextElementMethod) {
-            const proto = Object.getPrototypeOf(mgr);
-            if (proto.createTextElement === __floatingTextWrapper)
-                proto.createTextElement = __originalCreateTextElementMethod;
+        if (__floatingTextProto && __originalCreateTextElementMethod &&
+            __floatingTextProto.createTextElement === __floatingTextWrapper) {
+            __floatingTextProto.createTextElement = __originalCreateTextElementMethod;
         }
+        __floatingTextProto = null;
         __floatingTextWrapper = null;
         __originalCreateTextElement = null;
         __originalCreateTextElementMethod = null;
@@ -62195,7 +62967,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
                 const hasTarget = !!(window.gameClient?.player?.__target ||
                     window.gameClient?.player?.getTarget?.() ||
                     bot.attack?.getCurrentTarget?.());
-                const attackStatus = bot.attack?.status?.() || null;
+                const attackStatus = bot.attack?.getCombatSnapshot?.() || bot.attack?.status?.() || null;
                 const combatActive = !!(attackStatus?.combatActive &&
                     Number(attackStatus?.combatDurationMs || 0) < 60000);
                 const inCombat = combatActive || hasTarget ||
