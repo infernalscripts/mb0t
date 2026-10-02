@@ -3058,7 +3058,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.96",
+        version: "1.6.97",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -32529,12 +32529,22 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                     : "unnamed");
             bot.log(`Executing script for waypoint ${label}`);
             const scriptFn = new Function('bot', 'state', waypoint.script);
+            const bankTaskBefore = bot.bankNpc?.getPendingTask?.();
             let result;
             scriptExecutionDepth++;
             try {
                 result = scriptFn(bot, state);
             } finally {
                 scriptExecutionDepth--;
+            }
+
+            // A Bank call without an explicit return still owns this Script's
+            // completion. Preserve its rejection instead of only waiting for
+            // the external movement pause to disappear.
+            if (!result || typeof result.then !== "function") {
+                const bankTask = bot.bankNpc?.getPendingTask?.();
+                if (bankTask && bankTask !== bankTaskBefore)
+                    result = bankTask;
             }
 
             // Older Script waypoints often use bot.wait(...) or call a module
@@ -50342,32 +50352,120 @@ window.__minibiaBotBundle.installNpcSupplyBuyerModule = function installNpcSuppl
 window.__minibiaBotBundle.installBankNpcModule = function installBankNpcModule(bot) {
     const key="minibiaBot.bankNpc.config";
     const config=Object.assign({npcName:"",greeting:"hi",npcDelayMs:250,actionTimeoutMs:5000,customLines:""},bot.storage.get(key,{}));
-    const state={running:false,stopRequested:false,phase:"idle",lastError:null,lastRunAt:0,lastNpc:null,lastPreset:null};
-    const sleep=ms=>new Promise(r=>setTimeout(r,Math.max(0,Number(ms)||0)));
+    const state={running:false,stopRequested:false,phase:"idle",lastError:null,lastRunAt:0,lastNpc:null,lastPreset:null,runningPromise:null,requestKey:null,sleepTimer:null,sleepWake:null,destroyed:false};
+    // One owned wait per conversation; stopping/reloading wakes it immediately.
+    function wakeSleep(){
+        if(state.sleepTimer!=null)window.clearTimeout(state.sleepTimer);
+        state.sleepTimer=null;
+        const wake=state.sleepWake;state.sleepWake=null;
+        if(wake)wake();
+    }
+    const sleep=ms=>new Promise(resolve=>{
+        const timer=window.setTimeout(()=>{
+            if(state.sleepTimer===timer){state.sleepTimer=null;state.sleepWake=null;}
+            resolve();
+        },Math.max(0,Number(ms)||0));
+        state.sleepTimer=timer;state.sleepWake=resolve;
+    });
+    function checkStopped(){if(state.stopRequested||state.destroyed)throw new Error("Bank NPC action stopped");}
     function normalize(){config.npcName=String(config.npcName||"").trim();config.greeting=String(config.greeting||"hi").trim()||"hi";config.npcDelayMs=Math.max(0,Math.min(3000,Number(config.npcDelayMs)||250));config.actionTimeoutMs=Math.max(350,Math.min(30000,Number(config.actionTimeoutMs)||5000));config.customLines=String(config.customLines||"");}
     normalize();const persist=()=>bot.storage.set(key,{...config});
     function creatures(){const a=window.gameClient?.world?.activeCreatures||{};return a instanceof Map?Array.from(a.values()):Object.values(a);}
     function findNpc(){const q=config.npcName.toLowerCase(),me=bot.getPlayerPosition?.();const list=creatures().filter(c=>{let npc=false;try{npc=Number(c?.type)===Number(CONST?.TYPES?.NPC??2);}catch(e){npc=Number(c?.type)===2;}return npc&&(!q||String(c.name||"").toLowerCase()===q);});list.sort((a,b)=>{const d=c=>{const p=c.getPosition?.()||c.__position;return p&&me?Math.max(Math.abs(p.x-me.x),Math.abs(p.y-me.y)):999};return d(a)-d(b)});return list[0]||null;}
-    function dialog(){const d=window.gameClient?.interface?.npcDialog,t=d?.__turn||{};return d?{npc:t.npc||null,at:Number(t.at)||0,lines:Array.isArray(t.lines)?t.lines:[]}:null;}
+    function dialog(){
+        const d=window.gameClient?.interface?.npcDialog,t=d?.__turn||{};
+        return d?{npc:String(t.npc||"").trim(),at:Number(t.at)||0,
+            text:(Array.isArray(t.lines)?t.lines:[]).map(String).join("\n")}:null;
+    }
     function say(text){return bot.sendChatToChannel?.(String(text||""),"Default")===true;}
-    async function waitTurnAfter(at){const end=Date.now()+config.actionTimeoutMs;while(Date.now()<end){if(state.stopRequested)throw new Error("Bank NPC action stopped");const d=dialog();if(d&&Number(d.at)>Number(at||0))return true;await sleep(40);}return false;}
-    function recipe(preset,amount,custom){if(preset==="deposit-all")return["deposit","all","yes"];if(preset==="withdraw")return["withdraw",String(Math.max(1,Math.floor(Number(amount)||1))),"yes"];if(preset==="custom")return String(custom??config.customLines).split(/\r?\n/).map(x=>x.trim()).filter(Boolean);throw new Error(`Unknown bank preset: ${preset}`);}
-    async function run(preset="deposit-all",amount=0,custom=null){if(state.running)return false;if(window.gameClient?.player?.getTarget?.()||window.gameClient?.player?.__target)throw new Error("Cannot use bank while a combat target is active");const npc=findNpc();if(config.npcName&&!npc)throw new Error(`Configured bank NPC is not nearby: ${config.npcName}`);state.running=true;state.stopRequested=false;state.phase="greet";state.lastError=null;state.lastRunAt=Date.now();state.lastNpc=npc?.name||config.npcName||null;state.lastPreset=preset;bot.cave?.pauseMovement?.("bank-npc");try{
-        if(npc&&typeof NPCInteractPacket==="function"){
-            const before=dialog()?.at||0;window.gameClient.send(new NPCInteractPacket(npc.id));await waitTurnAfter(before);
-        }else{
-            const before=dialog()?.at||0;if(!say(config.greeting))throw new Error("Could not send bank greeting");if(!await waitTurnAfter(before))await sleep(config.npcDelayMs);
+    async function waitTurnAfter(before,expectedNpc,action){
+        const end=Date.now()+config.actionTimeoutMs;
+        const wanted=String(expectedNpc||"").trim().toLowerCase();
+        while(Date.now()<end){
+            checkStopped();
+            const d=dialog();
+            const sameNpc=d&&(!wanted||d.npc.toLowerCase()===wanted);
+            const fresh=d&&d.at>0&&(!before||d.at>before.at||
+                (d.at===before.at&&(d.npc!==before.npc||d.text!==before.text)));
+            if(sameNpc&&fresh)return d;
+            await sleep(40);
         }
-        const lines=recipe(preset,amount,custom);if(!lines.length)throw new Error("Bank dialogue recipe is empty");
-        for(let i=0;i<lines.length;i++){if(state.stopRequested)throw new Error("Bank NPC action stopped");state.phase=`line ${i+1}/${lines.length}`;const before=dialog()?.at||0;if(!say(lines[i]))throw new Error(`Could not send bank line: ${lines[i]}`);const got=await waitTurnAfter(before);if(!got)await sleep(config.npcDelayMs);}
-        await sleep(Math.max(120,config.npcDelayMs));state.phase="complete";bot.log(`[Bank NPC] ${preset} complete`);return true;
-    }catch(e){state.lastError=String(e?.message||e);state.phase="error";bot.log("[Bank NPC]",state.lastError);throw e;}finally{state.running=false;state.stopRequested=false;bot.cave?.resumeMovement?.("bank-npc");}}
-    function stop(){if(!state.running)return false;state.stopRequested=true;state.phase="stopping";return true;}
+        checkStopped();
+        throw new Error(`Bank NPC ${action} timed out waiting for ${expectedNpc||"an NPC"} reply; dialogue was not completed`);
+    }
+    function recipe(preset,amount,custom){if(preset==="deposit-all")return["deposit","all","yes"];if(preset==="withdraw")return["withdraw",String(Math.max(1,Math.floor(Number(amount)||1))),"yes"];if(preset==="custom")return String(custom??config.customLines).split(/\r?\n/).map(x=>x.trim()).filter(Boolean);throw new Error(`Unknown bank preset: ${preset}`);}
+    async function execute(preset="deposit-all",amount=0,custom=null){
+        if(window.gameClient?.player?.getTarget?.()||window.gameClient?.player?.__target)
+            throw new Error("Cannot use bank while a combat target is active");
+        const npc=findNpc();
+        if(config.npcName&&!npc)throw new Error(`Configured bank NPC is not nearby: ${config.npcName}`);
+        const lines=recipe(preset,amount,custom);
+        if(!lines.length)throw new Error("Bank dialogue recipe is empty");
+        state.running=true;state.stopRequested=false;state.phase="greet";state.lastError=null;
+        state.lastRunAt=Date.now();state.lastNpc=npc?.name||config.npcName||null;state.lastPreset=preset;
+        bot.cave?.pauseMovement?.("bank-npc");
+        try{
+            checkStopped();
+            const before=dialog();
+            if(npc&&typeof NPCInteractPacket==="function"){
+                // Match the client's click-greet path. Without this grant the
+                // NPC dialog can suppress the reply once recent chat expires.
+                window.gameClient?.interface?.npcDialog?.notePlayerSpoke?.();
+                window.gameClient.send(new NPCInteractPacket(npc.id));
+            }else if(!say(config.greeting))throw new Error("Could not send bank greeting");
+            const greeting=await waitTurnAfter(before,state.lastNpc,"greeting");
+            const expectedNpc=state.lastNpc||greeting.npc;
+            state.lastNpc=expectedNpc;
+            for(let i=0;i<lines.length;i++){
+                // Honour the configured NPC delay even when replies are fast.
+                if(config.npcDelayMs>0)await sleep(config.npcDelayMs);
+                checkStopped();
+                state.phase=`line ${i+1}/${lines.length}`;
+                const beforeLine=dialog();
+                if(!say(lines[i]))throw new Error(`Could not send bank line: ${lines[i]}`);
+                // A timeout fails the action. Never resend a deposit, withdrawal
+                // or confirmation blindly, and never report silent success.
+                await waitTurnAfter(beforeLine,expectedNpc,`line "${lines[i]}"`);
+            }
+            await sleep(Math.max(120,config.npcDelayMs));
+            checkStopped();
+            state.phase="complete";bot.log(`[Bank NPC] ${preset} complete`);return true;
+        }catch(e){
+            state.lastError=String(e?.message||e);state.phase="error";
+            bot.log("[Bank NPC]",state.lastError);throw e;
+        }finally{
+            wakeSleep();state.running=false;state.stopRequested=false;
+            bot.cave?.resumeMovement?.("bank-npc");
+        }
+    }
+    function run(preset="deposit-all",amount=0,custom=null){
+        const requestKey=JSON.stringify([config.npcName.toLowerCase(),preset,
+            preset==="withdraw"?Math.max(1,Math.floor(Number(amount)||1)):0,
+            preset==="custom"?String(custom??config.customLines):""]);
+        if(state.runningPromise){
+            if(requestKey!==state.requestKey)
+                return Promise.reject(new Error("A different Bank NPC action is already running"));
+            return state.runningPromise;
+        }
+        if(state.destroyed)return Promise.reject(new Error("Bank NPC module was destroyed"));
+        state.requestKey=requestKey;
+        const pending=execute(preset,amount,custom);
+        state.runningPromise=pending;
+        const clear=()=>{if(state.runningPromise===pending){state.runningPromise=null;state.requestKey=null;}};
+        // Join a running conversation instead of returning an immediate false
+        // that a Script waypoint could mistake for completed work.
+        pending.then(clear,clear);
+        return pending;
+    }
+    function stop(){
+        if(!state.running)return false;
+        state.stopRequested=true;state.phase="stopping";wakeSleep();return true;
+    }
     function updateConfig(p={}){Object.keys(p).forEach(k=>{if(Object.prototype.hasOwnProperty.call(config,k))config[k]=p[k];});normalize();persist();return status();}
     function status(){return{running:state.running,phase:state.phase,lastError:state.lastError,lastRunAt:state.lastRunAt,lastNpc:state.lastNpc,lastPreset:state.lastPreset,nearbyNpc:findNpc()?.name||null};}
     function addCaveWaypoint(preset="deposit-all",amount=0,custom="",insertIndex){const args=JSON.stringify([preset,Number(amount)||0,String(custom||"")]);const script=`{ const [preset,amount,custom] = ${args}; return bot.bankNpc.run(preset, amount, custom); }`;return bot.cave?.addWaypoint?.({label:preset==="withdraw"?`Bank Withdraw ${Number(amount)||0}`:preset==="custom"?"Bank Custom":"Bank Deposit All",script},insertIndex);}
-    bot.addCleanup(()=>{stop();bot.cave?.resumeMovement?.("bank-npc");});
-    bot.bankNpc={config,updateConfig,run,depositAll:()=>run("deposit-all"),withdraw:amount=>run("withdraw",amount),custom:lines=>run("custom",0,lines),stop,status,findNpc,addCaveWaypoint};
+    bot.addCleanup(()=>{state.destroyed=true;stop();wakeSleep();});
+    bot.bankNpc={config,updateConfig,run,depositAll:()=>run("deposit-all"),withdraw:amount=>run("withdraw",amount),custom:lines=>run("custom",0,lines),stop,status,findNpc,addCaveWaypoint,getPendingTask:()=>state.runningPromise};
 };
 
 window.__minibiaBotBundle.installPanel = function installPanel(bot) {
