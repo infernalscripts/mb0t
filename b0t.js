@@ -3058,7 +3058,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.97",
+        version: "1.6.98",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -30032,6 +30032,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     }
 
     function appendLearnWaypoint(waypoint, reason = "walk") {
+        if (state.learnMode !== true || state.running) return null;
         const norm = normalizeWaypoint(waypoint);
         if (!norm || !Number.isFinite(norm.x) || !Number.isFinite(norm.y) || !Number.isFinite(norm.z))
             return null;
@@ -30212,6 +30213,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     }
 
     function recordLearnTransition(previous, current) {
+        if (state.learnMode !== true || state.running) return false;
         const candidate = findLearnTransitionCandidate(previous, current);
         if (!candidate?.position)
             return false;
@@ -35508,6 +35510,14 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         config.tickMs = 500;
         persistConfig();
         const pos = normalizePosition(bot.getPlayerPosition());
+        // Hunting never inherits a manual Learn session. Do not append an
+        // "end" waypoint while switching to navigation.
+        state.learnMode = false;
+        state.learnDistance = 0;
+        state.learnPendingToolUse = null;
+        state.learnLastPosition = null;
+        state.learnLastWaypointPosition = null;
+        uninstallLearnToolObserver();
         state.running = true;
         clearScriptTask("CaveBot started");
         clearPostScriptHandoff();
@@ -52009,6 +52019,8 @@ function upgradeSectionHeaders(panel) {
         const routeLength = status?.routeLength ?? status?.route?.length ?? 0;
         if (toggle)
             toggle.checked = !!status?.running;
+        const learnToggle = document.getElementById("minibia-bot-cave-learn");
+        if (learnToggle) learnToggle.checked = status?.learnMode === true;
         if (label) {
             if (status?.learnMode) {
                 label.textContent = `Status: LEARN – recording every 10 tiles (${routeLength} waypoint${routeLength === 1 ? "" : "s"})`;
@@ -52374,11 +52386,11 @@ function upgradeSectionHeaders(panel) {
                 stop: () => bot.runeShooter?.stop?.()
             },
             {
-                id: "minibia-bot-collapsed-eat",
-                headerId: "minibia-bot-auto-eat-enabled",
-                isRunning: () => !!bot.eat?.status?.().running,
-                start: () => bot.eat?.start?.(),
-                stop: () => bot.eat?.stop?.()
+                id: "minibia-bot-collapsed-conjure-food",
+                headerId: "minibia-bot-conjure-food-enabled",
+                isRunning: () => !!bot.conjureFood?.status?.().running,
+                start: () => bot.conjureFood?.start?.(),
+                stop: () => bot.conjureFood?.stop?.()
             },
             {
                 id: "minibia-bot-collapsed-invisible",
@@ -53709,7 +53721,7 @@ function upgradeSectionHeaders(panel) {
   </div>
   <div class="mb-collapsed-module-row" aria-label="Combat support modules">
     <button type="button" class="mb-run-indicator mb-collapsed-module-button" id="minibia-bot-collapsed-rune-shooter" title="Rune Shooter"><span class="mb-run-dot"></span><span class="mb-run-label">🎯</span></button>
-    <button type="button" class="mb-run-indicator mb-collapsed-module-button" id="minibia-bot-collapsed-eat" title="Eat Food"><span class="mb-run-dot"></span><span class="mb-run-label">🍖</span></button>
+    <button type="button" class="mb-run-indicator mb-collapsed-module-button" id="minibia-bot-collapsed-conjure-food" title="Conjure Food"><span class="mb-run-dot"></span><span class="mb-run-label">🍖</span></button>
     <button type="button" class="mb-run-indicator mb-collapsed-module-button" id="minibia-bot-collapsed-invisible" title="Invisible"><span class="mb-run-dot"></span><span class="mb-run-label">👻</span></button>
     <button type="button" class="mb-run-indicator mb-collapsed-module-button" id="minibia-bot-collapsed-magic-shield" title="Utamo Vita (Mana Shield)"><span class="mb-run-dot"></span><span class="mb-run-label">🛡️</span></button>
   </div>
@@ -59193,7 +59205,12 @@ function upgradeSectionHeaders(panel) {
         const learnToggle = panel.querySelector("#minibia-bot-cave-learn");
         if (learnToggle) {
             learnToggle.checked = bot.cave?.getLearnMode?.() === true;
-            learnToggle.addEventListener("change", () => {
+            learnToggle.addEventListener("change", event => {
+                // A restored/synthetic checkbox change must not arm recording.
+                if (learnToggle.checked && event.isTrusted !== true) {
+                    learnToggle.checked = bot.cave?.getLearnMode?.() === true;
+                    return;
+                }
                 bot.cave?.setLearnMode?.(learnToggle.checked);
                 learnToggle.checked = bot.cave?.getLearnMode?.() === true;
                 refreshCaveStatus();
@@ -59965,57 +59982,26 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
         else uninstallLootFilter();
     }
 
-    function findBuildLine(container) {
-        const children = container.querySelectorAll("*");
-        for (const child of children) {
-            if (child.textContent && child.textContent.trim().toLowerCase().startsWith("build:")) {
-                return child;
-            }
-        }
-        return null;
-    }
-
     let ttlLastUpdateAt = 0;
+    let ttlRow = null;
     function updateTTLRow() {
-        if (uiTweaksDestroyed) return;
-        const now = Date.now();
-        if (ttlLastUpdateAt && now - ttlLastUpdateAt < 1000) return;
-        ttlLastUpdateAt = now;
+        if (uiTweaksDestroyed || !config.ttlEnabled) return;
         const overlay = document.getElementById("debug-statistics")
-             || document.getElementById("debugger-statistics")
-             || document.getElementById("debug-overlay")
-             || document.getElementById("performance-overlay");
-
-        let buildLine = null;
-        if (overlay) {
-            buildLine = findBuildLine(overlay);
-        } else {
-            const all = document.querySelectorAll("div, span, p, pre");
-            for (const el of all) {
-                if (el.textContent && el.textContent.trim().toLowerCase().startsWith("build:")) {
-                    buildLine = el;
-                    break;
-                }
-            }
-            if (!buildLine)
-                return;
-        }
-
-        let ttlRow = document.getElementById("ttl-inline-row");
+            || document.getElementById("debugger-statistics")
+            || document.getElementById("debug-overlay")
+            || document.getElementById("performance-overlay");
+        if (!overlay) return;
         if (!ttlRow) {
-            ttlRow = document.createElement("div");
+            ttlRow = document.getElementById("ttl-inline-row") || document.createElement("div");
             ttlRow.id = "ttl-inline-row";
-            ttlRow.style.color = "#9f9";
-            ttlRow.style.fontWeight = "bold";
-            ttlRow.style.marginTop = "2px";
-            ttlRow.style.pointerEvents = "none";
-            if (buildLine && buildLine.parentElement) {
-                buildLine.insertAdjacentElement("afterend", ttlRow);
-            } else if (overlay) {
-                overlay.appendChild(ttlRow);
-            }
+            Object.assign(ttlRow.style, {color:"#9f9",fontWeight:"bold",marginTop:"2px",pointerEvents:"none"});
         }
-        ttlRow.textContent = "⏳ TTL: " + calculateTTL();
+        const now = Date.now();
+        if (!ttlLastUpdateAt || now - ttlLastUpdateAt >= 1000) {
+            ttlLastUpdateAt = now;
+            ttlRow.textContent = "⏳ TTL: " + calculateTTL();
+        }
+        if (ttlRow.parentElement !== overlay) overlay.appendChild(ttlRow);
     }
 
     // ---- TTL install / uninstall ----
@@ -60023,55 +60009,53 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
 
     function installTTL() {
         if (uiTweaksDestroyed || !config.ttlEnabled) return;
-        if (ttlState.installed)
-            return;
-        const debuggerInstance = gameClient?.renderer?.debugger;
-        if (!debuggerInstance) {
+        const instance = window.gameClient?.renderer?.debugger;
+        if (ttlState.installed && ttlState.debuggerInstance === instance) return;
+        if (ttlState.installed) uninstallTTL();
+        if (!instance || typeof instance.renderStatistics !== "function") {
             if (ttlInstallTimer) clearTimeout(ttlInstallTimer);
-            ttlInstallTimer = setTimeout(() => {
-                ttlInstallTimer = null;
-                installTTL();
-            }, 500);
+            ttlInstallTimer = setTimeout(() => {ttlInstallTimer = null;installTTL();}, 500);
             return;
         }
-        ttlState.debuggerInstance = debuggerInstance;
-        const proto = Object.getPrototypeOf(debuggerInstance);
-        if (!proto.renderStatistics)
-            return;
-        ttlState.originalRenderStatistics = proto.renderStatistics;
-        proto.renderStatistics = function () {
-            ttlState.originalRenderStatistics.call(this);
-            updateTTLRow();
+        if (ttlInstallTimer) clearTimeout(ttlInstallTimer);
+        ttlInstallTimer = null;
+        const original = instance.renderStatistics;
+        ttlState.debuggerInstance = instance;
+        ttlState.originalRenderStatistics = original;
+        ttlState.hadOwnMethod = Object.prototype.hasOwnProperty.call(instance,"renderStatistics");
+        const wrapped = function () {
+            const result = original.apply(this,arguments);
+            if (this === instance && ttlState.wrapper === wrapped) updateTTLRow();
+            return result;
         };
-        debuggerInstance.renderStatistics = proto.renderStatistics;
+        ttlState.wrapper = wrapped;
+        instance.renderStatistics = wrapped;
         ttlState.installed = true;
-        if (!ttlState.intervalId) {
-            ttlState.intervalId = setInterval(() => {
-                if (document.getElementById("ttl-inline-row")) {
-                    updateTTLRow();
-                }
-            }, 2000);
-        }
+        updateTTLRow();
+        ttlState.intervalId = setInterval(() => {
+            if (uiTweaksDestroyed || !config.ttlEnabled) return;
+            installTTL(); // Rebind if reconnect replaces the debugger instance.
+            updateTTLRow();
+        }, 1000);
         bot.log("[TTL] Hook installed.");
     }
 
     function uninstallTTL() {
         ttlLastUpdateAt = 0;
-        if (ttlInstallTimer) {
-            clearTimeout(ttlInstallTimer);
-            ttlInstallTimer = null;
+        if (ttlInstallTimer) clearTimeout(ttlInstallTimer);
+        ttlInstallTimer = null;
+        if (ttlState.intervalId) clearInterval(ttlState.intervalId);
+        ttlState.intervalId = null;
+        const instance = ttlState.debuggerInstance;
+        if (instance && instance.renderStatistics === ttlState.wrapper) {
+            if (ttlState.hadOwnMethod) instance.renderStatistics = ttlState.originalRenderStatistics;
+            else delete instance.renderStatistics;
         }
-        if (ttlState.intervalId) {
-            clearInterval(ttlState.intervalId);
-            ttlState.intervalId = null;
-        }
-        if (ttlState.debuggerInstance && ttlState.originalRenderStatistics) {
-            const proto = Object.getPrototypeOf(ttlState.debuggerInstance);
-            proto.renderStatistics = ttlState.originalRenderStatistics;
-            ttlState.debuggerInstance.renderStatistics = ttlState.originalRenderStatistics;
-            ttlState.originalRenderStatistics = null;
-            ttlState.debuggerInstance = null;
-        }
+        ttlState.originalRenderStatistics = null;
+        ttlState.debuggerInstance = null;
+        ttlState.wrapper = null;
+        ttlRow?.remove();
+        ttlRow = null;
         document.getElementById("ttl-inline-row")?.remove();
         ttlState.installed = false;
         bot.log("[TTL] Hook uninstalled.");
