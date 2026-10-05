@@ -3058,7 +3058,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.98",
+        version: "1.6.99",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -23131,6 +23131,15 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
         return aliases[raw] || null;
     }
 
+    function normalizeMobNames(value) {
+        const names = Array.isArray(value) ? value : String(value || "").split(/[,;\n]+/);
+        return [...new Set(names.map(name => String(name).trim().toLowerCase()).filter(Boolean))];
+    }
+
+    function matchesRuleMob(rule, monster) {
+        return !rule.mobNames?.length || rule.mobNames.includes(String(monster?.name || "").trim().toLowerCase());
+    }
+
     function normalizeRules(rules) {
         const out = [];
         (Array.isArray(rules) ? rules : []).forEach((rule, index) => {
@@ -23139,11 +23148,12 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
             out.push({
                 rune,
                 minCreatures: Math.max(1, Math.min(30, Math.trunc(Number(rule?.minCreatures ?? rule?.creatureCount ?? 1) || 1))),
+                mobNames: normalizeMobNames(rule?.mobNames),
                 _order:index,
             });
         });
         out.sort((a,b) => b.minCreatures - a.minCreatures || a._order - b._order);
-        return out.map(({rune,minCreatures}) => ({rune,minCreatures}));
+        return out.map(({rune,minCreatures,mobNames}) => ({rune,minCreatures,mobNames}));
     }
     config.rules = normalizeRules(config.rules);
 
@@ -23252,6 +23262,7 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
             if (p && hasLos(p)) return current;
         }
         for (const m of getEligibleMonsters(true)) {
+            if (!monsters.some(candidate => Number(candidate.id) === Number(m.id))) continue;
             const p = monsterPos(m);
             if (p && hasLos(p)) return m;
             state.skippedNoLos++;
@@ -23292,7 +23303,7 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
             );
     }
 
-    function getBestAoeTarget(runeKey, monsters) {
+    function getBestAoeTarget(runeKey, monsters, rule) {
         const offsets = SHAPES[runeKey];
         if (!offsets?.length || !monsters?.length) return null;
         const me = normalizePosition(bot.getPlayerPosition());
@@ -23344,7 +23355,7 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
                 if (Number(e.monster.id) === currentId) includesCurrent = true;
                 distanceSum += dist(me,e.pos);
             }
-            if (!hits.length) continue;
+            if (!hits.length || !hits.some(monster => matchesRuleMob(rule, monster))) continue;
             const candidate = {
                 position:center, hits, hitCount:hits.length, includesCurrent,
                 centerDistance:dist(me,center), distanceSum
@@ -23457,8 +23468,10 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
         const supply = getRuneCountState(def.key, now);
         if (!supply.known || supply.count <= 0) { state.skippedNoSupply++; return false; }
 
-        const target = def.mode === "creature" ? getSingleTarget(monsters) : null;
-        const aoe = def.mode === "aoe" ? getBestAoeTarget(def.key, monsters) : null;
+        const matchingMonsters = monsters.filter(monster => matchesRuleMob(rule, monster));
+        if (!matchingMonsters.length) return false;
+        const target = def.mode === "creature" ? getSingleTarget(matchingMonsters) : null;
+        const aoe = def.mode === "aoe" ? getBestAoeTarget(def.key, monsters, rule) : null;
         if (def.mode === "creature" && !target) return false;
         if (def.mode === "aoe" && !aoe) return false;
 
@@ -51055,6 +51068,8 @@ function upgradeSectionHeaders(panel) {
         const save = document.getElementById("minibia-bot-rune-shooter-save");
         if (type) type.value = "sd";
         if (count) count.value = "1";
+        const names = document.getElementById("minibia-bot-rune-shooter-mob-names");
+        if (names) names.value = "";
         if (save) save.textContent = "Add Rule";
         runeShooterEditIndex = null;
     }
@@ -51065,6 +51080,8 @@ function upgradeSectionHeaders(panel) {
         const save = document.getElementById("minibia-bot-rune-shooter-save");
         if (type) type.value = rule?.rune || "sd";
         if (count) count.value = String(rule?.minCreatures ?? 1);
+        const names = document.getElementById("minibia-bot-rune-shooter-mob-names");
+        if (names) names.value = (rule?.mobNames || []).join(", ");
         if (save) save.textContent = "Update Rule";
         runeShooterEditIndex = index;
     }
@@ -51128,6 +51145,10 @@ function upgradeSectionHeaders(panel) {
             mode.textContent = def?.mode === "aoe" ? "AoE auto-aim" : "single target";
             mode.style.cssText = "opacity:0.72;";
             info.appendChild(mode);
+            const names = document.createElement("span");
+            names.textContent = rule.mobNames?.length ? `Mobs: ${rule.mobNames.join(", ")}` : "Any mob";
+            names.style.cssText = "color:#e9d39b;";
+            info.appendChild(names);
 
             const qty = document.createElement("span");
             qty.textContent = supply?.known ? `×${supply.count}` : "×?";
@@ -51172,7 +51193,9 @@ function upgradeSectionHeaders(panel) {
         if (count) count.value = String(minCreatures);
 
         const rules = (bot.runeShooter?.config?.rules || []).map(entry => ({...entry}));
-        const next = { rune, minCreatures };
+        const mobNames = String(document.getElementById("minibia-bot-rune-shooter-mob-names")?.value || "")
+            .split(/[,;\n]+/).map(name => name.trim()).filter(Boolean);
+        const next = { rune, minCreatures, mobNames };
 
         if (runeShooterEditIndex !== null && runeShooterEditIndex >= 0 && runeShooterEditIndex < rules.length)
             rules[runeShooterEditIndex] = next;
@@ -54641,6 +54664,12 @@ function upgradeSectionHeaders(panel) {
           <input type="number" id="minibia-bot-rune-shooter-count" min="1" max="30" value="1" style="padding:3px 4px;font-size:11px;" />
         </label>
       </div>
+
+      <label class="mb-field" style="margin-top:6px;">
+        <span class="mb-field-label" style="font-size:10px;">Mob names (blank = any mob)</span>
+        <input type="text" id="minibia-bot-rune-shooter-mob-names" placeholder="Dragon Lord, Demon" style="padding:3px 4px;font-size:11px;" />
+      </label>
+      <div class="mb-small-note">Exact names, separated by commas; ignores letter case. AoE must hit a matching mob and may also hit others. Creature Count keeps its existing meaning.</div>
 
       <div style="display:flex;gap:6px;margin-top:6px;">
         <button type="button" class="mb-small-button" id="minibia-bot-rune-shooter-save" style="flex:1;">Add Rule</button>
