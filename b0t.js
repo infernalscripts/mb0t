@@ -3058,7 +3058,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.102",
+        version: "1.6.106",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -26152,6 +26152,10 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             return false;
 
         const noWayPosition = normalizePosition(bot.getPlayerPosition());
+        // Rope can already be used here. A native path rejection (including a
+        // delayed message from the previous Stand) must not skip the action.
+        if (currentWp.rope && isBesideOrSameTile(noWayPosition, currentWp))
+            return false;
         if (
             config.autoTransitions === true &&
             noWayPosition &&
@@ -29784,6 +29788,10 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         if (!from || !waypoint)
             return false;
         bot.stopScriptFollowForCaveNavigation?.();
+        // Advancing from Stand to Rope must not ask Pathfinder to walk onto an
+        // action tile that is already within use range. Let the Rope tick act.
+        if (waypoint.rope && isBesideOrSameTile(from, waypoint))
+            return true;
         const to = new Position(waypoint.x, waypoint.y, waypoint.z);
 
         // v1.6.74 Special Areas: ordinary same-floor Cave travel uses the
@@ -34064,8 +34072,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                     return;
                 }
 
-                // ---- ADJACENCY CHECK (Chebyshev) ----
-                const adj = isAdjacentTile(position, waypoint);
+                // Rope use is valid beside or directly on the rope spot.
+                const adj = isBesideOrSameTile(position, waypoint);
                 if (!adj) {
                     const adjPos = findAdjacentWalkablePosition(waypoint, position);
                     if (adjPos) {
@@ -46666,6 +46674,10 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
         const stepTransitions = new Set(['floor-down', 'floor-up', 'stairs-up', 'stairs-down']);
         const directions = {here:[0,0], n:[0,-1], ne:[1,-1], e:[1,0], se:[1,1], s:[0,1], sw:[-1,1], w:[-1,0], nw:[-1,-1]};
         const types = new Set(['walk', 'stand', 'rope', 'shovel', 'ladder', 'ladder-up', 'ladder-down', 'use', 'script', ...stepTransitions]);
+        let previousStepTransitionKey = null;
+        let previousStepStart = -1;
+        let previousStepSource = null;
+        let coveredShovelStep = null;
         for (const [index, wp] of data.route.entries()) {
             if (wp?.enabled === false) continue;
             if (!wp || typeof wp !== 'object') throw new Error(`Waypoint ${index + 1}: invalid entry.`);
@@ -46677,12 +46689,23 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
             if (type === 'script' && (typeof script !== 'string' || !script.trim()))
                 throw new Error(`Waypoint ${index + 1}: missing script code.`);
             if (type !== 'script' && !valid) throw new Error(`Waypoint ${index + 1}: invalid position.`);
+            if (!stepTransitions.has(type)) previousStepTransitionKey = null;
             if (stepTransitions.has(type)) {
                 const direction = String(wp.params?.transitionTarget || '').trim().toLowerCase();
                 const delta = directions[direction];
                 if (!Object.prototype.hasOwnProperty.call(directions, direction))
                     throw new Error(`Waypoint ${index + 1}: invalid or missing transition direction "${direction}".`);
+                const target = {x:pos.x + delta[0], y:pos.y + delta[1], z:pos.z};
+                const sameTile = (a,b) => a && b && a.x === b.x && a.y === b.y && a.z === b.z;
+                if (type === 'floor-down' && coveredShovelStep &&
+                    sameTile(pos, coveredShovelStep.source) && sameTile(target, coveredShovelStep.target)) continue;
+                coveredShovelStep = null;
+                const transitionKey = JSON.stringify([type, pos.x, pos.y, pos.z, direction, String(wp.label || '').trim()]);
+                if (transitionKey === previousStepTransitionKey) continue;
+                previousStepTransitionKey = transitionKey;
                 const label = String(wp.label || '').trim() || type;
+                previousStepStart = route.length;
+                previousStepSource = {type, source:{...pos}, target};
                 // Explicit approach + step-on tile: neither is consumed by Skip SQM.
                 // Native Stand floor-change handling advances after holes/stairs.
                 route.push({x:pos.x, y:pos.y, z:pos.z, stand:true, label:`${label} (approach)`});
@@ -46700,9 +46723,18 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
                     throw new Error(`Waypoint ${index + 1}: invalid target direction "${direction}".`);
                 const delta = directions[direction];
                 targetPos = {x:pos.x + delta[0], y:pos.y + delta[1], z:pos.z};
-                // Preserve the approach before stepping/using the adjacent target.
-                route.push({x:pos.x, y:pos.y, z:pos.z, stand:true, label:`${String(wp.label || type).trim()} (approach)`});
+                // Tools/ladders handle their own approach; Stand navigates directly.
+                if (type === 'use')
+                    route.push({x:pos.x, y:pos.y, z:pos.z, stand:true, label:`${String(wp.label || type).trim()} (approach)`});
             }
+            const sameImportTile = (a,b) => a && b && a.x === b.x && a.y === b.y && a.z === b.z;
+            if (type === 'rope' && previousStepSource &&
+                ['stairs-up', 'floor-up'].includes(previousStepSource.type) &&
+                sameImportTile(pos, previousStepSource.source) && sameImportTile(targetPos, previousStepSource.target)) {
+                route.splice(previousStepStart);
+            }
+            previousStepSource = null;
+            coveredShovelStep = type === 'shovel' ? {source:{...pos}, target:{...targetPos}} : null;
             if (type === 'use') {
                 if (targetPos === pos)
                     route.push({x:pos.x, y:pos.y, z:pos.z, stand:true, label:'USE (approach)'});
