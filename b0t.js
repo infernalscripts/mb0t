@@ -3058,7 +3058,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.106",
+        version: "1.6.111",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -8067,6 +8067,186 @@ window.__minibiaBotBundle.installAutoMagicShieldModule = function installAutoMag
  *    handled exclusively by the separate Rune Shooter module.
  * ==================================================================================
  */
+window.__minibiaBotBundle.installCombatRulesModule = function(bot) {
+    const key = 'minibiaBot.combatRules.config';
+    const modes = ['inherit','attack','melee','client-chase','kite','lure','ignore'];
+    const runes = ['sd','gfb','fb','hmm','lmm','explo'];
+    const config = {enabled:false,rules:[],...bot.storage.get(key,{})};
+    let cached = null, cachedAt = 0;
+    let matchCache = new Map(), targetCache = new Map();
+    const spellState={lastAttemptAt:0,lastSpell:null,blockedReason:null};
+    const position = m => m?.getPosition?.() || m?.__position;
+    const distance = (a,b) => !a || !b || Number(a.z)!==Number(b.z) ? Infinity : Math.max(Math.abs(a.x-b.x),Math.abs(a.y-b.y));
+    const clamp = (value,min,max,fallback) => Number.isFinite(Number(value)) ? Math.max(min,Math.min(max,Number(value))) : fallback;
+    function normalize(r) {
+        const minHp=clamp(r.minHp,0,100,0), maxHp=clamp(r.maxHp,0,100,100);
+        const minCount=Math.trunc(clamp(r.minCount,1,100,1)), maxCount=Math.trunc(clamp(r.maxCount,1,100,100));
+        if(minHp>maxHp || minCount>maxCount) throw new Error('Minimum must not exceed maximum.');
+        return {enabled:r.enabled!==false,names:[...new Set((Array.isArray(r.names)?r.names:String(r.names||'').split(/[,;\n]+/)).map(n=>String(n).trim().toLowerCase()).filter(Boolean))],minHp,maxHp,minCount,maxCount,
+            range:Math.trunc(clamp(r.range,1,8,8)),mode:modes.includes(r.mode)?r.mode:'inherit',rune:runes.includes(r.rune)?r.rune:'',exori:r.exori===true,position:['inherit','any','front','diagonal'].includes(r.position)?r.position:'inherit',
+            spellWords:String(r.spellWords||'').trim().slice(0,160),spellMana:Math.trunc(clamp(r.spellMana,0,100000,0)),spellAim:r.spellAim==='area'?'area':'target'};
+    }
+    config.rules=(Array.isArray(config.rules)?config.rules:[]).map(r=>{try{return normalize(r)}catch{return null}}).filter(Boolean);
+    function invalidate(){cached=null;cachedAt=0;matchCache.clear();targetCache.clear();}
+    function monsters(){
+        const now=Date.now();
+        if(cached && now-cachedAt<50) return cached;
+        matchCache.clear();targetCache.clear();cached=bot.attack?.getVisibleCombatMonsters?.() || [];cachedAt=now;return cached;
+    }
+    function matchOne(rule,m) {
+        if(!rule?.enabled || !m) return false;
+        const hp=Number(m.state?.health ?? m.health);
+        if(!Number.isFinite(hp) || hp<=0 || hp<rule.minHp || hp>rule.maxHp) return false;
+        return (!rule.names.length || rule.names.includes(String(m.name||'').trim().toLowerCase())) && distance(bot.getPlayerPosition(),position(m))<=rule.range;
+    }
+    function matching(rule,list=monsters()){
+        if(list===cached && matchCache.has(rule))return matchCache.get(rule);
+        const result=list.filter(m=>matchOne(rule,m));if(list===cached)matchCache.set(rule,result);return result;
+    }
+    function meetsCount(rule,list=monsters()){const n=matching(rule,list).length;return n>=rule.minCount&&n<=rule.maxCount;}
+    function targetRule(m){
+        if(!config.enabled) return null;
+        monsters();if(targetCache.has(m))return targetCache.get(m);
+        const result=config.rules.find(r=>(r.mode!=='inherit'||r.position!=='inherit')&&matchOne(r,m)&&meetsCount(r)) || null;targetCache.set(m,result);return result;
+    }
+    function targetPriority(m){const r=targetRule(m);return r?config.rules.indexOf(r):100000;}
+    function activeTargetRule(){
+        if(!config.enabled) return null;
+        const current=bot.attack?.getCurrentTarget?.();
+        const currentRule=current&&targetRule(current);
+        if(currentRule&&currentRule.mode!=='ignore'&&!bot.attack?.isLegacyIgnoredTarget?.(current))return currentRule;
+        for(const rule of config.rules){
+            if((rule.mode==='inherit'&&rule.position==='inherit')||rule.mode==='ignore'||!meetsCount(rule))continue;
+            if(matching(rule).some(m=>!bot.attack?.isLegacyIgnoredTarget?.(m)&&targetRule(m)===rule))return rule;
+        }
+        return null;
+    }
+    function runeRules(list){
+        if(!config.enabled)return null;
+        return config.rules.filter(r=>r.rune&&meetsCount(r,list)).map(r=>({rune:r.rune,minCreatures:r.minCount,mobNames:r.names,combatRule:r}));
+    }
+    function exoriRule(list){return config.enabled?config.rules.find(r=>r.exori&&meetsCount(r,list))||null:null;}
+    function trySpellRules() {
+        const block=reason=>{spellState.blockedReason=reason;return false;};
+        const client=window.gameClient, now=Date.now();
+        if(!config.enabled||!bot.attack?.isRunning?.()||bot.actions?.isHalted?.()||!client?.networkManager?.isConnected?.())return block('inactive');
+        if(bot.attack?.isProtectionZoneBlocked?.(now))return block('protection zone');
+        if(now-spellState.lastAttemptAt<350)return block('awaiting spell acknowledgement');
+        const heal=bot.heal;
+        try {if(heal?.status?.().running&&(heal.tryHeal?.()===true||heal.hasPendingAction?.()===true||heal.needsPriorityAction?.()===true))return block('healing priority');}
+        catch(e){return block('healing priority');}
+        const spells=client.interface?.SPELLS, spellbook=client.player?.spellbook;
+        if(!spells?.forEach||!spellbook?.cooldowns?.has)return block('spell definitions unavailable');
+        const visible=monsters();
+        for(const rule of config.rules){
+            if(!rule.spellWords||!meetsCount(rule,visible))continue;
+            if(rule.spellAim==='target'){
+                const target=bot.attack.getCurrentTarget?.();
+                if(!target||!visible.some(m=>Number(m.id)===Number(target.id))||!matchOne(rule,target))continue;
+                if(bot.attack.getProjectileLineOfSightToPosition?.(position(target))!==true)continue;
+            }
+            const requireFront=rule.position==='front'||(rule.position==='inherit'&&bot.attack?.config?.keepFront===true);
+            if(requireFront){
+                const current=bot.attack.getCurrentTarget?.();
+                const anchor=current&&matchOne(rule,current)?current:rule.spellAim==='area'?matching(rule,visible)[0]:null;
+                const playerPos=bot.getPlayerPosition(), mobPos=position(anchor);
+                const aligned=playerPos&&mobPos&&Number(playerPos.z)===Number(mobPos.z)&&
+                    ((Number(playerPos.x)===Number(mobPos.x)) !== (Number(playerPos.y)===Number(mobPos.y)));
+                if(!aligned){spellState.blockedReason='waiting for Front alignment';continue;}
+            }
+            let definition=null,sid=null;
+            const words=rule.spellWords.toLowerCase();
+            spells.forEach((spell,id)=>{if(sid==null&&String(spell?.words||'').trim().toLowerCase()===words){sid=Number(id);definition=spell;}});
+            if(!Number.isFinite(sid)||!definition){spellState.blockedReason='unknown spell: '+rule.spellWords;continue;}
+            const bucket=typeof spellbook.__bucketFor==='function'?spellbook.__bucketFor(sid):spellbook.GLOBAL_COOLDOWN;
+            if(spellbook.cooldowns.has(sid)||(bucket!=null&&spellbook.cooldowns.has(bucket))){spellState.blockedReason='spell cooldown';continue;}
+            const rawMana=bot.mana?.(), mana=rawMana==null?NaN:Number(rawMana);
+            if(!Number.isFinite(mana)||mana<Math.max(rule.spellMana,Number(definition.mana)||0)){spellState.blockedReason='mana';continue;}
+            const action=()=>bot.sendChat(rule.spellWords);
+            const sent=bot.actions?.runShared?bot.actions.runShared('combat-rule-spell',bot.actions.priorities.COMBAT,action):action();
+            if(sent){spellState.lastAttemptAt=now;spellState.lastSpell=rule.spellWords;spellState.blockedReason=null;bot.log?.('Combat Rules: spell requested',{spell:rule.spellWords,aim:rule.spellAim});return true;}
+        }
+        return false;
+    }
+    function armActions(){
+        if(!config.enabled)return;
+        if(config.rules.some(r=>r.enabled&&r.rune)){bot.runeShooter?.start?.();bot.runeShooter?.requestCounts?.();}
+        if(config.rules.some(r=>r.enabled&&r.exori))bot.exori?.start?.();
+    }
+    function updateConfig(next){
+        const rules=next.rules===undefined?config.rules:next.rules.map(normalize);
+        config.enabled=next.enabled===undefined?config.enabled:next.enabled===true;config.rules=rules;invalidate();
+        bot.attack?.clearCombatRuleMode?.();
+        bot.storage.set(key,{enabled:config.enabled,rules:config.rules});armActions();return config;
+    }
+    function mount(panel){
+        const host=panel.querySelector('[data-tab-panel="targeting"]');if(!host)return;
+        const box=document.createElement('div');box.className='mb-section mb-combat-rules';host.prepend(box);
+        box.innerHTML=`<style>
+        #minibia-bot-panel .mb-combat-rules {font-size:11px;}
+        #minibia-bot-panel .mb-combat-rules .cr-toolbar {display:flex;align-items:center;justify-content:space-between;gap:8px;}
+        #minibia-bot-panel .mb-combat-rules .cr-form {display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:8px;}
+        #minibia-bot-panel .mb-combat-rules .cr-range {display:flex;align-items:center;gap:5px;}
+        #minibia-bot-panel .mb-combat-rules .cr-range input {min-width:0;flex:1;width:0;}
+        #minibia-bot-panel .mb-combat-rules input:not([type=checkbox]),
+        #minibia-bot-panel .mb-combat-rules select {height:27px;min-height:0;padding:3px 6px;font-size:11px;}
+        #minibia-bot-panel .mb-combat-rules input[type=checkbox] {width:13px!important;height:13px!important;min-width:13px!important;min-height:0!important;padding:0!important;margin:0!important;flex:0 0 13px;vertical-align:middle;}
+        #minibia-bot-panel .mb-combat-rules .cr-check {display:flex;flex-direction:row;align-items:center;gap:6px;font-size:11px;white-space:nowrap;}
+        #minibia-bot-panel .mb-combat-rules .cr-card {padding:7px 0;border-bottom:1px solid rgba(255,255,255,.08);min-width:0;}
+        #minibia-bot-panel .mb-combat-rules .cr-card-title {font-weight:700;color:var(--mb-hub-gold,#d4c48a);overflow-wrap:anywhere;}
+        #minibia-bot-panel .mb-combat-rules .cr-card-meta {font-size:10px;color:var(--mb-hub-text-2,#aaa);margin:3px 0 5px;overflow-wrap:anywhere;}
+        #minibia-bot-panel .mb-combat-rules .cr-actions {display:flex;gap:4px;flex-wrap:wrap;}
+        #minibia-bot-panel .mb-combat-rules .cr-actions button {padding:3px 7px;font-size:10px;}
+        #minibia-bot-panel .mb-combat-rules [hidden] {display:none!important;}
+        #minibia-bot-panel .mb-combat-rules details {font-size:10px;line-height:1.4;margin-top:7px;color:var(--mb-hub-text-2,#aaa);}
+        </style>
+        <div class="cr-toolbar">
+          <div class="mb-section-title" style="margin:0;flex:1"><input type="checkbox" data-cr="enabled" class="mb-title-toggle"><span class="mb-title-text">Combat Rules</span></div>
+          <button type="button" class="mb-small-button" data-cr="new">+ New Rule</button>
+        </div>
+        <div data-cr="list" style="margin:5px 0"></div>
+        <div data-cr="editor" style="border-top:1px solid rgba(255,255,255,.08);padding-top:8px">
+          <div class="cr-form">
+            <label class="mb-field" style="grid-column:1/-1"><span class="mb-field-label">Monster names</span><input data-cr="names" placeholder="Any monster — or Dragon Lord, Demon"></label>
+            <div class="mb-field"><span class="mb-field-label">Monster HP %</span><div class="cr-range"><input data-cr="minHp" type="number" min="0" max="100" value="0" aria-label="Minimum monster HP"><span>–</span><input data-cr="maxHp" type="number" min="0" max="100" value="100" aria-label="Maximum monster HP"></div></div>
+            <div class="mb-field"><span class="mb-field-label">Monster count</span><div class="cr-range"><input data-cr="minCount" type="number" min="1" max="100" value="1" aria-label="Minimum monster count"><span>–</span><input data-cr="maxCount" type="number" min="1" max="100" value="100" aria-label="Maximum monster count"></div></div>
+            <label class="mb-field"><span class="mb-field-label">Target mode</span><select data-cr="mode"><option value="inherit">Default / action only</option><option value="attack">Attack · no chase</option><option value="melee">Melee · bot chase</option><option value="client-chase">Client Chase</option><option value="kite">Kite</option><option value="lure">Lure</option><option value="ignore">Ignore targeting</option></select></label>
+            <label class="mb-field"><span class="mb-field-label">Range · SQM</span><input data-cr="range" type="number" min="1" max="8" value="8"></label>
+            <label class="mb-field"><span class="mb-field-label">Position · melee</span><select data-cr="position"><option value="inherit">Use Core setting</option><option value="any">Any adjacent tile</option><option value="front">Front · straight tile</option><option value="diagonal">Diagonal tile</option></select></label>
+            <label class="mb-field"><span class="mb-field-label">Attack spell</span><input data-cr="spellWords" placeholder="exori vis (blank = none)"></label>
+            <label class="mb-field"><span class="mb-field-label">Spell aim</span><select data-cr="spellAim"><option value="target">Matching current target</option><option value="area">Area · no target needed</option></select></label>
+            <label class="mb-field"><span class="mb-field-label">Min mana · 0 = spell cost</span><input data-cr="spellMana" type="number" min="0" value="0"></label>
+            <label class="mb-field"><span class="mb-field-label">Rune</span><select data-cr="rune"><option value="">None</option>${runes.map(r=>`<option value="${r}">${r.toUpperCase()}</option>`).join('')}</select></label>
+            <label class="cr-check" style="align-self:end;height:27px"><input type="checkbox" data-cr="exori"><span>Cast Exori</span></label>
+          </div>
+          <div class="cr-toolbar" style="margin-top:9px"><label class="cr-check"><input type="checkbox" data-cr="ruleEnabled" checked><span>Rule enabled</span></label><div class="cr-actions"><button type="button" class="mb-small-button" data-cr="save">Add Rule</button><button type="button" class="mb-small-button" data-cr="cancel">Cancel</button></div></div>
+        </div>
+        <div data-cr="message" class="mb-small-note" style="margin-top:4px"></div>
+        <details><summary>How rules work</summary><div style="margin-top:5px">Blank names match any monster. HP refers to monster health; count counts matching monsters within range. Top matching rule wins for target mode. Rune and Exori actions run independently. Ignore + Rune shoots without selecting the monster.<br>Combat Rules replace the old Rune Shooter rules and Exori count trigger when enabled. Unmatched targets use Core Targeting. Kite/Lure settings and existing mana, cooldown, healing and player-safety checks remain in use. Exori and spell actions require Targeting running. Front means north/south/east/west of the monster. Targeted spells require a matching selected mob and LOS; area spells use matching counts. Native spell cooldown and mana checks apply.</div></details>`;
+        const q=k=>box.querySelector(`[data-cr="${k}"]`);let edit=null;
+        function reset(){edit=null;for(const [k,v]of Object.entries({names:'',minHp:0,maxHp:100,minCount:1,maxCount:100,range:8,mode:'inherit',rune:'',position:'inherit',spellWords:'',spellAim:'target',spellMana:0}))q(k).value=v;q('exori').checked=false;q('ruleEnabled').checked=true;q('save').textContent='Add Rule';q('editor').hidden=config.rules.length>0;}
+        function render(){q('enabled').checked=config.enabled;const list=q('list');list.replaceChildren();
+            if(!config.rules.length){const empty=document.createElement('div');empty.className='mb-small-note';empty.textContent='No rules yet. Add your first rule below.';list.append(empty);}
+            const modeLabels={inherit:'Default',attack:'Attack',melee:'Melee','client-chase':'Client Chase',kite:'Kite',lure:'Lure',ignore:'Ignore'};
+            config.rules.forEach((r,i)=>{
+                const row=document.createElement('div');row.className='cr-card';
+                const title=document.createElement('div');title.className='cr-card-title';title.textContent=`${i+1}. ${r.names.join(', ')||'Any monster'}${r.enabled?'':' · Disabled'}`;
+                const meta=document.createElement('div');meta.className='cr-card-meta';meta.textContent=`HP ${r.minHp}–${r.maxHp}% · ${r.minCount}–${r.maxCount} mobs · ${r.range} SQM · ${modeLabels[r.mode]}${r.rune?' · '+r.rune.toUpperCase():''}${r.exori?' · Exori':''}${r.position!=='inherit'?' · '+r.position:''}${r.spellWords?' · '+r.spellWords:''}`;
+                const actions=document.createElement('div');actions.className='cr-actions';
+                for(const [label,fn]of [['Edit',()=>{edit=i;q('editor').hidden=false;for(const k of ['minHp','maxHp','minCount','maxCount','range','mode','rune','position','spellWords','spellAim','spellMana'])q(k).value=r[k];q('names').value=r.names.join(', ');q('exori').checked=r.exori;q('ruleEnabled').checked=r.enabled;q('save').textContent='Update Rule';}],['↑',()=>move(i,-1)],['↓',()=>move(i,1)],['Remove',()=>{const next=config.rules.slice();next.splice(i,1);updateConfig({rules:next});reset();render();}]]){const button=document.createElement('button');button.type='button';button.className='mb-small-button';button.textContent=label;button.title=label==='↑'?'Move rule up':label==='↓'?'Move rule down':label;button.addEventListener('click',fn);actions.append(button);}
+                row.append(title,meta,actions);list.append(row);
+            });
+        }
+        function move(i,d){const j=i+d;if(j<0||j>=config.rules.length)return;const next=config.rules.slice();[next[i],next[j]]=[next[j],next[i]];updateConfig({rules:next});reset();render();}
+        q('new').addEventListener('click',()=>{reset();q('editor').hidden=false;q('message').textContent='';q('names').focus();});
+        q('enabled').addEventListener('change',()=>updateConfig({enabled:q('enabled').checked}));
+        q('save').addEventListener('click',()=>{try{const r={};for(const k of ['names','minHp','maxHp','minCount','maxCount','range','mode','rune','position','spellWords','spellAim','spellMana'])r[k]=q(k).value;r.enabled=q('ruleEnabled').checked;r.exori=q('exori').checked;const next=config.rules.slice();if(edit===null)next.push(r);else next[edit]=r;updateConfig({rules:next});reset();render();q('message').textContent='Rule saved.';}catch(e){q('message').textContent=e.message;}});
+        q('cancel').addEventListener('click',reset);reset();render();
+    }
+    bot.combatRules={config,updateConfig,targetRule,targetPriority,activeTargetRule,matchOne,matching,meetsCount,runeRules,exoriRule,armActions,mount,invalidate,trySpellRules,status:()=>({...spellState})};
+    bot.addCleanup(()=>{invalidate();bot.attack?.clearCombatRuleMode?.();});
+};
+
 window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackModule(bot) {
     const configStorageKey = "minibiaBot.attack.config";
     const state = {
@@ -8640,6 +8820,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         kiteStuckCount: 0,
         unreachableStart: 0,
         keepDiagonal: false,
+        keepFront: false,
 
         // v1.5.53: smoother route-aware kite defaults. Kite movement is
         // cardinal-first; diagonal movement is emergency fallback only.
@@ -8830,6 +9011,31 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
     // ---- Constants for floor-change detection (copied from cave module) ----
 
+    let combatRuleModeBase = null;
+    let lastCombatRuleMode = null;
+    function clearCombatRuleMode() {
+        if (combatRuleModeBase) Object.assign(config, combatRuleModeBase);
+        combatRuleModeBase = null;
+        invalidateCandidateSnapshot();
+    }
+    function applyCombatRuleMode() {
+        clearCombatRuleMode();
+        bot.combatRules?.invalidate?.();
+        const rule = bot.combatRules?.activeTargetRule?.();
+        const nextMode = rule?.mode || null;
+        if (nextMode !== lastCombatRuleMode) {
+            stopKiteAutoWalk("combat rule changed");
+            stopManualTargetPursuitAutoWalk("combat rule changed");
+            setClientChaseMode(false);
+            lastCombatRuleMode = nextMode;
+        }
+        if (!rule) return;
+        const keys = ['meleeMode','useClientChase','kiteMode','lureMode','keepDiagonal','keepFront'];
+        combatRuleModeBase = Object.fromEntries(keys.map(k => [k,config[k]]));
+        if(rule.mode!=='inherit') Object.assign(config, {meleeMode:rule.mode==='melee'||rule.mode==='client-chase',
+            useClientChase:rule.mode==='client-chase', kiteMode:rule.mode==='kite', lureMode:rule.mode==='lure'});
+        if(rule.position!=='inherit') Object.assign(config,{keepDiagonal:rule.position==='diagonal',keepFront:rule.position==='front'});
+    }
     function persistConfig() {
         // Never let retired hotbar-rune keys survive through direct config
         // mutation, profile restore, or future save-all calls.
@@ -8839,7 +9045,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         bot.storage.set(
             configStorageKey,
             stripLegacyAttackRuneConfig(
-                config
+                {...config, ...(combatRuleModeBase || {})}
             )
         );
     }
@@ -9425,8 +9631,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function isIgnoredTargetCreature(creature) {
-        return !!creature &&
-            isIgnoredTargetName(creature.name);
+        return !!creature && (isIgnoredTargetName(creature.name) ||
+            bot.combatRules?.targetRule?.(creature)?.mode === 'ignore');
     }
 
     function noteIgnoredTargetEvent(
@@ -11958,7 +12164,9 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function tryAttack() {
-        return withTargetingSnapshot(tryAttackDecision);
+        applyCombatRuleMode();
+        try { return withTargetingSnapshot(tryAttackDecision); }
+        finally { bot.combatRules?.trySpellRules?.(); }
     }
 
     function tryAttackDecision() {
@@ -13532,7 +13740,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         return true;
     }
 
-    function isNativeVisibleMonster(creature) {
+    function isNativeVisibleMonster(creature, ignoreModeLos = false) {
         const client = window.gameClient;
         const player = client?.player;
         const world = client?.world;
@@ -13579,7 +13787,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         }
 
         if (
-            config.kiteMode &&
+            !ignoreModeLos && config.kiteMode &&
             !hasKiteLineOfSight(
                 creature
             )
@@ -13593,7 +13801,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
     function getNearbyMonsters(sortByDistance = true) {
         const creatures = Object.values(window.gameClient?.world?.activeCreatures || {});
-        const monsters = creatures.filter(isNativeVisibleMonster);
+        const monsters = creatures.filter(creature => isNativeVisibleMonster(creature));
         return sortByDistance ? sortMonstersByPriority(monsters) : monsters;
     }
 
@@ -19920,7 +20128,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 return false;
 
             const monsterName = normalizeCreatureName(monster.name);
-            if (ignoredNames.has(monsterName))
+            if (ignoredNames.has(monsterName) || bot.combatRules?.targetRule?.(monster)?.mode === 'ignore')
                 return false;
 
             // Check the acquisition radius before any approach search. A mob
@@ -19963,6 +20171,9 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
         const candidates = scoredCandidates
         .sort((left, right) => {
+            const ruleDiff = (bot.combatRules?.targetPriority?.(left.monster) ?? 0) -
+                (bot.combatRules?.targetPriority?.(right.monster) ?? 0);
+            if (ruleDiff) return ruleDiff;
             if (left.score !== right.score)
                 return left.score - right.score;
             return Number(left.monster?.id || 0) - Number(right.monster?.id || 0);
@@ -21361,15 +21572,16 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             state.meleeProgressAt = 0;
             state.meleeStuckAt = 0;
 
-            // ---- Handle diagonal with cooldown ----
-            if (config.keepDiagonal) {
+            // ---- Correct Front/Diagonal positioning as soon as the current step finishes ----
+            if (config.keepDiagonal || config.keepFront) {
                 const dx = targetPos.x - playerPos.x;
                 const dy = targetPos.y - playerPos.y;
                 const isDiagonal = dx !== 0 && dy !== 0;
 
-                if (!isDiagonal && now - state.lastDiagonalCorrection > 2000) {
-                    state.lastDiagonalCorrection = now;
-                    const diagOffsets = [{
+                if ((config.keepFront ? isDiagonal : !isDiagonal) && now - state.lastDiagonalCorrection >= 150) {
+                    const movingPlayer=window.gameClient?.player;
+                    if(movingPlayer?.isMoving?.())return false;
+                    const diagOffsets = config.keepFront ? [{dx:1,dy:0},{dx:-1,dy:0},{dx:0,dy:1},{dx:0,dy:-1}] : [{
                             dx: 1,
                             dy: 1
                         }, {
@@ -21390,7 +21602,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                         const ny = targetPos.y + off.dy;
                         const d = Math.max(Math.abs(nx - playerPos.x), Math.abs(ny - playerPos.y));
                         if (
-                            d < bestDist &&
+                            d <= 1 && d < bestDist &&
                             isSafeTargetApproachTile(
                                 nx,
                                 ny,
@@ -21407,6 +21619,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                         const dyMove = (targetPos.y + bestOffset.dy) - playerPos.y;
                         const dir = getDirection(dxMove, dyMove);
                         if (dir !== null && window.gameClient?.keyboard) {
+                            state.lastDiagonalCorrection = now;
                             window.gameClient.keyboard.handleMoveKey(dir);
                             state.lastChaseAt = now;
                             state.lastMoveAt = now;
@@ -21819,6 +22032,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function stop(options = {}) {
+        clearCombatRuleMode();
         const shouldPersist = options.persistEnabled !== false;
         state.running = false;
         detachTargetAckHook();
@@ -22589,6 +22803,9 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function updateConfig(nextConfig = {}) {
+        clearCombatRuleMode();
+        if(nextConfig.keepFront===true)nextConfig={...nextConfig,keepDiagonal:false};
+        if(nextConfig.keepDiagonal===true)nextConfig={...nextConfig,keepFront:false};
         nextConfig =
             stripLegacyAttackRuneConfig(
                 nextConfig
@@ -23024,6 +23241,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         canAttack,
         triggerAttack,
         getNearbyMonsters,
+        clearCombatRuleMode,
+        getBaseConfig: () => ({...config, ...(combatRuleModeBase || {})}),
+        isLegacyIgnoredTarget: creature => !!creature && isIgnoredTargetName(creature.name),
+        getVisibleCombatMonsters: () => Object.values(window.gameClient?.world?.activeCreatures || {}).filter(m => isNativeVisibleMonster(m, true)),
         getProjectileLineOfSightToPosition: (position) => {
             if (!position) return false;
             return getTargetLineOfSightInfo({ getPosition: () => position }).clear === true;
@@ -23137,6 +23358,7 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
     }
 
     function matchesRuleMob(rule, monster) {
+        if (rule.combatRule) return bot.combatRules.matchOne(rule.combatRule, monster);
         return !rule.mobNames?.length || rule.mobNames.includes(String(monster?.name || "").trim().toLowerCase());
     }
 
@@ -23172,7 +23394,10 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
 
     function getConfiguredDefinitions() {
         const seen = new Set(), out = [];
-        for (const rule of config.rules) {
+        const definitionsRules = bot.combatRules?.config?.enabled
+            ? bot.combatRules.config.rules.filter(r => r.enabled && r.rune)
+            : config.rules;
+        for (const rule of definitionsRules) {
             const def = getDefinition(rule.rune);
             if (!def || seen.has(def.itemId)) continue;
             seen.add(def.itemId); out.push(def);
@@ -23243,10 +23468,12 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
 
     function getEligibleMonsters(sorted = false) {
         let monsters = [];
-        try { monsters = bot.attack?.getNearbyMonsters?.(sorted) || []; } catch (e) {}
+        try { monsters = bot.combatRules?.config?.enabled
+            ? bot.attack?.getVisibleCombatMonsters?.() || []
+            : bot.attack?.getNearbyMonsters?.(sorted) || []; } catch (e) {}
         const me = normalizePosition(bot.getPlayerPosition());
         return monsters.filter(m => {
-            if (!m || m.id == null || bot.attack?.isIgnoredTarget?.(m)) return false;
+            if (!m || m.id == null || (!bot.combatRules?.config?.enabled && bot.attack?.isIgnoredTarget?.(m))) return false;
             const p = monsterPos(m);
             if (!me || !p || p.z !== me.z) return false;
             const hp = Number(m.state?.health ?? m.health);
@@ -23256,12 +23483,15 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
 
     function getSingleTarget(monsters) {
         if (!monsters?.length) return null;
-        const current = bot.attack?.getCurrentTarget?.();
+        const current = bot.combatRules?.config?.enabled ? null : bot.attack?.getCurrentTarget?.();
         if (current && monsters.some(m => Number(m.id) === Number(current.id))) {
             const p = monsterPos(current);
             if (p && hasLos(p)) return current;
         }
-        for (const m of getEligibleMonsters(true)) {
+        const ordered = bot.combatRules?.config?.enabled
+            ? [...monsters].sort((a,b) => dist(normalizePosition(bot.getPlayerPosition()),monsterPos(a)) - dist(normalizePosition(bot.getPlayerPosition()),monsterPos(b)))
+            : getEligibleMonsters(true);
+        for (const m of ordered) {
             if (!monsters.some(candidate => Number(candidate.id) === Number(m.id))) continue;
             const p = monsterPos(m);
             if (p && hasLos(p)) return m;
@@ -23471,7 +23701,7 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
         const matchingMonsters = monsters.filter(monster => matchesRuleMob(rule, monster));
         if (!matchingMonsters.length) return false;
         const target = def.mode === "creature" ? getSingleTarget(matchingMonsters) : null;
-        const aoe = def.mode === "aoe" ? getBestAoeTarget(def.key, monsters, rule) : null;
+        const aoe = def.mode === "aoe" ? getBestAoeTarget(def.key, rule.combatRule ? matchingMonsters : monsters, rule) : null;
         if (def.mode === "creature" && !target) return false;
         if (def.mode === "aoe" && !aoe) return false;
 
@@ -23561,7 +23791,7 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
             }
 
             requestRuneCounts(now,false);
-            if (!config.rules.length) return;
+            if (!(bot.combatRules?.config?.enabled ? bot.combatRules.config.rules.some(r => r.enabled && r.rune) : config.rules.length)) return;
             if (!configuredCountsKnown(now)) {
                 if (!state.lastCountRequestAt)
                     requestRuneCounts(now,true);
@@ -23575,7 +23805,8 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
             state.visibleMonsterCount = monsters.length;
             if (!monsters.length) return;
 
-            for (const rule of config.rules) {
+            const actionRules = bot.combatRules?.runeRules?.(monsters) ?? config.rules;
+            for (const rule of actionRules) {
                 if (monsters.length < rule.minCreatures) continue;
                 if (tryRule(rule,monsters,now)) break;
             }
@@ -39229,7 +39460,7 @@ window.__minibiaBotBundle.installExoriModule = function installExoriModule(bot) 
         // Reuse Targeting's native monster filter when available. That filter
         // already rejects players/NPC-like creatures, dead monsters, our own
         // summon, wrong-floor creatures and things outside native visibility.
-        const monsters = bot.attack?.getNearbyMonsters?.(false) ||
+        const monsters = (bot.combatRules?.config?.enabled ? bot.attack?.getVisibleCombatMonsters?.() : bot.attack?.getNearbyMonsters?.(false)) ||
             bot.xray?.getVisibleMonsters?.({ sameFloorOnly: true }) ||
             [];
 
@@ -39257,6 +39488,7 @@ window.__minibiaBotBundle.installExoriModule = function installExoriModule(bot) 
 
         if (
             bot.attack?.isLureActive?.() &&
+            !bot.combatRules?.config?.enabled &&
             !preferredAccessClear &&
             !lureDeadlockClear
         ) {
@@ -39299,7 +39531,9 @@ window.__minibiaBotBundle.installExoriModule = function installExoriModule(bot) 
             ? Math.min(Math.max(1, Number(config.monsterCount) || 3), 2)
             : Math.max(1, Number(config.monsterCount) || 3);
 
-        if (nearby.length < requiredCount) {
+        const ruleMode = bot.combatRules?.config?.enabled === true;
+        const ruleReady = ruleMode && !!bot.combatRules.exoriRule(nearby);
+        if ((ruleMode && !ruleReady) || (!ruleMode && nearby.length < requiredCount)) {
             state.lastBlockedReason = preferredAccessClear
                 ? "not enough monsters for preferred access clear"
                 : (
@@ -39330,6 +39564,7 @@ window.__minibiaBotBundle.installExoriModule = function installExoriModule(bot) 
 
         if (
             bot.attack?.isLureActive?.() &&
+            !bot.combatRules?.config?.enabled &&
             !preferredAccessClear &&
             !lureDeadlockClear
         ) {
@@ -46256,6 +46491,7 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
         "minibiaBot.invisible.config",
         "minibiaBot.magicShield.config",
         "minibiaBot.attack.config",
+        "minibiaBot.combatRules.config",
         "minibiaBot.runeShooter.config",
         "minibiaBot.cave.config",
         "minibiaBot.cave.route",
@@ -51328,6 +51564,8 @@ function upgradeSectionHeaders(panel) {
         const kiteToggle = document.getElementById("minibia-bot-auto-attack-kite");
         const idealDistInput = document.getElementById("minibia-bot-auto-attack-ideal-dist");
         const keepDiagonalToggle = document.getElementById("minibia-bot-auto-attack-keep-diagonal");
+        const keepFrontToggle = document.getElementById("minibia-bot-auto-attack-keep-front");
+        if(keepFrontToggle && document.activeElement!==keepFrontToggle)keepFrontToggle.checked=attackConfig.keepFront===true;
         const clientChaseStatusToggle = document.getElementById("minibia-bot-auto-attack-client-chase");
         if (keepDiagonalToggle && document.activeElement !== keepDiagonalToggle) {
             keepDiagonalToggle.checked = attackConfig.keepDiagonal || false;
@@ -54713,6 +54951,7 @@ function upgradeSectionHeaders(panel) {
           <input type="checkbox" id="minibia-bot-auto-attack-keep-diagonal" />
           <span>Keep Diagonal</span>
         </label>
+        <label class="mb-inline"><input type="checkbox" id="minibia-bot-auto-attack-keep-front" /><span>Keep Front</span></label>
 
       </div>
 
@@ -55361,6 +55600,7 @@ function upgradeSectionHeaders(panel) {
         // v1.6.56: keep the pre-v1.6.34 panel host. Keeping the panel in
         // document.body matches the last known-good mobile UI compositor path.
         document.body.appendChild(panel);
+        bot.combatRules?.mount?.(panel);
 
         // v1.6.75: Special Areas bind immediately after the panel exists.
         const __mbSpecialAreaUi = (() => {
@@ -56256,6 +56496,12 @@ function upgradeSectionHeaders(panel) {
                 });
                 bot.log("Keep diagonal set to", enabled);
             });
+        }
+
+        const keepFrontToggle = document.getElementById("minibia-bot-auto-attack-keep-front");
+        if(keepFrontToggle){
+            keepFrontToggle.checked=bot.attack?.config?.keepFront===true;
+            keepFrontToggle.addEventListener("change",function(){bot.attack.updateConfig({keepFront:this.checked});});
         }
 
         // ---- Exori monster count ----
@@ -62737,6 +62983,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         ["invisible", "minibiaBot.invisible.config"],
         ["magicShield", "minibiaBot.magicShield.config"],
         ["attack", "minibiaBot.attack.config"],
+        ["combatRules", "minibiaBot.combatRules.config"],
         ["runeShooter", "minibiaBot.runeShooter.config"],
         ["cave", "minibiaBot.cave.config"],
         ["equipRing", "minibiaBot.equipRing.config"],
@@ -62969,6 +63216,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         currentBundle.installHealModule(bot);
         currentBundle.installAutoInvisibleModule(bot);
         currentBundle.installAutoMagicShieldModule(bot);
+        currentBundle.installCombatRulesModule(bot);
         currentBundle.installAutoAttackModule(bot);
         currentBundle.installRuneShooterModule(bot);
         currentBundle.installCaveModule(bot);
@@ -63002,6 +63250,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         currentBundle.installNpcSupplyBuyerModule(bot);
         currentBundle.installBankNpcModule(bot);
 
+        bot.combatRules.armActions();
         currentBundle.installPanel(bot);
         currentBundle.installCustomNotificationModule(bot);
         currentBundle.installKeyringStealthToggleModule(bot);
@@ -63053,6 +63302,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
                 ["invisible", "minibiaBot.invisible.config"],
                 ["magicShield", "minibiaBot.magicShield.config"],
                 ["attack", "minibiaBot.attack.config"],
+        ["combatRules", "minibiaBot.combatRules.config"],
                 ["runeShooter", "minibiaBot.runeShooter.config"],
                 ["equipRing", "minibiaBot.equipRing.config"],
                 ["eat", "minibiaBot.eat.config"],
@@ -63100,7 +63350,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
                     const snapshot =
                         JSON.parse(
                             JSON.stringify(
-                                mod.config
+                                name === "attack" && mod.getBaseConfig ? mod.getBaseConfig() : mod.config
                             )
                         );
 
