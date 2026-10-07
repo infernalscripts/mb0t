@@ -3058,7 +3058,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.100",
+        version: "1.6.102",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -46663,7 +46663,9 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
     function convertExternalWaypointRoute(data, fileName) {
         if (!Array.isArray(data?.route)) throw new Error('Expected a route array.');
         const route = [];
-        const types = new Set(['walk', 'stand', 'rope', 'shovel', 'ladder', 'script']);
+        const stepTransitions = new Set(['floor-down', 'floor-up', 'stairs-up', 'stairs-down']);
+        const directions = {here:[0,0], n:[0,-1], ne:[1,-1], e:[1,0], se:[1,1], s:[0,1], sw:[-1,1], w:[-1,0], nw:[-1,-1]};
+        const types = new Set(['walk', 'stand', 'rope', 'shovel', 'ladder', 'ladder-up', 'ladder-down', 'use', 'script', ...stepTransitions]);
         for (const [index, wp] of data.route.entries()) {
             if (wp?.enabled === false) continue;
             if (!wp || typeof wp !== 'object') throw new Error(`Waypoint ${index + 1}: invalid entry.`);
@@ -46675,15 +46677,48 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
             if (type === 'script' && (typeof script !== 'string' || !script.trim()))
                 throw new Error(`Waypoint ${index + 1}: missing script code.`);
             if (type !== 'script' && !valid) throw new Error(`Waypoint ${index + 1}: invalid position.`);
+            if (stepTransitions.has(type)) {
+                const direction = String(wp.params?.transitionTarget || '').trim().toLowerCase();
+                const delta = directions[direction];
+                if (!Object.prototype.hasOwnProperty.call(directions, direction))
+                    throw new Error(`Waypoint ${index + 1}: invalid or missing transition direction "${direction}".`);
+                const label = String(wp.label || '').trim() || type;
+                // Explicit approach + step-on tile: neither is consumed by Skip SQM.
+                // Native Stand floor-change handling advances after holes/stairs.
+                route.push({x:pos.x, y:pos.y, z:pos.z, stand:true, label:`${label} (approach)`});
+                route.push({x:pos.x + delta[0], y:pos.y + delta[1], z:pos.z, stand:true, label});
+                continue;
+            }
+            const isLadder = type === 'ladder' || type === 'ladder-up' || type === 'ladder-down';
+            const offsetValue = type === 'rope' || type === 'shovel' || type === 'use'
+                ? wp.params?.targetOffset
+                : isLadder ? wp.params?.transitionTarget : type === 'stand' ? wp.params?.standDirection : undefined;
+            let targetPos = pos;
+            if (offsetValue != null && String(offsetValue).trim()) {
+                const direction = String(offsetValue).trim().toLowerCase();
+                if (!Object.prototype.hasOwnProperty.call(directions, direction))
+                    throw new Error(`Waypoint ${index + 1}: invalid target direction "${direction}".`);
+                const delta = directions[direction];
+                targetPos = {x:pos.x + delta[0], y:pos.y + delta[1], z:pos.z};
+                // Preserve the approach before stepping/using the adjacent target.
+                route.push({x:pos.x, y:pos.y, z:pos.z, stand:true, label:`${String(wp.label || type).trim()} (approach)`});
+            }
+            if (type === 'use') {
+                if (targetPos === pos)
+                    route.push({x:pos.x, y:pos.y, z:pos.z, stand:true, label:'USE (approach)'});
+                route.push({label:String(wp.label || 'USE').trim(),
+                    script:`if (!bot.usePosition(${targetPos.x}, ${targetPos.y}, ${targetPos.z})) throw new Error("Imported USE failed");`});
+                continue;
+            }
             route.push({
-                ...(valid ? {x:pos.x, y:pos.y, z:pos.z} : {}),
+                ...(valid ? {x:targetPos.x, y:targetPos.y, z:targetPos.z} : {}),
                 label: String(wp.label || '').trim() || undefined,
                 ...(type === 'script' ? {script} : {}),
-                stand:type === 'stand', rope:type === 'rope', shovel:type === 'shovel', ladder:type === 'ladder'
+                stand:type === 'stand', rope:type === 'rope', shovel:type === 'shovel', ladder:isLadder
             });
         }
         if (!route.length) throw new Error('No enabled waypoints to import.');
-        return [{name:String(fileName || 'Imported route').replace(/\.json$/i, '') || 'Imported route', route, transitions:[], areas:[]}];
+        return [{name:String(fileName || 'Imported route').replace(/\.(json|txt)$/i, '') || 'Imported route', route, transitions:[], areas:[]}];
     }
 
     function importWaypointsFromFile(file) {
@@ -55024,7 +55059,7 @@ function upgradeSectionHeaders(panel) {
       <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px; align-items:center; margin-top:4px;">
         <button type="button" class="mb-small-button" id="minibia-bot-profile-export-waypoints">Export Waypoints</button>
         <div style="display:flex; gap:6px; align-items:center;">
-          <input type="file" id="minibia-bot-profile-import-waypoints-input" accept=".json" style="display:none;" />
+          <input type="file" id="minibia-bot-profile-import-waypoints-input" accept=".json,.txt" style="display:none;" />
           <button type="button" class="mb-small-button" id="minibia-bot-profile-import-waypoints">Import Waypoints</button>
         </div>
       </div>
