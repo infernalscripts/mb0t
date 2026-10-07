@@ -3058,7 +3058,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.99",
+        version: "1.6.100",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -46660,6 +46660,32 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
         });
     }
 
+    function convertExternalWaypointRoute(data, fileName) {
+        if (!Array.isArray(data?.route)) throw new Error('Expected a route array.');
+        const route = [];
+        const types = new Set(['walk', 'stand', 'rope', 'shovel', 'ladder', 'script']);
+        for (const [index, wp] of data.route.entries()) {
+            if (wp?.enabled === false) continue;
+            if (!wp || typeof wp !== 'object') throw new Error(`Waypoint ${index + 1}: invalid entry.`);
+            const type = String(wp.type || 'walk').trim().toLowerCase();
+            if (!types.has(type)) throw new Error(`Waypoint ${index + 1}: unsupported type "${type}".`);
+            const pos = wp.position;
+            const valid = pos && ['x', 'y', 'z'].every(k => typeof pos[k] === 'number' && Number.isFinite(pos[k]) && Number.isInteger(pos[k]));
+            const script = wp.script ?? wp.params?.script ?? wp.params?.code;
+            if (type === 'script' && (typeof script !== 'string' || !script.trim()))
+                throw new Error(`Waypoint ${index + 1}: missing script code.`);
+            if (type !== 'script' && !valid) throw new Error(`Waypoint ${index + 1}: invalid position.`);
+            route.push({
+                ...(valid ? {x:pos.x, y:pos.y, z:pos.z} : {}),
+                label: String(wp.label || '').trim() || undefined,
+                ...(type === 'script' ? {script} : {}),
+                stand:type === 'stand', rope:type === 'rope', shovel:type === 'shovel', ladder:type === 'ladder'
+            });
+        }
+        if (!route.length) throw new Error('No enabled waypoints to import.');
+        return [{name:String(fileName || 'Imported route').replace(/\.json$/i, '') || 'Imported route', route, transitions:[], areas:[]}];
+    }
+
     function importWaypointsFromFile(file) {
         return new Promise((resolve, reject) => {
             const reader = new FileReader();
@@ -46668,9 +46694,9 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
                     const data = JSON.parse(e.target.result);
                     if (typeof data !== "object" || data === null)
                         return reject(new Error("Invalid file format – not an object."));
-                    const presetsData = data["minibiaBot.cave.presets"];
-                    if (!presetsData)
-                        return reject(new Error("No cave presets found in this file."));
+                    const presetsData = Object.prototype.hasOwnProperty.call(data, "minibiaBot.cave.presets")
+                        ? data["minibiaBot.cave.presets"]
+                        : convertExternalWaypointRoute(data, file.name);
                     if (!Array.isArray(presetsData) || presetsData.length === 0)
                         return reject(new Error("Cave presets array is empty or invalid."));
                     const result = bot.cave.mergePresets(presetsData, true);
