@@ -3079,7 +3079,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.136",
+        version: "1.6.148",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -4840,6 +4840,13 @@ window.__minibiaBotBundle.installXrayModule = function installXrayModule(bot) {
         const me = bot.getPlayerPosition();
         const viewportRect = getViewportRect();
         const creatures = getOverlayCreatures();
+        const signature=JSON.stringify([
+            me?.x,me?.y,me?.z,
+            viewportRect?.left,viewportRect?.top,viewportRect?.width,viewportRect?.height,
+            creatures.map(c=>[c.id,c.__position?.x,c.__position?.y,c.__position?.z,getCreatureLabel(c),readCreatureHealth(c)])
+        ]);
+        if(overlayState.lastRenderRoot===root&&overlayState.lastRenderSignature===signature)return;
+        overlayState.lastRenderRoot=root;overlayState.lastRenderSignature=signature;
         root.innerHTML = "";
         if (!me || !viewportRect || !creatures.length)
             return;
@@ -4903,6 +4910,7 @@ window.__minibiaBotBundle.installXrayModule = function installXrayModule(bot) {
         if (!overlayState.running && overlayState.timerId == null)
             return false;
         overlayState.running = false;
+        overlayState.lastRenderSignature=null;overlayState.lastRenderRoot=null;
         if (overlayState.timerId != null) {
             window.clearInterval(overlayState.timerId);
             overlayState.timerId = null;
@@ -13781,7 +13789,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             return false;
 
         // Never auto-target our own summon, matching the native hotbar logic.
-        if (creature.masterId === player.id)
+        if (bot.isPlayerSummon(creature))
             return false;
 
         const playerPos = player.getPosition?.();
@@ -13847,7 +13855,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             return false;
         if (monsterType === undefined && creature.type === 0)
             return false;
-        if (creature.masterId === player.id)
+        if (bot.isPlayerSummon(creature))
             return false;
 
         const playerPos = normalizePosition(player.getPosition?.());
@@ -15196,7 +15204,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 continue;
             if (monsterType !== undefined && creature.type !== monsterType)
                 continue;
-            if (creature.masterId === player?.id)
+            if (bot.isPlayerSummon(creature))
                 continue;
             if (!includeIgnored && isIgnoredTargetCreature(creature)) {
                 state.ignoredAccessBlockersSkipped++;
@@ -16316,7 +16324,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 continue;
             if (monsterType !== undefined && creature.type !== monsterType)
                 continue;
-            if (creature.masterId === player.id)
+            if (bot.isPlayerSummon(creature))
                 continue;
             if (!isPreferredCreature(creature))
                 continue;
@@ -19607,7 +19615,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 reason: "not a monster"
             });
         }
-        if (target.masterId === player.id) {
+        if (bot.isPlayerSummon(target)) {
             return result(false, {
                 reason: "own summon"
             });
@@ -25018,7 +25026,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             // Lure blocker logic is for mobs, not players/NPCs/our summon.
             if (monsterType !== undefined && creature.type !== monsterType)
                 continue;
-            if (creature.masterId === player?.id)
+            if (bot.isPlayerSummon(creature))
                 continue;
 
             const health = Number(creature.state?.health ?? creature.health);
@@ -25634,7 +25642,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             ) {
                 continue;
             }
-            if (creature.masterId === player?.id)
+            if (bot.isPlayerSummon(creature))
                 continue;
             if (
                 ignoredNames.has(
@@ -35869,6 +35877,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
     // ---- PUBLIC API ----
     function start(overrides = {}) {
+        if(bot.clientExtras?.canStart?.()===false)return false;
         if (!route.length) {
             bot.log("cave bot cannot start without waypoints");
             return false;
@@ -47996,6 +48005,186 @@ window.__minibiaBotBundle.installAntiAfkModule = function installAntiAfkModule(b
  * FISHER MODULE – Automatically fishes on a selected tile
  * ==================================================================================
  */
+window.__minibiaBotBundle.installClientImprovements = function(bot) {
+    const readings=new Map(),listeners=new Set(),requests=new Map();
+    let player=null,hunt=null,huntAt=0,disposed=false;
+    function sync(){const p=window.gameClient?.player;if(p!==player){player=p;readings.clear();requests.clear();hunt=null;huntAt=0;}}
+    function request(sids,force=false){sync();if(disposed||typeof ItemCountQueryPacket!=='function'||!window.gameClient?.send)return false;const now=Date.now();const ids=[...new Set(sids.map(Number).filter(n=>Number.isInteger(n)&&n>0&&n<=65535))].filter(n=>force||now-(requests.get(n)||0)>=1000);for(let i=0;i<ids.length;i+=50){window.gameClient.send(new ItemCountQueryPacket(ids.slice(i,i+50)));ids.slice(i,i+50).forEach(n=>requests.set(n,now));}return ids.length>0;}
+    function reading(sid){sync();return readings.get(Number(sid))||null;}
+    function count(sid,timeout=5000){return new Promise((resolve,reject)=>{let done=false;const started=Date.now();const finish=(error,r)=>{if(done)return;done=true;clearTimeout(timer);listeners.delete(on);error?reject(error):resolve(r.count);};const on=r=>{if(r.sid===Number(sid)&&r.at>=started)finish(null,r);};const timer=setTimeout(()=>finish(new Error('Exact SID inventory count timed out')),timeout);listeners.add(on);if(!request([sid],true))finish(new Error('Exact SID inventory count unavailable'));});}
+    function hook(name,accept){const proto=typeof PacketReader!=='undefined'?PacketReader.prototype:null,original=proto?.[name];if(typeof original!=='function')return;const wrapped=function(...args){const result=original.apply(this,args);if(!disposed){sync();accept(result);}return result;};proto[name]=wrapped;bot.addCleanup(()=>{if(proto[name]===wrapped)proto[name]=original;});}
+    hook('readItemCountResult',result=>{for(const item of result?.items||[]){const r={sid:Number(item.sid),count:Math.max(0,Number(item.count)||0),at:Date.now()};readings.set(r.sid,r);listeners.forEach(fn=>fn(r));}while(readings.size>512)readings.delete(readings.keys().next().value);});
+    hook('readHuntInfo',result=>{if(result){hunt=result;huntAt=Date.now();}});
+    bot.sidInventory={request,reading,count};
+    bot.isPlayerSummon=creature=>{const master=Number(creature?.masterId)||0;if(!master)return false;const c=window.gameClient;if(master===Number(c?.player?.id))return true;const owner=c?.world?.activeCreatures?.[master];return !!owner&&typeof CONST!=='undefined'&&owner.type===CONST.TYPES?.PLAYER;};
+    bot.toolReach=cid=>{const type=window.gameClient?.itemDefinitionsByCid?.[cid]?.properties?.type;return type==='rune'||type==='fluidContainer'||Number(cid)===3483?Infinity:Number(cid)===4863?2:1;};
+    bot.toolInReach=(cid,from,to)=>!!from&&!!to&&Number(from.z)===Number(to.z)&&Math.max(Math.abs(from.x-to.x),Math.abs(from.y-to.y))<=bot.toolReach(cid);
+    bot.huntStats={status:()=>{sync();return {info:hunt,at:huntAt};},mount(panel){const host=panel?.querySelector('[data-tab-panel="status"]');if(!host||host.querySelector('[data-hunt-section]'))return;const section=document.createElement('div');section.setAttribute('data-hunt-section','');section.className='mb-section';section.innerHTML='<div class="mb-section-title"><span class="mb-title-text">Hunt Statistics</span></div><div data-hunt-stats class="mb-small-note"></div><div class="prof-actions"><button type="button" class="mb-small-button" data-hunt-command="/hunt info">Refresh</button><button type="button" class="mb-small-button" data-hunt-command="/hunt start quiet">Start</button><button type="button" class="mb-small-button" data-hunt-command="/hunt pause quiet">Pause</button><button type="button" class="mb-small-button" data-hunt-command="/hunt resume quiet">Resume</button><button type="button" class="mb-small-button" data-hunt-command="/hunt reset quiet">Reset</button></div>';host.prepend(section);const click=e=>{const command=e.target?.getAttribute?.('data-hunt-command');if(command)window.gameClient?.interface?.channelManager?.sendMessageText?.(command,undefined,true);};section.addEventListener('click',click);const render=()=>{if(!section.getClientRects().length)return;sync();const info=hunt||window.gameClient?.interface?.huntWindow?.__info;const n=v=>Number(v||0).toLocaleString();const stats=section.querySelector('[data-hunt-stats]');if(!info){stats.textContent='Press Refresh to read the server hunt statistics.';return;}const skills=window.gameClient?.player?.skills,level=Number(skills?.level),xp=Number(skills?.__skills?.experience),rate=Number(info.xpPerHour);let ttl='—';if(level>0&&Number.isFinite(xp)&&rate>0){const l=level+1,next=Math.round((50/3)*(l*l*l-6*l*l+17*l-12)),seconds=Math.ceil(Math.max(0,next-xp)/rate*3600);ttl=`${Math.floor(seconds/3600)}h ${Math.floor(seconds%3600/60)}m`;}const metrics=[['XP/h',n(rate)],['XP',n(info.xp)],['To level',ttl],['Loot',n(info.lootValue)+' gp'],['Collected',n(info.lootValueTaken)+' gp'],['Supplies',n(info.suppliesValue)+' gp']];const signature=JSON.stringify(metrics);if(stats.dataset.signature===signature)return;stats.dataset.signature=signature;stats.replaceChildren();for(let row=0;row<2;row++){const line=document.createElement('div');line.className='mb-hunt-stat-row';for(const [label,value]of metrics.slice(row*3,row*3+3)){const cell=document.createElement('div');cell.textContent=label+': '+value;line.append(cell);}stats.append(line);} };render();const timer=setInterval(render,1000);bot.addCleanup(()=>{clearInterval(timer);section.removeEventListener('click',click);section.remove();});}};
+    bot.addCleanup(()=>{disposed=true;listeners.clear();readings.clear();requests.clear();});
+};
+
+window.__minibiaBotBundle.installClientExtras=function(bot){
+ const key='minibiaBot.clientExtras.config';const config={blessingGuard:false,maxLoss:10,minPilgrimages:0,requireTemple:false,requireWard:false,conditions:[],...bot.storage.get(key,{})};
+ let inventory=[],loot=null,tasks=null,quests=null,blessings=null,disposed=false,player=null,inventoryAt=0;const fired=new Set(),cleanups=[];let renderUi=()=>{},lastInventoryRequest=0;
+ config.conditions=Array.isArray(config.conditions)?config.conditions:[];
+ const persist=()=>bot.storage.set(key,{...config});
+ const sync=()=>{const p=window.gameClient?.player;if(p!==player){player=p;inventory=[];loot=tasks=quests=blessings=null;inventoryAt=0;fired.clear();}};
+ const textCommand=cmd=>window.gameClient?.interface?.channelManager?.sendMessageText?.(cmd,undefined,true);
+ function hook(name,accept){const proto=typeof PacketReader!=='undefined'?PacketReader.prototype:null,original=proto?.[name];if(typeof original!=='function')return;const wrapper=function(...args){const result=original.apply(this,args);if(!disposed){sync();accept(result);renderUi();}return result;};proto[name]=wrapper;cleanups.push(()=>{if(proto[name]===wrapper)proto[name]=original;});}
+ hook('readInventoryList',r=>{inventory=Array.isArray(r?.items)?r.items:[];inventoryAt=Date.now();});
+ hook('readLootListInfo',r=>{if(r)loot=r;});hook('readTaskInfo',r=>{tasks=r;evaluate();});hook('readQuestLog',r=>{quests=r;evaluate();});hook('readBlessingUpdate',r=>{blessings=r;});
+ function requestInventory(){sync();const now=Date.now();if(now-lastInventoryRequest<1000)return false;if(typeof InventoryListQueryPacket!=='function'||!window.gameClient?.send)return false;lastInventoryRequest=now;window.gameClient.send(new InventoryListQueryPacket());return true;}
+ function rows(){const result=[];for(const kind of ['hunting','magic','delivery']){const t=tasks?.[kind];if(t?.active)result.push({kind:'task',name:String(t.name||t.monster||kind),current:Number(t.progress)||0,required:Number(t.count)||0,completed:!!t.claimed||(Number(t.count)>0&&Number(t.progress)>=Number(t.count))});}for(const q of quests?.achievements||[])result.push({kind:'quest',name:String(q.name),current:Number(q.current)||0,required:Number(q.required)||0,completed:!!q.completed});for(const q of quests?.questChests||[])result.push({kind:'quest',name:String(q.name),current:q.completed?1:0,required:1,completed:!!q.completed});return result;}
+ function matches(rule){sync();const name=String(rule.name||'').trim().toLowerCase();if(!name)return false;const row=rows().find(r=>r.kind===rule.kind&&r.name.toLowerCase()===name);if(!row)return false;return rule.condition==='count'?row.current>=Math.max(0,Number(rule.count)||0):row.completed;}
+ function evaluate(){if(disposed||!bot.cave?.isRunning?.())return;for(let i=0;i<config.conditions.length;i++){const r=config.conditions[i];if(!r.enabled||fired.has(i)||!matches(r))continue;if(r.action==='label'){if(!String(r.label||'').trim())continue;const ok=bot.goToLabel?.(r.label);if(!ok){fired.add(i);bot.log('Progress condition: label not found: '+r.label);continue;}}else bot.cave.stop();fired.add(i);bot.log('Progress condition reached: '+r.name);break;}}
+ function canStart(){sync();if(!config.blessingGuard)return true;const b=blessings||window.gameClient?.player?.blessings;const ok=!!b&&Number(b.lossPercent)<=Number(config.maxLoss)&&Number(b.pilgrimageCount)>=Number(config.minPilgrimages)&&(!config.requireTemple||b.hasTemple)&&(!config.requireWard||b.hasWard);if(!ok)bot.log('CaveBot start blocked by blessing protection settings; check Status');return ok;}
+ function applyNative(values){const client=window.gameClient,settings=client?.interface?.settings;if(!settings?.__state||typeof AutoLootSettingsPacket!=='function'||!client.send)throw new Error('Native settings unavailable');const ids=['auto-loot-gold','auto-loot-food','auto-open-corpse','auto-refill-ammo','auto-eat-food','auto-convert-loot','reopen-containers'];const flags=ids.map(id=>!!values[id]);client.send(new AutoLootSettingsPacket(...flags));for(let i=0;i<ids.length;i++){settings.__state[ids[i]]=flags[i];const input=document.getElementById(ids[i]);if(input)input.checked=flags[i];}try{localStorage.setItem('settings',JSON.stringify(settings.__state));}catch(e){}return true;}
+ function saveLoot(selected,enabled,routes){sync();if(!loot)throw new Error('Load server loot settings before saving');if(typeof LootListUpdatePacket!=='function'||!window.gameClient?.send)throw new Error('Server loot routing unavailable');const ids=[...new Set(selected.map(Number))];if(ids.length>500||ids.some(s=>!Number.isInteger(s)||s<=0||s>65535))throw new Error('Select up to 500 valid SIDs');const safe={};for(const sid of ids){const name=String(routes[sid]||'').trim();if(name.length>20)throw new Error('Backpack names must be 20 characters or fewer');if(name)safe[sid]=name;}window.gameClient.send(new LootListUpdatePacket(ids,!!enabled,safe));loot={...loot,selected:ids,enabled:!!enabled,routes:safe};return true;}
+ function mount(panel){if(!panel||panel.querySelector('[data-client-extras]'))return;const sections=[];const section=(tab,title)=>{const host=panel.querySelector(`[data-tab-panel="${tab}"]`);if(!host)return null;const el=document.createElement('div');el.className='mb-section';el.setAttribute('data-client-extras','');const h=document.createElement('div');h.className='mb-section-title';const heading=document.createElement('span');heading.className='mb-title-text';heading.textContent=title;h.append(heading);el.append(h);host.prepend(el);sections.push(el);return el;};const make=(tag,parent,content)=>{const el=document.createElement(tag);if(content!=null)el.textContent=content;parent.append(el);return el;};const button=(parent,label,fn)=>{const b=make('button',parent,label);b.type='button';b.className='mb-small-button';b.addEventListener('click',()=>{try{fn();}catch(e){bot.log(e.message);message.textContent=e.message;}});return b;};const field=(parent,label,type='text',value='')=>{const l=make('label',parent);l.className='mb-field';make('span',l,label).className='mb-field-label';const i=make('input',l);i.type=type;i.value=value;if(type==='number')i.min='0';return i;};const check=(parent,label,value)=>{const l=make('label',parent);l.style.cssText='display:flex;align-items:center;gap:6px;margin:6px 0';const i=make('input',l);i.type='checkbox';i.checked=!!value;i.style.cssText='width:13px;min-width:13px;margin:0';make('span',l,label);return i;};const select=(parent,label,options)=>{const l=make('label',parent);l.className='mb-field';make('span',l,label);const s=make('select',l);for(const [value,name]of options){const o=make('option',s,name);o.value=value;}return s;};
+ const inv=section('resupply','Inventory Browser');const message=make('div',inv);message.className='mb-small-note';const actions=make('div',inv);button(actions,'Refresh inventory',requestInventory);const search=field(inv,'Filter by name / SID / CID');const inventoryList=make('div',inv);inventoryList.style.cssText='max-height:260px;overflow:auto';let invSignature='';
+ const routing=section('looter','Server Loot Routing');make('div',routing,'Loads and saves the game’s SID loot list. Fluid-specific rules stay in mb0t’s looter.').className='mb-small-note';const routeActions=make('div',routing);button(routeActions,'Load server settings',()=>textCommand('/lootlist'));const routeEnabled=check(routing,'Server loot list enabled',false);const routeList=make('div',routing);routeList.style.cssText='max-height:240px;overflow:auto';const routeSid=field(routing,'Item SID','number');const routeBag=field(routing,'Destination backpack name (blank = default)');let draft=null;button(routing,'Add / update route',()=>{if(!draft)throw new Error('Load server settings first');const sid=Number(routeSid.value);if(!Number.isInteger(sid)||sid<1||sid>65535)throw new Error('Invalid SID');if(!draft.selected.includes(sid))draft.selected.push(sid);draft.routes[sid]=routeBag.value.trim();renderRoutes();});button(routing,'Save to server',()=>{if(!draft)throw new Error('Load server settings first');saveLoot(draft.selected,routeEnabled.checked,draft.routes);message.textContent='Server loot settings sent.';});let lootRef=null;function renderRoutes(){routeList.replaceChildren();for(const sid of draft?.selected||[]){const line=make('div',routeList);line.style.cssText='display:flex;gap:6px;align-items:center;margin:4px 0';make('span',line,`${sid} → ${draft.routes[sid]||'default backpack'}`).style.flex='1';button(line,'Remove',()=>{draft.selected=draft.selected.filter(n=>n!==sid);delete draft.routes[sid];renderRoutes();});}}
+ const native=section('utility','Native Automation');const controls={};for(const [id,label]of [['auto-loot-gold','Auto loot gold'],['auto-loot-food','Auto loot food'],['auto-open-corpse','Auto open corpses'],['auto-refill-ammo','Auto refill ammo'],['auto-eat-food','Auto eat food'],['auto-convert-loot','Auto convert loot'],['reopen-containers','Reopen containers after login']])controls[id]=check(native,label,window.gameClient?.interface?.settings?.__state?.[id]);button(native,'Apply native settings',()=>{applyNative(Object.fromEntries(Object.entries(controls).map(([id,i])=>[id,i.checked])));message.textContent='Native settings applied.';});
+ const protection=section('status','Blessing Protection');const blessingText=make('div',protection);blessingText.className='mb-small-note';const guard=check(protection,'Check protection before starting CaveBot',config.blessingGuard);const maxLoss=field(protection,'Maximum death loss %','number',config.maxLoss);maxLoss.max='100';const pilgrimages=field(protection,'Minimum pilgrimage blessings','number',config.minPilgrimages);const temple=check(protection,'Require temple blessing',config.requireTemple),ward=check(protection,'Require Martyr’s Ward',config.requireWard);for(const i of [guard,maxLoss,pilgrimages,temple,ward])i.addEventListener('change',()=>{Object.assign(config,{blessingGuard:guard.checked,maxLoss:Math.max(0,Math.min(100,Number(maxLoss.value)||0)),minPilgrimages:Math.max(0,Number(pilgrimages.value)||0),requireTemple:temple.checked,requireWard:ward.checked});persist();});
+ const progress=section('cave','Task & Quest Conditions');const progressActions=make('div',progress);button(progressActions,'Refresh tasks',()=>textCommand('/task'));button(progressActions,'Refresh quests',()=>{if(typeof QuestLogPacket==='function')window.gameClient?.send?.(new QuestLogPacket());});const progressList=make('div',progress);progressList.className='mb-small-note';const kind=select(progress,'Type',[['task','Task'],['quest','Quest / achievement']]);const name=field(progress,'Exact task / quest name');const condition=select(progress,'Condition',[['complete','Complete'],['count','Progress at least']]);const count=field(progress,'Progress count','number',1);const action=select(progress,'Action',[['stop','Stop CaveBot'],['label','Jump to waypoint label']]);const label=field(progress,'Waypoint label');const ruleList=make('div',progress);function renderRules(){ruleList.replaceChildren();config.conditions.forEach((r,i)=>{const row=make('div',ruleList);const enabled=check(row,`${r.name}: ${r.condition==='count'?'>= '+r.count:'complete'} → ${r.action==='label'?r.label:'stop'}`,r.enabled);enabled.addEventListener('change',()=>{r.enabled=enabled.checked;fired.delete(i);persist();});button(row,'Remove',()=>{config.conditions.splice(i,1);fired.clear();persist();renderRules();});});}button(progress,'Add condition',()=>{if(!name.value.trim())throw new Error('Enter an exact task / quest name');if(action.value==='label'&&!label.value.trim())throw new Error('Enter a waypoint label');config.conditions.push({enabled:true,kind:kind.value,name:name.value.trim(),condition:condition.value,count:Math.max(0,Number(count.value)||0),action:action.value,label:label.value.trim()});persist();renderRules();});button(progress,'Rearm conditions',()=>{fired.clear();message.textContent='Conditions rearmed.';});make('div',progress,'Conditions run once per arm, from received task/quest progress. Refresh after progress changes. Scripts can use bot.progress.matches(rule) or bot.progress.branch(rule, label).').className='mb-small-note';renderRules();
+ function render(){sync();if(!loot&&lootRef){lootRef=null;draft=null;routeList.replaceChildren();}if(loot&&loot!==lootRef){lootRef=loot;draft={selected:(loot.selected||[]).map(Number),routes:{...loot.routes}};routeEnabled.checked=loot.enabled!==false;renderRoutes();}if(protection.getClientRects().length){const b=blessings||window.gameClient?.player?.blessings;blessingText.textContent=b?`Pilgrimages ${b.pilgrimageCount} · Temple ${b.hasTemple?'yes':'no'} · Ward ${b.hasWard?'yes':'no'} · Death loss ${b.lossPercent}%`:'Blessing state unknown';}if(progress.getClientRects().length)progressList.textContent=rows().map(r=>`${r.kind}: ${r.name} ${r.current}/${r.required}${r.completed?' ✓':''}`).join(' · ')||'Refresh to load task / quest progress.';if(!inv.getClientRects().length)return;const query=search.value.trim().toLowerCase(),signature=inventoryAt+':'+query;if(signature===invSignature)return;invSignature=signature;inventoryList.replaceChildren();for(const item of inventory){const def=window.gameClient?.itemDefinitionsBySid?.[item.sid];const itemName=def?.properties?.name||'Item';const desc=`${itemName} · SID ${item.sid} / CID ${item.cid} · Fluid ${item.fluidType} · Tint ${item.tintId}`;if(query&&!desc.toLowerCase().includes(query))continue;const row=make('div',inventoryList);row.style.cssText='padding:6px 0;border-bottom:1px solid #444';make('div',row,desc);button(row,'Cooking',()=>{if(item.fluidType)throw new Error('Fluid containers cannot be added as cooking food');const foods=bot.cooking.config.foods;if(!foods.some(f=>f.sid===item.sid&&f.cid===item.cid))bot.cooking.updateConfig({foods:[...foods,{sid:item.sid,cid:item.cid}]});message.textContent='Food added to Cooking.';});button(row,'Supply',()=>{const rule=bot.npcSupplyBuyer.addRule(itemName,100,10,itemName);if(rule)bot.npcSupplyBuyer.updateRule(rule.id,{sid:item.sid,cid:item.cid,fluidType:item.fluidType});message.textContent='Exact item supply rule added; edit amounts in Resupply.';});button(row,'Loot route',()=>{if(item.fluidType)throw new Error('Use mb0t looter capture for fluid-specific rules');routeSid.value=item.sid;message.textContent='SID copied to Server Loot Routing in Looter.';});}if(!inventory.length)make('div',inventoryList,'Refresh to list items in open and closed backpacks.');}
+ search.addEventListener('input',render);renderUi=render;render();const timer=setInterval(()=>{evaluate();render();},1000);cleanups.push(()=>{clearInterval(timer);search.removeEventListener('input',render);sections.forEach(s=>s.remove());renderUi=()=>{};});
+ }
+ bot.clientExtras={config,mount,canStart,requestInventory,saveLoot,applyNative,status:()=>{sync();return {inventory:inventory.map(i=>({...i})),inventoryAt,loot,blessings:blessings||window.gameClient?.player?.blessings};}};bot.progress={rows,matches,evaluate,branch:(rule,label)=>matches(rule)?bot.goToLabel(label):false,rearm:()=>fired.clear()};bot.addCleanup(()=>{disposed=true;cleanups.reverse().forEach(f=>f());fired.clear();inventory=[];});
+};
+
+window.__minibiaBotBundle.installObservability = function(bot) {
+    const storageKey='minibiaBot.supplyEstimates';
+    const saved=bot.storage.get(storageKey,{});
+    const config={enabled:!!saved.enabled,items:Array.isArray(saved.items)?saved.items.filter(x=>Number(x.cid)>0||Number(x.sid)>0).slice(0,20):[]};
+    let player=null,lastTick=0,lastQuery=0,disposed=false;
+    const skills=new Map(),supplies=new Map(),views=[],liveSkills=new Map();
+    let skillOwner=null,skillOriginal=null,skillWrapper=null;
+    function detachSkills(){if(skillOwner?.__handleSkillUpdate===skillWrapper)skillOwner.__handleSkillUpdate=skillOriginal;skillOwner=skillOriginal=skillWrapper=null;}
+    function observeSkills(){
+        const owner=window.gameClient?.networkManager?.packetHandler;
+        if(owner===skillOwner)return;
+        detachSkills();
+        if(typeof owner?.__handleSkillUpdate!=='function'||typeof owner?.__getSkillNameFromType!=='function')return;
+        skillOwner=owner;skillOriginal=owner.__handleSkillUpdate;const original=skillOriginal;
+        skillWrapper=function(type,points,...args){
+            const result=original.call(this,type,points,...args);
+            if(!disposed){sync();const name=this.__getSkillNameFromType(type);
+                if((name==='mining'||name==='woodcutting')&&Number.isFinite(Number(points))){
+                    const computed=this.__calculateSkillLevelAndPercentage?.(type,Number(points),window.gameClient?.player?.vocation||0);
+                    liveSkills.set(name,{points:Number(points),level:computed?.level,percent:computed?.percentage});
+                }
+            }
+            return result;
+        };
+        owner.__handleSkillUpdate=skillWrapper;
+    }
+    const identity=x=>`${Number(x.sid)||0}:${Number(x.cid)||0}:${Number(x.fluidType)||0}`;
+    const persist=()=>bot.storage.set(storageKey,config);
+    const duration=seconds=>!Number.isFinite(seconds)||seconds<0?'—':seconds<60?'<1m':`${Math.floor(seconds/3600)?Math.floor(seconds/3600)+'h ':''}${Math.floor(seconds%3600/60)}m`;
+    function sync(){const p=window.gameClient?.player;if(p!==player){player=p;skills.clear();supplies.clear();liveSkills.clear();lastTick=0;lastQuery=0;}return p;}
+    function skillSnapshot(name){
+        const p=sync(),native=p?.skills,live=liveSkills.get(name),points=Number(live?.points??native?.__skills?.[name]);
+        if(!Number.isFinite(points)||typeof native?.__getSkillLevel!=='function'||typeof native?.__getRequiredSkillPoints!=='function')return null;
+        const level=Number.isFinite(live?.level)?live.level:native.__getSkillLevel(name,points),low=native.__getRequiredSkillPoints(name,level),high=native.__getRequiredSkillPoints(name,level+1);
+        const state=skills.get(name),gained=state?Math.max(0,points-state.start):0,rate=state?.elapsed>=10000?gained/state.elapsed*3600000:0;
+        return {level,points,gained,rate,percent:Number.isFinite(live?.percent)?Math.max(0,Math.min(100,live.percent)):high>low?Math.max(0,Math.min(100,(points-low)/(high-low)*100)):0,remaining:Math.max(0,high-points),seconds:rate>0?Math.max(0,high-points)/rate*3600:null};
+    }
+    function sampleSkill(name,elapsed){
+        const value=skillSnapshot(name);if(!value)return;
+        let state=skills.get(name);if(!state||value.points<state.last){state={start:value.points,last:value.points,elapsed:0};skills.set(name,state);}
+        if(bot[name]?.status?.().running)state.elapsed+=elapsed;
+        state.last=value.points;
+    }
+    function reading(item){return Number(item.sid)>0?bot.sidInventory?.reading(Number(item.sid)):bot.getItemCountReading?.(Number(item.cid),Number(item.fluidType)||0);}
+    function sampleSupply(item,now){
+        const r=reading(item),key=identity(item);let s=supplies.get(key);
+        if(!r||now-Number(r.at)>15000){if(s)s.stale=true;return;}
+        const count=Number(r.count);if(!Number.isFinite(count))return;
+        if(!s){s={count,at:r.at,samples:[],stale:false};supplies.set(key,s);}
+        s.stale=false;
+        if(r.at===s.at)return;
+        const gap=Number(r.at)-Number(s.at);
+        // A refill or reconnect gap starts a fresh observation window.
+        if(count>s.count||gap>20000)s.samples=[];
+        else if(gap>0)s.samples.push({at:Number(r.at),elapsed:gap,used:Math.max(0,s.count-count)});
+        s.count=count;s.at=r.at;
+        s.samples=s.samples.filter(x=>now-x.at<=900000).slice(-180);
+    }
+    function supplySnapshot(item){
+        const s=supplies.get(identity(item));if(!s||s.stale)return {count:null,rate:0,seconds:null};
+        const elapsed=s.samples.reduce((n,x)=>n+x.elapsed,0),used=s.samples.reduce((n,x)=>n+x.used,0),rate=elapsed>=10000&&used>0?used/elapsed*3600000:0;
+        return {count:s.count,rate,seconds:s.count===0?0:rate>0?s.count/rate*3600:null};
+    }
+    function tick(){
+        if(disposed)return;observeSkills();const p=sync(),now=Date.now(),connected=!!window.gameClient?.networkManager?.isConnected?.();
+        const elapsed=lastTick?Math.max(0,Math.min(2000,now-lastTick)):0;lastTick=now;
+        if(p&&connected){for(const name of ['woodcutting','mining'])sampleSkill(name,elapsed);
+            if(config.enabled){if(now-lastQuery>=5000){lastQuery=now;
+                const sid=config.items.filter(x=>Number(x.sid)>0).map(x=>Number(x.sid));if(sid.length)bot.sidInventory?.request(sid);
+                const cid=config.items.filter(x=>!Number(x.sid)).map(x=>({id:Number(x.cid),fluidType:Number(x.fluidType)||0}));if(cid.length)bot.requestItemCounts?.(cid);
+            }for(const item of config.items)sampleSupply(item,now);}
+        }else for(const s of supplies.values())s.stale=true;
+        for(const render of views)render();
+    }
+    function diagnostics(){
+        const rows=[];
+        if(!window.gameClient?.networkManager?.isConnected?.())rows.push(['Connection','Waiting for connection']);
+        for(const [key,label]of [['woodcutting','Woodcutting'],['mining','Mining'],['cooking','Cooking'],['fisher','Fishing'],['heal','Healing'],['runeShooter','Rune Shooter'],['exori','Exori'],['depositer','Depositer'],['npcSupplyBuyer','Resupply'],['bankNpc','Bank']]){
+            const module=bot[key];if(!module?.status)continue;
+            let s;try{s=module.status();}catch{continue;}if(!s?.running)continue;
+            let text=s.reason||s.lastBlockedReason||s.message||s.lastError||s.phase;
+            if(key==='fisher')text=s.pausedForCooking?'Paused for cooking':!s.hasRod?'Fishing rod missing':!s.config?.tile?'Select a fishing tile':'Fishing';
+            if(key==='heal')text=s.pendingAttempt?'Waiting for healing confirmation':module.needsPriorityAction?.()?'Healing needed; waiting for available action':'Monitoring health and mana';
+            if(key==='runeShooter')text=s.lastError||(s.runeCooldownRemainingMs>0?`Cooldown ${Math.ceil(s.runeCooldownRemainingMs/100)/10}s`:'Monitoring rules and targets');
+            rows.push([label,text||'Running']);
+        }
+        const spell=bot.combatRules?.status?.();if(spell?.lastBlockedReason)rows.push(['Spell rules',spell.lastBlockedReason]);
+        if(bot.cave?.isRunning?.()){const s=bot.cave.getUiStatus?.();rows.push(['Cavebot',s?`Waypoint #${s.currentIndex+1} · ${s.movement?.mode||'Running'}`:'Running']);}
+        if(bot.actions?.isHalted?.())rows.unshift(['Actions','Halted']);
+        return rows;
+    }
+    function mount(panel){
+        if(!panel||panel.querySelector('[data-observability]'))return;
+        const make=(tag,parent,text)=>{const e=document.createElement(tag);if(text!=null)e.textContent=text;if(parent)parent.append(e);return e;};
+        const button=(parent,text,fn)=>{const b=make('button',parent,text);b.type='button';b.className='mb-small-button';b.addEventListener('click',fn);return b;};
+        const section=(parent,title)=>{const e=make('div',parent);e.className='mb-section';e.setAttribute('data-observability','');const h=make('div',e);h.className='mb-section-title';make('span',h,title).className='mb-title-text';return e;};
+        const style=make('style',panel);style.textContent='#minibia-bot-panel .mb-observe-grid{display:grid;grid-template-columns:1fr 1fr;gap:5px 10px;font-size:11px;margin:8px 0}#minibia-bot-panel .mb-skill-progress{width:100%;height:8px;accent-color:#b69b55}#minibia-bot-panel .mb-observe-row{display:flex;justify-content:space-between;gap:8px;font-size:11px;padding:5px 0;border-bottom:1px solid rgba(180,170,140,.12)}#minibia-bot-panel .mb-observe-row span{overflow-wrap:anywhere;min-width:0}';
+        for(const [name,prefix]of [['woodcutting','wc'],['mining','mn']]){
+            const status=panel.querySelector(`[data-${prefix}="status"]`);if(!status)continue;
+            const block=make('div');status.after(block);const label=make('div',block);label.className='mb-small-note';
+            const progress=make('progress',block);progress.className='mb-skill-progress';progress.max=100;progress.setAttribute('aria-label',name+' progress to next level');
+            const metrics=make('div',block);metrics.className='mb-observe-grid';
+            const cells=Array.from({length:4},()=>make('span',metrics));
+            button(block,'Reset statistics',()=>skills.delete(name));
+            views.push(()=>{if(!block.getClientRects().length)return;const s=skillSnapshot(name);label.textContent=s?`Skill ${s.level} · ${s.percent.toFixed(1)}% to ${s.level+1}`:'Waiting for profession skills';progress.value=s?.percent||0;
+                const values=[`Gained: ${s?.gained.toLocaleString()||0}`,`Points/h: ${Math.round(s?.rate||0).toLocaleString()}`,`To level: ${duration(s?.seconds)}`,`Remaining: ${s?.remaining.toLocaleString()||'—'}`];cells.forEach((c,i)=>{if(c.textContent!==values[i])c.textContent=values[i];});});
+        }
+        const host=panel.querySelector('[data-tab-panel="status"]');if(!host)return;
+        const supply=section(host,'Supply Time Remaining'),toggle=make('input');toggle.type='checkbox';toggle.className='mb-title-toggle';toggle.checked=config.enabled;supply.firstChild.prepend(toggle);
+        toggle.addEventListener('change',()=>{config.enabled=toggle.checked;supplies.clear();lastQuery=0;persist();});
+        const editor=make('details',supply);make('summary',editor,'+ Add supply');const form=make('div',editor);form.className='mb-observe-grid';
+        const field=(text,type)=>{const l=make('label',form);l.className='mb-field';make('span',l,text).className='mb-field-label';const i=make('input',l);i.type=type;if(type==='number'){i.min='0';i.max='65535';}return i;};
+        const name=field('Name','text'),sid=field('SID (exact item)','number'),cid=field('CID (optional with SID)','number'),fluid=field('Fluid type (CID only)','number');
+        const message=make('div',supply);message.className='mb-small-note';
+        button(editor,'Add supply',()=>{const item={name:name.value.trim(),sid:Number(sid.value)||0,cid:Number(cid.value)||0,fluidType:Number(fluid.value)||0};
+            if(!Number.isInteger(item.sid)||!Number.isInteger(item.cid)||!Number.isInteger(item.fluidType)||item.sid<0||item.sid>65535||item.cid<0||item.cid>65535||item.fluidType<0||item.fluidType>255||(!item.sid&&!item.cid)){message.textContent='Enter a valid SID or CID.';return;}
+            if(item.sid&&item.fluidType){message.textContent='For fluids, leave SID blank and use CID + fluid type.';return;}
+            if(config.items.length>=20){message.textContent='Maximum 20 supplies.';return;}
+            if(config.items.some(x=>identity(x)===identity(item))){message.textContent='This supply is already tracked.';return;}
+            config.items.push(item);persist();name.value=sid.value=cid.value=fluid.value='';message.textContent='';rebuild();});
+        button(supply,'Reset estimates',()=>supplies.clear());
+        const list=make('div',supply),supplyViews=[];
+        function rebuild(){list.replaceChildren();supplyViews.length=0;for(const item of config.items){const row=make('div',list);row.className='mb-observe-row';const text=make('span',row);button(row,'×',()=>{config.items=config.items.filter(x=>x!==item);supplies.delete(identity(item));persist();rebuild();});supplyViews.push(()=>{const s=supplySnapshot(item);text.textContent=`${item.name|| (item.sid?'SID '+item.sid:'CID '+item.cid+' / fluid '+item.fluidType)} · ${s.count??'—'} left · ${Math.round(s.rate)} /h · ${duration(s.seconds)} left`;});}}
+        rebuild();const note=make('details',supply);make('summary',note,'How estimates work');make('div',note,'Tracks count decreases over the last 15 minutes. Refilling resets the estimate. Selling, depositing or using items elsewhere also lowers counts. SID distinguishes items sharing a CID; fluids use CID + fluid type. Enable monitoring to refresh inventory every 5 seconds.').className='mb-small-note';
+        views.push(()=>{if(supply.getClientRects().length){toggle.checked=config.enabled;supplyViews.forEach(fn=>fn());}});
+        const diag=section(host,'Action Diagnostics'),details=make('details',diag);make('summary',details,'Show current actions');const rows=make('div',details);let signature='';
+        views.push(()=>{if(!details.open||!diag.getClientRects().length)return;const data=diagnostics(),next=JSON.stringify(data);if(next===signature)return;signature=next;rows.replaceChildren();if(!data.length)make('div',rows,'No active modules').className='mb-small-note';for(const [label,text]of data){const row=make('div',rows);row.className='mb-observe-row';make('span',row,label);make('span',row,text);}});
+        tick();
+    }
+    bot.observability={mount,skillSnapshot,supplySnapshot,diagnostics,config,tick,reset:()=>{skills.clear();supplies.clear();}};
+    observeSkills();sync();const timer=setInterval(tick,1000);bot.addCleanup(()=>{disposed=true;clearInterval(timer);detachSkills();views.length=0;skills.clear();supplies.clear();liveSkills.clear();});
+};
+
 window.__minibiaBotBundle.installWoodcuttingModule = function(bot) {
     const key='minibiaBot.woodcutting.config';
     const trees=new Map([[3682,2768],[9225,10143],[3625,2711],[3616,2702],[3617,2703],[3639,2725],[3622,2708]]);
@@ -48063,7 +48252,7 @@ window.__minibiaBotBundle.installWoodcuttingModule = function(bot) {
     const approachCache=new Map();
     function reachableApproach(target,from,now){
         if(Number(from.z)!==Number(target.pos.z))return null;
-        if(Math.max(Math.abs(from.x-target.pos.x),Math.abs(from.y-target.pos.y))<=1)return from;
+        if(bot.toolInReach(3268,from,target.pos))return from;
         const key=tileKey(from)+':'+target.key,revision=bot.specialAreas?.getRevision?.();
         const cached=approachCache.get(key);
         if(cached&&cached.revision===revision&&now-cached.at<1000)return cached.position;
@@ -48095,11 +48284,18 @@ window.__minibiaBotBundle.installWoodcuttingModule = function(bot) {
         const axe=findAxe();if(!axe)return false;
         const playerPosition=bot.getPlayerPosition();
         if(!playerPosition){reason='Waiting for player position';return false;}
-        const candidates=nearby().map(t=>({...t,approach:reachableApproach(t,playerPosition,now)})).filter(t=>t.approach&&(!inCombat||Math.max(Math.abs(playerPosition.x-t.pos.x),Math.abs(playerPosition.y-t.pos.y))<=1));
-        const target=candidates.find(t=>t.key===targetKey)||candidates[0];
+        const candidates=nearby();
+        const previous=candidates.findIndex(t=>t.key===targetKey);
+        if(previous>0)candidates.unshift(candidates.splice(previous,1)[0]);
+        let target=null;
+        for(const candidate of candidates){
+            if(inCombat&&Math.max(Math.abs(playerPosition.x-candidate.pos.x),Math.abs(playerPosition.y-candidate.pos.y))>1)continue;
+            const approach=reachableApproach(candidate,playerPosition,now);
+            if(approach){target={...candidate,approach};break;}
+        }
         if(!target){targetKey=null;reason='No reachable unstripped tree within '+config.range+' tiles';return false;}
         const playerPos=bot.getPlayerPosition(),distance=Math.max(Math.abs(playerPos.x-target.pos.x),Math.abs(playerPos.y-target.pos.y));
-        if(distance>1){
+        if(!bot.toolInReach(3268,playerPos,target.pos)){
             if(bot.cave?.isRunning?.()){stopOwnWalk();reason='Pause Cavebot to approach trees';return false;}
             const progressKey=tileKey(playerPos);
             if(targetKey!==target.key||walkProgressKey!==progressKey){walkProgressKey=progressKey;walkProgressAt=now;}
@@ -48146,7 +48342,7 @@ window.__minibiaBotBundle.installWoodcuttingModule = function(bot) {
         q('combat').checked=!!config.attackWhileGathering;q('combat').addEventListener('change',()=>updateConfig({attackWhileGathering:q('combat').checked}));
         q('enabled').addEventListener('change',()=>q('enabled').checked?start():stop());q('delay').value=config.delayMs;q('range').value=config.range;
         q('delay').addEventListener('change',()=>{updateConfig({delayMs:q('delay').value});q('delay').value=config.delayMs;});q('reset').addEventListener('click',resetTrees);q('range').addEventListener('change',()=>{updateConfig({range:q('range').value});q('range').value=config.range;});
-        const refresh=()=>{q('enabled').checked=running;q('status').textContent=`${reason} · ${attempts} chops requested · ${stripped.size} stripped trees`;};refresh();const uiTimer=window.setInterval(refresh,500);bot.addCleanup(()=>window.clearInterval(uiTimer));
+        const refresh=()=>{if(!host.getClientRects().length)return;q('enabled').checked=running;q('status').textContent=`${reason} · ${attempts} chops requested · ${stripped.size} stripped trees`;};refresh();const uiTimer=window.setInterval(refresh,500);bot.addCleanup(()=>window.clearInterval(uiTimer));
     }
     bot.woodcutting={config,start,stop,updateConfig,tick,resetTrees,mount,status:()=>({running,reason,attempts,strippedTrees:stripped.size,target:targetKey})};
     bot.addCleanup(()=>{disposed=true;stop({persistEnabled:false});detachHook();});
@@ -48155,7 +48351,7 @@ window.__minibiaBotBundle.installWoodcuttingModule = function(bot) {
 
 window.__minibiaBotBundle.installMiningModule = function(bot) {
     const key='minibiaBot.mining.config';
-    const stones=new Map([[1790,1303],[1789,1302],[1787,1300],[1788,1301],[1792,1305],[1793,1306],[1777,1290],[1785,1298],[1786,1299],[1784,1297],[1783,1296],[1810,1323],[1811,1324],[1791,1304],[1813,1326]]);
+    const stones=new Map([[1772,1285],[1774,1287],[1776,1289],[1775,1288],[1773,1286],[1790,1303],[1789,1302],[1787,1300],[1788,1301],[1792,1305],[1793,1306],[1777,1290],[1785,1298],[1786,1299],[1784,1297],[1783,1296],[1810,1323],[1811,1324],[1791,1304],[1813,1326]]);
     const config={enabled:false,delayMs:2000,range:5,attackWhileGathering:false,...bot.storage.get(key,{})};
     delete config.depletionText;
     config.delayMs=Math.max(350,Math.min(10000,Number(config.delayMs)||2000));
@@ -48221,7 +48417,7 @@ window.__minibiaBotBundle.installMiningModule = function(bot) {
     const approachCache=new Map();
     function reachableApproach(target,from,now){
         if(Number(from.z)!==Number(target.pos.z))return null;
-        if(Math.max(Math.abs(from.x-target.pos.x),Math.abs(from.y-target.pos.y))<=1)return from;
+        if(bot.toolInReach(3456,from,target.pos))return from;
         const key=tileKey(from)+':'+target.key,revision=bot.specialAreas?.getRevision?.();
         const cached=approachCache.get(key);
         if(cached&&cached.revision===revision&&now-cached.at<1000)return cached.position;
@@ -48253,11 +48449,18 @@ window.__minibiaBotBundle.installMiningModule = function(bot) {
         const axe=findPickaxe();if(!axe)return false;
         const playerPosition=bot.getPlayerPosition();
         if(!playerPosition){reason='Waiting for player position';return false;}
-        const candidates=nearby().map(t=>({...t,approach:reachableApproach(t,playerPosition,now)})).filter(t=>t.approach&&(!inCombat||Math.max(Math.abs(playerPosition.x-t.pos.x),Math.abs(playerPosition.y-t.pos.y))<=1));
-        const target=candidates.find(t=>t.key===targetKey)||candidates[0];
+        const candidates=nearby();
+        const previous=candidates.findIndex(t=>t.key===targetKey);
+        if(previous>0)candidates.unshift(candidates.splice(previous,1)[0]);
+        let target=null;
+        for(const candidate of candidates){
+            if(inCombat&&Math.max(Math.abs(playerPosition.x-candidate.pos.x),Math.abs(playerPosition.y-candidate.pos.y))>1)continue;
+            const approach=reachableApproach(candidate,playerPosition,now);
+            if(approach){target={...candidate,approach};break;}
+        }
         if(!target){targetKey=null;reason='No reachable undepleted stone within '+config.range+' tiles';return false;}
         const playerPos=bot.getPlayerPosition(),distance=Math.max(Math.abs(playerPos.x-target.pos.x),Math.abs(playerPos.y-target.pos.y));
-        if(distance>1){
+        if(!bot.toolInReach(3456,playerPos,target.pos)){
             if(bot.cave?.isRunning?.()){stopOwnWalk();reason='Pause Cavebot to approach stones';return false;}
             const progressKey=tileKey(playerPos);
             if(targetKey!==target.key||walkProgressKey!==progressKey){walkProgressKey=progressKey;walkProgressAt=now;}
@@ -48294,7 +48497,7 @@ window.__minibiaBotBundle.installMiningModule = function(bot) {
         q('enabled').addEventListener('change',()=>q('enabled').checked?start():stop());q('delay').value=config.delayMs;q('range').value=config.range;
         q('delay').addEventListener('change',()=>{updateConfig({delayMs:q('delay').value});q('delay').value=config.delayMs;});q('reset').addEventListener('click',resetStones);q('range').addEventListener('change',()=>{updateConfig({range:q('range').value});q('range').value=config.range;});
         
-        const refresh=()=>{q('enabled').checked=running;q('status').textContent=`${reason} · ${attempts} mining attempts requested · ${stripped.size} depleted stones`;};refresh();const uiTimer=window.setInterval(refresh,500);bot.addCleanup(()=>window.clearInterval(uiTimer));
+        const refresh=()=>{if(!host.getClientRects().length)return;q('enabled').checked=running;q('status').textContent=`${reason} · ${attempts} mining attempts requested · ${stripped.size} depleted stones`;};refresh();const uiTimer=window.setInterval(refresh,500);bot.addCleanup(()=>window.clearInterval(uiTimer));
     }
     bot.mining={config,start,stop,updateConfig,tick,resetStones,mount,status:()=>({running,reason,attempts,strippedStones:stripped.size,target:targetKey})};
     bot.addCleanup(()=>{disposed=true;stop({persistEnabled:false});detachHook();});
@@ -48368,8 +48571,8 @@ window.__minibiaBotBundle.installCookingModule=function(bot){
  const q=k=>host.querySelector(`[data-cook="${k}"]`);
  const render=()=>{q('list').replaceChildren();for(const f of config.foods){const row=document.createElement('div');row.className='prof-food-row';const label=document.createElement('span');label.textContent=`SID ${f.sid} · CID ${f.cid}${isCookable(f)?'':' · not cookable'}`;const remove=document.createElement('button');remove.type='button';remove.className='mb-small-button';remove.textContent='Remove';remove.addEventListener('click',()=>{updateConfig({foods:config.foods.filter(r=>r!==f)});render();});row.append(label,remove);q('list').append(row);}};
  q('enabled').addEventListener('change',()=>q('enabled').checked?start():stop());q('pick').addEventListener('click',()=>pickFood(f=>{q('sid').value=f.sid;q('cid').value=f.cid;updateConfig({foods:[...config.foods,f]});render();}));q('add').addEventListener('click',()=>{updateConfig({foods:[...config.foods,{sid:q('sid').value,cid:q('cid').value}]});render();});q('reset').addEventListener('click',resetBatch);
- const refresh=()=>{q('enabled').checked=running;q('status').textContent=`${reason} · ${used} food consumed`;q('ovens').textContent='Ovens: '+(ovens().map(o=>`SID ${o.sid} / CID ${o.cid}`).join(', ')||'waiting for game definitions');};render();refresh();const ui=window.setInterval(refresh,500);bot.addCleanup(()=>window.clearInterval(ui));}
- bot.cooking={config,hasFoodToCook:()=>config.foods.some(food=>isCookable(food)&&inventory(food).count>0)||!!pending||!!splitPending,start,stop,tick,updateConfig,resetBatch,pickFood,mount,status:()=>({running,reason,used,pending:!!pending,splitPending:!!splitPending,ovens:ovens()})};bot.addCleanup(()=>{disposed=true;stop({persistEnabled:false});});if(config.enabled)start();
+ const refresh=()=>{if(!host.getClientRects().length)return;q('enabled').checked=running;q('status').textContent=`${reason} · ${used} food consumed`;q('ovens').textContent='Ovens: '+(ovens().map(o=>`SID ${o.sid} / CID ${o.cid}`).join(', ')||'waiting for game definitions');};render();refresh();const ui=window.setInterval(refresh,500);bot.addCleanup(()=>window.clearInterval(ui));}
+ bot.cooking={config,hasFoodToCook:()=>config.foods.some(food=>{if(!isCookable(food))return false;if(inventory(food).count>0)return true;const r=bot.sidInventory.reading(food.sid);if(!r||Date.now()-r.at>5000){bot.sidInventory.request([food.sid]);return false;}return r.count>0;})||!!pending||!!splitPending,start,stop,tick,updateConfig,resetBatch,pickFood,mount,status:()=>({running,reason,used,pending:!!pending,splitPending:!!splitPending,ovens:ovens()})};bot.addCleanup(()=>{disposed=true;stop({persistEnabled:false});});if(config.enabled)start();
 };
 
 window.__minibiaBotBundle.installFisherModule = function installFisherModule(bot) {
@@ -48479,47 +48682,13 @@ window.__minibiaBotBundle.installFisherModule = function installFisherModule(bot
     // v1.6.35: use the same shared HOTBAR_ITEM_COUNT observer as the rest of
     // mb0t. The server count sees nested/closed backpacks; unknown/stale counts
     // pause fishing instead of pretending the visible-container total is final.
-    function requestFishCount(now = Date.now(), force = false) {
-        if (typeof bot.requestItemCounts !== "function") return false;
-        if (!force && now - state.lastFishCountRequestAt < FISH_COUNT_REQUEST_MS)
-            return false;
-        const sent = !!bot.requestItemCounts([{ id: FISH_ITEM_ID, fluidType: 0 }]);
-        if (sent) state.lastFishCountRequestAt = now;
-        return sent;
+    function requestFishCount(now=Date.now(),force=false){
+        if(!force&&now-state.lastFishCountRequestAt<FISH_COUNT_REQUEST_MS)return false;
+        const sent=bot.sidInventory.request([2667],force);if(sent)state.lastFishCountRequestAt=now;return sent;
     }
-
-    function getFishCountState(now = Date.now()) {
-        // Cooking distinguishes raw fish from finished fish sharing CID 3578.
-        // The CID-only server count cannot make that distinction.
-        if(bot.cooking?.config?.enabled&&bot.cooking.config.foods?.some(food=>Number(food.sid)===2667&&Number(food.cid)===FISH_ITEM_ID)){
-            let count=0;
-            for(const container of [getEquipment(),...getContainersArray()]){
-                if(!container?.getSlotItem)continue;
-                const size=container.slots?.length??container.size??0;
-                for(let i=0;i<size;i++){
-                    const item=container.getSlotItem(i);
-                    if(Number(item?.sid)===2667&&Number(item?.id)===FISH_ITEM_ID)count+=Math.max(1,Number(item.getCount?.()??item.count??1)||1);
-                }
-            }
-            return {known:true,fresh:true,count,at:now,rawOnly:true};
-        }
-
-        const reading = typeof bot.getItemCountReading === "function"
-            ? bot.getItemCountReading(FISH_ITEM_ID, 0)
-            : null;
-        if (!reading) {
-            return { known: false, fresh: false, count: null, at: 0 };
-        }
-        const at = Number(reading.at || 0);
-        return {
-            known: true,
-            // After each fishing attempt require a newer server reply before
-            // another cast. Otherwise a still-fresh pre-cast count could allow
-            // one extra cast before the periodic refresh lands.
-            fresh: now - at <= FISH_COUNT_FRESH_MS && at > state.lastFishAt,
-            count: Math.max(0, Math.trunc(Number(reading.count) || 0)),
-            at,
-        };
+    function getFishCountState(now=Date.now()){
+        const reading=bot.sidInventory.reading(2667);
+        return reading?{known:true,fresh:now-reading.at<=FISH_COUNT_FRESH_MS&&reading.at>state.lastFishAt,count:reading.count,at:reading.at,rawOnly:true}:{known:false,fresh:false,count:null,at:0};
     }
 
     function getFishCount(now = Date.now()) {
@@ -50942,7 +51111,7 @@ window.__minibiaBotBundle.installNpcSupplyBuyerModule = function installNpcSuppl
     const config=Object.assign({enabled:false,npcName:"",greeting:"hi",tradeKeyword:"trade",buyDelayMs:250,countTimeoutMs:5000,autoCooldownMs:15000,closeTradeAfter:true,supplyCheckOkLabel:"start",rules:[]},bot.storage.get(configStorageKey,{}));
     const state={running:false,stopRequested:false,phase:"idle",lastError:null,lastRunAt:0,lastNpc:null,purchases:[],sales:[],lastAutoAttemptAt:0,timerId:null,lastTradeOffer:null,activeTrade:null,tradeSeq:0,tradeHookOwner:null,tradeHookOriginal:null,tradeHookWrapper:null,tradeHookRetryTimer:null};
     const sleep=ms=>new Promise(r=>setTimeout(r,Math.max(0,Number(ms)||0)));
-    function makeRule(r={}){const name=String(r.name||"").trim();if(!name)return null;return{id:String(r.id||`supply-${Date.now()}-${Math.random().toString(36).slice(2,7)}`),enabled:r.enabled!==false,name,tradeName:String(r.tradeName||name).trim()||name,minCount:Math.max(0,Math.floor(Number(r.minCount)||0)),target:Math.max(0,Math.floor(Number(r.target??r.refillTarget)||0))};}
+    function makeRule(r={}){const name=String(r.name||"").trim();if(!name)return null;return{id:String(r.id||`supply-${Date.now()}-${Math.random().toString(36).slice(2,7)}`),enabled:r.enabled!==false,name,sid:Math.max(0,Math.trunc(Number(r.sid)||0)),cid:Math.max(0,Math.trunc(Number(r.cid)||0)),fluidType:Math.max(0,Math.trunc(Number(r.fluidType)||0)),tradeName:String(r.tradeName||name).trim()||name,minCount:Math.max(0,Math.floor(Number(r.minCount)||0)),target:Math.max(0,Math.floor(Number(r.target??r.refillTarget)||0))};}
     function normalize(){config.enabled=config.enabled===true;config.npcName=String(config.npcName||"").trim();config.greeting=String(config.greeting||"hi").trim()||"hi";config.tradeKeyword=String(config.tradeKeyword||"trade").trim()||"trade";config.buyDelayMs=Math.max(140,Math.min(3000,Number(config.buyDelayMs)||250));config.countTimeoutMs=Math.max(1200,Math.min(15000,Number(config.countTimeoutMs)||5000));config.autoCooldownMs=Math.max(5000,Math.min(300000,Number(config.autoCooldownMs)||15000));config.closeTradeAfter=config.closeTradeAfter!==false;config.supplyCheckOkLabel=String(config.supplyCheckOkLabel||"start").trim()||"start";config.rules=(Array.isArray(config.rules)?config.rules:[]).map(makeRule).filter(Boolean);}
     normalize();
     function persist(){bot.storage.set(configStorageKey,{...config,rules:config.rules.map(r=>({...r}))});}
@@ -51147,24 +51316,25 @@ window.__minibiaBotBundle.installNpcSupplyBuyerModule = function installNpcSuppl
         }catch(e){}
         return explicit||0;
     }
-    function findOffer(name,type="sell"){const session=currentTradeSession();if(!session)return null;const offers=Array.isArray(session.offers)?session.offers:[];const q=String(name||"").trim().toLowerCase();let rows=offers.map((o,i)=>({o,i})).filter(x=>!type||String(x.o.type||"").toLowerCase()===String(type).toLowerCase());let hit=rows.find(x=>String(x.o.name||"").trim().toLowerCase()===q);if(!hit){const fuzzy=rows.filter(x=>String(x.o.name||"").toLowerCase().includes(q));if(fuzzy.length===1)hit=fuzzy[0];}if(!hit)return null;const cid=Number(hit.o.id)||0;const fluidType=offerFluidType(hit.o,name);return{session,modal:session.modal||null,npcId:Number(session.npcId)||0,index:hit.i,offer:hit.o,cid,fluidType,name:String(hit.o.name||name)};}
+    function findOffer(name,type="sell",wantedSid=0){const session=currentTradeSession();if(!session)return null;const offers=Array.isArray(session.offers)?session.offers:[];const q=String(name||"").trim().toLowerCase();let rows=offers.map((o,i)=>({o,i})).filter(x=>!wantedSid||Number(x.o.sid)===Number(wantedSid)).filter(x=>!type||String(x.o.type||"").toLowerCase()===String(type).toLowerCase());let hit=rows.find(x=>String(x.o.name||"").trim().toLowerCase()===q);if(!hit){const fuzzy=rows.filter(x=>String(x.o.name||"").toLowerCase().includes(q));if(fuzzy.length===1)hit=fuzzy[0];}if(!hit)return null;const cid=Number(hit.o.id)||0;const fluidType=offerFluidType(hit.o,name);return{session,modal:session.modal||null,npcId:Number(session.npcId)||0,index:hit.i,offer:hit.o,sid:Number(hit.o.sid)||0,cid,fluidType,name:String(hit.o.name||name)};}
+    function readIdentityCount(identity){return identity.sid>0&&!identity.fluidType?bot.sidInventory.count(identity.sid,config.countTimeoutMs):readExactCount(identity.cid,identity.fluidType);}
     function readExactCount(cid,fluidType=0,timeoutMs=config.countTimeoutMs){return new Promise((resolve,reject)=>{const id=Number(cid),fluid=Number(fluidType)||0,started=Date.now();let done=false,timer=null,off=()=>{};const finish=(fn,v)=>{if(done)return;done=true;if(timer)clearTimeout(timer);try{off();}catch(e){}fn(v);};off=bot.subscribeItemCounts?.(r=>{if(Number(r?.itemId)!==id||Number(r?.fluidType||0)!==fluid)return;if(Number(r?.at||0)+25<started)return;finish(resolve,Math.max(0,Math.floor(Number(r.count)||0)));})||(()=>{});timer=setTimeout(()=>finish(reject,new Error(`Supply count timeout for ${id}:${fluid}`)),timeoutMs);if(!bot.requestItemCounts?.([{id,fluidType:fluid}]))finish(reject,new Error("Server item-count request unavailable"));});}
-    async function waitCount(identity,expected){const end=Date.now()+config.countTimeoutMs;let last=null;while(Date.now()<end){if(state.stopRequested)throw new Error("NPC trade stopped");await sleep(config.buyDelayMs);last=await readExactCount(identity.cid,identity.fluidType);if(last>=expected)return last;}throw new Error(`${identity.name} purchase was not confirmed (got ${last??"?"}, expected ${expected})`);}
+    async function waitCount(identity,expected){const end=Date.now()+config.countTimeoutMs;let last=null;while(Date.now()<end){if(state.stopRequested)throw new Error("NPC trade stopped");await sleep(config.buyDelayMs);last=await readIdentityCount(identity);if(last>=expected)return last;}throw new Error(`${identity.name} purchase was not confirmed (got ${last??"?"}, expected ${expected})`);}
     async function sendTrade(identity,count){const n=Math.max(1,Math.min(100,Math.floor(Number(count)||1)));if(typeof OfferBuyPacket!=="function")throw new Error("OfferBuyPacket unavailable");const npcId=Number(identity?.npcId||identity?.session?.npcId||identity?.modal?.__id)||0;if(!npcId)throw new Error("NPC trade identity has no NPC id");window.gameClient.send(new OfferBuyPacket(npcId,Number(identity.index),n));return n;}
-    async function buyToTarget(name,target){const identity=findOffer(name,"sell");if(!identity)throw new Error(`NPC does not sell: ${name}`);bot.log("[NPC Trade] resolved supply",{requested:name,offer:identity.name,cid:identity.cid,fluidType:identity.fluidType,offerCount:Number(identity.offer?.count)||0,offerIndex:identity.index,target:Math.max(0,Math.floor(Number(target)||0))});let current=await readExactCount(identity.cid,identity.fluidType);const result={name:identity.name,before:current,target,bought:0,cid:identity.cid,fluidType:identity.fluidType};while(current<target){const live=findOffer(name,"sell");if(!live||live.cid!==identity.cid||live.fluidType!==identity.fluidType)throw new Error(`NPC trade offer changed while buying ${name}`);const chunk=Math.min(100,target-current),expected=current+chunk;state.phase=`buying ${identity.name} (${current}/${target})`;await sendTrade(live,chunk);const confirmed=await waitCount(identity,expected);if(confirmed!==expected)throw new Error(`Inventory count changed unexpectedly while buying ${name}; stopped before another purchase`);result.bought+=confirmed-current;current=confirmed;}return result;}
-    async function buyFixed(name,amount){const identity=findOffer(name,"sell");if(!identity)throw new Error(`NPC does not sell: ${name}`);const before=await readExactCount(identity.cid,identity.fluidType);return buyToTarget(name,before+Math.max(0,Math.floor(Number(amount)||0)));}
+    async function buyToTarget(name,target,wantedSid=0){const identity=findOffer(name,"sell",wantedSid);if(!identity)throw new Error(`NPC does not sell: ${name}`);bot.log("[NPC Trade] resolved supply",{requested:name,offer:identity.name,cid:identity.cid,fluidType:identity.fluidType,offerCount:Number(identity.offer?.count)||0,offerIndex:identity.index,target:Math.max(0,Math.floor(Number(target)||0))});let current=await readIdentityCount(identity);const result={name:identity.name,before:current,target,bought:0,cid:identity.cid,fluidType:identity.fluidType};while(current<target){const live=findOffer(name,"sell",identity.sid);if(!live||live.sid!==identity.sid||live.cid!==identity.cid||live.fluidType!==identity.fluidType)throw new Error(`NPC trade offer changed while buying ${name}`);const chunk=Math.min(100,target-current),expected=current+chunk;state.phase=`buying ${identity.name} (${current}/${target})`;await sendTrade(live,chunk);const confirmed=await waitCount(identity,expected);if(confirmed!==expected)throw new Error(`Inventory count changed unexpectedly while buying ${name}; stopped before another purchase`);result.bought+=confirmed-current;current=confirmed;}return result;}
+    async function buyFixed(name,amount){const identity=findOffer(name,"sell");if(!identity)throw new Error(`NPC does not sell: ${name}`);const before=await readIdentityCount(identity);return buyToTarget(name,before+Math.max(0,Math.floor(Number(amount)||0)));}
     function resolveInventoryIdentity(name){
         const q=String(name||"").trim().toLowerCase().replace(/\s+/g," ");
         const fluids={"mana fluid":7,"mana fluids":7,"mana":7,"manas":7,"life fluid":10,"life fluids":10};
         if(Object.prototype.hasOwnProperty.call(fluids,q))return{cid:2874,fluidType:fluids[q],name};
-        const defs=window.gameClient?.itemDefinitionsByCid||{};const hits=Object.values(defs).filter(d=>String(d?.properties?.name||"").trim().toLowerCase()===q);
-        return hits.length===1?{cid:Number(hits[0].id),fluidType:0,name}:null;
+        const defs=window.gameClient?.itemDefinitionsBySid||{};const hits=Object.entries(defs).filter(([sid,d])=>String(d?.properties?.name||"").trim().toLowerCase()===q);
+        return hits.length===1?{sid:Number(hits[0][0]),cid:Number(hits[0][1].id),fluidType:0,name}:null;
     }
     function sellAmount(row,current){const mode=String(row?.mode||"all");if(mode==="all")return current;if(mode==="amount")return Math.min(current,Math.max(0,Math.floor(Number(row?.amount)||0)));if(mode==="keep")return Math.max(0,current-Math.max(0,Math.floor(Number(row?.keep)||0)));throw new Error("Invalid sell mode");}
-    async function sellItems(rows=[]){const out=[];for(const row of rows){const name=String(row?.name||row?.itemName||"").trim();if(!name)continue;const id=findOffer(name,"buy");if(!id){out.push({name,status:"not-offered",sold:0});continue;}const current=await readExactCount(id.cid,id.fluidType),amount=sellAmount(row,current);let remaining=amount,sold=0;while(remaining>0){const chunk=Math.min(100,remaining);await sendTrade(findOffer(name,"buy"),chunk);sold+=chunk;remaining-=chunk;await sleep(config.buyDelayMs);}out.push({name,before:current,requested:amount,sold,status:"sent"});}state.sales=out;return out;}
+    async function sellItems(rows=[]){const out=[];for(const row of rows){const name=String(row?.name||row?.itemName||"").trim();if(!name)continue;const id=findOffer(name,"buy");if(!id){out.push({name,status:"not-offered",sold:0});continue;}const current=await readIdentityCount(id),amount=sellAmount(row,current);let remaining=amount,sold=0;while(remaining>0){if(state.stopRequested)throw new Error("NPC trade stopped");const live=findOffer(name,"buy");if(!live||live.sid!==id.sid||live.cid!==id.cid||live.fluidType!==id.fluidType)throw new Error("NPC sell offer changed");const before=await readIdentityCount(live);const chunk=Math.min(100,remaining,sellAmount(row,before));if(chunk<=0)break;await sendTrade(live,chunk);await sleep(config.buyDelayMs);const after=await readIdentityCount(live);if(after!==before-chunk)throw new Error("NPC sale not confirmed; stopped before selling more");sold+=chunk;remaining-=chunk;}out.push({name,before:current,requested:amount,sold,status:"sent"});}state.sales=out;return out;}
     async function withTrade(fn,options={}){if(state.running)return false;ensureTradeOfferHook();if(window.gameClient?.player?.getTarget?.()||window.gameClient?.player?.__target)throw new Error("Cannot trade while a combat target is active");const npc=findNpc();if(config.npcName&&!npc)throw new Error(`Configured NPC is not nearby: ${config.npcName}`);if(!npc&&!tradeModal())throw new Error("No nearby NPC found");state.running=true;state.stopRequested=false;state.lastError=null;state.lastRunAt=Date.now();state.lastNpc=npc?.name||config.npcName||null;state.purchases=[];state.sales=[];state.activeTrade=null;bot.cave?.pauseMovement?.("npc-supply-buyer");try{const session=await greetAndOpenTrade(npc);state.activeTrade=session;return await fn();}catch(e){state.lastError=String(e?.message||e);state.phase="error";bot.log("[NPC Trade]",state.lastError);if(options.auto)return false;throw e;}finally{if(config.closeTradeAfter)closeTradeWindow();state.activeTrade=null;state.running=false;state.stopRequested=false;bot.cave?.resumeMovement?.("npc-supply-buyer");}}
-    async function buyNow(options={}){return withTrade(async()=>{const rules=config.rules.filter(r=>r.enabled!==false&&r.tradeName&&r.target>0);if(!rules.length)throw new Error("No enabled supply rules configured");for(const r of rules){const p=await buyToTarget(r.tradeName,r.target);p.ruleId=r.id;p.name=r.name;state.purchases.push(p);await sleep(config.buyDelayMs);}state.phase="complete";return true;},options);}
-    async function checkSupplies(){const rows=[];for(const r of config.rules.filter(x=>x.enabled!==false)){let identity=null,count=null,error=null;try{identity=currentTradeSession()?findOffer(r.tradeName,"sell"):null;if(!identity)identity=resolveInventoryIdentity(r.name);if(identity)count=await readExactCount(identity.cid,identity.fluidType);else error="item identity unresolved";}catch(e){error=String(e?.message||e);}rows.push({...r,count,low:Number.isFinite(count)?count<r.minCount:null,error});}return rows;}
+    async function buyNow(options={}){return withTrade(async()=>{const rules=config.rules.filter(r=>r.enabled!==false&&r.tradeName&&r.target>0);if(!rules.length)throw new Error("No enabled supply rules configured");for(const r of rules){const p=await buyToTarget(r.tradeName,r.target,r.sid);p.ruleId=r.id;p.name=r.name;state.purchases.push(p);await sleep(config.buyDelayMs);}state.phase="complete";return true;},options);}
+    async function checkSupplies(){const rows=[];for(const r of config.rules.filter(x=>x.enabled!==false)){let identity=null,count=null,error=null;try{identity=r.sid>0?{sid:r.sid,cid:r.cid,fluidType:r.fluidType}:currentTradeSession()?findOffer(r.tradeName,"sell"):null;if(!identity)identity=resolveInventoryIdentity(r.name);if(identity)count=await readIdentityCount(identity);else error="item identity unresolved";}catch(e){error=String(e?.message||e);}rows.push({...r,count,low:Number.isFinite(count)?count<r.minCount:null,error});}return rows;}
     function stop(){if(!state.running)return false;state.stopRequested=true;state.phase="stopping";return true;}
     function setEnabled(v){config.enabled=v===true;persist();return config.enabled;}
     function updateConfig(p={}){Object.keys(p).forEach(k=>{if(k==="rules")config.rules=p.rules;else if(Object.prototype.hasOwnProperty.call(config,k))config[k]=p[k];});normalize();persist();return status();}
@@ -51357,6 +51527,52 @@ window.__minibiaBotBundle.installBankNpcModule = function installBankNpcModule(b
 };
 
 window.__minibiaBotBundle.installPanel = function installPanel(bot) {
+    function organizePanelSections(panel){
+        const tab=name=>panel.querySelector(`[data-tab-panel="${name}"]`);
+        const header=(section,title)=>{const h=Array.from(section?.querySelectorAll('.mb-section-title')||[]).find(h=>h.textContent.trim()===title);return h;};
+        const moveToBottom=(name,title)=>{const host=tab(name);for(const s of host?.querySelectorAll(':scope > .mb-section')||[])if(header(s,title))host.append(s);};
+        moveToBottom('resupply','Inventory Browser');moveToBottom('looter','Server Loot Routing');moveToBottom('cave','Task & Quest Conditions');
+        const targeting=tab('targeting'),core=panel.querySelector('#minibia-bot-auto-attack-enabled')?.closest('.mb-section');
+        const extract=id=>{const toggle=panel.querySelector(id),h=toggle?.closest('.mb-section-title'),section=h?.parentElement;if(!section||!targeting)return null;section.classList.add('mb-section');section.style.cssText='';h.classList.remove('mb-section-title--sub');h.style.cssText='';targeting.append(section);return section;};
+        const rune=extract('#minibia-bot-rune-shooter-enabled');
+        const listsTitle=Array.from(targeting?.querySelectorAll('.mb-section-title')||[]).find(h=>h.textContent.trim()==='Target Lists');
+        const lists=listsTitle?.parentElement;if(lists){lists.classList.add('mb-section');lists.style.cssText='';listsTitle.classList.remove('mb-section-title--sub');listsTitle.style.cssText='';targeting.append(lists);}
+        const rules=targeting?.querySelector('.mb-combat-rules');if(core)targeting.prepend(core);if(rune)targeting.append(rune);if(rules)targeting.append(rules);if(lists)targeting.append(lists);
+        const cave=tab('cave');for(const title of ['Recovery Safety','Debug']){const h=Array.from(cave?.querySelectorAll('.mb-section-title')||[]).find(h=>h.textContent.trim()===title);const body=h?.parentElement;if(!body||body.tagName==='DETAILS')continue;const details=document.createElement('details');details.className='mb-cave-details';const summary=document.createElement('summary');summary.className='mb-section-title mb-section-title--sub';const label=document.createElement('span');label.className='mb-title-text';label.textContent=title;summary.append(label);details.append(summary);body.replaceWith(details);h.remove();details.append(...Array.from(body.childNodes));}
+        const native=Array.from(tab('utility')?.querySelectorAll('.mb-section')||[]).find(s=>header(s,'Native Automation'));if(native){const grid=document.createElement('div');grid.className='mb-native-grid';const checks=Array.from(native.children).filter(e=>e.tagName==='LABEL');checks.forEach(e=>grid.append(e));native.querySelector('.mb-section-title').after(grid);}
+        const status=tab('status');
+        const blessing=Array.from(status?.querySelectorAll(':scope > .mb-section')||[]).find(s=>header(s,'Blessing Protection'));
+        const quick=Array.from(status?.querySelectorAll(':scope > .mb-section')||[]).find(s=>s.querySelector('.mb-status-grid'));
+        if(quick&&blessing)quick.after(blessing);
+        for(const title of ['Waypoint Properties','Task & Quest Conditions']){
+            const h=Array.from(cave?.querySelectorAll('.mb-section-title')||[]).find(h=>h.textContent.trim()===title);
+            const body=h?.parentElement;if(!body||body.querySelector(':scope > details'))continue;
+            const details=document.createElement('details');details.className='mb-cave-fold';
+            const summary=document.createElement('summary');summary.className=h.className;summary.style.cssText='cursor:pointer;display:list-item;margin-bottom:6px';
+            summary.append(...Array.from(h.childNodes));h.remove();
+            details.append(summary,...Array.from(body.childNodes));body.append(details);
+        }
+        panel.querySelectorAll('[data-client-extras]').forEach(s=>s.classList.add('mb-new-section'));
+        panel.querySelector('[data-hunt-stats]')?.closest('.mb-section')?.classList.add('mb-new-section');
+        const style=document.createElement('style');style.textContent=`
+#minibia-bot-panel .mb-new-section{color:var(--mb-hub-text-2,#cfc8b8);font-size:11px;}
+#minibia-bot-panel .mb-new-section .mb-small-note{color:var(--mb-hub-muted,#a39d90);}
+#minibia-bot-panel .mb-cave-fold>summary{cursor:pointer;display:list-item!important;}
+#minibia-bot-panel .mb-status-grid{gap:5px!important;}
+#minibia-bot-panel .mb-status-card{display:grid!important;grid-template-columns:minmax(0,1fr) auto;gap:3px 6px!important;padding:6px!important;}
+#minibia-bot-panel .mb-status-card-top{gap:5px!important;}
+#minibia-bot-panel .mb-status-card-icon{width:22px!important;height:22px!important;font-size:13px!important;border-radius:3px!important;}
+#minibia-bot-panel .mb-status-card-state{grid-column:1;font-size:9px;gap:4px!important;margin:0!important;}
+#minibia-bot-panel .mb-status-toggle{grid-column:2;grid-row:1/3;align-self:center;width:auto!important;padding:3px 7px!important;font-size:10px!important;margin:0!important;}
+#minibia-bot-panel .mb-native-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px 8px;}
+#minibia-bot-panel .mb-native-grid label{font-size:10px;min-width:0;margin:0!important;}
+#minibia-bot-panel .mb-cave-details{border-top:1px solid rgba(255,255,255,.08);margin-top:10px;padding-top:6px;}
+#minibia-bot-panel .mb-cave-details>summary{cursor:pointer;display:list-item;}
+#minibia-bot-panel [data-hunt-stats]{display:grid;gap:5px;margin:6px 0;}
+#minibia-bot-panel .mb-hunt-stat-row{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:5px;font-size:11px;}
+`;panel.append(style);
+    }
+
     const panelPositionKey = "minibiaBot.ui.panelPosition";
     const panelCollapsedKey = "minibiaBot.ui.panelCollapsed";
 
@@ -52989,7 +53205,7 @@ function upgradeSectionHeaders(panel) {
     // ---- VISIBLE CREATURES LIST ----
     function refreshVisibleCreatures() {
         const list = document.getElementById("minibia-bot-visible-creatures-list");
-        if (!list)
+        if (!list || !list.getClientRects().length)
             return;
         const me = bot.getPlayerPosition?.();
         const status = bot.xray?.status?.();
@@ -55345,9 +55561,7 @@ function upgradeSectionHeaders(panel) {
       </div>
       <div style="display:flex;gap:6px;align-items:center;margin-top:5px;flex-wrap:wrap;">
         <label style="display:flex;gap:5px;align-items:center;font-size:11px;color:#e9d39b;"><span>Supply Check OK → label</span><input id="minibia-bot-cave-supply-check-ok-label" value="start" style="width:110px;padding:3px 5px;font-size:11px;" /></label>
-        <span class="mb-small-note" style="margin:0;">LOW = continue · OK = bot.goToLabel(label)</span>
       </div>
-      <div class="mb-small-note" style="margin-top:4px;">Uses the current settings from the Resupply tab and inserts after the selected waypoint.</div>
     </div>
 
     <!-- Waypoints -->
@@ -56139,10 +56353,14 @@ function upgradeSectionHeaders(panel) {
         // v1.6.56: keep the pre-v1.6.34 panel host. Keeping the panel in
         // document.body matches the last known-good mobile UI compositor path.
         document.body.appendChild(panel);
+        bot.huntStats?.mount?.(panel);
+        bot.clientExtras?.mount?.(panel);
         bot.combatRules?.mount?.(panel);
         bot.woodcutting?.mount?.(panel);
         bot.mining?.mount?.(panel);
         bot.cooking?.mount?.(panel);
+        bot.observability?.mount?.(panel);
+        organizePanelSections(panel);
 
         // v1.6.75: Special Areas bind immediately after the panel exists.
         const __mbSpecialAreaUi = (() => {
@@ -58219,6 +58437,8 @@ function upgradeSectionHeaders(panel) {
         }
 
         function refreshSpecialAreas() {
+            const tab=document.querySelector('[data-tab-panel="cave"]');
+            if(!tab||!tab.getClientRects().length)return;
             if (typeof __mbSpecialAreaUi !== "undefined" && __mbSpecialAreaUi?.refresh) {
                 __mbSpecialAreaUi.refresh();
                 return;
@@ -63755,6 +63975,9 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
 
         const bot = currentBundle.createBot();
         bot.hasNavigationObstacle = currentBundle.hasNavigationObstacle;
+        currentBundle.installClientImprovements(bot);
+        currentBundle.installClientExtras(bot);
+        currentBundle.installObservability(bot);
         currentBundle.installPzModule(bot);
         currentBundle.installXrayModule(bot);
         currentBundle.installPanicModule(bot);
