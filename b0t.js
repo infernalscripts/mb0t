@@ -662,7 +662,29 @@ function installItemCountObserver() {
     return true;
 }
 
-function requestItemCounts(items = []) {
+// Merge independent consumers in a short window; never reuse a pre-action reply as confirmation.
+const sharedCountQueue=new Map(),sharedCountLastSent=new Map();let sharedCountTimer=null,sharedCountPlayer=null;
+function requestItemCounts(items=[]){
+    const player=window.gameClient?.player;
+    if(!player||!window.gameClient?.networkManager?.isConnected?.()||typeof HotbarCountsRequestPacket!=='function')return false;
+    if(player!==sharedCountPlayer){sharedCountPlayer=player;sharedCountQueue.clear();sharedCountLastSent.clear();if(sharedCountTimer)clearTimeout(sharedCountTimer);sharedCountTimer=null;}
+    const now=Date.now();let accepted=false;
+    for(const item of items){const key=getItemCountKey(item?.id??item?.itemId,item?.fluidType);if(!key)continue;
+        if(sharedCountQueue.has(key)){accepted=true;continue;}
+        const [id,fluidType]=key.split(':').map(Number);if(sharedCountQueue.size<512){sharedCountQueue.set(key,{id,fluidType});accepted=true;}
+    }
+    if(sharedCountQueue.size&&!sharedCountTimer)sharedCountTimer=setTimeout(()=>{
+        sharedCountTimer=null;
+        const entries=[...sharedCountQueue.entries()];sharedCountQueue.clear();
+        if(window.gameClient?.player!==player)return;
+        for(let i=0;i<entries.length;i+=50){const chunk=entries.slice(i,i+50);if(sendItemCountRequests(chunk.map(x=>x[1])))for(const [key]of chunk)sharedCountLastSent.set(key,Date.now());}
+        while(sharedCountLastSent.size>512)sharedCountLastSent.delete(sharedCountLastSent.keys().next().value);
+    },50);
+    return accepted;
+}
+addCleanup(()=>{if(sharedCountTimer)clearTimeout(sharedCountTimer);sharedCountTimer=null;sharedCountQueue.clear();sharedCountLastSent.clear();});
+
+function sendItemCountRequests(items = []) {
     const unique = [];
     const seen = new Set();
     items.forEach((item) => {
@@ -3079,7 +3101,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.148",
+        version: "1.6.152",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -3171,7 +3193,26 @@ addCleanup(() => {
             get(key, fallback = null) {
                 try {
                     const value = window.localStorage.getItem(key);
-                    return value == null ? fallback : JSON.parse(value);
+                    if(value==null)return fallback;
+                    const parsed=JSON.parse(value);
+                    const object=v=>v!==null&&typeof v==='object'&&!Array.isArray(v);
+                    if(Array.isArray(fallback))return Array.isArray(parsed)?parsed:fallback;
+                    if(object(fallback)){
+                        if(!object(parsed))return fallback;
+                        const repaired={...parsed};
+                        for(const [name,defaultValue]of Object.entries(fallback)){
+                            if(repaired[name]===undefined)continue;
+                            if(Array.isArray(defaultValue)&&!Array.isArray(repaired[name]))repaired[name]=defaultValue;
+                            else if(typeof defaultValue==='number'&&!Number.isFinite(Number(repaired[name])))repaired[name]=defaultValue;
+                            else if(typeof defaultValue==='boolean'&&typeof repaired[name]!=='boolean')repaired[name]=repaired[name]===true||repaired[name]==='true'||repaired[name]===1;
+                        }
+                        for(const name of ['rules','healRules','foods','itemAlerts'])if(name in repaired){
+                            if(!Array.isArray(repaired[name]))repaired[name]=[];
+                            else repaired[name]=repaired[name].filter(object);
+                        }
+                        return repaired;
+                    }
+                    return parsed;
                 } catch {
                     return fallback;
                 }
@@ -5487,7 +5528,6 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
             modules: {
                 autoPickup: getSharedGmModuleSnapshot(bot.autoPickup),
                 rune: getSharedGmModuleSnapshot(bot.rune),
-                heal: getSharedGmModuleSnapshot(bot.heal),
                 eat: getSharedGmModuleSnapshot(bot.eat),
                 invisible: getSharedGmModuleSnapshot(bot.invisible),
                 magicShield: getSharedGmModuleSnapshot(bot.magicShield),
@@ -5509,13 +5549,13 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
     }
 
     function stopSharedGmKillSwitchModules() {
+        // Healing stays live and remains under the user's control throughout the GM encounter.
         // AutoPickup first so its movement-pause ownership is released before
         // CaveBot itself is stopped.
         try { bot.autoPickup?.stop?.({ persistEnabled: false }); } catch (e) {}
         try { bot.looter?.stop?.({ persistEnabled: false }); } catch (e) {}
         try { bot.runeShooter?.stop?.({ persistEnabled: false }); } catch (e) {}
         try { bot.rune?.stop?.({ persistEnabled: false }); } catch (e) {}
-        try { bot.heal?.stop?.({ persistEnabled: false }); } catch (e) {}
         try { bot.eat?.stop?.({ persistEnabled: false }); } catch (e) {}
         try { bot.invisible?.stop?.({ persistEnabled: false }); } catch (e) {}
         try { bot.magicShield?.stop?.({ persistEnabled: false }); } catch (e) {}
@@ -5620,7 +5660,6 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         });
 
         restoreSharedGmModule("Mana Training", bot.rune, modules.rune);
-        restoreSharedGmModule("Healing", bot.heal, modules.heal);
         restoreSharedGmModule("Auto Eat", bot.eat, modules.eat);
         restoreSharedGmModule("Auto Invisible", bot.invisible, modules.invisible);
         restoreSharedGmModule("Magic Shield", bot.magicShield, modules.magicShield);
@@ -23951,6 +23990,7 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
  * ==================================================================================
  */
 window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
+    const failedRecoveryTiles=new Map();
     const configStorageKey = "minibiaBot.cave.config";
     const routeStorageKey = "minibiaBot.cave.route";
     const transitionStorageKey = "minibiaBot.cave.transitions";
@@ -24801,6 +24841,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     // penalties, NO_WAY quarantine, remembered blockers, and target-avoidance
     // state so an edited route gets a clean recovery context.
     function resetRecoveryContext(reason = "route changed") {
+        failedRecoveryTiles.clear();
         clearPostScriptHandoff(reason);
         // Manual jumps/route edits supersede any logical branch segment.
         // Supply Check may arm a runtime recovery fence; never carry it across
@@ -31557,6 +31598,11 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
     // Recovery selection uses a bounded, static loaded-tile search. This is
     // separate from ordinary route traversal and ignores temporary creatures.
+    function quarantineRecoveryTile(wp,now=Date.now()){
+        if(!wp||wp.script||wp.x===undefined||wp.y===undefined||wp.z===undefined)return;
+        failedRecoveryTiles.set(`${wp.x},${wp.y},${wp.z}`,now+30000);
+        while(failedRecoveryTiles.size>128)failedRecoveryTiles.delete(failedRecoveryTiles.keys().next().value);
+    }
     function recoveryTileReachable(from, wp) {
         const start=getTileAt(from), goal=getTileAt(wp);
         if(!start||!goal||goal.__isPlaceholder)return null;
@@ -31637,6 +31683,9 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 // never permanently blacklists it, and later fallback passes may
                 // still select it if it is the only viable recovery target.
                 const candidateKey = `${wp.x},${wp.y},${wp.z}`;
+                const failedUntil=failedRecoveryTiles.get(candidateKey);
+                if(failedUntil>now)continue;
+                if(failedUntil!==undefined)failedRecoveryTiles.delete(candidateKey);
                 const candidateHealth = state.routeHealth.get(candidateKey);
                 const hotspotAvoidMs = Math.max(1000, Number(config.recoveryHotspotAvoidMs) || 10000);
                 const hotspotActive = candidateHealth &&
@@ -33482,6 +33531,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                     recoveryWatch.key=positionKey;recoveryWatch.at=now;
                 }else if(now-recoveryWatch.at>=Math.max(1000,Number(config.recoveryNoProgressWindowMs)||5000)){
                     const failedIndex=state.currentIndex;
+                    quarantineRecoveryTile(waypoint,now);
                     stopMovement();
                     bot.log(`Cave: recovery waypoint #${failedIndex+1} made no movement – selecting another nearby waypoint`);
                     state.recoveryDestinationWatch=null;
@@ -48007,9 +48057,15 @@ window.__minibiaBotBundle.installAntiAfkModule = function installAntiAfkModule(b
  */
 window.__minibiaBotBundle.installClientImprovements = function(bot) {
     const readings=new Map(),listeners=new Set(),requests=new Map();
-    let player=null,hunt=null,huntAt=0,disposed=false;
-    function sync(){const p=window.gameClient?.player;if(p!==player){player=p;readings.clear();requests.clear();hunt=null;huntAt=0;}}
-    function request(sids,force=false){sync();if(disposed||typeof ItemCountQueryPacket!=='function'||!window.gameClient?.send)return false;const now=Date.now();const ids=[...new Set(sids.map(Number).filter(n=>Number.isInteger(n)&&n>0&&n<=65535))].filter(n=>force||now-(requests.get(n)||0)>=1000);for(let i=0;i<ids.length;i+=50){window.gameClient.send(new ItemCountQueryPacket(ids.slice(i,i+50)));ids.slice(i,i+50).forEach(n=>requests.set(n,now));}return ids.length>0;}
+    let player=null,hunt=null,huntAt=0,disposed=false,requestTimer=null;const queued=new Set();
+    function sync(){const p=window.gameClient?.player;if(p!==player){player=p;readings.clear();requests.clear();queued.clear();if(requestTimer)clearTimeout(requestTimer);requestTimer=null;hunt=null;huntAt=0;}}
+    function request(sids,force=false){
+        sync();if(disposed||typeof ItemCountQueryPacket!=='function'||!window.gameClient?.send||window.gameClient?.networkManager?.isConnected?.()===false)return false;
+        const now=Date.now(),ids=[...new Set(sids.map(Number).filter(n=>Number.isInteger(n)&&n>0&&n<=65535))].filter(n=>queued.has(n)||force||now-(requests.get(n)??-Infinity)>=1000);
+        for(const id of ids)if(queued.size<512)queued.add(id);
+        if(queued.size&&!requestTimer){const expected=player;requestTimer=setTimeout(()=>{requestTimer=null;if(disposed||window.gameClient?.player!==expected){queued.clear();return;}const pending=[...queued];queued.clear();try{for(let i=0;i<pending.length;i+=50){const batch=pending.slice(i,i+50);window.gameClient.send(new ItemCountQueryPacket(batch));batch.forEach(n=>requests.set(n,Date.now()));}}catch(error){bot.log?.('Inventory count refresh failed: '+error.message);}},50);}
+        return ids.length>0;
+    }
     function reading(sid){sync();return readings.get(Number(sid))||null;}
     function count(sid,timeout=5000){return new Promise((resolve,reject)=>{let done=false;const started=Date.now();const finish=(error,r)=>{if(done)return;done=true;clearTimeout(timer);listeners.delete(on);error?reject(error):resolve(r.count);};const on=r=>{if(r.sid===Number(sid)&&r.at>=started)finish(null,r);};const timer=setTimeout(()=>finish(new Error('Exact SID inventory count timed out')),timeout);listeners.add(on);if(!request([sid],true))finish(new Error('Exact SID inventory count unavailable'));});}
     function hook(name,accept){const proto=typeof PacketReader!=='undefined'?PacketReader.prototype:null,original=proto?.[name];if(typeof original!=='function')return;const wrapped=function(...args){const result=original.apply(this,args);if(!disposed){sync();accept(result);}return result;};proto[name]=wrapped;bot.addCleanup(()=>{if(proto[name]===wrapped)proto[name]=original;});}
@@ -48020,7 +48076,7 @@ window.__minibiaBotBundle.installClientImprovements = function(bot) {
     bot.toolReach=cid=>{const type=window.gameClient?.itemDefinitionsByCid?.[cid]?.properties?.type;return type==='rune'||type==='fluidContainer'||Number(cid)===3483?Infinity:Number(cid)===4863?2:1;};
     bot.toolInReach=(cid,from,to)=>!!from&&!!to&&Number(from.z)===Number(to.z)&&Math.max(Math.abs(from.x-to.x),Math.abs(from.y-to.y))<=bot.toolReach(cid);
     bot.huntStats={status:()=>{sync();return {info:hunt,at:huntAt};},mount(panel){const host=panel?.querySelector('[data-tab-panel="status"]');if(!host||host.querySelector('[data-hunt-section]'))return;const section=document.createElement('div');section.setAttribute('data-hunt-section','');section.className='mb-section';section.innerHTML='<div class="mb-section-title"><span class="mb-title-text">Hunt Statistics</span></div><div data-hunt-stats class="mb-small-note"></div><div class="prof-actions"><button type="button" class="mb-small-button" data-hunt-command="/hunt info">Refresh</button><button type="button" class="mb-small-button" data-hunt-command="/hunt start quiet">Start</button><button type="button" class="mb-small-button" data-hunt-command="/hunt pause quiet">Pause</button><button type="button" class="mb-small-button" data-hunt-command="/hunt resume quiet">Resume</button><button type="button" class="mb-small-button" data-hunt-command="/hunt reset quiet">Reset</button></div>';host.prepend(section);const click=e=>{const command=e.target?.getAttribute?.('data-hunt-command');if(command)window.gameClient?.interface?.channelManager?.sendMessageText?.(command,undefined,true);};section.addEventListener('click',click);const render=()=>{if(!section.getClientRects().length)return;sync();const info=hunt||window.gameClient?.interface?.huntWindow?.__info;const n=v=>Number(v||0).toLocaleString();const stats=section.querySelector('[data-hunt-stats]');if(!info){stats.textContent='Press Refresh to read the server hunt statistics.';return;}const skills=window.gameClient?.player?.skills,level=Number(skills?.level),xp=Number(skills?.__skills?.experience),rate=Number(info.xpPerHour);let ttl='—';if(level>0&&Number.isFinite(xp)&&rate>0){const l=level+1,next=Math.round((50/3)*(l*l*l-6*l*l+17*l-12)),seconds=Math.ceil(Math.max(0,next-xp)/rate*3600);ttl=`${Math.floor(seconds/3600)}h ${Math.floor(seconds%3600/60)}m`;}const metrics=[['XP/h',n(rate)],['XP',n(info.xp)],['To level',ttl],['Loot',n(info.lootValue)+' gp'],['Collected',n(info.lootValueTaken)+' gp'],['Supplies',n(info.suppliesValue)+' gp']];const signature=JSON.stringify(metrics);if(stats.dataset.signature===signature)return;stats.dataset.signature=signature;stats.replaceChildren();for(let row=0;row<2;row++){const line=document.createElement('div');line.className='mb-hunt-stat-row';for(const [label,value]of metrics.slice(row*3,row*3+3)){const cell=document.createElement('div');cell.textContent=label+': '+value;line.append(cell);}stats.append(line);} };render();const timer=setInterval(render,1000);bot.addCleanup(()=>{clearInterval(timer);section.removeEventListener('click',click);section.remove();});}};
-    bot.addCleanup(()=>{disposed=true;listeners.clear();readings.clear();requests.clear();});
+    bot.addCleanup(()=>{disposed=true;if(requestTimer)clearTimeout(requestTimer);requestTimer=null;queued.clear();listeners.clear();readings.clear();requests.clear();});
 };
 
 window.__minibiaBotBundle.installClientExtras=function(bot){
@@ -48056,7 +48112,7 @@ window.__minibiaBotBundle.installObservability = function(bot) {
     const storageKey='minibiaBot.supplyEstimates';
     const saved=bot.storage.get(storageKey,{});
     const config={enabled:!!saved.enabled,items:Array.isArray(saved.items)?saved.items.filter(x=>Number(x.cid)>0||Number(x.sid)>0).slice(0,20):[]};
-    let player=null,lastTick=0,lastQuery=0,disposed=false;
+    let player=null,lastTick=0,lastQuery=0,disposed=false,excludeSupplyUntil=0;
     const skills=new Map(),supplies=new Map(),views=[],liveSkills=new Map();
     let skillOwner=null,skillOriginal=null,skillWrapper=null;
     function detachSkills(){if(skillOwner?.__handleSkillUpdate===skillWrapper)skillOwner.__handleSkillUpdate=skillOriginal;skillOwner=skillOriginal=skillWrapper=null;}
@@ -48081,7 +48137,7 @@ window.__minibiaBotBundle.installObservability = function(bot) {
     const identity=x=>`${Number(x.sid)||0}:${Number(x.cid)||0}:${Number(x.fluidType)||0}`;
     const persist=()=>bot.storage.set(storageKey,config);
     const duration=seconds=>!Number.isFinite(seconds)||seconds<0?'—':seconds<60?'<1m':`${Math.floor(seconds/3600)?Math.floor(seconds/3600)+'h ':''}${Math.floor(seconds%3600/60)}m`;
-    function sync(){const p=window.gameClient?.player;if(p!==player){player=p;skills.clear();supplies.clear();liveSkills.clear();lastTick=0;lastQuery=0;}return p;}
+    function sync(){const p=window.gameClient?.player;if(p!==player){player=p;skills.clear();supplies.clear();liveSkills.clear();lastTick=0;lastQuery=0;excludeSupplyUntil=0;}return p;}
     function skillSnapshot(name){
         const p=sync(),native=p?.skills,live=liveSkills.get(name),points=Number(live?.points??native?.__skills?.[name]);
         if(!Number.isFinite(points)||typeof native?.__getSkillLevel!=='function'||typeof native?.__getRequiredSkillPoints!=='function')return null;
@@ -48099,6 +48155,10 @@ window.__minibiaBotBundle.installObservability = function(bot) {
     function sampleSupply(item,now){
         const r=reading(item),key=identity(item);let s=supplies.get(key);
         if(!r||now-Number(r.at)>15000){if(s)s.stale=true;return;}
+        if(excludeSupplyUntil>0&&(!s||r.at<=excludeSupplyUntil||s.needsBaseline)){
+            if(!s){s={count:Number(r.count),at:r.at,samples:[],stale:false};supplies.set(key,s);}
+            s.count=Number(r.count);s.at=r.at;s.stale=false;s.needsBaseline=r.at<=excludeSupplyUntil;return;
+        }
         const count=Number(r.count);if(!Number.isFinite(count))return;
         if(!s){s={count,at:r.at,samples:[],stale:false};supplies.set(key,s);}
         s.stale=false;
@@ -48119,7 +48179,10 @@ window.__minibiaBotBundle.installObservability = function(bot) {
         if(disposed)return;observeSkills();const p=sync(),now=Date.now(),connected=!!window.gameClient?.networkManager?.isConnected?.();
         const elapsed=lastTick?Math.max(0,Math.min(2000,now-lastTick)):0;lastTick=now;
         if(p&&connected){for(const name of ['woodcutting','mining'])sampleSkill(name,elapsed);
-            if(config.enabled){if(now-lastQuery>=5000){lastQuery=now;
+            if(config.enabled){
+                const transaction=['depositer','npcSupplyBuyer','bankNpc'].some(key=>bot[key]?.status?.().running);
+                if(transaction){excludeSupplyUntil=now+15000;for(const state of supplies.values())state.needsBaseline=true;}
+                if(now-lastQuery>=5000){lastQuery=now;
                 const sid=config.items.filter(x=>Number(x.sid)>0).map(x=>Number(x.sid));if(sid.length)bot.sidInventory?.request(sid);
                 const cid=config.items.filter(x=>!Number(x.sid)).map(x=>({id:Number(x.cid),fluidType:Number(x.fluidType)||0}));if(cid.length)bot.requestItemCounts?.(cid);
             }for(const item of config.items)sampleSupply(item,now);}
@@ -48156,6 +48219,14 @@ window.__minibiaBotBundle.installObservability = function(bot) {
             const metrics=make('div',block);metrics.className='mb-observe-grid';
             const cells=Array.from({length:4},()=>make('span',metrics));
             button(block,'Reset statistics',()=>skills.delete(name));
+            const advanced=make('details',block);make('summary',advanced,'Gathering options');
+            const grid=make('div',advanced);grid.className='mb-observe-grid';
+            const module=bot[name];
+            for(const [key,title,type]of [['retryMinutes','Retry depleted after (min)','number'],['minCapacity','Stop at capacity (0 = off)','number'],['stopSkill','Stop at skill (0 = off)','number'],['goalSid','Item goal SID (0 = off)','number'],['goalCount','Item goal total count','number'],['goalLabel','On stop: route label (optional)','text']]){
+                const label=make('label',grid);label.className='mb-field';make('span',label,title).className='mb-field-label';const input=make('input',label);input.type=type;input.value=module?.config?.[key]??'';if(type==='number')input.min='0';
+                input.addEventListener('change',()=>{module?.updateConfig?.({[key]:input.value});input.value=module?.config?.[key]??'';});
+            }
+            make('div',advanced,'Stops when any enabled goal is reached. Item goals use total inventory count, including closed bags. The optional label selects a waypoint; Cavebot must already be running to continue.').className='mb-small-note';
             views.push(()=>{if(!block.getClientRects().length)return;const s=skillSnapshot(name);label.textContent=s?`Skill ${s.level} · ${s.percent.toFixed(1)}% to ${s.level+1}`:'Waiting for profession skills';progress.value=s?.percent||0;
                 const values=[`Gained: ${s?.gained.toLocaleString()||0}`,`Points/h: ${Math.round(s?.rate||0).toLocaleString()}`,`To level: ${duration(s?.seconds)}`,`Remaining: ${s?.remaining.toLocaleString()||'—'}`];cells.forEach((c,i)=>{if(c.textContent!==values[i])c.textContent=values[i];});});
         }
@@ -48175,7 +48246,7 @@ window.__minibiaBotBundle.installObservability = function(bot) {
         button(supply,'Reset estimates',()=>supplies.clear());
         const list=make('div',supply),supplyViews=[];
         function rebuild(){list.replaceChildren();supplyViews.length=0;for(const item of config.items){const row=make('div',list);row.className='mb-observe-row';const text=make('span',row);button(row,'×',()=>{config.items=config.items.filter(x=>x!==item);supplies.delete(identity(item));persist();rebuild();});supplyViews.push(()=>{const s=supplySnapshot(item);text.textContent=`${item.name|| (item.sid?'SID '+item.sid:'CID '+item.cid+' / fluid '+item.fluidType)} · ${s.count??'—'} left · ${Math.round(s.rate)} /h · ${duration(s.seconds)} left`;});}}
-        rebuild();const note=make('details',supply);make('summary',note,'How estimates work');make('div',note,'Tracks count decreases over the last 15 minutes. Refilling resets the estimate. Selling, depositing or using items elsewhere also lowers counts. SID distinguishes items sharing a CID; fluids use CID + fluid type. Enable monitoring to refresh inventory every 5 seconds.').className='mb-small-note';
+        rebuild();const note=make('details',supply);make('summary',note,'How estimates work');make('div',note,'Tracks count decreases over the last 15 minutes. Refilling resets the estimate. Known bot deposit, sell and resupply operations are excluded, including a 15-second confirmation buffer. Manual transfers can still affect estimates. SID distinguishes items sharing a CID; fluids use CID + fluid type. Enable monitoring to refresh inventory every 5 seconds.').className='mb-small-note';
         views.push(()=>{if(supply.getClientRects().length){toggle.checked=config.enabled;supplyViews.forEach(fn=>fn());}});
         const diag=section(host,'Action Diagnostics'),details=make('details',diag);make('summary',details,'Show current actions');const rows=make('div',details);let signature='';
         views.push(()=>{if(!details.open||!diag.getClientRects().length)return;const data=diagnostics(),next=JSON.stringify(data);if(next===signature)return;signature=next;rows.replaceChildren();if(!data.length)make('div',rows,'No active modules').className='mb-small-note';for(const [label,text]of data){const row=make('div',rows);row.className='mb-observe-row';make('span',row,label);make('span',row,text);}});
@@ -48188,7 +48259,7 @@ window.__minibiaBotBundle.installObservability = function(bot) {
 window.__minibiaBotBundle.installWoodcuttingModule = function(bot) {
     const key='minibiaBot.woodcutting.config';
     const trees=new Map([[3682,2768],[9225,10143],[3625,2711],[3616,2702],[3617,2703],[3639,2725],[3622,2708]]);
-    const config={enabled:false,delayMs:2000,range:5,attackWhileGathering:false,...bot.storage.get(key,{})};
+    const config={enabled:false,delayMs:2000,range:5,attackWhileGathering:false,retryMinutes:5,minCapacity:0,stopSkill:0,goalSid:0,goalCount:0,goalLabel:'',...bot.storage.get(key,{})};
     config.delayMs=Math.max(350,Math.min(10000,Number(config.delayMs)||2000));
     config.range=Math.max(1,Math.min(8,Math.trunc(Number(config.range)||5)));
     // Migrate the original default interval to the requested two seconds.
@@ -48196,8 +48267,30 @@ window.__minibiaBotBundle.installWoodcuttingModule = function(bot) {
     let walkDestination=null,lastWalkAt=0,walkProgressKey=null,walkProgressAt=0;const blocked=new Map();
     function stopOwnWalk(){const pf=window.gameClient?.world?.pathfinder;if(walkDestination&&pf?.__finalDestination&&tileKey(pf.__finalDestination)===tileKey(walkDestination))pf.setPathfindCache?.(null);walkDestination=null;}
     let running=false,timer=null,lastUse=0,targetKey=null,pending=null,reason='Stopped',attempts=0,disposed=false;
-    const stripped=new Set();let hookOwner=null,hookOriginal=null,hookWrapper=null;
+    const failures=new Map();let confirmed=0,lastConfirmedAt=0;const stripped=new Map();let hookOwner=null,hookOriginal=null,hookWrapper=null;
     const tileKey=p=>`${p.x},${p.y},${p.z}`;
+    function normalizeGoals(next){
+        for(const [key,max]of [['retryMinutes',1440],['minCapacity',1000000],['stopSkill',1000],['goalSid',65535],['goalCount',1000000]])if(next[key]!==undefined)config[key]=Math.max(0,Math.min(max,Math.trunc(Number(next[key])||0)));
+        if(next.goalLabel!==undefined)config.goalLabel=String(next.goalLabel||'').trim().slice(0,100);
+    }
+    normalizeGoals(config);
+    let lastGoalQuery=0;
+    function checkGoals(now){
+        if(config.retryMinutes>0)for(const [key,at]of stripped)if(now-at>=config.retryMinutes*60000)stripped.delete(key);
+        const cap=Number(window.gameClient?.player?.state?.capacity??window.gameClient?.player?.state?.cap);
+        let reached=config.minCapacity>0&&Number.isFinite(cap)&&cap<=config.minCapacity?'Capacity limit reached':null;
+        const skill=bot.observability?.skillSnapshot('woodcutting');
+        if(config.stopSkill>0&&skill?.level>=config.stopSkill)reached='Skill goal reached';
+        if(config.goalSid>0&&config.goalCount>0){
+            const reading=bot.sidInventory?.reading(config.goalSid);
+            if(!reading||now-Number(reading.at)>5000){if(now-lastGoalQuery>=1000){lastGoalQuery=now;bot.sidInventory?.request([config.goalSid]);}if(!reached){reason='Checking gathering goal inventory';return true;}}
+            else if(Number(reading.count)>=config.goalCount)reached='Item goal reached';
+        }
+        if(!reached)return false;
+        stop();reason=reached;
+        if(config.goalLabel){const jumped=bot.goToLabel?.(config.goalLabel);reason+=jumped?' — route label selected':' — route label not found';}
+        return true;
+    }
     function persist(){bot.storage.set(key,{...config});}
     let lastToolCountRequest=0;
     function findAxe(){
@@ -48230,7 +48323,7 @@ window.__minibiaBotBundle.installWoodcuttingModule = function(bot) {
         const original=hookOriginal;
         hookWrapper=function(message,...args){
             if(!disposed&&running&&pending&&Date.now()-pending.at<=10000&&String(message).toLowerCase().includes('this tree is stripped bare for now')){
-                stripped.add(pending.key);if(stripped.size>512)stripped.delete(stripped.values().next().value);
+                confirmed++;lastConfirmedAt=Date.now();failures.delete(pending.key);stripped.set(pending.key,Date.now());if(stripped.size>512)stripped.delete(stripped.keys().next().value);
                 if(targetKey===pending.key)targetKey=null;pending=null;reason='Tree stripped bare — selecting another';
             }
             return original.call(this,message,...args);
@@ -48275,6 +48368,15 @@ window.__minibiaBotBundle.installWoodcuttingModule = function(bot) {
         if(!running||disposed)return false;
         const client=window.gameClient,now=Date.now();
         if(!client?.networkManager?.isConnected?.()||client.player?.isDead||bot.actions?.isHalted?.()){reason='Waiting for connection / actions';return false;}
+        if(pending){
+            const skill=bot.observability?.skillSnapshot('woodcutting');
+            if(Number.isFinite(pending.skillPoints)&&Number(skill?.points)>pending.skillPoints){confirmed++;lastConfirmedAt=now;failures.delete(pending.key);pending=null;}
+            else if(now-pending.at<Math.max(2000,config.delayMs)){reason='Waiting for gathering response';return false;}
+            else{const key=pending.key,n=(failures.get(key)||0)+1;failures.set(key,n);while(failures.size>512)failures.delete(failures.keys().next().value);pending=null;
+                if(n>=3){blocked.set(key,now+30000);failures.delete(key);targetKey=null;reason='Gathering unconfirmed — retrying resource in 30s';return false;}
+            }
+        }
+        if(checkGoals(now))return false;
         if(!ensureHook()){reason='Waiting for cancel-message listener';return false;}
                 const inCombat=!!bot.attack?.getCurrentTarget?.();
         if(inCombat){stopOwnWalk();if(!config.attackWhileGathering){reason='Paused during combat';return false;}}
@@ -48313,7 +48415,7 @@ window.__minibiaBotBundle.installWoodcuttingModule = function(bot) {
         if(pending&&pending.key!==target.key&&now-pending.at<config.delayMs+1000){reason='Waiting for previous tree response';return false;}
         if(!axe.server&&!client.mouse?.__handleItemUseWith){reason='Item-use unavailable';return false;}
         const action=()=>{
-            targetKey=target.key;pending={key:target.key,at:now};lastUse=now;
+            targetKey=target.key;pending={key:target.key,at:now,skillPoints:bot.observability?.skillSnapshot('woodcutting')?.points};lastUse=now;
             if(axe.server){const pos=typeof Position==='function'?new Position(target.pos.x,target.pos.y,target.pos.z):target.pos;client.send(new HotbarUsePacket(axe.cid,0,3,0,pos));}
             else client.mouse.__handleItemUseWith(axe,{which:target.tile,index:target.index});attempts++;reason='Chopping '+target.key;return true;
         };
@@ -48322,8 +48424,8 @@ window.__minibiaBotBundle.installWoodcuttingModule = function(bot) {
     }
     function start(){if(disposed)return;bot.cooking?.stop?.();bot.mining?.stop?.();if(!running){running=true;timer=window.setInterval(tick,150);}config.enabled=true;persist();tick();}
     function stop(options={}){stopOwnWalk();running=false;if(timer!=null)window.clearInterval(timer);timer=null;pending=null;targetKey=null;reason='Stopped';if(options.persistEnabled!==false){config.enabled=false;persist();}}
-    function updateConfig(next){if(next.attackWhileGathering!==undefined)config.attackWhileGathering=!!next.attackWhileGathering;if(next.range!==undefined){stopOwnWalk();targetKey=null;config.range=Math.max(1,Math.min(8,Math.trunc(Number(next.range)||5)));}if(next.delayMs!==undefined)config.delayMs=Math.max(350,Math.min(10000,Number(next.delayMs)||2000));if(next.enabled!==undefined){next.enabled?start():stop();}else persist();}
-    function resetTrees(){stopOwnWalk();blocked.clear();stripped.clear();targetKey=null;pending=null;reason=running?'Searching for trees':'Stopped';}
+    function updateConfig(next){normalizeGoals(next);if(next.attackWhileGathering!==undefined)config.attackWhileGathering=!!next.attackWhileGathering;if(next.range!==undefined){stopOwnWalk();targetKey=null;config.range=Math.max(1,Math.min(8,Math.trunc(Number(next.range)||5)));}if(next.delayMs!==undefined)config.delayMs=Math.max(350,Math.min(10000,Number(next.delayMs)||2000));if(next.enabled!==undefined){next.enabled?start():stop();}else persist();}
+    function resetTrees(){stopOwnWalk();blocked.clear();failures.clear();stripped.clear();targetKey=null;pending=null;reason=running?'Searching for trees':'Stopped';}
     function mount(panel){
         const host=panel.querySelector('[data-tab-panel="professions"]');if(!host)return;
         host.innerHTML=`<style>
@@ -48337,14 +48439,14 @@ window.__minibiaBotBundle.installWoodcuttingModule = function(bot) {
 #minibia-bot-panel [data-tab-panel="professions"] summary{cursor:pointer;color:#bdb5a3;}
 #minibia-bot-panel [data-tab-panel="professions"] details .mb-hint{margin-top:6px;font-size:11px;overflow-wrap:anywhere;}
 #minibia-bot-panel [data-tab-panel="professions"] .prof-food-row{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:11px;padding:5px 0;border-bottom:1px solid rgba(180,170,140,.12);}
-</style><div class="mb-section"><div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-wc="enabled" /><span class="mb-title-text">Woodcutting</span></div><div class="prof-grid"><label class="mb-field"><span class="mb-field-label">Interval (ms)</span><input data-wc="delay" type="number" min="350" max="10000" /></label><label class="mb-field"><span class="mb-field-label">Search radius (tiles)</span><input data-wc="range" type="number" min="1" max="8" /></label></div><label class="mb-field" style="display:flex;flex-direction:row;align-items:center;gap:6px;margin-top:9px"><input type="checkbox" class="mb-title-toggle" data-wc="combat" /><span>Attack while gathering</span></label><div class="prof-actions"><button type="button" class="mb-small-button" data-wc="reset">Retry stripped trees</button></div><div class="prof-status" data-wc="status"></div><details><summary>How woodcutting works</summary><div class="mb-hint">Uses a handaxe (SID 2380 / CID 3268). Stripped trees are skipped until you retry them or reload. Finds the tool throughout your inventory, including closed backpacks. Walks beside nearby trees. Pause Cavebot for automatic approaches. Attack while gathering allows nearby resources during combat; combat controls movement. Healing stays first. Only one profession runs at a time.</div></details></div>`;
+</style><div class="mb-section"><div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-wc="enabled" /><span class="mb-title-text">Woodcutting</span></div><div class="prof-grid"><label class="mb-field"><span class="mb-field-label">Interval (ms)</span><input data-wc="delay" type="number" min="350" max="10000" /></label><label class="mb-field"><span class="mb-field-label">Search radius (tiles)</span><input data-wc="range" type="number" min="1" max="8" /></label></div><label class="mb-field" style="display:flex;flex-direction:row;align-items:center;gap:6px;margin-top:9px"><input type="checkbox" class="mb-title-toggle" data-wc="combat" /><span>Attack while gathering</span></label><div class="prof-actions"><button type="button" class="mb-small-button" data-wc="reset">Retry stripped trees</button></div><div class="prof-status" data-wc="status"></div><details><summary>How woodcutting works</summary><div class="mb-hint">Uses a handaxe (SID 2380 / CID 3268). Depleted resources are rechecked after the retry delay. Set it to 0 for manual retries. Finds the tool throughout your inventory, including closed backpacks. Walks beside nearby trees. Pause Cavebot for automatic approaches. Attack while gathering allows nearby resources during combat; combat controls movement. Healing stays first. Only one profession runs at a time.</div></details></div>`;
         const q=k=>host.querySelector(`[data-wc="${k}"]`);
         q('combat').checked=!!config.attackWhileGathering;q('combat').addEventListener('change',()=>updateConfig({attackWhileGathering:q('combat').checked}));
         q('enabled').addEventListener('change',()=>q('enabled').checked?start():stop());q('delay').value=config.delayMs;q('range').value=config.range;
         q('delay').addEventListener('change',()=>{updateConfig({delayMs:q('delay').value});q('delay').value=config.delayMs;});q('reset').addEventListener('click',resetTrees);q('range').addEventListener('change',()=>{updateConfig({range:q('range').value});q('range').value=config.range;});
         const refresh=()=>{if(!host.getClientRects().length)return;q('enabled').checked=running;q('status').textContent=`${reason} · ${attempts} chops requested · ${stripped.size} stripped trees`;};refresh();const uiTimer=window.setInterval(refresh,500);bot.addCleanup(()=>window.clearInterval(uiTimer));
     }
-    bot.woodcutting={config,start,stop,updateConfig,tick,resetTrees,mount,status:()=>({running,reason,attempts,strippedTrees:stripped.size,target:targetKey})};
+    bot.woodcutting={config,start,stop,updateConfig,tick,resetTrees,mount,status:()=>({running,reason,attempts,confirmed,lastConfirmedAt,pending:!!pending,strippedTrees:stripped.size,target:targetKey})};
     bot.addCleanup(()=>{disposed=true;stop({persistEnabled:false});detachHook();});
     if(config.enabled)start();
 };
@@ -48352,7 +48454,7 @@ window.__minibiaBotBundle.installWoodcuttingModule = function(bot) {
 window.__minibiaBotBundle.installMiningModule = function(bot) {
     const key='minibiaBot.mining.config';
     const stones=new Map([[1772,1285],[1774,1287],[1776,1289],[1775,1288],[1773,1286],[1790,1303],[1789,1302],[1787,1300],[1788,1301],[1792,1305],[1793,1306],[1777,1290],[1785,1298],[1786,1299],[1784,1297],[1783,1296],[1810,1323],[1811,1324],[1791,1304],[1813,1326]]);
-    const config={enabled:false,delayMs:2000,range:5,attackWhileGathering:false,...bot.storage.get(key,{})};
+    const config={enabled:false,delayMs:2000,range:5,attackWhileGathering:false,retryMinutes:5,minCapacity:0,stopSkill:0,goalSid:0,goalCount:0,goalLabel:'',...bot.storage.get(key,{})};
     delete config.depletionText;
     config.delayMs=Math.max(350,Math.min(10000,Number(config.delayMs)||2000));
     config.range=Math.max(1,Math.min(8,Math.trunc(Number(config.range)||5)));
@@ -48361,8 +48463,30 @@ window.__minibiaBotBundle.installMiningModule = function(bot) {
     let walkDestination=null,lastWalkAt=0,walkProgressKey=null,walkProgressAt=0;const blocked=new Map();
     function stopOwnWalk(){const pf=window.gameClient?.world?.pathfinder;if(walkDestination&&pf?.__finalDestination&&tileKey(pf.__finalDestination)===tileKey(walkDestination))pf.setPathfindCache?.(null);walkDestination=null;}
     let running=false,timer=null,lastUse=0,targetKey=null,pending=null,reason='Stopped',attempts=0,disposed=false;
-    const stripped=new Set();let hookOwner=null,hookOriginal=null,hookWrapper=null;
+    const failures=new Map();let confirmed=0,lastConfirmedAt=0;const stripped=new Map();let hookOwner=null,hookOriginal=null,hookWrapper=null;
     const tileKey=p=>`${p.x},${p.y},${p.z}`;
+    function normalizeGoals(next){
+        for(const [key,max]of [['retryMinutes',1440],['minCapacity',1000000],['stopSkill',1000],['goalSid',65535],['goalCount',1000000]])if(next[key]!==undefined)config[key]=Math.max(0,Math.min(max,Math.trunc(Number(next[key])||0)));
+        if(next.goalLabel!==undefined)config.goalLabel=String(next.goalLabel||'').trim().slice(0,100);
+    }
+    normalizeGoals(config);
+    let lastGoalQuery=0;
+    function checkGoals(now){
+        if(config.retryMinutes>0)for(const [key,at]of stripped)if(now-at>=config.retryMinutes*60000)stripped.delete(key);
+        const cap=Number(window.gameClient?.player?.state?.capacity??window.gameClient?.player?.state?.cap);
+        let reached=config.minCapacity>0&&Number.isFinite(cap)&&cap<=config.minCapacity?'Capacity limit reached':null;
+        const skill=bot.observability?.skillSnapshot('mining');
+        if(config.stopSkill>0&&skill?.level>=config.stopSkill)reached='Skill goal reached';
+        if(config.goalSid>0&&config.goalCount>0){
+            const reading=bot.sidInventory?.reading(config.goalSid);
+            if(!reading||now-Number(reading.at)>5000){if(now-lastGoalQuery>=1000){lastGoalQuery=now;bot.sidInventory?.request([config.goalSid]);}if(!reached){reason='Checking gathering goal inventory';return true;}}
+            else if(Number(reading.count)>=config.goalCount)reached='Item goal reached';
+        }
+        if(!reached)return false;
+        stop();reason=reached;
+        if(config.goalLabel){const jumped=bot.goToLabel?.(config.goalLabel);reason+=jumped?' — route label selected':' — route label not found';}
+        return true;
+    }
     function persist(){bot.storage.set(key,{...config});}
     let lastToolCountRequest=0;
     function findPickaxe(){
@@ -48395,7 +48519,7 @@ window.__minibiaBotBundle.installMiningModule = function(bot) {
         const original=hookOriginal;
         hookWrapper=function(message,...args){
             if(!disposed&&running&&pending&&Date.now()-pending.at<=10000&&String(message).toLowerCase().includes('this rock is tapped out for now')){
-                stripped.add(pending.key);if(stripped.size>512)stripped.delete(stripped.values().next().value);
+                confirmed++;lastConfirmedAt=Date.now();failures.delete(pending.key);stripped.set(pending.key,Date.now());if(stripped.size>512)stripped.delete(stripped.keys().next().value);
                 if(targetKey===pending.key)targetKey=null;pending=null;reason='Stone depleted — selecting another';
             }
             return original.call(this,message,...args);
@@ -48440,6 +48564,15 @@ window.__minibiaBotBundle.installMiningModule = function(bot) {
         if(!running||disposed)return false;
         const client=window.gameClient,now=Date.now();
         if(!client?.networkManager?.isConnected?.()||client.player?.isDead||bot.actions?.isHalted?.()){reason='Waiting for connection / actions';return false;}
+        if(pending){
+            const skill=bot.observability?.skillSnapshot('mining');
+            if(Number.isFinite(pending.skillPoints)&&Number(skill?.points)>pending.skillPoints){confirmed++;lastConfirmedAt=now;failures.delete(pending.key);pending=null;}
+            else if(now-pending.at<Math.max(2000,config.delayMs)){reason='Waiting for gathering response';return false;}
+            else{const key=pending.key,n=(failures.get(key)||0)+1;failures.set(key,n);while(failures.size>512)failures.delete(failures.keys().next().value);pending=null;
+                if(n>=3){blocked.set(key,now+30000);failures.delete(key);targetKey=null;reason='Gathering unconfirmed — retrying resource in 30s';return false;}
+            }
+        }
+        if(checkGoals(now))return false;
         if(!ensureHook()){reason='Waiting for cancel-message listener';return false;}
                 const inCombat=!!bot.attack?.getCurrentTarget?.();
         if(inCombat){stopOwnWalk();if(!config.attackWhileGathering){reason='Paused during combat';return false;}}
@@ -48478,7 +48611,7 @@ window.__minibiaBotBundle.installMiningModule = function(bot) {
         if(pending&&pending.key!==target.key&&now-pending.at<config.delayMs+1000){reason='Waiting for previous stone response';return false;}
         if(!axe.server&&!client.mouse?.__handleItemUseWith){reason='Item-use unavailable';return false;}
         const action=()=>{
-            targetKey=target.key;pending={key:target.key,at:now};lastUse=now;
+            targetKey=target.key;pending={key:target.key,at:now,skillPoints:bot.observability?.skillSnapshot('mining')?.points};lastUse=now;
             if(axe.server){const pos=typeof Position==='function'?new Position(target.pos.x,target.pos.y,target.pos.z):target.pos;client.send(new HotbarUsePacket(axe.cid,0,3,0,pos));}
             else client.mouse.__handleItemUseWith(axe,{which:target.tile,index:target.index});attempts++;reason='Mining '+target.key;return true;
         };
@@ -48487,11 +48620,11 @@ window.__minibiaBotBundle.installMiningModule = function(bot) {
     }
     function start(){if(disposed)return;bot.cooking?.stop?.();bot.woodcutting?.stop?.();if(!running){running=true;timer=window.setInterval(tick,150);}config.enabled=true;persist();tick();}
     function stop(options={}){stopOwnWalk();running=false;if(timer!=null)window.clearInterval(timer);timer=null;pending=null;targetKey=null;reason='Stopped';if(options.persistEnabled!==false){config.enabled=false;persist();}}
-    function updateConfig(next){if(next.attackWhileGathering!==undefined)config.attackWhileGathering=!!next.attackWhileGathering;if(next.range!==undefined){stopOwnWalk();targetKey=null;config.range=Math.max(1,Math.min(8,Math.trunc(Number(next.range)||5)));}if(next.delayMs!==undefined)config.delayMs=Math.max(350,Math.min(10000,Number(next.delayMs)||2000));if(next.enabled!==undefined){next.enabled?start():stop();}else persist();}
-    function resetStones(){stopOwnWalk();blocked.clear();stripped.clear();targetKey=null;pending=null;reason=running?'Searching for stones':'Stopped';}
+    function updateConfig(next){normalizeGoals(next);if(next.attackWhileGathering!==undefined)config.attackWhileGathering=!!next.attackWhileGathering;if(next.range!==undefined){stopOwnWalk();targetKey=null;config.range=Math.max(1,Math.min(8,Math.trunc(Number(next.range)||5)));}if(next.delayMs!==undefined)config.delayMs=Math.max(350,Math.min(10000,Number(next.delayMs)||2000));if(next.enabled!==undefined){next.enabled?start():stop();}else persist();}
+    function resetStones(){stopOwnWalk();blocked.clear();failures.clear();stripped.clear();targetKey=null;pending=null;reason=running?'Searching for stones':'Stopped';}
     function mount(panel){
         const parent=panel.querySelector('[data-tab-panel="professions"]');if(!parent)return;const host=document.createElement('div');parent.appendChild(host);
-        host.innerHTML=`<div class="mb-section"><div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-mn="enabled" /><span class="mb-title-text">Mining</span></div><div class="prof-grid"><label class="mb-field"><span class="mb-field-label">Interval (ms)</span><input data-mn="delay" type="number" min="350" max="10000" /></label><label class="mb-field"><span class="mb-field-label">Search radius (tiles)</span><input data-mn="range" type="number" min="1" max="8" /></label></div><label class="mb-field" style="display:flex;flex-direction:row;align-items:center;gap:6px;margin-top:9px"><input type="checkbox" class="mb-title-toggle" data-mn="combat" /><span>Attack while gathering</span></label><div class="prof-actions"><button type="button" class="mb-small-button" data-mn="reset">Retry depleted stones</button></div><div class="prof-status" data-mn="status"></div><details><summary>How mining works</summary><div class="mb-hint">Uses a pickaxe (SID 2553 / CID 3456). Automatically skips stones when the game reports “This rock is tapped out for now”. Retry depleted stones after they regenerate. Finds the tool throughout your inventory, including closed backpacks. Walks beside nearby stones. Pause Cavebot for automatic approaches. Attack while gathering allows nearby resources during combat; combat controls movement. Healing stays first. Only one profession runs at a time.</div></details></div>`;
+        host.innerHTML=`<div class="mb-section"><div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-mn="enabled" /><span class="mb-title-text">Mining</span></div><div class="prof-grid"><label class="mb-field"><span class="mb-field-label">Interval (ms)</span><input data-mn="delay" type="number" min="350" max="10000" /></label><label class="mb-field"><span class="mb-field-label">Search radius (tiles)</span><input data-mn="range" type="number" min="1" max="8" /></label></div><label class="mb-field" style="display:flex;flex-direction:row;align-items:center;gap:6px;margin-top:9px"><input type="checkbox" class="mb-title-toggle" data-mn="combat" /><span>Attack while gathering</span></label><div class="prof-actions"><button type="button" class="mb-small-button" data-mn="reset">Retry depleted stones</button></div><div class="prof-status" data-mn="status"></div><details><summary>How mining works</summary><div class="mb-hint">Uses a pickaxe (SID 2553 / CID 3456). Automatically skips stones when the game reports “This rock is tapped out for now”. Depleted resources are rechecked after the retry delay. Set it to 0 for manual retries. Finds the tool throughout your inventory, including closed backpacks. Walks beside nearby stones. Pause Cavebot for automatic approaches. Attack while gathering allows nearby resources during combat; combat controls movement. Healing stays first. Only one profession runs at a time.</div></details></div>`;
         const q=k=>host.querySelector(`[data-mn="${k}"]`);
         q('combat').checked=!!config.attackWhileGathering;q('combat').addEventListener('change',()=>updateConfig({attackWhileGathering:q('combat').checked}));
         q('enabled').addEventListener('change',()=>q('enabled').checked?start():stop());q('delay').value=config.delayMs;q('range').value=config.range;
@@ -48499,7 +48632,7 @@ window.__minibiaBotBundle.installMiningModule = function(bot) {
         
         const refresh=()=>{if(!host.getClientRects().length)return;q('enabled').checked=running;q('status').textContent=`${reason} · ${attempts} mining attempts requested · ${stripped.size} depleted stones`;};refresh();const uiTimer=window.setInterval(refresh,500);bot.addCleanup(()=>window.clearInterval(uiTimer));
     }
-    bot.mining={config,start,stop,updateConfig,tick,resetStones,mount,status:()=>({running,reason,attempts,strippedStones:stripped.size,target:targetKey})};
+    bot.mining={config,start,stop,updateConfig,tick,resetStones,mount,status:()=>({running,reason,attempts,confirmed,lastConfirmedAt,pending:!!pending,strippedStones:stripped.size,target:targetKey})};
     bot.addCleanup(()=>{disposed=true;stop({persistEnabled:false});detachHook();});
     if(config.enabled)start();
 };
@@ -48537,7 +48670,7 @@ window.__minibiaBotBundle.installCookingModule=function(bot){
   if(pending){
    const n=inventory(pending.food).count;
    if(n<pending.before){used+=pending.before-n;nextFood(pending.food);pending=null;}
-   else if(now-pending.at>=2000){nextFood(pending.food);pending=null;reason='Retrying next food type';}
+   else if(now-pending.at>=4000){nextFood(pending.food);pending=null;reason='Retrying next food type';}
    else{reason='Waiting for food update';return false;}
   }
   if(!client?.networkManager?.isConnected?.()||client.player?.isDead||bot.actions?.isHalted?.()){reason='Waiting for connection / actions';stopWalk();return false;}
