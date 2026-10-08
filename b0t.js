@@ -3079,7 +3079,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.132",
+        version: "1.6.133",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -8226,7 +8226,7 @@ window.__minibiaBotBundle.installCombatRulesModule = function(bot) {
           <button type="button" class="mb-small-button" data-cr="new">+ New Rule</button>
         </div>
         <div data-cr="list" style="margin:5px 0"></div>
-        <div data-cr="editor" style="border-top:1px solid rgba(255,255,255,.08);padding-top:8px">
+        <div data-cr="editor" hidden style="border-top:1px solid rgba(255,255,255,.08);padding-top:8px">
           <div class="cr-form">
             <label class="mb-field" style="grid-column:1/-1"><span class="mb-field-label">Monster names</span><input data-cr="names" placeholder="Any monster — or Dragon Lord, Demon"></label>
             <div class="mb-field"><span class="mb-field-label">Monster HP %</span><div class="cr-range"><input data-cr="minHp" type="number" min="0" max="100" value="0" aria-label="Minimum monster HP"><span>–</span><input data-cr="maxHp" type="number" min="0" max="100" value="100" aria-label="Maximum monster HP"></div></div>
@@ -8245,9 +8245,9 @@ window.__minibiaBotBundle.installCombatRulesModule = function(bot) {
         <div data-cr="message" class="mb-small-note" style="margin-top:4px"></div>
         <details><summary>How rules work</summary><div style="margin-top:5px">Blank names match any monster. HP refers to monster health; count counts matching monsters within range. Top matching rule wins for target mode. Rune and Exori actions run independently. Ignore + Rune shoots without selecting the monster.<br>Combat Rules replace the old Rune Shooter rules and Exori count trigger when enabled. Unmatched targets use Core Targeting. Kite/Lure settings and existing mana, cooldown, healing and player-safety checks remain in use. Exori and spell actions require Targeting running. Front means north/south/east/west of the monster. Targeted spells require a matching selected mob and LOS; area spells use matching counts. Native spell cooldown and mana checks apply.</div></details>`;
         const q=k=>box.querySelector(`[data-cr="${k}"]`);let edit=null;
-        function reset(){edit=null;for(const [k,v]of Object.entries({names:'',minHp:0,maxHp:100,minCount:1,maxCount:100,range:8,mode:'inherit',rune:'',position:'inherit',spellWords:'',spellAim:'target',spellMana:0}))q(k).value=v;q('exori').checked=false;q('ruleEnabled').checked=true;q('save').textContent='Add Rule';q('editor').hidden=config.rules.length>0;}
+        function reset(){edit=null;for(const [k,v]of Object.entries({names:'',minHp:0,maxHp:100,minCount:1,maxCount:100,range:8,mode:'inherit',rune:'',position:'inherit',spellWords:'',spellAim:'target',spellMana:0}))q(k).value=v;q('exori').checked=false;q('ruleEnabled').checked=true;q('save').textContent='Add Rule';q('editor').hidden=true;}
         function render(){q('enabled').checked=config.enabled;const list=q('list');list.replaceChildren();
-            if(!config.rules.length){const empty=document.createElement('div');empty.className='mb-small-note';empty.textContent='No rules yet. Add your first rule below.';list.append(empty);}
+            if(!config.rules.length){const empty=document.createElement('div');empty.className='mb-small-note';empty.textContent='No rules yet. Click + New Rule to add one.';list.append(empty);}
             const modeLabels={inherit:'Default',attack:'Attack',melee:'Melee','client-chase':'Client Chase',kite:'Kite',lure:'Lure',ignore:'Ignore'};
             config.rules.forEach((r,i)=>{
                 const row=document.createElement('div');row.className='cr-card';
