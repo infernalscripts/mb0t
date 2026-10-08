@@ -3079,7 +3079,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.134",
+        version: "1.6.136",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -47999,7 +47999,7 @@ window.__minibiaBotBundle.installAntiAfkModule = function installAntiAfkModule(b
 window.__minibiaBotBundle.installWoodcuttingModule = function(bot) {
     const key='minibiaBot.woodcutting.config';
     const trees=new Map([[3682,2768],[9225,10143],[3625,2711],[3616,2702],[3617,2703],[3639,2725],[3622,2708]]);
-    const config={enabled:false,delayMs:2000,range:5,...bot.storage.get(key,{})};
+    const config={enabled:false,delayMs:2000,range:5,attackWhileGathering:false,...bot.storage.get(key,{})};
     config.delayMs=Math.max(350,Math.min(10000,Number(config.delayMs)||2000));
     config.range=Math.max(1,Math.min(8,Math.trunc(Number(config.range)||5)));
     // Migrate the original default interval to the requested two seconds.
@@ -48060,18 +48060,44 @@ window.__minibiaBotBundle.installWoodcuttingModule = function(bot) {
         }
         return found.sort((a,b)=>a.distance-b.distance);
     }
+    const approachCache=new Map();
+    function reachableApproach(target,from,now){
+        if(Number(from.z)!==Number(target.pos.z))return null;
+        if(Math.max(Math.abs(from.x-target.pos.x),Math.abs(from.y-target.pos.y))<=1)return from;
+        const key=tileKey(from)+':'+target.key,revision=bot.specialAreas?.getRevision?.();
+        const cached=approachCache.get(key);
+        if(cached&&cached.revision===revision&&now-cached.at<1000)return cached.position;
+        const offsets=[[0,-1],[1,0],[0,1],[-1,0],[-1,-1],[1,-1],[-1,1],[1,1]];
+        offsets.sort((a,b)=>(Math.abs(target.pos.x+a[0]-from.x)+Math.abs(target.pos.y+a[1]-from.y))-(Math.abs(target.pos.x+b[0]-from.x)+Math.abs(target.pos.y+b[1]-from.y)));
+        let position=null;
+        for(const [dx,dy]of offsets){
+            const candidate={x:target.pos.x+dx,y:target.pos.y+dy,z:target.pos.z};
+            const native=typeof Position==='function'?new Position(candidate.x,candidate.y,candidate.z):candidate;
+            const tile=window.gameClient?.world?.getTileFromWorldPosition?.(native);
+            if(!tile||tile.__isPlaceholder||bot.hasNavigationObstacle?.(tile)||bot.cave?.isFloorChangeTile?.(tile))continue;
+            const result=bot.specialAreas?.findPolicyPath?.(from,candidate,{purpose:'route',force:true,fieldAware:true,maxNodes:4096});
+            if(result?.success===true&&result.complete===true){position=native;break;}
+        }
+        approachCache.set(key,{at:now,revision,position});
+        if(approachCache.size>128)approachCache.delete(approachCache.keys().next().value);
+        return position;
+    }
     function tick(){
         if(!running||disposed)return false;
         const client=window.gameClient,now=Date.now();
         if(!client?.networkManager?.isConnected?.()||client.player?.isDead||bot.actions?.isHalted?.()){reason='Waiting for connection / actions';return false;}
         if(!ensureHook()){reason='Waiting for cancel-message listener';return false;}
-                if(bot.attack?.getCurrentTarget?.()){stopOwnWalk();reason='Paused during combat';return false;}
+                const inCombat=!!bot.attack?.getCurrentTarget?.();
+        if(inCombat){stopOwnWalk();if(!config.attackWhileGathering){reason='Paused during combat';return false;}}
         const heal=bot.heal;
         if(heal?.status?.().running&&(heal.tryHeal?.()===true||heal.hasPendingAction?.()===true||heal.needsPriorityAction?.()===true)){stopOwnWalk();reason='Healing priority';return false;}
         if(now-lastUse<config.delayMs)return false;
         const axe=findAxe();if(!axe)return false;
-        const candidates=nearby(),target=candidates.find(t=>t.key===targetKey)||candidates[0];
-        if(!target){targetKey=null;reason='No unstripped tree within '+config.range+' tiles';return false;}
+        const playerPosition=bot.getPlayerPosition();
+        if(!playerPosition){reason='Waiting for player position';return false;}
+        const candidates=nearby().map(t=>({...t,approach:reachableApproach(t,playerPosition,now)})).filter(t=>t.approach&&(!inCombat||Math.max(Math.abs(playerPosition.x-t.pos.x),Math.abs(playerPosition.y-t.pos.y))<=1));
+        const target=candidates.find(t=>t.key===targetKey)||candidates[0];
+        if(!target){targetKey=null;reason='No reachable unstripped tree within '+config.range+' tiles';return false;}
         const playerPos=bot.getPlayerPosition(),distance=Math.max(Math.abs(playerPos.x-target.pos.x),Math.abs(playerPos.y-target.pos.y));
         if(distance>1){
             if(bot.cave?.isRunning?.()){stopOwnWalk();reason='Pause Cavebot to approach trees';return false;}
@@ -48081,7 +48107,7 @@ window.__minibiaBotBundle.installWoodcuttingModule = function(bot) {
             if(now-walkProgressAt>=5000){stopOwnWalk();blocked.set(target.key,now+30000);targetKey=null;reason='Tree unreachable — trying another';return false;}
             if(client.player?.isMoving?.()||now-lastWalkAt<1000){reason='Walking to tree '+target.key;return false;}
             const pf=client.world?.pathfinder,asPosition=p=>typeof Position==='function'?new Position(p.x,p.y,p.z):p;
-            const adjacent=client.mouse?.__findAdjacentWalkable?.(asPosition(target.pos),asPosition(playerPos));
+            const adjacent=target.approach;
             if(!adjacent||!pf?.findPath){blocked.set(target.key,now+30000);targetKey=null;reason='No reachable approach tile';return false;}
             const walk=()=>{stopOwnWalk();walkDestination=adjacent;lastWalkAt=now;pf.findPath(asPosition(playerPos),adjacent);reason='Walking to tree '+target.key;return true;};
             return bot.actions?.runShared?bot.actions.runShared('woodcutting-walk',bot.actions.priorities.UTILITY,walk):walk();
@@ -48100,7 +48126,7 @@ window.__minibiaBotBundle.installWoodcuttingModule = function(bot) {
     }
     function start(){if(disposed)return;bot.cooking?.stop?.();bot.mining?.stop?.();if(!running){running=true;timer=window.setInterval(tick,150);}config.enabled=true;persist();tick();}
     function stop(options={}){stopOwnWalk();running=false;if(timer!=null)window.clearInterval(timer);timer=null;pending=null;targetKey=null;reason='Stopped';if(options.persistEnabled!==false){config.enabled=false;persist();}}
-    function updateConfig(next){if(next.range!==undefined){stopOwnWalk();targetKey=null;config.range=Math.max(1,Math.min(8,Math.trunc(Number(next.range)||5)));}if(next.delayMs!==undefined)config.delayMs=Math.max(350,Math.min(10000,Number(next.delayMs)||2000));if(next.enabled!==undefined){next.enabled?start():stop();}else persist();}
+    function updateConfig(next){if(next.attackWhileGathering!==undefined)config.attackWhileGathering=!!next.attackWhileGathering;if(next.range!==undefined){stopOwnWalk();targetKey=null;config.range=Math.max(1,Math.min(8,Math.trunc(Number(next.range)||5)));}if(next.delayMs!==undefined)config.delayMs=Math.max(350,Math.min(10000,Number(next.delayMs)||2000));if(next.enabled!==undefined){next.enabled?start():stop();}else persist();}
     function resetTrees(){stopOwnWalk();blocked.clear();stripped.clear();targetKey=null;pending=null;reason=running?'Searching for trees':'Stopped';}
     function mount(panel){
         const host=panel.querySelector('[data-tab-panel="professions"]');if(!host)return;
@@ -48115,8 +48141,9 @@ window.__minibiaBotBundle.installWoodcuttingModule = function(bot) {
 #minibia-bot-panel [data-tab-panel="professions"] summary{cursor:pointer;color:#bdb5a3;}
 #minibia-bot-panel [data-tab-panel="professions"] details .mb-hint{margin-top:6px;font-size:11px;overflow-wrap:anywhere;}
 #minibia-bot-panel [data-tab-panel="professions"] .prof-food-row{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:11px;padding:5px 0;border-bottom:1px solid rgba(180,170,140,.12);}
-</style><div class="mb-section"><div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-wc="enabled" /><span class="mb-title-text">Woodcutting</span></div><div class="prof-grid"><label class="mb-field"><span class="mb-field-label">Interval (ms)</span><input data-wc="delay" type="number" min="350" max="10000" /></label><label class="mb-field"><span class="mb-field-label">Search radius (tiles)</span><input data-wc="range" type="number" min="1" max="8" /></label></div><div class="prof-actions"><button type="button" class="mb-small-button" data-wc="reset">Retry stripped trees</button></div><div class="prof-status" data-wc="status"></div><details><summary>How woodcutting works</summary><div class="mb-hint">Uses a handaxe (SID 2380 / CID 3268). Stripped trees are skipped until you retry them or reload. Finds the tool throughout your inventory, including closed backpacks. Walks beside nearby trees. Pause Cavebot for automatic approaches. Pauses during combat and healing. Only one profession runs at a time.</div></details></div>`;
+</style><div class="mb-section"><div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-wc="enabled" /><span class="mb-title-text">Woodcutting</span></div><div class="prof-grid"><label class="mb-field"><span class="mb-field-label">Interval (ms)</span><input data-wc="delay" type="number" min="350" max="10000" /></label><label class="mb-field"><span class="mb-field-label">Search radius (tiles)</span><input data-wc="range" type="number" min="1" max="8" /></label></div><label class="mb-field" style="display:flex;flex-direction:row;align-items:center;gap:6px;margin-top:9px"><input type="checkbox" class="mb-title-toggle" data-wc="combat" /><span>Attack while gathering</span></label><div class="prof-actions"><button type="button" class="mb-small-button" data-wc="reset">Retry stripped trees</button></div><div class="prof-status" data-wc="status"></div><details><summary>How woodcutting works</summary><div class="mb-hint">Uses a handaxe (SID 2380 / CID 3268). Stripped trees are skipped until you retry them or reload. Finds the tool throughout your inventory, including closed backpacks. Walks beside nearby trees. Pause Cavebot for automatic approaches. Attack while gathering allows nearby resources during combat; combat controls movement. Healing stays first. Only one profession runs at a time.</div></details></div>`;
         const q=k=>host.querySelector(`[data-wc="${k}"]`);
+        q('combat').checked=!!config.attackWhileGathering;q('combat').addEventListener('change',()=>updateConfig({attackWhileGathering:q('combat').checked}));
         q('enabled').addEventListener('change',()=>q('enabled').checked?start():stop());q('delay').value=config.delayMs;q('range').value=config.range;
         q('delay').addEventListener('change',()=>{updateConfig({delayMs:q('delay').value});q('delay').value=config.delayMs;});q('reset').addEventListener('click',resetTrees);q('range').addEventListener('change',()=>{updateConfig({range:q('range').value});q('range').value=config.range;});
         const refresh=()=>{q('enabled').checked=running;q('status').textContent=`${reason} · ${attempts} chops requested · ${stripped.size} stripped trees`;};refresh();const uiTimer=window.setInterval(refresh,500);bot.addCleanup(()=>window.clearInterval(uiTimer));
@@ -48129,7 +48156,7 @@ window.__minibiaBotBundle.installWoodcuttingModule = function(bot) {
 window.__minibiaBotBundle.installMiningModule = function(bot) {
     const key='minibiaBot.mining.config';
     const stones=new Map([[1790,1303],[1789,1302],[1787,1300],[1788,1301],[1792,1305],[1793,1306],[1777,1290],[1785,1298],[1786,1299],[1784,1297],[1783,1296],[1810,1323],[1811,1324],[1791,1304],[1813,1326]]);
-    const config={enabled:false,delayMs:2000,range:5,...bot.storage.get(key,{})};
+    const config={enabled:false,delayMs:2000,range:5,attackWhileGathering:false,...bot.storage.get(key,{})};
     delete config.depletionText;
     config.delayMs=Math.max(350,Math.min(10000,Number(config.delayMs)||2000));
     config.range=Math.max(1,Math.min(8,Math.trunc(Number(config.range)||5)));
@@ -48191,18 +48218,44 @@ window.__minibiaBotBundle.installMiningModule = function(bot) {
         }
         return found.sort((a,b)=>a.distance-b.distance);
     }
+    const approachCache=new Map();
+    function reachableApproach(target,from,now){
+        if(Number(from.z)!==Number(target.pos.z))return null;
+        if(Math.max(Math.abs(from.x-target.pos.x),Math.abs(from.y-target.pos.y))<=1)return from;
+        const key=tileKey(from)+':'+target.key,revision=bot.specialAreas?.getRevision?.();
+        const cached=approachCache.get(key);
+        if(cached&&cached.revision===revision&&now-cached.at<1000)return cached.position;
+        const offsets=[[0,-1],[1,0],[0,1],[-1,0],[-1,-1],[1,-1],[-1,1],[1,1]];
+        offsets.sort((a,b)=>(Math.abs(target.pos.x+a[0]-from.x)+Math.abs(target.pos.y+a[1]-from.y))-(Math.abs(target.pos.x+b[0]-from.x)+Math.abs(target.pos.y+b[1]-from.y)));
+        let position=null;
+        for(const [dx,dy]of offsets){
+            const candidate={x:target.pos.x+dx,y:target.pos.y+dy,z:target.pos.z};
+            const native=typeof Position==='function'?new Position(candidate.x,candidate.y,candidate.z):candidate;
+            const tile=window.gameClient?.world?.getTileFromWorldPosition?.(native);
+            if(!tile||tile.__isPlaceholder||bot.hasNavigationObstacle?.(tile)||bot.cave?.isFloorChangeTile?.(tile))continue;
+            const result=bot.specialAreas?.findPolicyPath?.(from,candidate,{purpose:'route',force:true,fieldAware:true,maxNodes:4096});
+            if(result?.success===true&&result.complete===true){position=native;break;}
+        }
+        approachCache.set(key,{at:now,revision,position});
+        if(approachCache.size>128)approachCache.delete(approachCache.keys().next().value);
+        return position;
+    }
     function tick(){
         if(!running||disposed)return false;
         const client=window.gameClient,now=Date.now();
         if(!client?.networkManager?.isConnected?.()||client.player?.isDead||bot.actions?.isHalted?.()){reason='Waiting for connection / actions';return false;}
         if(!ensureHook()){reason='Waiting for cancel-message listener';return false;}
-                if(bot.attack?.getCurrentTarget?.()){stopOwnWalk();reason='Paused during combat';return false;}
+                const inCombat=!!bot.attack?.getCurrentTarget?.();
+        if(inCombat){stopOwnWalk();if(!config.attackWhileGathering){reason='Paused during combat';return false;}}
         const heal=bot.heal;
         if(heal?.status?.().running&&(heal.tryHeal?.()===true||heal.hasPendingAction?.()===true||heal.needsPriorityAction?.()===true)){stopOwnWalk();reason='Healing priority';return false;}
         if(now-lastUse<config.delayMs)return false;
         const axe=findPickaxe();if(!axe)return false;
-        const candidates=nearby(),target=candidates.find(t=>t.key===targetKey)||candidates[0];
-        if(!target){targetKey=null;reason='No undepleted stone within '+config.range+' tiles';return false;}
+        const playerPosition=bot.getPlayerPosition();
+        if(!playerPosition){reason='Waiting for player position';return false;}
+        const candidates=nearby().map(t=>({...t,approach:reachableApproach(t,playerPosition,now)})).filter(t=>t.approach&&(!inCombat||Math.max(Math.abs(playerPosition.x-t.pos.x),Math.abs(playerPosition.y-t.pos.y))<=1));
+        const target=candidates.find(t=>t.key===targetKey)||candidates[0];
+        if(!target){targetKey=null;reason='No reachable undepleted stone within '+config.range+' tiles';return false;}
         const playerPos=bot.getPlayerPosition(),distance=Math.max(Math.abs(playerPos.x-target.pos.x),Math.abs(playerPos.y-target.pos.y));
         if(distance>1){
             if(bot.cave?.isRunning?.()){stopOwnWalk();reason='Pause Cavebot to approach stones';return false;}
@@ -48212,7 +48265,7 @@ window.__minibiaBotBundle.installMiningModule = function(bot) {
             if(now-walkProgressAt>=5000){stopOwnWalk();blocked.set(target.key,now+30000);targetKey=null;reason='Stone unreachable — trying another';return false;}
             if(client.player?.isMoving?.()||now-lastWalkAt<1000){reason='Walking to stone '+target.key;return false;}
             const pf=client.world?.pathfinder,asPosition=p=>typeof Position==='function'?new Position(p.x,p.y,p.z):p;
-            const adjacent=client.mouse?.__findAdjacentWalkable?.(asPosition(target.pos),asPosition(playerPos));
+            const adjacent=target.approach;
             if(!adjacent||!pf?.findPath){blocked.set(target.key,now+30000);targetKey=null;reason='No reachable approach tile';return false;}
             const walk=()=>{stopOwnWalk();walkDestination=adjacent;lastWalkAt=now;pf.findPath(asPosition(playerPos),adjacent);reason='Walking to stone '+target.key;return true;};
             return bot.actions?.runShared?bot.actions.runShared('mining-walk',bot.actions.priorities.UTILITY,walk):walk();
@@ -48231,12 +48284,13 @@ window.__minibiaBotBundle.installMiningModule = function(bot) {
     }
     function start(){if(disposed)return;bot.cooking?.stop?.();bot.woodcutting?.stop?.();if(!running){running=true;timer=window.setInterval(tick,150);}config.enabled=true;persist();tick();}
     function stop(options={}){stopOwnWalk();running=false;if(timer!=null)window.clearInterval(timer);timer=null;pending=null;targetKey=null;reason='Stopped';if(options.persistEnabled!==false){config.enabled=false;persist();}}
-    function updateConfig(next){if(next.range!==undefined){stopOwnWalk();targetKey=null;config.range=Math.max(1,Math.min(8,Math.trunc(Number(next.range)||5)));}if(next.delayMs!==undefined)config.delayMs=Math.max(350,Math.min(10000,Number(next.delayMs)||2000));if(next.enabled!==undefined){next.enabled?start():stop();}else persist();}
+    function updateConfig(next){if(next.attackWhileGathering!==undefined)config.attackWhileGathering=!!next.attackWhileGathering;if(next.range!==undefined){stopOwnWalk();targetKey=null;config.range=Math.max(1,Math.min(8,Math.trunc(Number(next.range)||5)));}if(next.delayMs!==undefined)config.delayMs=Math.max(350,Math.min(10000,Number(next.delayMs)||2000));if(next.enabled!==undefined){next.enabled?start():stop();}else persist();}
     function resetStones(){stopOwnWalk();blocked.clear();stripped.clear();targetKey=null;pending=null;reason=running?'Searching for stones':'Stopped';}
     function mount(panel){
         const parent=panel.querySelector('[data-tab-panel="professions"]');if(!parent)return;const host=document.createElement('div');parent.appendChild(host);
-        host.innerHTML=`<div class="mb-section"><div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-mn="enabled" /><span class="mb-title-text">Mining</span></div><div class="prof-grid"><label class="mb-field"><span class="mb-field-label">Interval (ms)</span><input data-mn="delay" type="number" min="350" max="10000" /></label><label class="mb-field"><span class="mb-field-label">Search radius (tiles)</span><input data-mn="range" type="number" min="1" max="8" /></label></div><div class="prof-actions"><button type="button" class="mb-small-button" data-mn="reset">Retry depleted stones</button></div><div class="prof-status" data-mn="status"></div><details><summary>How mining works</summary><div class="mb-hint">Uses a pickaxe (SID 2553 / CID 3456). Automatically skips stones when the game reports “This rock is tapped out for now”. Retry depleted stones after they regenerate. Finds the tool throughout your inventory, including closed backpacks. Walks beside nearby stones. Pause Cavebot for automatic approaches. Pauses during combat and healing. Only one profession runs at a time.</div></details></div>`;
+        host.innerHTML=`<div class="mb-section"><div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-mn="enabled" /><span class="mb-title-text">Mining</span></div><div class="prof-grid"><label class="mb-field"><span class="mb-field-label">Interval (ms)</span><input data-mn="delay" type="number" min="350" max="10000" /></label><label class="mb-field"><span class="mb-field-label">Search radius (tiles)</span><input data-mn="range" type="number" min="1" max="8" /></label></div><label class="mb-field" style="display:flex;flex-direction:row;align-items:center;gap:6px;margin-top:9px"><input type="checkbox" class="mb-title-toggle" data-mn="combat" /><span>Attack while gathering</span></label><div class="prof-actions"><button type="button" class="mb-small-button" data-mn="reset">Retry depleted stones</button></div><div class="prof-status" data-mn="status"></div><details><summary>How mining works</summary><div class="mb-hint">Uses a pickaxe (SID 2553 / CID 3456). Automatically skips stones when the game reports “This rock is tapped out for now”. Retry depleted stones after they regenerate. Finds the tool throughout your inventory, including closed backpacks. Walks beside nearby stones. Pause Cavebot for automatic approaches. Attack while gathering allows nearby resources during combat; combat controls movement. Healing stays first. Only one profession runs at a time.</div></details></div>`;
         const q=k=>host.querySelector(`[data-mn="${k}"]`);
+        q('combat').checked=!!config.attackWhileGathering;q('combat').addEventListener('change',()=>updateConfig({attackWhileGathering:q('combat').checked}));
         q('enabled').addEventListener('change',()=>q('enabled').checked?start():stop());q('delay').value=config.delayMs;q('range').value=config.range;
         q('delay').addEventListener('change',()=>{updateConfig({delayMs:q('delay').value});q('delay').value=config.delayMs;});q('reset').addEventListener('click',resetStones);q('range').addEventListener('change',()=>{updateConfig({range:q('range').value});q('range').value=config.range;});
         
