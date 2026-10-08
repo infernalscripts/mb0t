@@ -16,6 +16,27 @@
 // --- Global namespace for the bundle ---
 window.__minibiaBotBundle = window.__minibiaBotBundle || {};
 
+// Ground walkability alone does not make a stacked obstacle passable.
+window.__minibiaBotBundle.hasNavigationObstacle = function(tile) {
+    if (!tile) return false;
+    const client = window.gameClient;
+    const blocked = item => {
+        if (!item) return false;
+        const cid = Number(item.id ?? item.cid), sid = Number(item.sid);
+        const cidDef = client?.itemDefinitionsByCid?.[cid];
+        const sidDef = client?.itemDefinitionsBySid?.[sid];
+        if (cid === 389 || sid === 387 || Number(cidDef?.sid) === 387)
+            return true;
+        // Preserve the exact server-walkable crate and magic-field policies.
+        if (cid === 2471 || sid === 1739 || Number(cidDef?.sid) === 1739)
+            return false;
+        if (cidDef?.properties?.type === 'magicfield' || sidDef?.properties?.type === 'magicfield')
+            return false;
+        return [cidDef, sidDef].some(def => def && (Number(def.flags) & 1) === 1);
+    };
+    return blocked(tile) || (Array.isArray(tile.items) && tile.items.some(blocked));
+};
+
 /**
  * ==================================================================================
  * 1. CORE BOT FACTORY (createBot)
@@ -3058,7 +3079,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.127",
+        version: "1.6.132",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -9146,7 +9167,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     function isSafeToWalkTile(x, y, z, ignoreCreatures = false) {
         const pos = new Position(x, y, z);
         const tile = window.gameClient?.world?.getTileFromWorldPosition?.(pos);
-        if (!tile)
+        if (!tile || bot.hasNavigationObstacle(tile))
             return false;
         if (!tile.isWalkable())
             return false;
@@ -10355,7 +10376,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     function isTileWalkable(x, y, z, ignoreCreatures = false) {
         const pos = new Position(x, y, z);
         const tile = window.gameClient?.world?.getTileFromWorldPosition?.(pos);
-        if (!tile)
+        if (!tile || bot.hasNavigationObstacle(tile))
             return false;
         if (!tile.isWalkable())
             return false;
@@ -24969,7 +24990,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     function isTileWalkable(x, y, z, ignoreCreatures = false) {
         const pos = new Position(x, y, z);
         const tile = window.gameClient?.world?.getTileFromWorldPosition?.(pos);
-        if (!tile)
+        if (!tile || bot.hasNavigationObstacle(tile))
             return false;
         if (!tile.isWalkable())
             return false;
@@ -28702,7 +28723,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     }
 
     function caveFieldPassableStatic(tile, destination = null) {
-        if (!tile || tile.id === 0)
+        if (!tile || tile.id === 0 || bot.hasNavigationObstacle(tile))
             return false;
 
         // Never walk through stairs/holes/teleports as intermediate nodes.
@@ -30023,6 +30044,40 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         // action tile that is already within use range. Let the Rope tick act.
         if (waypoint.rope && isBesideOrSameTile(from, waypoint))
             return true;
+        // Explicit Stand points require stepping onto the exact tile. Native
+        // Pathfinder may reject a hole/teleport or keep a stale destination.
+        if(waypoint.stand&&Number(from.z)===Number(waypoint.z)){
+            const dx=Number(waypoint.x)-Number(from.x),dy=Number(waypoint.y)-Number(from.y);
+            if(Math.max(Math.abs(dx),Math.abs(dy))===1&&window.gameClient?.keyboard?.handleMoveKey&&
+               !bot.hasNavigationObstacle(getTileAt(waypoint))){
+                const now=Date.now(),client=window.gameClient,player=client.player;
+                const watchKey=`${state.routeRevision}:${state.currentIndex}:${from.x},${from.y},${from.z}:${waypoint.x},${waypoint.y},${waypoint.z}`;
+                if(state.standStepWatch?.key!==watchKey)state.standStepWatch={key:watchKey,at:now};
+                player?.prunePreWalks?.();
+                let moving=player?.isMoving?.()===true;
+                const stationaryMs=now-state.standStepWatch.at;
+                const nativeNow=typeof performance!=='undefined'?performance.now():now;
+                const expectedEnd=Number(player?.__moveEventExpectedEndAt)||0;
+                const expectedStepMs=Math.max(3000,(Number(player?.getStepDuration?.(player?.getTile?.()))||0)*50+500);
+                if(stationaryMs>=expectedStepMs&&(!expectedEnd||nativeNow>expectedEnd+100)){
+                    let repaired=false;
+                    if(moving){repaired=true;player.__movementEvent=null;player.__moveEventExpectedEndAt=null;moving=false;}
+                    if(Array.isArray(player?.__preWalks)&&player.__preWalks.length&&
+                       (!Number(player.__preWalksStamp)||nativeNow-Number(player.__preWalksStamp)>=expectedStepMs)){player.__preWalks.length=0;repaired=true;}
+                    state.standStepWatch.at=now;
+                    if(repaired)bot.log('Stand waypoint: stationary movement lock reset — retrying exact step');
+                }
+                if(moving||now-Number(state.lastStandStepAt||0)<250)return true;
+                const dir=getDirection(dx,dy);
+                if(dir!=null){
+                    client.world?.pathfinder?.setPathfindCache?.(null);
+                    client.keyboard.handleMoveKey(dir);
+                    state.lastStandStepAt=now;state.lastPathAt=now;
+                    state.lastWaypointTarget={x:waypoint.x,y:waypoint.y,z:waypoint.z};
+                    return true;
+                }
+            }
+        }
         const to = new Position(waypoint.x, waypoint.y, waypoint.z);
 
         // v1.6.74 Special Areas: ordinary same-floor Cave travel uses the
@@ -31492,6 +31547,33 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         state.nativePathWatchBestDistance = Number.isFinite(distance) ? distance : Infinity;
     }
 
+    // Recovery selection uses a bounded, static loaded-tile search. This is
+    // separate from ordinary route traversal and ignores temporary creatures.
+    function recoveryTileReachable(from, wp) {
+        const start=getTileAt(from), goal=getTileAt(wp);
+        if(!start||!goal||goal.__isPlaceholder)return null;
+        if(start===goal)return true;
+        if(!caveFieldPassableStatic(goal,goal))return false;
+        const queue=[start],seen=new Set(queue);
+        for(let i=0;i<queue.length&&i<4096;i++){
+            const tile=queue[i];
+            for(const next of tile.neighbours||[]){
+                if(!next||seen.has(next)||!caveFieldPassableStatic(next,goal))continue;
+                const a=tile.__position,b=next.__position;
+                if(!a||!b||Number(b.z)!==Number(from.z))continue;
+                const dx=Number(b.x)-Number(a.x),dy=Number(b.y)-Number(a.y);
+                if(Math.max(Math.abs(dx),Math.abs(dy))!==1)continue;
+                if(dx&&dy){
+                    if(!caveFieldPassableStatic(getTileAt({x:a.x+dx,y:a.y,z:a.z}),null)||
+                       !caveFieldPassableStatic(getTileAt({x:a.x,y:a.y+dy,z:a.z}),null))continue;
+                }
+                if(next===goal)return true;
+                seen.add(next);queue.push(next);
+            }
+        }
+        return false;
+    }
+
     function skipToClosestWaypoint(options = {}) {
         const pos = normalizePosition(bot.getPlayerPosition());
         if (!pos || !route.length)
@@ -31513,6 +31595,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         // noWayFailureKey contains index:coordinates for duplicate-notice locking;
         // use the actual coordinate key when quarantining recovery candidates.
         // Otherwise a duplicate route point at the same tile evades quarantine.
+        const reachability = new Map();
         const noWayKey = state.noWayLastWaypointKey || null;
         const noWayAvoidActive = !!noWayKey && Number.isFinite(Number(state.noWayFailureAt)) &&
             now - Number(state.noWayFailureAt) < Math.max(0, Number(config.noWayAvoidMs) || 10000);
@@ -31590,6 +31673,9 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 if (cheb === 0 && skipCurrentTile)
                     continue;
 
+                if(!reachability.has(i))reachability.set(i,recoveryTileReachable(pos,wp));
+                const reachable=reachability.get(i);
+                if(reachable===false)continue;
                 const manhattan = Math.abs(wp.x - pos.x) + Math.abs(wp.y - pos.y);
 
                 // Prefer a nearby waypoint. When distances are essentially equal, prefer
@@ -31619,7 +31705,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                     ? Math.min(2, candidateHealth.recoveries) *
                       Math.max(0, Number(config.recoveryHealthPenalty) || 0)
                     : 0;
-                const score = manhattan + routePenalty + wrongDirectionPenalty +
+                const score = manhattan + (reachable===null ? limit*2+1 : 0) + routePenalty + wrongDirectionPenalty +
                     transitionPenalty + healthPenalty;
 
                 if (score < bestScore) {
@@ -31693,6 +31779,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         state.recoveryLastTargetIndex = result.bestIdx;
         state.recoveryLastTargetAt = Date.now();
         state.recoveryLastTargetKey = `${wp.x},${wp.y},${wp.z}`;
+        state.recoveryDestinationWatch={index:result.bestIdx,key:getPositionKey(pos),at:now};
         bot.log(
             `Cave: recovery (${state.recoveryReason || 'UNKNOWN'}) → closest same-floor ${result.bestIsTransition ? 'transition ' : ''}waypoint #${result.bestIdx + 1} ` +
             `(${wp.x}, ${wp.y}, ${wp.z}) – ${result.bestProgress} tiles away, score ${Number(result.bestScore).toFixed(3)}` +
@@ -33373,6 +33460,25 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 waypoint = skipOverlongWaypoints(position);
                 if (!waypoint) {
                     scheduleNextTick();
+                    return;
+                }
+            }
+
+            // A recovery index change is not movement. Retry selection when its
+            // destination leaves us stationary, without requiring a module restart.
+            const recoveryWatch=state.recoveryDestinationWatch;
+            if(recoveryWatch){
+                if(recoveryWatch.index!==state.currentIndex||!waypoint||waypoint.script||isSameTile(position,waypoint)){
+                    state.recoveryDestinationWatch=null;
+                }else if(recoveryWatch.key!==positionKey){
+                    recoveryWatch.key=positionKey;recoveryWatch.at=now;
+                }else if(now-recoveryWatch.at>=Math.max(1000,Number(config.recoveryNoProgressWindowMs)||5000)){
+                    const failedIndex=state.currentIndex;
+                    stopMovement();
+                    bot.log(`Cave: recovery waypoint #${failedIndex+1} made no movement – selecting another nearby waypoint`);
+                    state.recoveryDestinationWatch=null;
+                    const recovered=skipToClosestWaypoint({excludeIndex:failedIndex,avoidIndex:failedIndex});
+                    if(!recovered)haltCaveNavigationForSafety();
                     return;
                 }
             }
@@ -47374,7 +47480,7 @@ window.__minibiaBotBundle.installSpecialAreasModule = function installSpecialAre
         }catch(e){return false;}
     }
     function isPhysicallyPassable(tile,destination=null,options={}){
-        if(!tile||tile.id===0)return false;
+        if(!tile||tile.id===0||bot.hasNavigationObstacle(tile))return false;
         if(tile!==destination && bot.cave?.isFloorChangeTile?.(tile))return false;
         const items=Array.isArray(tile.items)?tile.items:[];
         const hasField=items.some(isMagicFieldItem);
@@ -63558,6 +63664,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         }
 
         const bot = currentBundle.createBot();
+        bot.hasNavigationObstacle = currentBundle.hasNavigationObstacle;
         currentBundle.installPzModule(bot);
         currentBundle.installXrayModule(bot);
         currentBundle.installPanicModule(bot);
