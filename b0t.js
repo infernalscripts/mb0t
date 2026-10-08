@@ -3058,7 +3058,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.111",
+        version: "1.6.120",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -47867,6 +47867,292 @@ window.__minibiaBotBundle.installAntiAfkModule = function installAntiAfkModule(b
  * FISHER MODULE – Automatically fishes on a selected tile
  * ==================================================================================
  */
+window.__minibiaBotBundle.installWoodcuttingModule = function(bot) {
+    const key='minibiaBot.woodcutting.config';
+    const trees=new Map([[3682,2768],[9225,10143],[3625,2711],[3616,2702],[3617,2703],[3639,2725],[3622,2708]]);
+    const config={enabled:false,delayMs:2000,range:5,...bot.storage.get(key,{})};
+    config.delayMs=Math.max(350,Math.min(10000,Number(config.delayMs)||2000));
+    config.range=Math.max(1,Math.min(8,Math.trunc(Number(config.range)||5)));
+    // Migrate the original default interval to the requested two seconds.
+    if(config.delayMs===1000)config.delayMs=2000;
+    let walkDestination=null,lastWalkAt=0,walkProgressKey=null,walkProgressAt=0;const blocked=new Map();
+    function stopOwnWalk(){const pf=window.gameClient?.world?.pathfinder;if(walkDestination&&pf?.__finalDestination&&tileKey(pf.__finalDestination)===tileKey(walkDestination))pf.setPathfindCache?.(null);walkDestination=null;}
+    let running=false,timer=null,lastUse=0,targetKey=null,pending=null,reason='Stopped',attempts=0,disposed=false;
+    const stripped=new Set();let hookOwner=null,hookOriginal=null,hookWrapper=null;
+    const tileKey=p=>`${p.x},${p.y},${p.z}`;
+    function persist(){bot.storage.set(key,{...config});}
+    function findAxe(){
+        const player=window.gameClient?.player, opened=player?.__openedContainers;
+        const containers=opened instanceof Map?Array.from(opened.values()):opened&&typeof opened[Symbol.iterator]==='function'?Array.from(opened):Object.values(opened||{});
+        for(const container of [player?.equipment,...containers]){
+            if(!container?.getSlotItem)continue;
+            const size=container.slots?.length??container.size??0;
+            for(let i=0;i<size;i++){const item=container.getSlotItem(i);if(Number(item?.id)===3268||Number(item?.sid)===2380)return {which:container,index:i};}
+        }
+        return null;
+    }
+    function detachHook(){if(hookOwner?.setCancelMessage===hookWrapper)hookOwner.setCancelMessage=hookOriginal;hookOwner=hookOriginal=hookWrapper=null;}
+    function ensureHook(){
+        const owner=window.gameClient?.interface?.notificationManager;
+        if(!owner?.setCancelMessage)return false;
+        if(owner===hookOwner)return true;
+        detachHook();hookOwner=owner;hookOriginal=owner.setCancelMessage;
+        const original=hookOriginal;
+        hookWrapper=function(message,...args){
+            if(!disposed&&running&&pending&&Date.now()-pending.at<=10000&&String(message).toLowerCase().includes('this tree is stripped bare for now')){
+                stripped.add(pending.key);if(stripped.size>512)stripped.delete(stripped.values().next().value);
+                if(targetKey===pending.key)targetKey=null;pending=null;reason='Tree stripped bare — selecting another';
+            }
+            return original.call(this,message,...args);
+        };
+        owner.setCancelMessage=hookWrapper;return true;
+    }
+    function nearby(){
+        const p=bot.getPlayerPosition(),world=window.gameClient?.world;if(!p||!world?.getTileFromWorldPosition)return [];
+        const found=[];
+        for(let dx=-config.range;dx<=config.range;dx++)for(let dy=-config.range;dy<=config.range;dy++){
+            const pos={x:p.x+dx,y:p.y+dy,z:p.z},k=tileKey(pos);if(stripped.has(k)||(blocked.get(k)||0)>Date.now())continue;
+            const nativePos=typeof Position==='function'?new Position(pos.x,pos.y,pos.z):pos;
+            const tile=world.getTileFromWorldPosition(nativePos);if(!Array.isArray(tile?.items))continue;
+            const index=tile.items.findIndex(item=>trees.has(Number(item?.id))||Array.from(trees.values()).includes(Number(item?.sid)));
+            if(index>=0)found.push({key:k,pos,tile,index,distance:Math.abs(dx)+Math.abs(dy)});
+        }
+        return found.sort((a,b)=>a.distance-b.distance);
+    }
+    function tick(){
+        if(!running||disposed)return false;
+        const client=window.gameClient,now=Date.now();
+        if(!client?.networkManager?.isConnected?.()||client.player?.isDead||bot.actions?.isHalted?.()){reason='Waiting for connection / actions';return false;}
+        if(!ensureHook()){reason='Waiting for cancel-message listener';return false;}
+                if(bot.attack?.getCurrentTarget?.()){stopOwnWalk();reason='Paused during combat';return false;}
+        const heal=bot.heal;
+        if(heal?.status?.().running&&(heal.tryHeal?.()===true||heal.hasPendingAction?.()===true||heal.needsPriorityAction?.()===true)){stopOwnWalk();reason='Healing priority';return false;}
+        if(now-lastUse<config.delayMs)return false;
+        const axe=findAxe();if(!axe){reason='Handaxe missing — equip it or open its container';return false;}
+        const candidates=nearby(),target=candidates.find(t=>t.key===targetKey)||candidates[0];
+        if(!target){targetKey=null;reason='No unstripped tree within '+config.range+' tiles';return false;}
+        const playerPos=bot.getPlayerPosition(),distance=Math.max(Math.abs(playerPos.x-target.pos.x),Math.abs(playerPos.y-target.pos.y));
+        if(distance>1){
+            if(bot.cave?.isRunning?.()){stopOwnWalk();reason='Pause Cavebot to approach trees';return false;}
+            const progressKey=tileKey(playerPos);
+            if(targetKey!==target.key||walkProgressKey!==progressKey){walkProgressKey=progressKey;walkProgressAt=now;}
+            targetKey=target.key;
+            if(now-walkProgressAt>=5000){stopOwnWalk();blocked.set(target.key,now+30000);targetKey=null;reason='Tree unreachable — trying another';return false;}
+            if(client.player?.isMoving?.()||now-lastWalkAt<1000){reason='Walking to tree '+target.key;return false;}
+            const pf=client.world?.pathfinder,asPosition=p=>typeof Position==='function'?new Position(p.x,p.y,p.z):p;
+            const adjacent=client.mouse?.__findAdjacentWalkable?.(asPosition(target.pos),asPosition(playerPos));
+            if(!adjacent||!pf?.findPath){blocked.set(target.key,now+30000);targetKey=null;reason='No reachable approach tile';return false;}
+            const walk=()=>{stopOwnWalk();walkDestination=adjacent;lastWalkAt=now;pf.findPath(asPosition(playerPos),adjacent);reason='Walking to tree '+target.key;return true;};
+            return bot.actions?.runShared?bot.actions.runShared('woodcutting-walk',bot.actions.priorities.UTILITY,walk):walk();
+        }
+        stopOwnWalk();
+        if(client.player?.isMoving?.()){reason='Waiting for movement';return false;}
+        if(pending&&pending.key!==target.key&&now-pending.at<config.delayMs+1000){reason='Waiting for previous tree response';return false;}
+        if(!client.mouse?.__handleItemUseWith){reason='Item-use unavailable';return false;}
+        const action=()=>{
+            targetKey=target.key;pending={key:target.key,at:now};lastUse=now;
+            client.mouse.__handleItemUseWith(axe,{which:target.tile,index:target.index});attempts++;reason='Chopping '+target.key;return true;
+        };
+        try{return bot.actions?.runShared?bot.actions.runShared('woodcutting',bot.actions.priorities.UTILITY,action):action();}
+        catch(e){reason='Item-use failed';bot.log?.('Woodcutting: '+e.message);return false;}
+    }
+    function start(){if(disposed)return;bot.cooking?.stop?.();bot.mining?.stop?.();if(!running){running=true;timer=window.setInterval(tick,150);}config.enabled=true;persist();tick();}
+    function stop(options={}){stopOwnWalk();running=false;if(timer!=null)window.clearInterval(timer);timer=null;pending=null;targetKey=null;reason='Stopped';if(options.persistEnabled!==false){config.enabled=false;persist();}}
+    function updateConfig(next){if(next.range!==undefined){stopOwnWalk();targetKey=null;config.range=Math.max(1,Math.min(8,Math.trunc(Number(next.range)||5)));}if(next.delayMs!==undefined)config.delayMs=Math.max(350,Math.min(10000,Number(next.delayMs)||2000));if(next.enabled!==undefined){next.enabled?start():stop();}else persist();}
+    function resetTrees(){stopOwnWalk();blocked.clear();stripped.clear();targetKey=null;pending=null;reason=running?'Searching for trees':'Stopped';}
+    function mount(panel){
+        const host=panel.querySelector('[data-tab-panel="professions"]');if(!host)return;
+        host.innerHTML=`<style>
+#minibia-bot-panel [data-tab-panel="professions"] input.mb-title-toggle{width:13px!important;height:13px!important;min-width:13px!important;margin:0!important;padding:0!important;flex:0 0 13px;}
+#minibia-bot-panel [data-tab-panel="professions"] .prof-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:8px;}
+#minibia-bot-panel [data-tab-panel="professions"] .prof-grid .mb-field{margin:0;min-width:0;}
+#minibia-bot-panel [data-tab-panel="professions"] .prof-grid input{width:100%;box-sizing:border-box;}
+#minibia-bot-panel [data-tab-panel="professions"] .prof-actions{display:flex;align-items:center;gap:6px;margin-top:9px;}
+#minibia-bot-panel [data-tab-panel="professions"] .prof-status{font-size:11px;color:var(--mb-hub-muted,#afa897);margin-top:8px;line-height:1.4;overflow-wrap:anywhere;}
+#minibia-bot-panel [data-tab-panel="professions"] details{font-size:11px;margin-top:9px;line-height:1.5;}
+#minibia-bot-panel [data-tab-panel="professions"] summary{cursor:pointer;color:#bdb5a3;}
+#minibia-bot-panel [data-tab-panel="professions"] details .mb-hint{margin-top:6px;font-size:11px;overflow-wrap:anywhere;}
+#minibia-bot-panel [data-tab-panel="professions"] .prof-food-row{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:11px;padding:5px 0;border-bottom:1px solid rgba(180,170,140,.12);}
+</style><div class="mb-section"><div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-wc="enabled" /><span class="mb-title-text">Woodcutting</span></div><div class="prof-grid"><label class="mb-field"><span class="mb-field-label">Interval (ms)</span><input data-wc="delay" type="number" min="350" max="10000" /></label><label class="mb-field"><span class="mb-field-label">Search radius (tiles)</span><input data-wc="range" type="number" min="1" max="8" /></label></div><div class="prof-actions"><button type="button" class="mb-small-button" data-wc="reset">Retry stripped trees</button></div><div class="prof-status" data-wc="status"></div><details><summary>How woodcutting works</summary><div class="mb-hint">Uses a handaxe (SID 2380 / CID 3268). Stripped trees are skipped until you retry them or reload. Keep the tool equipped or in an open container. Walks beside nearby trees. Pause Cavebot for automatic approaches. Pauses during combat and healing. Only one profession runs at a time.</div></details></div>`;
+        const q=k=>host.querySelector(`[data-wc="${k}"]`);
+        q('enabled').addEventListener('change',()=>q('enabled').checked?start():stop());q('delay').value=config.delayMs;q('range').value=config.range;
+        q('delay').addEventListener('change',()=>{updateConfig({delayMs:q('delay').value});q('delay').value=config.delayMs;});q('reset').addEventListener('click',resetTrees);q('range').addEventListener('change',()=>{updateConfig({range:q('range').value});q('range').value=config.range;});
+        const refresh=()=>{q('enabled').checked=running;q('status').textContent=`${reason} · ${attempts} chops requested · ${stripped.size} stripped trees`;};refresh();const uiTimer=window.setInterval(refresh,500);bot.addCleanup(()=>window.clearInterval(uiTimer));
+    }
+    bot.woodcutting={config,start,stop,updateConfig,tick,resetTrees,mount,status:()=>({running,reason,attempts,strippedTrees:stripped.size,target:targetKey})};
+    bot.addCleanup(()=>{disposed=true;stop({persistEnabled:false});detachHook();});
+    if(config.enabled)start();
+};
+
+window.__minibiaBotBundle.installMiningModule = function(bot) {
+    const key='minibiaBot.mining.config';
+    const stones=new Map([[1790,1303],[1789,1302],[1787,1300],[1788,1301],[1792,1305],[1793,1306],[1777,1290],[1785,1298],[1786,1299],[1784,1297],[1783,1296],[1810,1323],[1811,1324],[1791,1304],[1813,1326]]);
+    const config={enabled:false,delayMs:2000,range:5,...bot.storage.get(key,{})};
+    delete config.depletionText;
+    config.delayMs=Math.max(350,Math.min(10000,Number(config.delayMs)||2000));
+    config.range=Math.max(1,Math.min(8,Math.trunc(Number(config.range)||5)));
+    // Migrate the original default interval to the requested two seconds.
+    if(config.delayMs===1000)config.delayMs=2000;
+    let walkDestination=null,lastWalkAt=0,walkProgressKey=null,walkProgressAt=0;const blocked=new Map();
+    function stopOwnWalk(){const pf=window.gameClient?.world?.pathfinder;if(walkDestination&&pf?.__finalDestination&&tileKey(pf.__finalDestination)===tileKey(walkDestination))pf.setPathfindCache?.(null);walkDestination=null;}
+    let running=false,timer=null,lastUse=0,targetKey=null,pending=null,reason='Stopped',attempts=0,disposed=false;
+    const stripped=new Set();let hookOwner=null,hookOriginal=null,hookWrapper=null;
+    const tileKey=p=>`${p.x},${p.y},${p.z}`;
+    function persist(){bot.storage.set(key,{...config});}
+    function findPickaxe(){
+        const player=window.gameClient?.player, opened=player?.__openedContainers;
+        const containers=opened instanceof Map?Array.from(opened.values()):opened&&typeof opened[Symbol.iterator]==='function'?Array.from(opened):Object.values(opened||{});
+        for(const container of [player?.equipment,...containers]){
+            if(!container?.getSlotItem)continue;
+            const size=container.slots?.length??container.size??0;
+            for(let i=0;i<size;i++){const item=container.getSlotItem(i);if(Number(item?.id)===3456||Number(item?.sid)===2553)return {which:container,index:i};}
+        }
+        return null;
+    }
+    function detachHook(){if(hookOwner?.setCancelMessage===hookWrapper)hookOwner.setCancelMessage=hookOriginal;hookOwner=hookOriginal=hookWrapper=null;}
+    function ensureHook(){
+        const owner=window.gameClient?.interface?.notificationManager;
+        if(!owner?.setCancelMessage)return false;
+        if(owner===hookOwner)return true;
+        detachHook();hookOwner=owner;hookOriginal=owner.setCancelMessage;
+        const original=hookOriginal;
+        hookWrapper=function(message,...args){
+            if(!disposed&&running&&pending&&Date.now()-pending.at<=10000&&String(message).toLowerCase().includes('this rock is tapped out for now')){
+                stripped.add(pending.key);if(stripped.size>512)stripped.delete(stripped.values().next().value);
+                if(targetKey===pending.key)targetKey=null;pending=null;reason='Stone depleted — selecting another';
+            }
+            return original.call(this,message,...args);
+        };
+        owner.setCancelMessage=hookWrapper;return true;
+    }
+    function nearby(){
+        const p=bot.getPlayerPosition(),world=window.gameClient?.world;if(!p||!world?.getTileFromWorldPosition)return [];
+        const found=[];
+        for(let dx=-config.range;dx<=config.range;dx++)for(let dy=-config.range;dy<=config.range;dy++){
+            const pos={x:p.x+dx,y:p.y+dy,z:p.z},k=tileKey(pos);if(stripped.has(k)||(blocked.get(k)||0)>Date.now())continue;
+            const nativePos=typeof Position==='function'?new Position(pos.x,pos.y,pos.z):pos;
+            const tile=world.getTileFromWorldPosition(nativePos);if(!Array.isArray(tile?.items))continue;
+            const index=tile.items.findIndex(item=>stones.has(Number(item?.id))||Array.from(stones.values()).includes(Number(item?.sid)));
+            if(index>=0)found.push({key:k,pos,tile,index,distance:Math.abs(dx)+Math.abs(dy)});
+        }
+        return found.sort((a,b)=>a.distance-b.distance);
+    }
+    function tick(){
+        if(!running||disposed)return false;
+        const client=window.gameClient,now=Date.now();
+        if(!client?.networkManager?.isConnected?.()||client.player?.isDead||bot.actions?.isHalted?.()){reason='Waiting for connection / actions';return false;}
+        if(!ensureHook()){reason='Waiting for cancel-message listener';return false;}
+                if(bot.attack?.getCurrentTarget?.()){stopOwnWalk();reason='Paused during combat';return false;}
+        const heal=bot.heal;
+        if(heal?.status?.().running&&(heal.tryHeal?.()===true||heal.hasPendingAction?.()===true||heal.needsPriorityAction?.()===true)){stopOwnWalk();reason='Healing priority';return false;}
+        if(now-lastUse<config.delayMs)return false;
+        const axe=findPickaxe();if(!axe){reason='Pickaxe missing — equip it or open its container';return false;}
+        const candidates=nearby(),target=candidates.find(t=>t.key===targetKey)||candidates[0];
+        if(!target){targetKey=null;reason='No undepleted stone within '+config.range+' tiles';return false;}
+        const playerPos=bot.getPlayerPosition(),distance=Math.max(Math.abs(playerPos.x-target.pos.x),Math.abs(playerPos.y-target.pos.y));
+        if(distance>1){
+            if(bot.cave?.isRunning?.()){stopOwnWalk();reason='Pause Cavebot to approach stones';return false;}
+            const progressKey=tileKey(playerPos);
+            if(targetKey!==target.key||walkProgressKey!==progressKey){walkProgressKey=progressKey;walkProgressAt=now;}
+            targetKey=target.key;
+            if(now-walkProgressAt>=5000){stopOwnWalk();blocked.set(target.key,now+30000);targetKey=null;reason='Stone unreachable — trying another';return false;}
+            if(client.player?.isMoving?.()||now-lastWalkAt<1000){reason='Walking to stone '+target.key;return false;}
+            const pf=client.world?.pathfinder,asPosition=p=>typeof Position==='function'?new Position(p.x,p.y,p.z):p;
+            const adjacent=client.mouse?.__findAdjacentWalkable?.(asPosition(target.pos),asPosition(playerPos));
+            if(!adjacent||!pf?.findPath){blocked.set(target.key,now+30000);targetKey=null;reason='No reachable approach tile';return false;}
+            const walk=()=>{stopOwnWalk();walkDestination=adjacent;lastWalkAt=now;pf.findPath(asPosition(playerPos),adjacent);reason='Walking to stone '+target.key;return true;};
+            return bot.actions?.runShared?bot.actions.runShared('mining-walk',bot.actions.priorities.UTILITY,walk):walk();
+        }
+        stopOwnWalk();
+        if(client.player?.isMoving?.()){reason='Waiting for movement';return false;}
+        if(pending&&pending.key!==target.key&&now-pending.at<config.delayMs+1000){reason='Waiting for previous stone response';return false;}
+        if(!client.mouse?.__handleItemUseWith){reason='Item-use unavailable';return false;}
+        const action=()=>{
+            targetKey=target.key;pending={key:target.key,at:now};lastUse=now;
+            client.mouse.__handleItemUseWith(axe,{which:target.tile,index:target.index});attempts++;reason='Mining '+target.key;return true;
+        };
+        try{return bot.actions?.runShared?bot.actions.runShared('mining',bot.actions.priorities.UTILITY,action):action();}
+        catch(e){reason='Item-use failed';bot.log?.('Mining: '+e.message);return false;}
+    }
+    function start(){if(disposed)return;bot.cooking?.stop?.();bot.woodcutting?.stop?.();if(!running){running=true;timer=window.setInterval(tick,150);}config.enabled=true;persist();tick();}
+    function stop(options={}){stopOwnWalk();running=false;if(timer!=null)window.clearInterval(timer);timer=null;pending=null;targetKey=null;reason='Stopped';if(options.persistEnabled!==false){config.enabled=false;persist();}}
+    function updateConfig(next){if(next.range!==undefined){stopOwnWalk();targetKey=null;config.range=Math.max(1,Math.min(8,Math.trunc(Number(next.range)||5)));}if(next.delayMs!==undefined)config.delayMs=Math.max(350,Math.min(10000,Number(next.delayMs)||2000));if(next.enabled!==undefined){next.enabled?start():stop();}else persist();}
+    function resetStones(){stopOwnWalk();blocked.clear();stripped.clear();targetKey=null;pending=null;reason=running?'Searching for stones':'Stopped';}
+    function mount(panel){
+        const parent=panel.querySelector('[data-tab-panel="professions"]');if(!parent)return;const host=document.createElement('div');parent.appendChild(host);
+        host.innerHTML=`<div class="mb-section"><div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-mn="enabled" /><span class="mb-title-text">Mining</span></div><div class="prof-grid"><label class="mb-field"><span class="mb-field-label">Interval (ms)</span><input data-mn="delay" type="number" min="350" max="10000" /></label><label class="mb-field"><span class="mb-field-label">Search radius (tiles)</span><input data-mn="range" type="number" min="1" max="8" /></label></div><div class="prof-actions"><button type="button" class="mb-small-button" data-mn="reset">Retry depleted stones</button></div><div class="prof-status" data-mn="status"></div><details><summary>How mining works</summary><div class="mb-hint">Uses a pickaxe (SID 2553 / CID 3456). Automatically skips stones when the game reports “This rock is tapped out for now”. Retry depleted stones after they regenerate. Keep the tool equipped or in an open container. Walks beside nearby stones. Pause Cavebot for automatic approaches. Pauses during combat and healing. Only one profession runs at a time.</div></details></div>`;
+        const q=k=>host.querySelector(`[data-mn="${k}"]`);
+        q('enabled').addEventListener('change',()=>q('enabled').checked?start():stop());q('delay').value=config.delayMs;q('range').value=config.range;
+        q('delay').addEventListener('change',()=>{updateConfig({delayMs:q('delay').value});q('delay').value=config.delayMs;});q('reset').addEventListener('click',resetStones);q('range').addEventListener('change',()=>{updateConfig({range:q('range').value});q('range').value=config.range;});
+        
+        const refresh=()=>{q('enabled').checked=running;q('status').textContent=`${reason} · ${attempts} mining attempts requested · ${stripped.size} depleted stones`;};refresh();const uiTimer=window.setInterval(refresh,500);bot.addCleanup(()=>window.clearInterval(uiTimer));
+    }
+    bot.mining={config,start,stop,updateConfig,tick,resetStones,mount,status:()=>({running,reason,attempts,strippedStones:stripped.size,target:targetKey})};
+    bot.addCleanup(()=>{disposed=true;stop({persistEnabled:false});detachHook();});
+    if(config.enabled)start();
+};
+
+
+window.__minibiaBotBundle.installCookingModule=function(bot){
+ const key='minibiaBot.cooking.config',config={enabled:false,foods:[],limit:10,...bot.storage.get(key,{})};
+ const normalize=rows=>(Array.isArray(rows)?rows:[]).map(r=>({sid:Math.trunc(Number(r.sid)),cid:Math.trunc(Number(r.cid))})).filter(r=>r.sid>0&&r.cid>0).filter((r,i,arr)=>arr.findIndex(s=>s.sid===r.sid&&s.cid===r.cid)===i);
+ config.foods=normalize(config.foods);config.limit=10;
+ let running=false,timer=null,disposed=false,used=0,pending=null,splitPending=null,batchSource=null,lastUse=0,reason='Stopped',capture=null,captureTimer=null,walkDestination=null,lastWalk=0,ovenCache=null,ovenDefs=null;
+ const posKey=p=>`${p.x},${p.y},${p.z}`;
+ function persist(){bot.storage.set(key,{...config});}
+ function containers(){const p=window.gameClient?.player,c=p?.__openedContainers;return [p?.equipment,...(c instanceof Map?Array.from(c.values()):c&&typeof c[Symbol.iterator]==='function'?Array.from(c):Object.values(c||{}))].filter(Boolean);}
+ function inventory(food){const slots=[];let count=0;for(const container of containers()){const size=container.slots?.length??container.size??0;for(let i=0;i<size;i++){const item=container.getSlotItem?.(i);if(Number(item?.sid)!==food.sid||Number(item?.id)!==food.cid)continue;const n=Math.max(1,Number(item.getCount?.()??item.count??1)||1);count+=n;slots.push({which:container,index:i,item});}}return {count,slots};}
+ function ovens(){const client=window.gameClient,defs=client?.itemDefinitionsBySid||client?.itemDefinitions;if(defs===ovenDefs&&ovenCache)return ovenCache;const list=[];for(const [sid,def]of Object.entries(defs||{}))if(/\boven\b/i.test(String(def?.properties?.name||def?.name||'')))list.push({sid:Number(sid),cid:Number(def.id),name:def.properties?.name||def.name});ovenDefs=defs;ovenCache=list;return list;}
+ function findOven(){const p=bot.getPlayerPosition(),world=window.gameClient?.world,list=ovens();if(!p||!world?.getTileFromWorldPosition)return null;let best=null;for(let dx=-5;dx<=5;dx++)for(let dy=-5;dy<=5;dy++){const pos={x:p.x+dx,y:p.y+dy,z:p.z},tile=world.getTileFromWorldPosition(asPosition(pos));if(!Array.isArray(tile?.items))continue;const index=tile.items.findIndex(item=>list.some(o=>Number(item?.sid)>0?Number(item.sid)===o.sid:Number(item?.id)===o.cid));const distance=Math.max(Math.abs(dx),Math.abs(dy));if(index>=0&&(!best||distance<best.distance))best={pos,tile,index,distance};}return best;}
+ const asPosition=p=>typeof Position==='function'?new Position(p.x,p.y,p.z):p;
+ function stopWalk(){const pf=window.gameClient?.world?.pathfinder;if(walkDestination&&pf?.__finalDestination&&posKey(pf.__finalDestination)===posKey(walkDestination))pf.setPathfindCache?.(null);walkDestination=null;}
+ function clearCapture(){if(capture)document.removeEventListener('pointerdown',capture,true);capture=null;if(captureTimer!=null)window.clearTimeout(captureTimer);captureTimer=null;}
+ function pickFood(callback){clearCapture();reason='Click food in an open container or equipment slot';capture=event=>{const slot=event.target?.closest?.('.slot[slotindex]');if(!slot)return;event.preventDefault();event.stopPropagation();event.stopImmediatePropagation?.();let item=null;const el=slot.closest?.('[containerindex]');if(el){const id=Number(el.getAttribute('containerindex'));const c=containers().find(c=>Number(c.__containerId)===id);item=c?.getSlotItem?.(Number(slot.getAttribute('slotindex')));}else{const eq=window.gameClient?.player?.equipment;for(let i=0;i<(eq?.slots?.length||0);i++){const e=eq.slots[i]?.element;if(e===slot||e?.contains?.(slot)){item=eq.getSlotItem?.(i);break;}}}if(!(Number(item?.sid)>0&&Number(item?.id)>0)){reason='Exact SID unavailable — choose another item or enter both IDs';return;}callback({sid:Number(item.sid),cid:Number(item.id)});clearCapture();reason='Food IDs captured';};document.addEventListener('pointerdown',capture,true);captureTimer=window.setTimeout(()=>{clearCapture();reason='Item picker expired';},30000);}
+ function emptySlot(){const eq=window.gameClient?.player?.equipment;for(const c of containers()){if(c===eq)continue;for(let i=0;i<(c.size??c.slots?.length??0);i++)if(!c.getSlotItem?.(i))return {which:c,index:i};}return null;}
+ function stackCount(item){return Math.max(1,Number(item?.getCount?.()??item?.count??1)||1);}
+ function tick(){if(!running||disposed)return false;const client=window.gameClient,now=Date.now();
+  if(splitPending){
+   const r=inventory(splitPending.food);
+   const piece=r.slots.find(slot=>stackCount(slot.item)===10);
+   const actualCounts=r.slots.map(slot=>stackCount(slot.item)).sort((a,b)=>a-b);
+   const expectedCounts=splitPending.expectedCounts;
+   if(piece&&actualCounts.length===expectedCounts.length&&actualCounts.every((n,i)=>n===expectedCounts[i])){batchSource=piece;splitPending=null;}
+   else{reason=now-splitPending.at>=10000?'Split not confirmed — check open containers, then Retry cooking':'Waiting for 10-stack split';return false;}
+  }
+  if(pending){const n=inventory(pending.food).count;if(n<pending.before){used+=pending.before-n;pending=null;batchSource=null;}else{reason=now-pending.at>=10000?'Cooking unconfirmed — check food/oven, then reset batch':'Waiting for food update';return false;}}
+  if(!client?.networkManager?.isConnected?.()||client.player?.isDead||bot.actions?.isHalted?.()){reason='Waiting for connection / actions';stopWalk();return false;}
+  if(bot.attack?.getCurrentTarget?.()){reason='Paused during combat';stopWalk();return false;}
+  const heal=bot.heal;if(heal?.status?.().running&&(heal.tryHeal?.()===true||heal.hasPendingAction?.()===true||heal.needsPriorityAction?.()===true)){reason='Healing priority';stopWalk();return false;}
+  if(now-lastUse<2000)return false;
+  if(!config.foods.length){reason='Add food SID and CID';return false;}
+  let food=null,reading=null;for(const f of config.foods){const r=inventory(f);r.slots.sort((a,b)=>stackCount(a.item)-stackCount(b.item));if(r.slots.length){food=f;reading=r;break;}}if(!food){reason='No matching food in equipment/open containers';return false;}
+  const oven=findOven();if(!oven){reason=ovens().length?'No oven within 5 tiles':'Waiting for oven definitions';return false;}
+  if(oven.distance>1){if(bot.cave?.isRunning?.()){stopWalk();reason='Pause Cavebot to approach oven';return false;}if(client.player?.isMoving?.()||now-lastWalk<2000)return false;const dest=client.mouse?.__findAdjacentWalkable?.(asPosition(oven.pos),asPosition(bot.getPlayerPosition())),pf=client.world?.pathfinder;if(!dest||!pf?.findPath){reason='No oven approach available';return false;}const move=()=>{stopWalk();walkDestination=dest;lastWalk=now;pf.findPath(asPosition(bot.getPlayerPosition()),dest);reason='Walking to oven';return true;};return bot.actions?.runShared?bot.actions.runShared('cooking-walk',bot.actions.priorities.UTILITY,move):move();}
+  stopWalk();if(client.player?.isMoving?.()||!client.mouse?.__handleItemUseWith)return false;
+  const source=reading.slots.find(slot=>batchSource&&slot.which===batchSource.which&&slot.index===batchSource.index&&stackCount(slot.item)<=10)||reading.slots[0];
+  if(stackCount(source.item)>10){
+   const destination=emptySlot();if(!destination){reason='Free one slot in an open container to split food';return false;}
+   const split=()=>{const expectedCounts=reading.slots.map(slot=>stackCount(slot.item));expectedCounts.splice(reading.slots.indexOf(source),1,stackCount(source.item)-10,10);expectedCounts.sort((a,b)=>a-b);splitPending={food:{...food},expectedCounts,at:now};lastUse=now;
+    if(client.mouse?.sendItemMove)client.mouse.sendItemMove({which:source.which,index:source.index},destination,10);
+    else if(typeof ItemMovePacket==='function'&&client.send)client.send(new ItemMovePacket({which:source.which,index:source.index},destination,10));
+    else{splitPending=null;reason='Stack splitting unavailable';return false;}
+    reason='Splitting 10 food items';return true;};
+   try{return bot.actions?.runShared?bot.actions.runShared('cooking-split',bot.actions.priorities.UTILITY,split):split();}catch(e){reason='Stack split failed';return false;}
+  }
+  const action=()=>{lastUse=now;pending={food:{...food},before:reading.count,at:now};client.mouse.__handleItemUseWith({which:source.which,index:source.index},{which:oven.tile,index:oven.index});reason='Cooking SID '+food.sid;return true;};try{return bot.actions?.runShared?bot.actions.runShared('cooking',bot.actions.priorities.UTILITY,action):action();}catch(e){reason='Cooking use failed';return false;}
+ }
+ function start(){if(disposed)return;bot.mining?.stop?.();bot.woodcutting?.stop?.();if(!running){running=true;timer=window.setInterval(tick,150);}config.enabled=true;persist();tick();}
+ function stop(options={}){running=false;if(timer!=null)window.clearInterval(timer);timer=null;stopWalk();clearCapture();reason='Stopped';if(options.persistEnabled!==false){config.enabled=false;persist();}}
+ function resetBatch(){if((pending&&Date.now()-pending.at<10000)||(splitPending&&Date.now()-splitPending.at<10000)){reason='Wait for the outstanding cooking action';return false;}pending=null;splitPending=null;reason='Ready to continue cooking';return true;}
+ function updateConfig(next){if(next.foods!==undefined)config.foods=normalize(next.foods);persist();}
+ function mount(panel){const parent=panel.querySelector('[data-tab-panel="professions"]');if(!parent)return;const host=document.createElement('div');parent.appendChild(host);host.innerHTML=`<div class="mb-section"><div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-cook="enabled" /><span class="mb-title-text">Cooking</span></div><div class="prof-grid"><label class="mb-field"><span class="mb-field-label">Food SID</span><input type="number" min="1" data-cook="sid" /></label><label class="mb-field"><span class="mb-field-label">Food CID</span><input type="number" min="1" data-cook="cid" /></label></div><div class="prof-actions"><button type="button" class="mb-small-button" data-cook="pick" title="Click a food item to capture its exact SID and CID">🔍 Pick food</button><button type="button" class="mb-small-button" data-cook="add">Add food</button><button type="button" class="mb-small-button" data-cook="reset">Retry cooking</button></div><div data-cook="list" style="margin-top:6px"></div><div class="prof-status" data-cook="status"></div><details><summary>How cooking works</summary><div class="mb-hint">2-second interval. Splits 10 items, cooks that stack, and repeats until all selected food is gone. Smaller remaining stacks are cooked too. Matches both SID and CID. Keep food containers open with a free slot for splitting. Auto Stacker pauses merging while Cooking runs. Approaches ovens within 5 tiles; pause Cavebot for walking. Pauses during combat and healing.</div></details><details><summary>Detected oven IDs</summary><div class="mb-hint" data-cook="ovens"></div></details></div>`;
+ const q=k=>host.querySelector(`[data-cook="${k}"]`);
+ const render=()=>{q('list').replaceChildren();for(const f of config.foods){const row=document.createElement('div');row.className='prof-food-row';const label=document.createElement('span');label.textContent=`SID ${f.sid} · CID ${f.cid}`;const remove=document.createElement('button');remove.type='button';remove.className='mb-small-button';remove.textContent='Remove';remove.addEventListener('click',()=>{updateConfig({foods:config.foods.filter(r=>r!==f)});render();});row.append(label,remove);q('list').append(row);}};
+ q('enabled').addEventListener('change',()=>q('enabled').checked?start():stop());q('pick').addEventListener('click',()=>pickFood(f=>{q('sid').value=f.sid;q('cid').value=f.cid;updateConfig({foods:[...config.foods,f]});render();}));q('add').addEventListener('click',()=>{updateConfig({foods:[...config.foods,{sid:q('sid').value,cid:q('cid').value}]});render();});q('reset').addEventListener('click',resetBatch);
+ const refresh=()=>{q('enabled').checked=running;q('status').textContent=`${reason} · ${used} food consumed`;q('ovens').textContent='Ovens: '+(ovens().map(o=>`SID ${o.sid} / CID ${o.cid}`).join(', ')||'waiting for game definitions');};render();refresh();const ui=window.setInterval(refresh,500);bot.addCleanup(()=>window.clearInterval(ui));}
+ bot.cooking={config,start,stop,tick,updateConfig,resetBatch,pickFood,mount,status:()=>({running,reason,used,pending:!!pending,splitPending:!!splitPending,ovens:ovens()})};bot.addCleanup(()=>{disposed=true;stop({persistEnabled:false});});if(config.enabled)start();
+};
+
 window.__minibiaBotBundle.installFisherModule = function installFisherModule(bot) {
     const configStorageKey = "minibiaBot.fisher.config";
     const FISHING_ROD_ID = 3483;
@@ -48460,6 +48746,7 @@ window.__minibiaBotBundle.installAutoStackerModule = function installAutoStacker
     }
 
     function stackItems() {
+        if(bot.cooking?.status?.().running)return false;
         if (!config.enabled)
             return false;
         const containers = getContainers();
@@ -54091,6 +54378,7 @@ function upgradeSectionHeaders(panel) {
     <button type="button" class="mb-tab-button" data-tab-button="looter">💰 Looter</button>
     <button type="button" class="mb-tab-button" data-tab-button="alert">⚠️ Alerts</button>
     <button type="button" class="mb-tab-button" data-tab-button="antibot">🤖 Anti-Bot</button>
+    <button type="button" class="mb-tab-button" data-tab-button="professions">🪓 Professions</button>
     <button type="button" class="mb-tab-button" data-tab-button="utility">🛠️ Tools</button>
     <button type="button" class="mb-tab-button" data-tab-button="support">💕 Support</button>
     <button type="button" class="mb-tab-button" data-tab-button="training">✨ Training</button>
@@ -54104,6 +54392,8 @@ function upgradeSectionHeaders(panel) {
   </div>
 
   <div class="mb-tab-content">
+
+<div class="mb-tab-panel" data-tab-panel="professions"></div>
 
 <!-- Status Tab -->
 <div class="mb-tab-panel" data-tab-panel="status" data-active="true">
@@ -55601,6 +55891,9 @@ function upgradeSectionHeaders(panel) {
         // document.body matches the last known-good mobile UI compositor path.
         document.body.appendChild(panel);
         bot.combatRules?.mount?.(panel);
+        bot.woodcutting?.mount?.(panel);
+        bot.mining?.mount?.(panel);
+        bot.cooking?.mount?.(panel);
 
         // v1.6.75: Special Areas bind immediately after the panel exists.
         const __mbSpecialAreaUi = (() => {
@@ -63143,6 +63436,9 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
             ["paladin", "minibiaBot.paladin.config", [{ persistEnabled: false }]],
             ["antiAfk", "minibiaBot.antiAfk.config", [{ persistEnabled: false }]],
             ["fisher", "minibiaBot.fisher.config", [{ persistEnabled: false }]],
+            ["woodcutting", "minibiaBot.woodcutting.config", [{ persistEnabled: false }]],
+            ["mining", "minibiaBot.mining.config", [{ persistEnabled: false }]],
+            ["cooking", "minibiaBot.cooking.config", [{ persistEnabled: false }]],
             ["autoStacker", "minibiaBot.autostacker.config", [{ persistEnabled: false }]],
         ];
 
@@ -63236,6 +63532,9 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         currentBundle.installProfileModule(bot);
         currentBundle.installAntiAfkModule(bot);
         currentBundle.installFisherModule(bot);
+        currentBundle.installWoodcuttingModule(bot);
+        currentBundle.installMiningModule(bot);
+        currentBundle.installCookingModule(bot);
         currentBundle.installAutoStackerModule(bot);
         currentBundle.installPlayerAttackMonitorModule(bot);
         currentBundle.installMessageAlertModule(bot);
@@ -63319,6 +63618,9 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
                 ["autoPickup", "minibiaBot.autoPickup.config"],
                 ["antiAfk", "minibiaBot.antiafk.config"],
                 ["fisher", "minibiaBot.fisher.config"],
+                ["woodcutting", "minibiaBot.woodcutting.config"],
+                ["mining", "minibiaBot.mining.config"],
+                ["cooking", "minibiaBot.cooking.config"],
                 ["slimeTrainer", "minibiaBot.slimeTrainer.config"],
                 ["specialAreas", "minibiaBot.specialAreas.config"],
                 ["lightHack", "minibiaBot.lightHack.config"],
