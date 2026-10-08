@@ -3079,7 +3079,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.133",
+        version: "1.6.134",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -48010,7 +48010,19 @@ window.__minibiaBotBundle.installWoodcuttingModule = function(bot) {
     const stripped=new Set();let hookOwner=null,hookOriginal=null,hookWrapper=null;
     const tileKey=p=>`${p.x},${p.y},${p.z}`;
     function persist(){bot.storage.set(key,{...config});}
+    let lastToolCountRequest=0;
     function findAxe(){
+        const client=window.gameClient,now=Date.now();
+        if(typeof HotbarUsePacket==='function'&&client?.send){
+            const cid=Number(client.itemDefinitionsBySid?.[2380]?.id)||3268;
+            const reading=bot.getItemCountReading?.(cid,0);
+            if(!reading||now-Number(reading.at||0)>5000){
+                if(now-lastToolCountRequest>=1000){lastToolCountRequest=now;bot.requestItemCounts?.([{id:cid,fluidType:0}]);}
+                reason='Checking handaxe in inventory';return null;
+            }
+            if(Number(reading.count)<=0){reason='Handaxe missing from inventory';return null;}
+            return {server:true,cid};
+        }
         const player=window.gameClient?.player, opened=player?.__openedContainers;
         const containers=opened instanceof Map?Array.from(opened.values()):opened&&typeof opened[Symbol.iterator]==='function'?Array.from(opened):Object.values(opened||{});
         for(const container of [player?.equipment,...containers]){
@@ -48018,7 +48030,7 @@ window.__minibiaBotBundle.installWoodcuttingModule = function(bot) {
             const size=container.slots?.length??container.size??0;
             for(let i=0;i<size;i++){const item=container.getSlotItem(i);if(Number(item?.id)===3268||Number(item?.sid)===2380)return {which:container,index:i};}
         }
-        return null;
+        reason='Handaxe missing — equip it or open its container';return null;
     }
     function detachHook(){if(hookOwner?.setCancelMessage===hookWrapper)hookOwner.setCancelMessage=hookOriginal;hookOwner=hookOriginal=hookWrapper=null;}
     function ensureHook(){
@@ -48057,7 +48069,7 @@ window.__minibiaBotBundle.installWoodcuttingModule = function(bot) {
         const heal=bot.heal;
         if(heal?.status?.().running&&(heal.tryHeal?.()===true||heal.hasPendingAction?.()===true||heal.needsPriorityAction?.()===true)){stopOwnWalk();reason='Healing priority';return false;}
         if(now-lastUse<config.delayMs)return false;
-        const axe=findAxe();if(!axe){reason='Handaxe missing — equip it or open its container';return false;}
+        const axe=findAxe();if(!axe)return false;
         const candidates=nearby(),target=candidates.find(t=>t.key===targetKey)||candidates[0];
         if(!target){targetKey=null;reason='No unstripped tree within '+config.range+' tiles';return false;}
         const playerPos=bot.getPlayerPosition(),distance=Math.max(Math.abs(playerPos.x-target.pos.x),Math.abs(playerPos.y-target.pos.y));
@@ -48077,10 +48089,11 @@ window.__minibiaBotBundle.installWoodcuttingModule = function(bot) {
         stopOwnWalk();
         if(client.player?.isMoving?.()){reason='Waiting for movement';return false;}
         if(pending&&pending.key!==target.key&&now-pending.at<config.delayMs+1000){reason='Waiting for previous tree response';return false;}
-        if(!client.mouse?.__handleItemUseWith){reason='Item-use unavailable';return false;}
+        if(!axe.server&&!client.mouse?.__handleItemUseWith){reason='Item-use unavailable';return false;}
         const action=()=>{
             targetKey=target.key;pending={key:target.key,at:now};lastUse=now;
-            client.mouse.__handleItemUseWith(axe,{which:target.tile,index:target.index});attempts++;reason='Chopping '+target.key;return true;
+            if(axe.server){const pos=typeof Position==='function'?new Position(target.pos.x,target.pos.y,target.pos.z):target.pos;client.send(new HotbarUsePacket(axe.cid,0,3,0,pos));}
+            else client.mouse.__handleItemUseWith(axe,{which:target.tile,index:target.index});attempts++;reason='Chopping '+target.key;return true;
         };
         try{return bot.actions?.runShared?bot.actions.runShared('woodcutting',bot.actions.priorities.UTILITY,action):action();}
         catch(e){reason='Item-use failed';bot.log?.('Woodcutting: '+e.message);return false;}
@@ -48102,7 +48115,7 @@ window.__minibiaBotBundle.installWoodcuttingModule = function(bot) {
 #minibia-bot-panel [data-tab-panel="professions"] summary{cursor:pointer;color:#bdb5a3;}
 #minibia-bot-panel [data-tab-panel="professions"] details .mb-hint{margin-top:6px;font-size:11px;overflow-wrap:anywhere;}
 #minibia-bot-panel [data-tab-panel="professions"] .prof-food-row{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:11px;padding:5px 0;border-bottom:1px solid rgba(180,170,140,.12);}
-</style><div class="mb-section"><div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-wc="enabled" /><span class="mb-title-text">Woodcutting</span></div><div class="prof-grid"><label class="mb-field"><span class="mb-field-label">Interval (ms)</span><input data-wc="delay" type="number" min="350" max="10000" /></label><label class="mb-field"><span class="mb-field-label">Search radius (tiles)</span><input data-wc="range" type="number" min="1" max="8" /></label></div><div class="prof-actions"><button type="button" class="mb-small-button" data-wc="reset">Retry stripped trees</button></div><div class="prof-status" data-wc="status"></div><details><summary>How woodcutting works</summary><div class="mb-hint">Uses a handaxe (SID 2380 / CID 3268). Stripped trees are skipped until you retry them or reload. Keep the tool equipped or in an open container. Walks beside nearby trees. Pause Cavebot for automatic approaches. Pauses during combat and healing. Only one profession runs at a time.</div></details></div>`;
+</style><div class="mb-section"><div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-wc="enabled" /><span class="mb-title-text">Woodcutting</span></div><div class="prof-grid"><label class="mb-field"><span class="mb-field-label">Interval (ms)</span><input data-wc="delay" type="number" min="350" max="10000" /></label><label class="mb-field"><span class="mb-field-label">Search radius (tiles)</span><input data-wc="range" type="number" min="1" max="8" /></label></div><div class="prof-actions"><button type="button" class="mb-small-button" data-wc="reset">Retry stripped trees</button></div><div class="prof-status" data-wc="status"></div><details><summary>How woodcutting works</summary><div class="mb-hint">Uses a handaxe (SID 2380 / CID 3268). Stripped trees are skipped until you retry them or reload. Finds the tool throughout your inventory, including closed backpacks. Walks beside nearby trees. Pause Cavebot for automatic approaches. Pauses during combat and healing. Only one profession runs at a time.</div></details></div>`;
         const q=k=>host.querySelector(`[data-wc="${k}"]`);
         q('enabled').addEventListener('change',()=>q('enabled').checked?start():stop());q('delay').value=config.delayMs;q('range').value=config.range;
         q('delay').addEventListener('change',()=>{updateConfig({delayMs:q('delay').value});q('delay').value=config.delayMs;});q('reset').addEventListener('click',resetTrees);q('range').addEventListener('change',()=>{updateConfig({range:q('range').value});q('range').value=config.range;});
@@ -48128,7 +48141,19 @@ window.__minibiaBotBundle.installMiningModule = function(bot) {
     const stripped=new Set();let hookOwner=null,hookOriginal=null,hookWrapper=null;
     const tileKey=p=>`${p.x},${p.y},${p.z}`;
     function persist(){bot.storage.set(key,{...config});}
+    let lastToolCountRequest=0;
     function findPickaxe(){
+        const client=window.gameClient,now=Date.now();
+        if(typeof HotbarUsePacket==='function'&&client?.send){
+            const cid=Number(client.itemDefinitionsBySid?.[2553]?.id)||3456;
+            const reading=bot.getItemCountReading?.(cid,0);
+            if(!reading||now-Number(reading.at||0)>5000){
+                if(now-lastToolCountRequest>=1000){lastToolCountRequest=now;bot.requestItemCounts?.([{id:cid,fluidType:0}]);}
+                reason='Checking pickaxe in inventory';return null;
+            }
+            if(Number(reading.count)<=0){reason='Pickaxe missing from inventory';return null;}
+            return {server:true,cid};
+        }
         const player=window.gameClient?.player, opened=player?.__openedContainers;
         const containers=opened instanceof Map?Array.from(opened.values()):opened&&typeof opened[Symbol.iterator]==='function'?Array.from(opened):Object.values(opened||{});
         for(const container of [player?.equipment,...containers]){
@@ -48136,7 +48161,7 @@ window.__minibiaBotBundle.installMiningModule = function(bot) {
             const size=container.slots?.length??container.size??0;
             for(let i=0;i<size;i++){const item=container.getSlotItem(i);if(Number(item?.id)===3456||Number(item?.sid)===2553)return {which:container,index:i};}
         }
-        return null;
+        reason='Pickaxe missing — equip it or open its container';return null;
     }
     function detachHook(){if(hookOwner?.setCancelMessage===hookWrapper)hookOwner.setCancelMessage=hookOriginal;hookOwner=hookOriginal=hookWrapper=null;}
     function ensureHook(){
@@ -48175,7 +48200,7 @@ window.__minibiaBotBundle.installMiningModule = function(bot) {
         const heal=bot.heal;
         if(heal?.status?.().running&&(heal.tryHeal?.()===true||heal.hasPendingAction?.()===true||heal.needsPriorityAction?.()===true)){stopOwnWalk();reason='Healing priority';return false;}
         if(now-lastUse<config.delayMs)return false;
-        const axe=findPickaxe();if(!axe){reason='Pickaxe missing — equip it or open its container';return false;}
+        const axe=findPickaxe();if(!axe)return false;
         const candidates=nearby(),target=candidates.find(t=>t.key===targetKey)||candidates[0];
         if(!target){targetKey=null;reason='No undepleted stone within '+config.range+' tiles';return false;}
         const playerPos=bot.getPlayerPosition(),distance=Math.max(Math.abs(playerPos.x-target.pos.x),Math.abs(playerPos.y-target.pos.y));
@@ -48195,10 +48220,11 @@ window.__minibiaBotBundle.installMiningModule = function(bot) {
         stopOwnWalk();
         if(client.player?.isMoving?.()){reason='Waiting for movement';return false;}
         if(pending&&pending.key!==target.key&&now-pending.at<config.delayMs+1000){reason='Waiting for previous stone response';return false;}
-        if(!client.mouse?.__handleItemUseWith){reason='Item-use unavailable';return false;}
+        if(!axe.server&&!client.mouse?.__handleItemUseWith){reason='Item-use unavailable';return false;}
         const action=()=>{
             targetKey=target.key;pending={key:target.key,at:now};lastUse=now;
-            client.mouse.__handleItemUseWith(axe,{which:target.tile,index:target.index});attempts++;reason='Mining '+target.key;return true;
+            if(axe.server){const pos=typeof Position==='function'?new Position(target.pos.x,target.pos.y,target.pos.z):target.pos;client.send(new HotbarUsePacket(axe.cid,0,3,0,pos));}
+            else client.mouse.__handleItemUseWith(axe,{which:target.tile,index:target.index});attempts++;reason='Mining '+target.key;return true;
         };
         try{return bot.actions?.runShared?bot.actions.runShared('mining',bot.actions.priorities.UTILITY,action):action();}
         catch(e){reason='Item-use failed';bot.log?.('Mining: '+e.message);return false;}
@@ -48209,7 +48235,7 @@ window.__minibiaBotBundle.installMiningModule = function(bot) {
     function resetStones(){stopOwnWalk();blocked.clear();stripped.clear();targetKey=null;pending=null;reason=running?'Searching for stones':'Stopped';}
     function mount(panel){
         const parent=panel.querySelector('[data-tab-panel="professions"]');if(!parent)return;const host=document.createElement('div');parent.appendChild(host);
-        host.innerHTML=`<div class="mb-section"><div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-mn="enabled" /><span class="mb-title-text">Mining</span></div><div class="prof-grid"><label class="mb-field"><span class="mb-field-label">Interval (ms)</span><input data-mn="delay" type="number" min="350" max="10000" /></label><label class="mb-field"><span class="mb-field-label">Search radius (tiles)</span><input data-mn="range" type="number" min="1" max="8" /></label></div><div class="prof-actions"><button type="button" class="mb-small-button" data-mn="reset">Retry depleted stones</button></div><div class="prof-status" data-mn="status"></div><details><summary>How mining works</summary><div class="mb-hint">Uses a pickaxe (SID 2553 / CID 3456). Automatically skips stones when the game reports “This rock is tapped out for now”. Retry depleted stones after they regenerate. Keep the tool equipped or in an open container. Walks beside nearby stones. Pause Cavebot for automatic approaches. Pauses during combat and healing. Only one profession runs at a time.</div></details></div>`;
+        host.innerHTML=`<div class="mb-section"><div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-mn="enabled" /><span class="mb-title-text">Mining</span></div><div class="prof-grid"><label class="mb-field"><span class="mb-field-label">Interval (ms)</span><input data-mn="delay" type="number" min="350" max="10000" /></label><label class="mb-field"><span class="mb-field-label">Search radius (tiles)</span><input data-mn="range" type="number" min="1" max="8" /></label></div><div class="prof-actions"><button type="button" class="mb-small-button" data-mn="reset">Retry depleted stones</button></div><div class="prof-status" data-mn="status"></div><details><summary>How mining works</summary><div class="mb-hint">Uses a pickaxe (SID 2553 / CID 3456). Automatically skips stones when the game reports “This rock is tapped out for now”. Retry depleted stones after they regenerate. Finds the tool throughout your inventory, including closed backpacks. Walks beside nearby stones. Pause Cavebot for automatic approaches. Pauses during combat and healing. Only one profession runs at a time.</div></details></div>`;
         const q=k=>host.querySelector(`[data-mn="${k}"]`);
         q('enabled').addEventListener('change',()=>q('enabled').checked?start():stop());q('delay').value=config.delayMs;q('range').value=config.range;
         q('delay').addEventListener('change',()=>{updateConfig({delayMs:q('delay').value});q('delay').value=config.delayMs;});q('reset').addEventListener('click',resetStones);q('range').addEventListener('change',()=>{updateConfig({range:q('range').value});q('range').value=config.range;});
@@ -48364,6 +48390,7 @@ window.__minibiaBotBundle.installFisherModule = function installFisherModule(bot
 
     // ---- Find fishing rod in equipment or containers ----
     function findFishingRod() {
+        if(typeof HotbarUsePacket==='function'&&window.gameClient?.send)return {server:true,item:{id:FISHING_ROD_ID}};
         const eq = getEquipment();
         if (eq) {
             for (let i = 0; i < eq.slots.length; i++) {
@@ -48472,6 +48499,15 @@ window.__minibiaBotBundle.installFisherModule = function installFisherModule(bot
 
         // Use rod on tile
         try {
+            if(rod.server){
+                const now=Date.now(),reading=bot.getItemCountReading?.(FISHING_ROD_ID,0);
+                if(!reading||now-Number(reading.at||0)>5000){
+                    if(now-Number(state.lastRodCountRequestAt||0)>=1000){state.lastRodCountRequestAt=now;bot.requestItemCounts?.([{id:FISHING_ROD_ID,fluidType:0}]);}
+                    return false;
+                }
+                if(Number(reading.count)<=0)return false;
+                window.gameClient.send(new HotbarUsePacket(FISHING_ROD_ID,0,3,0,pos));return true;
+            }
             // Method 1: use mouse.__handleItemUseWith if available
             if (window.gameClient?.mouse?.__handleItemUseWith) {
                 const source = {
