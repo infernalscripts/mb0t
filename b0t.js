@@ -3058,7 +3058,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.124",
+        version: "1.6.127",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -30666,11 +30666,40 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         return null;
     }
 
+    const toolCountRequests=new Map();
+    function findServerToolSource(kind,sid,predicate){
+        const local=findToolSource(predicate),client=window.gameClient;
+        if(typeof HotbarUsePacket!=='function'||!client?.send)return local;
+        const defs=client.itemDefinitionsBySid||{};
+        const def=defs[sid]||Object.values(defs).find(def=>String(def?.properties?.name||'').toLowerCase()===kind);
+        const cid=Number(local?.item?.id||def?.id);
+        if(!(cid>0))return {location:'server',kind,item:null};
+        return {location:'server',kind,item:local?.item||{id:cid,sid},index:null};
+    }
     function findRopeSource() {
-        return findToolSource(isRopeItem);
+        return findServerToolSource('rope',2120,isRopeItem);
     }
     function findShovelSource() {
-        return findToolSource(isShovelItem);
+        return findServerToolSource('shovel',2554,isShovelItem);
+    }
+    function sendToolUse(tool,targetTile,targetPosition,now=Date.now()){
+        const client=window.gameClient;
+        if(tool?.location==='server'){
+            const cid=Number(tool.item?.id);if(!(cid>0))return false;
+            const reading=bot.getItemCountReading?.(cid,0);
+            if(!reading||now-Number(reading.at||0)>5000){
+                if(now-(toolCountRequests.get(cid)||0)>=1000){toolCountRequests.set(cid,now);bot.requestItemCounts?.([{id:cid,fluidType:0}]);}
+                return false;
+            }
+            if(Number(reading.count)<=0)return false;
+            if(typeof HotbarUsePacket!=='function'||!client?.send)return false;
+            client.send(new HotbarUsePacket(cid,0,3,0,targetPosition));return true;
+        }
+        if(!tool||!targetTile)return false;
+        const source={which:tool.which,index:tool.index},target={which:targetTile,index:0xFF};
+        if(client?.mouse?.__handleItemUseWith){client.mouse.__handleItemUseWith(source,target);return true;}
+        if(client?.send&&typeof ThingUseWithPacket==='function'){client.send(new ThingUseWithPacket(source,target));return true;}
+        return false;
     }
 
     function getLearnUseObjectItem(object) {
@@ -30873,13 +30902,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             if (adj)
                 return goToPosition(adj);
         }
-        window.gameClient?.mouse?.__handleItemUseWith?.({
-            which: tool.which,
-            index: tool.index
-        }, {
-            which: targetTile,
-            index: 0xFF
-        });
+        if(!sendToolUse(tool,targetTile,targetPosition,now))return false;
         state.lastStairsUseAt = now;
         state.lastPathAt = now;
         markPendingTransitionSource(targetPosition);
@@ -34355,18 +34378,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                     };
                     let used = false;
 
-                    if (window.gameClient?.mouse?.__handleItemUseWith) {
-                        window.gameClient.mouse.__handleItemUseWith(source, target);
-                        used = true;
-                        bot.log("Rope waypoint: used rope via mouse.__handleItemUseWith");
-                    } else if (window.gameClient?.send && typeof ThingUseWithPacket === 'function') {
-                        window.gameClient.send(new ThingUseWithPacket(source, target));
-                        used = true;
-                        bot.log("Rope waypoint: used rope via ThingUseWithPacket");
-                    } else {
-                        state._ropeNextUseAt[index] = now + 750;
-                        bot.log("Rope waypoint: cannot use rope – no method available");
-                    }
+                    used=sendToolUse(ropeSource,tile,waypoint,now);
+                    if(!used)state._ropeNextUseAt[index]=now+750;
 
                     if (used) {
                         state._ropeNextUseAt[index] = now + 1000;
@@ -42879,17 +42892,30 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                 45000
         )
     );
+    function trackedKey(value,name){
+        const raw=String(value);
+        if(/^\d+:\d+(?::\d+)?$/.test(raw)){const [sid,cid,fluid=0]=raw.split(':').map(Number);return sid>0&&cid>0?`${sid}:${cid}:${fluid}`:`legacy:${cid}`;}
+        if(raw.startsWith('legacy:'))return raw;
+        const cid=Number(value),defs=window.gameClient?.itemDefinitionsBySid||{};
+        const matches=Object.entries(defs).filter(([sid,def])=>Number(def?.id)===cid&&String(def?.properties?.name||'').toLowerCase()===String(name||'').toLowerCase());
+        return matches.length===1?`${Number(matches[0][0])}:${cid}:0`:`legacy:${cid}`;
+    }
+    function exactItemKey(item){return Number(item?.sid)>0&&Number(item?.id)>0?`${Number(item.sid)}:${Number(item.id)}:${Math.max(0,Math.trunc(Number(item.fluidType)||0))}`:'';}
+    function dropRuleKey(value){
+        const raw=String(value);if(raw.includes(':'))return trackedKey(raw);
+        return Array.from(state.trackedItems.keys()).find(key=>Number(key.split(':')[1])===Number(value))||`legacy:${Number(value)}`;
+    }
     if (Array.isArray(stored.trackedItems)) {
         for (const [id, name] of stored.trackedItems) {
-            state.trackedItems.set(Number(id), name);
+            state.trackedItems.set(trackedKey(id,name), name);
         }
     }
 
     if (Array.isArray(stored.dropItemIds)) {
         for (const id of stored.dropItemIds) {
-            const numericId = Number(id);
+            const numericId = dropRuleKey(id);
             if (
-                Number.isFinite(numericId) &&
+                
                 state.trackedItems.has(numericId)
             ) {
                 state.dropItemIds.add(numericId);
@@ -43172,7 +43198,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         for (const container of containers) {
             const id = Number(container?.__containerId);
             if (
-                !Number.isFinite(id) ||
+                
                 baselineIds?.has(id)
             ) {
                 continue;
@@ -43193,7 +43219,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
 
     function isDropTrackedItem(itemId) {
         return state.dropItemIds.has(
-            Number(itemId)
+            dropRuleKey(itemId)
         );
     }
 
@@ -43201,9 +43227,9 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         itemId,
         enabled
     ) {
-        const id = Number(itemId);
+        const id = dropRuleKey(itemId);
         if (
-            !Number.isFinite(id) ||
+            
             !state.trackedItems.has(id)
         ) {
             return false;
@@ -43242,8 +43268,8 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
 
             if (
                 item &&
-                state.trackedItems.has(item.id) &&
-                !isDropTrackedItem(item.id)
+                state.trackedItems.has(exactItemKey(item)) &&
+                !isDropTrackedItem(exactItemKey(item))
             ) {
                 return true;
             }
@@ -43294,8 +43320,8 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         if (
             !container ||
             !item ||
-            !state.trackedItems.has(item.id) ||
-            !isDropTrackedItem(item.id)
+            !state.trackedItems.has(exactItemKey(item)) ||
+            !isDropTrackedItem(exactItemKey(item))
         ) {
             return false;
         }
@@ -43387,6 +43413,8 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             sourceTitle: String(container.__title || ""),
             slot,
             itemId: item.id,
+                    itemSid:Number(item.sid)||0,
+                    itemFluidType:Number(item.fluidType)||0,
             count: item.count,
             at: now
         };
@@ -43395,9 +43423,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         state.lastDroppedItemId =
             item.id;
         state.lastDroppedItemName =
-            state.trackedItems.get(
-                item.id
-            ) || null;
+            state.trackedItems.get(exactItemKey(item)) || null;
         state.lastDropAt = now;
 
         return true;
@@ -43411,7 +43437,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             const item = container.getSlotItem?.(slot);
             if (
                 item &&
-                state.trackedItems.has(item.id)
+                state.trackedItems.has(exactItemKey(item))
             ) {
                 return true;
             }
@@ -45481,6 +45507,8 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             if (
                 !item ||
                 item.id !== pending.itemId ||
+                Number(item.sid||0)!==Number(pending.itemSid||0) ||
+                Number(item.fluidType||0)!==Number(pending.itemFluidType||0) ||
                 item.count !== pending.count
             ) {
                 state.pendingMove = null;
@@ -45565,12 +45593,8 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
 
                 if (
                     !item ||
-                    !state.trackedItems.has(
-                        item.id
-                    ) ||
-                    !isDropTrackedItem(
-                        item.id
-                    )
+                    !state.trackedItems.has(exactItemKey(item)) ||
+                    !isDropTrackedItem(exactItemKey(item))
                 ) {
                     continue;
                 }
@@ -45622,12 +45646,8 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
 
                 if (
                     !item ||
-                    !state.trackedItems.has(
-                        item.id
-                    ) ||
-                    isDropTrackedItem(
-                        item.id
-                    )
+                    !state.trackedItems.has(exactItemKey(item)) ||
+                    isDropTrackedItem(exactItemKey(item))
                 ) {
                     continue;
                 }
@@ -45752,6 +45772,8 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                         String(container.__title || ""),
                     slot,
                     itemId: item.id,
+                    itemSid:Number(item.sid)||0,
+                    itemFluidType:Number(item.fluidType)||0,
                     count: item.count,
                     destId:
                         dest.__containerId,
@@ -46048,7 +46070,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                 new Map(
                     next.trackedItems.map(
                         ([id, name]) => [
-                            Number(id),
+                            trackedKey(id,name),
                             name
                         ]
                     )
@@ -46072,9 +46094,8 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             state.dropItemIds =
                 new Set(
                     next.dropItemIds
-                        .map(Number)
+                        .map(dropRuleKey)
                         .filter(id =>
-                            Number.isFinite(id) &&
                             state.trackedItems.has(id)
                         )
                 );
@@ -46215,9 +46236,11 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                 return;
             }
 
+            if(!exactItemKey(item)){bot.log('Looter: exact SID unavailable; select an item with SID information');clearCaptureMode();return;}
+            state.trackedItems.delete(`legacy:${Number(item.id)}`);
             const itemName = window.gameClient?.itemDefinitionsBySid?.[item.sid]?.properties?.name || `Item ${item.id}`;
             state.trackedItems.set(
-                Number(item.id),
+                exactItemKey(item),
                 itemName
             );
             persistConfig();
@@ -46278,7 +46301,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
     }
 
     function removeTrackedItem(id) {
-        id = Number(id);
+        id = dropRuleKey(id);
 
         if (state.trackedItems.has(id)) {
             state.trackedItems.delete(id);
@@ -51439,7 +51462,7 @@ function upgradeSectionHeaders(panel) {
                     row.style.cssText = "display:flex;justify-content:space-between;align-items:center;gap:8px;padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.05);";
 
                     const label = document.createElement("span");
-                    label.textContent = `${name} (${id})`;
+                    label.textContent = String(id).startsWith('legacy:')?`${name} · re-track for SID`:`${name} · SID ${String(id).split(':')[0]} / CID ${String(id).split(':')[1]} / Fluid ${String(id).split(':')[2]||0}`;
                     label.style.cssText = "flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
 
                     const actions = document.createElement("div");
@@ -58868,7 +58891,7 @@ function upgradeSectionHeaders(panel) {
                 for (const [sid, def] of Object.entries(defs)) {
                     if (def?.properties?.name?.toLowerCase() === name.toLowerCase()) {
                         found = {
-                            id: def.id,
+                            id: `${Number(sid)}:${Number(def.id)}:0`,
                             name: def.properties.name
                         };
                         break;
