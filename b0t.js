@@ -3101,7 +3101,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.159",
+        version: "1.6.161",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -48176,6 +48176,37 @@ window.__minibiaBotBundle.installClientExtras=function(bot){
  bot.clientExtras={config,mount,canStart,requestInventory,saveLoot,applyNative,status:()=>{sync();return {inventory:inventory.map(i=>({...i})),inventoryAt,loot,blessings:blessings||window.gameClient?.player?.blessings};}};bot.progress={rows,matches,evaluate,branch:(rule,label)=>matches(rule)?bot.goToLabel(label):false,rearm:()=>fired.clear()};bot.addCleanup(()=>{disposed=true;cleanups.reverse().forEach(f=>f());fired.clear();inventory=[];});
 };
 
+window.__minibiaBotBundle.installCurePoisonModule=function(bot){
+    const key='minibiaBot.curePoison.config',config={enabled:bot.storage.get(key,{}).enabled===true};let lastAttempt=0,disposed=false;
+    function tick(){
+        if(disposed||!config.enabled)return false;
+        const client=window.gameClient,player=client?.player,now=Date.now();
+        if(!client?.networkManager?.isConnected?.()||player?.isDead||bot.actions?.isHalted?.())return false;
+        const poison=typeof ConditionManager!=='undefined'?ConditionManager.prototype.POISONED:1;
+        if(!(player?.hasCondition?.(poison)??player?.conditions?.has?.(poison)))return false;
+        const mana=Number(bot.mana?.());if(!Number.isFinite(mana)||mana<=30||now-lastAttempt<2000)return false;
+        const book=player.spellbook;let sid=null;
+        client.interface?.SPELLS?.forEach?.((s,id)=>{if(String(s?.words||'').trim().toLowerCase()==='exana pox')sid=Number(id);});
+        if(sid==null||!book?.cooldowns?.has)return false;
+        const bucket=book.__bucketFor?.(sid)??book.GLOBAL_COOLDOWN_HEAL;
+        if(book.cooldowns.has(sid)||(bucket!=null&&book.cooldowns.has(bucket)))return false;
+        const heal=bot.heal;if(heal?.status?.().running&&(heal.hasPendingAction?.()||heal.needsPriorityAction?.()))return false;
+        const action=()=>bot.sendChat('exana pox');
+        const sent=bot.actions?.runShared?bot.actions.runShared('cure-poison',bot.actions.priorities.DEFENSE,action):action();
+        if(sent)lastAttempt=now;return !!sent;
+    }
+    function mount(panel){
+        const tab=panel.querySelector('[data-tab-panel="utility"]');if(!tab||tab.querySelector('[data-cure-poison]'))return;
+        const title=[...tab.querySelectorAll('.mb-title-text')].find(e=>e.textContent.includes('Tools'));
+        const parent=title?.closest('.mb-section');if(!parent)return;
+        const label=document.createElement('label');label.className='mb-toggle';label.style.cssText='margin:0;font-size:11px';label.title='Cast exana pox when poisoned and mana is above 30. Respects cooldowns and healing priority.';label.setAttribute('data-cure-poison','');
+        const input=document.createElement('input');input.type='checkbox';input.checked=config.enabled;
+        input.addEventListener('change',()=>{config.enabled=input.checked;bot.storage.set(key,config);tick();});
+        const text=document.createElement('span');text.textContent='Cure Poison';label.append(input,text);const shield=parent.querySelector('#minibia-bot-auto-magic-shield-enabled')?.closest('label');if(shield)shield.after(label);else parent.append(label);
+    }
+    bot.curePoison={config,tick,mount};const timer=setInterval(tick,250);bot.addCleanup(()=>{disposed=true;clearInterval(timer);});
+};
+
 window.__minibiaBotBundle.installObservability = function(bot) {
     const storageKey='minibiaBot.supplyEstimates';
     const saved=bot.storage.get(storageKey,{});
@@ -56756,6 +56787,7 @@ function upgradeSectionHeaders(panel) {
         bot.smithing?.mount?.(panel);
         bot.cooking?.mount?.(panel);
         bot.observability?.mount?.(panel);
+        bot.curePoison?.mount?.(panel);
         organizePanelSections(panel);
 
         // v1.6.75: Special Areas bind immediately after the panel exists.
@@ -64374,6 +64406,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         currentBundle.installClientImprovements(bot);
         currentBundle.installClientExtras(bot);
         currentBundle.installObservability(bot);
+        currentBundle.installCurePoisonModule(bot);
         currentBundle.installPzModule(bot);
         currentBundle.installXrayModule(bot);
         currentBundle.installPanicModule(bot);
