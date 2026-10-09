@@ -3101,7 +3101,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.158",
+        version: "1.6.159",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -41974,7 +41974,7 @@ window.__minibiaBotBundle.installComboBotModule = function installComboBotModule
         const sent=bot.actions?.runShared?bot.actions.runShared("combo-hotkey",bot.actions.priorities.COMBAT,fire):fire();
         if(!sent)return;
         state.lastTriggerAt = performance.now();
-        log('Triggered hotkey slot', config.hotkeySlot);
+        log('Triggered hotkey slot', config.hotkeySlot + 1);
     }
 
     function sendPacket(packetName, ...args) {
@@ -56597,8 +56597,8 @@ function upgradeSectionHeaders(panel) {
       <div class="mb-field"><span class="mb-field-label">Leader name</span><input id="minibia-bot-combo-leader-name" placeholder="Exact player name" /></div>
       <details><summary>Leader-hit mode</summary><div class="mb-small-note">Works across computers. Follows visible damage from the named leader. Area hits keep the current target when possible. Stops assisting after 8 seconds without a leader hit.</div></details>
       <div class="mb-field">
-        <span class="mb-field-label">Hotkey Slot (0=F1 – 11=F12)</span>
-        <input type="number" id="minibia-bot-combo-slot" min="0" max="11" value="11" />
+        <span class="mb-field-label">Hotkey Slot (1=F1 – 12=F12)</span>
+        <input type="number" id="minibia-bot-combo-slot" min="1" max="12" value="12" />
       </div>
 
       <div class="mb-field">
@@ -58185,7 +58185,7 @@ function upgradeSectionHeaders(panel) {
                 comboMode.value = status.config.mode || 'follower';
             }
             if (comboSlot && document.activeElement !== comboSlot) {
-                comboSlot.value = status.config.hotkeySlot ?? 11;
+                comboSlot.value = (status.config.hotkeySlot ?? 11) + 1;
             }
             if (comboMinMana && document.activeElement !== comboMinMana) {
                 comboMinMana.value = status.config.minMana || 0;
@@ -58241,10 +58241,10 @@ function upgradeSectionHeaders(panel) {
         // Slot change
         if (comboSlot) {
             comboSlot.addEventListener("change", function () {
-                const val = Math.min(11, Math.max(0, parseInt(this.value) || 0));
+                const val = Math.min(12, Math.max(1, parseInt(this.value) || 1));
                 this.value = val;
                 bot.comboBot.updateConfig({
-                    hotkeySlot: val
+                    hotkeySlot: val - 1
                 });
                 refreshComboStatus();
             });
