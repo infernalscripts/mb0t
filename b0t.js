@@ -3101,7 +3101,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.152",
+        version: "1.6.155",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -8151,8 +8151,8 @@ window.__minibiaBotBundle.installCombatRulesModule = function(bot) {
         const minCount=Math.trunc(clamp(r.minCount,1,100,1)), maxCount=Math.trunc(clamp(r.maxCount,1,100,100));
         if(minHp>maxHp || minCount>maxCount) throw new Error('Minimum must not exceed maximum.');
         return {enabled:r.enabled!==false,names:[...new Set((Array.isArray(r.names)?r.names:String(r.names||'').split(/[,;\n]+/)).map(n=>String(n).trim().toLowerCase()).filter(Boolean))],minHp,maxHp,minCount,maxCount,
-            range:Math.trunc(clamp(r.range,1,8,8)),mode:modes.includes(r.mode)?r.mode:'inherit',rune:runes.includes(r.rune)?r.rune:'',exori:r.exori===true,position:['inherit','any','front','diagonal'].includes(r.position)?r.position:'inherit',
-            spellWords:String(r.spellWords||'').trim().slice(0,160),spellMana:Math.trunc(clamp(r.spellMana,0,100000,0)),spellAim:r.spellAim==='area'?'area':'target'};
+            range:Math.trunc(clamp(r.range,1,8,8)),mode:modes.includes(r.mode)?r.mode:'inherit',rune:runes.includes(r.rune)?r.rune:'',position:['inherit','any','front','diagonal'].includes(r.position)?r.position:'inherit',
+            spellWords:String(r.spellWords||(r.exori?'exori':'')).trim().replace(/\s+/g,' ').slice(0,160),spellMana:Math.trunc(clamp(r.spellMana,0,100000,0)),spellAim:String(r.spellWords||(r.exori?'exori':'')).trim().toLowerCase()==='exori'?'area':r.spellAim==='area'?'area':'target'};
     }
     config.rules=(Array.isArray(config.rules)?config.rules:[]).map(r=>{try{return normalize(r)}catch{return null}}).filter(Boolean);
     function invalidate(){cached=null;cachedAt=0;matchCache.clear();targetCache.clear();}
@@ -8163,7 +8163,14 @@ window.__minibiaBotBundle.installCombatRulesModule = function(bot) {
     }
     function matchOne(rule,m) {
         if(!rule?.enabled || !m) return false;
-        const hp=Number(m.state?.health ?? m.health);
+        let hp=NaN;
+        try{if(typeof m.getHealthPercentage==='function')hp=Number(m.getHealthPercentage());}catch(e){}
+        if(!Number.isFinite(hp)){
+            const health=Number(m.state?.health??m.health),max=Number(m.maxHealth??m.state?.maxHealth);
+            if(Number.isFinite(health)&&Number.isFinite(max)&&max>0)hp=health/max*100;
+            else hp=Number(m.healthPercent??m.hpPercent??m.state?.healthPercent);
+        }
+        if(Number.isFinite(hp))hp=Math.max(0,Math.min(100,hp));
         if(!Number.isFinite(hp) || hp<=0 || hp<rule.minHp || hp>rule.maxHp) return false;
         return (!rule.names.length || rule.names.includes(String(m.name||'').trim().toLowerCase())) && distance(bot.getPlayerPosition(),position(m))<=rule.range;
     }
@@ -8193,7 +8200,7 @@ window.__minibiaBotBundle.installCombatRulesModule = function(bot) {
         if(!config.enabled)return null;
         return config.rules.filter(r=>r.rune&&meetsCount(r,list)).map(r=>({rune:r.rune,minCreatures:r.minCount,mobNames:r.names,combatRule:r}));
     }
-    function exoriRule(list){return config.enabled?config.rules.find(r=>r.exori&&meetsCount(r,list))||null:null;}
+    function exoriRule(list){return config.enabled?config.rules.find(r=>r.spellWords.toLowerCase()==='exori'&&meetsCount(r,list))||null:null;}
     function trySpellRules() {
         const block=reason=>{spellState.blockedReason=reason;return false;};
         const client=window.gameClient, now=Date.now();
@@ -8207,16 +8214,19 @@ window.__minibiaBotBundle.installCombatRulesModule = function(bot) {
         if(!spells?.forEach||!spellbook?.cooldowns?.has)return block('spell definitions unavailable');
         const visible=monsters();
         for(const rule of config.rules){
-            if(!rule.spellWords||!meetsCount(rule,visible))continue;
+            if(!rule.enabled||!rule.spellWords)continue;
+            const isExori=rule.spellWords.toLowerCase()==='exori';
+            const spellMonsters=isExori?visible.filter(m=>distance(bot.getPlayerPosition(),position(m))<=1):visible;
+            if(!meetsCount(rule,spellMonsters)){spellState.blockedReason='monster count / name / HP conditions';continue;}
             if(rule.spellAim==='target'){
                 const target=bot.attack.getCurrentTarget?.();
                 if(!target||!visible.some(m=>Number(m.id)===Number(target.id))||!matchOne(rule,target))continue;
                 if(bot.attack.getProjectileLineOfSightToPosition?.(position(target))!==true)continue;
             }
-            const requireFront=rule.position==='front'||(rule.position==='inherit'&&bot.attack?.config?.keepFront===true);
+            const requireFront=!isExori&&(rule.position==='front'||(rule.position==='inherit'&&bot.attack?.config?.keepFront===true));
             if(requireFront){
                 const current=bot.attack.getCurrentTarget?.();
-                const anchor=current&&matchOne(rule,current)?current:rule.spellAim==='area'?matching(rule,visible)[0]:null;
+                const anchor=current&&matchOne(rule,current)?current:rule.spellAim==='area'?matching(rule,spellMonsters)[0]:null;
                 const playerPos=bot.getPlayerPosition(), mobPos=position(anchor);
                 const aligned=playerPos&&mobPos&&Number(playerPos.z)===Number(mobPos.z)&&
                     ((Number(playerPos.x)===Number(mobPos.x)) !== (Number(playerPos.y)===Number(mobPos.y)));
@@ -8233,13 +8243,14 @@ window.__minibiaBotBundle.installCombatRulesModule = function(bot) {
             const action=()=>bot.sendChat(rule.spellWords);
             const sent=bot.actions?.runShared?bot.actions.runShared('combat-rule-spell',bot.actions.priorities.COMBAT,action):action();
             if(sent){spellState.lastAttemptAt=now;spellState.lastSpell=rule.spellWords;spellState.blockedReason=null;bot.log?.('Combat Rules: spell requested',{spell:rule.spellWords,aim:rule.spellAim});return true;}
+            spellState.blockedReason='waiting for shared action slot';
         }
         return false;
     }
     function armActions(){
         if(!config.enabled)return;
         if(config.rules.some(r=>r.enabled&&r.rune)){bot.runeShooter?.start?.();bot.runeShooter?.requestCounts?.();}
-        if(config.rules.some(r=>r.enabled&&r.exori))bot.exori?.start?.();
+        
     }
     function updateConfig(next){
         const rules=next.rules===undefined?config.rules:next.rules.map(normalize);
@@ -8285,30 +8296,30 @@ window.__minibiaBotBundle.installCombatRulesModule = function(bot) {
             <label class="mb-field"><span class="mb-field-label">Spell aim</span><select data-cr="spellAim"><option value="target">Matching current target</option><option value="area">Area · no target needed</option></select></label>
             <label class="mb-field"><span class="mb-field-label">Min mana · 0 = spell cost</span><input data-cr="spellMana" type="number" min="0" value="0"></label>
             <label class="mb-field"><span class="mb-field-label">Rune</span><select data-cr="rune"><option value="">None</option>${runes.map(r=>`<option value="${r}">${r.toUpperCase()}</option>`).join('')}</select></label>
-            <label class="cr-check" style="align-self:end;height:27px"><input type="checkbox" data-cr="exori"><span>Cast Exori</span></label>
+
           </div>
           <div class="cr-toolbar" style="margin-top:9px"><label class="cr-check"><input type="checkbox" data-cr="ruleEnabled" checked><span>Rule enabled</span></label><div class="cr-actions"><button type="button" class="mb-small-button" data-cr="save">Add Rule</button><button type="button" class="mb-small-button" data-cr="cancel">Cancel</button></div></div>
         </div>
         <div data-cr="message" class="mb-small-note" style="margin-top:4px"></div>
         <details><summary>How rules work</summary><div style="margin-top:5px">Blank names match any monster. HP refers to monster health; count counts matching monsters within range. Top matching rule wins for target mode. Rune and Exori actions run independently. Ignore + Rune shoots without selecting the monster.<br>Combat Rules replace the old Rune Shooter rules and Exori count trigger when enabled. Unmatched targets use Core Targeting. Kite/Lure settings and existing mana, cooldown, healing and player-safety checks remain in use. Exori and spell actions require Targeting running. Front means north/south/east/west of the monster. Targeted spells require a matching selected mob and LOS; area spells use matching counts. Native spell cooldown and mana checks apply.</div></details>`;
         const q=k=>box.querySelector(`[data-cr="${k}"]`);let edit=null;
-        function reset(){edit=null;for(const [k,v]of Object.entries({names:'',minHp:0,maxHp:100,minCount:1,maxCount:100,range:8,mode:'inherit',rune:'',position:'inherit',spellWords:'',spellAim:'target',spellMana:0}))q(k).value=v;q('exori').checked=false;q('ruleEnabled').checked=true;q('save').textContent='Add Rule';q('editor').hidden=true;}
+        function reset(){edit=null;for(const [k,v]of Object.entries({names:'',minHp:0,maxHp:100,minCount:1,maxCount:100,range:8,mode:'inherit',rune:'',position:'inherit',spellWords:'',spellAim:'target',spellMana:0}))q(k).value=v;q('ruleEnabled').checked=true;q('save').textContent='Add Rule';q('editor').hidden=true;}
         function render(){q('enabled').checked=config.enabled;const list=q('list');list.replaceChildren();
             if(!config.rules.length){const empty=document.createElement('div');empty.className='mb-small-note';empty.textContent='No rules yet. Click + New Rule to add one.';list.append(empty);}
             const modeLabels={inherit:'Default',attack:'Attack',melee:'Melee','client-chase':'Client Chase',kite:'Kite',lure:'Lure',ignore:'Ignore'};
             config.rules.forEach((r,i)=>{
                 const row=document.createElement('div');row.className='cr-card';
                 const title=document.createElement('div');title.className='cr-card-title';title.textContent=`${i+1}. ${r.names.join(', ')||'Any monster'}${r.enabled?'':' · Disabled'}`;
-                const meta=document.createElement('div');meta.className='cr-card-meta';meta.textContent=`HP ${r.minHp}–${r.maxHp}% · ${r.minCount}–${r.maxCount} mobs · ${r.range} SQM · ${modeLabels[r.mode]}${r.rune?' · '+r.rune.toUpperCase():''}${r.exori?' · Exori':''}${r.position!=='inherit'?' · '+r.position:''}${r.spellWords?' · '+r.spellWords:''}`;
+                const meta=document.createElement('div');meta.className='cr-card-meta';meta.textContent=`HP ${r.minHp}–${r.maxHp}% · ${r.minCount}–${r.maxCount} mobs · ${r.range} SQM · ${modeLabels[r.mode]}${r.rune?' · '+r.rune.toUpperCase():''}${r.position!=='inherit'?' · '+r.position:''}${r.spellWords?' · '+r.spellWords:''}`;
                 const actions=document.createElement('div');actions.className='cr-actions';
-                for(const [label,fn]of [['Edit',()=>{edit=i;q('editor').hidden=false;for(const k of ['minHp','maxHp','minCount','maxCount','range','mode','rune','position','spellWords','spellAim','spellMana'])q(k).value=r[k];q('names').value=r.names.join(', ');q('exori').checked=r.exori;q('ruleEnabled').checked=r.enabled;q('save').textContent='Update Rule';}],['↑',()=>move(i,-1)],['↓',()=>move(i,1)],['Remove',()=>{const next=config.rules.slice();next.splice(i,1);updateConfig({rules:next});reset();render();}]]){const button=document.createElement('button');button.type='button';button.className='mb-small-button';button.textContent=label;button.title=label==='↑'?'Move rule up':label==='↓'?'Move rule down':label;button.addEventListener('click',fn);actions.append(button);}
+                for(const [label,fn]of [['Edit',()=>{edit=i;q('editor').hidden=false;for(const k of ['minHp','maxHp','minCount','maxCount','range','mode','rune','position','spellWords','spellAim','spellMana'])q(k).value=r[k];q('names').value=r.names.join(', ');q('ruleEnabled').checked=r.enabled;q('save').textContent='Update Rule';}],['↑',()=>move(i,-1)],['↓',()=>move(i,1)],['Remove',()=>{const next=config.rules.slice();next.splice(i,1);updateConfig({rules:next});reset();render();}]]){const button=document.createElement('button');button.type='button';button.className='mb-small-button';button.textContent=label;button.title=label==='↑'?'Move rule up':label==='↓'?'Move rule down':label;button.addEventListener('click',fn);actions.append(button);}
                 row.append(title,meta,actions);list.append(row);
             });
         }
         function move(i,d){const j=i+d;if(j<0||j>=config.rules.length)return;const next=config.rules.slice();[next[i],next[j]]=[next[j],next[i]];updateConfig({rules:next});reset();render();}
         q('new').addEventListener('click',()=>{reset();q('editor').hidden=false;q('message').textContent='';q('names').focus();});
         q('enabled').addEventListener('change',()=>updateConfig({enabled:q('enabled').checked}));
-        q('save').addEventListener('click',()=>{try{const r={};for(const k of ['names','minHp','maxHp','minCount','maxCount','range','mode','rune','position','spellWords','spellAim','spellMana'])r[k]=q(k).value;r.enabled=q('ruleEnabled').checked;r.exori=q('exori').checked;const next=config.rules.slice();if(edit===null)next.push(r);else next[edit]=r;updateConfig({rules:next});reset();render();q('message').textContent='Rule saved.';}catch(e){q('message').textContent=e.message;}});
+        q('save').addEventListener('click',()=>{try{const r={};for(const k of ['names','minHp','maxHp','minCount','maxCount','range','mode','rune','position','spellWords','spellAim','spellMana'])r[k]=q(k).value;r.enabled=q('ruleEnabled').checked;const next=config.rules.slice();if(edit===null)next.push(r);else next[edit]=r;updateConfig({rules:next});reset();render();q('message').textContent='Rule saved.';}catch(e){q('message').textContent=e.message;}});
         q('cancel').addEventListener('click',reset);reset();render();
     }
     bot.combatRules={config,updateConfig,targetRule,targetPriority,activeTargetRule,matchOne,matching,meetsCount,runeRules,exoriRule,armActions,mount,invalidate,trySpellRules,status:()=>({...spellState})};
@@ -12233,8 +12244,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
     function tryAttack() {
         applyCombatRuleMode();
-        try { return withTargetingSnapshot(tryAttackDecision); }
-        finally { bot.combatRules?.trySpellRules?.(); }
+        if(bot.combatRules?.trySpellRules?.()===true)return true;
+        return withTargetingSnapshot(tryAttackDecision);
     }
 
     function tryAttackDecision() {
@@ -48201,7 +48212,7 @@ window.__minibiaBotBundle.installObservability = function(bot) {
             if(key==='runeShooter')text=s.lastError||(s.runeCooldownRemainingMs>0?`Cooldown ${Math.ceil(s.runeCooldownRemainingMs/100)/10}s`:'Monitoring rules and targets');
             rows.push([label,text||'Running']);
         }
-        const spell=bot.combatRules?.status?.();if(spell?.lastBlockedReason)rows.push(['Spell rules',spell.lastBlockedReason]);
+        const spell=bot.combatRules?.status?.();if(spell?.blockedReason&&spell.blockedReason!=='inactive')rows.push(['Spell rules',spell.blockedReason]);
         if(bot.cave?.isRunning?.()){const s=bot.cave.getUiStatus?.();rows.push(['Cavebot',s?`Waypoint #${s.currentIndex+1} · ${s.movement?.mode||'Running'}`:'Running']);}
         if(bot.actions?.isHalted?.())rows.unshift(['Actions','Halted']);
         return rows;
