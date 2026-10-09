@@ -3101,7 +3101,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.155",
+        version: "1.6.158",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -41694,6 +41694,54 @@ window.__minibiaBotBundle.installComboBotModule = function installComboBotModule
         leaderName: '',
     }, bot.storage.get(configStorageKey, {}));
 
+    let damageOwner=null,damageOriginal=null,damageWrapper=null,watchTimer=null,burstTimer=null;
+    let observedPlayer=null,lastLeaderHitAt=0,leaderSeenId=null;const hitBurst=new Map();
+    const isObserved=()=>config.mode==='observed';
+    const paused=()=>bot.actions?.isHalted?.()||bot.gmKillSwitch?.isActive?.()||!window.gameClient?.networkManager?.isConnected?.();
+    function detachDamage(){if(damageOwner?.handleDamageEvent===damageWrapper)damageOwner.handleDamageEvent=damageOriginal;damageOwner=damageOriginal=damageWrapper=null;}
+    function clearObservedTarget(){
+        if(state.followInterval){clearInterval(state.followInterval);state.followInterval=null;}
+        const p=getPlayer();if(state.currentTargetId!=null&&Number(p?.__target?.id)===Number(state.currentTargetId)){p.setTarget(null);sendPacket('TargetPacket',0);}
+        state.currentTargetId=null;
+    }
+    function flushLeaderHits(){
+        burstTimer=null;if(!state.running||!isObserved()||paused()){hitBurst.clear();return;}
+        const world=getWorld(),hits=[...hitBurst.values()].filter(h=>{const m=world?.getCreature(h.id);return m&&Number(m.state?.health)>0;});hitBurst.clear();
+        if(!hits.length)return;
+        // Keep the current target when an area hit includes it. Otherwise use
+        // the strongest hit, breaking ties by ID for a stable burst decision.
+        const chosen=hits.find(h=>Number(h.id)===Number(state.currentTargetId))||hits.sort((a,b)=>b.damage-a.damage||a.id-b.id)[0];
+        lastLeaderHitAt=Date.now();leaderSeenId=chosen.leaderId;
+        if(Number(state.currentTargetId)===Number(chosen.id))return;
+        handleTarget({id:chosen.id,leaderId:chosen.leaderId});
+    }
+    function ensureDamageHook(){
+        const gc=window.gameClient,p=gc?.player;
+        if(p!==observedPlayer){observedPlayer=p;hitBurst.clear();lastLeaderHitAt=0;leaderSeenId=null;if(burstTimer)clearTimeout(burstTimer);burstTimer=null;clearObservedTarget();}
+        const owner=gc?.networkManager?.packetHandler;if(owner===damageOwner)return;
+        detachDamage();if(typeof owner?.handleDamageEvent!=='function')return;
+        damageOwner=owner;damageOriginal=owner.handleDamageEvent;const original=damageOriginal;
+        damageWrapper=function(packet,...args){
+            const result=original.call(this,packet,...args);
+            if(!state.running||!isObserved()||paused()||getPlayer()!==observedPlayer||!config.leaderName.trim()||Number(packet?.damage)<=0)return result;
+            const world=getWorld(),source=world?.getCreature(packet.source),target=world?.getCreature(packet.target);
+            const types=typeof CONST!=='undefined'?CONST.TYPES:null;
+            if(!types||source?.type!==types.PLAYER||target?.type!==types.MONSTER||Number(source.id)===Number(getPlayer()?.id)||String(source.name||'').trim().toLowerCase()!==config.leaderName.trim().toLowerCase()||Number(target.state?.health)<=0)return result;
+            hitBurst.set(Number(target.id),{id:Number(target.id),leaderId:Number(source.id),damage:(hitBurst.get(Number(target.id))?.damage||0)+Number(packet.damage)});
+            if(hitBurst.size>64)hitBurst.delete(hitBurst.keys().next().value);
+            if(!burstTimer)burstTimer=setTimeout(flushLeaderHits,100);
+            return result;
+        };owner.handleDamageEvent=damageWrapper;
+    }
+    function startObserved(){
+        if(!config.leaderName.trim()){log('Enter a leader name before starting observed follower mode.');return false;}
+        state.running=true;config.enabled=true;persistConfig();ensureDamageHook();
+        watchTimer=setInterval(()=>{if(!state.running)return;ensureDamageHook();
+            if(paused()||lastLeaderHitAt&&Date.now()-lastLeaderHitAt>8000||leaderSeenId&&!getWorld()?.getCreature(leaderSeenId))clearObservedTarget();
+        },250);log('Following leader hits without a leader bot.');return true;
+    }
+    function stopObserved(){if(watchTimer)clearInterval(watchTimer);watchTimer=null;if(burstTimer)clearTimeout(burstTimer);burstTimer=null;hitBurst.clear();detachDamage();if(isObserved())clearObservedTarget();observedPlayer=null;lastLeaderHitAt=0;leaderSeenId=null;}
+
     function persistConfig() {
         bot.storage.set(configStorageKey, {
             ...config
@@ -41819,7 +41867,7 @@ window.__minibiaBotBundle.installComboBotModule = function installComboBotModule
             state.requestInterval = null;
         }
         // Only run if we are a follower and not already having a target
-        if (isLeader())
+        if (isLeader()||isObserved())
             return;
         if (state.currentTargetId !== null)
             return;
@@ -41907,6 +41955,9 @@ window.__minibiaBotBundle.installComboBotModule = function installComboBotModule
     }
 
     function triggerHotkey() {
+        if(paused())return;
+        if(isObserved()&&(Date.now()-lastLeaderHitAt>8000||!getWorld()?.getCreature(leaderSeenId)))return;
+        const heal=bot.heal;if(heal?.status?.().running&&(heal.hasPendingAction?.()||heal.needsPriorityAction?.()))return;
         const gc = window.gameClient;
         if (!gc || !gc.interface || !gc.interface.hotbarManager)
             return;
@@ -41919,7 +41970,9 @@ window.__minibiaBotBundle.installComboBotModule = function installComboBotModule
             return;
         }
 
-        gc.interface.hotbarManager.__handleClick(config.hotkeySlot);
+        const fire=()=>{gc.interface.hotbarManager.__handleClick(config.hotkeySlot);return true;};
+        const sent=bot.actions?.runShared?bot.actions.runShared("combo-hotkey",bot.actions.priorities.COMBAT,fire):fire();
+        if(!sent)return;
         state.lastTriggerAt = performance.now();
         log('Triggered hotkey slot', config.hotkeySlot);
     }
@@ -42047,6 +42100,8 @@ window.__minibiaBotBundle.installComboBotModule = function installComboBotModule
             state.retryCount = 0;
         }
 
+        if(isObserved())return startObserved();
+
         if (!setupChannel()) {
             log('Failed to set up communication channel.');
             return false;
@@ -42084,6 +42139,7 @@ window.__minibiaBotBundle.installComboBotModule = function installComboBotModule
     }
 
     function stop(options = {}) {
+        stopObserved();
         const shouldPersist = options.persistEnabled !== false;
         const wasRunning = state.running;
 
@@ -42147,6 +42203,7 @@ window.__minibiaBotBundle.installComboBotModule = function installComboBotModule
     }
 
     function updateConfig(next) {
+        const wasObserved=isObserved();if(state.running&&wasObserved)stopObserved();
         Object.assign(config, next);
         if (config.cooldownMs < 100)
             config.cooldownMs = 100;
@@ -48136,7 +48193,7 @@ window.__minibiaBotBundle.installObservability = function(bot) {
         skillWrapper=function(type,points,...args){
             const result=original.call(this,type,points,...args);
             if(!disposed){sync();const name=this.__getSkillNameFromType(type);
-                if((name==='mining'||name==='woodcutting')&&Number.isFinite(Number(points))){
+                if((name==='mining'||name==='woodcutting'||name==='smithing')&&Number.isFinite(Number(points))){
                     const computed=this.__calculateSkillLevelAndPercentage?.(type,Number(points),window.gameClient?.player?.vocation||0);
                     liveSkills.set(name,{points:Number(points),level:computed?.level,percent:computed?.percentage});
                 }
@@ -48189,7 +48246,7 @@ window.__minibiaBotBundle.installObservability = function(bot) {
     function tick(){
         if(disposed)return;observeSkills();const p=sync(),now=Date.now(),connected=!!window.gameClient?.networkManager?.isConnected?.();
         const elapsed=lastTick?Math.max(0,Math.min(2000,now-lastTick)):0;lastTick=now;
-        if(p&&connected){for(const name of ['woodcutting','mining'])sampleSkill(name,elapsed);
+        if(p&&connected){for(const name of ['woodcutting','mining','smithing'])sampleSkill(name,elapsed);
             if(config.enabled){
                 const transaction=['depositer','npcSupplyBuyer','bankNpc'].some(key=>bot[key]?.status?.().running);
                 if(transaction){excludeSupplyUntil=now+15000;for(const state of supplies.values())state.needsBaseline=true;}
@@ -48203,7 +48260,7 @@ window.__minibiaBotBundle.installObservability = function(bot) {
     function diagnostics(){
         const rows=[];
         if(!window.gameClient?.networkManager?.isConnected?.())rows.push(['Connection','Waiting for connection']);
-        for(const [key,label]of [['woodcutting','Woodcutting'],['mining','Mining'],['cooking','Cooking'],['fisher','Fishing'],['heal','Healing'],['runeShooter','Rune Shooter'],['exori','Exori'],['depositer','Depositer'],['npcSupplyBuyer','Resupply'],['bankNpc','Bank']]){
+        for(const [key,label]of [['woodcutting','Woodcutting'],['mining','Mining'],['smithing','Smithing'],['cooking','Cooking'],['fisher','Fishing'],['heal','Healing'],['runeShooter','Rune Shooter'],['exori','Exori'],['depositer','Depositer'],['npcSupplyBuyer','Resupply'],['bankNpc','Bank']]){
             const module=bot[key];if(!module?.status)continue;
             let s;try{s=module.status();}catch{continue;}if(!s?.running)continue;
             let text=s.reason||s.lastBlockedReason||s.message||s.lastError||s.phase;
@@ -48223,7 +48280,7 @@ window.__minibiaBotBundle.installObservability = function(bot) {
         const button=(parent,text,fn)=>{const b=make('button',parent,text);b.type='button';b.className='mb-small-button';b.addEventListener('click',fn);return b;};
         const section=(parent,title)=>{const e=make('div',parent);e.className='mb-section';e.setAttribute('data-observability','');const h=make('div',e);h.className='mb-section-title';make('span',h,title).className='mb-title-text';return e;};
         const style=make('style',panel);style.textContent='#minibia-bot-panel .mb-observe-grid{display:grid;grid-template-columns:1fr 1fr;gap:5px 10px;font-size:11px;margin:8px 0}#minibia-bot-panel .mb-skill-progress{width:100%;height:8px;accent-color:#b69b55}#minibia-bot-panel .mb-observe-row{display:flex;justify-content:space-between;gap:8px;font-size:11px;padding:5px 0;border-bottom:1px solid rgba(180,170,140,.12)}#minibia-bot-panel .mb-observe-row span{overflow-wrap:anywhere;min-width:0}';
-        for(const [name,prefix]of [['woodcutting','wc'],['mining','mn']]){
+        for(const [name,prefix]of [['woodcutting','wc'],['mining','mn'],['smithing','sm']]){
             const status=panel.querySelector(`[data-${prefix}="status"]`);if(!status)continue;
             const block=make('div');status.after(block);const label=make('div',block);label.className='mb-small-note';
             const progress=make('progress',block);progress.className='mb-skill-progress';progress.max=100;progress.setAttribute('aria-label',name+' progress to next level');
@@ -48433,7 +48490,7 @@ window.__minibiaBotBundle.installWoodcuttingModule = function(bot) {
         try{return bot.actions?.runShared?bot.actions.runShared('woodcutting',bot.actions.priorities.UTILITY,action):action();}
         catch(e){reason='Item-use failed';bot.log?.('Woodcutting: '+e.message);return false;}
     }
-    function start(){if(disposed)return;bot.cooking?.stop?.();bot.mining?.stop?.();if(!running){running=true;timer=window.setInterval(tick,150);}config.enabled=true;persist();tick();}
+    function start(){if(disposed)return;bot.smithing?.stop?.();bot.cooking?.stop?.();bot.mining?.stop?.();if(!running){running=true;timer=window.setInterval(tick,150);}config.enabled=true;persist();tick();}
     function stop(options={}){stopOwnWalk();running=false;if(timer!=null)window.clearInterval(timer);timer=null;pending=null;targetKey=null;reason='Stopped';if(options.persistEnabled!==false){config.enabled=false;persist();}}
     function updateConfig(next){normalizeGoals(next);if(next.attackWhileGathering!==undefined)config.attackWhileGathering=!!next.attackWhileGathering;if(next.range!==undefined){stopOwnWalk();targetKey=null;config.range=Math.max(1,Math.min(8,Math.trunc(Number(next.range)||5)));}if(next.delayMs!==undefined)config.delayMs=Math.max(350,Math.min(10000,Number(next.delayMs)||2000));if(next.enabled!==undefined){next.enabled?start():stop();}else persist();}
     function resetTrees(){stopOwnWalk();blocked.clear();failures.clear();stripped.clear();targetKey=null;pending=null;reason=running?'Searching for trees':'Stopped';}
@@ -48629,7 +48686,7 @@ window.__minibiaBotBundle.installMiningModule = function(bot) {
         try{return bot.actions?.runShared?bot.actions.runShared('mining',bot.actions.priorities.UTILITY,action):action();}
         catch(e){reason='Item-use failed';bot.log?.('Mining: '+e.message);return false;}
     }
-    function start(){if(disposed)return;bot.cooking?.stop?.();bot.woodcutting?.stop?.();if(!running){running=true;timer=window.setInterval(tick,150);}config.enabled=true;persist();tick();}
+    function start(){if(disposed)return;bot.smithing?.stop?.();bot.cooking?.stop?.();bot.woodcutting?.stop?.();if(!running){running=true;timer=window.setInterval(tick,150);}config.enabled=true;persist();tick();}
     function stop(options={}){stopOwnWalk();running=false;if(timer!=null)window.clearInterval(timer);timer=null;pending=null;targetKey=null;reason='Stopped';if(options.persistEnabled!==false){config.enabled=false;persist();}}
     function updateConfig(next){normalizeGoals(next);if(next.attackWhileGathering!==undefined)config.attackWhileGathering=!!next.attackWhileGathering;if(next.range!==undefined){stopOwnWalk();targetKey=null;config.range=Math.max(1,Math.min(8,Math.trunc(Number(next.range)||5)));}if(next.delayMs!==undefined)config.delayMs=Math.max(350,Math.min(10000,Number(next.delayMs)||2000));if(next.enabled!==undefined){next.enabled?start():stop();}else persist();}
     function resetStones(){stopOwnWalk();blocked.clear();failures.clear();stripped.clear();targetKey=null;pending=null;reason=running?'Searching for stones':'Stopped';}
@@ -48644,6 +48701,197 @@ window.__minibiaBotBundle.installMiningModule = function(bot) {
         const refresh=()=>{if(!host.getClientRects().length)return;q('enabled').checked=running;q('status').textContent=`${reason} · ${attempts} mining attempts requested · ${stripped.size} depleted stones`;};refresh();const uiTimer=window.setInterval(refresh,500);bot.addCleanup(()=>window.clearInterval(uiTimer));
     }
     bot.mining={config,start,stop,updateConfig,tick,resetStones,mount,status:()=>({running,reason,attempts,confirmed,lastConfirmedAt,pending:!!pending,strippedStones:stripped.size,target:targetKey})};
+    bot.addCleanup(()=>{disposed=true;stop({persistEnabled:false});detachHook();});
+    if(config.enabled)start();
+};
+
+
+window.__minibiaBotBundle.installSmithingModule = function(bot) {
+    const key='minibiaBot.smithing.config';
+    const anvils=new Map([[3458,2555]]);
+    const oreSids=new Set([9902,9904,9931]);
+    const config={enabled:false,delayMs:2000,range:5,attackWhileGathering:false,retryMinutes:5,minCapacity:0,stopSkill:0,goalSid:0,goalCount:0,goalLabel:'',...bot.storage.get(key,{})};
+    delete config.depletionText;
+    config.delayMs=Math.max(350,Math.min(10000,Number(config.delayMs)||2000));
+    config.range=Math.max(1,Math.min(8,Math.trunc(Number(config.range)||5)));
+    // Migrate the original default interval to the requested two seconds.
+    if(config.delayMs===1000)config.delayMs=2000;
+    let walkDestination=null,lastWalkAt=0,walkProgressKey=null,walkProgressAt=0;const blocked=new Map();
+    function stopOwnWalk(){const pf=window.gameClient?.world?.pathfinder;if(walkDestination&&pf?.__finalDestination&&tileKey(pf.__finalDestination)===tileKey(walkDestination))pf.setPathfindCache?.(null);walkDestination=null;}
+    let running=false,timer=null,lastUse=0,targetKey=null,pending=null,reason='Stopped',attempts=0,disposed=false;
+    const failures=new Map();let confirmed=0,lastConfirmedAt=0;const stripped=new Map();let hookOwner=null,hookOriginal=null,hookWrapper=null;
+    const tileKey=p=>`${p.x},${p.y},${p.z}`;
+    function normalizeGoals(next){
+        for(const [key,max]of [['retryMinutes',1440],['minCapacity',1000000],['stopSkill',1000],['goalSid',65535],['goalCount',1000000]])if(next[key]!==undefined)config[key]=Math.max(0,Math.min(max,Math.trunc(Number(next[key])||0)));
+        if(next.goalLabel!==undefined)config.goalLabel=String(next.goalLabel||'').trim().slice(0,100);
+    }
+    normalizeGoals(config);
+    let lastGoalQuery=0;
+    function checkGoals(now){
+        if(config.retryMinutes>0)for(const [key,at]of stripped)if(now-at>=config.retryMinutes*60000)stripped.delete(key);
+        const cap=Number(window.gameClient?.player?.state?.capacity??window.gameClient?.player?.state?.cap);
+        let reached=config.minCapacity>0&&Number.isFinite(cap)&&cap<=config.minCapacity?'Capacity limit reached':null;
+        const skill=bot.observability?.skillSnapshot('smithing');
+        if(config.stopSkill>0&&skill?.level>=config.stopSkill)reached='Skill goal reached';
+        if(config.goalSid>0&&config.goalCount>0){
+            const reading=bot.sidInventory?.reading(config.goalSid);
+            if(!reading||now-Number(reading.at)>5000){if(now-lastGoalQuery>=1000){lastGoalQuery=now;bot.sidInventory?.request([config.goalSid]);}if(!reached){reason='Checking gathering goal inventory';return true;}}
+            else if(Number(reading.count)>=config.goalCount)reached='Item goal reached';
+        }
+        if(!reached)return false;
+        stop();reason=reached;
+        if(config.goalLabel){const jumped=bot.goToLabel?.(config.goalLabel);reason+=jumped?' — route label selected':' — route label not found';}
+        return true;
+    }
+    function persist(){bot.storage.set(key,{...config});}
+    let lastOreQuery=0;
+    function findPickaxe(){
+        const client=window.gameClient,now=Date.now();
+        if(typeof HotbarUsePacket==='function'&&client?.send&&bot.sidInventory){
+            const ids=[...oreSids];
+            if(now-lastOreQuery>=1000){lastOreQuery=now;bot.sidInventory.request(ids);}
+            let waiting=false;
+            for(const sid of ids){
+                const reading=bot.sidInventory.reading(sid);
+                if(!reading||now-Number(reading.at)>5000){waiting=true;continue;}
+                if(Number(reading.count)<=0)continue;
+                const cid=Number(client.itemDefinitionsBySid?.[sid]?.id);
+                if(Number.isInteger(cid)&&cid>0)return {server:true,cid,sid};
+            }
+            reason=waiting?'Checking ore throughout inventory':'No supported ore found in inventory';return null;
+        }
+        const player=window.gameClient?.player,opened=player?.__openedContainers;
+        const containers=opened instanceof Map?Array.from(opened.values()):opened&&typeof opened[Symbol.iterator]==='function'?Array.from(opened):Object.values(opened||{});
+        for(const sid of oreSids)for(const container of [player?.equipment,...containers]){
+            if(!container?.getSlotItem)continue;
+            const size=container.slots?.length??container.size??0;
+            for(let i=0;i<size;i++){const item=container.getSlotItem(i);if(oreSids.has(Number(item?.sid))&&Number(item.sid)===sid)return {which:container,index:i,sid};}
+        }
+        reason='No copper, silver or gold ore in open containers';return null;
+    }
+    function detachHook(){if(hookOwner?.setCancelMessage===hookWrapper)hookOwner.setCancelMessage=hookOriginal;hookOwner=hookOriginal=hookWrapper=null;}
+    function ensureHook(){
+        const owner=window.gameClient?.interface?.notificationManager;
+        if(!owner?.setCancelMessage)return false;
+        if(owner===hookOwner)return true;
+        detachHook();hookOwner=owner;hookOriginal=owner.setCancelMessage;
+        const original=hookOriginal;
+        hookWrapper=function(message,...args){
+            if(!disposed&&running&&pending&&Date.now()-pending.at<=10000&&String(message).toLowerCase().includes("you've worked this anvil enough for now")){
+                confirmed++;lastConfirmedAt=Date.now();failures.delete(pending.key);stripped.set(pending.key,Date.now());if(stripped.size>512)stripped.delete(stripped.keys().next().value);
+                if(targetKey===pending.key)targetKey=null;pending=null;reason='Anvil depleted — selecting another';
+            }
+            return original.call(this,message,...args);
+        };
+        owner.setCancelMessage=hookWrapper;return true;
+    }
+    function nearby(){
+        const p=bot.getPlayerPosition(),world=window.gameClient?.world;if(!p||!world?.getTileFromWorldPosition)return [];
+        const found=[];
+        for(let dx=-config.range;dx<=config.range;dx++)for(let dy=-config.range;dy<=config.range;dy++){
+            const pos={x:p.x+dx,y:p.y+dy,z:p.z},k=tileKey(pos);if(stripped.has(k)||(blocked.get(k)||0)>Date.now())continue;
+            const nativePos=typeof Position==='function'?new Position(pos.x,pos.y,pos.z):pos;
+            const tile=world.getTileFromWorldPosition(nativePos);if(!Array.isArray(tile?.items))continue;
+            const index=tile.items.findIndex(item=>anvils.has(Number(item?.id))||Array.from(anvils.values()).includes(Number(item?.sid)));
+            if(index>=0)found.push({key:k,pos,tile,index,distance:Math.abs(dx)+Math.abs(dy)});
+        }
+        return found.sort((a,b)=>a.distance-b.distance);
+    }
+    const approachCache=new Map();
+    function reachableApproach(target,from,now){
+        if(Number(from.z)!==Number(target.pos.z))return null;
+        if(bot.toolInReach(3458,from,target.pos))return from;
+        const key=tileKey(from)+':'+target.key,revision=bot.specialAreas?.getRevision?.();
+        const cached=approachCache.get(key);
+        if(cached&&cached.revision===revision&&now-cached.at<1000)return cached.position;
+        const offsets=[[0,-1],[1,0],[0,1],[-1,0],[-1,-1],[1,-1],[-1,1],[1,1]];
+        offsets.sort((a,b)=>(Math.abs(target.pos.x+a[0]-from.x)+Math.abs(target.pos.y+a[1]-from.y))-(Math.abs(target.pos.x+b[0]-from.x)+Math.abs(target.pos.y+b[1]-from.y)));
+        let position=null;
+        for(const [dx,dy]of offsets){
+            const candidate={x:target.pos.x+dx,y:target.pos.y+dy,z:target.pos.z};
+            const native=typeof Position==='function'?new Position(candidate.x,candidate.y,candidate.z):candidate;
+            const tile=window.gameClient?.world?.getTileFromWorldPosition?.(native);
+            if(!tile||tile.__isPlaceholder||bot.hasNavigationObstacle?.(tile)||bot.cave?.isFloorChangeTile?.(tile))continue;
+            const result=bot.specialAreas?.findPolicyPath?.(from,candidate,{purpose:'route',force:true,fieldAware:true,maxNodes:4096});
+            if(result?.success===true&&result.complete===true){position=native;break;}
+        }
+        approachCache.set(key,{at:now,revision,position});
+        if(approachCache.size>128)approachCache.delete(approachCache.keys().next().value);
+        return position;
+    }
+    function tick(){
+        if(!running||disposed)return false;
+        const client=window.gameClient,now=Date.now();
+        if(!client?.networkManager?.isConnected?.()||client.player?.isDead||bot.actions?.isHalted?.()){reason='Waiting for connection / actions';return false;}
+        if(pending){
+            const skill=bot.observability?.skillSnapshot('smithing');
+            if(Number.isFinite(pending.skillPoints)&&Number(skill?.points)>pending.skillPoints){confirmed++;lastConfirmedAt=now;failures.delete(pending.key);pending=null;}
+            else if(now-pending.at<Math.max(2000,config.delayMs)){reason='Waiting for gathering response';return false;}
+            else{const key=pending.key,n=(failures.get(key)||0)+1;failures.set(key,n);while(failures.size>512)failures.delete(failures.keys().next().value);pending=null;
+                if(n>=3){blocked.set(key,now+30000);failures.delete(key);targetKey=null;reason='Gathering unconfirmed — retrying resource in 30s';return false;}
+            }
+        }
+        if(checkGoals(now))return false;
+        if(!ensureHook()){reason='Waiting for cancel-message listener';return false;}
+                const inCombat=!!bot.attack?.getCurrentTarget?.();
+        if(inCombat){stopOwnWalk();if(!config.attackWhileGathering){reason='Paused during combat';return false;}}
+        const heal=bot.heal;
+        if(heal?.status?.().running&&(heal.tryHeal?.()===true||heal.hasPendingAction?.()===true||heal.needsPriorityAction?.()===true)){stopOwnWalk();reason='Healing priority';return false;}
+        if(now-lastUse<config.delayMs)return false;
+        const axe=findPickaxe();if(!axe)return false;
+        const playerPosition=bot.getPlayerPosition();
+        if(!playerPosition){reason='Waiting for player position';return false;}
+        const candidates=nearby();
+        const previous=candidates.findIndex(t=>t.key===targetKey);
+        if(previous>0)candidates.unshift(candidates.splice(previous,1)[0]);
+        let target=null;
+        for(const candidate of candidates){
+            if(inCombat&&Math.max(Math.abs(playerPosition.x-candidate.pos.x),Math.abs(playerPosition.y-candidate.pos.y))>1)continue;
+            const approach=reachableApproach(candidate,playerPosition,now);
+            if(approach){target={...candidate,approach};break;}
+        }
+        if(!target){targetKey=null;reason='No reachable undepleted anvil within '+config.range+' tiles';return false;}
+        const playerPos=bot.getPlayerPosition(),distance=Math.max(Math.abs(playerPos.x-target.pos.x),Math.abs(playerPos.y-target.pos.y));
+        if(!bot.toolInReach(3458,playerPos,target.pos)){
+            if(bot.cave?.isRunning?.()){stopOwnWalk();reason='Pause Cavebot to approach anvils';return false;}
+            const progressKey=tileKey(playerPos);
+            if(targetKey!==target.key||walkProgressKey!==progressKey){walkProgressKey=progressKey;walkProgressAt=now;}
+            targetKey=target.key;
+            if(now-walkProgressAt>=5000){stopOwnWalk();blocked.set(target.key,now+30000);targetKey=null;reason='Anvil unreachable — trying another';return false;}
+            if(client.player?.isMoving?.()||now-lastWalkAt<1000){reason='Walking to anvil '+target.key;return false;}
+            const pf=client.world?.pathfinder,asPosition=p=>typeof Position==='function'?new Position(p.x,p.y,p.z):p;
+            const adjacent=target.approach;
+            if(!adjacent||!pf?.findPath){blocked.set(target.key,now+30000);targetKey=null;reason='No reachable approach tile';return false;}
+            const walk=()=>{stopOwnWalk();walkDestination=adjacent;lastWalkAt=now;pf.findPath(asPosition(playerPos),adjacent);reason='Walking to anvil '+target.key;return true;};
+            return bot.actions?.runShared?bot.actions.runShared('smithing-walk',bot.actions.priorities.UTILITY,walk):walk();
+        }
+        stopOwnWalk();
+        if(client.player?.isMoving?.()){reason='Waiting for movement';return false;}
+        if(pending&&pending.key!==target.key&&now-pending.at<config.delayMs+1000){reason='Waiting for previous anvil response';return false;}
+        if(!axe.server&&!client.mouse?.__handleItemUseWith){reason='Item-use unavailable';return false;}
+        const action=()=>{
+            targetKey=target.key;pending={key:target.key,at:now,skillPoints:bot.observability?.skillSnapshot('smithing')?.points};lastUse=now;
+            if(axe.server){const pos=typeof Position==='function'?new Position(target.pos.x,target.pos.y,target.pos.z):target.pos;client.send(new HotbarUsePacket(axe.cid,0,3,0,pos));}
+            else client.mouse.__handleItemUseWith(axe,{which:target.tile,index:target.index});attempts++;reason='Smithing '+target.key;return true;
+        };
+        try{return bot.actions?.runShared?bot.actions.runShared('smithing',bot.actions.priorities.UTILITY,action):action();}
+        catch(e){reason='Item-use failed';bot.log?.('Smithing: '+e.message);return false;}
+    }
+    function start(){if(disposed)return;bot.cooking?.stop?.();bot.woodcutting?.stop?.();bot.mining?.stop?.();if(!running){running=true;timer=window.setInterval(tick,150);}config.enabled=true;persist();tick();}
+    function stop(options={}){stopOwnWalk();running=false;if(timer!=null)window.clearInterval(timer);timer=null;pending=null;targetKey=null;reason='Stopped';if(options.persistEnabled!==false){config.enabled=false;persist();}}
+    function updateConfig(next){normalizeGoals(next);if(next.attackWhileGathering!==undefined)config.attackWhileGathering=!!next.attackWhileGathering;if(next.range!==undefined){stopOwnWalk();targetKey=null;config.range=Math.max(1,Math.min(8,Math.trunc(Number(next.range)||5)));}if(next.delayMs!==undefined)config.delayMs=Math.max(350,Math.min(10000,Number(next.delayMs)||2000));if(next.enabled!==undefined){next.enabled?start():stop();}else persist();}
+    function resetAnvils(){stopOwnWalk();blocked.clear();failures.clear();stripped.clear();targetKey=null;pending=null;reason=running?'Searching for anvils':'Stopped';}
+    function mount(panel){
+        const parent=panel.querySelector('[data-tab-panel="professions"]');if(!parent)return;const host=document.createElement('div');parent.appendChild(host);
+        host.innerHTML=`<div class="mb-section"><div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-sm="enabled" /><span class="mb-title-text">Smithing</span></div><div class="prof-grid"><label class="mb-field"><span class="mb-field-label">Interval (ms)</span><input data-sm="delay" type="number" min="350" max="10000" /></label><label class="mb-field"><span class="mb-field-label">Search radius (tiles)</span><input data-sm="range" type="number" min="1" max="8" /></label></div><label class="mb-field" style="display:flex;flex-direction:row;align-items:center;gap:6px;margin-top:9px"><input type="checkbox" class="mb-title-toggle" data-sm="combat" /><span>Attack while smithing</span></label><div class="prof-actions"><button type="button" class="mb-small-button" data-sm="reset">Retry depleted anvils</button></div><div class="prof-status" data-sm="status"></div><details><summary>How smithing works</summary><div class="mb-hint">Uses copper ore (SID 9902), silver ore (SID 9904) and gold ore (SID 9931) on an anvil (SID 2555 / CID 3458). Finds ore throughout your inventory, including closed backpacks, using server-side counts and hotbar item use. Automatically skips anvils when the game reports “you've worked this anvil enough for now”. Depleted resources are rechecked after the retry delay. Set it to 0 for manual retries.  Walks beside nearby anvils. Pause Cavebot for automatic approaches. Attack while gathering allows nearby resources during combat; combat controls movement. Healing stays first. Only one profession runs at a time.</div></details></div>`;
+        const q=k=>host.querySelector(`[data-sm="${k}"]`);
+        q('combat').checked=!!config.attackWhileGathering;q('combat').addEventListener('change',()=>updateConfig({attackWhileGathering:q('combat').checked}));
+        q('enabled').addEventListener('change',()=>q('enabled').checked?start():stop());q('delay').value=config.delayMs;q('range').value=config.range;
+        q('delay').addEventListener('change',()=>{updateConfig({delayMs:q('delay').value});q('delay').value=config.delayMs;});q('reset').addEventListener('click',resetAnvils);q('range').addEventListener('change',()=>{updateConfig({range:q('range').value});q('range').value=config.range;});
+        
+        const refresh=()=>{if(!host.getClientRects().length)return;q('enabled').checked=running;q('status').textContent=`${reason} · ${attempts} smithing attempts requested · ${stripped.size} depleted anvils`;};refresh();const uiTimer=window.setInterval(refresh,500);bot.addCleanup(()=>window.clearInterval(uiTimer));
+    }
+    bot.smithing={config,start,stop,updateConfig,tick,resetAnvils,mount,status:()=>({running,reason,attempts,confirmed,lastConfirmedAt,pending:!!pending,workedAnvils:stripped.size,target:targetKey})};
     bot.addCleanup(()=>{disposed=true;stop({persistEnabled:false});detachHook();});
     if(config.enabled)start();
 };
@@ -48707,7 +48955,7 @@ window.__minibiaBotBundle.installCookingModule=function(bot){
   }
   const action=()=>{const live=source.which.getSlotItem?.(source.index);if(Number(live?.sid)!==food.sid||Number(live?.id)!==food.cid||stackCount(live)>10){batchSource=null;batchFood=null;reason='Food moved — selecting its exact SID again';return false;}lastUse=now;pending={food:{...food},before:reading.count,at:now};client.mouse.__handleItemUseWith({which:source.which,index:source.index},{which:oven.tile,index:oven.index});reason='Cooking SID '+food.sid;return true;};try{return bot.actions?.runShared?bot.actions.runShared('cooking',bot.actions.priorities.UTILITY,action):action();}catch(e){reason='Cooking use failed';return false;}
  }
- function start(){if(disposed)return;bot.mining?.stop?.();bot.woodcutting?.stop?.();if(!running){running=true;timer=window.setInterval(tick,150);}config.enabled=true;persist();tick();}
+ function start(){if(disposed)return;bot.smithing?.stop?.();bot.mining?.stop?.();bot.woodcutting?.stop?.();if(!running){running=true;timer=window.setInterval(tick,150);}config.enabled=true;persist();tick();}
  function stop(options={}){running=false;if(timer!=null)window.clearInterval(timer);timer=null;stopWalk();clearCapture();reason='Stopped';if(options.persistEnabled!==false){config.enabled=false;persist();}}
  function resetBatch(){if((pending&&Date.now()-pending.at<10000)||(splitPending&&Date.now()-splitPending.at<10000)){reason='Wait for the outstanding cooking action';return false;}pending=null;splitPending=null;batchSource=null;batchFood=null;foodCursor=0;reason='Ready to continue cooking';return true;}
  function updateConfig(next){if(next.foods!==undefined)config.foods=normalize(next.foods);persist();}
@@ -56341,10 +56589,13 @@ function upgradeSectionHeaders(panel) {
         <span class="mb-field-label">Mode</span>
         <select id="minibia-bot-combo-mode">
           <option value="leader">Leader</option>
-          <option value="follower">Follower</option>
+          <option value="follower">Follower (same browser)</option>
+          <option value="observed">Follower (leader hits — no leader bot)</option>
         </select>
       </div>
 
+      <div class="mb-field"><span class="mb-field-label">Leader name</span><input id="minibia-bot-combo-leader-name" placeholder="Exact player name" /></div>
+      <details><summary>Leader-hit mode</summary><div class="mb-small-note">Works across computers. Follows visible damage from the named leader. Area hits keep the current target when possible. Stops assisting after 8 seconds without a leader hit.</div></details>
       <div class="mb-field">
         <span class="mb-field-label">Hotkey Slot (0=F1 – 11=F12)</span>
         <input type="number" id="minibia-bot-combo-slot" min="0" max="11" value="11" />
@@ -56502,6 +56753,7 @@ function upgradeSectionHeaders(panel) {
         bot.combatRules?.mount?.(panel);
         bot.woodcutting?.mount?.(panel);
         bot.mining?.mount?.(panel);
+        bot.smithing?.mount?.(panel);
         bot.cooking?.mount?.(panel);
         bot.observability?.mount?.(panel);
         organizePanelSections(panel);
@@ -64151,6 +64403,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         currentBundle.installFisherModule(bot);
         currentBundle.installWoodcuttingModule(bot);
         currentBundle.installMiningModule(bot);
+        currentBundle.installSmithingModule(bot);
         currentBundle.installCookingModule(bot);
         currentBundle.installAutoStackerModule(bot);
         currentBundle.installPlayerAttackMonitorModule(bot);
