@@ -3101,7 +3101,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.161",
+        version: "1.6.165",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -8318,7 +8318,8 @@ window.__minibiaBotBundle.installCombatRulesModule = function(bot) {
         }
         function move(i,d){const j=i+d;if(j<0||j>=config.rules.length)return;const next=config.rules.slice();[next[i],next[j]]=[next[j],next[i]];updateConfig({rules:next});reset();render();}
         q('new').addEventListener('click',()=>{reset();q('editor').hidden=false;q('message').textContent='';q('names').focus();});
-        q('enabled').addEventListener('change',()=>updateConfig({enabled:q('enabled').checked}));
+        
+ q('enabled').addEventListener('change',()=>updateConfig({enabled:q('enabled').checked}));
         q('save').addEventListener('click',()=>{try{const r={};for(const k of ['names','minHp','maxHp','minCount','maxCount','range','mode','rune','position','spellWords','spellAim','spellMana'])r[k]=q(k).value;r.enabled=q('ruleEnabled').checked;const next=config.rules.slice();if(edit===null)next.push(r);else next[edit]=r;updateConfig({rules:next});reset();render();q('message').textContent='Rule saved.';}catch(e){q('message').textContent=e.message;}});
         q('cancel').addEventListener('click',reset);reset();render();
     }
@@ -14294,8 +14295,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         const distance = getTileDistance(playerPos, targetPos);
 
         if (
-            state.offscreenHuntPauseHeld &&
-            state.offscreenHuntLastMoveAt > 0
+            state.offscreenHuntActive &&
+            state.offscreenHuntPlayerProgressAt > 0
         ) {
             const playerProgressKey =
                 `${Number(playerPos.x)},${Number(playerPos.y)},${Number(playerPos.z)}`;
@@ -14310,21 +14311,25 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                     now;
             } else if (
                 state.offscreenHuntPlayerProgressAt > 0 &&
-                now - state.offscreenHuntPlayerProgressAt >= 2400
+                now - state.offscreenHuntPlayerProgressAt >= Math.max(1000,Number(config.offscreenHuntNoProgressMs)||5000)
             ) {
-                rememberSkippedTarget(target, now, 8000);
+                rememberSkippedTarget(target, now, 30000);
                 state.offscreenHuntRetryAfter = now + 1500;
                 clearOffscreenHunt(
-                    "Hunt AutoWalk started but player made no physical progress for 2.4s"
+                    "hunt stalled without physical movement — target skipped for 30s"
                 );
                 return false;
             }
         }
 
-        if (distance > range) {
-            rememberSkippedTarget(target, now, 2000);
+        // Acquisition stays inside the configured range. An existing chase
+        // needs room for path detours and moving creatures at that boundary.
+        const chaseRange = range + Math.max(3, Math.min(8, Math.ceil(range * 0.25)));
+        if (distance > chaseRange) {
+            rememberSkippedTarget(target, now, 30000);
+            state.offscreenHuntRetryAfter = now + 1500;
             clearOffscreenHunt(
-                `creature left hunt range (${distance} > ${range})`
+                `creature left chase range (${distance} > ${chaseRange}) — target skipped for 30s`
             );
             return false;
         }
@@ -48929,11 +48934,12 @@ window.__minibiaBotBundle.installSmithingModule = function(bot) {
 
 
 window.__minibiaBotBundle.installCookingModule=function(bot){
- const key='minibiaBot.cooking.config',config={enabled:false,foods:[],limit:10,...bot.storage.get(key,{})};
+ const key='minibiaBot.cooking.config',config={enabled:false,foods:[],limit:10,cookAfter:10,...bot.storage.get(key,{})};
  const cookableSids=new Set([2666,2667,2671,2672,2787,2789,2790,2795,2695,2689,9908,9909,9910,9911]);
  const isCookable=food=>{const native=typeof Mouse!=='undefined'?Mouse.COOKABLE_SIDS:null;return native?native[food.sid]===true:cookableSids.has(food.sid);};
  const normalize=rows=>(Array.isArray(rows)?rows:[]).map(r=>({sid:Math.trunc(Number(r.sid)),cid:Math.trunc(Number(r.cid))})).filter(r=>r.sid>0&&r.cid>0).filter((r,i,arr)=>arr.findIndex(s=>s.sid===r.sid&&s.cid===r.cid)===i);
- config.foods=normalize(config.foods);config.limit=10;
+ config.foods=normalize(config.foods);config.limit=10;config.cookAfter=Math.max(1,Math.trunc(Number(config.cookAfter)||10));
+ let cookingBatchActive=false;
  let running=false,timer=null,disposed=false,used=0,pending=null,splitPending=null,batchSource=null,batchFood=null,foodCursor=0,lastUse=0,reason='Stopped',capture=null,captureTimer=null,walkDestination=null,lastWalk=0,ovenCache=null,ovenDefs=null;
  const posKey=p=>`${p.x},${p.y},${p.z}`;
  function persist(){bot.storage.set(key,{...config});}
@@ -48948,7 +48954,19 @@ window.__minibiaBotBundle.installCookingModule=function(bot){
  function nextFood(food){const i=config.foods.findIndex(f=>f.sid===food.sid&&f.cid===food.cid);foodCursor=i<0?0:(i+1)%Math.max(1,config.foods.length);batchSource=null;batchFood=null;}
  function emptySlot(){const eq=window.gameClient?.player?.equipment;for(const c of containers()){if(c===eq)continue;for(let i=0;i<(c.size??c.slots?.length??0);i++)if(!c.getSlotItem?.(i))return {which:c,index:i};}return null;}
  function stackCount(item){return Math.max(1,Number(item?.getCount?.()??item?.count??1)||1);}
+ function hasFoodToCook(){
+  let count=0,unknown=false;
+  for(const food of config.foods){if(!isCookable(food))continue;const local=inventory(food).count;const r=bot.sidInventory?.reading?.(food.sid);const fresh=r&&Date.now()-r.at<=5000;
+   if(!fresh)bot.sidInventory?.request?.([food.sid]);
+   count+=Math.max(local,fresh?Number(r.count)||0:0);if(!fresh&&local===0)unknown=true;
+  }
+  if(pending||splitPending)cookingBatchActive=true;
+  else if(count===0&&!unknown)cookingBatchActive=false;
+  else if(count>0&&(!bot.fisher?.isRunning?.()||count>=config.cookAfter))cookingBatchActive=true;
+  return cookingBatchActive;
+ }
  function tick(){if(!running||disposed)return false;const client=window.gameClient,now=Date.now();
+  if(bot.fisher?.isRunning?.()&&!hasFoodToCook()){reason='Waiting for '+config.cookAfter+' food before cooking';return false;}
   if(splitPending){
    const r=inventory(splitPending.food);
    const piece=r.slots.find(slot=>stackCount(slot.item)===10);
@@ -48987,15 +49005,16 @@ window.__minibiaBotBundle.installCookingModule=function(bot){
   const action=()=>{const live=source.which.getSlotItem?.(source.index);if(Number(live?.sid)!==food.sid||Number(live?.id)!==food.cid||stackCount(live)>10){batchSource=null;batchFood=null;reason='Food moved — selecting its exact SID again';return false;}lastUse=now;pending={food:{...food},before:reading.count,at:now};client.mouse.__handleItemUseWith({which:source.which,index:source.index},{which:oven.tile,index:oven.index});reason='Cooking SID '+food.sid;return true;};try{return bot.actions?.runShared?bot.actions.runShared('cooking',bot.actions.priorities.UTILITY,action):action();}catch(e){reason='Cooking use failed';return false;}
  }
  function start(){if(disposed)return;bot.smithing?.stop?.();bot.mining?.stop?.();bot.woodcutting?.stop?.();if(!running){running=true;timer=window.setInterval(tick,150);}config.enabled=true;persist();tick();}
- function stop(options={}){running=false;if(timer!=null)window.clearInterval(timer);timer=null;stopWalk();clearCapture();reason='Stopped';if(options.persistEnabled!==false){config.enabled=false;persist();}}
+ function stop(options={}){running=false;if(timer!=null)window.clearInterval(timer);timer=null;stopWalk();clearCapture();cookingBatchActive=false;reason='Stopped';if(options.persistEnabled!==false){config.enabled=false;persist();}}
  function resetBatch(){if((pending&&Date.now()-pending.at<10000)||(splitPending&&Date.now()-splitPending.at<10000)){reason='Wait for the outstanding cooking action';return false;}pending=null;splitPending=null;batchSource=null;batchFood=null;foodCursor=0;reason='Ready to continue cooking';return true;}
- function updateConfig(next){if(next.foods!==undefined)config.foods=normalize(next.foods);persist();}
- function mount(panel){const parent=panel.querySelector('[data-tab-panel="professions"]');if(!parent)return;const host=document.createElement('div');parent.appendChild(host);host.innerHTML=`<div class="mb-section"><div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-cook="enabled" /><span class="mb-title-text">Cooking</span></div><div class="prof-grid"><label class="mb-field"><span class="mb-field-label">Food SID</span><input type="number" min="1" data-cook="sid" /></label><label class="mb-field"><span class="mb-field-label">Food CID</span><input type="number" min="1" data-cook="cid" /></label></div><div class="prof-actions"><button type="button" class="mb-small-button" data-cook="pick" title="Click a food item to capture its exact SID and CID">🔍 Pick food</button><button type="button" class="mb-small-button" data-cook="add">Add food</button><button type="button" class="mb-small-button" data-cook="reset">Retry cooking</button></div><div data-cook="list" style="margin-top:6px"></div><div class="prof-status" data-cook="status"></div><details><summary>How cooking works</summary><div class="mb-hint">2-second interval. Splits 10 items, cooks that stack, and repeats until all selected food is gone. Smaller remaining stacks are cooked too. Matches both SID and CID. Keep food containers open with a free slot for splitting. Auto Stacker pauses merging while Cooking runs. Approaches ovens within 5 tiles; pause Cavebot for walking. Pauses during combat and healing.</div></details><details><summary>Detected oven IDs</summary><div class="mb-hint" data-cook="ovens"></div></details></div>`;
+ function updateConfig(next){if(next.foods!==undefined){config.foods=normalize(next.foods);cookingBatchActive=false;}if(next.cookAfter!==undefined)config.cookAfter=Math.max(1,Math.trunc(Number(next.cookAfter)||10));persist();}
+ function mount(panel){const parent=panel.querySelector('[data-tab-panel="professions"]');if(!parent)return;const host=document.createElement('div');parent.appendChild(host);host.innerHTML=`<div class="mb-section"><div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-cook="enabled" /><span class="mb-title-text">Cooking</span></div><div class="prof-grid"><label class="mb-field"><span class="mb-field-label">Food SID</span><input type="number" min="1" data-cook="sid" /></label><label class="mb-field"><span class="mb-field-label">Food CID</span><input type="number" min="1" data-cook="cid" /></label></div><div class="prof-actions"><button type="button" class="mb-small-button" data-cook="pick" title="Click a food item to capture its exact SID and CID">🔍 Pick food</button><button type="button" class="mb-small-button" data-cook="add">Add food</button><button type="button" class="mb-small-button" data-cook="reset">Retry cooking</button></div><label class="mb-field"><span class="mb-field-label">Fish before cooking</span><input type="number" min="1" step="1" data-cook="cookAfter" /></label><div data-cook="list" style="margin-top:6px"></div><div class="prof-status" data-cook="status"></div><details><summary>How cooking works</summary><div class="mb-hint">With Fisher running, waits for the configured count of selected cookable food, then cooks everything before fishing resumes. 2-second interval. Splits 10 items, cooks that stack, and repeats until all selected food is gone. Smaller remaining stacks are cooked too. Matches both SID and CID. Keep food containers open with a free slot for splitting. Auto Stacker pauses merging while Cooking runs. Approaches ovens within 5 tiles; pause Cavebot for walking. Pauses during combat and healing.</div></details><details><summary>Detected oven IDs</summary><div class="mb-hint" data-cook="ovens"></div></details></div>`;
  const q=k=>host.querySelector(`[data-cook="${k}"]`);
  const render=()=>{q('list').replaceChildren();for(const f of config.foods){const row=document.createElement('div');row.className='prof-food-row';const label=document.createElement('span');label.textContent=`SID ${f.sid} · CID ${f.cid}${isCookable(f)?'':' · not cookable'}`;const remove=document.createElement('button');remove.type='button';remove.className='mb-small-button';remove.textContent='Remove';remove.addEventListener('click',()=>{updateConfig({foods:config.foods.filter(r=>r!==f)});render();});row.append(label,remove);q('list').append(row);}};
+ q('cookAfter').value=config.cookAfter;q('cookAfter').addEventListener('change',()=>{updateConfig({cookAfter:q('cookAfter').value});q('cookAfter').value=config.cookAfter;});
  q('enabled').addEventListener('change',()=>q('enabled').checked?start():stop());q('pick').addEventListener('click',()=>pickFood(f=>{q('sid').value=f.sid;q('cid').value=f.cid;updateConfig({foods:[...config.foods,f]});render();}));q('add').addEventListener('click',()=>{updateConfig({foods:[...config.foods,{sid:q('sid').value,cid:q('cid').value}]});render();});q('reset').addEventListener('click',resetBatch);
  const refresh=()=>{if(!host.getClientRects().length)return;q('enabled').checked=running;q('status').textContent=`${reason} · ${used} food consumed`;q('ovens').textContent='Ovens: '+(ovens().map(o=>`SID ${o.sid} / CID ${o.cid}`).join(', ')||'waiting for game definitions');};render();refresh();const ui=window.setInterval(refresh,500);bot.addCleanup(()=>window.clearInterval(ui));}
- bot.cooking={config,hasFoodToCook:()=>config.foods.some(food=>{if(!isCookable(food))return false;if(inventory(food).count>0)return true;const r=bot.sidInventory.reading(food.sid);if(!r||Date.now()-r.at>5000){bot.sidInventory.request([food.sid]);return false;}return r.count>0;})||!!pending||!!splitPending,start,stop,tick,updateConfig,resetBatch,pickFood,mount,status:()=>({running,reason,used,pending:!!pending,splitPending:!!splitPending,ovens:ovens()})};bot.addCleanup(()=>{disposed=true;stop({persistEnabled:false});});if(config.enabled)start();
+ bot.cooking={config,hasFoodToCook,hasConfiguredFish:()=>config.foods.some(f=>f.sid===2667&&isCookable(f)),start,stop,tick,updateConfig,resetBatch,pickFood,mount,status:()=>({running,reason,used,pending:!!pending,splitPending:!!splitPending,ovens:ovens()})};bot.addCleanup(()=>{disposed=true;stop({persistEnabled:false});});if(config.enabled)start();
 };
 
 window.__minibiaBotBundle.installFisherModule = function installFisherModule(bot) {
@@ -49211,7 +49230,7 @@ window.__minibiaBotBundle.installFisherModule = function installFisherModule(bot
             scheduleNextTick();
             return;
         }
-        if (fishState.count >= config.fishThreshold) {
+        if (fishState.count >= config.fishThreshold && !(bot.cooking?.config?.enabled && bot.cooking.hasConfiguredFish?.())) {
             scheduleNextTick();
             return;
         }
@@ -49408,6 +49427,7 @@ window.__minibiaBotBundle.installFisherModule = function installFisherModule(bot
 
     // Public API
     bot.fisher = {
+        isRunning: () => state.running,
         start,
         stop,
         status,
