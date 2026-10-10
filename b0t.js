@@ -3101,7 +3101,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.173",
+        version: "1.6.174",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -48650,7 +48650,7 @@ window.__minibiaBotBundle.installWoodcuttingModule = function(bot) {
 
 window.__minibiaBotBundle.installMiningModule = function(bot) {
     const key='minibiaBot.mining.config';
-    const stones=new Map([[1772,1285],[1774,1287],[1776,1289],[1775,1288],[1773,1286],[1790,1303],[1789,1302],[1787,1300],[1788,1301],[1792,1305],[1793,1306],[1777,1290],[1785,1298],[1786,1299],[1784,1297],[1783,1296],[1810,1323],[1811,1324],[1791,1304],[1813,1326]]);
+    const stones=new Map([[1778,1291],[1794,1307],[1772,1285],[1774,1287],[1776,1289],[1775,1288],[1773,1286],[1790,1303],[1789,1302],[1787,1300],[1788,1301],[1792,1305],[1793,1306],[1777,1290],[1785,1298],[1786,1299],[1784,1297],[1783,1296],[1810,1323],[1811,1324],[1791,1304],[1813,1326]]);
     const config={enabled:false,delayMs:2000,range:5,attackWhileGathering:false,retryMinutes:5,minCapacity:0,stopSkill:0,goalSid:0,goalCount:0,goalLabel:'',...bot.storage.get(key,{})};
     delete config.depletionText;
     config.delayMs=Math.max(350,Math.min(10000,Number(config.delayMs)||2000));
