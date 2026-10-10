@@ -3101,7 +3101,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.165",
+        version: "1.6.173",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -13985,11 +13985,11 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 // fall between normal acquisition and Off-screen Hunt. Approach
                 // them under the hunt range; normal Targeting still owns mobs
                 // already in its acquisition range and all attack validation.
+                const antiKSReason = getAntiKSBlockReason(creature, antiKS, now);
+                if (antiKSReason && !String(antiKSReason).startsWith("Anti-KS self range"))
+                    return false;
                 if (visible) {
                     if (getTileDistance(me, pos) <= normalRange)
-                        return false;
-                    const antiKSReason = getAntiKSBlockReason(creature, antiKS, now);
-                    if (antiKSReason && !String(antiKSReason).startsWith("Anti-KS self range"))
                         return false;
                     visibleCandidates.add(creature);
                 }
@@ -14241,6 +14241,9 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         }
 
         let target = getActiveOffscreenHuntTarget();
+        if (!target && (state.offscreenHuntActive || state.offscreenHuntPauseHeld)) {
+            clearOffscreenHunt("hunted creature is no longer available — releasing Cavebot pause");
+        }
 
         if (target && !isKnownMonsterForOffscreenHunt(target)) {
             clearOffscreenHunt("creature disappeared or changed floor");
@@ -14268,10 +14271,14 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         if (!target) {
             const candidates = getOffscreenHuntCandidates(now);
             target = candidates[0] || null;
-            if (!target)
+            if (!target) {
+                clearOffscreenHunt("no hunt candidate available", { quiet: true });
                 return false;
-            if (!beginOffscreenHunt(target, now))
+            }
+            if (!beginOffscreenHunt(target, now)) {
+                clearOffscreenHunt("hunt could not start", { quiet: true });
                 return false;
+            }
         }
 
         const playerPos = normalizePosition(bot.getPlayerPosition());
@@ -14344,11 +14351,11 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             return false;
         }
 
-        // Once the hunted creature is visible, Anti-KS becomes authoritative.
+        // Anti-KS player proximity applies throughout the off-screen chase.
         // "Self range" only means we still need to approach; another player's
         // proximity is a real veto and ends the hunt immediately.
         const huntScreen = getNativeSmallScreenInfo(target);
-        if (huntScreen.visible && config.antiKSEnabled) {
+        if (config.antiKSEnabled) {
             const antiKSReason =
                 getAntiKSBlockReason(
                     target,
@@ -14361,7 +14368,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                     "Anti-KS self range"
                 )
             ) {
-                rememberSkippedTarget(target, now, 5000);
+                rememberSkippedTarget(target, now, 30000);
+                state.offscreenHuntRetryAfter = now + 3000;
                 clearOffscreenHunt(
                     `Anti-KS blocked hunted creature: ${antiKSReason}`
                 );
@@ -20047,6 +20055,9 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         state.antiKSSnapshot = null;
     }
 
+    const antiKSRecentPlayers = new Map();
+    bot.addCleanup(() => antiKSRecentPlayers.clear());
+
     function getAntiKSContext(now = Date.now()) {
         if (!config.antiKSEnabled)
             return { enabled: false, otherPlayers: [] };
@@ -20071,6 +20082,11 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 .map(name => normalizeCreatureName(name))
                 .filter(Boolean));
 
+        const me = normalizePosition(bot.getPlayerPosition());
+        for (const [id, player] of antiKSRecentPlayers) {
+            if (now - player.at > 30000 || id === myId || trustedSet.has(player.normalizedName))
+                antiKSRecentPlayers.delete(id);
+        }
         const otherPlayers = [];
         for (const player of visiblePlayers) {
             if (!player || player.id === myId)
@@ -20084,12 +20100,20 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             if (!position)
                 continue;
 
-            otherPlayers.push({
+            antiKSRecentPlayers.set(player.id, {
                 id: player.id,
                 name: player.name || "Player",
                 normalizedName,
-                position
+                position,
+                at: now
             });
+        }
+
+        while (antiKSRecentPlayers.size > 128)
+            antiKSRecentPlayers.delete(antiKSRecentPlayers.keys().next().value);
+        for (const player of antiKSRecentPlayers.values()) {
+            if (me && player.position.z === me.z)
+                otherPlayers.push(player);
         }
 
         const snapshot = {
@@ -20120,15 +20144,6 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         const otherRange = Math.max(1, Number(config.antiKSOtherRange) || 2);
         const selfDist = getTileDistance(me, targetPos);
 
-        if (selfDist > selfRange) {
-            state.antiKSLastBlockedTargetId = target.id ?? null;
-            state.antiKSLastBlockedPlayerId = null;
-            state.antiKSLastBlockedPlayerName = null;
-            state.antiKSLastBlockedDistance = selfDist;
-            state.antiKSLastBlockedAt = now;
-            return `Anti-KS self range (${selfDist} > ${selfRange})`;
-        }
-
         let nearest = null;
         for (const player of antiKS.otherPlayers) {
             const pPos = player.position;
@@ -20152,6 +20167,15 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             state.antiKSLastBlockedDistance = nearest.distance;
             state.antiKSLastBlockedAt = now;
             return `Anti-KS ${nearest.name} near target (${nearest.distance} <= ${otherRange})`;
+        }
+
+        if (selfDist > selfRange) {
+            state.antiKSLastBlockedTargetId = target.id ?? null;
+            state.antiKSLastBlockedPlayerId = null;
+            state.antiKSLastBlockedPlayerName = null;
+            state.antiKSLastBlockedDistance = selfDist;
+            state.antiKSLastBlockedAt = now;
+            return `Anti-KS self range (${selfDist} > ${selfRange})`;
         }
 
         return null;
@@ -24451,7 +24475,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         // to treat a new failure as a separate incident (not waypoint index hops).
         circuitBreakerProgressTiles: 4,
         // Number of native Pathfinder repath recoveries before route-level recovery.
-        maxRepathRecoveries: 2,
+        maxRepathRecoveries: 10,
         // Number of controlled side-steps around a confirmed temporary blocker.
         maxRecoverySideSteps: 2,
         // Minimum time between controlled recovery side-steps.
@@ -24578,6 +24602,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     config.lureLastMobSlowHoldMs = Math.max(350, Math.min(2500, Math.trunc(Number(config.lureLastMobSlowHoldMs) || 500)));
     config.lurePackRunMs = Math.max(350, Math.min(1500, Math.trunc(Number(config.lurePackRunMs) || 500)));
     config.lurePackHoldMs = Math.max(500, Math.min(3000, Math.trunc(Number(config.lurePackHoldMs) || 1000)));
+    config.maxRepathRecoveries = Math.max(10, Math.trunc(Number(config.maxRepathRecoveries) || 10));
     config.recoveryObstacleMemoryMs = Math.max(1000, Math.trunc(Number(config.recoveryObstacleMemoryMs) || 10000));
     config.routeHealthWarningThreshold = Math.max(1, Math.trunc(Number(config.routeHealthWarningThreshold) || 3));
     config.recoveryHotspotAvoidMs = Math.max(1000, Math.min(60000, Math.trunc(Number(config.recoveryHotspotAvoidMs) || 10000)));
@@ -26520,7 +26545,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
         const maxRepathRecoveries = Math.max(
             0,
-            Math.trunc(Number(config.maxRepathRecoveries ?? 2) || 0)
+            Math.trunc(Number(config.maxRepathRecoveries ?? 10) || 0)
         );
         const maxRecoverySideSteps = Math.max(
             0,
@@ -27621,13 +27646,13 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         if (dx === 1 && dy === 0)
             return CONST.DIRECTION.EAST;
         if (dx === -1 && dy === -1)
-            return CONST.DIRECTION.NORTHWEST;
+            return (CONST.DIRECTION.NORTH_WEST ?? CONST.DIRECTION.NORTHWEST);
         if (dx === 1 && dy === -1)
-            return CONST.DIRECTION.NORTHEAST;
+            return (CONST.DIRECTION.NORTH_EAST ?? CONST.DIRECTION.NORTHEAST);
         if (dx === -1 && dy === 1)
-            return CONST.DIRECTION.SOUTHWEST;
+            return (CONST.DIRECTION.SOUTH_WEST ?? CONST.DIRECTION.SOUTHWEST);
         if (dx === 1 && dy === 1)
-            return CONST.DIRECTION.SOUTHEAST;
+            return (CONST.DIRECTION.SOUTH_EAST ?? CONST.DIRECTION.SOUTHEAST);
         return null;
     }
 
@@ -29600,6 +29625,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             try { client.keyboard?.noteAutowalk?.(); } catch (e) {}
 
             client.send(new AutoWalkPacket(directions));
+            state.frontierMotionWatch = { bestDistance: state.offscreenFrontierBestDistance, progressAt: state.offscreenFrontierLastImprovedAt || now, key: getPositionKey(current), at: now, index: state.currentIndex, revision: state.routeRevision };
             state.lastPathAt = now;
             return true;
         } catch (e) {
@@ -29610,6 +29636,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         }
     }
 
+    const OFFSCREEN_FRONTIER_MAX_ATTEMPTS = 10;
     const OFFSCREEN_FRONTIER_SAMPLE_LIMIT = 8;
     // Four occupied-tile samples are enough to prove A-B-A-B.
     const OFFSCREEN_FRONTIER_OSCILLATION_MIN_SAMPLES = 4;
@@ -29624,6 +29651,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     }
 
     function resetOffscreenFrontierTracking() {
+        state.frontierMotionWatch = null;
         state.offscreenFrontierKey = null;
         state.offscreenFrontierAttempts = 0;
         state.offscreenFrontierBestDistance = Infinity;
@@ -29746,7 +29774,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             Math.max(
                 0,
                 Math.trunc(
-                    Number(config.maxRepathRecoveries ?? 2) || 0
+                    Number(config.maxRepathRecoveries ?? 10) || 0
                 )
             );
         state.recoverySideStepAttempts =
@@ -29813,6 +29841,10 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         if (!current || !isCaveWaypointOffScreen(current, waypoint))
             return false;
 
+        const motion = state.frontierMotionWatch;
+        if (motion && motion.index === state.currentIndex && motion.revision === state.routeRevision &&
+            window.gameClient?.world?.pathfinder?.__isAutoWalking && now - motion.at < 5000)
+            return true; // Do not cancel an in-flight frontier batch on repeated NO_WAY.
         const frontierState = noteOffscreenFrontierState(waypoint, current, now);
         if (isOffscreenFrontierBlocked(waypoint, now))
             return false;
@@ -29908,13 +29940,13 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 )
             );
 
-        // Hard 5-second ceiling for this CaveBot fallback regardless of stale
-        // config from old profiles.
+        // Allow ten frontier attempts before abandoning a stalled destination.
+        // A five-second no-progress window still guards against rapid retries.
         const stalled =
-            state.offscreenFrontierAttempts >= 2 &&
+            state.offscreenFrontierAttempts >= OFFSCREEN_FRONTIER_MAX_ATTEMPTS &&
             noProgressFor >= 5000;
 
-        if (oscillating || stalled) {
+        if ((oscillating && state.offscreenFrontierAttempts >= OFFSCREEN_FRONTIER_MAX_ATTEMPTS) || stalled) {
             const reason =
                 directABAB
                     ? "A-B-A-B player movement"
@@ -33436,6 +33468,30 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             const positionKey = getPositionKey(position);
             const now = Date.now();
 
+            // A Stand floor transition belongs to sequential navigation, before
+            // relocation/closest-waypoint recovery can redirect it back downstairs.
+            const floorStand = getCurrentWaypoint();
+            if (position && floorStand?.stand && !floorStand.script &&
+                floorStand.z !== undefined && Number(floorStand.z) !== Number(position.z)) {
+                const oldIndex = state.currentIndex;
+                stopCaveMovementNow();
+                delete state.standStartAt?.[oldIndex];
+                state.floorRecoveryLoop = null;
+                state.recoveryDestinationWatch = null;
+                state.lastRelocationCheckPosition = { ...position };
+                const next = advanceWaypoint();
+                state.lastWaypointTarget = null;
+                state.lastPathAt = 0;
+                state.pathAttemptStart = 0;
+                state.stuckRecoveryAttempts = 0;
+                state.recoverySideStepAttempts = 0;
+                resetWaypointProgressTracking(next, position, now);
+                state.lastPositionKey = positionKey;
+                bot.log(`Cave: Stand transition completed at #${oldIndex + 1} — continuing with waypoint #${state.currentIndex + 1}`);
+                if (!next) stop();
+                return;
+            }
+
             // Reset special waypoint state immediately after a GM teleport,
             // temple return, floor jump or similar server-side relocation.
             // A just-completed Script gets a short, exact-index handoff first:
@@ -33534,6 +33590,36 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 if (!waypoint) {
                     scheduleNextTick();
                     return;
+                }
+            }
+
+            // Server-owned AutoWalk is only active if the player actually moves.
+            // Run before native-path gating so a stale active flag cannot suppress retries.
+            const frontierMotion = state.frontierMotionWatch;
+            if (frontierMotion) {
+                if (!waypoint || waypoint.script || frontierMotion.index !== state.currentIndex ||
+                    frontierMotion.revision !== state.routeRevision || isSameTile(position, waypoint)) {
+                    state.frontierMotionWatch = null;
+                } else {
+                    const frontierDistance = getDistanceToWaypoint(position, waypoint);
+                    if (frontierDistance < frontierMotion.bestDistance) {
+                        frontierMotion.bestDistance = frontierDistance;
+                        frontierMotion.progressAt = now;
+                    }
+                    if (frontierMotion.key !== positionKey) {
+                    frontierMotion.key = positionKey;
+                    frontierMotion.at = now;
+                }
+                    if (now - frontierMotion.at >= 5000 || now - frontierMotion.progressAt >= 5000) {
+                    state.frontierMotionWatch = null;
+                    stopCaveMovementNow();
+                    bot.log(`Cave: frontier walk made no route progress for 5s — retrying loaded path (${state.offscreenFrontierAttempts}/10)`);
+                    if (tryCaveOffscreenFrontierRecovery(waypoint, now, "stationary frontier retry")) return;
+                    state.lastWaypointTarget = null;
+                    state.lastPathAt = 0;
+                    goToWaypoint(waypoint);
+                    return;
+                    }
                 }
             }
 
@@ -35112,7 +35198,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             if (movementOscillation.detected) {
                 const maxRepathRecoveries = Math.max(
                     0,
-                    Math.trunc(Number(config.maxRepathRecoveries ?? 2) || 0)
+                    Math.trunc(Number(config.maxRepathRecoveries ?? 10) || 0)
                 );
                 stopMovement();
                 state.lastWaypointTarget = null;
@@ -35292,7 +35378,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                     // First recover by rebuilding the native path. This avoids
                     // skipping a perfectly valid waypoint just because one path
                     // attempt got blocked by a creature, door, or transient state.
-                    const maxRepathRecoveries = Math.max(0, Math.trunc(Number(config.maxRepathRecoveries ?? 2) || 0));
+                    const maxRepathRecoveries = Math.max(0, Math.trunc(Number(config.maxRepathRecoveries ?? 10) || 0));
                     // If the previous recovery side-step did not produce route progress,
                     // remember that exact tile briefly. This prevents repeated attempts
                     // to step onto the same temporarily bad square without constraining
@@ -35322,7 +35408,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
                         bot.log(
                             `Cave: movement stalled for ${(stalledFor / 1000).toFixed(1)}s – ` +
-                            `repath recovery ${state.stuckRecoveryAttempts}/2`
+                            `repath recovery ${state.stuckRecoveryAttempts}/${maxRepathRecoveries}`
                         );
 
                         state.lastProgressAt = now;
@@ -35710,7 +35796,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 if (state.stuckCount >= 2) {
                     state.stuckCount = 0;
                     state.lastProgressAt = now - nativeStallMs;
-                    state.stuckRecoveryAttempts = Math.max(state.stuckRecoveryAttempts, Math.max(0, Math.trunc(Number(config.maxRepathRecoveries ?? 2) || 0)));
+                    state.stuckRecoveryAttempts = Math.max(state.stuckRecoveryAttempts, Math.max(0, Math.trunc(Number(config.maxRepathRecoveries ?? 10) || 0)));
                     // Let the existing bounded recovery path decide whether to
                     // sidestep, wait for a creature, or select a recovery waypoint.
                     goToWaypoint(waypoint);
@@ -39124,6 +39210,13 @@ window.__minibiaBotBundle.installMessageAlertModule = function installMessageAle
         bot.isRecentSentChat?.(message?.rawMessage, 20000);
     }
 
+    function isTrustedMessage(message) {
+        const sender = normalizeText(message?.sender);
+        if (!sender) return false;
+        const names = bot.panic?.getTrustedNames?.() || bot.panic?.config?.trustedNames || [];
+        return names.some(name => normalizeText(name) === sender);
+    }
+
     function getNewMessages() {
         const all = getChatMessages();
         const newMessages = [];
@@ -39142,7 +39235,7 @@ window.__minibiaBotBundle.installMessageAlertModule = function installMessageAle
             if (state.seenKeys.has(msg.key))
                 continue;
             state.seenKeys.add(msg.key);
-            if (isSelfMessage(msg))
+            if (isSelfMessage(msg) || isTrustedMessage(msg))
                 continue;
             const upper = msg.body.toUpperCase();
             // Skip if body contains any ignored phrase (case‑insensitive)
@@ -51183,11 +51276,11 @@ window.__minibiaBotBundle.installDepositerModule = function installDepositerModu
             for (let slot = 0; slot < slots(c); slot++) {
                 const it = peek(c, slot);
                 if (!it && empty === null) empty = slot;
-                if (it && !isBag(it) && identity.stackable && sameIdentity(it, identity) && count(it) < 255) {
-                    return { c, path, slot, kind: "stack", rootKey };
+                if (it && !isBag(it) && identity.stackable && sameIdentity(it, identity) && count(it) < 100) {
+                    return { c, path, slot, kind: "stack", capacity: 100 - count(it), rootKey };
                 }
             }
-            if (empty !== null) return { c, path, slot: empty, kind: "empty", rootKey };
+            if (empty !== null) return { c, path, slot: empty, kind: "empty", capacity: identity.stackable ? 100 : 1, rootKey };
             const bs = bagSlots(c);
             for (let ordinal = 0; ordinal < bs.length; ordinal++) queue.push(path.concat([ordinal]));
         }
@@ -51410,17 +51503,9 @@ window.__minibiaBotBundle.installDepositerModule = function installDepositerModu
             }
             if(!row)break;
             const id=identify(row.it);
-            let target=null;
-            for(const c of openedContainers().filter(x=>x===destination||x.__openedFromParent===destination||x.__replacedParent===destination||Number(x.__parentCid)===Number(destination.__containerId))) {
-                for(let slot=0;slot<slots(c);slot++){
-                    const it=peek(c,slot);
-                    if(it && id.stackable && sameIdentity(it,id) && count(it)<255){target={c,slot};break;}
-                    if(!it && !target)target={c,slot};
-                }
-                if(target)break;
-            }
+            const target=await findTargetSlot(async()=>destination,[],id,"manual-destination");
             if(!target)throw new Error("Manual destination tree is full");
-            await moveConfirmed(row,target,Math.min(255,count(row.it)));
+            await moveConfirmed(row,target,Math.min(target.capacity,count(row.it)));
         }
     }
 
@@ -51466,7 +51551,7 @@ window.__minibiaBotBundle.installDepositerModule = function installDepositerModu
                     liveTarget = await findTargetSlot(depotRootProvider, targetPaths.get(row.info.group), row.info, "depot");
                     if (!liveTarget) throw new Error(`Destination became unavailable: ${config.bags[row.info.group]}`);
                 }
-                const n = Math.min(remaining, count(source.it), 255);
+                const n = Math.min(remaining, count(source.it), liveTarget.capacity);
                 await moveConfirmed(source, liveTarget, n);
                 remaining -= n;
                 state.groups[row.info.group] = (state.groups[row.info.group] || 0) + n;
