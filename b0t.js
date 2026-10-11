@@ -3101,7 +3101,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.174",
+        version: "1.6.175",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -42607,6 +42607,28 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
         const eq = window.gameClient?.player?.equipment;
         if (!eq) return false;
 
+        // v1.6.175: the server total includes the equipped stack. If all of
+        // this weapon is already in the left hand, there is nothing to equip.
+        // Wait for a fresh server count instead of treating unknown inventory
+        // as spare ammo, including for the manual Equip Now action.
+        const now = Date.now();
+        const reading = bot.getItemCountReading?.(itemConfig.id, 0);
+        const serverCount = Number(reading?.count);
+        const countAt = Number(reading?.at);
+        if (!reading || !Number.isSafeInteger(serverCount) || serverCount < 0 ||
+            !Number.isFinite(countAt) || countAt <= 0 ||
+            now - countAt > AMMO_COUNT_FRESH_MS) {
+            bot.requestItemCounts?.([{ id: itemConfig.id, fluidType: 0 }]);
+            return false;
+        }
+        const leftItem = eq.getSlotItem(LEFT_HAND_SLOT);
+        const heldCount = leftItem && Number(leftItem.id) === itemConfig.id
+            ? Number(typeof leftItem.getCount === "function"
+                ? leftItem.getCount() : (leftItem.count ?? 1))
+            : 0;
+        if (!Number.isSafeInteger(heldCount) || heldCount < 0 || serverCount <= heldCount)
+            return false;
+
         // v1.6.20: route Weapon Equipper through the same native hotbar equip
         // machinery used by safe equipment hotkeys. It selects the largest live
         // stack from open bags, handles stale slots/debounce, and falls back to
@@ -42805,10 +42827,14 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
         let leftHandCount = 0;
         let leftHandHasWeapon = false;
         const leftItem = eq.getSlotItem(LEFT_HAND_SLOT);
-        if (leftItem && leftItem.id === config.weaponId) {
-            leftHandCount = leftItem.count || 1;
+        if (leftItem && Number(leftItem.id) === Number(config.weaponId)) {
+            leftHandCount = typeof leftItem.getCount === "function"
+                ? leftItem.getCount() : (leftItem.count ?? 1);
             leftHandHasWeapon = true;
         }
+
+        // Refresh the shared server count even when only the equipper is on.
+        requestAmmoCount(Date.now(), false);
 
         // Equip only if left hand is empty OR count is below threshold
         if (!leftHandHasWeapon || leftHandCount <= config.equipThreshold) {
@@ -42902,6 +42928,7 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
             return false;
         }
         state.equipRunning = true;
+        requestAmmoCount(Date.now(), true);
         bot.log("Paladin equipper started", {
             weaponId: config.weaponId
         });
@@ -43039,7 +43066,7 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
         if (newWeaponId !== oldWeaponId) {
             state.ammoCountItemId = null;
             state.lastAmmoCountRequestAt = 0;
-            if (state.running) requestAmmoCount(Date.now(), true);
+            if (state.running || state.equipRunning) requestAmmoCount(Date.now(), true);
         }
         bot.log("Paladin config updated", {
             ...config
