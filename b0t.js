@@ -3101,7 +3101,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.176",
+        version: "1.6.180",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -3135,6 +3135,7 @@ addCleanup(() => {
                 this.equipRing.stop({
                     persistEnabled: false
                 });
+            this.bootsSwapper?.stop?.({ persistEnabled: false });
             if (this.eat?.stop)
                 this.eat.stop({
                     persistEnabled: false
@@ -5400,6 +5401,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         return {
             caveRunning: !!bot.cave?.status?.().running,
             equipRingRunning: !!bot.equipRing?.status?.().running,
+            bootsSwapperRunning: !!bot.bootsSwapper?.status?.().running,
         };
     }
 
@@ -5429,6 +5431,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
             bot.equipRing?.start?.();
             bot.ui?.refreshEquipRingStatus?.();
         }
+        if (state.pendingReturnModules?.bootsSwapperRunning) bot.bootsSwapper?.start?.();
     }
 
     function tryReturnToOrigin(now = Date.now()) {
@@ -5535,6 +5538,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
                 runeShooter: getSharedGmModuleSnapshot(bot.runeShooter),
                 cave: getSharedGmModuleSnapshot(bot.cave),
                 equipRing: getSharedGmModuleSnapshot(bot.equipRing),
+                bootsSwapper: getSharedGmModuleSnapshot(bot.bootsSwapper),
                 slimeTrainer: getSharedGmModuleSnapshot(bot.slimeTrainer),
                 paladin:
                     bot.paladin?.getKillSwitchSnapshot?.() || {
@@ -5562,6 +5566,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         try { bot.attack?.stop?.({ persistEnabled: false }); } catch (e) {}
         try { bot.cave?.stop?.({ persistEnabled: false }); } catch (e) {}
         try { bot.equipRing?.stop?.({ persistEnabled: false }); } catch (e) {}
+        try { bot.bootsSwapper?.stop?.({ persistEnabled: false }); } catch (e) {}
         try { bot.slimeTrainer?.stop?.({ persistEnabled: false }); } catch (e) {}
         try { bot.paladin?.stop?.({ persistEnabled: false }); } catch (e) {}
 
@@ -5667,6 +5672,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         restoreSharedGmModule("Rune Shooter", bot.runeShooter, modules.runeShooter);
         restoreSharedGmModule("CaveBot", bot.cave, modules.cave);
         restoreSharedGmModule("Equip Ring", bot.equipRing, modules.equipRing);
+        restoreSharedGmModule("Boots Swapper", bot.bootsSwapper, modules.bootsSwapper);
         restoreSharedGmModule("Slime Trainer", bot.slimeTrainer, modules.slimeTrainer);
 
         if (modules.paladin) {
@@ -5879,6 +5885,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
             });
             bot.ui?.refreshEquipRingStatus?.();
         }
+        bot.bootsSwapper?.stop?.({ persistEnabled: false });
         return !!bot.pz?.goToHomePz?.();
     }
 
@@ -24629,7 +24636,70 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     // detour-plan helpers live outside tick(). The previous stopMovement()
     // helper was declared inside tick(), so followLureDetourPlan() could not
     // see it and threw "stopMovement is not defined" at runtime.
+    // Cave owns direction batches; native Pathfinder must never retry them.
+    // No hooks or extra timers: the existing Cave tick retires completed batches.
+    let cavePacketBatch = null;
+
+    function ownCavePacketBatch(pf, endpoint, now = Date.now(), goal = endpoint) {
+        const position = normalizePosition(bot.getPlayerPosition());
+        cavePacketBatch = {
+            pf, client: window.gameClient, endpoint: normalizePosition(endpoint),
+            key: getPositionKey(position), progressAt: now, goalKey: getPositionKey(goal)
+        };
+        pf.__finalDestination = null;
+        pf.__minimapWaypoints = null;
+        pf.__hybridPath = null;
+    }
+
+    function releaseCavePacketBatch(stopServer = false) {
+        const batch = cavePacketBatch;
+        cavePacketBatch = null;
+        if (!batch || batch.pf.__finalDestination != null)
+            return; // A different movement owner has installed its destination.
+        const pf = batch.pf;
+        if (stopServer && pf.__isAutoWalking) {
+            try { batch.client?.send?.(new StopWalkPacket()); } catch (e) {}
+        }
+        pf.__isAutoWalking = false;
+        pf.__autoWalkStepsRemaining = 0;
+        pf.__pathfindCache = [];
+    }
+
+    function refreshCavePacketBatch(now = Date.now()) {
+        const batch = cavePacketBatch;
+        if (!batch) return;
+        if (batch.pf !== window.gameClient?.world?.pathfinder) {
+            releaseCavePacketBatch(true);
+            return;
+        }
+        if (batch.pf.__finalDestination != null) {
+            cavePacketBatch = null; // Targeting, Follow or a manual walk took over.
+            return;
+        }
+        const position = normalizePosition(bot.getPlayerPosition());
+        if (!position) return;
+        const key = getPositionKey(position);
+        if (key !== batch.key) {
+            batch.key = key;
+            batch.progressAt = now;
+        }
+        if (!batch.pf.__isAutoWalking || batch.pf.__autoWalkStepsRemaining <= 0 ||
+            isSameTile(position, batch.endpoint)) {
+            releaseCavePacketBatch();
+        } else if (position.z !== batch.endpoint?.z || now - batch.progressAt >= 5000) {
+            releaseCavePacketBatch(true);
+            state.lastPathAt = 0;
+        }
+    }
+
+    function isOwnCavePacketBatch(pf, endpoint) {
+        refreshCavePacketBatch();
+        return cavePacketBatch?.pf === pf && pf.__isAutoWalking &&
+            isSameTile(cavePacketBatch.endpoint, endpoint);
+    }
+
     function stopCaveMovementNow() {
+        releaseCavePacketBatch();
         // Cancel any queued CaveBot manual step.
         state.fallbackMoveRequestId++;
 
@@ -27418,19 +27488,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             return false;
 
         // If this exact batch is still being executed, do not resend it.
-        if (
-            pf.__isAutoWalking &&
-            pf.__finalDestination &&
-            Number(
-                pf.__finalDestination.x
-            ) === Number(destination.x) &&
-            Number(
-                pf.__finalDestination.y
-            ) === Number(destination.y) &&
-            Number(
-                pf.__finalDestination.z
-            ) === Number(destination.z)
-        ) {
+        if (isOwnCavePacketBatch(pf, destination)) {
             return true;
         }
 
@@ -27487,6 +27545,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
             // Existing stop-on-target logic deliberately permits AutoWalkPacket
             // while Lure is active, so no special combat permit is necessary.
+            ownCavePacketBatch(pf, destination, now, waypoint);
             window.gameClient.send(
                 new AutoWalkPacket(
                     directions
@@ -28794,10 +28853,9 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     }
 
     // ---- FIELD-IGNORING CAVEBOT PATHFINDER ----
-    // Native Pathfinder treats some magic-field sprites as blocking. CaveBot can
-    // optionally override that decision without weakening normal wall/item
-    // collision. The override is active only while CaveBot itself is requesting
-    // a path, so other modules keep the game's normal pathing rules.
+    // Cave owns its A* searches and direction batches. Field handling uses one
+    // passability rule for path nodes, diagonal sides and live send validation;
+    // native Pathfinder and other movement modules are not patched.
     function isMagicFieldItem(item) {
         if (!item)
             return false;
@@ -28930,6 +28988,14 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         return true;
     }
 
+    function isCaveRoutePassable(tile, destination = null) {
+        if (!caveFieldPassable(tile, destination)) return false;
+        if (config.ignoreFields === true) return true;
+        // Avoid damaging fields even if the game's item flags call them walkable.
+        return !isMagicFieldItem(tile) &&
+            !(Array.isArray(tile.items) && tile.items.some(isMagicFieldItem));
+    }
+
     function findCaveFieldAwarePath(
         fromPosition,
         toPosition
@@ -28951,7 +29017,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         const startTile = getTileAt(from);
         const destinationTile = getTileAt(to);
 
-        if (!startTile || !destinationTile)
+        if (!startTile || !destinationTile || startTile.__isPlaceholder || destinationTile.__isPlaceholder)
             return null;
 
         state.fieldRouteManualSearches++;
@@ -28964,6 +29030,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 );
 
             pf.__dirtyNodes = new Array(startTile);
+            startTile.__g = 0;
             startTile.__h =
                 pf.heuristic(
                     startTile,
@@ -28971,6 +29038,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 );
 
             const openHeap = new BinaryHeap();
+            startTile.__f = startTile.__h;
             openHeap.push(startTile);
 
             while (openHeap.size() > 0) {
@@ -29016,7 +29084,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                         continue;
 
                     if (
-                        !caveFieldPassable(
+                        !isCaveRoutePassable(
                             neighbourNode,
                             destinationTile
                         )
@@ -29061,8 +29129,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                             });
 
                         if (
-                            !caveFieldPassable(sideA, null) ||
-                            !caveFieldPassable(sideB, null)
+                            !isCaveRoutePassable(sideA, null) ||
+                            !isCaveRoutePassable(sideB, null)
                         ) {
                             continue;
                         }
@@ -29172,19 +29240,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
         // Cave tick already treats __isAutoWalking as movement ownership.
         // If this exact custom batch is still active, do not resend it.
-        if (
-            pf.__isAutoWalking &&
-            pf.__finalDestination &&
-            Number(
-                pf.__finalDestination.x
-            ) === destination.x &&
-            Number(
-                pf.__finalDestination.y
-            ) === destination.y &&
-            Number(
-                pf.__finalDestination.z
-            ) === destination.z
-        ) {
+        if (isOwnCavePacketBatch(pf, destination)) {
             return true;
         }
 
@@ -29196,6 +29252,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             i < path.length;
             i++
         ) {
+            if (!isCaveRoutePassable(path[i], lastTile))
+                return false;
             const tilePos =
                 normalizePosition(
                     path[i]?.__position
@@ -29309,6 +29367,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                     ?.noteAutowalk?.();
             } catch (e) {}
 
+            ownCavePacketBatch(pf, destination, now, routeInfo.goal || destination);
             window.gameClient.send(
                 new AutoWalkPacket(
                     directions
@@ -29336,12 +29395,10 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         }
     }
 
-    // ---- OFF-SCREEN WAYPOINT FRONTIER FALLBACK ----
-    // Native minimap pathing remains the primary long-range pathfinder. If it
-    // gives up on a waypoint that is outside the visible viewport, CaveBot can
-    // still make safe progress by A*-routing through the currently loaded tile
-    // graph toward the best reachable frontier, sending only a short AutoWalk
-    // segment, then retrying the REAL waypoint after the next map area loads.
+    // ---- LOADED-MAP WAYPOINT FRONTIER ----
+    // For distant waypoints Cave searches the loaded tile graph immediately,
+    // sends a short direction batch to a reachable frontier, then recalculates
+    // as new tiles load. Native minimap/mapclick routing is never invoked.
     // This never changes the route index or replaces the actual waypoint.
     function isCaveWaypointOffScreen(fromPosition, waypoint) {
         const from = normalizePosition(fromPosition);
@@ -29361,11 +29418,10 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             return false;
         if (bot.blacklist?.isBlacklisted(pos.x, pos.y, pos.z))
             return false;
+        if (bot.specialAreas?.getPositionPolicy?.(pos, { purpose: "route" })?.allowed === false)
+            return false;
 
-        if (config.ignoreFields === true)
-            return caveFieldPassable(tile, null);
-
-        return isTileWalkable(pos.x, pos.y, pos.z, false);
+        return isCaveRoutePassable(tile, null);
     }
 
     function findCaveLoadedFrontierPath(fromPosition, waypoint, maxSegmentSteps = 10) {
@@ -29535,6 +29591,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
             return {
                 path,
+                goal: to,
                 startDistance,
                 frontierDistance: bestDistance,
                 endpoint,
@@ -29624,6 +29681,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
             try { client.keyboard?.noteAutowalk?.(); } catch (e) {}
 
+            ownCavePacketBatch(pf, previous, now, routeInfo.goal || previous);
             client.send(new AutoWalkPacket(directions));
             state.frontierMotionWatch = { bestDistance: state.offscreenFrontierBestDistance, progressAt: state.offscreenFrontierLastImprovedAt || now, key: getPositionKey(current), at: now, index: state.currentIndex, revision: state.routeRevision };
             state.lastPathAt = now;
@@ -29829,8 +29887,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             !state.running ||
             state.pausedForCombat ||
             state.positionUnavailable ||
-            bot.attack?.isCombatActive?.() ||
-            bot.attack?.isLureActive?.() ||
+            (bot.attack?.isCombatActive?.() && !bot.attack?.isLureActive?.()) ||
+            isMovementPausedExternally() ||
             !waypoint ||
             waypoint.script
         ) {
@@ -30000,102 +30058,6 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         return true;
     }
 
-    // Remember the exact Pathfinder object whose search method we wrapped.
-    // A client reconnect may replace world.pathfinder before cleanup runs;
-    // looking up only the current Pathfinder would retain the old wrapper and
-    // its closure over this CaveBot instance.
-    let fieldPatchOwner = null;
-    function installFieldIgnoringPathfinder() {
-        const pf = window.gameClient?.world?.pathfinder;
-        if (!pf || typeof pf.search !== "function")
-            return false;
-        if (fieldPatchOwner && fieldPatchOwner !== pf)
-            uninstallFieldIgnoringPathfinder();
-        if (pf.__mbCaveFieldSearchInstalled)
-            return true;
-
-        const originalSearch = pf.search;
-        pf.__mbCaveOriginalSearch = originalSearch;
-        pf.search = function (from, to) {
-            const caveActive = state.running && config.ignoreFields === true;
-            if (!caveActive)
-                return originalSearch.call(this, from, to);
-
-            // Mirror native A* while changing only the field collision test.
-            this.__dirtyNodes.forEach(node => node.cleanPathfinding());
-            this.__dirtyNodes = new Array(from);
-            from.__h = this.heuristic(from, to);
-            const openHeap = new BinaryHeap();
-            openHeap.push(from);
-
-            while (openHeap.size() > 0) {
-                const currentNode = openHeap.pop();
-                if (currentNode === to)
-                    return this.pathTo(currentNode);
-                currentNode.__closed = true;
-
-                for (let i = 0; i < currentNode.neighbours.length; i++) {
-                    const neighbourNode = currentNode.neighbours[i];
-                    if (neighbourNode.__closed)
-                        continue;
-                    if (!caveFieldPassable(neighbourNode, to))
-                        continue;
-
-                    const dx = neighbourNode.__position.x - currentNode.__position.x;
-                    const dy = neighbourNode.__position.y - currentNode.__position.y;
-                    const isDiagonal = dx !== 0 && dy !== 0;
-                    if (isDiagonal && !this.__isDiagonalPassable(currentNode, neighbourNode))
-                        continue;
-
-                    const penalty = isDiagonal ? 3 : 1;
-                    const gScore = currentNode.__g + penalty * neighbourNode.getCost(currentNode);
-                    const visited = neighbourNode.__visited;
-                    if (!visited || gScore < neighbourNode.__g) {
-                        neighbourNode.__visited = true;
-                        neighbourNode.__parent = currentNode;
-                        neighbourNode.__h = neighbourNode.__h || this.heuristic(neighbourNode, to);
-                        neighbourNode.__g = gScore;
-                        neighbourNode.__f = neighbourNode.__g + neighbourNode.__h;
-                        this.__dirtyNodes.push(neighbourNode);
-                        if (!visited)
-                            openHeap.push(neighbourNode);
-                        else
-                            openHeap.rescoreElement(neighbourNode);
-                    }
-                }
-            }
-
-            let bestFrontier = null;
-            let bestFrontierDist = Infinity;
-            for (let i = 0; i < this.__dirtyNodes.length; i++) {
-                const node = this.__dirtyNodes[i];
-                if (!node.__closed) continue;
-                const d = Math.abs(node.__position.x - to.__position.x) +
-                    Math.abs(node.__position.y - to.__position.y);
-                if (d < bestFrontierDist) {
-                    bestFrontierDist = d;
-                    bestFrontier = node;
-                }
-            }
-            this.__lastFrontierNode = bestFrontier;
-            return new Array();
-        };
-        pf.__mbCaveFieldSearchInstalled = true;
-        fieldPatchOwner = pf;
-        return true;
-    }
-
-    function uninstallFieldIgnoringPathfinder() {
-        const pf = fieldPatchOwner;
-        fieldPatchOwner = null;
-        if (!pf || !pf.__mbCaveFieldSearchInstalled)
-            return;
-        if (pf.__mbCaveOriginalSearch)
-            pf.search = pf.__mbCaveOriginalSearch;
-        delete pf.__mbCaveOriginalSearch;
-        delete pf.__mbCaveFieldSearchInstalled;
-    }
-
     function goToWaypoint(waypoint) {
         // If this is a script-only waypoint, nothing to move
         if (!waypoint || waypoint.x === undefined || waypoint.x === null) {
@@ -30126,17 +30088,18 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         // Only the newest CaveBot movement request may issue a delayed manual
         // step. Cancel even when the new native path succeeds: otherwise a
         // pending fallback from an earlier failure could fire 75ms later.
-        const fallbackRequestId = ++state.fallbackMoveRequestId;
+        state.fallbackMoveRequestId++;
         if (state.fallbackMoveTimerId != null) {
             window.clearTimeout(state.fallbackMoveTimerId);
             state.fallbackMoveTimerId = null;
         }
-        const fallbackWaypointIndex = state.currentIndex;
-        const fallbackRouteRevision = state.routeRevision;
         const from = bot.getPlayerPosition();
         if (!from || !waypoint)
             return false;
         bot.stopScriptFollowForCaveNavigation?.();
+        refreshCavePacketBatch();
+        if (cavePacketBatch && cavePacketBatch.goalKey !== getPositionKey(waypoint))
+            releaseCavePacketBatch(true);
         // Advancing from Stand to Rope must not ask Pathfinder to walk onto an
         // action tile that is already within use range. Let the Rope tick act.
         if (waypoint.rope && isBesideOrSameTile(from, waypoint))
@@ -30176,181 +30139,71 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             }
         }
         const to = new Position(waypoint.x, waypoint.y, waypoint.z);
+        const now = Date.now();
+        refreshCavePacketBatch(now);
+        if (cavePacketBatch?.pf === window.gameClient?.world?.pathfinder &&
+            cavePacketBatch.pf.__isAutoWalking)
+            return true;
+        if (Number(from.z) !== Number(waypoint.z)) return false;
 
-        // v1.6.74 Special Areas: ordinary same-floor Cave travel uses the
-        // weighted/hard policy path when at least one area exists on this floor.
-        // Manual transition/action waypoints remain authoritative and bypass it.
         const isSpecialWaypoint = !!(waypoint.stand || waypoint.rope || waypoint.shovel || waypoint.ladder || waypoint.script);
-        if (!isSpecialWaypoint && Number(from.z) === Number(waypoint.z) &&
+        if (!isSpecialWaypoint &&
             bot.specialAreas?.hasActiveAreasForFloor?.(from.z, { purpose: "route" })) {
-            const policyMove = bot.specialAreas.walkTo(from, waypoint, {
-                purpose: "route",
-                fieldAware: config.ignoreFields === true,
+            // Search only; Cave sends the resulting directions and owns retries.
+            const policyRoute = bot.specialAreas.findPolicyPath(from, waypoint, {
+                purpose: "route", fieldAware: config.ignoreFields === true,
+                avoidFields: config.ignoreFields !== true,
                 maxNodes: 8000
             });
-            if (policyMove?.handled) {
-                state.lastPathAt = Date.now();
-                if (policyMove.success) {
-                    state.lastWaypointTarget = { x: waypoint.x, y: waypoint.y, z: waypoint.z };
-                    return true;
+            if (policyRoute?.handled) {
+                if (policyRoute.success && policyRoute.path?.length) {
+                    const path = policyRoute.path.slice(0, 10).map(getTileAt);
+                    if (sendCaveFieldRouteStep({ path, goal: waypoint }, now)) {
+                        state.lastWaypointTarget = { x: waypoint.x, y: waypoint.y, z: waypoint.z };
+                        return true;
+                    }
                 }
-                bot.log("Cave: Special Area policy blocked route", {
-                    waypoint: state.currentIndex + 1,
-                    reason: policyMove.reason || "no policy-safe path"
-                });
+                const key = `${state.currentIndex}:${state.routeRevision}`;
+                if (state.packetRouteFailureKey !== key || now - (state.packetRouteFailureLogAt || 0) >= 5000) {
+                    state.packetRouteFailureKey = key;
+                    state.packetRouteFailureLogAt = now;
+                    bot.log("Cave: Special Area policy blocked route", {
+                        waypoint: state.currentIndex + 1,
+                        reason: policyRoute.reason || "no policy-safe path"
+                    });
+                }
                 return false;
             }
         }
 
-        // When the local route contains a magic field, do not ask native
-        // findPath() to generate it. Its passability logic can still refuse the
-        // field. CaveBot generates the route, then sends the whole direction
-        // list as one native-style AutoWalk batch for smooth movement.
-        if (config.ignoreFields === true) {
-            const fieldRoute =
-                findCaveFieldAwarePath(
-                    from,
-                    to
-                );
-
-            if (
-                fieldRoute &&
-                fieldRoute.pathHasMagicField === true &&
-                fieldRoute.path.length > 0
-            ) {
+        const routeInfo = findCaveFieldAwarePath(from, to);
+        if (routeInfo?.path?.length) {
+            if (sendCaveFieldRouteStep({ ...routeInfo, path: routeInfo.path.slice(0, 10), goal: waypoint }, now)) {
                 state.fieldRouteManualRoutes++;
+                state.lastWaypointTarget = { x: waypoint.x, y: waypoint.y, z: waypoint.z };
+                return true;
+            }
+            return false;
+        }
+        if (isSameTile(from, waypoint)) return true;
 
-                if (
-                    sendCaveFieldRouteStep(
-                        fieldRoute,
-                        Date.now()
-                    )
-                ) {
-                    state.lastWaypointTarget = {
-                        x: waypoint.x,
-                        y: waypoint.y,
-                        z: waypoint.z
-                    };
-                    return true;
-                }
+        // A distant endpoint may be unloaded. Use loaded geometry first, rather
+        // than waiting for native minimap failure/NO_WAY to start the frontier.
+        if (tryCaveOffscreenFrontierRecovery(waypoint, now, "loaded route"))
+            return true;
+        // Manual action tiles can be non-pathable. Approach safely, then let
+        // Stand's exact step or the existing Rope/Shovel/Ladder tick act.
+        if (isSpecialWaypoint) {
+            const approach = findCaveLoadedFrontierPath(from, waypoint, 10);
+            if (approach?.path?.length && approach.frontierDistance < approach.startDistance &&
+                sendCaveLoadedFrontierPath(approach, now)) {
+                state.lastWaypointTarget = { x: waypoint.x, y: waypoint.y, z: waypoint.z };
+                return true;
             }
         }
-
-        let success = false;
-        try {
-            installFieldIgnoringPathfinder();
-            window.gameClient?.world?.pathfinder?.findPath?.(from, to);
-            state.lastPathAt = Date.now();
-            success = true;
-        } catch (error) {
-            // pathfinder threw – we'll fallback
-        }
-
-        // Native Pathfinder owns movement. Only use the manual one-step fallback
-        // when it genuinely failed to establish a destination. Track the delayed
-        // fallback so reload/stop cannot leave an orphaned movement command behind.
-        const pf = window.gameClient?.world?.pathfinder;
-        if (!success || !pf?.__finalDestination) {
-            state.fallbackMoveTimerId = window.setTimeout(() => {
-                state.fallbackMoveTimerId = null;
-                if (!state.running || state.pausedForCombat || state.positionUnavailable ||
-                    bot.attack?.isCombatActive?.()) return;
-                if (fallbackRequestId !== state.fallbackMoveRequestId ||
-                    fallbackWaypointIndex !== state.currentIndex ||
-                    fallbackRouteRevision !== state.routeRevision) return;
-                // A reconnect may replace the native Pathfinder in this window.
-                const livePf = window.gameClient?.world?.pathfinder;
-                if (livePf !== pf || livePf?.__finalDestination || livePf?.__isAutoWalking) return;
-                const current = bot.getPlayerPosition();
-                if (!current) return;
-
-                // If the native long-range request failed to establish any
-                // destination at all, prefer a real loaded-map A* segment over
-                // the old blind one-tile fallback.
-                if (tryCaveOffscreenFrontierRecovery(waypoint, Date.now(), "native path did not start"))
-                    return;
-                // A repeated loaded-frontier loop means the direct same-floor
-                // fallback is also unsafe: it would simply walk back into the
-                // same wall. Leave movement idle so the normal 5s/NO_WAY
-                // recovery can choose another route waypoint (often the nearby
-                // Stand/hole transition) instead.
-                if (isOffscreenFrontierBlocked(waypoint, Date.now())) {
-                    if (
-                        forceLoadedFrontierWalkRecovery(
-                            waypoint,
-                            Date.now(),
-                            "frontier remained blocked after native path failure"
-                        )
-                    ) {
-                        return;
-                    }
-                    return;
-                }
-
-                const dx = waypoint.x - current.x;
-                const dy = waypoint.y - current.y;
-                const stepX = dx > 0 ? 1 : (dx < 0 ? -1 : 0);
-                const stepY = dy > 0 ? 1 : (dy < 0 ? -1 : 0);
-                const attempts = [
-                    { dx: stepX, dy: 0 },
-                    { dx: 0, dy: stepY },
-                    { dx: stepX, dy: stepY }
-                ];
-                for (const a of attempts) {
-                    const nx = current.x + a.dx;
-                    const ny = current.y + a.dy;
-                    if (!a.dx && !a.dy) continue;
-                    if (bot.blacklist?.isBlacklisted(nx, ny, current.z)) continue;
-
-                    const lureActive =
-                        bot.attack?.isLureActive?.() === true;
-
-                    const fallbackTile =
-                        getTileAt({
-                            x: nx,
-                            y: ny,
-                            z: current.z
-                        });
-
-                    const fallbackWalkable =
-                        config.ignoreFields === true
-                            ? caveFieldPassable(
-                                fallbackTile,
-                                null
-                            )
-                            : isTileWalkable(
-                                nx,
-                                ny,
-                                current.z,
-                                !lureActive
-                            );
-
-                    if (!fallbackWalkable) {
-                        continue;
-                    }
-
-                    if (
-                        !isStaticLureStepValid(
-                            current,
-                            { x: nx, y: ny, z: current.z }
-                        )
-                    ) {
-                        continue;
-                    }
-
-                    if (fallbackTile && isFloorChangeTile(fallbackTile))
-                        continue;
-
-                    const dir = getDirection(a.dx, a.dy);
-                    if (dir !== null && window.gameClient?.keyboard) {
-                        window.gameClient.keyboard.handleMoveKey(dir);
-                        state.lastPathAt = Date.now();
-                        break;
-                    }
-                }
-            }, 75);
-        }
-        return success;
+        // Existing 5-second progress/recovery logic handles unavailable routes.
+        // Never invoke native findPath or send a blind step into an obstacle.
+        return false;
     }
 
     function goToPosition(position) {
@@ -33106,6 +32959,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     function tick() {
         if (!state.running)
             return;
+        refreshCavePacketBatch();
 
         // The client may replace #cancelmessage/#notification on reconnect.
         // Reuse this existing 500ms tick to rebind observers as needed, instead
@@ -36264,9 +36118,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         resetOffscreenFrontierTracking();
         state.fallbackMoveRequestId++;
         stopNoWayObserver();
-        // Do not leave CaveBot's wrapped native search on the game client after
-        // CaveBot stops (including a Pink Skull or circuit-breaker safety stop).
-        uninstallFieldIgnoringPathfinder();
+        releaseCavePacketBatch(true);
         if (state.timerId != null) {
             window.clearTimeout(state.timerId);
             state.timerId = null;
@@ -37023,7 +36875,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         start();
 
     bot.addCleanup(() => {
-        uninstallFieldIgnoringPathfinder();
+        releaseCavePacketBatch(true);
     });
 
     bot.cave = {
@@ -37808,6 +37660,267 @@ window.__minibiaBotBundle.installEquipRingModule = function installEquipRingModu
         startCaptureRing, clearCaptureMode,
     };
 };
+
+/** Boots Swapper: current target selects combat boots; otherwise idle boots. */
+window.__minibiaBotBundle.installBootsSwapperModule = function installBootsSwapperModule(bot) {
+    const storageKey = "minibiaBot.bootsSwapper.config";
+    const SWAP_COOLDOWN_MS = 2000;
+    const IDLE_GRACE_MS = 2000;
+    const state = {
+        running: false, destroyed: false, timerId: null, player: null, equipment: null,
+        mode: null, noTargetSince: null, lastActionAt: null, pending: null,
+        retryAfter: 0, lastCountId: 0, lastCountAt: 0,
+        captureMode: null, captureHandler: null, captureKeyHandler: null, captureTimer: null,
+        reason: "Stopped"
+    };
+    const config = Object.assign({ enabled: false, idleId: 0, combatId: 0, idleSid: 0, combatSid: 0 },
+        bot.storage.get(storageKey, {}));
+    const validId = value => Number.isSafeInteger(Number(value)) && Number(value) > 0 && Number(value) <= 65535 ? Number(value) : 0;
+    function normalizeConfig() {
+        for (const field of ["idleId", "combatId", "idleSid", "combatSid"]) config[field] = validId(config[field]);
+        config.enabled = config.enabled === true;
+    }
+    normalizeConfig();
+    function persist() { bot.storage.set(storageKey, { ...config }); }
+    function refreshUi() { bot.ui?.refreshBootsSwapperStatus?.(); }
+    function getBootsSlot() {
+        const slot = window.CONST?.EQUIPMENT?.BOOTS;
+        return Number.isInteger(slot) && slot >= 0 ? slot : 3;
+    }
+    function getEquippedBoots() { return window.gameClient?.player?.equipment?.getSlotItem?.(getBootsSlot()) || null; }
+    function getDefinition(item) {
+        const client = window.gameClient;
+        return (item?.sid && client?.itemDefinitionsBySid?.[item.sid]) || client?.itemDefinitionsByCid?.[item?.id] || null;
+    }
+    function isBoots(item) {
+        const properties = getDefinition(item)?.properties || {};
+        const slot = String(properties.slotType || properties.slot || "").toLowerCase();
+        return slot === "boots" || slot === "feet" || /\bboots?\b/i.test(properties.name || item?.name || "");
+    }
+    function getInventoryIdentity(item) {
+        if (!item) return { id: 0, sid: 0 };
+        const client = window.gameClient;
+        const dormantSid = validId(getDefinition(item)?.properties?.transformDeEquipTo);
+        const dormant = dormantSid ? client?.itemDefinitionsBySid?.[dormantSid] : null;
+        if (dormant && validId(dormant.id)) return { id: validId(dormant.id), sid: dormantSid };
+        return { id: validId(item.id), sid: validId(item.sid) };
+    }
+    function matchesBoots(item, id, sid = 0) {
+        if (!item || !id) return false;
+        const identity = getInventoryIdentity(item);
+        return (Number(item.id) === id || identity.id === id) &&
+            (!sid || Number(item.sid) === sid || identity.sid === sid);
+    }
+    function hasLiveTarget() {
+        const player = window.gameClient?.player;
+        const target = player?.getTarget?.() || player?.__target || null;
+        if (!target) return false;
+        const health = target.state?.health ?? target.health;
+        return health == null || !Number.isFinite(Number(health)) || Number(health) > 0;
+    }
+    function updateMode(now) {
+        if (hasLiveTarget()) {
+            state.noTargetSince = null;
+            state.mode = "combat";
+        } else {
+            if (state.noTargetSince == null) state.noTargetSince = now;
+            if (state.mode !== "combat" || now - state.noTargetSince >= IDLE_GRACE_MS)
+                state.mode = "idle";
+        }
+        return state.mode;
+    }
+    function syncSession() {
+        const player = window.gameClient?.player || null;
+        const equipment = player?.equipment || null;
+        if (state.player !== player || state.equipment !== equipment) {
+            state.player = player;
+            state.equipment = equipment;
+            state.mode = null;
+            state.noTargetSince = null;
+            state.lastActionAt = null;
+            state.pending = null;
+            state.retryAfter = 0;
+            state.lastCountId = 0;
+            state.lastCountAt = 0;
+        }
+        return !!player && !!equipment;
+    }
+    function trySwap(now = Date.now()) {
+        if (!state.running || state.destroyed) return false;
+        if (!syncSession() || window.gameClient?.networkManager?.isConnected?.() === false) {
+            state.reason = "Waiting for character";
+            return false;
+        }
+        const mode = updateMode(now);
+        const id = config[`${mode}Id`], sid = config[`${mode}Sid`];
+        const worn = getEquippedBoots();
+        if (state.pending) {
+            if (matchesBoots(worn, state.pending.id, state.pending.sid)) {
+                state.pending = null;
+            } else if (now - state.pending.at < 3500) {
+                state.reason = "Waiting for boots swap";
+                return false;
+            } else {
+                state.pending = null;
+                state.retryAfter = now + 5000;
+            }
+        }
+        if (!id) {
+            state.reason = `Set ${mode === "combat" ? "targeting" : "no-target"} boots ID`;
+            return false;
+        }
+        if (matchesBoots(worn, id, sid)) {
+            state.reason = `${mode === "combat" ? "Targeting" : "No-target"} boots equipped`;
+            return false;
+        }
+        if (state.lastActionAt != null && now - state.lastActionAt < SWAP_COOLDOWN_MS) {
+            state.reason = "Swap cooldown";
+            return false;
+        }
+        if (now < state.retryAfter) { state.reason = "Waiting to retry boots swap"; return false; }
+        if (state.lastCountId !== id || now - state.lastCountAt >= 5000) {
+            state.lastCountId = id;
+            state.lastCountAt = now;
+            bot.requestItemCounts?.([{ id, fluidType: 0 }]);
+        }
+        const reading = bot.getItemCountReading?.(id, 0);
+        const visible = bot.items?.find?.({ cid: id, sid: sid || null });
+        if (!visible && reading && Number(reading.count) === 0 &&
+            now - Number(reading.at || 0) <= 12000) {
+            state.reason = "Selected boots are missing";
+            return false;
+        }
+        const hm = window.gameClient?.interface?.hotbarManager;
+        if (typeof hm?.__handleItemUseWithMode !== "function") {
+            state.reason = "Boots equip function unavailable";
+            return false;
+        }
+        const resolvedSid = sid || validId(window.gameClient?.sidByCid?.[id]) ||
+            validId(window.gameClient?.itemDefinitionsByCid?.[id]?.sid);
+        const sent = bot.actions.runShared("boots-swap", bot.actions.priorities.UTILITY, () => {
+            // Recheck the boots slot inside the shared inventory-action lock.
+            if (matchesBoots(getEquippedBoots(), id, sid)) return false;
+            const nativeDebounceMs = Number(typeof HotbarManager !== "undefined"
+                ? HotbarManager.prototype.EQUIP_MOVE_DEBOUNCE_MS : 300) || 300;
+            if (hm.__lastEquipMoveAt && now - hm.__lastEquipMoveAt < nativeDebounceMs)
+                return false; // Native equipment debounce would silently discard it.
+            hm.__handleItemUseWithMode({ id, sid: resolvedSid, fluidType: 0 }, "boots");
+            return true;
+        }, 120);
+        if (!sent) { state.reason = "Waiting for other action"; return false; }
+        state.lastActionAt = now;
+        state.pending = { id, sid, at: now };
+        state.reason = `Switching to ${mode === "combat" ? "targeting" : "no-target"} boots`;
+        return true;
+    }
+    function tick() {
+        state.timerId = null;
+        if (!state.running || state.destroyed) return;
+        try { trySwap(); }
+        catch (error) { state.reason = "Boots swap failed"; state.retryAfter = Date.now() + 5000; bot.log("Boots Swapper:", error?.message || String(error)); }
+        finally {
+            if (state.running && !state.destroyed) state.timerId = window.setTimeout(tick, 250);
+        }
+    }
+    function clearCaptureMode() {
+        if (state.captureHandler) document.removeEventListener("click", state.captureHandler, true);
+        if (state.captureKeyHandler) document.removeEventListener("keydown", state.captureKeyHandler, true);
+        if (state.captureTimer != null) window.clearTimeout(state.captureTimer);
+        state.captureHandler = state.captureKeyHandler = state.captureTimer = null;
+        state.captureMode = null;
+        refreshUi();
+    }
+    function startCaptureBoots(mode) {
+        if (state.destroyed || !["idle", "combat"].includes(mode)) return false;
+        const cancel = state.captureMode === mode;
+        clearCaptureMode();
+        if (cancel) return false;
+        bot.equipRing?.clearCaptureMode?.();
+        state.captureMode = mode;
+        state.reason = "Click boots in an open backpack or equipment slot";
+        state.captureHandler = event => {
+            const slot = event?.target?.closest?.(".slot[slotindex]");
+            if (!slot) return;
+            event.preventDefault(); event.stopPropagation(); event.stopImmediatePropagation?.();
+            let item = null, equipmentBootsSlot = false;
+            const containerEl = slot.closest?.("[containerindex]") || slot.closest?.("[containerIndex]");
+            if (containerEl) {
+                const containerId = Number(containerEl.getAttribute("containerindex") || containerEl.getAttribute("containerIndex"));
+                const index = Number(slot.getAttribute("slotindex"));
+                if (Number.isSafeInteger(index) && index >= 0) {
+                    for (const container of window.gameClient?.player?.__openedContainers || []) {
+                        if (Number(container?.__containerId) === containerId) { item = container.getSlotItem?.(index); break; }
+                    }
+                }
+            } else {
+                const eq = window.gameClient?.player?.equipment;
+                for (let index = 0; index < (eq?.slots?.length || 0); index++) {
+                    const el = eq.slots[index]?.element;
+                    if (el && (el === slot || el.contains?.(slot))) {
+                        item = eq.getSlotItem?.(index);
+                        equipmentBootsSlot = index === getBootsSlot();
+                        break;
+                    }
+                }
+            }
+            if (!item || (!equipmentBootsSlot && !isBoots(item))) {
+                state.reason = "Select a boots item";
+                refreshUi();
+                return;
+            }
+            const identity = getInventoryIdentity(item);
+            if (!identity.id) { state.reason = "Could not read boots ID"; refreshUi(); return; }
+            updateConfig({ [`${mode}Id`]: identity.id, [`${mode}Sid`]: identity.sid });
+            state.reason = `${mode === "combat" ? "Targeting" : "No-target"} boots ID selected`;
+            clearCaptureMode();
+        };
+        state.captureKeyHandler = event => { if (event.key === "Escape") { state.reason = "Boots selection cancelled"; clearCaptureMode(); } };
+        document.addEventListener("click", state.captureHandler, true);
+        document.addEventListener("keydown", state.captureKeyHandler, true);
+        state.captureTimer = window.setTimeout(() => { state.reason = "Boots selection expired"; clearCaptureMode(); }, 30000);
+        refreshUi();
+        return true;
+    }
+    function updateConfig(next = {}) {
+        for (const mode of ["idle", "combat"]) {
+            if (Object.hasOwn(next, `${mode}Id`)) {
+                config[`${mode}Id`] = validId(next[`${mode}Id`]);
+                config[`${mode}Sid`] = validId(next[`${mode}Sid`]);
+            }
+        }
+        normalizeConfig();
+        persist();
+        refreshUi();
+        return { ...config };
+    }
+    function start() {
+        if (state.destroyed || state.running) return false;
+        state.running = true; config.enabled = true; persist();
+        tick(); refreshUi();
+        return true;
+    }
+    function stop(options = {}) {
+        const wasRunning = state.running;
+        state.running = false;
+        if (state.timerId != null) window.clearTimeout(state.timerId);
+        state.timerId = null;
+        // Keep lastActionAt/pending across a quick stop/start: an accepted
+        // inventory move still needs confirmation and the two-second cooldown.
+        clearCaptureMode();
+        if (options.persistEnabled !== false) { config.enabled = false; persist(); }
+        state.reason = "Stopped"; refreshUi();
+        return wasRunning;
+    }
+    function status() {
+        return { running: state.running, mode: state.mode, reason: state.reason,
+            selecting: state.captureMode, lastActionAt: state.lastActionAt,
+            cooldownRemainingMs: state.lastActionAt == null ? 0 : Math.max(0, SWAP_COOLDOWN_MS - (Date.now() - state.lastActionAt)) };
+    }
+    bot.bootsSwapper = { start, stop, status, config, updateConfig, startCaptureBoots, clearCaptureMode, trySwap };
+    bot.addCleanup(() => { stop({ persistEnabled: false }); state.destroyed = true; state.player = state.equipment = state.pending = null; });
+    if (config.enabled) start();
+};
+
 
 /**
  * ==================================================================================
@@ -46783,7 +46896,7 @@ window.__minibiaBotBundle.installPinkSkullDetectorModule = function installPinkS
         // Module errors must never prevent the disconnect. Preserve enabled
         // preferences so that a deliberate reload does not silently erase them.
         for (const name of ["autoPickup", "cave", "attack", "runeShooter", "rune", "heal", "invisible", "magicShield",
-                            "equipRing", "eat", "conjureFood", "paladin", "looter"]) {
+                            "equipRing", "bootsSwapper", "eat", "conjureFood", "paladin", "looter"]) {
             try { bot[name]?.stop?.({ persistEnabled: false }); }
             catch (e) { bot.log(`Pink Skull: failed to stop ${name}:`, e); }
         }
@@ -46879,6 +46992,7 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
         "minibiaBot.cave.transitions",
         "minibiaBot.cave.presets",
         "minibiaBot.equipRing.config",
+        "minibiaBot.bootsSwapper.config",
         "minibiaBot.eat.config",
         "minibiaBot.conjureFood.config",
         "minibiaBot.talk.config",
@@ -47736,6 +47850,7 @@ window.__minibiaBotBundle.installSpecialAreasModule = function installSpecialAre
         if(tile!==destination && bot.cave?.isFloorChangeTile?.(tile))return false;
         const items=Array.isArray(tile.items)?tile.items:[];
         const hasField=items.some(isMagicFieldItem);
+        if(options.avoidFields===true&&hasField)return false;
         const hasKnownWalkableObject=items.some(isKnownWalkableCrate);
         if(!tile.isWalkable?.() && !tile.__hasWalkableGroundItem?.() && !(options.fieldAware===true&&hasField) && !hasKnownWalkableObject)return false;
         try{
@@ -48250,8 +48365,8 @@ window.__minibiaBotBundle.installAntiAfkModule = function installAntiAfkModule(b
  */
 window.__minibiaBotBundle.installClientImprovements = function(bot) {
     const readings=new Map(),listeners=new Set(),requests=new Map();
-    let player=null,hunt=null,huntAt=0,disposed=false,requestTimer=null;const queued=new Set();
-    function sync(){const p=window.gameClient?.player;if(p!==player){player=p;readings.clear();requests.clear();queued.clear();if(requestTimer)clearTimeout(requestTimer);requestTimer=null;hunt=null;huntAt=0;}}
+    let player=null,disposed=false,requestTimer=null;const queued=new Set();
+    function sync(){const p=window.gameClient?.player;if(p!==player){player=p;readings.clear();requests.clear();queued.clear();if(requestTimer)clearTimeout(requestTimer);requestTimer=null;}}
     function request(sids,force=false){
         sync();if(disposed||typeof ItemCountQueryPacket!=='function'||!window.gameClient?.send||window.gameClient?.networkManager?.isConnected?.()===false)return false;
         const now=Date.now(),ids=[...new Set(sids.map(Number).filter(n=>Number.isInteger(n)&&n>0&&n<=65535))].filter(n=>queued.has(n)||force||now-(requests.get(n)??-Infinity)>=1000);
@@ -48263,12 +48378,10 @@ window.__minibiaBotBundle.installClientImprovements = function(bot) {
     function count(sid,timeout=5000){return new Promise((resolve,reject)=>{let done=false;const started=Date.now();const finish=(error,r)=>{if(done)return;done=true;clearTimeout(timer);listeners.delete(on);error?reject(error):resolve(r.count);};const on=r=>{if(r.sid===Number(sid)&&r.at>=started)finish(null,r);};const timer=setTimeout(()=>finish(new Error('Exact SID inventory count timed out')),timeout);listeners.add(on);if(!request([sid],true))finish(new Error('Exact SID inventory count unavailable'));});}
     function hook(name,accept){const proto=typeof PacketReader!=='undefined'?PacketReader.prototype:null,original=proto?.[name];if(typeof original!=='function')return;const wrapped=function(...args){const result=original.apply(this,args);if(!disposed){sync();accept(result);}return result;};proto[name]=wrapped;bot.addCleanup(()=>{if(proto[name]===wrapped)proto[name]=original;});}
     hook('readItemCountResult',result=>{for(const item of result?.items||[]){const r={sid:Number(item.sid),count:Math.max(0,Number(item.count)||0),at:Date.now()};readings.set(r.sid,r);listeners.forEach(fn=>fn(r));}while(readings.size>512)readings.delete(readings.keys().next().value);});
-    hook('readHuntInfo',result=>{if(result){hunt=result;huntAt=Date.now();}});
     bot.sidInventory={request,reading,count};
     bot.isPlayerSummon=creature=>{const master=Number(creature?.masterId)||0;if(!master)return false;const c=window.gameClient;if(master===Number(c?.player?.id))return true;const owner=c?.world?.activeCreatures?.[master];return !!owner&&typeof CONST!=='undefined'&&owner.type===CONST.TYPES?.PLAYER;};
     bot.toolReach=cid=>{const type=window.gameClient?.itemDefinitionsByCid?.[cid]?.properties?.type;return type==='rune'||type==='fluidContainer'||Number(cid)===3483?Infinity:Number(cid)===4863?2:1;};
     bot.toolInReach=(cid,from,to)=>!!from&&!!to&&Number(from.z)===Number(to.z)&&Math.max(Math.abs(from.x-to.x),Math.abs(from.y-to.y))<=bot.toolReach(cid);
-    bot.huntStats={status:()=>{sync();return {info:hunt,at:huntAt};},mount(panel){const host=panel?.querySelector('[data-tab-panel="status"]');if(!host||host.querySelector('[data-hunt-section]'))return;const section=document.createElement('div');section.setAttribute('data-hunt-section','');section.className='mb-section';section.innerHTML='<div class="mb-section-title"><span class="mb-title-text">Hunt Statistics</span></div><div data-hunt-stats class="mb-small-note"></div><div class="prof-actions"><button type="button" class="mb-small-button" data-hunt-command="/hunt info">Refresh</button><button type="button" class="mb-small-button" data-hunt-command="/hunt start quiet">Start</button><button type="button" class="mb-small-button" data-hunt-command="/hunt pause quiet">Pause</button><button type="button" class="mb-small-button" data-hunt-command="/hunt resume quiet">Resume</button><button type="button" class="mb-small-button" data-hunt-command="/hunt reset quiet">Reset</button></div>';host.prepend(section);const click=e=>{const command=e.target?.getAttribute?.('data-hunt-command');if(command)window.gameClient?.interface?.channelManager?.sendMessageText?.(command,undefined,true);};section.addEventListener('click',click);const render=()=>{if(!section.getClientRects().length)return;sync();const info=hunt||window.gameClient?.interface?.huntWindow?.__info;const n=v=>Number(v||0).toLocaleString();const stats=section.querySelector('[data-hunt-stats]');if(!info){stats.textContent='Press Refresh to read the server hunt statistics.';return;}const skills=window.gameClient?.player?.skills,level=Number(skills?.level),xp=Number(skills?.__skills?.experience),rate=Number(info.xpPerHour);let ttl='—';if(level>0&&Number.isFinite(xp)&&rate>0){const l=level+1,next=Math.round((50/3)*(l*l*l-6*l*l+17*l-12)),seconds=Math.ceil(Math.max(0,next-xp)/rate*3600);ttl=`${Math.floor(seconds/3600)}h ${Math.floor(seconds%3600/60)}m`;}const metrics=[['XP/h',n(rate)],['XP',n(info.xp)],['To level',ttl],['Loot',n(info.lootValue)+' gp'],['Collected',n(info.lootValueTaken)+' gp'],['Supplies',n(info.suppliesValue)+' gp']];const signature=JSON.stringify(metrics);if(stats.dataset.signature===signature)return;stats.dataset.signature=signature;stats.replaceChildren();for(let row=0;row<2;row++){const line=document.createElement('div');line.className='mb-hunt-stat-row';for(const [label,value]of metrics.slice(row*3,row*3+3)){const cell=document.createElement('div');cell.textContent=label+': '+value;line.append(cell);}stats.append(line);} };render();const timer=setInterval(render,1000);bot.addCleanup(()=>{clearInterval(timer);section.removeEventListener('click',click);section.remove();});}};
     bot.addCleanup(()=>{disposed=true;if(requestTimer)clearTimeout(requestTimer);requestTimer=null;queued.clear();listeners.clear();readings.clear();requests.clear();});
 };
 
@@ -52108,7 +52221,6 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
             details.append(summary,...Array.from(body.childNodes));body.append(details);
         }
         panel.querySelectorAll('[data-client-extras]').forEach(s=>s.classList.add('mb-new-section'));
-        panel.querySelector('[data-hunt-stats]')?.closest('.mb-section')?.classList.add('mb-new-section');
         const style=document.createElement('style');style.textContent=`
 #minibia-bot-panel .mb-new-section{color:var(--mb-hub-text-2,#cfc8b8);font-size:11px;}
 #minibia-bot-panel .mb-new-section .mb-small-note{color:var(--mb-hub-muted,#a39d90);}
@@ -52123,8 +52235,6 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
 #minibia-bot-panel .mb-native-grid label{font-size:10px;min-width:0;margin:0!important;}
 #minibia-bot-panel .mb-cave-details{border-top:1px solid rgba(255,255,255,.08);margin-top:10px;padding-top:6px;}
 #minibia-bot-panel .mb-cave-details>summary{cursor:pointer;display:list-item;}
-#minibia-bot-panel [data-hunt-stats]{display:grid;gap:5px;margin:6px 0;}
-#minibia-bot-panel .mb-hunt-stat-row{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:5px;font-size:11px;}
 `;panel.append(style);
     }
 
@@ -53220,6 +53330,28 @@ function upgradeSectionHeaders(panel) {
         const toggle = document.getElementById("minibia-bot-auto-magic-shield-enabled");
         if (toggle)
             toggle.checked = !!bot.magicShield?.status?.().running;
+    }
+
+    function refreshBootsSwapperStatus() {
+        const status = bot.bootsSwapper?.status?.();
+        const toggle = document.getElementById("minibia-bot-boots-swapper-enabled");
+        if (toggle && document.activeElement !== toggle) toggle.checked = !!status?.running;
+        for (const mode of ["idle", "combat"]) {
+            const input = document.getElementById(`minibia-bot-boots-${mode}-id`);
+            if (input && document.activeElement !== input) input.value = bot.bootsSwapper?.config?.[`${mode}Id`] || "";
+            const button = document.getElementById(`minibia-bot-boots-${mode}-select`);
+            if (button) {
+                const selecting = status?.selecting === mode;
+                button.setAttribute("aria-pressed", selecting ? "true" : "false");
+                button.title = selecting ? "Click boots in a backpack/equipment slot. Click 🔍 again or press Esc to cancel."
+                    : `Click, then click your ${mode === "idle" ? "no-target" : "targeting"} boots in a backpack or equipment slot`;
+            }
+        }
+        const label = document.getElementById("minibia-bot-boots-swapper-status");
+        if (label) {
+            label.textContent = status?.reason || "";
+            label.hidden = !status?.running && !status?.selecting;
+        }
     }
 
     function refreshEquipRingStatus() {
@@ -54759,6 +54891,109 @@ function upgradeSectionHeaders(panel) {
   align-items: end;
 }
 
+/* Compact Tools: balanced toggles and matching equipment controls. */
+#minibia-bot-panel .mb-tools-toggle-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 2px 18px;
+}
+#minibia-bot-panel .mb-tools-toggle-grid .mb-toggle {
+  margin: 0;
+  min-height: 22px;
+  box-sizing: border-box;
+}
+#minibia-bot-panel .mb-tools-food {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+#minibia-bot-panel .mb-tools-food input[type="number"] {
+  width: 42px;
+  height: 24px;
+  padding: 2px 4px;
+  text-align: center;
+}
+#minibia-bot-panel .mb-tools-equipment {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 8px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(255,255,255,.08);
+}
+#minibia-bot-panel .mb-tools-equip-card {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  min-width: 0;
+  padding: 9px;
+  border: 1px solid rgba(255,255,255,.1);
+  border-radius: 4px;
+  background: rgba(0,0,0,.12);
+}
+#minibia-bot-panel .mb-tools-equip-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  min-height: 20px;
+}
+#minibia-bot-panel .mb-tools-equip-header .mb-toggle {
+  margin: 0;
+  font-weight: bold;
+}
+#minibia-bot-panel .mb-tools-count,
+#minibia-bot-panel .mb-tools-cooldown {
+  font-size: 10px;
+  color: #aaa;
+  white-space: nowrap;
+}
+#minibia-bot-panel .mb-tools-item-row {
+  display: grid;
+  grid-template-columns: 60px minmax(0, 1fr) 26px;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+#minibia-bot-panel .mb-tools-item-row label {
+  font-size: 10px;
+  color: #bdbdbd;
+}
+#minibia-bot-panel .mb-tools-item-row input {
+  min-width: 0;
+  height: 26px;
+  padding: 3px 4px;
+  border-radius: 3px;
+  text-align: center;
+}
+#minibia-bot-panel .mb-tools-item-row .mb-tools-picker {
+  width: 26px;
+  height: 26px;
+  min-width: 26px;
+  padding: 0;
+  border-radius: 3px;
+  font-size: 12px;
+  line-height: 1;
+}
+#minibia-bot-panel .mb-tools-picker[aria-pressed="true"] {
+  border-color: #dbc691;
+}
+#minibia-bot-panel .mb-tools-ring-options {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+#minibia-bot-panel .mb-tools-ring-options .mb-toggle {
+  font-size: 10px;
+  margin: 0;
+}
+#minibia-bot-panel .mb-tools-status {
+  font-size: 10px;
+  color: #aaa;
+  overflow-wrap: anywhere;
+}
+#minibia-bot-panel .mb-tools-status[hidden] { display: none; }
+
 /* ── Lists ── */
 #minibia-bot-panel .mb-list {
   display: flex;
@@ -55851,40 +56086,57 @@ function upgradeSectionHeaders(panel) {
 <div class="mb-tab-panel" data-tab-panel="utility">
 
   <!-- Tools -->
-  <div class="mb-section">
-    <div class="mb-section-title">
-      <span class="mb-title-text">🛠️ Tools</span>
-    </div>
-    <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px 32px;">
-      <!-- Left Column -->
-      <div style="display:flex; flex-direction:column; gap:10px;">
-        <div style="display:flex; align-items:center; gap:12px;">
-          <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-auto-eat-enabled" /><span>Eat Food</span></label>
-          <label class="mb-field" style="flex:0 0 60px;"><input type="number" id="minibia-bot-auto-eat-hotkey" min="1" max="12" placeholder="10" style="padding:4px 4px;font-size:11px;text-align:center;" /></label>
-        </div>
-        <label class="mb-toggle" style="margin:0; font-size:11px;" title="When food time drops below 60 seconds and mana is at least 30, cast exevo pan and eat the conjured ham/meat/bread/fish/cookie"><input type="checkbox" id="minibia-bot-conjure-food-enabled" /><span>Conjure Food</span></label>
-        <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-auto-invisible-enabled" /><span>Invisible</span></label>
-        <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-light-hack-enabled" /><span>Light Hack (Full)</span></label>
-        <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-light-hack-legit-enabled" /><span>Light Hack (Utevo)</span></label>
-        <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-antiafk-enabled" /><span>Anti-AFK</span></label>
-        <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-autostacker-enabled" /><span>Auto Stacker</span></label>
+  <div class="mb-section mb-tools-section">
+    <div class="mb-section-title"><span class="mb-title-text">🛠️ Tools</span></div>
+    <div class="mb-tools-toggle-grid">
+      <div class="mb-tools-food">
+        <label class="mb-toggle"><input type="checkbox" id="minibia-bot-auto-eat-enabled" /><span>Eat Food</span></label>
+        <input type="number" id="minibia-bot-auto-eat-hotkey" min="1" max="12" placeholder="10" title="Food hotkey slot" aria-label="Food hotkey slot" />
       </div>
-      <!-- Right Column -->
-      <div style="display:flex; flex-direction:column; gap:10px;">
-        <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-auto-magic-shield-enabled" /><span>Utamo Vita</span></label>
-        <div style="display:flex; flex-direction:column; gap:10px;">
-          <div style="display:flex; align-items:center; gap:4px; flex-wrap:nowrap;">
-            <label class="mb-toggle" style="margin:0; font-size:11px; flex:0 0 auto;"><input type="checkbox" id="minibia-bot-equip-ring-enabled" /><span>Equip Ring</span></label>
-            <input type="number" id="minibia-bot-equip-ring-id" min="0" max="65535" step="1" placeholder="ID" title="Ring inventory item ID (CID). Empty or 0 = any ring." aria-label="Ring item ID" style="box-sizing:border-box;width:42px;min-width:42px;padding:4px 1px;font-size:10px;text-align:center;" />
-            <button type="button" class="mb-small-button" id="minibia-bot-equip-ring-select" title="Click, then click a ring in an open backpack or equipment slot" aria-label="Select ring item ID" aria-pressed="false" style="padding:3px 4px; min-width:22px; font-size:11px; line-height:1.2;">🔍</button>
-            <span id="minibia-bot-equip-ring-count" title="Set a ring ID to use the server-side item count." style="font-size:10px; color:#aaa; min-width:24px; white-space:nowrap;"> </span>
-          </div>
-          <label class="mb-toggle" style="margin:0; font-size:11px;" title="When mana is 98% or higher, safely stow the selected ring in inventory"><input type="checkbox" id="minibia-bot-equip-ring-unequip-98" /><span>Unequip Ring 98%</span></label>
-          <label class="mb-toggle" style="margin:0; font-size:11px;" title="Alert at most once per minute when the server reports no matching ring in your full inventory"><input type="checkbox" id="minibia-bot-equip-ring-warn" /><span>Alert missing ring</span></label>
+      <label class="mb-toggle"><input type="checkbox" id="minibia-bot-auto-magic-shield-enabled" /><span>Utamo Vita</span></label>
+      <label class="mb-toggle" title="Conjure food when food time is below 60 seconds and mana is at least 30"><input type="checkbox" id="minibia-bot-conjure-food-enabled" /><span>Conjure Food</span></label>
+      <label class="mb-toggle"><input type="checkbox" id="minibia-bot-auto-invisible-enabled" /><span>Invisible</span></label>
+      <label class="mb-toggle"><input type="checkbox" id="minibia-bot-light-hack-enabled" /><span>Light Hack (Full)</span></label>
+      <label class="mb-toggle"><input type="checkbox" id="minibia-bot-light-hack-legit-enabled" /><span>Light Hack (Utevo)</span></label>
+      <label class="mb-toggle"><input type="checkbox" id="minibia-bot-antiafk-enabled" /><span>Anti-AFK</span></label>
+      <label class="mb-toggle"><input type="checkbox" id="minibia-bot-autostacker-enabled" /><span>Auto Stacker</span></label>
+      <label class="mb-toggle"><input type="checkbox" id="minibia-bot-pink-skull-enabled" /><span>Pink Skull</span></label>
+      <label class="mb-toggle"><input type="checkbox" id="minibia-bot-reconnect-enabled" /><span>Auto-Reconnect</span></label>
+      <label class="mb-toggle"><input type="checkbox" id="minibia-bot-autostacker-convert-currency" /><span>Convert Currency</span></label>
+    </div>
+
+    <div class="mb-tools-equipment">
+      <div class="mb-tools-equip-card">
+        <div class="mb-tools-equip-header">
+          <label class="mb-toggle"><input type="checkbox" id="minibia-bot-equip-ring-enabled" /><span>Equip Ring</span></label>
+          <span class="mb-tools-count" id="minibia-bot-equip-ring-count" title="Server inventory count"></span>
         </div>
-        <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-pink-skull-enabled" /><span>Pink Skull</span></label>
-        <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-reconnect-enabled" /><span>Auto‑Reconnect</span></label>
-        <label class="mb-toggle" style="margin:0; font-size:11px;"><input type="checkbox" id="minibia-bot-autostacker-convert-currency" /><span>Convert Currency</span></label>
+        <div class="mb-tools-item-row">
+          <label for="minibia-bot-equip-ring-id">Ring ID</label>
+          <input type="number" id="minibia-bot-equip-ring-id" min="0" max="65535" step="1" placeholder="Any ring" title="Ring item ID. Empty or 0 = any ring." aria-label="Ring item ID" />
+          <button type="button" class="mb-small-button mb-tools-picker" id="minibia-bot-equip-ring-select" title="Click, then click a ring in a backpack or equipment slot" aria-label="Select ring item ID" aria-pressed="false">🔍</button>
+        </div>
+        <div class="mb-tools-ring-options">
+          <label class="mb-toggle" title="Safely stow the selected ring when mana is 98% or higher"><input type="checkbox" id="minibia-bot-equip-ring-unequip-98" /><span>Unequip at 98% mana</span></label>
+          <label class="mb-toggle" title="Alert when the server reports no matching ring in your inventory"><input type="checkbox" id="minibia-bot-equip-ring-warn" /><span>Alert missing ring</span></label>
+        </div>
+      </div>
+      <div class="mb-tools-equip-card">
+        <div class="mb-tools-equip-header">
+          <label class="mb-toggle"><input type="checkbox" id="minibia-bot-boots-swapper-enabled" /><span>Boots Swapper</span></label>
+          <span class="mb-tools-cooldown" title="2-second swap cooldown; waits for 2 seconds without a target before switching back">2s</span>
+        </div>
+        <div class="mb-tools-item-row">
+          <label for="minibia-bot-boots-idle-id">No target</label>
+          <input type="number" id="minibia-bot-boots-idle-id" min="1" max="65535" step="1" placeholder="Boots ID" title="Boots to wear without a target" />
+          <button type="button" class="mb-small-button mb-tools-picker" id="minibia-bot-boots-idle-select" title="Pick no-target boots from a backpack or equipment slot" aria-label="Select no-target boots ID" aria-pressed="false">🔍</button>
+        </div>
+        <div class="mb-tools-item-row">
+          <label for="minibia-bot-boots-combat-id">Targeting</label>
+          <input type="number" id="minibia-bot-boots-combat-id" min="1" max="65535" step="1" placeholder="Boots ID" title="Boots to wear with a selected target" />
+          <button type="button" class="mb-small-button mb-tools-picker" id="minibia-bot-boots-combat-select" title="Pick targeting boots from a backpack or equipment slot" aria-label="Select targeting boots ID" aria-pressed="false">🔍</button>
+        </div>
+        <span class="mb-tools-status" id="minibia-bot-boots-swapper-status" aria-live="polite" hidden></span>
       </div>
     </div>
   </div>
@@ -56911,7 +57163,6 @@ function upgradeSectionHeaders(panel) {
         // v1.6.56: keep the pre-v1.6.34 panel host. Keeping the panel in
         // document.body matches the last known-good mobile UI compositor path.
         document.body.appendChild(panel);
-        bot.huntStats?.mount?.(panel);
         bot.clientExtras?.mount?.(panel);
         bot.combatRules?.mount?.(panel);
         bot.woodcutting?.mount?.(panel);
@@ -57369,6 +57620,26 @@ function upgradeSectionHeaders(panel) {
             });
         }
 
+        // ---- Boots Swapper ----
+        const bootsToggle = panel.querySelector("#minibia-bot-boots-swapper-enabled");
+        if (bootsToggle) bootsToggle.addEventListener("change", function () {
+            if (this.checked) bot.bootsSwapper?.start?.();
+            else bot.bootsSwapper?.stop?.();
+            refreshBootsSwapperStatus();
+        });
+        for (const mode of ["idle", "combat"]) {
+            const input = panel.querySelector(`#minibia-bot-boots-${mode}-id`);
+            if (input) input.addEventListener("change", function () {
+                bot.bootsSwapper?.updateConfig?.({ [`${mode}Id`]: Number(this.value) });
+                refreshBootsSwapperStatus();
+            });
+            const button = panel.querySelector(`#minibia-bot-boots-${mode}-select`);
+            if (button) button.addEventListener("click", () => {
+                bot.bootsSwapper?.startCaptureBoots?.(mode);
+                refreshBootsSwapperStatus();
+            });
+        }
+
         // ---- Equip Ring ----
         const equipRingToggle = panel.querySelector("#minibia-bot-equip-ring-enabled");
         const equipRingId = panel.querySelector("#minibia-bot-equip-ring-id");
@@ -57381,6 +57652,7 @@ function upgradeSectionHeaders(panel) {
                 if (this.checked) bot.equipRing.start();
                 else bot.equipRing.stop();
                 refreshEquipRingStatus();
+                refreshBootsSwapperStatus();
             });
         }
         if (equipRingId) {
@@ -57390,12 +57662,14 @@ function upgradeSectionHeaders(panel) {
                 bot.equipRing?.updateConfig?.({ ringId:
                     Number.isSafeInteger(id) && id >= 1 && id <= 65535 ? id : 0 });
                 refreshEquipRingStatus();
+                refreshBootsSwapperStatus();
             });
         }
         if (equipRingSelect) {
             equipRingSelect.addEventListener("click", function () {
                 bot.equipRing?.startCaptureRing?.();
                 refreshEquipRingStatus();
+                refreshBootsSwapperStatus();
             });
         }
         if (equipRingUnequip98) {
@@ -57403,6 +57677,7 @@ function upgradeSectionHeaders(panel) {
             equipRingUnequip98.addEventListener("change", function () {
                 bot.equipRing?.updateConfig?.({ unequipRingAt98: this.checked });
                 refreshEquipRingStatus();
+                refreshBootsSwapperStatus();
             });
         }
         if (equipRingWarn) {
@@ -57410,6 +57685,7 @@ function upgradeSectionHeaders(panel) {
             equipRingWarn.addEventListener("change", function () {
                 bot.equipRing?.updateConfig?.({ warnMissingRing: this.checked });
                 refreshEquipRingStatus();
+                refreshBootsSwapperStatus();
             });
         }
 
@@ -61362,6 +61638,7 @@ function upgradeSectionHeaders(panel) {
             refreshConjureFoodStatus();
             refreshCaveStatus();
             refreshEquipRingStatus();
+            refreshBootsSwapperStatus();
             refreshTalkStatus();
             refreshVisibleCreatures();
             refreshCavePresetControls();
@@ -61474,6 +61751,7 @@ function upgradeSectionHeaders(panel) {
         refreshCaveStatus,
         refreshCavePresetControls,
         refreshEquipRingStatus,
+        refreshBootsSwapperStatus,
         refreshTalkStatus,
         refreshVisibleCreatures,
         refreshCaveClosestStatus,
@@ -64309,6 +64587,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         ["runeShooter", "minibiaBot.runeShooter.config"],
         ["cave", "minibiaBot.cave.config"],
         ["equipRing", "minibiaBot.equipRing.config"],
+        ["bootsSwapper", "minibiaBot.bootsSwapper.config"],
         ["eat", "minibiaBot.eat.config"],
         ["conjureFood", "minibiaBot.conjureFood.config"],
         ["talk", "minibiaBot.talk.config"],
@@ -64552,6 +64831,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         currentBundle.installCaveModule(bot);
         currentBundle.installSpecialAreasModule(bot);
         currentBundle.installEquipRingModule(bot);
+        currentBundle.installBootsSwapperModule(bot);
         currentBundle.installAutoEatModule(bot);
         currentBundle.installConjureFoodModule(bot);
         currentBundle.installTalkModule(bot);
@@ -64614,6 +64894,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
             cave: bot.cave.status(),
             specialAreas: bot.specialAreas?.status?.(),
             equipRing: bot.equipRing.status(),
+            bootsSwapper: bot.bootsSwapper.status(),
             eat: bot.eat.status(),
             conjureFood: bot.conjureFood.status(),
             talk: bot.talk.status(),
@@ -64639,6 +64920,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         ["combatRules", "minibiaBot.combatRules.config"],
                 ["runeShooter", "minibiaBot.runeShooter.config"],
                 ["equipRing", "minibiaBot.equipRing.config"],
+        ["bootsSwapper", "minibiaBot.bootsSwapper.config"],
                 ["eat", "minibiaBot.eat.config"],
                 ["conjureFood", "minibiaBot.conjureFood.config"],
                 ["talk", "minibiaBot.talk.config"],
@@ -64818,7 +65100,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
             version: bot.version,
             character: characterName || "(global)",
             modules: ["pz", "xray", "panic", "rune", "heal", "invisible", "magicShield",
-                "attack", "cave", "equipRing", "eat", "talk", "ui"]
+                "attack", "cave", "equipRing", "bootsSwapper", "eat", "talk", "ui"]
         });
         console.log("minibiaBot.reload()");
         return bot;
