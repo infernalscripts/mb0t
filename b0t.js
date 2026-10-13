@@ -3101,7 +3101,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.191",
+        version: "1.6.192",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -13102,7 +13102,13 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                         currentHealthPct <= finishHealthPct &&
                         damageAgeMs <= finishDamageGraceMs;
 
+                    // Preferred is an acquisition priority, not a reason to
+                    // bounce between preferred mobs as their routes change.
+                    // Dead, invalid, unreachable and stuck handoffs above
+                    // still release this target when needed.
+                    const preferredTargetProtected = currentInfo.preferred;
                     const manualTargetProtected = isManualTargetProtected(current, now);
+                    if (preferredTargetProtected) resetRetargetCandidate();
 
                     if (finishTargetProtected) {
                         state.finishTargetBlocks++;
@@ -13116,6 +13122,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
                     const ordinaryRetargetReady =
                         !state.preferredAccessBlocked &&
+                        !preferredTargetProtected &&
                         !manualTargetProtected &&
                         !finishTargetProtected &&
                         heldForMs >= stickMs &&
@@ -16744,6 +16751,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         const currentPreferredTarget =
             current &&
             isPreferredCreature(current) &&
+            Number(current.state?.health ?? current.health ?? 1) > 0 &&
             !isIgnoredTargetCreature(current) &&
             isStrictPreferredScreenVisible(current) &&
             isTargetPolicyReachable(current, "combat", now) &&
@@ -16780,7 +16788,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 threshold,
                 visibleMonsters,
                 preferredVisible: preferredActionable,
-                preferredActionableTarget: actionablePreferred,
+                preferredActionableTarget: currentPreferredTarget || actionablePreferred,
                 preferredTrackedTarget: trackedPreferred
             };
         }
@@ -16837,7 +16845,9 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         // Preferred exits lure either when it passes the SAME real checks normal
         // targeting needs, or when Targeting has already selected a live visible
         // preferred mob and now needs normal chase movement to take over.
-        const preferredHandoffTarget = actionablePreferred || currentPreferredTarget;
+        // Keep an engaged preferred mob ahead of another preferred candidate.
+        // Distance changes must not restart the handoff midway through a kill.
+        const preferredHandoffTarget = currentPreferredTarget || actionablePreferred;
         if (preferredHandoffTarget) {
             return {
                 active: false,
