@@ -1608,70 +1608,8 @@ addCleanup(() => {
                         dx !== 0 &&
                         dy !== 0;
 
-                    if (diagonal) {
-                        const z =
-                            Number(
-                                currentNode
-                                    .__position?.z
-                            );
-                        const world =
-                            window.gameClient
-                                ?.world;
-
-                        const sideA =
-                            world
-                                ?.getTileFromWorldPosition?.(
-                                    new Position(
-                                        Number(
-                                            currentNode
-                                                .__position?.x
-                                        ) + dx,
-                                        Number(
-                                            currentNode
-                                                .__position?.y
-                                        ),
-                                        z
-                                    )
-                                );
-                        const sideB =
-                            world
-                                ?.getTileFromWorldPosition?.(
-                                    new Position(
-                                        Number(
-                                            currentNode
-                                                .__position?.x
-                                        ),
-                                        Number(
-                                            currentNode
-                                                .__position?.y
-                                        ) + dy,
-                                        z
-                                    )
-                                );
-
-                        if (
-                            !isFollowFieldPassableTile(
-                                sideA,
-                                {
-                                    allowNonPvpPlayerPassThrough:
-                                        options
-                                            .allowNonPvpPlayerPassThrough ===
-                                            true
-                                }
-                            ) ||
-                            !isFollowFieldPassableTile(
-                                sideB,
-                                {
-                                    allowNonPvpPlayerPassThrough:
-                                        options
-                                            .allowNonPvpPlayerPassThrough ===
-                                            true
-                                }
-                            )
-                        ) {
-                            continue;
-                        }
-                    }
+                    // The native eight-neighbour path search validates the
+                    // destination, not the two tiles beside a diagonal step.
 
                     const penalty =
                         diagonal
@@ -3101,7 +3039,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.192",
+        version: "1.6.193",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -9722,57 +9660,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                         dx !== 0 &&
                         dy !== 0;
 
-                    // For diagonal movement, both cardinal side tiles must also
-                    // be passable. Fields on those sides are still allowed.
-                    if (diagonal) {
-                        const z =
-                            Number(
-                                currentNode
-                                    .__position?.z
-                            );
-
-                        const sideA =
-                            getTileFromPosition({
-                                x:
-                                    Number(
-                                        currentNode
-                                            .__position?.x
-                                    ) + dx,
-                                y:
-                                    Number(
-                                        currentNode
-                                            .__position?.y
-                                    ),
-                                z
-                            });
-                        const sideB =
-                            getTileFromPosition({
-                                x:
-                                    Number(
-                                        currentNode
-                                            .__position?.x
-                                    ),
-                                y:
-                                    Number(
-                                        currentNode
-                                            .__position?.y
-                                    ) + dy,
-                                z
-                            });
-
-                        if (
-                            !isTargetFieldPassableTile(
-                                sideA,
-                                false
-                            ) ||
-                            !isTargetFieldPassableTile(
-                                sideB,
-                                false
-                            )
-                        ) {
-                            continue;
-                        }
-                    }
+                    // Match native movement: a diagonal enters only its
+                    // destination tile. Its two side tiles need not be open.
 
                     const penalty =
                         diagonal ? 3 : 1;
@@ -11313,11 +11202,17 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             return usableCardinals[0];
         }
 
-        // v1.5.59: Kite chase is cardinal-only. A diagonal chase is slower,
-        // leaves the character between tiles longer, and is not worth it.
+        // Cardinals remain the first choice. If none can advance a chase,
+        // allow a validated diagonal that closes the gap instead of stalling.
         if (mode === "chase") {
-            state.kiteDiagonalRejectedNonEmergency++;
-            return null;
+            const chaseDiagonal = candidates.find(candidate =>
+                candidate.isDiagonalStep && candidate.targetDelta < 0);
+            if (!chaseDiagonal) {
+                state.kiteDiagonalRejectedNonEmergency++;
+                return null;
+            }
+            chaseDiagonal.__fallbackCounted = true;
+            return chaseDiagonal;
         }
 
         const diagonal =
@@ -15481,13 +15376,6 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             const sideB = { x: from.x, y: from.y + dy, z };
 
             if (
-                !isTileWalkable(sideA.x, sideA.y, z, true) ||
-                !isTileWalkable(sideB.x, sideB.y, z, true)
-            ) {
-                return false;
-            }
-
-            if (
                 bot.specialAreas?.hasHardAreasForFloor?.(
                     z,
                     { purpose: "combat" }
@@ -15506,14 +15394,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 return false;
             }
 
-            const tileA = getTileAtPosition(sideA);
-            const tileB = getTileAtPosition(sideB);
-            if (
-                (tileA && isFloorChangeTile(tileA)) ||
-                (tileB && isFloorChangeTile(tileB))
-            ) {
-                return false;
-            }
+            // These sides are checked only for user-defined hard-area policy;
+            // physical walls, creatures and transitions there are not entered.
         }
 
         return true;
@@ -20980,27 +20862,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 return false;
             }
 
-            // A monster occupying either corner side also invalidates a
-            // diagonal move. searchTargetPathIgnoringFields() uses the same
-            // rule when constructing a fresh route.
-            if (dx !== 0 && dy !== 0) {
-                if (
-                    !isSafeTargetApproachTile(
-                        previous.x + dx,
-                        previous.y,
-                        previous.z,
-                        false
-                    ) ||
-                    !isSafeTargetApproachTile(
-                        previous.x,
-                        previous.y + dy,
-                        previous.z,
-                        false
-                    )
-                ) {
-                    return false;
-                }
-            }
+            // Revalidate the actual queued destination tile above. A creature
+            // beside a diagonal step does not occupy that step.
 
             previous = {
                 x: Number(step.x),
@@ -29034,7 +28897,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
     // ---- FIELD-IGNORING CAVEBOT PATHFINDER ----
     // Cave owns its A* searches and direction batches. Field handling uses one
-    // passability rule for path nodes, diagonal sides and live send validation;
+    // passability rule for path destinations and live send validation;
     // native Pathfinder and other movement modules are not patched.
     function isMagicFieldItem(item) {
         if (!item)
@@ -29286,39 +29149,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                     const isDiagonal =
                         dx !== 0 && dy !== 0;
 
-                    // Custom diagonal validation. Do NOT call the native
-                    // diagonal passability helper because it can reject fields.
-                    if (isDiagonal) {
-                        const z =
-                            Number(currentNode.__position?.z);
-
-                        const sideA =
-                            getTileAt({
-                                x:
-                                    Number(currentNode.__position?.x) +
-                                    dx,
-                                y:
-                                    Number(currentNode.__position?.y),
-                                z
-                            });
-
-                        const sideB =
-                            getTileAt({
-                                x:
-                                    Number(currentNode.__position?.x),
-                                y:
-                                    Number(currentNode.__position?.y) +
-                                    dy,
-                                z
-                            });
-
-                        if (
-                            !isCaveRoutePassable(sideA, null) ||
-                            !isCaveRoutePassable(sideB, null)
-                        ) {
-                            continue;
-                        }
-                    }
+                    // A legal loaded destination can be reached diagonally
+                    // even when the two cardinal side tiles are blocked.
 
                     const penalty =
                         isDiagonal ? 3 : 1;
@@ -29705,26 +29537,16 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                         Number(currentNode.__position?.y);
                     const isDiagonal = dx !== 0 && dy !== 0;
 
-                    // Validate diagonals using the SAME passability rules as the
-                    // frontier route. Native __isDiagonalPassable() uses
-                    // isOccupied(), which would reintroduce the field problem.
+                    // Use the same destination-only diagonal rule as a
+                    // complete route; otherwise frontier searches stop here.
                     if (isDiagonal) {
-                        const z = Number(currentNode.__position?.z);
-                        const sideA = getTileAt({
-                            x: Number(currentNode.__position?.x) + dx,
-                            y: Number(currentNode.__position?.y),
-                            z
-                        });
-                        const sideB = getTileAt({
-                            x: Number(currentNode.__position?.x),
-                            y: Number(currentNode.__position?.y) + dy,
-                            z
-                        });
-
-                        if (
-                            !isCaveFrontierPassableTile(sideA) ||
-                            !isCaveFrontierPassableTile(sideB)
-                        ) {
+                        const fromPos = currentNode.__position;
+                        const sidePositions = [
+                            { x: Number(fromPos.x) + dx, y: Number(fromPos.y), z: Number(fromPos.z) },
+                            { x: Number(fromPos.x), y: Number(fromPos.y) + dy, z: Number(fromPos.z) }
+                        ];
+                        if (sidePositions.some(pos =>
+                            bot.specialAreas?.getPositionPolicy?.(pos, { purpose: "route" })?.allowed === false)) {
                             continue;
                         }
                     }
@@ -48121,8 +47943,8 @@ window.__minibiaBotBundle.installSpecialAreasModule = function installSpecialAre
                 const policy=getPositionPolicy(np,policyOptions);if(!policy.allowed)continue;
                 const dx=np.x-cur.position.x,dy=np.y-cur.position.y;
                 if(dx!==0&&dy!==0){
-                    const sideA=getTileAt({x:cur.position.x+dx,y:cur.position.y,z:from.z}), sideB=getTileAt({x:cur.position.x,y:cur.position.y+dy,z:from.z});
-                    if(!isPhysicallyPassable(sideA,null,options)||!isPhysicallyPassable(sideB,null,options))continue;
+                    // Preserve hard Special Area boundaries, while physical
+                    // side tiles do not block the native diagonal step.
                     if(!getPositionPolicy({x:cur.position.x+dx,y:cur.position.y,z:from.z},policyOptions).allowed||!getPositionPolicy({x:cur.position.x,y:cur.position.y+dy,z:from.z},policyOptions).allowed)continue;
                 }
                 let base=100;try{const c=Number(nt.getCost?.(cur.tile));if(Number.isFinite(c)&&c>0)base=c;}catch(e){}
@@ -48222,11 +48044,7 @@ window.__minibiaBotBundle.installSpecialAreasModule = function installSpecialAre
                         y:cur.position.y+dy,
                         z:from.z
                     };
-                    const sideA=getTileAt(sideAPos);
-                    const sideB=getTileAt(sideBPos);
                     if(
-                        !isPhysicallyPassable(sideA,null,searchOptions)||
-                        !isPhysicallyPassable(sideB,null,searchOptions)||
                         !getPositionPolicy(sideAPos,policyOptions).allowed||
                         !getPositionPolicy(sideBPos,policyOptions).allowed
                     ){
