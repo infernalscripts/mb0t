@@ -3101,7 +3101,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.188",
+        version: "1.6.189",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -55951,6 +55951,31 @@ function upgradeSectionHeaders(panel) {
   padding-bottom: 3px; /* previously 1px: add 2px to the collapsed panel */
 }
 
+#minibia-bot-panel .mb-action-safety-options {
+  display: grid;
+  gap: 6px;
+}
+#minibia-bot-panel .mb-action-safety-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+}
+#minibia-bot-panel .mb-action-safety-options .mb-toggle {
+  margin: 0;
+  flex: 0 0 auto;
+}
+#minibia-bot-panel .mb-action-safety-distance {
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+}
+#minibia-bot-panel .mb-action-safety-distance input {
+  width: 52px;
+  padding: 3px 5px;
+}
+
+
 `;
         document.head.appendChild(style);
 
@@ -56911,8 +56936,13 @@ function upgradeSectionHeaders(panel) {
 
     <div style="border-top:1px solid rgba(255,255,255,.08);margin-top:8px;padding-top:8px;">
       <div class="mb-section-title mb-section-title--sub"><span class="mb-title-text">Action Safety</span></div>
-      <label class="mb-inline"><input type="checkbox" id="minibia-bot-targeting-rune-avoid-players"><span>AoE runes: avoid players</span></label>
-      <div style="display:flex;gap:10px;align-items:center;"><label class="mb-inline"><input type="checkbox" id="minibia-bot-exori-player-check"><span>Exori: avoid players</span></label><label class="mb-field"><span class="mb-field-label">Avoid distance</span><input type="number" id="minibia-bot-exori-player-dist" min="1" max="10" value="3"></label></div>
+      <div class="mb-action-safety-options">
+        <label class="mb-toggle"><input type="checkbox" id="minibia-bot-targeting-rune-avoid-players"><span>AoE runes: avoid players</span></label>
+        <div class="mb-action-safety-row">
+          <label class="mb-toggle"><input type="checkbox" id="minibia-bot-exori-player-check"><span>Exori: avoid players</span></label>
+          <label class="mb-field mb-action-safety-distance"><span class="mb-field-label">Avoid distance</span><input type="number" id="minibia-bot-exori-player-dist" min="1" max="10" value="3"></label>
+        </div>
+      </div>
     </div>
     <!-- Target lists -->
     <div style="border-top:1px solid rgba(255,255,255,0.08); margin-top:10px; padding-top:8px;">
