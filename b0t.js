@@ -3039,7 +3039,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.193",
+        version: "1.6.201",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -5031,7 +5031,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         unknownPlayerEnabled: false,
         healthLossEnabled: false,
         playerAlertEnabled: false,
-        playerAlertCooldownMs: 60000,
+        playerAlertCooldownMs: 10000,
         // ---- Audio alerts ----
         targetDeathBeep: false,
         lowHealthBeep: true,
@@ -6202,7 +6202,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
             next.playerAlertEnabled = !!next.playerAlertEnabled;
         }
         if (next.playerAlertCooldownMs !== undefined) {
-            next.playerAlertCooldownMs = Math.max(10000, Number(next.playerAlertCooldownMs) || 60000);
+            next.playerAlertCooldownMs = Math.max(10000, Number(next.playerAlertCooldownMs) || 10000);
         }
         // ---- Audio alert normalization ----
         if (next.lowHealthBeepThreshold !== undefined) {
@@ -48770,19 +48770,19 @@ window.__minibiaBotBundle.installObservability = function(bot) {
         const style=make('style',panel);style.textContent='#minibia-bot-panel .mb-observe-grid{display:grid;grid-template-columns:1fr 1fr;gap:5px 10px;font-size:11px;margin:8px 0}#minibia-bot-panel .mb-skill-progress{width:100%;height:8px;accent-color:#b69b55}#minibia-bot-panel .mb-observe-row{display:flex;justify-content:space-between;gap:8px;font-size:11px;padding:5px 0;border-bottom:1px solid rgba(180,170,140,.12)}#minibia-bot-panel .mb-observe-row span{overflow-wrap:anywhere;min-width:0}';
         for(const [name,prefix]of [['woodcutting','wc'],['mining','mn'],['smithing','sm']]){
             const status=panel.querySelector(`[data-${prefix}="status"]`);if(!status)continue;
-            const block=make('div');status.after(block);const label=make('div',block);label.className='mb-small-note';
+            const block=make('div');block.className='prof-progress';status.after(block);const label=make('div',block);label.className='mb-small-note';
             const progress=make('progress',block);progress.className='mb-skill-progress';progress.max=100;progress.setAttribute('aria-label',name+' progress to next level');
-            const metrics=make('div',block);metrics.className='mb-observe-grid';
+            const statistics=make('details',block);make('summary',statistics,'Statistics');const metrics=make('div',statistics);metrics.className='mb-observe-grid';
             const cells=Array.from({length:4},()=>make('span',metrics));
-            button(block,'Reset statistics',()=>skills.delete(name));
-            const advanced=make('details',block);make('summary',advanced,'Gathering options');
+            button(statistics,'Reset statistics',()=>skills.delete(name));
+            const advanced=make('details',block);make('summary',advanced,'Limits & retry settings');
             const grid=make('div',advanced);grid.className='mb-observe-grid';
             const module=bot[name];
-            for(const [key,title,type]of [['retryMinutes','Retry depleted after (min)','number'],['minCapacity','Stop at capacity (0 = off)','number'],['stopSkill','Stop at skill (0 = off)','number'],['goalSid','Item goal SID (0 = off)','number'],['goalCount','Item goal total count','number'],['goalLabel','On stop: route label (optional)','text']]){
+            for(const [key,title,type]of [['retryMinutes','Retry depleted (min)','number'],['minCapacity','Stop below capacity','number'],['stopSkill','Stop at skill','number'],['goalSid','Item goal SID','number'],['goalCount','Goal count','number'],['goalLabel','On stop: route label','text']]){
                 const label=make('label',grid);label.className='mb-field';make('span',label,title).className='mb-field-label';const input=make('input',label);input.type=type;input.value=module?.config?.[key]??'';if(type==='number')input.min='0';
                 input.addEventListener('change',()=>{module?.updateConfig?.({[key]:input.value});input.value=module?.config?.[key]??'';});
             }
-            make('div',advanced,'Stops when any enabled goal is reached. Item goals use total inventory count, including closed bags. The optional label selects a waypoint; Cavebot must already be running to continue.').className='mb-small-note';
+            make('div',advanced,'0 disables a limit; retry 0 means manual retries. Stops when any enabled goal is reached. Item goals use total inventory count, including closed bags. The optional label selects a waypoint; Cavebot must already be running to continue.').className='mb-small-note';
             views.push(()=>{if(!block.getClientRects().length)return;const s=skillSnapshot(name);label.textContent=s?`Skill ${s.level} · ${s.percent.toFixed(1)}% to ${s.level+1}`:'Waiting for profession skills';progress.value=s?.percent||0;
                 const values=[`Gained: ${s?.gained.toLocaleString()||0}`,`Points/h: ${Math.round(s?.rate||0).toLocaleString()}`,`To level: ${duration(s?.seconds)}`,`Remaining: ${s?.remaining.toLocaleString()||'—'}`];cells.forEach((c,i)=>{if(c.textContent!==values[i])c.textContent=values[i];});});
         }
@@ -48995,7 +48995,29 @@ window.__minibiaBotBundle.installWoodcuttingModule = function(bot) {
 #minibia-bot-panel [data-tab-panel="professions"] summary{cursor:pointer;color:#bdb5a3;}
 #minibia-bot-panel [data-tab-panel="professions"] details .mb-hint{margin-top:6px;font-size:11px;overflow-wrap:anywhere;}
 #minibia-bot-panel [data-tab-panel="professions"] .prof-food-row{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:11px;padding:5px 0;border-bottom:1px solid rgba(180,170,140,.12);}
-</style><div class="mb-section"><div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-wc="enabled" /><span class="mb-title-text">Woodcutting</span></div><div class="prof-grid"><label class="mb-field"><span class="mb-field-label">Interval (s)</span><input data-wc="delay" type="number" min="0.35" max="10" step="0.001" /></label><label class="mb-field"><span class="mb-field-label">Search radius (tiles)</span><input data-wc="range" type="number" min="1" max="8" /></label></div><label class="mb-field" style="display:flex;flex-direction:row;align-items:center;gap:6px;margin-top:9px"><input type="checkbox" class="mb-title-toggle" data-wc="combat" /><span>Attack while gathering</span></label><div class="prof-actions"><button type="button" class="mb-small-button" data-wc="reset">Retry stripped trees</button></div><div class="prof-status" data-wc="status"></div><details><summary>How woodcutting works</summary><div class="mb-hint">Uses a handaxe (SID 2380 / CID 3268). Depleted resources are rechecked after the retry delay. Set it to 0 for manual retries. Finds the tool throughout your inventory, including closed backpacks. Walks beside nearby trees. Pause Cavebot for automatic approaches. Attack while gathering allows nearby resources during combat; combat controls movement. Healing stays first. Only one profession runs at a time.</div></details></div>`;
+
+#minibia-bot-panel [data-tab-panel="professions"] .mb-prof-card {padding:8px 10px;margin-bottom:7px;}
+#minibia-bot-panel [data-tab-panel="professions"] .mb-prof-card .mb-section-title {margin-bottom:6px;}
+#minibia-bot-panel [data-tab-panel="professions"] .mb-prof-card .prof-grid {gap:5px 8px;}
+#minibia-bot-panel [data-tab-panel="professions"] .mb-prof-card input:not([type="checkbox"]) {min-width:0;padding:4px 6px;}
+#minibia-bot-panel [data-tab-panel="professions"] .prof-toolbar {display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-top:6px;}
+#minibia-bot-panel [data-tab-panel="professions"] .prof-toolbar .mb-toggle {margin:0;padding:0;font-size:11px;}
+#minibia-bot-panel [data-tab-panel="professions"] .mb-prof-card button {padding:3px 8px;}
+#minibia-bot-panel [data-tab-panel="professions"] .mb-prof-card .prof-status {font-size:10px;margin-top:5px;line-height:1.4;}
+#minibia-bot-panel [data-tab-panel="professions"] .mb-prof-card details {border-top:1px solid rgba(255,255,255,.08);margin-top:6px;padding-top:5px;font-size:11px;}
+#minibia-bot-panel [data-tab-panel="professions"] .mb-prof-card summary {color:var(--mb-hub-text-2);line-height:1.5;}
+#minibia-bot-panel [data-tab-panel="professions"] .prof-fold-body {margin-top:6px;}
+#minibia-bot-panel [data-tab-panel="professions"] .prof-progress > .mb-small-note {margin:5px 0 3px;}
+#minibia-bot-panel [data-tab-panel="professions"] .prof-progress .mb-observe-grid {margin:6px 0;gap:5px 8px;}
+#minibia-bot-panel [data-tab-panel="professions"] .prof-progress .mb-field {margin:0;min-width:0;}
+#minibia-bot-panel [data-tab-panel="professions"] .prof-cook-toolbar {display:flex;align-items:end;flex-wrap:wrap;gap:6px 10px;}
+#minibia-bot-panel [data-tab-panel="professions"] .prof-cook-count {flex:1;min-width:140px;}
+#minibia-bot-panel [data-tab-panel="professions"] .prof-cook-count input {max-width:90px;}
+#minibia-bot-panel [data-tab-panel="professions"] .prof-cook-toolbar .prof-actions {flex-wrap:wrap;margin:0;}
+#minibia-bot-panel [data-tab-panel="professions"] .prof-food-list {max-height:140px;overflow:auto;margin-top:6px;}
+#minibia-bot-panel [data-tab-panel="professions"] .prof-food-row {gap:6px;padding:4px 0;}
+#minibia-bot-panel [data-tab-panel="professions"] .prof-food-row span {min-width:0;overflow-wrap:anywhere;}
+</style><div class="mb-section mb-prof-card"><div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-wc="enabled"><span class="mb-title-text">Woodcutting</span></div><div class="prof-grid"><label class="mb-field"><span class="mb-field-label">Interval (s)</span><input data-wc="delay" type="number" min="0.35" max="10" step="0.001"></label><label class="mb-field"><span class="mb-field-label">Radius (tiles)</span><input data-wc="range" type="number" min="1" max="8"></label></div><div class="prof-toolbar"><label class="mb-toggle"><input type="checkbox" class="mb-title-toggle" data-wc="combat"><span>Attack while gathering</span></label><button type="button" class="mb-small-button" data-wc="reset" title="Retry stripped trees">Retry</button></div><div class="prof-status" data-wc="status"></div></div>`;
         const q=k=>host.querySelector(`[data-wc="${k}"]`);
         q('combat').checked=!!config.attackWhileGathering;q('combat').addEventListener('change',()=>updateConfig({attackWhileGathering:q('combat').checked}));
         q('enabled').addEventListener('change',()=>q('enabled').checked?start():stop());q('delay').value=config.delayMs/1000;q('range').value=config.range;
@@ -49180,7 +49202,7 @@ window.__minibiaBotBundle.installMiningModule = function(bot) {
     function resetStones(){stopOwnWalk();blocked.clear();failures.clear();stripped.clear();targetKey=null;pending=null;reason=running?'Searching for stones':'Stopped';}
     function mount(panel){
         const parent=panel.querySelector('[data-tab-panel="professions"]');if(!parent)return;const host=document.createElement('div');parent.appendChild(host);
-        host.innerHTML=`<div class="mb-section"><div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-mn="enabled" /><span class="mb-title-text">Mining</span></div><div class="prof-grid"><label class="mb-field"><span class="mb-field-label">Interval (s)</span><input data-mn="delay" type="number" min="0.35" max="10" step="0.001" /></label><label class="mb-field"><span class="mb-field-label">Search radius (tiles)</span><input data-mn="range" type="number" min="1" max="8" /></label></div><label class="mb-field" style="display:flex;flex-direction:row;align-items:center;gap:6px;margin-top:9px"><input type="checkbox" class="mb-title-toggle" data-mn="combat" /><span>Attack while gathering</span></label><div class="prof-actions"><button type="button" class="mb-small-button" data-mn="reset">Retry depleted stones</button></div><div class="prof-status" data-mn="status"></div><details><summary>How mining works</summary><div class="mb-hint">Uses a pickaxe (SID 2553 / CID 3456). Automatically skips stones when the game reports “This rock is tapped out for now”. Depleted resources are rechecked after the retry delay. Set it to 0 for manual retries. Finds the tool throughout your inventory, including closed backpacks. Walks beside nearby stones. Pause Cavebot for automatic approaches. Attack while gathering allows nearby resources during combat; combat controls movement. Healing stays first. Only one profession runs at a time.</div></details></div>`;
+        host.innerHTML=`<div class="mb-section mb-prof-card"><div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-mn="enabled"><span class="mb-title-text">Mining</span></div><div class="prof-grid"><label class="mb-field"><span class="mb-field-label">Interval (s)</span><input data-mn="delay" type="number" min="0.35" max="10" step="0.001"></label><label class="mb-field"><span class="mb-field-label">Radius (tiles)</span><input data-mn="range" type="number" min="1" max="8"></label></div><div class="prof-toolbar"><label class="mb-toggle"><input type="checkbox" class="mb-title-toggle" data-mn="combat"><span>Attack while gathering</span></label><button type="button" class="mb-small-button" data-mn="reset" title="Retry depleted stones">Retry</button></div><div class="prof-status" data-mn="status"></div></div>`;
         const q=k=>host.querySelector(`[data-mn="${k}"]`);
         q('combat').checked=!!config.attackWhileGathering;q('combat').addEventListener('change',()=>updateConfig({attackWhileGathering:q('combat').checked}));
         q('enabled').addEventListener('change',()=>q('enabled').checked?start():stop());q('delay').value=config.delayMs/1000;q('range').value=config.range;
@@ -49371,7 +49393,7 @@ window.__minibiaBotBundle.installSmithingModule = function(bot) {
     function resetAnvils(){stopOwnWalk();blocked.clear();failures.clear();stripped.clear();targetKey=null;pending=null;reason=running?'Searching for anvils':'Stopped';}
     function mount(panel){
         const parent=panel.querySelector('[data-tab-panel="professions"]');if(!parent)return;const host=document.createElement('div');parent.appendChild(host);
-        host.innerHTML=`<div class="mb-section"><div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-sm="enabled" /><span class="mb-title-text">Smithing</span></div><div class="prof-grid"><label class="mb-field"><span class="mb-field-label">Interval (s)</span><input data-sm="delay" type="number" min="0.35" max="10" step="0.001" /></label><label class="mb-field"><span class="mb-field-label">Search radius (tiles)</span><input data-sm="range" type="number" min="1" max="8" /></label></div><label class="mb-field" style="display:flex;flex-direction:row;align-items:center;gap:6px;margin-top:9px"><input type="checkbox" class="mb-title-toggle" data-sm="combat" /><span>Attack while smithing</span></label><div class="prof-actions"><button type="button" class="mb-small-button" data-sm="reset">Retry depleted anvils</button></div><div class="prof-status" data-sm="status"></div><details><summary>How smithing works</summary><div class="mb-hint">Uses copper ore (SID 9902), silver ore (SID 9904) and gold ore (SID 9931) on an anvil (SID 2555 / CID 3458). Finds ore throughout your inventory, including closed backpacks, using server-side counts and hotbar item use. Automatically skips anvils when the game reports “you've worked this anvil enough for now”. Depleted resources are rechecked after the retry delay. Set it to 0 for manual retries.  Walks beside nearby anvils. Pause Cavebot for automatic approaches. Attack while gathering allows nearby resources during combat; combat controls movement. Healing stays first. Only one profession runs at a time.</div></details></div>`;
+        host.innerHTML=`<div class="mb-section mb-prof-card"><div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-sm="enabled"><span class="mb-title-text">Smithing</span></div><div class="prof-grid"><label class="mb-field"><span class="mb-field-label">Interval (s)</span><input data-sm="delay" type="number" min="0.35" max="10" step="0.001"></label><label class="mb-field"><span class="mb-field-label">Radius (tiles)</span><input data-sm="range" type="number" min="1" max="8"></label></div><div class="prof-toolbar"><label class="mb-toggle"><input type="checkbox" class="mb-title-toggle" data-sm="combat"><span>Attack while smithing</span></label><button type="button" class="mb-small-button" data-sm="reset" title="Retry depleted anvils">Retry</button></div><div class="prof-status" data-sm="status"></div></div>`;
         const q=k=>host.querySelector(`[data-sm="${k}"]`);
         q('combat').checked=!!config.attackWhileGathering;q('combat').addEventListener('change',()=>updateConfig({attackWhileGathering:q('combat').checked}));
         q('enabled').addEventListener('change',()=>q('enabled').checked?start():stop());q('delay').value=config.delayMs/1000;q('range').value=config.range;
@@ -49460,12 +49482,12 @@ window.__minibiaBotBundle.installCookingModule=function(bot){
  function stop(options={}){running=false;if(timer!=null)window.clearInterval(timer);timer=null;stopWalk();clearCapture();cookingBatchActive=false;reason='Stopped';if(options.persistEnabled!==false){config.enabled=false;persist();}}
  function resetBatch(){if((pending&&Date.now()-pending.at<10000)||(splitPending&&Date.now()-splitPending.at<10000)){reason='Wait for the outstanding cooking action';return false;}pending=null;splitPending=null;batchSource=null;batchFood=null;foodCursor=0;reason='Ready to continue cooking';return true;}
  function updateConfig(next){if(next.foods!==undefined){config.foods=normalize(next.foods);cookingBatchActive=false;}if(next.cookAfter!==undefined)config.cookAfter=Math.max(1,Math.trunc(Number(next.cookAfter)||10));persist();}
- function mount(panel){const parent=panel.querySelector('[data-tab-panel="professions"]');if(!parent)return;const host=document.createElement('div');parent.appendChild(host);host.innerHTML=`<div class="mb-section"><div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-cook="enabled" /><span class="mb-title-text">Cooking</span></div><div class="prof-grid"><label class="mb-field"><span class="mb-field-label">Food SID</span><input type="number" min="1" data-cook="sid" /></label><label class="mb-field"><span class="mb-field-label">Food CID</span><input type="number" min="1" data-cook="cid" /></label></div><div class="prof-actions"><button type="button" class="mb-small-button" data-cook="pick" title="Click a food item to capture its exact SID and CID">🔍 Pick food</button><button type="button" class="mb-small-button" data-cook="add">Add food</button><button type="button" class="mb-small-button" data-cook="reset">Retry cooking</button></div><label class="mb-field"><span class="mb-field-label">Fish before cooking</span><input type="number" min="1" step="1" data-cook="cookAfter" /></label><div data-cook="list" style="margin-top:6px"></div><div class="prof-status" data-cook="status"></div><details><summary>How cooking works</summary><div class="mb-hint">With Fisher running, waits for the configured count of selected cookable food, then cooks everything before fishing resumes. 2-second interval. Splits 10 items, cooks that stack, and repeats until all selected food is gone. Smaller remaining stacks are cooked too. Matches both SID and CID. Keep food containers open with a free slot for splitting. Auto Stacker pauses merging while Cooking runs. Approaches ovens within 5 tiles; pause Cavebot for walking. Pauses during combat and healing.</div></details><details><summary>Detected oven IDs</summary><div class="mb-hint" data-cook="ovens"></div></details></div>`;
+ function mount(panel){const parent=panel.querySelector('[data-tab-panel="professions"]');if(!parent)return;const host=document.createElement('div');parent.appendChild(host);host.innerHTML=`<div class="mb-section mb-prof-card"><div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-cook="enabled"><span class="mb-title-text">Cooking</span></div><div class="prof-cook-toolbar"><label class="mb-field prof-cook-count"><span class="mb-field-label">Fish before cooking</span><input type="number" min="1" step="1" data-cook="cookAfter"></label><div class="prof-actions"><button type="button" class="mb-small-button" data-cook="pick" title="Click a food item to capture its exact SID and CID">🔍 Pick food</button><button type="button" class="mb-small-button" data-cook="reset" title="Retry cooking">Retry</button></div></div><div data-cook="list" class="prof-food-list"></div><div class="prof-status" data-cook="status"></div><details><summary>Add food by ID</summary><div class="prof-fold-body"><div class="prof-grid"><label class="mb-field"><span class="mb-field-label">Food SID</span><input type="number" min="1" data-cook="sid"></label><label class="mb-field"><span class="mb-field-label">Food CID</span><input type="number" min="1" data-cook="cid"></label></div><div class="prof-actions"><button type="button" class="mb-small-button" data-cook="add">Add food</button></div></div></details></div>`;
  const q=k=>host.querySelector(`[data-cook="${k}"]`);
- const render=()=>{q('list').replaceChildren();for(const f of config.foods){const row=document.createElement('div');row.className='prof-food-row';const label=document.createElement('span');label.textContent=`SID ${f.sid} · CID ${f.cid}${isCookable(f)?'':' · not cookable'}`;const remove=document.createElement('button');remove.type='button';remove.className='mb-small-button';remove.textContent='Remove';remove.addEventListener('click',()=>{updateConfig({foods:config.foods.filter(r=>r!==f)});render();});row.append(label,remove);q('list').append(row);}};
+ const render=()=>{q('list').replaceChildren();for(const f of config.foods){const row=document.createElement('div');row.className='prof-food-row';const label=document.createElement('span');const definition=window.gameClient?.itemDefinitionsBySid?.[f.sid]||window.gameClient?.itemDefinitionsByCid?.[f.cid];label.textContent=`${definition?.properties?.name||('Food '+f.sid)}${isCookable(f)?'':' · not cookable'}`;label.title=`SID ${f.sid} · CID ${f.cid}`;const remove=document.createElement('button');remove.type='button';remove.className='mb-small-button';remove.textContent='Remove';remove.addEventListener('click',()=>{updateConfig({foods:config.foods.filter(r=>r!==f)});render();});row.append(label,remove);q('list').append(row);}};
  q('cookAfter').value=config.cookAfter;q('cookAfter').addEventListener('change',()=>{updateConfig({cookAfter:q('cookAfter').value});q('cookAfter').value=config.cookAfter;});
  q('enabled').addEventListener('change',()=>q('enabled').checked?start():stop());q('pick').addEventListener('click',()=>pickFood(f=>{q('sid').value=f.sid;q('cid').value=f.cid;updateConfig({foods:[...config.foods,f]});render();}));q('add').addEventListener('click',()=>{updateConfig({foods:[...config.foods,{sid:q('sid').value,cid:q('cid').value}]});render();});q('reset').addEventListener('click',resetBatch);
- const refresh=()=>{if(!host.getClientRects().length)return;q('enabled').checked=running;q('status').textContent=`${reason} · ${used} food consumed`;q('ovens').textContent='Ovens: '+(ovens().map(o=>`SID ${o.sid} / CID ${o.cid}`).join(', ')||'waiting for game definitions');};render();refresh();const ui=window.setInterval(refresh,500);bot.addCleanup(()=>window.clearInterval(ui));}
+ const refresh=()=>{if(!host.getClientRects().length)return;q('enabled').checked=running;q('status').textContent=`${reason} · ${used} food consumed`;};render();refresh();const ui=window.setInterval(refresh,500);bot.addCleanup(()=>window.clearInterval(ui));}
  bot.cooking={config,hasFoodToCook,hasConfiguredFish:()=>config.foods.some(f=>f.sid===2667&&isCookable(f)),start,stop,tick,updateConfig,resetBatch,pickFood,mount,status:()=>({running,reason,used,pending:!!pending,splitPending:!!splitPending,ovens:ovens()})};bot.addCleanup(()=>{disposed=true;stop({persistEnabled:false});});if(config.enabled)start();
 };
 
@@ -53372,7 +53394,7 @@ function upgradeSectionHeaders(panel) {
         if (alertToggle)
             alertToggle.checked = !!status?.config?.playerAlertEnabled;
         if (cooldownInput && document.activeElement !== cooldownInput) {
-            const sec = Math.round((status?.config?.playerAlertCooldownMs || 60000) / 1000);
+            const sec = Math.round((status?.config?.playerAlertCooldownMs || 10000) / 1000);
             cooldownInput.value = sec;
         }
     }
@@ -55838,6 +55860,42 @@ function upgradeSectionHeaders(panel) {
 #minibia-bot-panel .mb-resupply-inventory .mb-resupply-fold {border:0;margin:0;padding:0;}
 #minibia-bot-panel .mb-resupply-inventory .mb-resupply-fold > summary {display:list-item;margin-bottom:0;}
 
+#minibia-bot-panel .mb-alert-compact .mb-section {padding:8px 10px;margin-bottom:7px;}
+#minibia-bot-panel .mb-alert-compact .mb-section-title {margin-bottom:6px;}
+#minibia-bot-panel .mb-alert-toggle-grid {display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px 10px;}
+#minibia-bot-panel .mb-alert-compact .mb-toggle {margin:0;padding:2px 0;min-width:0;}
+#minibia-bot-panel .mb-alert-grid {display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px 8px;}
+#minibia-bot-panel .mb-alert-compact .mb-field {margin:0;min-width:0;}
+#minibia-bot-panel .mb-alert-compact input:not([type="checkbox"]) {min-width:0;padding:4px 6px;}
+#minibia-bot-panel .mb-alert-fold {border-top:1px solid rgba(255,255,255,.08);margin-top:6px;padding-top:5px;}
+#minibia-bot-panel .mb-alert-fold > summary {cursor:pointer;color:var(--mb-hub-text-2);font-size:11px;line-height:1.5;}
+#minibia-bot-panel .mb-alert-fold-body {margin-top:6px;}
+#minibia-bot-panel .mb-alert-setting-group + .mb-alert-setting-group {margin-top:8px;}
+#minibia-bot-panel .mb-alert-setting-title {font-size:11px;margin-bottom:4px;color:var(--mb-hub-text-2);}
+#minibia-bot-panel .mb-alert-actions {display:flex;gap:5px;margin-top:6px;}
+#minibia-bot-panel .mb-alert-pick {display:flex;gap:5px;min-width:0;}
+#minibia-bot-panel .mb-alert-pick input {flex:1;width:0;}
+#minibia-bot-panel .mb-alert-compact .mb-list {max-height:140px;overflow:auto;}
+#minibia-bot-panel .mb-alert-compact .mb-list-row {gap:8px;}
+#minibia-bot-panel .mb-alert-compact .mb-list-row > span {min-width:0;overflow-wrap:anywhere;}
+#minibia-bot-panel .mb-alert-trusted > summary {cursor:pointer;display:list-item;margin:0;}
+#minibia-bot-panel .mb-alert-home {display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:7px;}
+#minibia-bot-panel .mb-alert-home > span {min-width:0;overflow-wrap:anywhere;}
+#minibia-bot-panel .mb-alert-fold input#minibia-bot-panic-player-cooldown {max-width:100px;}
+
+#minibia-bot-panel .mb-tools-pickup {padding:8px 10px;}
+#minibia-bot-panel .mb-tools-pickup .mb-section-title {margin-bottom:6px;}
+#minibia-bot-panel .mb-tools-pickup-main {display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;}
+#minibia-bot-panel .mb-tools-pickup-radius {display:flex;align-items:center;gap:7px;font-size:11px;}
+#minibia-bot-panel .mb-tools-pickup-radius input {width:56px;min-width:0;padding:3px 5px;}
+#minibia-bot-panel .mb-tools-pickup-fold {border-top:1px solid rgba(255,255,255,.08);margin-top:7px;padding-top:5px;}
+#minibia-bot-panel .mb-tools-pickup-fold > summary {cursor:pointer;font-size:11px;line-height:1.5;color:var(--mb-hub-text-2);}
+#minibia-bot-panel .mb-tools-pickup-ignore {display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:6px;}
+#minibia-bot-panel .mb-tools-pickup-ignore .mb-field {margin:0;min-width:0;}
+#minibia-bot-panel .mb-tools-pickup-ignore input {min-width:0;padding:4px 6px;}
+#minibia-bot-panel .mb-tools-pickup-footer {display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:6px;}
+#minibia-bot-panel .mb-tools-pickup-footer .mb-small-note {flex:1;min-width:160px;}
+
 `;
         document.head.appendChild(style);
 
@@ -55885,7 +55943,6 @@ function upgradeSectionHeaders(panel) {
     <button type="button" class="mb-tab-button" data-tab-button="healing">💚 Healing</button>
     <button type="button" class="mb-tab-button" data-tab-button="looter">💰 Looter</button>
     <button type="button" class="mb-tab-button" data-tab-button="alert">⚠️ Alerts</button>
-    <button type="button" class="mb-tab-button" data-tab-button="antibot">🤖 Anti-Bot</button>
     <button type="button" class="mb-tab-button" data-tab-button="professions">🪓 Professions</button>
     <button type="button" class="mb-tab-button" data-tab-button="utility">🛠️ Tools</button>
     <button type="button" class="mb-tab-button" data-tab-button="support">💕 Support</button>
@@ -56073,248 +56130,62 @@ function upgradeSectionHeaders(panel) {
   </div>
 </div>
 
-<!-- AntiBot Tab -->
-<div class="mb-tab-panel" data-tab-panel="antibot">
-  <div class="mb-section">
-    <div class="mb-section-title">
-      <span class="mb-title-text">🤖 Anti-Bot Functions</span>
-    </div>
-    <button type="button" id="minibia-bot-panic-cancel-restart" style="display:none;">Cancel Restart</button>
-
-    <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px 32px;">
-      <!-- Left Column -->
-      <div style="display:flex; flex-direction:column; gap:10px;">
-        <label class="mb-toggle"><input type="checkbox" id="minibia-bot-gm-chat-monitor" /><span>GM/God Chat Killswitch</span></label>
-      </div>
-
-      <!-- Right Column -->
-      <div style="display:flex; flex-direction:column; gap:10px;">
-        <label class="mb-toggle"><input type="checkbox" id="minibia-bot-antibot-creature-enabled" /><span>Anti-Bot Creature</span></label>
-      </div>
-    </div>
-
-    <hr style="margin:12px 0;border-color:#444;">
-
-    <div class="mb-stack">
-      <div class="mb-inline">
-        <input type="text" id="minibia-bot-panic-gm-input" placeholder="Game master name" />
-        <button type="button" class="mb-small-button" id="minibia-bot-panic-gm-add">Add</button>
-      </div>
-      <div class="mb-list" id="minibia-bot-panic-gm-list"></div>
-    </div>
-
-    <!-- Auto Pickup Blacklist -->
-    <hr style="margin:12px 0;border-color:#444;">
-    <div class="mb-section-title">
-      <input type="checkbox" id="minibia-bot-auto-pickup-enabled" class="mb-title-toggle" />
-      <span class="mb-title-text">Auto Pickup Items</span>
-    </div>
-    <div style="display:flex; gap:8px; flex-wrap:wrap;">
-      <label class="mb-field" style="flex:0 0 80px;">
-        <span class="mb-field-label">Radius</span>
-        <input type="number" id="minibia-bot-auto-pickup-radius" min="1" max="3" value="2" />
-      </label>
-      <label class="mb-field" style="flex:0 0 80px;">
-        <span class="mb-field-label">Delay (ms)</span>
-        <input type="number" id="minibia-bot-auto-pickup-delay" min="100" max="2000" value="300" />
-      </label>
-    </div>
-
-    <div class="mb-section-title mb-section-title--sub">
-      <span class="mb-title-text">Pickup Blacklist</span>
-    </div>
-    <div style="display:flex; gap:6px; flex-wrap:wrap;">
-      <label class="mb-field" style="flex:1; min-width:140px;">
-        <span class="mb-field-label">Item IDs</span>
-        <input type="text" id="minibia-bot-auto-pickup-ignore-ids" placeholder="1234, 5678" />
-      </label>
-      <label class="mb-field" style="flex:1; min-width:140px;">
-        <span class="mb-field-label">Item Names</span>
-        <input type="text" id="minibia-bot-auto-pickup-ignore-names" placeholder="Dirt, Sand, Rubbish" />
-      </label>
-    </div>
-    <button type="button" class="mb-small-button" id="minibia-bot-auto-pickup-save-blacklist" style="margin-top:4px;">Save Blacklist</button>
-    <div class="mb-small-note">Items matching ID or name (case-insensitive) will never be picked up by Auto Pickup.</div>
-  </div>
-</div>
-
 <!-- Alert Tab -->
-<div class="mb-tab-panel" data-tab-panel="alert">
-
-  <!-- General & Audio Alerts -->
-  <div class="mb-section">
-    <div class="mb-section-title">
-      <span class="mb-title-text">⚠️ Audio Alerts</span>
-    </div>
-    <div class="mb-stack">
-
-      <!-- Top Alert Checkboxes (2 Rows) -->
-      <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px 16px;">
-        <label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-player-alert" /><span>Player On Screen Alert</span></label>
-        <label class="mb-toggle"><input type="checkbox" id="minibia-bot-antibot-enabled" /><span>Anti-Bot Alert</span></label>
-        <label class="mb-toggle"><input type="checkbox" id="minibia-bot-player-attack-alert" /><span>Player Attack Alert</span></label>
-        <label class="mb-toggle"><input type="checkbox" id="minibia-bot-message-alert" /><span>Message Alert</span></label>
-      </div>
-
-      <div style="display:flex; gap:8px; align-items:center; margin-top:4px;">
-        <label style="font-size:11px; color:#e9d39b;">Alert Cooldown (s)</label>
-        <input type="number" id="minibia-bot-panic-player-cooldown" min="10" value="10" style="width:60px; padding:2px 4px;" />
-      </div>
-
-      <hr style="margin:8px 0; border:0; border-top:1px solid #444;" />
-
-      <!-- Audio Triggers (2x2 grid) -->
-      <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px 16px; align-items:start;">
-
-        <!-- Row 1 · Col 1: Target Death -->
-        <label class="mb-toggle" style="margin:0;">
-          <input type="checkbox" id="minibia-bot-panic-target-death-beep" />
-          <span>Target Death (descending tone)</span>
-        </label>
-
-        <!-- Row 1 · Col 2: Low Health -->
-        <div style="display:flex; flex-direction:column; gap:4px;">
-          <label class="mb-toggle" style="margin:0;">
-            <input type="checkbox" id="minibia-bot-panic-low-health-beep" />
-            <span>Low Health</span>
-          </label>
-          <div style="display:grid; grid-template-columns:1fr 1fr; gap:4px;">
-            <label class="mb-field">
+<div class="mb-tab-panel mb-alert-compact" data-tab-panel="alert"><div class="mb-section"><div class="mb-section-title"><span class="mb-title-text">⚠️ Alerts</span></div><div class="mb-alert-toggle-grid"><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-player-alert"><span>Player on screen</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-antibot-enabled"><span>Anti-bot check</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-player-attack-alert"><span>Player attack</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-message-alert"><span>Message</span></label><label class="mb-toggle" title="Plays a descending tone when your target dies"><input type="checkbox" id="minibia-bot-panic-target-death-beep"><span>Target death</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-low-health-beep"><span>Low health</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-mana-full-beep"><span>Mana full</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-no-target-beep"><span>No target</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-low-cap-beep"><span>Low capacity</span></label></div><details class="mb-alert-fold"><summary>Player alert settings</summary><div class="mb-alert-fold-body"><label class="mb-field"><span class="mb-field-label">Player alert cooldown (s)</span><input type="number" id="minibia-bot-panic-player-cooldown" min="10" value="10"></label></div></details><details class="mb-alert-fold"><summary>Thresholds &amp; repeat timing</summary><div class="mb-alert-fold-body"><div class="mb-alert-setting-group"><div class="mb-alert-setting-title">Low health</div><div class="mb-alert-grid"><label class="mb-field">
               <span class="mb-field-label">Threshold %</span>
-              <input type="number" id="minibia-bot-panic-low-health-threshold" min="1" max="99" value="50" />
-            </label>
-            <label class="mb-field">
+              <input type="number" id="minibia-bot-panic-low-health-threshold" min="1" max="99" value="50">
+            </label><label class="mb-field">
               <span class="mb-field-label">Repeat (s)</span>
-              <input type="number" id="minibia-bot-panic-low-health-repeat" min="1" value="5" />
-            </label>
-          </div>
-        </div>
-
-        <!-- Row 2 · Col 1: Mana Full -->
-        <div style="display:flex; flex-direction:column; gap:4px;">
-          <label class="mb-toggle" style="margin:0;">
-            <input type="checkbox" id="minibia-bot-panic-mana-full-beep" />
-            <span>Mana Full</span>
-          </label>
-          <div style="display:grid; grid-template-columns:1fr 1fr; gap:4px;">
-            <label class="mb-field">
+              <input type="number" id="minibia-bot-panic-low-health-repeat" min="1" value="5">
+            </label></div></div><div class="mb-alert-setting-group"><div class="mb-alert-setting-title">Mana full</div><div class="mb-alert-grid"><label class="mb-field">
               <span class="mb-field-label">After (s)</span>
-              <input type="number" id="minibia-bot-panic-mana-full-delay" min="1" value="10" />
-            </label>
-            <label class="mb-field">
+              <input type="number" id="minibia-bot-panic-mana-full-delay" min="1" value="10">
+            </label><label class="mb-field">
               <span class="mb-field-label">Repeat (s)</span>
-              <input type="number" id="minibia-bot-panic-mana-full-repeat" min="1" value="30" />
-            </label>
-          </div>
-        </div>
-
-        <!-- Row 2 · Col 2: No Target -->
-        <div style="display:flex; flex-direction:column; gap:4px;">
-          <label class="mb-toggle" style="margin:0;">
-            <input type="checkbox" id="minibia-bot-panic-no-target-beep" />
-            <span>No Target</span>
-          </label>
-          <div style="display:grid; grid-template-columns:1fr 1fr; gap:4px;">
-            <label class="mb-field">
+              <input type="number" id="minibia-bot-panic-mana-full-repeat" min="1" value="30">
+            </label></div></div><div class="mb-alert-setting-group"><div class="mb-alert-setting-title">No target</div><div class="mb-alert-grid"><label class="mb-field">
               <span class="mb-field-label">After (s)</span>
-              <input type="number" id="minibia-bot-panic-no-target-delay" min="1" value="10" />
-            </label>
-            <label class="mb-field">
+              <input type="number" id="minibia-bot-panic-no-target-delay" min="1" value="10">
+            </label><label class="mb-field">
               <span class="mb-field-label">Repeat (s)</span>
-              <input type="number" id="minibia-bot-panic-no-target-repeat" min="1" value="30" />
-            </label>
-          </div>
-        </div>
-
-        <!-- Row 3 · Col 1: Low Capacity -->
-        <div style="display:flex; flex-direction:column; gap:4px;">
-          <label class="mb-toggle" style="margin:0;">
-            <input type="checkbox" id="minibia-bot-panic-low-cap-beep" />
-            <span>Low Capacity</span>
-          </label>
-          <div style="display:grid; grid-template-columns:1fr 1fr; gap:4px;">
-            <label class="mb-field">
+              <input type="number" id="minibia-bot-panic-no-target-repeat" min="1" value="30">
+            </label></div></div><div class="mb-alert-setting-group"><div class="mb-alert-setting-title">Low capacity</div><div class="mb-alert-grid"><label class="mb-field">
               <span class="mb-field-label">Below Cap</span>
-              <input type="number" id="minibia-bot-panic-low-cap-threshold" min="0" value="100" />
-            </label>
-            <label class="mb-field">
+              <input type="number" id="minibia-bot-panic-low-cap-threshold" min="0" value="100">
+            </label><label class="mb-field">
               <span class="mb-field-label">Repeat (s)</span>
-              <input type="number" id="minibia-bot-panic-low-cap-repeat" min="1" value="30" />
-            </label>
-          </div>
-        </div>
-
-      </div>
-
-    </div>
-  </div>
-
-  <!-- Item Count Alerts Section -->
-  <div class="mb-section">
-    <div class="mb-section-title">
-      <span class="mb-title-text">Item Count Alerts</span>
-    </div>
-    <div class="mb-stack">
-      <div id="minibia-bot-panic-item-alerts-list" class="mb-list" style="max-height:110px;"></div>
-
-      <div style="display:grid; grid-template-columns:60px 1fr 52px 56px auto; gap:4px; align-items:end;">
-        <label class="mb-field">
+              <input type="number" id="minibia-bot-panic-low-cap-repeat" min="1" value="30">
+            </label></div></div></div></details></div><div class="mb-section"><div class="mb-section-title"><span class="mb-title-text">Item Count Alerts</span></div><div id="minibia-bot-panic-item-alerts-list" class="mb-list"></div><details class="mb-alert-fold"><summary>Add item alert</summary><div class="mb-alert-fold-body"><div class="mb-alert-grid"><label class="mb-field">
           <span class="mb-field-label">Item ID</span>
-          <input type="text" id="minibia-bot-panic-item-alert-id" placeholder="2874" />
-        </label>
-        <label class="mb-field">
+          <input type="text" id="minibia-bot-panic-item-alert-id" placeholder="2874">
+        </label><label class="mb-field">
           <span class="mb-field-label">Name</span>
-          <input type="text" id="minibia-bot-panic-item-alert-name" placeholder="Mana Fluid" />
-        </label>
-        <label class="mb-field">
-          <span class="mb-field-label">Fluid</span>
-          <input type="number" id="minibia-bot-panic-item-alert-fluid-type" min="0" max="255" value="0" placeholder="0" />
-        </label>
-        <label class="mb-field">
+          <input type="text" id="minibia-bot-panic-item-alert-name" placeholder="Mana Fluid">
+        </label><label class="mb-field">
           <span class="mb-field-label">Below</span>
-          <input type="number" id="minibia-bot-panic-item-alert-threshold" min="1" value="10" />
-        </label>
-        <button type="button" class="mb-small-button" id="minibia-bot-panic-item-alert-add" style="padding:6px 10px;">Add</button>
-      </div>
-
-      <div class="mb-small-note">
-        Common IDs: 3160 UH · 2874:7 MP · 2874:10 HP.
-      </div>
+          <input type="number" id="minibia-bot-panic-item-alert-threshold" min="1" value="10">
+        </label><label class="mb-field">
+          <span class="mb-field-label">Fluid</span>
+          <input type="number" id="minibia-bot-panic-item-alert-fluid-type" min="0" max="255" value="0" placeholder="0">
+        </label></div><div class="mb-alert-actions"><button type="button" class="mb-small-button" id="minibia-bot-panic-item-alert-add">Add</button></div><details class="mb-alert-fold"><summary>Item ID examples</summary><div class="mb-alert-fold-body"><div class="mb-small-note">Common IDs: 3160 UH · 2874:7 MP · 2874:10 HP.</div></div></details></div></details></div>  <div class="mb-section mb-alert-antibot">
+    <div class="mb-section-title"><span class="mb-title-text">🤖 Anti-Bot &amp; GM Protection</span></div>
+    <div class="mb-alert-toggle-grid">
+      <label class="mb-toggle"><input type="checkbox" id="minibia-bot-gm-chat-monitor"><span>GM Auto Respond</span></label>
+      <label class="mb-toggle"><input type="checkbox" id="minibia-bot-antibot-creature-enabled"><span>Anti-bot creature</span></label>
     </div>
+    <details class="mb-alert-fold">
+      <summary>Game master names</summary>
+      <div class="mb-alert-fold-body">
+        <div class="mb-alert-pick"><input type="text" id="minibia-bot-panic-gm-input" placeholder="Game master name"><button type="button" class="mb-small-button" id="minibia-bot-panic-gm-add">Add</button></div>
+        <div class="mb-list" id="minibia-bot-panic-gm-list"></div>
+      </div>
+    </details>
+    <button type="button" id="minibia-bot-panic-cancel-restart" style="display:none;" class="mb-small-button">Cancel Restart</button>
   </div>
-
-  <!-- Trusted Names Section -->
-  <div class="mb-section">
-    <div class="mb-section-title">
-      <span class="mb-title-text">Trusted Names</span>
-    </div>
-    <div class="mb-stack">
-      <div class="mb-inline">
-        <input type="text" id="minibia-bot-panic-trusted-input" placeholder="Trusted name" />
-        <button type="button" class="mb-small-button" id="minibia-bot-panic-trusted-add">Add</button>
-      </div>
-      <div class="mb-list" id="minibia-bot-panic-trusted-list"></div>
-    </div>
-  </div>
-
-  <!-- Panic Runner Section -->
-  <div class="mb-section">
-    <div class="mb-section-title">
-      <span class="mb-title-text">Panic Runner</span>
-    </div>
-    <div class="mb-stack">
-      <div style="display:flex; justify-content:space-between; align-items:center;">
-        <span id="minibia-bot-home" style="font-size:11px;">Panic Runner Home: not set</span>
-        <button type="button" class="mb-small-button" id="minibia-bot-set-home">Set Home</button>
-      </div>
-
-      <label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-unknown" /><span>Unknown Player</span></label>
-      <label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-health" /><span>Healthloss</span></label>
-      <label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-return" /><span>Auto Return to Position</span></label>
-    </div>
-  </div>
-
+<details class="mb-section mb-alert-trusted"><summary class="mb-section-title"><span class="mb-title-text">Trusted Names</span></summary><div class="mb-alert-fold-body"><div class="mb-alert-pick"><input type="text" id="minibia-bot-panic-trusted-input" placeholder="Trusted name"><button type="button" class="mb-small-button" id="minibia-bot-panic-trusted-add">Add</button></div><div class="mb-list" id="minibia-bot-panic-trusted-list"></div></div></details><div class="mb-section"><div class="mb-section-title"><span class="mb-title-text">Panic Runner</span></div><div class="mb-alert-toggle-grid"><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-unknown"><span>Unknown player</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-health"><span>Health loss</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-return"><span>Auto return to position</span></label></div><div class="mb-alert-home"><span class="mb-small-note" id="minibia-bot-home">Panic Runner Home: not set</span><button type="button" class="mb-small-button" id="minibia-bot-set-home">Set Home</button></div></div>
 </div>
+
+
 
 <!-- Xray Tab -->
 <div class="mb-tab-panel" data-tab-panel="xray">
@@ -56399,6 +56270,23 @@ function upgradeSectionHeaders(panel) {
     </div>
   </div>
 
+
+  <!-- Auto Pickup -->
+  <div class="mb-section mb-tools-pickup">
+    <div class="mb-section-title"><input type="checkbox" id="minibia-bot-auto-pickup-enabled" class="mb-title-toggle"><span class="mb-title-text">📦 Auto Pickup Items</span></div>
+    <div class="mb-tools-pickup-main">
+      <label class="mb-tools-pickup-radius"><span>Radius (tiles)</span><input type="number" id="minibia-bot-auto-pickup-radius" min="1" max="3" value="2"></label>
+      <span class="mb-small-note" id="minibia-bot-auto-pickup-status" aria-live="polite">Off</span>
+    </div>
+    <details class="mb-tools-pickup-fold">
+      <summary>Ignored items</summary>
+      <div class="mb-tools-pickup-ignore">
+        <label class="mb-field"><span class="mb-field-label">Item IDs</span><input type="text" id="minibia-bot-auto-pickup-ignore-ids" placeholder="1234, 5678"></label>
+        <label class="mb-field"><span class="mb-field-label">Item names</span><input type="text" id="minibia-bot-auto-pickup-ignore-names" placeholder="Dirt, Sand, Rubbish"></label>
+      </div>
+      <div class="mb-tools-pickup-footer"><button type="button" class="mb-small-button" id="minibia-bot-auto-pickup-save-blacklist">Save Blacklist</button><span class="mb-small-note">Comma-separated. Names match part of the item name.</span></div>
+    </details>
+  </div>
 
   <!-- Fisher -->
   <div class="mb-section">
@@ -57534,6 +57422,8 @@ function upgradeSectionHeaders(panel) {
         // ---- SETUP UI BEHAVIOR ----
         // Tab switching
         function setActiveBotTab(tabId) {
+            // Follow the moved controls when restoring the old saved tab.
+            if (tabId === "antibot") tabId = "alert";
             panel.querySelectorAll(".mb-tab-button").forEach(btn => btn.dataset.active = btn.dataset.tabButton === tabId ? "true" : "false");
             panel.querySelectorAll(".mb-tab-panel").forEach(tp => tp.dataset.active = tp.dataset.tabPanel === tabId ? "true" : "false");
             try {
@@ -57793,7 +57683,6 @@ function upgradeSectionHeaders(panel) {
 
         const autoPickupToggle = document.getElementById("minibia-bot-auto-pickup-enabled");
         const autoPickupRadius = document.getElementById("minibia-bot-auto-pickup-radius");
-        const autoPickupDelay = document.getElementById("minibia-bot-auto-pickup-delay");
 
         function refreshAutoPickupStatus() {
             const status = bot.autoPickup?.status?.();
@@ -57805,9 +57694,10 @@ function upgradeSectionHeaders(panel) {
             if (autoPickupRadius && document.activeElement !== autoPickupRadius) {
                 autoPickupRadius.value = status.config.radius;
             }
-            if (autoPickupDelay && document.activeElement !== autoPickupDelay) {
-                autoPickupDelay.value = status.config.delayMs;
-            }
+            const label = document.getElementById("minibia-bot-auto-pickup-status");
+            const text = !status.running ? "Off" : status.pickupInProgress ? "Picking up…"
+                : (bot.attack?.isCombatActive?.() || window.gameClient?.player?.getTarget?.()) ? "Waiting for combat" : "Ready";
+            if (label && label.textContent !== text) label.textContent = text;
         }
 
         if (autoPickupToggle) {
@@ -57815,11 +57705,9 @@ function upgradeSectionHeaders(panel) {
             autoPickupToggle.addEventListener("change", function () {
                 if (this.checked) {
                     const radius = parseInt(autoPickupRadius?.value) || 2;
-                    const delay = parseInt(autoPickupDelay?.value) || 300;
                     bot.autoPickup.updateConfig({
                         enabled: true,
-                        radius,
-                        delayMs: delay
+                        radius
                     });
                 } else {
                     bot.autoPickup.stop();
@@ -57837,18 +57725,10 @@ function upgradeSectionHeaders(panel) {
                 refreshAutoPickupStatus();
             });
         }
-        if (autoPickupDelay) {
-            autoPickupDelay.addEventListener("change", function () {
-                const val = Math.max(100, Math.min(2000, parseInt(this.value) || 300));
-                this.value = val;
-                bot.autoPickup.updateConfig({
-                    delayMs: val
-                });
-                refreshAutoPickupStatus();
-            });
-        }
         // Initial refresh
         setTimeout(refreshAutoPickupStatus, 100);
+        const autoPickupStatusTimer = window.setInterval(refreshAutoPickupStatus, 1000);
+        bot.addCleanup(() => window.clearInterval(autoPickupStatusTimer));
 
         // ---- AntiBotCreature ----
         const antiBotCreatureToggle = document.getElementById("minibia-bot-antibot-creature-enabled");
@@ -60498,9 +60378,9 @@ function upgradeSectionHeaders(panel) {
         }
 
         if (playerCooldownInput) {
-            playerCooldownInput.value = (bot.panic?.config?.playerAlertCooldownMs ?? 60000) / 1000;
+            playerCooldownInput.value = (bot.panic?.config?.playerAlertCooldownMs ?? 10000) / 1000;
             playerCooldownInput.addEventListener("change", () => {
-                const sec = Math.max(10, Number(playerCooldownInput.value) || 60);
+                const sec = Math.max(10, Number(playerCooldownInput.value) || 10);
                 playerCooldownInput.value = sec;
                 bot.panic.updateConfig({
                     playerAlertCooldownMs: sec * 1000
@@ -63955,7 +63835,6 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
     const state = {
         running: false,
         pickupInProgress: false,
-        cooldown: new Map(), // tileKey -> lastPickupTime
         originalHandleItemAdd: null,
         patched: false,
         caveMovementPaused: false,
@@ -63974,12 +63853,14 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
     const config = Object.assign({
         enabled: false,
         radius: 5, // Chebyshev distance
-        cooldownMs: 2000, // don't pick up from same tile too often
-        delayMs: 300, // small delay before acting (human reaction)
+        cooldownMs: 0, // retired: no per-tile pickup cooldown
+        delayMs: 0, // retired: process item-add events without an artificial wait
         walkTimeoutMs: 5000, // give up walking after this long
         ignoredItemIds: [], // array of item client IDs (CID) to ignore
         ignoredItemNames: [], // array of item name substrings to ignore (case-insensitive)
     }, bot.storage.get(configStorageKey, {}));
+    // Carry over radius and ignored items; retire delay values in old saves.
+    config.cooldownMs = config.delayMs = 0;
 
     function persistConfig() {
         bot.storage.set(configStorageKey, {
@@ -64226,19 +64107,6 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
             }
 
             const tileKey = `${pos.x},${pos.y},${pos.z}`;
-            const now = Date.now();
-            const last = state.cooldown.get(tileKey) || 0;
-            if (now - last < config.cooldownMs) {
-                return result;
-            }
-            state.cooldown.set(tileKey, now);
-            if (state.cooldown.size > 200) {
-                for (const [key, at] of state.cooldown)
-                    if (now - at >= config.cooldownMs) state.cooldown.delete(key);
-                while (state.cooldown.size > 200)
-                    state.cooldown.delete(state.cooldown.keys().next().value);
-            }
-
             // Duplicate packet events for a tile share one bounded pending job.
             // During active combat postpone pickup rather than stopping Targeting.
             if (state.pendingTiles.has(tileKey) || state.pendingTiles.size >= 64)
@@ -64255,7 +64123,7 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
                     }
                     const tile = gameClient.world?.getTileFromWorldPosition(pickupPos);
                     const topItem = getTopItemOnTile(tile);
-                    if (!topItem || topItem.id !== itemId) {
+                    if (!topItem) {
                         abandon();
                         return;
                     }
@@ -64272,8 +64140,8 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
                         return;
                     }
                     abandon();
-                    __walkAndPickup(pickupPos, itemId);
-                }, attempt === 0 ? config.delayMs : 500);
+                    __walkAndPickup(pickupPos, topItem.id);
+                }, attempt === 0 ? 0 : 500);
                 state.delayedJobs.add(delayedJob);
             };
             schedulePickup(0);
@@ -64305,7 +64173,7 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
     // ---- Start / Stop ----
     function start(overrides = {}) {
         Object.assign(config, overrides, {
-            enabled: true
+            enabled: true, cooldownMs: 0, delayMs: 0
         });
         persistConfig();
         if (state.running) {
@@ -64314,7 +64182,6 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
         }
         state.running = true;
         clearPickupTimers();
-        state.cooldown.clear();
         state.pickupInProgress = false;
         state.caveMovementPaused = false;
         installHook();
@@ -64337,7 +64204,6 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
         // CaveBot or Targeting after Pink Skull / destruction.
         __resumeModules();
         uninstallHook();
-        state.cooldown.clear();
         if (shouldPersist) {
             config.enabled = false;
             persistConfig();
@@ -64372,10 +64238,7 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
         Object.assign(config, next);
         if (config.radius < 1)
             config.radius = 1;
-        if (config.cooldownMs < 500)
-            config.cooldownMs = 500;
-        if (config.delayMs < 100)
-            config.delayMs = 100;
+        config.cooldownMs = config.delayMs = 0;
         if (config.walkTimeoutMs < 2000)
             config.walkTimeoutMs = 2000;
         persistConfig();
