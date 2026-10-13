@@ -3039,7 +3039,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.201",
+        version: "1.6.203",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -23423,7 +23423,9 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
         lastCountRequestAt:0, pendingUntil:0, lastCastAt:0,
         castCount:0, aoeCastCount:0, creatureCastCount:0,
         skippedCooldown:0, skippedNoSupply:0, skippedNoLos:0,
-        skippedAoeBelowThreshold:0,
+        skippedAoeBelowThreshold:0, skippedStaleAoe:0, aoeReaims:0,
+        lastAoeCurrentHitCount:0, lastAoePredictedHitCount:0,
+        lastAoeMotionTargets:0, lastAoeEdgeMargin:0,
         lastRejectedAoeHitCount:0,
         lastRejectedAoeRuleMin:0,
         skippedHealingPriority:0,
@@ -23637,70 +23639,143 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
             );
     }
 
+    // The client stores the server-reported destination at movement start.
+    // Only consider the NEXT step near the end of that movement; never lead
+    // the current step twice. A forecast is an alternative, not a replacement
+    // for the live tile, so stopping/turning cannot invalidate a counted hit.
+    function getAoeMotion(creature) {
+        const pos = monsterPos(creature);
+        if (!pos) return null;
+        const motion = { pos, next: pos, predicted: false };
+        try {
+            const event = creature.__movementEvent;
+            if (creature.__teleported || !event || event.cancelled ||
+                (typeof creature.isMoving === "function" && !creature.isMoving())) return motion;
+            const previous = normalizePosition(creature.__previousPosition);
+            if (!previous || previous.z !== pos.z) return motion;
+            const dx = pos.x - previous.x, dy = pos.y - previous.y;
+            if (Math.abs(dx) > 1 || Math.abs(dy) > 1 || (!dx && !dy)) return motion;
+            const remaining = Number(event.remainingMillis?.());
+            const rawRtt = Number(window.gameClient?.networkManager?.state?.latency);
+            const horizon = Math.max(80, Math.min(300, 80 + (Number.isFinite(rawRtt) ? Math.max(0, rawRtt) / 2 : 0)));
+            if (!Number.isFinite(remaining) || remaining < -50 || remaining > horizon) return motion;
+            const next = { x: pos.x + dx, y: pos.y + dy, z: pos.z };
+            const tile = getLoadedTile(next);
+            if (!tile || tile.id === 0 || bot.hasNavigationObstacle?.(tile) ||
+                bot.cave?.isFloorChangeTile?.(tile) ||
+                (typeof tile.isWalkable === "function" && !tile.isWalkable())) return motion;
+            motion.next = next; motion.predicted = true;
+        } catch (e) { /* unknown movement data: use the live tile */ }
+        return motion;
+    }
+
+    // Distance in tiles to the first uncovered square. Larger margins keep
+    // targets away from the thin outer tips of the user's exact rune masks.
+    const AOE_GEOMETRY = Object.fromEntries(Object.entries(SHAPES).map(([key, offsets]) => {
+        const cells = new Set(offsets.map(o => `${o.x},${o.y}`));
+        const margins = new Map();
+        for (const offset of offsets) {
+            let margin = 0;
+            for (let radius = 1; radius <= 8; radius++) {
+                let contained = true;
+                for (let dx = -radius; dx <= radius && contained; dx++) {
+                    for (let dy = -radius; dy <= radius; dy++) {
+                        if (!cells.has(`${offset.x + dx},${offset.y + dy}`)) { contained = false; break; }
+                    }
+                }
+                if (!contained) break;
+                margin = radius;
+            }
+            margins.set(`${offset.x},${offset.y}`, margin);
+        }
+        return [key, { cells, margins }];
+    }));
+
+    function getFreshAoeMonsters(rule) {
+        let fresh = getEligibleMonsters(false);
+        if (rule.monsters) {
+            const allowed = new Set(rule.monsters.map(m => Number(m.id)));
+            fresh = fresh.filter(m => allowed.has(Number(m.id)));
+        }
+        if (rule.combatRule) {
+            if (!bot.combatRules?.meetsCount?.(rule.combatRule, fresh)) return [];
+            fresh = fresh.filter(m => matchesRuleMob(rule, m));
+        }
+        return fresh;
+    }
+
     function getBestAoeTarget(runeKey, monsters, rule) {
-        const offsets = SHAPES[runeKey];
+        const offsets = SHAPES[runeKey], geometry = AOE_GEOMETRY[runeKey];
         if (!offsets?.length || !monsters?.length) return null;
         const me = normalizePosition(bot.getPlayerPosition());
         if (!me) return null;
-        const entries = monsters.map(monster => ({monster,pos:monsterPos(monster)}))
-            .filter(e => e.pos && e.pos.z === me.z);
+        const entries = monsters.map(monster => ({ monster, motion: getAoeMotion(monster) }))
+            .filter(e => e.motion && e.motion.pos.z === me.z);
         if (!entries.length) return null;
         const currentId = Number(bot.attack?.getCurrentTarget?.()?.id);
         const centers = new Map();
-        for (const e of entries) {
-            for (const off of offsets) {
-                const c = {x:e.pos.x-off.x, y:e.pos.y-off.y, z:e.pos.z};
-                centers.set(`${c.x},${c.y},${c.z}`, c);
+        for (const entry of entries) {
+            for (const pos of [entry.motion.pos, entry.motion.next]) {
+                for (const offset of offsets) {
+                    const center = { x: pos.x - offset.x, y: pos.y - offset.y, z: pos.z };
+                    centers.set(`${center.x},${center.y},${center.z}`, center);
+                }
             }
         }
-        const offsetSet = new Set(offsets.map(o => `${o.x},${o.y}`));
-        const safetyPlayers =
-            getAoeSafetyPlayers(me.z);
+        const safetyPlayers = getAoeSafetyPlayers(me.z).map(entry =>
+            ({ ...entry, motion: getAoeMotion(entry.player) || { pos: entry.pos, next: entry.pos } }));
+        const motionTargets = entries.filter(e => e.motion.predicted).length;
+        const covered = (pos, center) => geometry.cells.has(`${pos.x-center.x},${pos.y-center.y}`);
+        const marginAt = (pos, center) => geometry.margins.get(`${pos.x-center.x},${pos.y-center.y}`) ?? 0;
         let best = null;
         for (const center of centers.values()) {
             if (!getLoadedTile(center)) continue;
             if (!hasLos(center)) { state.skippedNoLos++; continue; }
-
-            if (safetyPlayers.length) {
-                const unsafePlayers =
-                    safetyPlayers.filter(entry =>
-                        offsetSet.has(
-                            `${entry.pos.x-center.x},${entry.pos.y-center.y}`
-                        )
-                    );
-
-                if (unsafePlayers.length) {
-                    state.skippedUnsafePlayerAoe++;
-                    state.lastUnsafePlayerAoeNames =
-                        unsafePlayers.map(entry =>
-                            entry.player?.name || "Player"
-                        );
-                    state.lastUnsafePlayerAoePosition =
-                        { ...center };
-                    continue;
-                }
+            const unsafePlayers = safetyPlayers.filter(entry =>
+                covered(entry.motion.pos, center) || covered(entry.motion.next, center));
+            if (unsafePlayers.length) {
+                state.skippedUnsafePlayerAoe++;
+                state.lastUnsafePlayerAoeNames = unsafePlayers.map(entry => entry.player?.name || "Player");
+                state.lastUnsafePlayerAoePosition = { ...center };
+                continue;
             }
-
             const hits = [];
-            let includesCurrent = false, distanceSum = 0;
-            for (const e of entries) {
-                if (!offsetSet.has(`${e.pos.x-center.x},${e.pos.y-center.y}`)) continue;
-                hits.push(e.monster);
-                if (Number(e.monster.id) === currentId) includesCurrent = true;
-                distanceSum += dist(me,e.pos);
+            let currentHitCount = 0, predictedHitCount = 0, includesCurrent = false;
+            let edgeMargin = Infinity, totalMargin = 0, distanceSum = 0;
+            for (const { monster, motion } of entries) {
+                const currentHit = covered(motion.pos, center), nextHit = covered(motion.next, center);
+                if (currentHit) currentHitCount++;
+                if (nextHit) predictedHitCount++;
+                // Count only monsters covered whether they stay or continue
+                // the observed step. Never satisfy a rule with predicted-only hits.
+                if (!currentHit || !nextHit) continue;
+                hits.push(monster);
+                includesCurrent ||= Number(monster.id) === currentId;
+                const margin = Math.min(marginAt(motion.pos, center), marginAt(motion.next, center));
+                edgeMargin = Math.min(edgeMargin, margin); totalMargin += margin;
+                distanceSum += dist(me, motion.pos);
             }
             if (!hits.length || !hits.some(monster => matchesRuleMob(rule, monster))) continue;
             const candidate = {
-                position:center, hits, hitCount:hits.length, includesCurrent,
-                centerDistance:dist(me,center), distanceSum
+                position: center, hits, hitCount: hits.length, includesCurrent,
+                currentHitCount, predictedHitCount, edgeMargin, totalMargin,
+                motionTargets,
+                centerDistance: dist(me, center), distanceSum
             };
-            if (!best ||
-                candidate.hitCount > best.hitCount ||
-                (candidate.hitCount === best.hitCount && candidate.includesCurrent && !best.includesCurrent) ||
-                (candidate.hitCount === best.hitCount && candidate.includesCurrent === best.includesCurrent && candidate.centerDistance < best.centerDistance) ||
-                (candidate.hitCount === best.hitCount && candidate.includesCurrent === best.includesCurrent && candidate.centerDistance === best.centerDistance && candidate.distanceSum < best.distanceSum)) {
-                best = candidate;
-            }
+            if (!best || candidate.hitCount > best.hitCount ||
+                (candidate.hitCount === best.hitCount && (
+                    candidate.edgeMargin > best.edgeMargin ||
+                    (candidate.edgeMargin === best.edgeMargin && (
+                        candidate.totalMargin > best.totalMargin ||
+                        (candidate.totalMargin === best.totalMargin && (
+                            (candidate.includesCurrent && !best.includesCurrent) ||
+                            (candidate.includesCurrent === best.includesCurrent && (
+                                candidate.centerDistance < best.centerDistance ||
+                                (candidate.centerDistance === best.centerDistance && candidate.distanceSum < best.distanceSum)
+                            ))
+                        ))
+                    ))
+                ))) best = candidate;
         }
         return best;
     }
@@ -23806,7 +23881,7 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
         const matchingMonsters = monsters.filter(monster => matchesRuleMob(rule, monster));
         if (!matchingMonsters.length) return false;
         const target = def.mode === "creature" ? getSingleTarget(matchingMonsters) : null;
-        const aoe = def.mode === "aoe" ? getBestAoeTarget(def.key, rule.combatRule ? matchingMonsters : monsters, rule) : null;
+        let aoe = def.mode === "aoe" ? getBestAoeTarget(def.key, rule.combatRule ? matchingMonsters : monsters, rule) : null;
         if (def.mode === "creature" && !target) return false;
         if (def.mode === "aoe" && !aoe) return false;
 
@@ -23837,8 +23912,24 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
         const releaseRuneGuard = bot.actions?.tryAcquire?.("aggressive-rune", 900) || null;
         if (bot.actions && !releaseRuneGuard) return false;
 
-        const action = () => def.mode === "creature"
-            ? sendCreatureRune(def,target) : sendAoeRune(def,aoe.position);
+        const action = () => {
+            if (def.mode === "creature") return sendCreatureRune(def, target);
+            // Refresh aim, matching conditions and nearby players inside the
+            // shared action gate, immediately before issuing the normal packet.
+            if (bot.actions?.isHalted?.() ||
+                (bot.combatRules?.config?.unified && !bot.attack?.isRunning?.()) ||
+                bot.attack?.isProtectionZoneBlocked?.(Date.now()) ||
+                getRuneCooldownRemainingMs() > 0 || yieldToHealing(false)) return false;
+            const fresh = getBestAoeTarget(def.key, getFreshAoeMonsters(rule), rule);
+            if (!fresh || fresh.hitCount < rule.minCreatures) {
+                state.skippedStaleAoe++;
+                return false;
+            }
+            if (fresh.position.x !== aoe.position.x || fresh.position.y !== aoe.position.y || fresh.position.z !== aoe.position.z)
+                state.aoeReaims++;
+            aoe = fresh;
+            return sendAoeRune(def, aoe.position);
+        };
         const sent = bot.actions?.runShared
             ? bot.actions.runShared("rune-shooter", bot.actions.priorities.COMBAT, action, 120)
             : action();
@@ -23867,13 +23958,19 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
         } else {
             state.aoeCastCount++;
             state.lastHitCount = aoe.hitCount;
+            state.lastAoeCurrentHitCount = aoe.currentHitCount;
+            state.lastAoePredictedHitCount = aoe.predictedHitCount;
+            state.lastAoeMotionTargets = aoe.motionTargets;
+            state.lastAoeEdgeMargin = aoe.edgeMargin;
             state.lastTargetPosition = {...aoe.position};
             state.lastTargetCreatureId = null;
             state.lastTargetCreatureName = null;
             bot.log("Rune Shooter: fired AoE rune", {
                 rune:def.label, itemId:def.itemId, minCreatures:rule.minCreatures,
                 visibleMonsters:monsters.length, hitCount:aoe.hitCount, aim:aoe.position,
-                hits:aoe.hits.map(m => m.name || "Mob"), supplyBefore:supply.count
+                hits:aoe.hits.map(m => m.name || "Mob"), supplyBefore:supply.count,
+                currentHitCount:aoe.currentHitCount, predictedHitCount:aoe.predictedHitCount,
+                movingTargets:aoe.motionTargets, edgeMargin:aoe.edgeMargin
             });
         }
         return true;
@@ -23994,6 +24091,10 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
             skippedCooldown:state.skippedCooldown, skippedNoSupply:state.skippedNoSupply,
             skippedNoLos:state.skippedNoLos,
             skippedAoeBelowThreshold:state.skippedAoeBelowThreshold,
+            skippedStaleAoe:state.skippedStaleAoe, aoeReaims:state.aoeReaims,
+            lastAoeCurrentHitCount:state.lastAoeCurrentHitCount,
+            lastAoePredictedHitCount:state.lastAoePredictedHitCount,
+            lastAoeMotionTargets:state.lastAoeMotionTargets, lastAoeEdgeMargin:state.lastAoeEdgeMargin,
             lastRejectedAoeHitCount:state.lastRejectedAoeHitCount,
             lastRejectedAoeRuleMin:state.lastRejectedAoeRuleMin,
             skippedHealingPriority:state.skippedHealingPriority,
@@ -48624,7 +48725,6 @@ window.__minibiaBotBundle.installClientExtras=function(bot){
  function mount(panel){if(!panel||panel.querySelector('[data-client-extras]'))return;const sections=[];const section=(tab,title)=>{const host=panel.querySelector(`[data-tab-panel="${tab}"]`);if(!host)return null;const el=document.createElement('div');el.className='mb-section';el.setAttribute('data-client-extras','');const h=document.createElement('div');h.className='mb-section-title';const heading=document.createElement('span');heading.className='mb-title-text';heading.textContent=title;h.append(heading);el.append(h);host.prepend(el);sections.push(el);return el;};const make=(tag,parent,content)=>{const el=document.createElement(tag);if(content!=null)el.textContent=content;parent.append(el);return el;};const button=(parent,label,fn)=>{const b=make('button',parent,label);b.type='button';b.className='mb-small-button';b.addEventListener('click',()=>{try{fn();}catch(e){bot.log(e.message);message.textContent=e.message;}});return b;};const field=(parent,label,type='text',value='')=>{const l=make('label',parent);l.className='mb-field';make('span',l,label).className='mb-field-label';const i=make('input',l);i.type=type;i.value=value;if(type==='number')i.min='0';return i;};const check=(parent,label,value)=>{const l=make('label',parent);l.style.cssText='display:flex;align-items:center;gap:6px;margin:6px 0';const i=make('input',l);i.type='checkbox';i.checked=!!value;i.style.cssText='width:13px;min-width:13px;margin:0';make('span',l,label);return i;};const select=(parent,label,options)=>{const l=make('label',parent);l.className='mb-field';make('span',l,label);const s=make('select',l);for(const [value,name]of options){const o=make('option',s,name);o.value=value;}return s;};
  const inv=section('resupply','Inventory Browser');const message=make('div',inv);message.className='mb-small-note';const actions=make('div',inv);button(actions,'Refresh inventory',requestInventory);const search=field(inv,'Filter by name / SID / CID');const inventoryList=make('div',inv);inventoryList.style.cssText='max-height:260px;overflow:auto';let invSignature='';
  const routing=section('looter','Server Loot Routing');make('div',routing,'Loads and saves the game’s SID loot list. Fluid-specific rules stay in mb0t’s looter.').className='mb-small-note';const routeActions=make('div',routing);button(routeActions,'Load server settings',()=>textCommand('/lootlist'));const routeEnabled=check(routing,'Server loot list enabled',false);const routeList=make('div',routing);routeList.style.cssText='max-height:240px;overflow:auto';const routeSid=field(routing,'Item SID','number');const routeBag=field(routing,'Destination backpack name (blank = default)');let draft=null;button(routing,'Add / update route',()=>{if(!draft)throw new Error('Load server settings first');const sid=Number(routeSid.value);if(!Number.isInteger(sid)||sid<1||sid>65535)throw new Error('Invalid SID');if(!draft.selected.includes(sid))draft.selected.push(sid);draft.routes[sid]=routeBag.value.trim();renderRoutes();});button(routing,'Save to server',()=>{if(!draft)throw new Error('Load server settings first');saveLoot(draft.selected,routeEnabled.checked,draft.routes);message.textContent='Server loot settings sent.';});let lootRef=null;function renderRoutes(){routeList.replaceChildren();for(const sid of draft?.selected||[]){const line=make('div',routeList);line.style.cssText='display:flex;gap:6px;align-items:center;margin:4px 0';make('span',line,`${sid} → ${draft.routes[sid]||'default backpack'}`).style.flex='1';button(line,'Remove',()=>{draft.selected=draft.selected.filter(n=>n!==sid);delete draft.routes[sid];renderRoutes();});}}
- const native=section('utility','Native Automation');const controls={};for(const [id,label]of [['auto-loot-gold','Auto loot gold'],['auto-loot-food','Auto loot food'],['auto-open-corpse','Auto open corpses'],['auto-refill-ammo','Auto refill ammo'],['auto-eat-food','Auto eat food'],['auto-convert-loot','Auto convert loot'],['reopen-containers','Reopen containers after login']])controls[id]=check(native,label,window.gameClient?.interface?.settings?.__state?.[id]);button(native,'Apply native settings',()=>{applyNative(Object.fromEntries(Object.entries(controls).map(([id,i])=>[id,i.checked])));message.textContent='Native settings applied.';});
  const protection=section('status','Blessing Protection');const blessingText=make('div',protection);blessingText.className='mb-small-note';const guard=check(protection,'Check protection before starting CaveBot',config.blessingGuard);const maxLoss=field(protection,'Maximum death loss %','number',config.maxLoss);maxLoss.max='100';const pilgrimages=field(protection,'Minimum pilgrimage blessings','number',config.minPilgrimages);const temple=check(protection,'Require temple blessing',config.requireTemple),ward=check(protection,'Require Martyr’s Ward',config.requireWard);for(const i of [guard,maxLoss,pilgrimages,temple,ward])i.addEventListener('change',()=>{Object.assign(config,{blessingGuard:guard.checked,maxLoss:Math.max(0,Math.min(100,Number(maxLoss.value)||0)),minPilgrimages:Math.max(0,Number(pilgrimages.value)||0),requireTemple:temple.checked,requireWard:ward.checked});persist();});
  const progress=section('cave','Task & Quest Conditions');const progressActions=make('div',progress);button(progressActions,'Refresh tasks',()=>textCommand('/task'));button(progressActions,'Refresh quests',()=>{if(typeof QuestLogPacket==='function')window.gameClient?.send?.(new QuestLogPacket());});const progressList=make('div',progress);progressList.className='mb-small-note';const kind=select(progress,'Type',[['task','Task'],['quest','Quest / achievement']]);const name=field(progress,'Exact task / quest name');const condition=select(progress,'Condition',[['complete','Complete'],['count','Progress at least']]);const count=field(progress,'Progress count','number',1);const action=select(progress,'Action',[['stop','Stop CaveBot'],['label','Jump to waypoint label']]);const label=field(progress,'Waypoint label');const ruleList=make('div',progress);function renderRules(){ruleList.replaceChildren();config.conditions.forEach((r,i)=>{const row=make('div',ruleList);const enabled=check(row,`${r.name}: ${r.condition==='count'?'>= '+r.count:'complete'} → ${r.action==='label'?r.label:'stop'}`,r.enabled);enabled.addEventListener('change',()=>{r.enabled=enabled.checked;fired.delete(i);persist();});button(row,'Remove',()=>{config.conditions.splice(i,1);fired.clear();persist();renderRules();});});}button(progress,'Add condition',()=>{if(!name.value.trim())throw new Error('Enter an exact task / quest name');if(action.value==='label'&&!label.value.trim())throw new Error('Enter a waypoint label');config.conditions.push({enabled:true,kind:kind.value,name:name.value.trim(),condition:condition.value,count:Math.max(0,Number(count.value)||0),action:action.value,label:label.value.trim()});persist();renderRules();});button(progress,'Rearm conditions',()=>{fired.clear();message.textContent='Conditions rearmed.';});make('div',progress,'Conditions run once per arm, from received task/quest progress. Refresh after progress changes. Scripts can use bot.progress.matches(rule) or bot.progress.branch(rule, label).').className='mb-small-note';renderRules();
  function render(){sync();if(!loot&&lootRef){lootRef=null;draft=null;routeList.replaceChildren();}if(loot&&loot!==lootRef){lootRef=loot;draft={selected:(loot.selected||[]).map(Number),routes:{...loot.routes}};routeEnabled.checked=loot.enabled!==false;renderRoutes();}if(protection.getClientRects().length){const b=blessings||window.gameClient?.player?.blessings;blessingText.textContent=b?`Pilgrimages ${b.pilgrimageCount} · Temple ${b.hasTemple?'yes':'no'} · Ward ${b.hasWard?'yes':'no'} · Death loss ${b.lossPercent}%`:'Blessing state unknown';}if(progress.getClientRects().length)progressList.textContent=rows().map(r=>`${r.kind}: ${r.name} ${r.current}/${r.required}${r.completed?' ✓':''}`).join(' · ')||'Refresh to load task / quest progress.';if(!inv.getClientRects().length)return;const query=search.value.trim().toLowerCase(),signature=inventoryAt+':'+query;if(signature===invSignature)return;invSignature=signature;inventoryList.replaceChildren();for(const item of inventory){const def=window.gameClient?.itemDefinitionsBySid?.[item.sid];const itemName=def?.properties?.name||'Item';const desc=`${itemName} · SID ${item.sid} / CID ${item.cid} · Fluid ${item.fluidType} · Tint ${item.tintId}`;if(query&&!desc.toLowerCase().includes(query))continue;const row=make('div',inventoryList);row.style.cssText='padding:6px 0;border-bottom:1px solid #444';make('div',row,desc);button(row,'Cooking',()=>{if(item.fluidType)throw new Error('Fluid containers cannot be added as cooking food');const foods=bot.cooking.config.foods;if(!foods.some(f=>f.sid===item.sid&&f.cid===item.cid))bot.cooking.updateConfig({foods:[...foods,{sid:item.sid,cid:item.cid}]});message.textContent='Food added to Cooking.';});button(row,'Supply',()=>{const rule=bot.npcSupplyBuyer.addRule(itemName,100,10,itemName);if(rule)bot.npcSupplyBuyer.updateRule(rule.id,{sid:item.sid,cid:item.cid,fluidType:item.fluidType});message.textContent='Exact item supply rule added; edit amounts in Resupply.';});button(row,'Loot route',()=>{if(item.fluidType)throw new Error('Use mb0t looter capture for fluid-specific rules');routeSid.value=item.sid;message.textContent='SID copied to Server Loot Routing in Looter.';});}if(!inventory.length)make('div',inventoryList,'Refresh to list items in open and closed backpacks.');}
@@ -52455,7 +52555,6 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
         const lists=listsTitle?.parentElement;if(lists){lists.classList.add('mb-section');lists.style.cssText='';listsTitle.classList.remove('mb-section-title--sub');listsTitle.style.cssText='';targeting.append(lists);}
         const rules=targeting?.querySelector('.mb-combat-rules');if(core)targeting.prepend(core);if(rune)targeting.append(rune);if(rules)targeting.append(rules);if(lists)targeting.append(lists);
         const cave=tab('cave');for(const title of ['Recovery Safety','Debug']){const h=Array.from(cave?.querySelectorAll('.mb-section-title')||[]).find(h=>h.textContent.trim()===title);const body=h?.parentElement;if(!body||body.tagName==='DETAILS')continue;const details=document.createElement('details');details.className='mb-cave-details';const summary=document.createElement('summary');summary.className='mb-section-title mb-section-title--sub';const label=document.createElement('span');label.className='mb-title-text';label.textContent=title;summary.append(label);details.append(summary);body.replaceWith(details);h.remove();details.append(...Array.from(body.childNodes));}
-        const native=Array.from(tab('utility')?.querySelectorAll('.mb-section')||[]).find(s=>header(s,'Native Automation'));if(native){const grid=document.createElement('div');grid.className='mb-native-grid';const checks=Array.from(native.children).filter(e=>e.tagName==='LABEL');checks.forEach(e=>grid.append(e));native.querySelector('.mb-section-title').after(grid);}
         const status=tab('status');
         const blessing=Array.from(status?.querySelectorAll(':scope > .mb-section')||[]).find(s=>header(s,'Blessing Protection'));
         const quick=Array.from(status?.querySelectorAll(':scope > .mb-section')||[]).find(s=>s.querySelector('.mb-status-grid'));
@@ -52479,8 +52578,6 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
 #minibia-bot-panel .mb-status-card-icon{width:22px!important;height:22px!important;font-size:13px!important;border-radius:3px!important;}
 #minibia-bot-panel .mb-status-card-state{grid-column:1;font-size:9px;gap:4px!important;margin:0!important;}
 #minibia-bot-panel .mb-status-toggle{grid-column:2;grid-row:1/3;align-self:center;width:auto!important;padding:3px 7px!important;font-size:10px!important;margin:0!important;}
-#minibia-bot-panel .mb-native-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px 8px;}
-#minibia-bot-panel .mb-native-grid label{font-size:10px;min-width:0;margin:0!important;}
 #minibia-bot-panel .mb-cave-details{border-top:1px solid rgba(255,255,255,.08);margin-top:10px;padding-top:6px;}
 #minibia-bot-panel .mb-cave-details>summary{cursor:pointer;display:list-item;}
 `;panel.append(style);
