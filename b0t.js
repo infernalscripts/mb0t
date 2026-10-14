@@ -3078,7 +3078,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.215",
+        version: "1.6.216",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -49113,7 +49113,7 @@ window.__minibiaBotBundle.installGroundSpawnLogger = function(bot) {
     }
     const enabled = () => !disposed && config.enabled === true;
     const render = () => { for (const view of views) view(); };
-    function append(record, consoleDetails = true) {
+    function append(record) {
         if (disposed) return false;
         record.sequence = ++sequence;
         let json = JSON.stringify(record);
@@ -49128,8 +49128,6 @@ window.__minibiaBotBundle.installGroundSpawnLogger = function(bot) {
             historyChars -= records.shift().length; dropped++;
         }
         records.push(json); historyChars += json.length;
-        if (consoleDetails) bot.log("Ground Spawn Logger: " + json);
-        else bot.log(`Ground Spawn Logger: snapshot saved (${record.tiles.length} tiles)`);
         render(); return true;
     }
     function context(at = Date.now()) {
@@ -49157,7 +49155,7 @@ window.__minibiaBotBundle.installGroundSpawnLogger = function(bot) {
             const tile = captureTile({x:p.x+dx,y:p.y+dy,z:p.z});
             if (tile?.loaded) tiles.push(tile);
         }
-        return append({...context(),kind:"snapshot",source:reason,tiles},false);
+        return append({...context(),kind:"snapshot",source:reason,tiles});
     }
     function updateConfig(next = {}) {
         if (disposed) return false;
