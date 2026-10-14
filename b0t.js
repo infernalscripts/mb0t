@@ -3078,7 +3078,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.214",
+        version: "1.6.215",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -47463,6 +47463,7 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
         "minibiaBot.messageAlert.config",
         "minibiaBot.antibot.config",
         "minibiaBot.gmChatMonitor.config",
+        "minibiaBot.groundSpawnLogger.config",
         "minibiaBot.antiBotCreature.config",
         "minibiaBot.tormentedGhost.config", // legacy key; deleted by AntiBotCreature on startup
         "minibiaBot.keyringToggle.config",
@@ -48815,7 +48816,7 @@ window.__minibiaBotBundle.installClientEvents = function installClientEvents(bot
         const event = { ...data, type, player: window.gameClient?.player || null, client: window.gameClient, at: Date.now() };
         // Target acknowledgements are protocol transitions: preserve their exact
         // order and state, rather than merging an acceptance with a later clear.
-        if (type === "target") {
+        if (type === "target" || type === "ground-item") {
             for (const fn of [...listeners.get(type) || []]) {
                 try { fn(event); } catch (error) { bot.log("Client event listener failed", error?.message || String(error)); }
             }
@@ -48919,8 +48920,17 @@ window.__minibiaBotBundle.installClientEvents = function installClientEvents(bot
                 ? { position: args[0]?.position } : null);
         hook(handler, "handleCancelWalk", "movement-cancel", (args, context) => ({ position: args[0], cave: context }),
             args => bot.cave?.captureMovementContext?.(args[0]) || null);
-        for (const name of ["handleChunk", "handleMapArea", "handleMapSlice", "handleTransformTile", "handleItemAdd", "handleRemoveItem", "handleItemReplace"])
+        for (const name of ["handleChunk", "handleMapArea", "handleMapSlice", "handleTransformTile"])
             hook(handler, name, "map");
+        for (const [name,kind] of [["handleItemAdd","add"],["handleRemoveItem","remove"],["handleItemReplace","replace"]]) {
+            hook(handler,name,"map",(args,before) => {
+                // Keep every ground update in order; the ordinary map signal
+                // remains coalesced for navigation and healing listeners.
+                if (bot.groundSpawnLogger?.enabled?.()) emit("ground-item",{kind,packet:args[0],before});
+                return {};
+            },args => bot.groundSpawnLogger?.enabled?.()
+                ? bot.groundSpawnLogger.captureTile(args[0]?.position) : null);
+        }
         hook(handler, "handleEntityTeleport", "movement", args =>
             Number(args[0]?.id) === Number(window.gameClient?.player?.id) ? { position: args[0]?.position } : null);
         hook(handler, "handleEntityRemove", "creatures");
@@ -49055,6 +49065,153 @@ window.__minibiaBotBundle.installCurePoisonModule=function(bot){
     }
     bot.curePoison={config,tick,mount};const timer=setInterval(tick,250);bot.addCleanup(()=>{disposed=true;clearInterval(timer);});
 };
+
+window.__minibiaBotBundle.installGroundSpawnLogger = function(bot) {
+    const key = "minibiaBot.groundSpawnLogger.config";
+    const saved = bot.storage.get(key, {});
+    const config = { enabled: saved?.enabled === true };
+    const MAX_RECORDS = 200, MAX_CHARS = 1000000, MAX_ITEMS = 16;
+    let disposed = false, historyChars = 0, dropped = 0, sequence = 0;
+    const records = [], views = new Set();
+    const number = value => value == null || value === "" || !Number.isFinite(Number(value)) ? null : Number(value);
+    const position = value => {
+        const p = value?.getPosition?.() || value;
+        return p && [p.x,p.y,p.z].every(v => number(v) != null)
+            ? { x: Number(p.x), y: Number(p.y), z: Number(p.z) } : null;
+    };
+    function flag(thing, name) {
+        const value = typeof PropBitFlag !== "undefined" ? PropBitFlag.prototype.flags[name] : undefined;
+        return value !== undefined && typeof thing?.hasFlag === "function" ? !!thing.hasFlag(value) : null;
+    }
+    function readThing(thing, ground = false) {
+        if (!thing) return null;
+        const client = window.gameClient, cid = number(thing.id ?? thing.cid);
+        const sid = number(thing.sid ?? client?.sidByCid?.[cid] ?? client?.itemDefinitionsByCid?.[cid]?.sid);
+        const sidDef = sid > 0 ? client?.itemDefinitionsBySid?.[sid] : null;
+        const cidDef = client?.itemDefinitionsByCid?.[cid];
+        const def = sidDef || cidDef;
+        return { cid, sid, name: def?.properties?.name || thing.name || null,
+            count: number(thing.count), fluidType: number(thing.fluidType), tintId: number(thing.tintId),
+            definitionFound: !!def, definitionCid: number(def?.id), serverFlags: number(def?.flags),
+            floorchange: def?.properties?.floorchange || null, itemType: def?.properties?.type || null,
+            ground: ground || flag(thing,"DatFlagGround") === true,
+            pickupable: flag(thing,"DatFlagPickupable"), notMoveable: flag(thing,"DatFlagNotMoveable"),
+            datNotWalkable: flag(thing,"DatFlagNotWalkable"), datNotPathable: flag(thing,"DatFlagNotPathable"),
+            walkable: typeof thing.isWalkable === "function" ? !!thing.isWalkable() : null };
+    }
+    function captureTile(value) {
+        const p = position(value), client = window.gameClient;
+        if (!p) return null;
+        const lookup = typeof Position === "function" ? new Position(p.x,p.y,p.z) : p;
+        const tile = client?.world?.getTileFromWorldPosition?.(lookup);
+        if (!tile || tile.id === 0 || tile.__isPlaceholder) return { position:p, loaded:false };
+        const items = Array.isArray(tile.items) ? tile.items : [];
+        return { position:p, loaded:true, ground:readThing(tile,true), itemCount:items.length,
+            items:items.slice(0,MAX_ITEMS).map((item,index) => ({ index, ...readThing(item) })),
+            omittedItems:Math.max(0,items.length-MAX_ITEMS),
+            creatures:Array.from(tile.monsters || []).slice(0,8).map(c => ({id:number(c.id),name:c.name || null,type:c.type ?? null})) };
+    }
+    const enabled = () => !disposed && config.enabled === true;
+    const render = () => { for (const view of views) view(); };
+    function append(record, consoleDetails = true) {
+        if (disposed) return false;
+        record.sequence = ++sequence;
+        let json = JSON.stringify(record);
+        // Snapshot requests may include crowded tiles. Bound both record count
+        // and retained JSON size without retaining client objects or tile graphs.
+        while (json.length > MAX_CHARS && record.tiles?.length > 1) {
+            record.tiles.pop(); record.omittedTiles = (record.omittedTiles || 0) + 1;
+            json = JSON.stringify(record);
+        }
+        if (json.length > MAX_CHARS) return false;
+        while (records.length && (records.length >= MAX_RECORDS || historyChars+json.length > MAX_CHARS)) {
+            historyChars -= records.shift().length; dropped++;
+        }
+        records.push(json); historyChars += json.length;
+        if (consoleDetails) bot.log("Ground Spawn Logger: " + json);
+        else bot.log(`Ground Spawn Logger: snapshot saved (${record.tiles.length} tiles)`);
+        render(); return true;
+    }
+    function context(at = Date.now()) {
+        const player = window.gameClient?.player;
+        return { at, time:new Date(at).toISOString(), version:bot.version,
+            player: { name:player?.name || null, position:position(player?.getPosition?.() || bot.getPlayerPosition?.()) } };
+    }
+    function receive(event) {
+        if (!enabled() || event.client !== window.gameClient || event.player !== window.gameClient?.player) return;
+        const raw = event.packet || {}, p = position(raw.position);
+        if (!p) return;
+        const packet = { position:p };
+        for (const name of ["id","sid","count","fluidType","tintId","slot","index"])
+            if (raw[name] !== undefined) packet[name] = number(raw[name]);
+        append({ ...context(event.at), kind:event.kind, source:"server-ground-update",
+            packet, item:raw.id != null ? readThing(raw) : null,
+            before:event.before || null, after:captureTile(p) });
+    }
+    function snapshot(reason = "manual") {
+        if (disposed) return false;
+        const p = position(window.gameClient?.player?.getPosition?.() || bot.getPlayerPosition?.());
+        if (!p) return false;
+        const tiles = [];
+        for (let dy=-5;dy<=5;dy++) for (let dx=-7;dx<=7;dx++) {
+            const tile = captureTile({x:p.x+dx,y:p.y+dy,z:p.z});
+            if (tile?.loaded) tiles.push(tile);
+        }
+        return append({...context(),kind:"snapshot",source:reason,tiles},false);
+    }
+    function updateConfig(next = {}) {
+        if (disposed) return false;
+        const wasEnabled = enabled();
+        if (typeof next.enabled === "boolean") config.enabled = next.enabled;
+        bot.storage.set(key,{...config});
+        if (!wasEnabled && enabled()) {
+            bot.clientEvents?.ensureBound?.(); snapshot("logger-enabled");
+        }
+        render(); return true;
+    }
+    function clear() { records.length=0; historyChars=0; dropped=0; render(); }
+    function getLog() {
+        return { schemaVersion:1, logger:"mb0t-ground-spawn", version:bot.version,
+            exportedAt:new Date().toISOString(), droppedRecords:dropped,
+            limits:{maxRecords:MAX_RECORDS,maxJsonCharacters:MAX_CHARS,maxItemsPerTile:MAX_ITEMS},
+            records:records.map(json => JSON.parse(json)) };
+    }
+    function saveLog() {
+        if (!records.length || disposed) return false;
+        const blob = new Blob([JSON.stringify(getLog(),null,2)],{type:"application/json"});
+        const url = URL.createObjectURL(blob), link = document.createElement("a");
+        const stamp = new Date().toISOString().replace(/[:.]/g,"-");
+        link.href=url; link.download=`mb0t-ground-spawns-${stamp}.json`;
+        try { document.body.appendChild(link); link.click(); }
+        finally { link.remove(); window.setTimeout(() => URL.revokeObjectURL(url),1000); }
+        return true;
+    }
+    function mount(panel) {
+        const tab = panel?.querySelector('[data-tab-panel="alert"]');
+        if (!tab || tab.querySelector('[data-ground-spawn-logger]')) return;
+        const host = document.createElement("div"); host.className="mb-section";
+        host.setAttribute("data-ground-spawn-logger","");
+        host.innerHTML=`<label class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-ground-log="enabled"><span class="mb-title-text">Ground Spawn Logger</span></label><div class="mb-alert-actions" style="align-items:center;flex-wrap:wrap"><button type="button" class="mb-small-button" data-ground-log="snapshot">Snapshot</button><button type="button" class="mb-small-button" data-ground-log="save">Save log</button><button type="button" class="mb-small-button" data-ground-log="clear">Clear</button><span class="mb-small-note" data-ground-log="status"></span></div>`;
+        const trusted = tab.querySelector(".mb-alert-trusted"); tab.insertBefore(host,trusted || null);
+        const input=host.querySelector('[data-ground-log="enabled"]'), status=host.querySelector('[data-ground-log="status"]');
+        const save=host.querySelector('[data-ground-log="save"]'), clearButton=host.querySelector('[data-ground-log="clear"]');
+        const refresh=() => {
+            input.checked=config.enabled; status.textContent=`${enabled()?"Recording":"Off"} · ${records.length}/${MAX_RECORDS}`;
+            save.disabled=clearButton.disabled=!records.length;
+        };
+        input.addEventListener("change",() => updateConfig({enabled:input.checked}));
+        host.querySelector('[data-ground-log="snapshot"]').addEventListener("click",() => snapshot());
+        save.addEventListener("click",saveLog); clearButton.addEventListener("click",clear);
+        views.add(refresh); refresh();
+        bot.addCleanup(() => { views.delete(refresh); host.remove(); });
+    }
+    const off = bot.clientEvents?.subscribe?.("ground-item",receive);
+    bot.groundSpawnLogger = {config,enabled,captureTile,snapshot,updateConfig,clear,getLog,saveLog,mount,
+        status:() => ({enabled:enabled(),records:records.length,dropped,maxRecords:MAX_RECORDS})};
+    bot.addCleanup(() => { disposed=true; off?.(); views.clear(); records.length=0; historyChars=0; });
+    if (enabled()) snapshot("logger-enabled");
+};
+
 
 window.__minibiaBotBundle.installObservability = function(bot) {
     const storageKey='minibiaBot.supplyEstimates';
@@ -57887,6 +58044,7 @@ function upgradeSectionHeaders(panel) {
         bot.smithing?.mount?.(panel);
         bot.cooking?.mount?.(panel);
         bot.observability?.mount?.(panel);
+        bot.groundSpawnLogger?.mount?.(panel);
         bot.curePoison?.mount?.(panel);
         organizePanelSections(panel);
 
@@ -65538,6 +65696,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         currentBundle.installClientEvents(bot);
         currentBundle.installClientExtras(bot);
         currentBundle.installObservability(bot);
+        currentBundle.installGroundSpawnLogger(bot);
         currentBundle.installCurePoisonModule(bot);
         currentBundle.installPzModule(bot);
         currentBundle.installXrayModule(bot);
@@ -65671,6 +65830,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
                 ["messageAlert", "minibiaBot.messageAlert.config"],
                 ["antiBotMonitor", "minibiaBot.antibot.config"],
                 ["gmChatMonitor", "minibiaBot.gmChatMonitor.config"],
+                ["groundSpawnLogger", "minibiaBot.groundSpawnLogger.config"],
                 ["antiBotCreature", "minibiaBot.antiBotCreature.config"],
                 ["keyringToggle", "minibiaBot.keyringToggle.config"],
                 ["itemIdDisplay", "minibiaBot.itemIdDisplay.config"],
