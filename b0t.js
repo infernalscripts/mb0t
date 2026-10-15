@@ -3414,7 +3414,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.229",
+        version: "1.6.230",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -53767,7 +53767,7 @@ function upgradeSectionHeaders(panel) {
             input.value = preferred.join("\n");
         }
 
-        if (modeSelect)
+        if (modeSelect && (force || document.activeElement !== modeSelect))
             modeSelect.value = mode;
         if (statusLabel) {
             const names = preferred.length ? preferred.join(", ") : "none";
@@ -62731,6 +62731,13 @@ function upgradeSectionHeaders(panel) {
             refreshPanicItemAlertsList();
         }, 2000);
         bot.addCleanup(() => window.clearInterval(audioAlertRefresh));
+
+        // Save match-mode changes immediately, before periodic status refresh.
+        // The explicit Save button also commits the current names and mode.
+        const prefModeSelect = document.getElementById("minibia-bot-auto-attack-preferred-match-mode");
+        const prefSaveButton = document.getElementById("minibia-bot-auto-attack-preferred-save");
+        prefModeSelect?.addEventListener("change", saveAutoAttackPreferredConfig);
+        prefSaveButton?.addEventListener("click", saveAutoAttackPreferredConfig);
 
         // ---- Auto-save preferred names on blur ----
         const prefInput = document.getElementById("minibia-bot-auto-attack-preferred-names");
