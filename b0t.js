@@ -3414,7 +3414,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.228",
+        version: "1.6.229",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -25210,6 +25210,12 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     }
 
     function stopCaveMovementNow() {
+        // An intentionally stopped route is no longer an outstanding walk.
+        // Combat/chase/looting can move the player away from its positions;
+        // retaining its watch would turn the pause into a false 5s stall.
+        // Keep the waypoint's real progress and bounded recovery clocks intact.
+        state.frontierMotionWatch = null;
+        state.frontierRoutePlan = null;
         releaseCavePacketBatch();
         // Cancel any queued CaveBot manual step.
         state.fallbackMoveRequestId++;
