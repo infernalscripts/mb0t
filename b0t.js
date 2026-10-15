@@ -936,6 +936,9 @@ addCleanup(() => {
         // Optional PvP behavior: when true, standalone Follow keeps ownership
         // of its own short A* AutoWalk batches even while a combat target exists.
         allowDuringTarget: false,
+        followFloors: false,
+        transitionReason: "",
+        transitionDestinationKey: null,
         targetId: null,
         targetPosKey: null,
         destinationKey: null,
@@ -1010,8 +1013,15 @@ addCleanup(() => {
             return false;
         customFollowBot = owner || window.minibiaBot;
         mode = mode === "nonpvp" && window.gameClient?.__worldPvp === false ? "nonpvp" : "pvp";
-        if (customFollowState.name !== name || customFollowState.mode !== mode)
+        if (customFollowState.name !== name || customFollowState.mode !== mode) {
+            clearFollowFloorTracking();
             customFollowState.retryAt = 0;
+        }
+        if (Object.hasOwn(options,"followFloors") && customFollowState.followFloors !== (options.followFloors === true)) {
+            clearFollowFloorTracking();
+            stopCustomFollowAutoWalk("floor follow option changed");
+            customFollowState.followFloors=options.followFloors === true;
+        }
         customFollowState.active = true;
         customFollowState.name = name;
         customFollowState.mode = mode;
@@ -1033,6 +1043,7 @@ addCleanup(() => {
     }
 
     function endCustomFollow(reason) {
+        clearFollowFloorTracking();
         customFollowState.active = false;
         customFollowState.name = "";
         customFollowState.continuous = false;
@@ -1061,6 +1072,317 @@ addCleanup(() => {
             customFollowBot?.cave?.resumeMovement?.("script-follow-arrival");
         }
     }
+
+    let lastFollowFloorFailure = null;
+    const followFloorState = {client:null,player:null,lastSeen:null,lastStep:null,trail:[],evidence:null,blocked:false,routeChanged:false};
+    const followFloorPosition = p => p && [p.x,p.y,p.z].every(v=>Number.isFinite(Number(v)))
+        ? {x:Number(p.x),y:Number(p.y),z:Number(p.z)} : null;
+    const followFloorDistance = (a,b) => a && b && a.z===b.z ? Math.max(Math.abs(a.x-b.x),Math.abs(a.y-b.y)) : Infinity;
+    function clearFollowFloorTracking() {
+        followFloorState.client=followFloorState.player=followFloorState.lastSeen=followFloorState.lastStep=followFloorState.evidence=null;
+        followFloorState.trail=[]; followFloorState.blocked=false; followFloorState.routeChanged=false;
+        customFollowState.transitionReason=""; customFollowState.transitionDestinationKey=null;
+    }
+    function followTransitionThing(thing) {
+        const client=window.gameClient;
+        const def=client?.itemDefinitionsBySid?.[thing?.sid] || client?.itemDefinitionsByCid?.[thing?.id];
+        const name=String(def?.properties?.name || thing?.name || "").toLowerCase();
+        return !!(def?.properties?.floorchange || def?.properties?.type==="teleport" ||
+            [1948,1968,435].includes(Number(thing?.id)) || /\b(rope spot|ladder|stairs|staircase|hole|trapdoor|teleport)\b/.test(name));
+    }
+    function getFollowTransitionInfo(tile) {
+        if (!tile || !tile.id || tile.__isPlaceholder) return null;
+        const client=window.gameClient;
+        for (const thing of [tile,...(tile.items || [])]) {
+            if (!thing) continue;
+            const def=client?.itemDefinitionsBySid?.[thing.sid] || client?.itemDefinitionsByCid?.[thing.id];
+            const name=String(def?.properties?.name || thing.name || "").toLowerCase();
+            if (def?.properties?.type==="teleport" || /\bteleport/.test(name)) return {kind:"step",delta:0};
+            if (/\brope spot\b/.test(name)) return {kind:"rope",delta:-1};
+            if (/\b(closed hole|loose stone pile|stone pile|gravel pile|dirt pile|diggable|sand hole)\b/.test(name)) return {kind:"shovel",delta:1};
+            const floor=def?.properties?.floorchange;
+            if ([1948,1968,435].includes(Number(thing.id)) || /\bladder\b/.test(name))
+                return {kind:"use",delta:floor ? (floor==="down"?1:-1) : 0};
+            if (floor) return {kind:"step",delta:floor==="down"?1:-1};
+            if (/\b(open hole|hole|open trapdoor)\b/.test(name) && !/closed/.test(name)) return {kind:"step",delta:1};
+        }
+        return null;
+    }
+    function getFollowFloorTile(p) {
+        return p && typeof Position==="function" ? window.gameClient?.world?.getTileFromWorldPosition?.(new Position(p.x,p.y,p.z)) : null;
+    }
+    function selectFollowTransition(from,to) {
+        const candidates=[];
+        // The last visible position can precede the actual stair by several
+        // tiles. Search the observed entrance/exit area, not the follower's
+        // surroundings. Ordinary stairs must also be close to the exit XY.
+        for(let dy=-4;dy<=4;dy++) for(let dx=-4;dx<=4;dx++) {
+            const p={x:from.x+dx,y:from.y+dy,z:from.z},tile=getFollowFloorTile(p);
+            let info=getFollowTransitionInfo(tile);
+            if (info?.delta===1 && to.z<from.z && [tile,...(tile?.items || [])].some(t=>/\bhole\b/.test(String(window.gameClient?.itemDefinitionsByCid?.[t?.id]?.properties?.name || t?.name || "").toLowerCase()))) info={kind:"rope",delta:-1};
+            if (!info || (info.delta && Math.sign(to.z-from.z)!==info.delta)) continue;
+            const sourceDistance=Math.max(Math.abs(dx),Math.abs(dy));
+            const exitDistance=Math.max(Math.abs(p.x-to.x),Math.abs(p.y-to.y));
+            const teleport=[tile,...(tile?.items || [])].some(t=>{
+                const def=window.gameClient?.itemDefinitionsBySid?.[t?.sid] || window.gameClient?.itemDefinitionsByCid?.[t?.id];
+                return def?.properties?.type==="teleport" || /\bteleport/.test(String(def?.properties?.name || t?.name || "").toLowerCase());
+            });
+            if (sourceDistance>1 && !teleport && exitDistance>2) continue;
+            const score=sourceDistance*10+exitDistance;
+            candidates.push({position:p,...info,score,sourceDistance,exitDistance});
+        }
+        // Retain the precise local selection when available. Wider candidates
+        // are a fallback for missing final leader steps, and ties stay unknown.
+        const local=candidates.filter(c=>c.sourceDistance<=1);
+        const ranked=local.length ? local : candidates;
+        ranked.sort((a,b)=>a.score-b.score);
+        if (!ranked.length) return null;
+        const tied=ranked.filter(c=>c.score===ranked[0].score);
+        if (tied.length===1) return tied[0];
+        // Side-by-side tiles of one staircase can tie in Chebyshev distance.
+        // Prefer the tile aligned with the observed entrance and exit; retain
+        // uncertainty for distinct transitions or equally aligned entrances.
+        if (tied.some(c=>c.kind!=="step" || !c.delta || c.delta!==tied[0].delta ||
+            tied.some(other=>followFloorDistance(c.position,other.position)>1))) return null;
+        const alignment=c=>Math.abs(c.position.x-from.x)+Math.abs(c.position.y-from.y)+
+            Math.abs(c.position.x-to.x)+Math.abs(c.position.y-to.y);
+        tied.sort((a,b)=>alignment(a)-alignment(b));
+        return alignment(tied[0])<alignment(tied[1]) ? tied[0] : null;
+    }
+    function captureFollowFloorDiagnostics() {
+        const client=window.gameClient,from=followFloorState.evidence?.from || followFloorState.lastSeen?.position;
+        const samples=[];
+        const thing=t=>{
+            if (!t) return null;
+            const def=client?.itemDefinitionsBySid?.[t.sid] || client?.itemDefinitionsByCid?.[t.id];
+            return {cid:t.id,sid:t.sid ?? client?.sidByCid?.[t.id] ?? null,name:def?.properties?.name || t.name || null,
+                floorchange:def?.properties?.floorchange || null,type:def?.properties?.type || null,flags:def?.flags ?? null,
+                walkable:t.isWalkable?.() ?? null};
+        };
+        if (from) for(let dy=-4;dy<=4;dy++) for(let dx=-4;dx<=4;dx++) {
+            const position={x:from.x+dx,y:from.y+dy,z:from.z},tile=getFollowFloorTile(position);
+            samples.push(!tile || !tile.id || tile.__isPlaceholder ? {position,loaded:false} :
+                {position,loaded:true,transition:getFollowTransitionInfo(tile),ground:thing(tile),items:(tile.items || []).slice(0,8).map(thing)});
+        }
+        return {at:Date.now(),version:customFollowBot?.version || window.minibiaBot?.version || null,
+            name:customFollowState.name,enabled:customFollowState.followFloors,reason:customFollowState.transitionReason,
+            player:followFloorPosition(client?.player?.getPosition?.()),leader:followFloorState.lastSeen,
+            evidence:followFloorState.evidence,lastStep:followFloorState.lastStep,pending:followFloorState.trail,samples};
+    }
+    function getFollowDiagnostics() {
+        // Freeze only serializable snapshots, with one retained failure report.
+        return JSON.parse(JSON.stringify({current:captureFollowFloorDiagnostics(),lastFailure:lastFollowFloorFailure}));
+    }
+    function rememberFollowFloorChange(from,to,at=Date.now(),confirmed=true) {
+        if (!from || !to || from.z===to.z || followFloorState.blocked) return;
+        const entrance=selectFollowTransition(from,to);
+        if (!entrance) { followFloorState.evidence={from,to,at}; return; }
+        const key=`${entrance.position.x},${entrance.position.y},${from.z}>${to.z}`;
+        const previous=followFloorState.trail.find(hop=>hop.key===key ||
+            (confirmed && hop.inferred && followFloorDistance(hop.position,entrance.position)===0));
+        if (previous) {
+            // A remove packet can only infer an exit. A later authoritative
+            // floor update refines that same hop instead of adding a second one.
+            if (confirmed && previous.inferred) Object.assign(previous,entrance,{key,exit:{...to},inferred:false});
+            followFloorState.evidence=null;
+            return;
+        }
+        if (followFloorState.trail.length>=4) { followFloorState.blocked=true;customFollowState.transitionReason="Too many unseen floor changes";return; }
+        if (!followFloorState.trail.length) followFloorState.routeChanged=true;
+        followFloorState.trail.push({...entrance,key,exit:{...to},at,inferred:!confirmed,startedAt:0,attempts:0,actionAt:0,approach:null});
+        followFloorState.evidence=null;
+    }
+    function observeFollowLeaderEvent(kind,packet) {
+        if (!customFollowState.active || !customFollowState.followFloors) return;
+        const client=window.gameClient,player=client?.player;
+        if (followFloorState.client!==client || followFloorState.player!==player) {
+            clearFollowFloorTracking();followFloorState.client=client;followFloorState.player=player;
+        }
+        const id=typeof packet==="number"?packet:packet?.id;
+        const target=client?.world?.getCreature?.(id) || client?.world?.activeCreatures?.[id];
+        if (!target) {
+            const previous=followFloorState.lastSeen,to=followFloorPosition(packet?.position);
+            // Leaving the visible creature list can precede the floor packet.
+            // Match only the recently observed leader ID in this same session.
+            if (kind!=="remove" && to && previous && Number(id)===Number(previous.id) &&
+                Number(id)!==Number(player?.id) && Date.now()-previous.at<=5000) {
+                if (previous.position.z!==to.z) rememberFollowFloorChange(previous.position,to);
+                followFloorState.lastSeen={id:previous.id,position:to,at:Date.now()};
+            }
+            return;
+        }
+        if (String(target.name || "").toLowerCase()!==customFollowState.name.toLowerCase() || target.id===player?.id) return;
+        const health=target.state?.health ?? target.health;
+        if (health!=null && Number(health)<=0) { followFloorState.trail=[];followFloorState.evidence=null;followFloorState.lastSeen=null;return; }
+        const from=followFloorPosition(target.getPosition?.() || target.__position),to=followFloorPosition(packet?.position);
+        if (!from) return;
+        followFloorState.lastSeen={id:target.id,position:to || from,at:Date.now()};
+        if (to && to.z!==from.z) rememberFollowFloorChange(from,to);
+        if (kind==="move" && to && from.z===to.z && followFloorDistance(from,to)===1)
+            followFloorState.lastStep={from,to,at:Date.now()};
+        if (kind==="remove") {
+            const info=getFollowTransitionInfo(getFollowFloorTile(from));
+            if (info?.delta) rememberFollowFloorChange(from,{...from,z:from.z+info.delta},Date.now(),false);
+            else {
+                // Some stair crossings remove the leader before an on-stair
+                // position is broadcast. Use only the immediately forward stair
+                // from a recent confirmed step; never probe nearby exits.
+                const step=followFloorState.lastStep;
+                if (step && Date.now()-step.at<2000 && followFloorDistance(step.to,from)===0) {
+                    const ahead={x:from.x+step.to.x-step.from.x,y:from.y+step.to.y-step.from.y,z:from.z};
+                    const tile=getFollowFloorTile(ahead),next=getFollowTransitionInfo(tile);
+                    const hole=[tile,...(tile?.items || [])].some(t=>/\bhole\b/.test(String(window.gameClient?.itemDefinitionsByCid?.[t?.id]?.properties?.name || t?.name || "").toLowerCase()));
+                    if (next?.kind==="step" && next.delta && !hole)
+                        rememberFollowFloorChange(from,{...ahead,z:ahead.z+next.delta},Date.now(),false);
+                }
+            }
+        }
+    }
+    function noteFollowLeaderPosition(target,now) {
+        const client=window.gameClient,player=client?.player;
+        if (followFloorState.client!==client || followFloorState.player!==player) {
+            clearFollowFloorTracking();followFloorState.client=client;followFloorState.player=player;
+        }
+        const to=followFloorPosition(target?.getPosition?.() || target?.__position);
+        if (!to) return;
+        const previous=followFloorState.lastSeen;
+        if (previous && previous.id===target.id && now-previous.at<=10000 && previous.position.z!==to.z)
+            rememberFollowFloorChange(previous.position,to,now);
+        followFloorState.lastSeen={id:target.id,position:to,at:now};
+    }
+    function canContinueFloorFollow(name) {
+        if (!customFollowState.active || !customFollowState.followFloors || followFloorState.blocked ||
+            followFloorState.client!==window.gameClient || followFloorState.player!==window.gameClient?.player ||
+            String(name).trim().toLowerCase()!==customFollowState.name.toLowerCase()) return false;
+        const hop=followFloorState.trail[0],now=Date.now();
+        return !!(hop && now-hop.at<30000) || !!(followFloorState.lastSeen && now-followFloorState.lastSeen.at<5000);
+    }
+    function followFloorTool(kind,p,now) {
+        const owner=customFollowBot || window.minibiaBot,client=window.gameClient;
+        const sid=kind==="rope"?2120:2554,def=client?.itemDefinitionsBySid?.[sid],cid=Number(def?.id);
+        if (!(cid>0) || typeof HotbarUsePacket!=="function") return false;
+        const reading=owner?.getItemCountReading?.(cid,0);
+        if (!reading || now-Number(reading.at || 0)>5000) {
+            if (now-(customFollowState.toolQueryAt || 0)>=1000) { customFollowState.toolQueryAt=now;owner?.requestItemCounts?.([{id:cid,fluidType:0}]); }
+            return false;
+        }
+        if (!(Number(reading.count)>0)) { customFollowState.transitionReason=`Missing ${kind}`;return false; }
+        return owner?.actions?.runShared?.("follow-transition",owner.actions.priorities.UTILITY,
+            ()=>client.send(new HotbarUsePacket(cid,0,3,0,new Position(p.x,p.y,p.z)))!==false,300)===true;
+    }
+    function followFloorMovementPending() {
+        const player=window.gameClient?.player;
+        // Use the client's own stale-prediction recovery. Never discard a live
+        // prediction or cancel a server-paced batch to act on a visual position.
+        player?.prunePreWalks?.();
+        return !!player?.isMoving?.() || (Array.isArray(player?.__preWalks) && player.__preWalks.length>0);
+    }
+    function runFollowFloorTransition(target,now) {
+        if (!customFollowState.followFloors) return false;
+        if (followFloorState.client!==window.gameClient || followFloorState.player!==window.gameClient?.player) {
+            clearFollowFloorTracking();followFloorState.client=window.gameClient;followFloorState.player=window.gameClient?.player;
+        }
+        if (target) noteFollowLeaderPosition(target,now);
+        if ((followFloorState.trail.length || followFloorState.evidence) && followFloorMovementPending()) {
+            customFollowState.transitionReason="Finishing current step before transition";
+            return true;
+        }
+        if (followFloorState.routeChanged) {
+            stopCustomFollowAutoWalk("leader changed floor");followFloorState.routeChanged=false;
+            customFollowState.transitionDestinationKey=null;
+        }
+        const pos=followFloorPosition(window.gameClient?.player?.getPosition?.());
+        if (!pos) return true;
+        let hop=followFloorState.trail[0];
+        while (hop && pos.z===hop.exit.z && followFloorDistance(pos,hop.exit)<=6) {
+            followFloorState.trail.shift();stopCustomFollowAutoWalk("floor transition complete");
+            customFollowState.transitionDestinationKey=null;hop=followFloorState.trail[0];
+        }
+        const leader=followFloorPosition(target?.getPosition?.() || target?.__position);
+        // Confirm completion before retrying or timing out old entrance evidence.
+        // Keep any remaining hops: an up/down sequence may end on this floor
+        // even though the follower still has transitions to traverse.
+        if (!hop && leader && leader.z===pos.z) {
+            followFloorState.evidence=null;followFloorState.blocked=false;
+            customFollowState.transitionReason="";customFollowState.transitionDestinationKey=null;
+            return false;
+        }
+        if (followFloorState.blocked) { stopCustomFollowAutoWalk("transition blocked");return true; }
+        const evidence=followFloorState.evidence;
+        if (evidence) {
+            if (now-evidence.at<10000) rememberFollowFloorChange(evidence.from,evidence.to,evidence.at);
+            else {
+                followFloorState.blocked=true;customFollowState.transitionReason="Could not identify leader's transition";
+                lastFollowFloorFailure=JSON.parse(JSON.stringify(captureFollowFloorDiagnostics()));
+                followFloorState.evidence=null;
+                return true;
+            }
+        }
+        hop=followFloorState.trail[0];
+        if (!hop) {
+            customFollowState.transitionReason="Waiting for leader's transition";stopCustomFollowAutoWalk("leader changed floor");return true;
+        }
+        if (!hop.startedAt) hop.startedAt=now;
+        if (pos.z!==hop.position.z || now-hop.at>=30000 || now-hop.startedAt>=20000 || (hop.attempts>=3 && now-hop.actionAt>=1500)) {
+            followFloorState.blocked=true;customFollowState.transitionReason="Transition failed — restart Follow to retry";
+            stopCustomFollowAutoWalk("transition timeout");return true;
+        }
+        const tile=getFollowFloorTile(hop.position),info=getFollowTransitionInfo(tile);
+        if (!info) {customFollowState.transitionReason="Waiting for transition tile";return true;}
+        if (hop.kind==="shovel" && info.kind==="step") {hop.kind="step";hop.attempts=0;}
+        const tool=hop.kind==="rope" || hop.kind==="shovel" || hop.kind==="use";
+        const distance=followFloorDistance(pos,hop.position);
+        const stepOff=hop.kind==="shovel" && distance===0;
+        if ((tool && distance<=1 && !stepOff) || (!tool && distance===0)) {
+            stopCustomFollowAutoWalk("using leader's transition");
+            customFollowState.transitionReason=`Following ${hop.kind==="step"?"floor change":hop.kind}`;
+            if (now-hop.actionAt<1500 || window.gameClient?.player?.isMoving?.()) return true;
+            let sent=false;
+            if (hop.kind==="rope" || hop.kind==="shovel") sent=followFloorTool(hop.kind,hop.position,now);
+            else {
+                const owner=customFollowBot || window.minibiaBot,client=window.gameClient;
+                sent=owner?.actions?.runShared?.("follow-transition",owner.actions.priorities.UTILITY,()=>{
+                    if (typeof client?.mouse?.use!=="function") return false;
+                    client.mouse.use({which:tile,index:0xFF});return true;
+                },300)===true;
+            }
+            if (sent) {hop.actionAt=now;hop.attempts++;}
+            return true;
+        }
+        let destination=hop.position, plannedPath=null;
+        if (tool && hop.approach) {
+            const previous={id:followFloorState.lastSeen?.id || -1,name:customFollowState.name,getPosition:()=>hop.approach};
+            if (isCustomFollowBatchUsable(previous,"pvp",now)) return true;
+        }
+        if (tool) {
+            const choices=[];
+            for(let dy=-1;dy<=1;dy++) for(let dx=-1;dx<=1;dx++) if(dx || dy) {
+                const p={x:hop.position.x+dx,y:hop.position.y+dy,z:pos.z},t=getFollowFloorTile(p);
+                if (isFollowFieldPassableTile(t,{allowNonPvpPlayerPassThrough:window.gameClient?.__worldPvp===false})) choices.push(p);
+            }
+            choices.sort((a,b)=>followFloorDistance(a,pos)-followFloorDistance(b,pos));
+            destination=null;
+            for (const choice of choices) {
+                const candidate=searchFollowPathIgnoringFields(getFollowFloorTile(pos),getFollowFloorTile(choice),{
+                    freshNeighbours:true,specialAreaPurpose:"route",allowNonPvpPlayerPassThrough:window.gameClient?.__worldPvp===false});
+                if (candidate?.length) {destination=choice;plannedPath=candidate;break;}
+            }
+            if (!destination) {customFollowState.transitionReason="Transition approach blocked";return true;}
+            hop.approach=destination;
+        }
+        const stub={id:followFloorState.lastSeen?.id || -1,name:customFollowState.name,getPosition:()=>destination};
+        if (isCustomFollowBatchUsable(stub,"pvp",now)) return true;
+        stopCustomFollowAutoWalk("route to leader's transition");
+        const from=getFollowFloorTile(pos),to=getFollowFloorTile(destination);
+        const path=plannedPath || searchFollowPathIgnoringFields(from,to,{allowTransitionDestination:!tool,freshNeighbours:true,specialAreaPurpose:"route",
+            allowNonPvpPlayerPassThrough:window.gameClient?.__worldPvp===false});
+        if (!path?.length) {customFollowState.transitionReason="Transition route blocked";return true;}
+        customFollowState.transitionReason="Walking to leader's transition";
+        sendCustomFollowAutoWalk(stub,{targetPosition:destination,transitionDestination:!tool,
+            pathPositions:path.map(t=>followFloorPosition(t.__position || t.getPosition?.()))},"pvp",now);
+        return true;
+    }
+
 
     function findFollowCreatureByName(name) {
         const targetName =
@@ -1344,7 +1666,8 @@ addCleanup(() => {
         if (!tile || tile.id === 0)
             return false;
 
-        if (isFollowFloorChangeTile(tile))
+        const transitionDestination=options.allowTransitionDestination === true && !!getFollowTransitionInfo(tile);
+        if (isFollowFloorChangeTile(tile) && !transitionDestination)
             return false;
 
         const items =
@@ -1391,7 +1714,8 @@ addCleanup(() => {
             !tile.__hasWalkableGroundItem?.() &&
             !hasMagicField &&
             !hasKnownWalkableObject &&
-            !allowedCreaturePresent
+            !allowedCreaturePresent &&
+            !(transitionDestination && followTransitionThing(tile))
         ) {
             return false;
         }
@@ -1407,7 +1731,7 @@ addCleanup(() => {
                     PropBitFlag.prototype
                         .flags
                         .DatFlagNotPathable
-                ) && !bot.isPlankBridgeGround?.(tile)
+                ) && !bot.isPlankBridgeGround?.(tile) && !(transitionDestination && followTransitionThing(tile))
             ) {
                 return false;
             }
@@ -1421,7 +1745,8 @@ addCleanup(() => {
                 isFollowMagicFieldItem(
                     item
                 ) ||
-                isKnownFollowWalkableObject(item)
+                isKnownFollowWalkableObject(item) ||
+                (transitionDestination && followTransitionThing(item))
             ) {
                 continue;
             }
@@ -1576,12 +1901,10 @@ addCleanup(() => {
                 currentNode.__closed =
                     true;
 
-                const neighbours =
-                    Array.isArray(
-                        currentNode.neighbours
-                    )
-                        ? currentNode.neighbours
-                        : [];
+                const neighbours = options.allowTransitionDestination === true || options.freshNeighbours === true
+                    ? [[0,-1],[1,0],[0,1],[-1,0],[-1,-1],[1,-1],[-1,1],[1,1]]
+                        .map(([dx,dy]) => getFollowFloorTile({x:currentNode.__position.x+dx,y:currentNode.__position.y+dy,z:currentNode.__position.z})).filter(Boolean)
+                    : (Array.isArray(currentNode.neighbours) ? currentNode.neighbours : []);
 
                 for (
                     let i = 0;
@@ -1605,6 +1928,7 @@ addCleanup(() => {
                         !isFollowFieldPassableTile(
                             neighbourNode,
                             {
+                                allowTransitionDestination: isDestination && options.allowTransitionDestination === true,
                                 allowedCreatureId:
                                     isDestination
                                         ? options
@@ -2322,6 +2646,7 @@ addCleanup(() => {
                 !isFollowFieldPassableTile(
                     tile,
                     {
+                        allowTransitionDestination: route.transitionDestination === true && i === pathPositions.length-1,
                         allowedCreatureId:
                             isFinalExactTarget
                                 ? target.id
@@ -2446,6 +2771,8 @@ addCleanup(() => {
                 targetPosKey;
             customFollowState.destinationKey =
                 destinationKey;
+            customFollowState.transitionDestinationKey=route.transitionDestination === true
+                ? `${targetPos.x},${targetPos.y},${targetPos.z}` : null;
             customFollowState.batchPathPositions = batch.map(step => ({
                 x: Number(step.x), y: Number(step.y), z: Number(step.z)
             }));
@@ -2568,6 +2895,7 @@ addCleanup(() => {
             const exact = mode === "nonpvp" && step.x === Number(targetPos.x) &&
                 step.y === Number(targetPos.y);
             const options = {
+                allowTransitionDestination: customFollowState.transitionDestinationKey === `${step.x},${step.y},${step.z}`,
                 allowedCreatureId: exact ? target.id : null,
                 allowCreatureStack: exact,
                 allowNonPvpPlayerPassThrough: client.__worldPvp === false
@@ -2663,6 +2991,13 @@ addCleanup(() => {
                 customFollowState.name
             );
 
+        const targetHealth=target?.state?.health ?? target?.health;
+        if (targetHealth != null && Number(targetHealth)<=0) {
+            clearFollowFloorTracking();
+        } else if (target?.id !== player.id && runFollowFloorTransition(target,now)) {
+            return true;
+        }
+
         if (
             !target ||
             target.id === player.id
@@ -2730,6 +3065,7 @@ addCleanup(() => {
     addCleanup(() => {
         customFollowDestroyed = true;
         endCustomFollow("bot cleanup");
+        lastFollowFloorFailure=null;
 
         const client =
             window.gameClient;
@@ -3078,7 +3414,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.216",
+        version: "1.6.221",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -3906,6 +4242,18 @@ addCleanup(() => {
                 options,
                 this
             );
+        },
+
+        observeFollowLeaderEvent,
+        canContinueFloorFollow,
+        getFollowDiagnostics,
+        setFollowFloors(enabled) {
+            if (customFollowState.followFloors !== (enabled === true)) {
+                clearFollowFloorTracking();
+                stopCustomFollowAutoWalk("floor follow option changed");
+                customFollowState.followFloors=enabled === true;
+            }
+            return customFollowState.followFloors;
         },
 
         setFollowDuringTarget(enabled) {
@@ -42927,6 +43275,8 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
         lastEquipAt: 0,
         captureMode: false,
         captureHandler: null,
+        captureKeyHandler: null,
+        captureTimer: null,
         // v1.6.20: Ammo Crafter uses the same server-backed HOTBAR_ITEM_COUNT
         // pipeline as the native hotbar. Never infer a full-inventory count by
         // scanning only equipment + currently open containers.
@@ -42941,6 +43291,7 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
         craftEnabled: false,
         craftTickMs: 2000,
         ammoThreshold: 4,
+        ammoItemId: null, // null retains legacy weapon/held-item counting
         craftManaCost: 140,
         craftSpellWords: "exeta con",
         highManaSpellWords: "utani hur",
@@ -42953,6 +43304,12 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
         equipThreshold: 7,
     }, stored);
 
+    function validAmmoId(value) {
+        const id = Number(value);
+        return Number.isSafeInteger(id) && id > 0 && id <= 65535 ? id : null;
+    }
+    config.ammoItemId = validAmmoId(config.ammoItemId);
+
     // Backward compatibility: if old `enabled` was true, set craftEnabled
     if (stored.enabled === true && config.craftEnabled === false) {
         config.craftEnabled = true;
@@ -42963,6 +43320,7 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
             craftEnabled: config.craftEnabled,
             equipEnabled: config.equipEnabled,
             ammoThreshold: config.ammoThreshold,
+            ammoItemId: config.ammoItemId,
             craftManaCost: config.craftManaCost,
             craftSpellWords: config.craftSpellWords,
             highManaSpellWords: config.highManaSpellWords,
@@ -43033,6 +43391,8 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
     const AMMO_COUNT_FRESH_MS = 6000;
 
     function resolveAmmoCountItemId() {
+        const ammoId = validAmmoId(config.ammoItemId);
+        if (ammoId) return ammoId;
         const configured = Number(config.weaponId || 0);
         if (Number.isSafeInteger(configured) && configured > 0)
             return configured;
@@ -43217,104 +43577,59 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
         }
     }
 
-    function startCaptureWeapon() {
-        if (state.captureMode)
-            return;
-        state.captureMode = true;
-        bot.log("Paladin: click a weapon slot (any container or equipment) to capture its ID");
-
-        const handler = (event) => {
-            const slot = event.target.closest(".slot[slotindex]");
-            if (!slot)
-                return;
-            event.preventDefault();
-            event.stopPropagation();
-
-            let containerEl = slot.closest("[containerindex]");
-            if (!containerEl)
-                containerEl = slot.closest("[containerIndex]");
-            if (!containerEl) {
-                const eq = window.gameClient?.player?.equipment;
-                if (eq) {
-                    for (let i = 0; i < eq.slots.length; i++) {
-                        const slotEl = eq.slots[i]?.element;
-                        if (slotEl && slotEl.contains(slot)) {
-                            const item = eq.getSlotItem(i);
-                            if (item) {
-                                config.weaponId = item.id;
-                                persistConfig();
-                                bot.log("Paladin: captured weapon ID from equipment", {
-                                    weaponId: item.id
-                                });
-                                const weaponIdInput = document.getElementById("minibia-bot-paladin-weapon-id");
-                                if (weaponIdInput)
-                                    weaponIdInput.value = item.id;
-                                if (typeof bot.ui?.refreshPaladinStatus === "function")
-                                    bot.ui.refreshPaladinStatus();
-                                state.captureMode = false;
-                                document.removeEventListener("click", handler, true);
-                                if (state.captureHandler === handler) state.captureHandler = null;
-                                return;
-                            }
-                        }
-                    }
-                }
-                bot.log("Paladin: no container or equipment slot found");
-                state.captureMode = false;
-                document.removeEventListener("click", handler, true);
-                if (state.captureHandler === handler) state.captureHandler = null;
-                return;
-            }
-
-            const containerId = Number(containerEl.getAttribute("containerindex") || containerEl.getAttribute("containerIndex"));
-            const container = getContainerById(containerId);
-            if (!container) {
-                bot.log("Paladin: container not found", {
-                    containerId
-                });
-                const available = getContainersArray().map(c => c.__containerId);
-                bot.log("Available containers:", available);
-                state.captureMode = false;
-                document.removeEventListener("click", handler, true);
-                if (state.captureHandler === handler) state.captureHandler = null;
-                return;
-            }
-
-            const slotIndex = Number(slot.getAttribute("slotindex"));
-            const item = container.getSlotItem(slotIndex);
-            if (!item) {
-                bot.log("Paladin: no item in slot");
-                state.captureMode = false;
-                document.removeEventListener("click", handler, true);
-                if (state.captureHandler === handler) state.captureHandler = null;
-                return;
-            }
-
-            config.weaponId = item.id;
-            persistConfig();
-            bot.log("Paladin: captured weapon ID", {
-                weaponId: item.id
-            });
-            const weaponIdInput = document.getElementById("minibia-bot-paladin-weapon-id");
-            if (weaponIdInput)
-                weaponIdInput.value = item.id;
-            if (typeof bot.ui?.refreshPaladinStatus === "function")
-                bot.ui.refreshPaladinStatus();
-
-            state.captureMode = false;
-            document.removeEventListener("click", handler, true);
-        };
-
-        state.captureHandler = handler;
-        document.addEventListener("click", handler, true);
+    function cancelCaptureWeapon() {
+        if (state.captureHandler) document.removeEventListener("click",state.captureHandler,true);
+        if (state.captureKeyHandler) document.removeEventListener("keydown",state.captureKeyHandler,true);
+        if (state.captureTimer != null) window.clearTimeout(state.captureTimer);
+        state.captureHandler=state.captureKeyHandler=state.captureTimer=null;
+        state.captureMode=false;
     }
 
-    function cancelCaptureWeapon() {
-        if (state.captureHandler) {
-            document.removeEventListener("click", state.captureHandler, true);
-            state.captureHandler = null;
-        }
-        state.captureMode = false;
+    function startCaptureWeapon(mode = "weapon") {
+        mode = mode === "ammo" ? "ammo" : "weapon";
+        const cancel = state.captureMode === mode;
+        cancelCaptureWeapon();
+        if (cancel) return false;
+        bot.itemDropper?.cancelCapture?.();
+        bot.equipRing?.clearCaptureMode?.();
+        bot.bootsSwapper?.clearCaptureMode?.();
+        const client=window.gameClient, player=client?.player;
+        if (!player) return false;
+        state.captureMode=mode;
+        bot.log(`Paladin: click ${mode === "ammo" ? "ammo" : "a weapon"} in a bag, equipment slot or on the ground (Esc to cancel)`);
+        state.captureHandler=event => {
+            if (client !== window.gameClient || player !== client.player) { cancelCaptureWeapon(); return; }
+            const slot=event.target?.closest?.(".slot[slotindex]");
+            if (!slot && event.target?.id !== "screen") return;
+            event.preventDefault(); event.stopPropagation(); event.stopImmediatePropagation?.();
+            let item=null;
+            if (slot) {
+                const containerEl=slot.closest?.("[containerindex]") || slot.closest?.("[containerIndex]");
+                if (containerEl) {
+                    const id=Number(containerEl.getAttribute("containerindex") ?? containerEl.getAttribute("containerIndex"));
+                    item=getContainerById(id)?.getSlotItem?.(Number(slot.getAttribute("slotindex")));
+                } else {
+                    const eq=player.equipment;
+                    for (let i=0;i<(eq?.slots?.length || 0);i++) {
+                        const element=eq.slots[i]?.element;
+                        if (element && (element === slot || element.contains?.(slot))) { item=eq.getSlotItem?.(i); break; }
+                    }
+                }
+            } else {
+                const object=client.mouse?.getWorldObject?.(event);
+                item=object?.which?.peekItem?.(object.index);
+            }
+            const id=validAmmoId(item?.id);
+            if (!id) { bot.log("Paladin: select an item with a valid ID"); return; }
+            updateConfig({[mode === "ammo" ? "ammoItemId" : "weaponId"]:id});
+            cancelCaptureWeapon();
+            bot.ui?.refreshPaladinStatus?.();
+        };
+        state.captureKeyHandler=event => { if (event.key === "Escape") cancelCaptureWeapon(); };
+        document.addEventListener("click",state.captureHandler,true);
+        document.addEventListener("keydown",state.captureKeyHandler,true);
+        state.captureTimer=window.setTimeout(cancelCaptureWeapon,30000);
+        return true;
     }
 
     // ---- Crafter functions ----
@@ -43386,8 +43701,8 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
             leftHandHasWeapon = true;
         }
 
-        // Refresh the shared server count even when only the equipper is on.
-        requestAmmoCount(Date.now(), false);
+        // Weapon and crafted ammo may now have different IDs.
+        bot.requestItemCounts?.([{id:Number(config.weaponId),fluidType:0}]);
 
         // Equip only if left hand is empty OR count is below threshold
         if (!leftHandHasWeapon || leftHandCount <= config.equipThreshold) {
@@ -43481,7 +43796,7 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
             return false;
         }
         state.equipRunning = true;
-        requestAmmoCount(Date.now(), true);
+        bot.requestItemCounts?.([{id:Number(config.weaponId),fluidType:0}]);
         bot.log("Paladin equipper started", {
             weaponId: config.weaponId
         });
@@ -43604,8 +43919,10 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
     }
 
     function updateConfig(nextConfig = {}) {
+        const oldAmmoId = resolveAmmoCountItemId();
         const oldWeaponId = Number(config.weaponId || 0) || null;
         Object.assign(config, nextConfig);
+        config.ammoItemId = validAmmoId(config.ammoItemId);
         config.ammoThreshold = Math.max(0, Number(config.ammoThreshold) || 0);
         config.craftManaCost = Math.max(0, Number(config.craftManaCost) || 0);
         config.highManaThreshold = Math.min(100, Math.max(0, Number(config.highManaThreshold) || 0));
@@ -43616,17 +43933,21 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
         }
         persistConfig();
         const newWeaponId = Number(config.weaponId || 0) || null;
-        if (newWeaponId !== oldWeaponId) {
+        if (resolveAmmoCountItemId() !== oldAmmoId) {
             state.ammoCountItemId = null;
             state.lastAmmoCountRequestAt = 0;
-            if (state.running || state.equipRunning) requestAmmoCount(Date.now(), true);
+            if (state.running) requestAmmoCount(Date.now(), true);
         }
+        if (newWeaponId !== oldWeaponId && state.equipRunning && newWeaponId)
+            bot.requestItemCounts?.([{id:newWeaponId,fluidType:0}]);
         bot.log("Paladin config updated", {
             ...config
         });
         const weaponIdInput = document.getElementById("minibia-bot-paladin-weapon-id");
         if (weaponIdInput)
             weaponIdInput.value = config.weaponId || "";
+        const ammoIdInput = document.getElementById("minibia-bot-paladin-ammo-id");
+        if (ammoIdInput) ammoIdInput.value = config.ammoItemId || "";
         return {
             ...config
         };
@@ -43659,6 +43980,8 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
         getAmmoCountState,
         requestAmmoCount,
         startCaptureWeapon,
+        startCaptureAmmo: () => startCaptureWeapon("ammo"),
+        cancelCaptureWeapon,
         getKillSwitchSnapshot,
         restoreKillSwitchSnapshot,
     };
@@ -47464,6 +47787,7 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
         "minibiaBot.antibot.config",
         "minibiaBot.gmChatMonitor.config",
         "minibiaBot.groundSpawnLogger.config",
+        "minibiaBot.follow.floors",
         "minibiaBot.antiBotCreature.config",
         "minibiaBot.tormentedGhost.config", // legacy key; deleted by AntiBotCreature on startup
         "minibiaBot.keyringToggle.config",
@@ -48917,7 +49241,8 @@ window.__minibiaBotBundle.installClientEvents = function installClientEvents(bot
         hook(handler, "handleSetTarget", "target", args => ({ id: args[0] }));
         hook(handler, "handleCreatureServerMove", "movement", args =>
             Number(args[0]?.id ?? args[0]?.guid) === Number(window.gameClient?.player?.id)
-                ? { position: args[0]?.position } : null);
+                ? { position: args[0]?.position } : null,
+            args => window.gameClient===client && client.player===player ? bot.observeFollowLeaderEvent?.("move",args[0]) : null);
         hook(handler, "handleCancelWalk", "movement-cancel", (args, context) => ({ position: args[0], cave: context }),
             args => bot.cave?.captureMovementContext?.(args[0]) || null);
         for (const name of ["handleChunk", "handleMapArea", "handleMapSlice", "handleTransformTile"])
@@ -48932,8 +49257,10 @@ window.__minibiaBotBundle.installClientEvents = function installClientEvents(bot
                 ? bot.groundSpawnLogger.captureTile(args[0]?.position) : null);
         }
         hook(handler, "handleEntityTeleport", "movement", args =>
-            Number(args[0]?.id) === Number(window.gameClient?.player?.id) ? { position: args[0]?.position } : null);
-        hook(handler, "handleEntityRemove", "creatures");
+                Number(args[0]?.id) === Number(window.gameClient?.player?.id) ? { position: args[0]?.position } : null,
+            args => window.gameClient===client && client.player===player ? bot.observeFollowLeaderEvent?.("teleport",args[0]) : null);
+        hook(handler, "handleEntityRemove", "creatures",null,
+            args => window.gameClient===client && client.player===player ? bot.observeFollowLeaderEvent?.("remove",args[0]) : null);
         hook(handler, "handleCreatureManifest", "creatures");
         hook(spellbook, "__lockSpell", "cooldown");
         hook(spellbook, "__unlockSpell", "cooldown");
@@ -57654,7 +57981,10 @@ function upgradeSectionHeaders(panel) {
           <span class="mb-field-label">High Mana %</span>
           <input type="number" id="minibia-bot-paladin-high-mana-threshold" min="0" max="100" value="98" />
         </label>
-        <div></div>
+        <label class="mb-field" for="minibia-bot-paladin-ammo-id">
+          <span class="mb-field-label">Item ID</span>
+          <div style="display:flex;gap:5px;min-width:0;"><input type="number" id="minibia-bot-paladin-ammo-id" min="1" max="65535" step="1" placeholder="Auto (weapon / hand)" style="flex:1;min-width:0;width:0;" /><button type="button" class="mb-small-button" id="minibia-bot-paladin-capture-ammo" aria-label="Pick ammo item" title="Click ammo in a bag, equipment slot or on the ground" style="flex:0 0 32px;width:32px;padding:4px;">🔍</button></div>
+        </label>
       </div>
     </div>
   </div>
@@ -57921,7 +58251,9 @@ function upgradeSectionHeaders(panel) {
         <input type="checkbox" id="minibia-bot-follow-during-target" />
         <span>Follow During Target</span>
       </label>
+      <label class="mb-toggle"><input type="checkbox" id="minibia-bot-follow-floors"><span>Follow floor transitions</span></label>
       <div class="mb-small-note" id="minibia-bot-follow-status">Status: idle</div>
+      <button type="button" class="mb-small-button" id="minibia-bot-follow-debug" title="Save the last follow-transition failure and nearby tile details">Save debug</button>
     </div>
   </div>
 </div>
@@ -58964,11 +59296,23 @@ function upgradeSectionHeaders(panel) {
             panel.querySelector(
                 "#minibia-bot-follow-during-target"
             );
+        const followFloorsToggle=panel.querySelector("#minibia-bot-follow-floors");
+        const getFollowFloors=() => followFloorsToggle?.checked === true;
         const followStatus =
             panel.querySelector(
                 "#minibia-bot-follow-status"
             );
 
+        const followDebugButton=panel.querySelector("#minibia-bot-follow-debug");
+        if (followDebugButton) followDebugButton.addEventListener("click",() => {
+            const data=bot.getFollowDiagnostics?.();
+            if (!data) return;
+            const url=URL.createObjectURL(new Blob([JSON.stringify(data,null,2)],{type:"application/json"}));
+            const link=document.createElement("a");
+            link.href=url;link.download="mb0t-follow-debug-"+new Date().toISOString().replace(/[:.]/g,"-")+".json";
+            try {document.body.appendChild(link);link.click();}
+            finally {link.remove();window.setTimeout(()=>URL.revokeObjectURL(url),1000);}
+        });
         let followInterval = null;
         let followEnabled = false;
 
@@ -58985,6 +59329,11 @@ function upgradeSectionHeaders(panel) {
         }
 
         function refreshFollowStatus() {
+            const transitionReason=bot.followStatus?.()?.transitionReason;
+            if (followEnabled && transitionReason && followStatus) {
+                followStatus.textContent=transitionReason;
+                return;
+            }
             if (
                 followToggle &&
                 document.activeElement !==
@@ -59084,6 +59433,8 @@ function upgradeSectionHeaders(panel) {
                     getFollowDuringTarget()
                 )
             );
+            localStorage.setItem("minibiaBot.follow.floors",JSON.stringify(getFollowFloors()));
+            bot.setFollowFloors?.(getFollowFloors());
             bot.setFollowDuringTarget?.(
                 getFollowDuringTarget()
             );
@@ -59171,6 +59522,7 @@ function upgradeSectionHeaders(panel) {
                 {
                     mode,
                     continuous: false,
+                    followFloors: getFollowFloors(),
                     allowDuringTarget:
                         getFollowDuringTarget()
                 }
@@ -59183,9 +59535,7 @@ function upgradeSectionHeaders(panel) {
                             return;
 
                         if (
-                            !isLeaderAlive(
-                                name
-                            )
+                            !isLeaderAlive(name) && !bot.canContinueFloorFollow?.(name)
                         ) {
                             bot.log(
                                 `Follow: "${name}" is dead or missing, stopping.`
@@ -59210,10 +59560,12 @@ function upgradeSectionHeaders(panel) {
                                 mode:
                                     getFollowMode(),
                                 continuous: false,
+                                followFloors: getFollowFloors(),
                                 allowDuringTarget:
                                     getFollowDuringTarget()
                             }
                         );
+                        refreshFollowStatus();
                     },
                     120
                 );
@@ -59235,6 +59587,10 @@ function upgradeSectionHeaders(panel) {
                     localStorage.getItem(
                         "minibiaBot.follow.nonpvp"
                     );
+                if (followFloorsToggle) {
+                    followFloorsToggle.checked=localStorage.getItem("minibiaBot.follow.floors")==="true";
+                    bot.setFollowFloors?.(followFloorsToggle.checked);
+                }
                 const savedDuringTarget =
                     localStorage.getItem(
                         "minibiaBot.follow.duringTarget"
@@ -59306,6 +59662,12 @@ function upgradeSectionHeaders(panel) {
                     }
                 );
         }
+
+        if (followFloorsToggle) followFloorsToggle.addEventListener("change",function () {
+            localStorage.setItem("minibiaBot.follow.floors",JSON.stringify(this.checked));
+            bot.setFollowFloors?.(this.checked);
+            if (followEnabled) startFollow(); else refreshFollowStatus();
+        });
 
         if (followDuringTargetToggle) {
             followDuringTargetToggle
@@ -60716,6 +61078,8 @@ function upgradeSectionHeaders(panel) {
         // ---- Paladin UI listeners ----
         const paladinCrafterToggle = document.getElementById("minibia-bot-paladin-crafter-enabled");
         const paladinEquipperToggle = document.getElementById("minibia-bot-paladin-equipper-enabled");
+        const paladinAmmoId = document.getElementById("minibia-bot-paladin-ammo-id");
+        const paladinCaptureAmmo = document.getElementById("minibia-bot-paladin-capture-ammo");
         const paladinAmmoThreshold = document.getElementById("minibia-bot-paladin-ammo-threshold");
         const paladinCraftMana = document.getElementById("minibia-bot-paladin-craft-mana");
         const paladinCraftSpell = document.getElementById("minibia-bot-paladin-craft-spell");
@@ -60755,6 +61119,8 @@ function upgradeSectionHeaders(panel) {
             }
 
             // Input values (only if not focused)
+            if (paladinAmmoId && document.activeElement !== paladinAmmoId)
+                paladinAmmoId.value = status.config.ammoItemId || "";
             if (paladinAmmoThreshold && document.activeElement !== paladinAmmoThreshold) {
                 paladinAmmoThreshold.value = status.config.ammoThreshold ?? 4;
             }
@@ -60781,11 +61147,23 @@ function upgradeSectionHeaders(panel) {
             }
         }
 
+        if (paladinCaptureAmmo) paladinCaptureAmmo.addEventListener("click",() => bot.paladin.startCaptureAmmo());
+        if (paladinAmmoId) paladinAmmoId.addEventListener("change",function () {
+            const id=Number(this.value);
+            if (this.value !== "" && (!Number.isSafeInteger(id) || id < 1 || id > 65535)) {
+                this.value=bot.paladin.config.ammoItemId || ""; return;
+            }
+            bot.paladin.updateConfig({ammoItemId:this.value === "" ? null : id});
+            refreshPaladinStatus();
+        });
+
         // ---- Crafter toggle ----
         if (paladinCrafterToggle) {
             paladinCrafterToggle.addEventListener("change", function () {
                 if (this.checked) {
+                    const selectedAmmoId=Number(paladinAmmoId?.value);
                     const config = {
+                        ammoItemId: Number.isSafeInteger(selectedAmmoId) && selectedAmmoId > 0 && selectedAmmoId <= 65535 ? selectedAmmoId : null,
                         ammoThreshold: parseInt(paladinAmmoThreshold?.value) || 4,
                         craftManaCost: parseInt(paladinCraftMana?.value) || 140,
                         craftSpellWords: paladinCraftSpell?.value?.trim() || "",
