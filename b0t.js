@@ -3414,7 +3414,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.221",
+        version: "1.6.224",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -8952,6 +8952,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         offscreenHuntLastProgressAt: 0,
         offscreenHuntLastMoveAt: 0,
         offscreenHuntPauseHeld: false,
+        offscreenLootPauseHeld: false,
         offscreenHuntPlayerProgressKey: null,
         offscreenHuntPlayerProgressAt: 0,
         offscreenHuntRetryAfter: 0,
@@ -9368,6 +9369,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         // v1.6.37: walk toward known same-floor monsters outside the rendered
         // playfield. OFF by default so existing CaveBot routes are unchanged.
         offscreenHuntEnabled: false,
+        offscreenHuntLootFirst: false,
         offscreenHuntRange: 20,
         offscreenHuntNoProgressMs: 5000,
         meleeMode: true,
@@ -9490,6 +9492,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     if (config.kiteMode)
         config.useClientChase = false;
     config.offscreenHuntEnabled = config.offscreenHuntEnabled === true;
+    config.offscreenHuntLootFirst = config.offscreenHuntLootFirst === true;
     config.offscreenHuntRange = Math.max(
         5,
         Math.min(50, Math.trunc(Number(config.offscreenHuntRange) || 20))
@@ -14476,10 +14479,33 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             });
     }
 
+    function clearOffscreenLootWait() {
+        if (state.offscreenLootPauseHeld)
+            bot.cave?.resumeMovement?.("offscreen-loot");
+        state.offscreenLootPauseHeld=false;
+    }
+
+    function waitForLootBeforeOffscreenHunt(target, now) {
+        if (!config.offscreenHuntLootFirst || getNativeSmallScreenInfo(target).visible ||
+            bot.looter?.hasPendingLoot?.(now)!==true) {
+            clearOffscreenLootWait();
+            return false;
+        }
+        // Release only the hunt's movement; the looter may already own a path.
+        if (state.offscreenHuntActive || state.offscreenHuntPauseHeld ||
+            window.gameClient?.__mbTargetingAutoWalkOwner==="hunt")
+            clearOffscreenHunt("looting before next off-screen target", {quiet:true});
+        if (!state.offscreenLootPauseHeld && bot.cave?.status?.().running)
+            state.offscreenLootPauseHeld=bot.cave.pauseMovement?.("offscreen-loot")===true;
+        state.offscreenHuntLastReason="looting before next off-screen target";
+        return true;
+    }
+
     function clearOffscreenHunt(
         reason = "hunt cleared",
         options = {}
     ) {
+        clearOffscreenLootWait();
         const wasActive = state.offscreenHuntActive === true;
         const oldId = state.offscreenHuntTargetId;
         const oldName = state.offscreenHuntTargetName;
@@ -14617,13 +14643,15 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         if (!state.running || !config.enabled || !config.offscreenHuntEnabled || config.lureMode)
             return false;
         const client = window.gameClient;
-        if (!state.offscreenHuntActive && !state.offscreenHuntPauseHeld &&
+        if (!state.offscreenHuntActive && !state.offscreenHuntPauseHeld && !state.offscreenLootPauseHeld &&
             client?.__mbTargetingAutoWalkOwner !== "hunt")
             return false;
 
         const current = getCurrentTarget();
-        if (current && getNativeSmallScreenInfo(current).visible)
+        if (current && getNativeSmallScreenInfo(current).visible) {
+            clearOffscreenLootWait();
             return false;
+        }
         if (current)
             releaseCurrentTargetIfOffScreen(now);
         // If a client API could not clear the old selection, do not silently
@@ -14726,10 +14754,12 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 clearOffscreenHunt("no hunt candidate available", { quiet: true });
                 return false;
             }
-            if (!beginOffscreenHunt(target, now)) {
-                clearOffscreenHunt("hunt could not start", { quiet: true });
-                return false;
-            }
+        }
+        if (waitForLootBeforeOffscreenHunt(target, now))
+            return true;
+        if (!state.offscreenHuntActive && !beginOffscreenHunt(target, now)) {
+            clearOffscreenHunt("hunt could not start", { quiet: true });
+            return false;
         }
 
         const playerPos = normalizePosition(bot.getPlayerPosition());
@@ -23347,6 +23377,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             nextConfig.offscreenHuntEnabled =
                 nextConfig.offscreenHuntEnabled === true;
         }
+        if (nextConfig.offscreenHuntLootFirst !== undefined)
+            nextConfig.offscreenHuntLootFirst=nextConfig.offscreenHuntLootFirst===true;
         if (nextConfig.offscreenHuntRange !== undefined) {
             nextConfig.offscreenHuntRange = Math.max(
                 5,
@@ -23645,6 +23677,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         }
         Object.assign(config, nextConfig);
 
+        if (!config.offscreenHuntLootFirst)
+            clearOffscreenLootWait();
         if (!config.offscreenHuntEnabled) {
             clearOffscreenHunt(
                 "Off-screen Hunt disabled",
@@ -23834,7 +23868,7 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
 
     const config = Object.assign({
         enabled:false, tickMs:100, countRefreshMs:15000, countFreshMs:30000,
-        avoidPlayersInAoe:true, rules:[]
+        avoidPlayersInAoe:true, currentTargetOnly:false, rules:[]
     }, bot.storage.get(configStorageKey, {}));
 
     function normalizeRuneKey(value) {
@@ -23876,6 +23910,7 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
         return out.map(({rune,minCreatures,mobNames}) => ({rune,minCreatures,mobNames}));
     }
     config.rules = normalizeRules(config.rules);
+    config.currentTargetOnly = config.currentTargetOnly === true;
 
     function persistConfig() {
         bot.storage.set(configStorageKey, {
@@ -23884,6 +23919,7 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
             countRefreshMs:config.countRefreshMs,
             countFreshMs:config.countFreshMs,
             avoidPlayersInAoe:config.avoidPlayersInAoe !== false,
+            currentTargetOnly:config.currentTargetOnly === true,
             rules:config.rules.map(r => ({...r})),
         });
     }
@@ -23979,8 +24015,22 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
         });
     }
 
+    function getCurrentRuneTarget(monsters, rule = null) {
+        const current=bot.attack?.getCurrentTarget?.();
+        if (current?.id==null) return null;
+        // Resolve the selected ID against the fresh eligible list, so a stale
+        // client target cannot authorize a dead, off-screen or different-floor mob.
+        const target=monsters.find(m=>Number(m.id)===Number(current.id));
+        return target && (!rule || matchesRuleMob(rule,target)) ? target : null;
+    }
+
     function getSingleTarget(monsters) {
         if (!monsters?.length) return null;
+        if (config.currentTargetOnly) {
+            const target=getCurrentRuneTarget(monsters),pos=monsterPos(target);
+            if (target && pos && hasLos(pos)) return target;
+            return null;
+        }
         const current = bot.combatRules?.config?.enabled ? null : bot.attack?.getCurrentTarget?.();
         if (current && monsters.some(m => Number(m.id) === Number(current.id))) {
             const p = monsterPos(current);
@@ -24105,8 +24155,14 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
             .filter(e => e.motion && e.motion.pos.z === me.z);
         if (!entries.length) return null;
         const currentId = Number(bot.attack?.getCurrentTarget?.()?.id);
+        const current=config.currentTargetOnly ? getCurrentRuneTarget(entries.map(e=>e.monster),rule) : null;
+        if (config.currentTargetOnly && !current) return null;
         const centers = new Map();
-        for (const entry of entries) {
+        if (config.currentTargetOnly) {
+            const center=monsterPos(current);
+            centers.set(`${center.x},${center.y},${center.z}`,center);
+        }
+        for (const entry of config.currentTargetOnly ? [] : entries) {
             for (const pos of [entry.motion.pos, entry.motion.next]) {
                 for (const offset of offsets) {
                     const center = { x: pos.x - offset.x, y: pos.y - offset.y, z: pos.z };
@@ -24147,7 +24203,8 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
                 edgeMargin = Math.min(edgeMargin, margin); totalMargin += margin;
                 distanceSum += dist(me, motion.pos);
             }
-            if (!hits.length || !hits.some(monster => matchesRuleMob(rule, monster))) continue;
+            if (!hits.length || !hits.some(monster => matchesRuleMob(rule, monster)) ||
+                (config.currentTargetOnly && !includesCurrent)) continue;
             const candidate = {
                 position: center, hits, hitCount: hits.length, includesCurrent,
                 currentHitCount, predictedHitCount, edgeMargin, totalMargin,
@@ -24272,7 +24329,7 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
 
         const matchingMonsters = monsters.filter(monster => matchesRuleMob(rule, monster));
         if (!matchingMonsters.length) return false;
-        const target = def.mode === "creature" ? getSingleTarget(matchingMonsters) : null;
+        let target = def.mode === "creature" ? getSingleTarget(matchingMonsters) : null;
         let aoe = def.mode === "aoe" ? getBestAoeTarget(def.key, rule.combatRule ? matchingMonsters : monsters, rule) : null;
         if (def.mode === "creature" && !target) return false;
         if (def.mode === "aoe" && !aoe) return false;
@@ -24305,7 +24362,19 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
         if (bot.actions && !releaseRuneGuard) return false;
 
         const action = () => {
-            if (def.mode === "creature") return sendCreatureRune(def, target);
+            if (def.mode === "creature") {
+                if (config.currentTargetOnly) {
+                    if (bot.actions?.isHalted?.() ||
+                        (bot.combatRules?.config?.unified && !bot.attack?.isRunning?.()) ||
+                        bot.attack?.isProtectionZoneBlocked?.(Date.now()) ||
+                        getRuneCooldownRemainingMs()>0 || yieldToHealing(false)) return false;
+                    const fresh=getFreshAoeMonsters(rule);
+                    if (fresh.length<rule.minCreatures) return false;
+                    target=getSingleTarget(fresh.filter(m=>matchesRuleMob(rule,m)));
+                    if (!target) return false;
+                }
+                return sendCreatureRune(def, target);
+            }
             // Refresh aim, matching conditions and nearby players inside the
             // shared action gate, immediately before issuing the normal packet.
             if (bot.actions?.isHalted?.() ||
@@ -24459,6 +24528,7 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
         if (next.countRefreshMs !== undefined) config.countRefreshMs = Math.max(5000,Math.min(60000,Math.trunc(Number(next.countRefreshMs)||15000)));
         if (next.countFreshMs !== undefined) config.countFreshMs = Math.max(10000,Math.min(120000,Math.trunc(Number(next.countFreshMs)||30000)));
         if (next.avoidPlayersInAoe !== undefined) config.avoidPlayersInAoe = next.avoidPlayersInAoe !== false;
+        if (next.currentTargetOnly !== undefined) config.currentTargetOnly = next.currentTargetOnly === true;
         if (next.enabled !== undefined) config.enabled = next.enabled === true;
         persistConfig();
         if (config.enabled && !state.running) start();
@@ -44007,6 +44077,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         captureMode: false,
         captureHandler: null,
         pendingMove: null,
+        nearbyCorpseReadyUntil: 0,
         lastFullLogAt: 0,
 
         // v1.5.37: optional corpse-approach ownership.
@@ -44744,12 +44815,8 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         if (!Number.isFinite(id))
             return null;
 
-        return (
-            window.gameClient
-                ?.itemDefinitionsByCid?.[
-                    id
-                ] || null
-        );
+        return window.gameClient?.itemDefinitionsBySid?.[thing.sid] ||
+            window.gameClient?.itemDefinitionsByCid?.[id] || null;
     }
 
     function isLooterFloorChangeThing(
@@ -44902,209 +44969,108 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         return null;
     }
 
-    function getCorpseApproachCandidates(
-        corpsePosition,
-        playerPosition,
-        excludedKeys = null
-    ) {
-        if (!corpsePosition || !playerPosition)
-            return [];
-
-        const world = window.gameClient?.world;
-        const pf = world?.pathfinder;
-        if (!world || !pf)
-            return [];
-
-        const startPos = new Position(
-            Number(playerPosition.x),
-            Number(playerPosition.y),
-            Number(playerPosition.z)
-        );
-        const startTile =
-            world.getTileFromWorldPosition?.(startPos) ||
-            null;
-
-        if (!startTile)
-            return [];
-
-        const offsets = [
-            { x: 0, y: -1 },
-            { x: 1, y: 0 },
-            { x: 0, y: 1 },
-            { x: -1, y: 0 },
-            { x: -1, y: -1 },
-            { x: 1, y: -1 },
-            { x: -1, y: 1 },
-            { x: 1, y: 1 }
-        ];
-
-        const candidates = [];
-
-        for (const offset of offsets) {
-            const pos = new Position(
-                Number(corpsePosition.x) +
-                    offset.x,
-                Number(corpsePosition.y) +
-                    offset.y,
-                Number(corpsePosition.z)
-            );
-
-            const key =
-                getCorpseApproachKey(pos);
-
-            if (
-                excludedKeys?.has?.(key)
-            ) {
-                continue;
+    function getCorpseRouteOptions() {
+        const ignoreFields=bot.cave?.config?.ignoreFields!==false;
+        const player=window.gameClient?.player,blockedKeys=new Set();
+        for (const creature of Object.values(window.gameClient?.world?.activeCreatures || {})) {
+            if (!creature || creature===player || Number(creature.id)===Number(player?.id) ||
+                creature.outfit?.verifiedGhost===true) continue;
+            const hp=Number(creature.state?.health ?? creature.health);
+            if (Number.isFinite(hp) && hp<=0) continue;
+            const pos=creature.getPosition?.() || creature.__position;
+            if (pos) blockedKeys.add(getCorpseApproachKey(pos));
+        }
+        return {
+            purpose:"route",fieldAware:ignoreFields,avoidFields:!ignoreFields,maxNodes:5000,
+            isTileAllowed:tile=> {
+                if (!tile || !tile.id || tile.__isPlaceholder || isUnsafeCorpseApproachTile(tile)) return false;
+                const pos=tile.__position || tile.getPosition?.();
+                if (!pos) return false;
+                // Tile creature sets can lag a server move by a frame. Keep
+                // live creatures blocked even when ignoring field item flags.
+                return !blockedKeys.has(getCorpseApproachKey(pos));
             }
+        };
+    }
 
-            const tile =
-                world.getTileFromWorldPosition?.(pos) ||
-                null;
-
-            if (!tile)
-                continue;
-
-            let walkable = false;
-            let occupied = false;
-
-            try {
-                walkable =
-                    tile.isWalkable?.() === true;
-                occupied =
-                    tile.isOccupied?.() === true;
-            } catch (e) {}
-
-            if (!walkable)
-                continue;
-
-            // The native pathfinder permits a floor-change tile when that tile
-            // is the FINAL destination. Looter must never use a hole/stair/
-            // teleport as the adjacent corpse destination.
-            if (
-                isUnsafeCorpseApproachTile(
-                    tile
-                )
-            ) {
+    function getCorpseApproachCandidates(corpsePosition,playerPosition,excludedKeys=null) {
+        const world=window.gameClient?.world;
+        if (!corpsePosition || !playerPosition || Number(corpsePosition.z)!==Number(playerPosition.z) ||
+            !world?.pathfinder || typeof bot.specialAreas?.searchPolicyPath!=="function") return [];
+        const options=getCorpseRouteOptions(),candidates=[];
+        for (const [dx,dy] of [[0,-1],[1,0],[0,1],[-1,0],[-1,-1],[1,-1],[-1,1],[1,1]]) {
+            const pos=new Position(Number(corpsePosition.x)+dx,Number(corpsePosition.y)+dy,Number(corpsePosition.z));
+            const key=getCorpseApproachKey(pos),tile=world.getTileFromWorldPosition?.(pos);
+            if (excludedKeys?.has?.(key) || !tile || !tile.id || tile.__isPlaceholder) continue;
+            if (isUnsafeCorpseApproachTile(tile)) {
                 state.corpseFloorChangeDestinationRejects++;
-                state.corpseLastFloorChangeReject = {
-                    kind: "destination",
-                    position: {
-                        x: Number(pos.x),
-                        y: Number(pos.y),
-                        z: Number(pos.z)
-                    },
-                    at: Date.now()
-                };
+                state.corpseLastFloorChangeReject={kind:"destination",position:{x:pos.x,y:pos.y,z:pos.z},at:Date.now()};
                 continue;
             }
-
-            const alreadyThere =
-                Number(pos.x) ===
-                    Number(playerPosition.x) &&
-                Number(pos.y) ===
-                    Number(playerPosition.y) &&
-                Number(pos.z) ===
-                    Number(playerPosition.z);
-
-            // A locally walkable tile occupied by another creature is not a
-            // useful corpse-approach destination. The player's own tile is OK.
-            if (occupied && !alreadyThere)
-                continue;
-
-            if (alreadyThere) {
-                candidates.push({
-                    pos,
-                    key,
-                    pathSteps: 0,
-                    pathCost: 0
-                });
-                continue;
-            }
-
-            if (typeof pf.search !== "function")
-                continue;
-
             try {
-                const path =
-                    pf.search(
-                        startTile,
-                        tile
-                    );
-
-                if (
-                    !Array.isArray(path) ||
-                    path.length <= 0
-                ) {
-                    continue;
+                const result=bot.specialAreas.searchPolicyPath(playerPosition,pos,options);
+                if (!result?.success || result.complete!==true || !Array.isArray(result.path)) continue;
+                const path=result.path.map(p=>getTileAtPosition(new Position(p.x,p.y,p.z)));
+                if (path.some(tile=>!tile) || getUnsafeCorpsePathStep(path)) continue;
+                if (!path.length && key!==getCorpseApproachKey(playerPosition)) continue;
+                let previous=playerPosition,pathCost=0;
+                for (let i=0;i<path.length;i++) {
+                    const p=result.path[i],fromTile=getTileAtPosition(previous);
+                    const base=Number(path[i].getCost?.(fromTile)) || 100;
+                    const diagonal=p.x!==previous.x && p.y!==previous.y;
+                    const policy=bot.specialAreas.getPositionPolicy?.(p,{purpose:"route"});
+                    pathCost+=Math.max(10,base*(diagonal?3:1)+Number(policy?.cost || 0));
+                    previous=p;
                 }
-
-                const unsafeStep =
-                    getUnsafeCorpsePathStep(
-                        path
-                    );
-
-                if (unsafeStep) {
-                    state.corpseFloorChangePathRejects++;
-                    state.corpseLastFloorChangeReject = {
-                        kind: "path",
-                        destination: {
-                            x: Number(pos.x),
-                            y: Number(pos.y),
-                            z: Number(pos.z)
-                        },
-                        unsafeStep,
-                        at: Date.now()
-                    };
-                    continue;
-                }
-
-                const rawCost =
-                    Number(tile.__g);
-
-                candidates.push({
-                    pos,
-                    key,
-                    pathSteps:
-                        path.length,
-                    pathCost:
-                        Number.isFinite(rawCost) &&
-                        rawCost >= 0
-                            ? rawCost
-                            : path.length * 100
-                });
+                candidates.push({pos,key,pathSteps:path.length,pathCost,pathPositions:result.path});
             } catch (e) {}
         }
-
-        candidates.sort((a, b) => {
-            if (a.pathCost !== b.pathCost)
-                return a.pathCost - b.pathCost;
-            if (a.pathSteps !== b.pathSteps)
-                return a.pathSteps - b.pathSteps;
-
-            const ad =
-                Math.abs(
-                    Number(a.pos.x) -
-                    Number(playerPosition.x)
-                ) +
-                Math.abs(
-                    Number(a.pos.y) -
-                    Number(playerPosition.y)
-                );
-            const bd =
-                Math.abs(
-                    Number(b.pos.x) -
-                    Number(playerPosition.x)
-                ) +
-                Math.abs(
-                    Number(b.pos.y) -
-                    Number(playerPosition.y)
-                );
-
-            return ad - bd;
-        });
-
+        candidates.sort((a,b)=>a.pathCost-b.pathCost || a.pathSteps-b.pathSteps ||
+            (Math.abs(a.pos.x-playerPosition.x)+Math.abs(a.pos.y-playerPosition.y))-
+            (Math.abs(b.pos.x-playerPosition.x)+Math.abs(b.pos.y-playerPosition.y)));
         return candidates;
+    }
+
+    function sendCorpseApproachPath(from,path,now) {
+        const client=window.gameClient,pf=client?.world?.pathfinder;
+        if (!pf || !Array.isArray(path) || !path.length || path.length>255 ||
+            typeof AutoWalkPacket!=="function" || typeof client.send!=="function" ||
+            client.networkManager?.isConnected?.()===false) return false;
+        const directions=[];
+        let previous=from;
+        const options=getCorpseRouteOptions();
+        for (const pos of path) {
+            const dx=pos.x-previous.x,dy=pos.y-previous.y;
+            const tile=getTileAtPosition(new Position(pos.x,pos.y,pos.z));
+            if (pos.z!==from.z || Math.abs(dx)>1 || Math.abs(dy)>1 || (!dx&&!dy) ||
+                !options.isTileAllowed(tile) || bot.hasNavigationObstacle?.(tile) ||
+                bot.specialAreas.getPositionPolicy?.(pos,{purpose:"route"})?.allowed===false) return false;
+            if (options.avoidFields && [tile,...(tile.items || [])].some(t=> {
+                const def=client.itemDefinitionsBySid?.[t?.sid] || client.itemDefinitionsByCid?.[t?.id];
+                return def?.properties?.type==="magicfield";
+            })) return false;
+            const direction=new Position(previous.x,previous.y,previous.z).getLookDirection(new Position(pos.x,pos.y,pos.z));
+            if (direction==null) return false;
+            directions.push(direction);previous=pos;
+        }
+        try {
+            pf.setPathfindCache?.(null);
+            pf.__pathfindCache=[];pf.__minimapWaypoints=null;pf.__hybridPath=null;
+            pf.__recentMinimapStarts=[];pf.__lastCancelPosition=null;pf.__autowalkStepHistory=[];
+            pf.__finalDestination=new Position(previous.x,previous.y,previous.z);
+            pf.__isAutoWalking=true;pf.__autoWalkStepsRemaining=directions.length;
+            pf.__autowalkStartPosition={x:Number(from.x),y:Number(from.y),z:Number(from.z)};
+            pf.__autowalkStartedAt=typeof performance!=="undefined"?performance.now():now;
+            client.keyboard?.noteAutowalk?.();
+            const before=client.networkManager?.nPacketsSent;
+            const result=client.send(new AutoWalkPacket(directions));
+            const after=client.networkManager?.nPacketsSent;
+            if (result===false || (Number.isFinite(before)&&Number.isFinite(after)&&after<=before)) throw new Error("Corpse walk was not sent");
+            return true;
+        } catch (e) {
+            pf.__isAutoWalking=false;pf.__autoWalkStepsRemaining=0;pf.__finalDestination=null;pf.__pathfindCache=[];
+            return false;
+        }
     }
 
     function getCorpseApproachDestination(
@@ -45213,12 +45179,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         const pf =
             window.gameClient?.world?.pathfinder;
 
-        if (
-            !pf ||
-            typeof pf.findPath !== "function"
-        ) {
-            return false;
-        }
+        if (!pf) return false;
 
         try {
             // Cancel only the previous corpse approach before choosing a new
@@ -45229,11 +45190,9 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                 clearCorpseApproachMovement(job);
             }
 
-            pf.setPathfindCache?.(null);
-            pf.findPath(
-                playerPos,
-                destination
-            );
+            // Execute the field-aware path we validated, instead of asking
+            // native findPath to rebuild it with field-blocking rules.
+            if (!sendCorpseApproachPath(playerPos,route.pathPositions,now)) return false;
 
             job.walkDestination = {
                 x: Number(destination.x),
@@ -45480,8 +45439,10 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
 
         clearCorpseApproachMovement(job);
 
-        if (success)
+        if (success) {
             state.corpseJobsCompleted++;
+            state.nearbyCorpseReadyUntil=Math.max(state.nearbyCorpseReadyUntil,Date.now()+750);
+        }
         else
             state.corpseJobsFailed++;
 
@@ -45627,7 +45588,6 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
     ) {
         if (
             !state.running ||
-            !state.walkToCorpses ||
             !creature
         ) {
             return false;
@@ -45651,6 +45611,11 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             Math.abs(Number(pos.x) - Number(playerPos.x)),
             Math.abs(Number(pos.y) - Number(playerPos.y))
         );
+
+        if (Number.isFinite(distance) && distance<=1)
+            state.nearbyCorpseReadyUntil=Math.max(state.nearbyCorpseReadyUntil,now+750);
+        if (!state.walkToCorpses)
+            return false;
 
         // v1.5.49: if the monster dies on an adjacent tile, do not create a
         // movement-ownership job at all. The game's normal corpse auto-open
@@ -45950,7 +45915,6 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             try {
                 if (
                     state.running &&
-                    state.walkToCorpses &&
                     packet?.property ===
                         CONST.PROPERTIES.HEALTH &&
                     Number(packet?.value) === 0
@@ -46289,6 +46253,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                     }
 
                     removed++;
+                    state.nearbyCorpseReadyUntil=Math.max(state.nearbyCorpseReadyUntil,now+750);
                     state.corpseAdjacentSkips++;
                     state.corpsePassedAdjacentConsumes++;
                     state.corpsePassedAdjacentLastKey =
@@ -46695,6 +46660,31 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
     // One outstanding inventory move at a time. Containers update asynchronously;
     // re-sending every slot before acknowledgement can duplicate requests and
     // repeatedly target the same empty destination slot.
+    function hasPendingLoot(now = Date.now()) {
+        if (!state.running || bot.actions?.isHalted?.()) return false;
+        if (state.corpseJob || now<state.nearbyCorpseReadyUntil) return true;
+        const player=bot.getPlayerPosition();
+        if (state.walkToCorpses && player && state.corpseQueue.some(entry=> {
+            const pos=entry?.position;
+            if (!pos || now>entry.expiresAt || Number(pos.z)!==Number(player.z) ||
+                isCorpseCombatAbandoned(entry.key,now)) return false;
+            const distance=Math.max(Math.abs(pos.x-player.x),Math.abs(pos.y-player.y));
+            return Number.isFinite(distance) && distance>1 && distance<=state.corpseMaxDistance;
+        })) return true;
+        if (state.pendingMove && now-state.pendingMove.at<5000) return true;
+        const dest=getDestinationContainer();
+        const canStore=dest && findEmptySlot(dest)!==-1;
+        return getContainersArray().some(container=> {
+            for (let slot=0;slot<container.size;slot++) {
+                const item=container.getSlotItem(slot),key=exactItemKey(item);
+                if (!state.trackedItems.has(key)) continue;
+                if (isDropTrackedItem(key) || (canStore && container.__containerId!==dest.__containerId))
+                    return true;
+            }
+            return false;
+        });
+    }
+
     function moveItems() {
         if (
             !state.running ||
@@ -47089,6 +47079,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             return false;
         state.running = true;
         state.pendingMove = null;
+        state.nearbyCorpseReadyUntil = 0;
         resetLooterContainerCache();
         state.corpseQueue = [];
         state.corpseJob = null;
@@ -47136,6 +47127,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
     function stop() {
         state.running = false;
         state.pendingMove = null;
+        state.nearbyCorpseReadyUntil = 0;
         looterContainerCache.clear();
 
         const activeCorpseJob =
@@ -47578,6 +47570,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         getDestinationId: () => state.destinationId,
         getDestinationTitle: () => state.destinationTitle,
         isCorpseBusy: () => !!state.corpseJob,
+        hasPendingLoot,
         getCorpseQueue: () =>
             state.corpseQueue.map(entry => ({
                 ...entry,
@@ -54302,6 +54295,8 @@ function upgradeSectionHeaders(panel) {
         const list = document.getElementById("minibia-bot-rune-shooter-rules-list");
         const label = document.getElementById("minibia-bot-rune-shooter-status");
         const status = bot.runeShooter?.status?.();
+        const currentOnly=document.getElementById("minibia-bot-targeting-rune-current-only");
+        if (currentOnly) currentOnly.checked=status?.config?.currentTargetOnly===true;
 
         if (toggle && document.activeElement !== toggle)
             toggle.checked = !!status?.running;
@@ -54437,6 +54432,7 @@ function upgradeSectionHeaders(panel) {
             maxDist: document.getElementById("minibia-bot-auto-attack-maxdist"),
             offscreenHunt: document.getElementById("minibia-bot-auto-attack-offscreen-hunt"),
             offscreenHuntRange: document.getElementById("minibia-bot-auto-attack-offscreen-hunt-range"),
+            offscreenLootFirst: document.getElementById("minibia-bot-auto-attack-offscreen-loot-first"),
             antiKS: document.getElementById("minibia-bot-auto-attack-antiks"),
             antiKSSelf: document.getElementById("minibia-bot-auto-attack-antiks-self"),
             antiKSOther: document.getElementById("minibia-bot-auto-attack-antiks-other"),
@@ -54491,6 +54487,10 @@ function upgradeSectionHeaders(panel) {
         if (inputs.offscreenHunt) {
             inputs.offscreenHunt.checked =
                 attackConfig.offscreenHuntEnabled === true;
+        }
+        if (inputs.offscreenLootFirst) {
+            inputs.offscreenLootFirst.checked=attackConfig.offscreenHuntLootFirst===true;
+            inputs.offscreenLootFirst.disabled=attackConfig.offscreenHuntEnabled!==true;
         }
         if (
             inputs.offscreenHuntRange &&
@@ -57783,7 +57783,7 @@ function upgradeSectionHeaders(panel) {
     <details class="mb-cave-details" style="margin-top:10px;"><summary>Advanced Targeting</summary>
     <div style="border-top:1px solid rgba(255,255,255,.08);margin-top:8px;padding-top:8px;">
       <div class="mb-section-title mb-section-title--sub"><span class="mb-title-text">Off-screen Hunt</span></div>
-      <div style="display:flex;gap:10px;align-items:center;"><label class="mb-toggle"><input type="checkbox" id="minibia-bot-auto-attack-offscreen-hunt"><span>Enabled</span></label><label class="mb-field"><span class="mb-field-label">Hunt range</span><input type="number" id="minibia-bot-auto-attack-offscreen-hunt-range" min="5" max="50" value="20"></label></div>
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;"><label class="mb-toggle"><input type="checkbox" id="minibia-bot-auto-attack-offscreen-hunt"><span>Enabled</span></label><label class="mb-field"><span class="mb-field-label">Hunt range</span><input type="number" id="minibia-bot-auto-attack-offscreen-hunt-range" min="5" max="50" value="20"></label><label class="mb-toggle" title="Finish pending looting before moving toward another off-screen monster"><input type="checkbox" id="minibia-bot-auto-attack-offscreen-loot-first"><span>Loot first</span></label></div>
     </div>
     <!-- Lure -->
     <div style="border-top:1px solid rgba(255,255,255,0.08); margin-top:10px; padding-top:8px;">
@@ -57868,6 +57868,7 @@ function upgradeSectionHeaders(panel) {
     <div style="border-top:1px solid rgba(255,255,255,.08);margin-top:8px;padding-top:8px;">
       <div class="mb-section-title mb-section-title--sub"><span class="mb-title-text">Action Safety</span></div>
       <div class="mb-action-safety-options">
+        <label class="mb-toggle" title="Aim runes only at the selected monster; wait when there is no valid target"><input type="checkbox" id="minibia-bot-targeting-rune-current-only"><span>Runes: current target only</span></label>
         <label class="mb-toggle"><input type="checkbox" id="minibia-bot-targeting-rune-avoid-players"><span>AoE runes: avoid players</span></label>
         <div class="mb-action-safety-row">
           <label class="mb-toggle"><input type="checkbox" id="minibia-bot-exori-player-check"><span>Exori: avoid players</span></label>
@@ -61417,6 +61418,14 @@ function upgradeSectionHeaders(panel) {
         defaultTargetMode?.addEventListener('change',()=>{bot.combatRules.updateDefaults({mode:defaultTargetMode.value});refreshAutoAttackStatus();});
         const defaultTargetPosition=panel.querySelector('#minibia-bot-targeting-default-position');
         defaultTargetPosition?.addEventListener('change',()=>{bot.combatRules.updateDefaults({position:defaultTargetPosition.value});refreshAutoAttackStatus();});
+        const runeCurrentOnly=panel.querySelector('#minibia-bot-targeting-rune-current-only');
+        if(runeCurrentOnly){
+            runeCurrentOnly.checked=bot.runeShooter?.config?.currentTargetOnly===true;
+            runeCurrentOnly.addEventListener('change',()=>{
+                bot.runeShooter?.updateConfig?.({currentTargetOnly:runeCurrentOnly.checked});
+                bot.combatRules.syncActions();
+            });
+        }
         const runePlayerSafety=panel.querySelector('#minibia-bot-targeting-rune-avoid-players');
         if(runePlayerSafety){runePlayerSafety.checked=bot.runeShooter?.config?.avoidPlayersInAoe!==false;runePlayerSafety.addEventListener('change',()=>{bot.runeShooter?.updateConfig?.({avoidPlayersInAoe:runePlayerSafety.checked});bot.combatRules.syncActions();});}
 
@@ -61499,6 +61508,7 @@ function upgradeSectionHeaders(panel) {
         const maxDistInput = panel.querySelector("#minibia-bot-auto-attack-maxdist");
         const offscreenHuntInput = panel.querySelector("#minibia-bot-auto-attack-offscreen-hunt");
         const offscreenHuntRangeInput = panel.querySelector("#minibia-bot-auto-attack-offscreen-hunt-range");
+        const offscreenLootFirstInput = panel.querySelector("#minibia-bot-auto-attack-offscreen-loot-first");
         const antiKSInput = panel.querySelector("#minibia-bot-auto-attack-antiks");
         const antiKSSelfInput = panel.querySelector("#minibia-bot-auto-attack-antiks-self");
         const antiKSOtherInput = panel.querySelector("#minibia-bot-auto-attack-antiks-other");
@@ -61559,6 +61569,14 @@ function upgradeSectionHeaders(panel) {
                 bot.attack.updateConfig({
                     offscreenHuntEnabled: offscreenHuntInput.checked
                 });
+                refreshAutoAttackStatus();
+            });
+        }
+        if (offscreenLootFirstInput) {
+            offscreenLootFirstInput.checked=bot.attack?.config?.offscreenHuntLootFirst===true;
+            offscreenLootFirstInput.disabled=bot.attack?.config?.offscreenHuntEnabled!==true;
+            offscreenLootFirstInput.addEventListener("change",()=> {
+                bot.attack.updateConfig({offscreenHuntLootFirst:offscreenLootFirstInput.checked});
                 refreshAutoAttackStatus();
             });
         }
