@@ -3414,7 +3414,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.226",
+        version: "1.6.227",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -25089,11 +25089,23 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             fallback.key === `${state.routeRevision}:${state.currentIndex}:${getPositionKey(goal)}`;
     }
 
+    function isCaveSingleStepPending(goal) {
+        if (!goal || goal.script || goal.stand || goal.rope || goal.shovel || goal.ladder ||
+            !isCaveSingleStepFallback(goal)) return false;
+        const player=window.gameClient?.player;
+        // A CREATURE_MOVE updates position before its walk animation finishes.
+        // Raw MOVE is not a server-paced AutoWalk queue: wait until the native
+        // client would accept the next manual step instead of sending it early.
+        player?.prunePreWalks?.();
+        return player?.isMoving?.()===true || (player?.__preWalks?.length || 0)>0;
+    }
+
     function sendCaveNavigationPacket(client, directions, origin, goal) {
         // Keep the normal client send chain, including movement-owner guards.
         // A dropped packet must not leave a fictitious active walk behind.
         if (client.networkManager?.isConnected?.() === false) return false;
         const singleStep = isCaveSingleStepFallback(goal);
+        if (singleStep && isCaveSingleStepPending(goal)) return false;
         let packet;
         if (singleStep) {
             if (typeof MovementPacket !== "function") return false;
@@ -30398,18 +30410,25 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             watch.index !== state.currentIndex || watch.revision !== state.routeRevision ||
             watch.pf !== window.gameClient?.world?.pathfinder || watch.pf.__finalDestination != null) return false;
         const at = (watch.positions || []).findIndex(pos => isSameTile(pos, position));
-        if (at <= watch.progressIndex) return false;
-        watch.progressIndex = at; watch.progressAt = now; watch.at = now;
-        watch.key = getPositionKey(position);
-        // Monotonic advancement on the actual issued route is real progress,
-        // including walking right/around a wall while goal distance increases.
-        state.lastProgressAt = now;
-        state.nativePathWatchAt = now;
-        state.offscreenFrontierLastImprovedAt = now;
-        state.offscreenFrontierAttempts = 0;
-        const plan = state.frontierRoutePlan;
-        if (plan && plan.key === watch.planKey) plan.progressAt = now;
-        return true;
+        if (at<0) return false;
+        const advanced=at>watch.progressIndex;
+        if (advanced) {
+            watch.progressIndex=at;watch.progressAt=now;watch.at=now;
+            watch.key=getPositionKey(position);
+            // A real step along the issued detour counts even if direct
+            // distance to the waypoint temporarily increases.
+            state.lastProgressAt=now;state.nativePathWatchAt=now;
+            state.offscreenFrontierLastImprovedAt=now;state.offscreenFrontierAttempts=0;
+            const plan=state.frontierRoutePlan;
+            if (plan && plan.key===watch.planKey) plan.progressAt=now;
+        }
+        if (at===watch.positions.length-1) {
+            // This batch is finished, not stalled. Keep the overall waypoint
+            // progress clock running if the next loaded route is unavailable.
+            state.frontierMotionWatch=null;
+            state.lastPathAt=0;
+        }
+        return advanced;
     }
 
     function recoverStalledCaveWalk(waypoint, position, now = Date.now()) {
@@ -30422,6 +30441,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             return false;
         }
         observeCaveFrontierProgress(position, waypoint, now);
+        if (state.frontierMotionWatch!==watch) return false;
         if (now - watch.at < 5000 && now - watch.progressAt < 5000) return false;
         const next = watch.positions?.[watch.progressIndex + 1];
         const client = window.gameClient;
@@ -30724,6 +30744,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         if (Number(from.z) !== Number(waypoint.z)) return false;
 
         const isSpecialWaypoint = !!(waypoint.stand || waypoint.rope || waypoint.shovel || waypoint.ladder || waypoint.script);
+        if (!isSpecialWaypoint && isCaveSingleStepPending(waypoint)) return true;
         if (!isSpecialWaypoint &&
             bot.specialAreas?.hasActiveAreasForFloor?.(from.z, { purpose: "route" })) {
             // Search only; Cave sends the resulting directions and owns retries.
@@ -37441,6 +37462,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             nativeDestination: normalizePosition(pf?.__finalDestination),
             activeWalk: pf?.__isAutoWalking === true, remainingSteps: pf?.__autoWalkStepsRemaining,
             singleStepFallback: isCaveSingleStepFallback(to),
+            singleStepWaiting: isCaveSingleStepPending(goal),
             offScreenOrUnloaded: from && to ? isCaveWaypointOffScreen(from,to) : null,
             startTile: from ? inspect(from) : null, goalTile: to ? inspect(to) : null,
             tiles: Array.from(around.values())
