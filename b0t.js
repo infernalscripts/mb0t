@@ -3414,7 +3414,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.227",
+        version: "1.6.228",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -9371,6 +9371,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         // v1.6.37: walk toward known same-floor monsters outside the rendered
         // playfield. OFF by default so existing CaveBot routes are unchanged.
         offscreenHuntEnabled: false,
+        alphaHunterEnabled: false,
         offscreenHuntLootFirst: false,
         offscreenHuntRange: 20,
         offscreenHuntNoProgressMs: 5000,
@@ -9494,6 +9495,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     if (config.kiteMode)
         config.useClientChase = false;
     config.offscreenHuntEnabled = config.offscreenHuntEnabled === true;
+    config.alphaHunterEnabled = config.alphaHunterEnabled === true;
+    if (config.alphaHunterEnabled) config.offscreenHuntEnabled = false;
     config.offscreenHuntLootFirst = config.offscreenHuntLootFirst === true;
     config.offscreenHuntRange = Math.max(
         5,
@@ -14207,8 +14210,26 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
     const OFFSCREEN_HUNT_PAUSE_REASON = "offscreen-hunt";
 
+    function isOffscreenHuntEnabled() {
+        return config.offscreenHuntEnabled === true || config.alphaHunterEnabled === true;
+    }
+
+    function isAlphaHuntCreature(creature) {
+        if (!creature) return false;
+        // The supplied client documents 1.3 as the server's alpha scale.
+        // Match that value, not arbitrary enlarged/enraged creatures. Named
+        // alphas are also recognized if the scale has not arrived yet.
+        return /^alpha(?:\s|$)/i.test(String(creature.name || "").trim()) ||
+            Math.abs(Number(creature.__scale) - 1.3) < 0.001;
+    }
+
+    function isAllowedOffscreenHuntCreature(creature) {
+        return isOffscreenHuntEnabled() &&
+            (config.alphaHunterEnabled !== true || isAlphaHuntCreature(creature));
+    }
+
     function getOffscreenHuntCandidates(now = Date.now(), options = {}) {
-        if (!config.offscreenHuntEnabled)
+        if (!isOffscreenHuntEnabled())
             return [];
 
         if (Number(state.offscreenHuntRetryAfter) > now)
@@ -14230,7 +14251,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             window.gameClient?.world?.activeCreatures || {}
         )
             .filter(creature => {
-                if (!isKnownMonsterForOffscreenHunt(creature))
+                if (!isKnownMonsterForOffscreenHunt(creature) || !isAllowedOffscreenHuntCreature(creature))
                     return false;
                 if (isIgnoredTargetCreature(creature))
                     return false;
@@ -14390,6 +14411,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function beginOffscreenHunt(target, now = Date.now()) {
+        if (!isAllowedOffscreenHuntCreature(target)) return false;
         const playerPos = normalizePosition(bot.getPlayerPosition());
         const targetPos = normalizePosition(
             target?.getPosition?.() || target?.__position
@@ -14457,7 +14479,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function syncVisibleHuntPriority(now = Date.now()) {
-        if (!state.running || !config.enabled || !config.offscreenHuntEnabled || config.lureMode)
+        if (!state.running || !config.enabled || !isOffscreenHuntEnabled() || config.lureMode)
             return false;
         const client = window.gameClient;
         if (!state.offscreenHuntActive && !state.offscreenHuntPauseHeld && !state.offscreenLootPauseHeld &&
@@ -14498,7 +14520,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         if (
             !state.running ||
             !config.enabled ||
-            !config.offscreenHuntEnabled
+            !isOffscreenHuntEnabled()
         ) {
             clearOffscreenHunt(
                 "disabled",
@@ -14539,6 +14561,11 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         let target = getActiveOffscreenHuntTarget();
         if (!target && (state.offscreenHuntActive || state.offscreenHuntPauseHeld)) {
             clearOffscreenHunt("hunted creature is no longer available — releasing Cavebot pause");
+        }
+
+        if (target && !isAllowedOffscreenHuntCreature(target)) {
+            clearOffscreenHunt("creature does not match hunt mode", { quiet: true });
+            target = null;
         }
 
         if (target && !isKnownMonsterForOffscreenHunt(target)) {
@@ -19280,7 +19307,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         // Off-screen Hunt intentionally has no combat target yet. Keep CaveBot
         // paused while this Targeting-owned movement is active anyway.
         if (
-            config.offscreenHuntEnabled &&
+            isOffscreenHuntEnabled() &&
             state.offscreenHuntActive
         ) {
             state.movementOwner = "offscreen-hunt";
@@ -23191,6 +23218,11 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             nextConfig.offscreenHuntEnabled =
                 nextConfig.offscreenHuntEnabled === true;
         }
+        if (nextConfig.alphaHunterEnabled !== undefined)
+            nextConfig.alphaHunterEnabled = nextConfig.alphaHunterEnabled === true;
+        // Independent hunt choices: enabling either switches out of the other.
+        if (nextConfig.alphaHunterEnabled === true) nextConfig.offscreenHuntEnabled = false;
+        else if (nextConfig.offscreenHuntEnabled === true) nextConfig.alphaHunterEnabled = false;
         if (nextConfig.offscreenHuntLootFirst !== undefined)
             nextConfig.offscreenHuntLootFirst=nextConfig.offscreenHuntLootFirst===true;
         if (nextConfig.offscreenHuntRange !== undefined) {
@@ -23494,11 +23526,12 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
         if (!config.offscreenHuntLootFirst)
             clearOffscreenLootWait();
-        if (!config.offscreenHuntEnabled) {
-            clearOffscreenHunt(
-                "Off-screen Hunt disabled",
-                { quiet: true }
-            );
+        if (!isOffscreenHuntEnabled()) {
+            clearOffscreenHunt("Off-screen Hunt disabled", { quiet: true });
+        } else {
+            const hunted = getActiveOffscreenHuntTarget();
+            if (hunted && !isAllowedOffscreenHuntCreature(hunted))
+                clearOffscreenHunt("creature does not match hunt mode", { quiet: true });
         }
         if (!config.lureOffscreenPullEnabled || !config.lureMode) {
             clearLureOffscreenPull(
@@ -54268,6 +54301,7 @@ function upgradeSectionHeaders(panel) {
             hotkey: document.getElementById("minibia-bot-auto-attack-hotkey"),
             maxDist: document.getElementById("minibia-bot-auto-attack-maxdist"),
             offscreenHunt: document.getElementById("minibia-bot-auto-attack-offscreen-hunt"),
+            alphaHunter: document.getElementById("minibia-bot-auto-attack-alpha-hunter"),
             offscreenHuntRange: document.getElementById("minibia-bot-auto-attack-offscreen-hunt-range"),
             offscreenLootFirst: document.getElementById("minibia-bot-auto-attack-offscreen-loot-first"),
             antiKS: document.getElementById("minibia-bot-auto-attack-antiks"),
@@ -54325,9 +54359,11 @@ function upgradeSectionHeaders(panel) {
             inputs.offscreenHunt.checked =
                 attackConfig.offscreenHuntEnabled === true;
         }
+        if (inputs.alphaHunter)
+            inputs.alphaHunter.checked=attackConfig.alphaHunterEnabled===true;
         if (inputs.offscreenLootFirst) {
             inputs.offscreenLootFirst.checked=attackConfig.offscreenHuntLootFirst===true;
-            inputs.offscreenLootFirst.disabled=attackConfig.offscreenHuntEnabled!==true;
+            inputs.offscreenLootFirst.disabled=attackConfig.offscreenHuntEnabled!==true && attackConfig.alphaHunterEnabled!==true;
         }
         if (
             inputs.offscreenHuntRange &&
@@ -57620,7 +57656,7 @@ function upgradeSectionHeaders(panel) {
     <details class="mb-cave-details" style="margin-top:10px;"><summary>Advanced Targeting</summary>
     <div style="border-top:1px solid rgba(255,255,255,.08);margin-top:8px;padding-top:8px;">
       <div class="mb-section-title mb-section-title--sub"><span class="mb-title-text">Off-screen Hunt</span></div>
-      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;"><label class="mb-toggle"><input type="checkbox" id="minibia-bot-auto-attack-offscreen-hunt"><span>Enabled</span></label><label class="mb-field"><span class="mb-field-label">Hunt range</span><input type="number" id="minibia-bot-auto-attack-offscreen-hunt-range" min="5" max="50" value="20"></label><label class="mb-toggle" title="Finish pending looting before moving toward another off-screen monster"><input type="checkbox" id="minibia-bot-auto-attack-offscreen-loot-first"><span>Loot first</span></label></div>
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;"><label class="mb-toggle"><input type="checkbox" id="minibia-bot-auto-attack-offscreen-hunt"><span>All mobs</span></label><label class="mb-toggle" title="Hunt only alpha mobs off screen; shares Hunt range and Loot first"><input type="checkbox" id="minibia-bot-auto-attack-alpha-hunter"><span>Alpha Hunter</span></label><label class="mb-field"><span class="mb-field-label">Hunt range</span><input type="number" id="minibia-bot-auto-attack-offscreen-hunt-range" min="5" max="50" value="20"></label><label class="mb-toggle" title="Finish pending looting before moving toward another off-screen monster"><input type="checkbox" id="minibia-bot-auto-attack-offscreen-loot-first"><span>Loot first</span></label></div>
     </div>
     <!-- Lure -->
     <div style="border-top:1px solid rgba(255,255,255,0.08); margin-top:10px; padding-top:8px;">
@@ -61344,6 +61380,7 @@ function upgradeSectionHeaders(panel) {
         const autoAttackHotkeyInput = panel.querySelector("#minibia-bot-auto-attack-hotkey");
         const maxDistInput = panel.querySelector("#minibia-bot-auto-attack-maxdist");
         const offscreenHuntInput = panel.querySelector("#minibia-bot-auto-attack-offscreen-hunt");
+        const alphaHunterInput = panel.querySelector("#minibia-bot-auto-attack-alpha-hunter");
         const offscreenHuntRangeInput = panel.querySelector("#minibia-bot-auto-attack-offscreen-hunt-range");
         const offscreenLootFirstInput = panel.querySelector("#minibia-bot-auto-attack-offscreen-loot-first");
         const antiKSInput = panel.querySelector("#minibia-bot-auto-attack-antiks");
@@ -61409,9 +61446,16 @@ function upgradeSectionHeaders(panel) {
                 refreshAutoAttackStatus();
             });
         }
+        if (alphaHunterInput) {
+            alphaHunterInput.checked=bot.attack?.config?.alphaHunterEnabled===true;
+            alphaHunterInput.addEventListener("change",()=> {
+                bot.attack.updateConfig({alphaHunterEnabled:alphaHunterInput.checked});
+                refreshAutoAttackStatus();
+            });
+        }
         if (offscreenLootFirstInput) {
             offscreenLootFirstInput.checked=bot.attack?.config?.offscreenHuntLootFirst===true;
-            offscreenLootFirstInput.disabled=bot.attack?.config?.offscreenHuntEnabled!==true;
+            offscreenLootFirstInput.disabled=bot.attack?.config?.offscreenHuntEnabled!==true && bot.attack?.config?.alphaHunterEnabled!==true;
             offscreenLootFirstInput.addEventListener("change",()=> {
                 bot.attack.updateConfig({offscreenHuntLootFirst:offscreenLootFirstInput.checked});
                 refreshAutoAttackStatus();
