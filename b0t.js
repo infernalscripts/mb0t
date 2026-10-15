@@ -3414,7 +3414,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.224",
+        version: "1.6.226",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -9146,6 +9146,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         kiteLosCornerBlocks: 0,
         kiteLosLastReason: null,
         kiteLosLastBlockPosition: null,
+        kiteLosRecovery: null,
+        kiteLosRecoveryMoves: 0,
         ignoredLastTargetId: null,
         ignoredLastTargetName: null,
         ignoredLastAt: 0,
@@ -10442,13 +10444,14 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function getTargetLineOfSightInfo(
-        target
+        target,
+        fromPosition = null
     ) {
         state.kiteLosChecks++;
 
         const playerPos =
             normalizePosition(
-                bot.getPlayerPosition()
+                fromPosition || bot.getPlayerPosition()
             );
         const targetPos =
             normalizePosition(
@@ -11039,197 +11042,60 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         );
     }
 
-    function getKiteEscapeSpaceInfo(
-        startPos,
-        originPos,
-        targetPos,
-        currentTargetDist,
-        idealDistance,
-        mode = "away",
-        maxDepth = 6
-    ) {
+    function getKiteRetreatThreats() {
+        if (targetingSnapshot?.kiteRetreatThreats) return targetingSnapshot.kiteRetreatThreats;
+        const threats=Object.values(window.gameClient?.world?.activeCreatures || {})
+            .filter(m=>isKnownMonsterForOffscreenHunt(m)).map(m=>normalizePosition(m.getPosition?.() || m.__position)).filter(Boolean);
+        if (targetingSnapshot) targetingSnapshot.kiteRetreatThreats=threats;
+        return threats;
+    }
+
+    function entersKiteMonsterContact(pos,origin,threats) {
+        return threats.some(threat=>threat.z===pos.z && getChebyshevDistance(pos,threat)<=1 &&
+            getChebyshevDistance(pos,threat)<Math.min(2,getChebyshevDistance(origin,threat)));
+    }
+
+    function getKiteEscapeSpaceInfo(startPos,originPos,targetPos,currentTargetDist,idealDistance,mode="away",maxDepth=4) {
         state.kiteLookaheadChecks++;
-
-        if (
-            !startPos ||
-            !targetPos
-        ) {
-            return {
-                maxDepth: 0,
-                reachableCount: 0,
-                branchCount: 0,
-                horizonCount: 0,
-                reachesHorizon: false,
-                isLocalPocket: true
-            };
-        }
-
-        const z =
-            Number(startPos.z);
-
-        const queue = [{
-            x: Number(startPos.x),
-            y: Number(startPos.y),
-            z,
-            depth: 0
-        }];
-
-        const seen =
-            new Set([
-                getKitePositionKey(
-                    startPos
-                )
-            ]);
-
-        // Critical v1.5.65 change: do NOT let the lookahead count the tile we
-        // are standing on as "future escape space". For a tunnel entrance that
-        // means the search measures only what lies AHEAD of the candidate.
-        if (originPos) {
-            seen.add(
-                getKitePositionKey(
-                    originPos
-                )
-            );
-        }
-
-        let furthest = 0;
-        let reachableCount = 0;
-        let branchCount = 0;
-        let horizonCount = 0;
-
-        const cardinalOffsets = [
-            [0, -1],
-            [1, 0],
-            [0, 1],
-            [-1, 0]
-        ];
-
-        for (
-            let cursor = 0;
-            cursor < queue.length &&
-            cursor < 128;
-            cursor++
-        ) {
-            const node =
-                queue[cursor];
-
-            if (
-                node.depth >= maxDepth
-            ) {
-                horizonCount++;
-                continue;
+        const empty={maxDepth:0,reachableCount:0,branchCount:0,horizonCount:0,reachesHorizon:false,isLocalPocket:true};
+        if (!startPos || !originPos || !targetPos) return empty;
+        const depthLimit=Math.max(1,Math.min(4,Number(maxDepth)||4));
+        const horizon=Math.min(3,depthLimit),threats=getKiteRetreatThreats();
+        const startTile=getTileAtPosition(startPos);
+        if (!startTile || !startTile.id || startTile.__isPlaceholder) return empty;
+        if (mode==="away" && entersKiteMonsterContact(startPos,originPos,threats)) return empty;
+        const forwardX=startPos.x-originPos.x,forwardY=startPos.y-originPos.y;
+        const queue=[{...startPos,depth:0}],seen=new Set([getKitePositionKey(startPos),getKitePositionKey(originPos)]);
+        const policy=pos=>bot.specialAreas?.getPositionPolicy?.(pos,{purpose:"combat"})?.allowed!==false;
+        let furthest=0,reachableCount=0,branchCount=0,horizonCount=0;
+        for (let cursor=0;cursor<queue.length && cursor<128;cursor++) {
+            const node=queue[cursor];
+            // Count real displacement, not winding around a tiny enclosed loop.
+            if (getChebyshevDistance(node,startPos)>=horizon) horizonCount++;
+            if (node.depth>=depthLimit) continue;
+            let branches=0;
+            for (const [dx,dy] of [[0,-1],[1,0],[0,1],[-1,0],[-1,-1],[1,-1],[-1,1],[1,1]]) {
+                const next={x:node.x+dx,y:node.y+dy,z:startPos.z},key=getKitePositionKey(next);
+                // Looking back around our current tile is not forward escape
+                // room: a pursuing monster can close that entrance behind us.
+                if ((next.x-startPos.x)*forwardX+(next.y-startPos.y)*forwardY<0) continue;
+                if (seen.has(key) || !isSafeTileForKite(next) || !policy(next)) continue;
+                if (dx && dy && (!policy({x:node.x+dx,y:node.y,z:startPos.z}) ||
+                    !policy({x:node.x,y:node.y+dy,z:startPos.z}))) continue;
+                const tile=getTileAtPosition(next);
+                if (!tile || tile.__isPlaceholder) continue;
+                if (mode==="away" && (getChebyshevDistance(next,targetPos)<currentTargetDist ||
+                    entersKiteMonsterContact(next,originPos,threats))) continue;
+                seen.add(key);branches++;reachableCount++;
+                const depth=node.depth+1;furthest=Math.max(furthest,depth);
+                queue.push({...next,depth});
             }
-
-            let localBranches = 0;
-
-            for (
-                const [dx, dy] of
-                cardinalOffsets
-            ) {
-                const next = {
-                    x: node.x + dx,
-                    y: node.y + dy,
-                    z
-                };
-                const key =
-                    getKitePositionKey(next);
-
-                if (seen.has(key))
-                    continue;
-
-                if (
-                    bot.blacklist?.isBlacklisted(
-                        next.x,
-                        next.y,
-                        z
-                    )
-                ) {
-                    continue;
-                }
-
-                if (
-                    !isSafeTileForKite(
-                        next
-                    )
-                ) {
-                    continue;
-                }
-
-                // Creature occupancy is temporary and should not make permanent
-                // map geometry look like a dead end. Immediate movement still
-                // checks occupancy separately before this helper is called.
-                if (
-                    !isTileWalkable(
-                        next.x,
-                        next.y,
-                        z,
-                        true
-                    )
-                ) {
-                    continue;
-                }
-
-                const nextTargetDist =
-                    getChebyshevDistance(
-                        next,
-                        targetPos
-                    );
-
-                if (
-                    mode === "away" &&
-                    currentTargetDist <
-                        idealDistance &&
-                    nextTargetDist <
-                        currentTargetDist
-                ) {
-                    continue;
-                }
-
-                seen.add(key);
-                localBranches++;
-
-                const depth =
-                    node.depth + 1;
-
-                queue.push({
-                    ...next,
-                    depth
-                });
-
-                reachableCount++;
-                furthest =
-                    Math.max(
-                        furthest,
-                        depth
-                    );
-            }
-
-            if (localBranches >= 2)
-                branchCount++;
+            if (branches>=2) branchCount++;
         }
-
-        const reachesHorizon =
-            horizonCount > 0;
-
-        if (reachesHorizon)
-            state.kiteForwardEscapeHorizonHits++;
-
-        // If the only way out is back through originPos, and the forward flood
-        // cannot even continue six cardinal steps, this is a local cul-de-sac.
-        const isLocalPocket =
-            !reachesHorizon;
-
-        if (isLocalPocket)
-            state.kiteLookaheadDeadEndPenalties++;
-
-        return {
-            maxDepth: furthest,
-            reachableCount,
-            branchCount,
-            horizonCount,
-            reachesHorizon,
-            isLocalPocket
-        };
+        const reachesHorizon=horizonCount>0;
+        if (reachesHorizon) state.kiteForwardEscapeHorizonHits++;
+        else state.kiteLookaheadDeadEndPenalties++;
+        return {maxDepth:furthest,reachableCount,branchCount,horizonCount,reachesHorizon,isLocalPocket:!reachesHorizon};
     }
 
     function getKiteStepCandidates(
@@ -11364,7 +11230,6 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 );
 
             const escapeSpace =
-                !isDiagonalStep &&
                 mode === "away"
                     ? getKiteEscapeSpaceInfo(
                         candidatePos,
@@ -11373,7 +11238,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                         currentTargetDist,
                         idealDistance,
                         mode,
-                        6
+                        4
                     )
                     : {
                         maxDepth: 0,
@@ -11405,7 +11270,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 if (targetDelta === 0)
                     score += 8;
 
-                if (!isDiagonalStep) {
+                {
                     // Prefer tiles that still have room to continue escaping.
                     // This prevents stepping deeper into a two-tile pocket
                     // just because that first tile looks locally good.
@@ -11425,9 +11290,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                     if (
                         escapeSpace.isLocalPocket
                     ) {
-                        // This penalty is secondary to the hard selector veto,
-                        // but keeps forced-choice ordering sensible if every
-                        // available cardinal tile is itself enclosed.
+                        // The selector excludes this tile; retain the penalty
+                        // in candidate scores for diagnostics.
                         score -= 260;
                     }
                 }
@@ -11523,124 +11387,22 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         return candidates;
     }
 
-    function selectKiteMovementCandidate(
-        candidates,
-        mode = "away"
-    ) {
-        if (!Array.isArray(candidates))
-            return null;
-
-        const cardinals =
-            candidates.filter(
-                candidate =>
-                    !candidate.isDiagonalStep
-            );
-
+    function selectKiteMovementCandidate(candidates,mode="away") {
+        if (!Array.isArray(candidates)) return null;
+        const usable=mode==="away" ? candidates.filter(c=>!c.deadEndTrap) : candidates;
+        if (mode==="away") state.kiteDeadEndHardRejects+=candidates.length-usable.length;
+        const cardinals=usable.filter(c=>!c.isDiagonalStep);
         if (cardinals.length) {
-            const nonPocketCardinals =
-                mode === "away"
-                    ? cardinals.filter(
-                        candidate =>
-                            !candidate.deadEndTrap
-                    )
-                    : cardinals;
-
-            // Hard rule: never voluntarily enter a local cul-de-sac while a
-            // cardinal alternative has real forward continuation.
-            const usableCardinals =
-                nonPocketCardinals.length
-                    ? nonPocketCardinals
-                    : cardinals;
-
-            if (
-                mode === "away" &&
-                nonPocketCardinals.length &&
-                nonPocketCardinals.length <
-                    cardinals.length
-            ) {
-                state.kiteDeadEndHardRejects +=
-                    cardinals.length -
-                    nonPocketCardinals.length;
-            }
-
-            if (
-                mode === "away" &&
-                !nonPocketCardinals.length &&
-                cardinals.some(
-                    candidate =>
-                        candidate.deadEndTrap
-                )
-            ) {
-                state.kiteDeadEndForcedEntries++;
-            }
-
-            const nonBacktrack =
-                usableCardinals.find(
-                    candidate =>
-                        !candidate
-                            .immediateBacktrack
-                );
-
-            if (nonBacktrack) {
-                if (
-                    usableCardinals[0]
-                        ?.immediateBacktrack
-                ) {
-                    state.kiteImmediateReverseAvoids++;
-                }
-                return nonBacktrack;
-            }
-
-            // If reversal is the only safe cardinal exit, allow it. Importantly,
-            // a safe backtrack beats a non-backtracking dead-end entry because
-            // pocket filtering happened BEFORE this anti-reversal preference.
-            return usableCardinals[0];
+            const nonBacktrack=cardinals.find(c=>!c.immediateBacktrack);
+            if (nonBacktrack && cardinals[0]?.immediateBacktrack) state.kiteImmediateReverseAvoids++;
+            return nonBacktrack || cardinals[0];
         }
-
-        // Cardinals remain the first choice. If none can advance a chase,
-        // allow a validated diagonal that closes the gap instead of stalling.
-        if (mode === "chase") {
-            const chaseDiagonal = candidates.find(candidate =>
-                candidate.isDiagonalStep && candidate.targetDelta < 0);
-            if (!chaseDiagonal) {
-                state.kiteDiagonalRejectedNonEmergency++;
-                return null;
-            }
-            chaseDiagonal.__fallbackCounted = true;
-            return chaseDiagonal;
-        }
-
-        const diagonal =
-            candidates.find(candidate => {
-                if (!candidate.isDiagonalStep)
-                    return false;
-
-                const currentDistance =
-                    Number(candidate.nextTargetDist) -
-                    Number(candidate.targetDelta);
-
-                // Retreat diagonals are emergency-only:
-                // 1) monster must already be adjacent,
-                // 2) the diagonal must INCREASE distance,
-                // 3) every legal cardinal was already unavailable above.
-                if (
-                    currentDistance > 1 ||
-                    candidate.targetDelta <= 0
-                ) {
-                    return false;
-                }
-
-                return true;
-            });
-
-        if (!diagonal) {
-            state.kiteDiagonalRejectedNonEmergency++;
-            return null;
-        }
-
-        diagonal.__fallbackCounted = true;
-        diagonal.__emergencyDiagonal = true;
-
+        // A verified diagonal escape beats entering a known cardinal trap.
+        // It stays a single step and must preserve/increase target separation.
+        const diagonal=usable.find(c=>c.isDiagonalStep && (mode==="chase" ? c.targetDelta<0 : c.targetDelta>=0));
+        if (!diagonal) {state.kiteDiagonalRejectedNonEmergency++;return null;}
+        diagonal.__fallbackCounted=true;
+        diagonal.__emergencyDiagonal=mode==="away" && diagonal.nextTargetDist-diagonal.targetDelta<=1 && diagonal.targetDelta>0;
         return diagonal;
     }
 
@@ -11692,7 +11454,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         if (dx === 0 && dy === 0)
             return [];
 
-        // Emergency retreat diagonals stay one-step only. Cardinal movement is
+        // Validated retreat diagonals stay one-step only. Cardinal movement is
         // safe to batch briefly and remains the normal Kite preference.
         const limit =
             candidate.isDiagonalStep
@@ -11770,13 +11532,9 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                     break;
                 }
 
-                // Re-run the forward-space check for projected cardinal steps.
-                // This keeps the existing dead-end hardening relevant to every
-                // tile in the short batch, not only the first one.
-                if (
-                    i > 0 &&
-                    !candidate.isDiagonalStep
-                ) {
+                // Every queued retreat tile needs its own onward escape route.
+                // This also covers the first tile and diagonal-only escapes.
+                {
                     const escapeInfo =
                         getKiteEscapeSpaceInfo(
                             next,
@@ -11785,7 +11543,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                             previousTargetDistance,
                             idealDistance,
                             "away",
-                            6
+                            4
                         );
 
                     if (
@@ -11967,6 +11725,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 );
                 return false;
             }
+
+            if (mode==="away" && getKiteEscapeSpaceInfo(liveNextPos,livePlayerPos,targetPos,
+                getChebyshevDistance(livePlayerPos,targetPos),idealDistance,"away",4).isLocalPocket)
+                return false;
 
             keyboard.handleMoveKey(
                 candidate.direction
@@ -12712,13 +12474,6 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         // while lure/normal branches disagree about who owns movement.
         releaseCurrentTargetIfOffScreen(now);
 
-        // v1.5.63: being visible in the rendered playfield is not enough for
-        // Kite. A target behind a projectile-blocking corner/wall is released
-        // before Lure/normal movement can wait on it.
-        releaseCurrentKiteTargetIfLineBlocked(
-            now
-        );
-
         // v1.5.44: ignored names are an unconditional veto for mb0t-owned
         // targets. This also handles changing the Ignore list mid-fight.
         releaseIgnoredAutoTarget(now);
@@ -12804,7 +12559,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 returnDetails: true,
                 maxDx: 8,
                 maxDy: 6,
-                skipReachability: true
+                skipReachability: true,
+                skipLineOfSight: config.kiteMode === true
             });
             if (!liveInfo.valid) {
                 state.lastInvalidTargetAt = now;
@@ -12840,6 +12596,11 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             state.unreachableStart = 0;
             return false;
         }
+
+        // A selected Kite target gets a short LOS grace and a safe shooting
+        // route before access clearing, ordinary chase or retargeting can run.
+        if (syncKiteLineOfSight(now))
+            return true;
 
         // v1.5.20: preferred targets can be boxed off by ordinary mobs even
         // though the underlying map route is valid. Temporarily attack those
@@ -14224,53 +13985,109 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         return true;
     }
 
-    function releaseCurrentKiteTargetIfLineBlocked(
-        now = Date.now()
-    ) {
-        if (!config.kiteMode)
-            return false;
+    function clearKiteLosRecovery(reason = "Kite LOS recovery cleared") {
+        if (state.kiteLosRecovery?.moving) stopKiteAutoWalk(reason);
+        state.kiteLosRecovery=null;
+    }
 
-        const current =
-            getCurrentTarget();
-
-        if (!current)
-            return false;
-
-        const info =
-            getTargetLineOfSightInfo(
-                current
-            );
-
-        if (info.clear)
-            return false;
-
-        state.kiteLosCurrentTargetClears++;
-        state.kiteLosLastReason =
-            info.reason;
-
-        handoffTarget(
-            current,
-            `kite LOS blocked: ${info.reason}`,
-            now,
-            350
-        );
-
-        bot.log(
-            "Kite: target released – line of sight blocked",
-            {
-                id:
-                    current.id ?? null,
-                name:
-                    current.name ||
-                    "Mob",
-                reason:
-                    info.reason,
-                blockPosition:
-                    info.blockPosition ||
-                    null
+    function findKiteShootingPath(target,from) {
+        const targetPos=normalizePosition(target?.getPosition?.() || target?.__position);
+        if (!from || !targetPos || from.z!==targetPos.z || typeof BinaryHeap!=="function") return null;
+        const range=Math.max(1,Math.min(7,Number(config.maxTargetDistance)||5));
+        const ideal=Math.max(1,Math.min(range,Number(config.idealDistance)||3));
+        const open=new BinaryHeap(),costs=new Map();
+        const start={position:from,g:0,__f:0,parent:null};
+        const key=p=>`${p.x},${p.y},${p.z}`;
+        const policy=p=>bot.specialAreas?.getPositionPolicy?.(p,{purpose:"combat"}) || {allowed:true,cost:0};
+        const reconstruct=node=> {
+            const path=[];
+            while (node.parent) {path.unshift(node.position);node=node.parent;}
+            return {pathPositions:path};
+        };
+        open.push(start);costs.set(key(from),0);
+        let processed=0,best=null,bestScore=Infinity;
+        while (open.size()>0 && processed++<1200) {
+            const node=open.pop(),pos=node.position;
+            if (node.g!==costs.get(key(pos))) continue;
+            const distance=getTileDistance(pos,targetPos);
+            if (node.parent && distance<=range && getTargetLineOfSightInfo(target,pos).clear) {
+                if (distance>=Math.max(1,ideal-1) && distance<=ideal+1) return reconstruct(node);
+                const score=node.g+Math.abs(distance-ideal)*200+(distance<ideal?400:0);
+                if (score<bestScore) {best=node;bestScore=score;}
             }
-        );
+            for (const [dx,dy] of [[0,-1],[1,0],[0,1],[-1,0],[-1,-1],[1,-1],[-1,1],[1,1]]) {
+                const next={x:pos.x+dx,y:pos.y+dy,z:from.z};
+                if (Math.abs(next.x-from.x)>8 || Math.abs(next.y-from.y)>6 || !isSafeTileForKite(next)) continue;
+                const tile=getTileAtPosition(next);
+                // Repositioning is same-floor travel, never a floor transition.
+                if (!tile || tile.__isPlaceholder || [tile,...(tile.items || [])].some(isFloorChangeThing)) continue;
+                const nextPolicy=policy(next);
+                if (nextPolicy.allowed===false) continue;
+                if (dx && dy && (policy({x:pos.x+dx,y:pos.y,z:from.z}).allowed===false ||
+                    policy({x:pos.x,y:pos.y+dy,z:from.z}).allowed===false)) continue;
+                const base=Math.max(10,Number(tile.getCost?.(getTileAtPosition(pos)))||100);
+                const g=node.g+Math.max(10,base*(dx&&dy?3:1)+Number(nextPolicy.cost||0));
+                const nextKey=key(next);
+                if (g>=(costs.get(nextKey)??Infinity)) continue;
+                costs.set(nextKey,g);open.push({position:next,g,__f:g,parent:node});
+            }
+        }
+        return best ? reconstruct(best) : null;
+    }
 
+    function isKiteLosBatchUsable(playerPos,target) {
+        const client=window.gameClient;
+        if (client?.__mbTargetingAutoWalkActive!==true || client.__mbTargetingAutoWalkOwner!=="kite" ||
+            state.manualPursuitAutoWalkTargetId!==target.id || !client.world?.pathfinder?.__isAutoWalking) return false;
+        const path=state.manualPursuitAutoWalkPathPositions || [];
+        const key=getKitePositionKey(playerPos);
+        const index=key===state.manualPursuitAutoWalkStartKey ? -1 : path.findIndex(p=>getKitePositionKey(p)===key);
+        if (index<0 && key!==state.manualPursuitAutoWalkStartKey) return false;
+        const remaining=path.slice(index+1);
+        return remaining.length>0 && remaining.every(p=>isSafeTileForKite(p) &&
+            bot.specialAreas?.getPositionPolicy?.(p,{purpose:"combat"})?.allowed!==false);
+    }
+
+    function syncKiteLineOfSight(now = Date.now()) {
+        const target=getCurrentTarget();
+        if (!config.kiteMode || !target) {clearKiteLosRecovery();return false;}
+        const info=getTargetLineOfSightInfo(target);
+        if (info.clear) {clearKiteLosRecovery("Kite line of sight restored");return false;}
+        const playerPos=normalizePosition(bot.getPlayerPosition());
+        const targetPos=normalizePosition(target.getPosition?.() || target.__position);
+        if (!playerPos || !targetPos || playerPos.z!==targetPos.z) {clearKiteLosRecovery();return false;}
+        let recovery=state.kiteLosRecovery;
+        if (!recovery || recovery.targetId!==target.id) {
+            clearKiteLosRecovery("Kite LOS target changed");
+            stopKiteAutoWalk("Kite waiting for line of sight");
+            recovery=state.kiteLosRecovery={targetId:target.id,since:now,startedAt:0,lastPlanAt:0,
+                progressKey:getKitePositionKey(playerPos),progressAt:now,moving:false};
+        }
+        if (now-recovery.since<1000) return true;
+        if (!recovery.startedAt) {recovery.startedAt=now;recovery.progressAt=now;}
+        const key=getKitePositionKey(playerPos);
+        if (key!==recovery.progressKey) {recovery.progressKey=key;recovery.progressAt=now;}
+        if (now-recovery.progressAt>=5000 || now-recovery.startedAt>=20000) {
+            clearKiteLosRecovery("Kite shooting route made no progress");
+            state.kiteLosCurrentTargetClears++;
+            handoffTarget(target,"kite LOS recovery could not reach a firing position",now,3000);
+            return true;
+        }
+        if (recovery.moving && isKiteLosBatchUsable(playerPos,target)) return true;
+        const player=window.gameClient?.player;
+        player?.prunePreWalks?.();
+        if (player?.isMoving?.() || player?.__preWalks?.length) return true;
+        if (now-recovery.lastPlanAt<400) return true;
+        recovery.lastPlanAt=now;
+        stopKiteAutoWalk("Kite replanning shooting position");
+        const route=findKiteShootingPath(target,playerPos);
+        if (!route?.pathPositions?.length) return true;
+        const moved=sendManualTargetPursuitAutoWalk(playerPos,route,target,targetPos,
+            "Kite restoring line of sight",now,{owner:"kite",maxSteps:2,refreshOnDestinationChange:false});
+        if (moved) {
+            recovery.moving=true;state.kiteLosRecoveryMoves++;
+            state.lastKiteMoveAt=now;state.lastKiteMoveReason="restoring line of sight";
+        }
         return true;
     }
 
@@ -19533,6 +19350,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function resetAttackSessionState(reason = "session changed") {
+        clearKiteLosRecovery("Kite player session changed");
         clearOffscreenHunt(
             reason,
             { quiet: true }
@@ -19887,6 +19705,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function clearEngagedTarget() {
+        clearKiteLosRecovery();
         const clearedEngagedId = state.engagedTargetId;
         state.engagedTargetId = null;
         if (
@@ -19998,15 +19817,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 return null;
             }
 
-            if (
-                config.kiteMode &&
-                !hasKiteLineOfSight(
-                    current
-                )
-            ) {
-                return null;
-            }
-
+            // Preserve the selected target during Kite's LOS grace/reposition.
+            // New target acquisition still requires a clear projectile line.
             state.engagedTargetId = current.id;
             noteTargetEngagement(current);
             return current;
@@ -23133,6 +22945,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 state.kiteLosBlocked || 0,
             kiteLosCurrentTargetClears:
                 state.kiteLosCurrentTargetClears || 0,
+            kiteLosRecoveryActive: !!state.kiteLosRecovery,
+            kiteLosRecoveryMoves: state.kiteLosRecoveryMoves || 0,
             kiteLosCandidateRejects:
                 state.kiteLosCandidateRejects || 0,
             kiteLosUnknownTileBlocks:
@@ -23676,6 +23490,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                  : [];
         }
         Object.assign(config, nextConfig);
+        if (!config.kiteMode) clearKiteLosRecovery("Kite disabled");
 
         if (!config.offscreenHuntLootFirst)
             clearOffscreenLootWait();
