@@ -3414,7 +3414,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.231",
+        version: "1.6.234",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -46903,6 +46903,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         try {
             const now = Date.now();
 
+            if (bot.followingItemGuard?.isHolding?.()) return;
             ensureDeathHookOwnership();
 
             // This runs even during combat. If CaveBot/Targeting naturally
@@ -47660,6 +47661,7 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
         "minibiaBot.antibot.config",
         "minibiaBot.gmChatMonitor.config",
         "minibiaBot.groundSpawnLogger.config",
+        "minibiaBot.followingItemGuard.config",
         "minibiaBot.follow.floors",
         "minibiaBot.antiBotCreature.config",
         "minibiaBot.tormentedGhost.config", // legacy key; deleted by AntiBotCreature on startup
@@ -49141,10 +49143,12 @@ window.__minibiaBotBundle.installClientEvents = function installClientEvents(bot
             hook(handler,name,"map",(args,before) => {
                 // Keep every ground update in order; the ordinary map signal
                 // remains coalesced for navigation and healing listeners.
-                if (bot.groundSpawnLogger?.enabled?.()) emit("ground-item",{kind,packet:args[0],before});
+                if (bot.groundSpawnLogger?.enabled?.() || bot.followingItemGuard?.enabled?.())
+                    emit("ground-item",{kind,packet:args[0],before});
                 return {};
             },args => bot.groundSpawnLogger?.enabled?.()
-                ? bot.groundSpawnLogger.captureTile(args[0]?.position) : null);
+                ? bot.groundSpawnLogger.captureTile(args[0]?.position)
+                : bot.followingItemGuard?.enabled?.() ? bot.followingItemGuard.captureTile(args[0]?.position) : null);
         }
         hook(handler, "handleEntityTeleport", "movement", args =>
                 Number(args[0]?.id) === Number(window.gameClient?.player?.id) ? { position: args[0]?.position } : null,
@@ -49282,6 +49286,205 @@ window.__minibiaBotBundle.installCurePoisonModule=function(bot){
     }
     bot.curePoison={config,tick,mount};const timer=setInterval(tick,250);bot.addCleanup(()=>{disposed=true;clearInterval(timer);});
 };
+
+window.__minibiaBotBundle.installFollowingItemGuard = function(bot) {
+    const key="minibiaBot.followingItemGuard.config",reason="following-item";
+    const config={enabled:bot.storage.get(key,{})?.enabled===true};
+    let running=config.enabled,disposed=false,chain=[],hold=null,timer=null,resumeTimer=null,message="Watching",muteUntil=0;
+    const views=new Set(),corpses=new Map();
+    const pos=value=>{const p=value?.getPosition?.()||value;return p&&[p.x,p.y,p.z].every(Number.isFinite)?{x:p.x,y:p.y,z:p.z}:null;};
+    const pkey=p=>p?`${p.x},${p.y},${p.z}`:null;
+    const distance=(a,b)=>a&&b?Math.max(Math.abs(a.x-b.x),Math.abs(a.y-b.y)):Infinity;
+    const tileAt=p=>p?window.gameClient?.world?.getTileFromWorldPosition?.(typeof Position==="function"?new Position(p.x,p.y,p.z):p):null;
+    const loaded=t=>!!t&&t.id!==0&&!t.__isPlaceholder;
+    function identity(item){
+        const cid=Number(item?.cid??item?.id),client=window.gameClient;
+        const sid=Number(item?.sid??client?.sidByCid?.[cid]??client?.itemDefinitionsByCid?.[cid]?.sid)||null;
+        return {cid,sid,fluidType:Number(item?.fluidType)||0};
+    }
+    const sameItem=(a,b)=>!!a&&!!b&&a.cid===b.cid&&a.sid===b.sid&&a.fluidType===b.fluidType;
+    const count=item=>Math.max(1,Math.min(100,Number(item?.count)||1));
+    function describe(item,index){
+        const id=identity(item),def=window.gameClient?.itemDefinitionsBySid?.[id.sid]||window.gameClient?.itemDefinitionsByCid?.[id.cid];
+        return {...id,index,count:count(item),name:def?.properties?.name||item?.name||"Item",itemType:def?.properties?.type||null};
+    }
+    function captureTile(value){
+        const p=pos(value),tile=tileAt(p);
+        return loaded(tile)?{position:p,loaded:true,items:(tile.items||[]).slice(0,64).map(describe)}:{position:p,loaded:false};
+    }
+    const enabled=()=>!disposed&&running&&config.enabled;
+    const render=()=>{for(const fn of views)fn();};
+    function cancelTimer(){if(timer!=null)window.clearTimeout(timer);timer=null;}
+    function finish(text){cancelTimer();if(hold)hold.pending=false;message=text;render();}
+    function quantity(tile,item){return (tile?.items||[]).filter(t=>sameItem(identity(t),item)).reduce((n,t)=>n+count(t),0);}
+    function movable(item){
+        return typeof item?.isMoveable==="function"&&item.isMoveable()===true;
+    }
+    function candidate(event){
+        if(event.kind!=="add")return null;
+        const packet=event.packet||{},p=pos(packet.position),me=pos(event.player?.getPosition?.());
+        if(!p||!me||p.z!==me.z||distance(p,me)!==1)return null;
+        const tile=tileAt(p);if(!loaded(tile))return null;
+        const id=identity(packet),indices=[];
+        (tile.items||[]).forEach((item,i)=>{if(sameItem(identity(item),id))indices.push(i);});
+        const slot=Number(packet.slot),index=Number.isInteger(slot)&&indices.includes(slot)?slot:indices.length===1?indices[0]:-1;
+        const item=tile.items?.[index];if(index<0||index>=254||!movable(item))return null;
+        const d=describe(item,index);
+        if(["corpse","splash","magicfield"].includes(d.itemType))return null;
+        if(event.at-(corpses.get(pkey(p))??-Infinity)<350)return null;
+        // A new item, not a re-announcement of a tile stack already present.
+        if(event.before?.loaded!==true)return null;
+        const prior=(event.before.items||[]).filter(x=>sameItem(identity(x),id)).reduce((n,x)=>n+count(x),0);
+        if(quantity(tile,id)<=prior)return null;
+        return {...d,position:p,player:me,at:event.at,removedAt:null};
+    }
+    function sourceGone(previous){
+        if(previous.removedAt!=null)return true;
+        const tile=tileAt(previous.position);
+        return loaded(tile)&&quantity(tile,previous)===0;
+    }
+    function tick(){
+        timer=null;const h=hold;if(!h?.pending||disposed)return;
+        if(bot.actions?.isHalted?.()){finish("Automation halted — move not sent");return;}
+        const client=window.gameClient,player=client?.player,me=pos(player?.getPosition?.());
+        if(client!==h.client||player!==h.player||!me||me.z!==h.item.position.z||
+            (h.sent&&distance(me,h.destination)>0)){finish("Position changed");return;}
+        if(!h.sent)h.destination=me;
+        const source=tileAt(h.item.position),target=tileAt(h.destination);
+        if(h.sent&&loaded(source)&&loaded(target)&&quantity(source,h.item)<=h.sourceBefore-h.item.count&&
+            quantity(target,h.item)>=h.targetBefore+h.item.count){
+            finish("Moved to your tile");return;
+        }
+        if(Date.now()-h.at>=3000){finish("Move not confirmed");return;}
+        player.prunePreWalks?.();
+        const busy=player.isMoving?.()===true||(player.__preWalks?.length||0)>0;
+        if(!h.sent&&!busy&&loaded(source)&&loaded(target)){
+            if(distance(me,h.item.position)===0){finish("Item is already on your tile");return;}
+            if(distance(me,h.item.position)!==1||me.z!==h.item.position.z){finish("Item is out of reach");return;}
+            const items=source.items||[],matches=items.map((it,index)=>({it,index})).filter(({it})=>sameItem(identity(it),h.item));
+            const found=matches.find(({index})=>index===h.item.index)||(matches.length===1?matches[0]:null);
+            if(!found||!movable(found.it)){finish("Item disappeared or changed");return;}
+            if(found.index>=254||count(found.it)!==h.item.count){finish("Item stack changed");return;}
+            h.sourceBefore=quantity(source,h.item);h.targetBefore=quantity(target,h.item);
+            const from={which:source,index:found.index},to={which:target,index:0xFF};
+            try{
+                if(client.networkManager?.isConnected?.()===false){finish("Disconnected — move not sent");return;}
+                if(typeof client.mouse?.sendItemMove!=="function"){finish("Client item move unavailable");return;}
+                // The checked adjacent source prevents Mouse.sendItemMove from
+                // starting an autowalk. Keep the client's normal move gates.
+                const send=()=>{
+                    const before=client.networkManager?.nPacketsSent;
+                    const result=client.mouse.sendItemMove(from,to,h.item.count);
+                    const after=client.networkManager?.nPacketsSent;
+                    if(result===false||(Number.isFinite(before)&&Number.isFinite(after)&&after<=before)){
+                        finish("Move was not sent");return false;
+                    }
+                    h.sent=true;message="Move requested — waiting for ground updates";render();return true;
+                };
+                if(bot.actions?.runShared)bot.actions.runShared(reason,bot.actions.priorities?.UTILITY??20,send);
+                else send();
+            }catch(error){finish("Move failed");bot.log("Following item: move failed",String(error?.message||error));return;}
+        }
+        if(h.pending)timer=window.setTimeout(tick,100);
+    }
+    function detect(item){
+        const client=window.gameClient,player=client?.player;
+        if(!client||!player)return;
+        const wasTargeting=bot.attack?.isRunning?.()===true;
+        hold={client,player,item,destination:pos(player.getPosition?.()),at:Date.now(),pending:true,sent:false,wasTargeting};
+        const expectedHold=hold;
+        // The pause deadline is independent of the item-move attempt. Success,
+        // failure, missing updates or a finished move must never cancel it.
+        resumeTimer=window.setTimeout(()=>{
+            if(hold===expectedHold)release();
+        },10000);
+        message="Following item detected — pausing";render();
+        let pauseFailed=false;
+        try{bot.cave?.pauseMovement?.(reason);bot.attack?.stop?.({persistEnabled:false});}
+        catch(error){pauseFailed=true;bot.log("Following item: pause failed",String(error?.message||error));}
+        try{
+            const pf=client.world?.pathfinder;pf?.setPathfindCache?.(null);
+            if(typeof StopWalkPacket==="function")client.send(new StopWalkPacket());
+            if(player.__target||player.getTarget?.()){
+                player.setTarget?.(null);
+                if(typeof TargetPacket==="function")client.send(new TargetPacket(0));
+            }
+        }catch(error){bot.log("Following item: movement stop failed",String(error?.message||error));}
+        try{bot.playAlarm?.();}catch(error){bot.log("Following item: alert failed",String(error?.message||error));}
+        bot.log("Following item detected — CaveBot and Targeting paused",{item:{cid:item.cid,sid:item.sid,name:item.name},position:item.position,evidence:chain.map(x=>({at:x.at,cid:x.cid,sid:x.sid,position:x.position,player:x.player}))});
+        try{if(bot.groundSpawnLogger?.enabled?.())bot.groundSpawnLogger.snapshot("following-item-detected");}catch(e){}
+        bot.ui?.refreshAutoAttackStatus?.();
+        // A single bounded attempt, after the current packet handler returns.
+        if(pauseFailed){finish("Could not pause automation — move not sent");return;}
+        timer=window.setTimeout(tick,50);
+    }
+    function receive(event){
+        if(!enabled()||event.client!==window.gameClient||event.player!==window.gameClient?.player)return;
+        if(event.type==="session"){
+            chain=[];corpses.clear();
+            if(hold&&(hold.client!==event.client||hold.player!==event.player)){release(false);message="Session changed";render();}
+            return;
+        }
+        if(event.type!=="ground-item")return;
+        const p=pos(event.packet?.position),now=event.at;
+        for(const [key,at]of corpses)if(now-at>1000)corpses.delete(key);
+        const packetType=window.gameClient?.itemDefinitionsBySid?.[Number(event.packet?.sid)]?.properties?.type||window.gameClient?.itemDefinitionsByCid?.[Number(event.packet?.id)]?.properties?.type;
+        if(event.kind==="add"&&packetType==="corpse"&&p){corpses.set(pkey(p),now);while(corpses.size>64)corpses.delete(corpses.keys().next().value);}
+        if(hold){if(hold.pending&&timer==null)timer=window.setTimeout(tick,0);return;}
+        if(now<muteUntil||bot.actions?.isHalted?.())return;
+        for(const previous of chain){
+            if(event.kind!=="remove"||pkey(p)!==pkey(previous.position))continue;
+            const index=Number(event.packet?.index),before=event.before?.items?.find(x=>x.index===index);
+            if(before?sameItem(identity(before),previous):index===previous.index)previous.removedAt=now;
+        }
+        const next=candidate(event);if(!next)return;
+        const previous=chain.at(-1),gap=previous?now-previous.at:0;
+        const follows=previous&&gap>=1500&&gap<=7000&&sourceGone(previous)&&
+            pkey(next.position)!==pkey(previous.position)&&distance(next.player,previous.player)>=2&&
+            distance(next.player,previous.player)<=12&&Math.abs(next.player.z-previous.player.z)<=1;
+        chain=follows?[...chain.slice(-2),next]:[next];
+        if(chain.length===3&&chain.reduce((n,x,i)=>n+(i?distance(x.player,chain[i-1].player):0),0)>=4)detect(next);
+        else{message=`Watching · ${chain.length}/3 following appearances`;render();}
+    }
+    function release(resume=true){
+        const h=hold;cancelTimer();
+        if(resumeTimer!=null)window.clearTimeout(resumeTimer);
+        resumeTimer=null;hold=null;chain=[];corpses.clear();muteUntil=Date.now()+10000;
+        if(h){
+            bot.cave?.resumeMovement?.(reason);
+            if(resume&&!bot.actions?.isHalted?.()&&h.client===window.gameClient&&h.player===window.gameClient?.player&&h.wasTargeting&&
+                bot.attack?.config?.enabled!==false&&!bot.attack?.isRunning?.())bot.attack?.start?.();
+        }
+        message=config.enabled?"Watching":"Off";render();bot.ui?.refreshAutoAttackStatus?.();return !!h;
+    }
+    function updateConfig(next={}){
+        if(disposed)return false;
+        if(typeof next.enabled==="boolean")config.enabled=next.enabled;
+        running=config.enabled;
+        bot.storage.set(key,{...config});
+        if(!config.enabled)release();else{chain=[];corpses.clear();bot.clientEvents?.ensureBound?.();}
+        render();return {...config};
+    }
+    function mount(panel){
+        const section=panel?.querySelector('.mb-alert-antibot'),grid=section?.querySelector('.mb-alert-toggle-grid');
+        if(!grid||section.querySelector('[data-following-item]'))return;
+        const label=document.createElement('label');label.className='mb-toggle';label.setAttribute('data-following-item','');
+        label.title='Detect repeated movable item spawns following your movement. Alert, pause CaveBot/Targeting for 10 seconds, and try moving the item onto your tile.';
+        label.innerHTML='<input type="checkbox"><span>Following Item</span>';grid.appendChild(label);
+        const row=document.createElement('div');row.className='mb-alert-actions';row.style.cssText='align-items:center;flex-wrap:wrap;margin-top:5px';
+        row.innerHTML='<span class="mb-small-note" data-following-status></span><button type="button" class="mb-small-button" data-following-resume>Resume now</button>';grid.after(row);
+        const input=label.querySelector('input'),status=row.querySelector('[data-following-status]'),resume=row.querySelector('[data-following-resume]');
+        const refresh=()=>{input.checked=config.enabled;status.textContent=config.enabled||hold?message+(hold?" · 10s pause":""):"";row.style.display=config.enabled||hold?'flex':'none';resume.hidden=!hold;};
+        input.addEventListener('change',()=>updateConfig({enabled:input.checked}));resume.addEventListener('click',()=>release());views.add(refresh);refresh();
+        bot.addCleanup(()=>{views.delete(refresh);label.remove();row.remove();});
+    }
+    const off=bot.clientEvents?.subscribe?.(['ground-item','session'],receive);
+    bot.followingItemGuard={config,enabled,captureTile,mount,updateConfig,resume:()=>release(),isHolding:()=>!!hold,
+        start:()=>updateConfig({enabled:true}),stop:options=>{if(options?.persistEnabled===false){running=false;release(false);return;}return updateConfig({enabled:false});},
+        status:()=>({enabled:enabled(),holding:!!hold,message,pauseRemainingMs:hold?Math.max(0,hold.at+10000-Date.now()):0,appearances:chain.length,pending:hold?.pending===true,item:hold?{cid:hold.item.cid,sid:hold.item.sid,name:hold.item.name}:null})};
+    bot.addCleanup(()=>{disposed=true;off?.();release(false);views.clear();});
+};
+
 
 window.__minibiaBotBundle.installGroundSpawnLogger = function(bot) {
     const key = "minibiaBot.groundSpawnLogger.config";
@@ -57349,6 +57552,7 @@ function upgradeSectionHeaders(panel) {
     <div class="mb-alert-toggle-grid">
       <label class="mb-toggle"><input type="checkbox" id="minibia-bot-gm-chat-monitor"><span>GM Auto Respond</span></label>
       <label class="mb-toggle"><input type="checkbox" id="minibia-bot-antibot-creature-enabled"><span>Anti-bot creature</span></label>
+      <label class="mb-toggle"><input type="checkbox" id="minibia-bot-pink-skull-enabled" /><span>Pinkskull XLOG</span></label>
     </div>
     <details class="mb-alert-fold">
       <summary>Game master names</summary>
@@ -57406,7 +57610,6 @@ function upgradeSectionHeaders(panel) {
       <label class="mb-toggle"><input type="checkbox" id="minibia-bot-light-hack-legit-enabled" /><span>Light Hack (Utevo)</span></label>
       <label class="mb-toggle"><input type="checkbox" id="minibia-bot-antiafk-enabled" /><span>Anti-AFK</span></label>
       <label class="mb-toggle"><input type="checkbox" id="minibia-bot-autostacker-enabled" /><span>Auto Stacker</span></label>
-      <label class="mb-toggle"><input type="checkbox" id="minibia-bot-pink-skull-enabled" /><span>Pink Skull</span></label>
       <label class="mb-toggle"><input type="checkbox" id="minibia-bot-reconnect-enabled" /><span>Auto-Reconnect</span></label>
       <label class="mb-toggle"><input type="checkbox" id="minibia-bot-autostacker-convert-currency" /><span>Convert Currency</span></label>
     </div>
@@ -58276,6 +58479,7 @@ function upgradeSectionHeaders(panel) {
         bot.cooking?.mount?.(panel);
         bot.observability?.mount?.(panel);
         bot.groundSpawnLogger?.mount?.(panel);
+        bot.followingItemGuard?.mount?.(panel);
         bot.curePoison?.mount?.(panel);
         organizePanelSections(panel);
 
@@ -65245,6 +65449,7 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
 
     // ---- Core pickup logic with walk and pause ----
     function __doPickup(pos, itemId, callback) {
+        if (bot.followingItemGuard?.isHolding?.()) { callback?.(false); return false; }
         const tile = gameClient.world.getTileFromWorldPosition(pos);
         if (!tile) {
             if (callback)
@@ -65311,7 +65516,7 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
     }
 
     function __walkAndPickup(pos, itemId) {
-        if (state.pickupInProgress || bot.actions?.isHalted?.() ||
+        if (state.pickupInProgress || bot.followingItemGuard?.isHolding?.() || bot.actions?.isHalted?.() ||
             bot.attack?.isCombatActive?.() || window.gameClient?.player?.getTarget?.())
             return;
         state.pickupInProgress = true;
@@ -65377,6 +65582,7 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
 
         state.walkInterval = setInterval(() => {
             if (
+                bot.followingItemGuard?.isHolding?.() ||
                 bot.actions?.isHalted?.() ||
                 bot.attack?.isCombatActive?.() ||
                 window.gameClient?.player?.getTarget?.()
@@ -66006,6 +66212,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         currentBundle.installClientExtras(bot);
         currentBundle.installObservability(bot);
         currentBundle.installGroundSpawnLogger(bot);
+        currentBundle.installFollowingItemGuard(bot);
         currentBundle.installCurePoisonModule(bot);
         currentBundle.installPzModule(bot);
         currentBundle.installXrayModule(bot);
@@ -66140,6 +66347,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
                 ["antiBotMonitor", "minibiaBot.antibot.config"],
                 ["gmChatMonitor", "minibiaBot.gmChatMonitor.config"],
                 ["groundSpawnLogger", "minibiaBot.groundSpawnLogger.config"],
+                ["followingItemGuard", "minibiaBot.followingItemGuard.config"],
                 ["antiBotCreature", "minibiaBot.antiBotCreature.config"],
                 ["keyringToggle", "minibiaBot.keyringToggle.config"],
                 ["itemIdDisplay", "minibiaBot.itemIdDisplay.config"],
