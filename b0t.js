@@ -3414,7 +3414,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.230",
+        version: "1.6.231",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -30791,6 +30791,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 purpose: "route", fieldAware: config.ignoreFields === true,
                 avoidFields: config.ignoreFields !== true,
                 isTileAllowed: tile => isCaveRoutePassable(tile),
+                allowLoadedFrontier: true,
                 maxNodes: 8000
             });
             if (policyRoute?.handled) {
@@ -30807,6 +30808,9 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                     state.packetRouteFailureLogAt = now;
                     bot.log("Cave: Special Area policy blocked route", {
                         waypoint: state.currentIndex + 1,
+                        from: normalizePosition(from), goal: normalizePosition(waypoint),
+                        processedNodes: policyRoute.processedNodes,
+                        blockedBy: policyRoute.blockedBy || [],
                         reason: policyRoute.reason || "no policy-safe path"
                     });
                 }
@@ -48465,6 +48469,14 @@ window.__minibiaBotBundle.installSpecialAreasModule = function installSpecialAre
 
     function getTileAt(p){ if(!p||typeof Position!=="function")return null; return window.gameClient?.world?.getTileFromWorldPosition?.(new Position(p.x,p.y,p.z))||null; }
     const getTilePosition=tile=>normalizePosition(tile?.__position||tile?.position||tile?.getPosition?.());
+    function getLoadedPolicyNeighbours(position){
+        // Resolve the eight adjacent positions from the live world, as Cave's
+        // loaded-map planner does. Chunk replacement can leave tile.neighbours
+        // pointing to stale objects or missing newly loaded connections.
+        return [[0,-1],[1,0],[0,1],[-1,0],[-1,-1],[1,-1],[-1,1],[1,1]]
+            .map(([dx,dy])=>getTileAt({x:position.x+dx,y:position.y+dy,z:position.z}))
+            .filter(tile=>tile&&tile.id!==0&&!tile.__isPlaceholder);
+    }
     function isKnownWalkableCrate(item){
         if(!item)return false;
         const cid=Number(item.id??item.cid), sid=Number(item.sid);
@@ -48484,7 +48496,7 @@ window.__minibiaBotBundle.installSpecialAreasModule = function installSpecialAre
         }catch(e){return false;}
     }
     function isPhysicallyPassable(tile,destination=null,options={}){
-        if(!tile||tile.id===0||bot.hasNavigationObstacle(tile))return false;
+        if(!tile||tile.id===0||tile.__isPlaceholder||bot.hasNavigationObstacle(tile))return false;
         if(typeof options.isTileAllowed==="function"&&!options.isTileAllowed(tile))return false;
         if(tile!==destination && bot.cave?.isFloorChangeTile?.(tile))return false;
         const items=Array.isArray(tile.items)?tile.items:[];
@@ -48517,14 +48529,16 @@ window.__minibiaBotBundle.installSpecialAreasModule = function installSpecialAre
         const policyCache=new Map();
         const policyOptions={...options,purpose,areas,policyCache};
         const destPolicy=getPositionPolicy(to,policyOptions); if(!destPolicy.allowed)return {success:false,complete:false,path:[],reason:"The destination is blocked by a Special Area.",blockedBy:destPolicy.blockedBy};
-        const startTile=getTileAt(from), destinationTile=getTileAt(to); if(!startTile)return {success:false,complete:false,path:[],reason:"The current tile is not loaded."};
+        const startTile=getTileAt(from), destinationTile=getTileAt(to);
+        if(!startTile||startTile.id===0||startTile.__isPlaceholder)return {success:false,complete:false,path:[],reason:"The current tile is not loaded."};
+        const destinationUnloaded=!destinationTile||destinationTile.id===0||destinationTile.__isPlaceholder;
         const open=[],bestCost=new Map(); const start={tile:startTile,position:from,g:0,f:heuristic(from,to),parent:null};heapPush(open,start);bestCost.set(positionKey(from),0);
         let best=start,bestH=heuristic(from,to),processed=0;
         while(open.length&&processed<maxNodes){
             const cur=heapPop(open),ck=positionKey(cur.position);if(cur.g!==bestCost.get(ck))continue;processed++;
             if(samePosition(cur.position,to))return {success:true,complete:true,path:reconstruct(cur),reason:null,processedNodes:processed};
             const h=heuristic(cur.position,to);if(h<bestH||(h===bestH&&cur.g<best.g)){best=cur;bestH=h;}
-            for(const nt of Array.from(cur.tile?.neighbours||[])){
+            for(const nt of getLoadedPolicyNeighbours(cur.position)){
                 const np=getTilePosition(nt);if(!np||np.z!==from.z)continue;const isDest=samePosition(np,to);
                 if(!isPhysicallyPassable(nt,isDest?nt:destinationTile,options))continue;
                 const policy=getPositionPolicy(np,policyOptions);if(!policy.allowed)continue;
@@ -48540,7 +48554,14 @@ window.__minibiaBotBundle.installSpecialAreasModule = function installSpecialAre
                 bestCost.set(nk,ng);heapPush(open,{tile:nt,position:np,g:ng,f:ng+heuristic(np,to),parent:cur});
             }
         }
-        if(!destinationTile&&best?.parent)return {success:true,complete:false,path:reconstruct(best),reason:"Walking to the closest loaded policy-safe tile.",processedNodes:processed};
+        if((destinationUnloaded||options.allowLoadedFrontier===true)&&best?.parent&&
+            bestH<heuristic(from,to)&&processed<maxNodes){
+            // Cave's ordinary Walk points can be approached while the exact
+            // tile is creature-blocked or disconnected from loaded geometry.
+            // Every returned step has already passed the same hard areas,
+            // field toggle, creature and diagonal-boundary checks above.
+            return {success:true,complete:false,path:reconstruct(best),reason:"Walking to the closest loaded policy-safe tile.",processedNodes:processed};
+        }
         return {success:false,complete:false,path:[],reason:processed>=maxNodes?"The policy path search reached its safety limit.":"No policy-safe path is currently available.",processedNodes:processed};
     }
     function hasPolicySafeApproach(fromValue,targetValue,options={}){
@@ -48612,7 +48633,7 @@ window.__minibiaBotBundle.installSpecialAreasModule = function installSpecialAre
 
             if(goalKeys.has(ck))return true;
 
-            for(const nt of Array.from(cur.tile?.neighbours||[])){
+            for(const nt of getLoadedPolicyNeighbours(cur.position)){
                 const np=getTilePosition(nt);
                 if(!np||np.z!==from.z)continue;
                 if(!isPhysicallyPassable(nt,null,searchOptions))continue;
