@@ -3414,7 +3414,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.235",
+        version: "1.6.236",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -9936,6 +9936,28 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         return true;
     }
 
+    function isTargetingStepPolicyAllowed(from, to, purpose = "combat") {
+        if (!from || !to || from.z!==to.z) return false;
+        const allowed=p=>bot.specialAreas?.getPositionPolicy?.(p,{purpose})?.allowed!==false;
+        if (!allowed(to)) return false;
+        const dx=to.x-from.x,dy=to.y-from.y;
+        return !dx || !dy || (allowed({x:from.x+dx,y:from.y,z:from.z}) &&
+            allowed({x:from.x,y:from.y+dy,z:from.z}));
+    }
+
+    function isStoredTargetingPolicyBatchPassable(playerPos, owner) {
+        const path=state.manualPursuitAutoWalkPathPositions||[];
+        if (!path.length) return true;
+        const key=getKitePositionKey(playerPos);
+        const at=path.findIndex(p=>getKitePositionKey(p)===key);
+        if (at<0 && key!==state.manualPursuitAutoWalkStartKey) return false;
+        let previous=playerPos;
+        return path.slice(at+1).every(next=>{
+            const allowed=isTargetingStepPolicyAllowed(previous,next,owner==="pull"?"lure":"combat");
+            previous=next;return allowed;
+        });
+    }
+
     function isSafeTargetApproachTile(
         x,
         y,
@@ -9951,6 +9973,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                     new Position(x, y, z)
                 );
 
+        if (bot.specialAreas?.getPositionPolicy?.({x,y,z},{purpose:isLureActive()?"lure":"combat"})?.allowed===false)
+            return false;
         return isTargetFieldPassableTile(
             tile,
             ignoreCreatures
@@ -11142,15 +11166,6 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             const nx = playerPos.x + dx;
             const ny = playerPos.y + dy;
 
-            if (
-                bot.blacklist?.isBlacklisted(
-                    nx,
-                    ny,
-                    playerPos.z
-                )
-            ) {
-                continue;
-            }
 
             const candidatePos = {
                 x: nx,
@@ -11158,7 +11173,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 z: playerPos.z
             };
 
-            if (!isSafeTileForKite(candidatePos))
+            if (!isSafeTileForKite(candidatePos) || !isTargetingStepPolicyAllowed(playerPos,candidatePos))
                 continue;
 
             if (
@@ -11494,17 +11509,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 z: previous.z
             };
 
-            if (
-                bot.blacklist?.isBlacklisted(
-                    next.x,
-                    next.y,
-                    next.z
-                )
-            ) {
-                break;
-            }
 
-            if (!isSafeTileForKite(next))
+            if (!isSafeTileForKite(next) || !isTargetingStepPolicyAllowed(previous,next))
                 break;
 
             const nextTargetDistance =
@@ -11723,7 +11729,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 y: livePlayerPos.y + (Number(candidate.dy) || 0),
                 z: livePlayerPos.z
             } : null;
-            if (!liveNextPos || !isSafeTileForKite(liveNextPos)) {
+            if (!liveNextPos || !isSafeTileForKite(liveNextPos) || !isTargetingStepPolicyAllowed(livePlayerPos,liveNextPos)) {
                 stopKiteAutoWalk(
                     "Kite safety vetoed dangerous fallback step"
                 );
@@ -14073,8 +14079,11 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         const index=key===state.manualPursuitAutoWalkStartKey ? -1 : path.findIndex(p=>getKitePositionKey(p)===key);
         if (index<0 && key!==state.manualPursuitAutoWalkStartKey) return false;
         const remaining=path.slice(index+1);
-        return remaining.length>0 && remaining.every(p=>isSafeTileForKite(p) &&
-            bot.specialAreas?.getPositionPolicy?.(p,{purpose:"combat"})?.allowed!==false);
+        let previous=playerPos;
+        return remaining.length>0 && remaining.every(p=>{
+            const allowed=isSafeTileForKite(p) && isTargetingStepPolicyAllowed(previous,p);
+            previous=p;return allowed;
+        });
     }
 
     function syncKiteLineOfSight(now = Date.now()) {
@@ -21292,6 +21301,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             owner === "melee" &&
             targetMovedTiles <= 2;
 
+        const storedPolicyBatchPassable=isStoredTargetingPolicyBatchPassable(playerPos,owner);
         const storedMeleeBatchPassable =
             owner !== "melee" ||
             isStoredMeleeAutoWalkBatchPassable(playerPos);
@@ -21354,6 +21364,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             ) &&
             pf.__isAutoWalking &&
             storedMeleeBatchPassable &&
+            storedPolicyBatchPassable &&
             !stalePursuitAutoWalk
         ) {
             return true;
@@ -21479,7 +21490,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                                 false
                             );
 
-            if (!stepPassable) {
+            if (!stepPassable || !isTargetingStepPolicyAllowed(previous,step,owner==="pull"?"lure":"combat")) {
                 state.manualPursuitPathFailures++;
                 return false;
             }
@@ -21688,6 +21699,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             return false;
         }
 
+        if (!isTargetingStepPolicyAllowed(playerPos,{x:Number(playerPos.x)+dx,y:Number(playerPos.y)+dy,z:playerPos.z})) return false;
         const dir = getDirection(dx, dy);
         if (dir === null || dir === undefined) return false;
 
@@ -22009,6 +22021,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                         const d = Math.max(Math.abs(nx - playerPos.x), Math.abs(ny - playerPos.y));
                         if (
                             d <= 1 && d < bestDist &&
+                            isTargetingStepPolicyAllowed(playerPos,{x:nx,y:ny,z:playerPos.z}) &&
                             isSafeTargetApproachTile(
                                 nx,
                                 ny,
@@ -22165,7 +22178,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             // Legacy fallback must obey the exact same Kite safety gate as the
             // scored/AutoWalk path. In particular, walkable holes/stairs can
             // still change floor and must never be selected by Kite.
-            if (!isSafeTileForKite({ x: nx, y: ny, z: playerPos.z }))
+            if (!isSafeTileForKite({ x: nx, y: ny, z: playerPos.z }) || !isTargetingStepPolicyAllowed(playerPos,{x:nx,y:ny,z:playerPos.z}))
                 continue;
 
             const newDist = Math.max(Math.abs(nx - targetPos.x), Math.abs(ny - targetPos.y));
@@ -22251,7 +22264,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 continue;
 
             // ---- BLACKLIST CHECK ----
-            if (bot.blacklist?.isBlacklisted(nx, ny, playerPos.z))
+            if (!isTargetingStepPolicyAllowed(playerPos,{x:nx,y:ny,z:playerPos.z}))
                 continue;
             // ---- END ----
 
@@ -48274,6 +48287,7 @@ window.__minibiaBotBundle.installSpecialAreasModule = function installSpecialAre
         { value: "never-step", label: "Never Step", color: "#ff6f78", defaultWeight: 10, description: "Blocks both route and combat movement." },
         { value: "prefer", label: "Prefer", color: "#45dec0", defaultWeight: 3, description: "Makes the pathfinder prefer these tiles." },
         { value: "combat-only", label: "Combat Only", color: "#b59cff", defaultWeight: 10, description: "Blocked for Cave Bot travel but allowed during combat." },
+        { value: "targeting-wall", label: "Targeting Wall", color: "#ff9c60", defaultWeight: 10, description: "A wall for Targeting movement, including Kite and Lure. CaveBot may walk through." },
         { value: "no-combat", label: "No Combat", color: "#5fc9ff", defaultWeight: 10, description: "Allowed for Cave Bot travel but blocked for combat movement." },
         { value: "lure-destination", label: "Lure Destination", color: "#ff8ee7", defaultWeight: 5, description: "Makes combat/lure positioning prefer this destination area." },
     ];
@@ -48411,7 +48425,7 @@ window.__minibiaBotBundle.installSpecialAreasModule = function installSpecialAre
         return !!area?.enabled && (
             area.type==="never-step" ||
             (area.type==="combat-only"&&purpose==="route") ||
-            (area.type==="no-combat"&&(purpose==="combat"||purpose==="lure"))
+            ((area.type==="no-combat"||area.type==="targeting-wall")&&(purpose==="combat"||purpose==="lure"))
         );
     }
 
@@ -58260,11 +58274,11 @@ function upgradeSectionHeaders(panel) {
   <div class="mb-section">
     <div class="mb-section-title"><span class="mb-title-text">🗺️ Special Areas</span></div>
     <div class="mb-stack">
-      <div class="mb-small-note">Areas belong to the active Cave preset and floor. Avoid / Prefer change path cost; Never Step, Combat Only and No Combat are hard movement rules.</div>
+      <div class="mb-small-note">Areas belong to the active Cave preset and floor. Avoid / Prefer change path cost; Never Step, Combat Only and No Combat are hard movement rules. Targeting Wall blocks Targeting movement while CaveBot can pass.</div>
       <label class="mb-toggle"><input type="checkbox" id="minibia-bot-special-area-enabled" checked /><span>Enable Special Area policies</span></label>
       <div class="mb-form-grid">
         <label class="mb-field"><span class="mb-field-label">Area Name</span><input type="text" id="minibia-bot-special-area-name" maxlength="64" placeholder="Optional name" /></label>
-        <label class="mb-field"><span class="mb-field-label">Area Type</span><select id="minibia-bot-special-area-type"><option value="avoid">Avoid</option><option value="never-step">Never Step</option><option value="prefer">Prefer</option><option value="combat-only">Combat Only</option><option value="no-combat">No Combat</option><option value="lure-destination">Lure Destination</option></select></label>
+        <label class="mb-field"><span class="mb-field-label">Area Type</span><select id="minibia-bot-special-area-type"><option value="avoid">Avoid</option><option value="never-step">Never Step</option><option value="prefer">Prefer</option><option value="combat-only">Combat Only</option><option value="targeting-wall">Targeting Wall</option><option value="no-combat">No Combat</option><option value="lure-destination">Lure Destination</option></select></label>
         <label class="mb-field"><span class="mb-field-label">Strength (1-20)</span><input type="number" id="minibia-bot-special-area-weight" min="1" max="20" value="6" /></label>
       </div>
       <div class="mb-special-area-actions">
