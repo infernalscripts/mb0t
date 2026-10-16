@@ -3414,7 +3414,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.234",
+        version: "1.6.235",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -8868,6 +8868,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         lastFollowProgressAt: 0,
         lastFollowStallAt: 0,
         skippedTargetIds: new Map(),
+        offscreenHuntSkippedIds: new Map(),
         kiteWaypointIndex: null, // index of the waypoint we're kiting toward
         kiteTargetReached: false,
         meleeLastDist: Infinity,
@@ -13993,6 +13994,31 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         state.kiteLosRecovery=null;
     }
 
+    const kiteAcquisitionRoutes=new Map();
+    function getAutomaticTargetInfo(target, options = {}) {
+        const info=isTargetValidAndOnScreen(target,{...options,returnDetails:true});
+        if (info.valid || !config.kiteMode || !String(info.reason).startsWith("blocked line of sight:")) return info;
+        // A selected Kite target already gets LOS recovery. Apply the same
+        // opportunity to automatic acquisition, only when a safe loaded path
+        // to an actual firing position exists. Rune dispatch keeps its LOS gate.
+        const checked=isTargetValidAndOnScreen(target,{...options,returnDetails:true,skipLineOfSight:true,skipReachability:true});
+        if (!checked.valid) return checked;
+        const from=normalizePosition(bot.getPlayerPosition());
+        const to=normalizePosition(target?.getPosition?.() || target?.__position);
+        if (!from || !to) return info;
+        const now=Date.now();
+        const key=`${target.id}:${from.x},${from.y},${from.z}:${to.x},${to.y},${to.z}:${config.maxTargetDistance}:${config.idealDistance}:${bot.specialAreas?.getRevision?.()||0}`;
+        let cached=kiteAcquisitionRoutes.get(key);
+        if (!cached || now-cached.at>=400) {
+            for (const [k,v] of kiteAcquisitionRoutes) if (now-v.at>=400) kiteAcquisitionRoutes.delete(k);
+            const route=findKiteShootingPath(target,from);
+            cached={at:now,reachable:!!route?.pathPositions?.length};
+            kiteAcquisitionRoutes.set(key,cached);
+            while (kiteAcquisitionRoutes.size>64) kiteAcquisitionRoutes.delete(kiteAcquisitionRoutes.keys().next().value);
+        }
+        return cached.reachable ? {...checked,reason:"safe Kite firing position available",needsKiteReposition:true} : info;
+    }
+
     function findKiteShootingPath(target,from) {
         const targetPos=normalizePosition(target?.getPosition?.() || target?.__position);
         if (!from || !targetPos || from.z!==targetPos.z || typeof BinaryHeap!=="function") return null;
@@ -14153,9 +14179,9 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         return true;
     }
 
-    function getNearbyMonsters(sortByDistance = true) {
+    function getNearbyMonsters(sortByDistance = true, options = {}) {
         const creatures = Object.values(window.gameClient?.world?.activeCreatures || {});
-        const monsters = creatures.filter(creature => isNativeVisibleMonster(creature));
+        const monsters = creatures.filter(creature => isNativeVisibleMonster(creature, options.ignoreModeLos === true));
         return sortByDistance ? sortMonstersByPriority(monsters) : monsters;
     }
 
@@ -14255,7 +14281,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                     return false;
                 if (isIgnoredTargetCreature(creature))
                     return false;
-                if (isTargetSkipped(creature, now))
+                if (isTargetSkipped(creature, now) || isOffscreenHuntTargetSkipped(creature, now))
                     return false;
 
                 const visible = getNativeSmallScreenInfo(creature).visible;
@@ -14578,7 +14604,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             target = null;
         }
 
-        if (target && isTargetSkipped(target, now)) {
+        if (target && (isTargetSkipped(target, now) || isOffscreenHuntTargetSkipped(target, now))) {
             clearOffscreenHunt("creature temporarily skipped", { quiet: true });
             target = null;
         }
@@ -14645,10 +14671,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 state.offscreenHuntPlayerProgressAt > 0 &&
                 now - state.offscreenHuntPlayerProgressAt >= Math.max(1000,Number(config.offscreenHuntNoProgressMs)||5000)
             ) {
-                rememberSkippedTarget(target, now, 30000);
+                rememberOffscreenHuntSkippedTarget(target, now, 30000);
                 state.offscreenHuntRetryAfter = now + 1500;
                 clearOffscreenHunt(
-                    "hunt stalled without physical movement — target skipped for 30s"
+                    "hunt stalled without physical movement — off-screen retry delayed for 30s"
                 );
                 return false;
             }
@@ -14658,17 +14684,17 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         // needs room for path detours and moving creatures at that boundary.
         const chaseRange = range + Math.max(3, Math.min(8, Math.ceil(range * 0.25)));
         if (distance > chaseRange) {
-            rememberSkippedTarget(target, now, 30000);
+            rememberOffscreenHuntSkippedTarget(target, now, 30000);
             state.offscreenHuntRetryAfter = now + 1500;
             clearOffscreenHunt(
-                `creature left chase range (${distance} > ${chaseRange}) — target skipped for 30s`
+                `creature left chase range (${distance} > ${chaseRange}) — off-screen retry delayed for 30s`
             );
             return false;
         }
 
         if (!isTargetPolicyReachable(target, "combat", now, { allowLoadedFrontier: true })) {
             state.specialAreaHuntRejects++;
-            rememberSkippedTarget(target, now, 5000);
+            rememberOffscreenHuntSkippedTarget(target, now, 5000);
             clearOffscreenHunt(
                 "target is behind a hard Special Area",
                 { quiet: true }
@@ -14693,7 +14719,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                     "Anti-KS self range"
                 )
             ) {
-                rememberSkippedTarget(target, now, 30000);
+                rememberOffscreenHuntSkippedTarget(target, now, 30000);
                 state.offscreenHuntRetryAfter = now + 3000;
                 clearOffscreenHunt(
                     `Anti-KS blocked hunted creature: ${antiKSReason}`
@@ -14722,7 +14748,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             state.offscreenHuntLastProgressAt &&
             now - state.offscreenHuntLastProgressAt >= noProgressMs
         ) {
-            rememberSkippedTarget(target, now, 3000);
+            rememberOffscreenHuntSkippedTarget(target, now, 3000);
             clearOffscreenHunt(
                 `no movement progress for ${Math.round(noProgressMs / 1000)}s`
             );
@@ -14732,7 +14758,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         // If the last known position is stale, getting right beside it without
         // the creature becoming normally actionable is the end of this hunt.
         if (distance <= 1) {
-            rememberSkippedTarget(target, now, 3000);
+            rememberOffscreenHuntSkippedTarget(target, now, 3000);
             clearOffscreenHunt(
                 "reached last known position but target is not actionable"
             );
@@ -14813,7 +14839,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             route.pathPositions.length === 0
         ) {
             state.offscreenHuntPathFailures++;
-            rememberSkippedTarget(target, now, 6000);
+            rememberOffscreenHuntSkippedTarget(target, now, 6000);
             state.offscreenHuntRetryAfter = now + 1200;
             clearOffscreenHunt(
                 "no safe path to last known position",
@@ -14839,7 +14865,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                     OFFSCREEN_HUNT_PAUSE_REASON
                 ) !== true
             ) {
-                rememberSkippedTarget(target, now, 3000);
+                rememberOffscreenHuntSkippedTarget(target, now, 3000);
                 state.offscreenHuntRetryAfter = now + 1000;
                 clearOffscreenHunt(
                     "could not acquire Cave movement pause",
@@ -14901,7 +14927,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         }
 
         state.offscreenHuntPathFailures++;
-        rememberSkippedTarget(target, now, 7000);
+        rememberOffscreenHuntSkippedTarget(target, now, 7000);
         state.offscreenHuntRetryAfter = now + 1500;
         clearOffscreenHunt(
             "hunt movement packet/path failed"
@@ -19689,6 +19715,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         state.movementOwner = null;
         state.movementOwnedUntil = 0;
         state.skippedTargetIds.clear();
+        state.offscreenHuntSkippedIds.clear();
+        kiteAcquisitionRoutes.clear();
         reachCache.clear();
         targetApproachReadings.clear();
         specialAreaTargetReachCache.clear();
@@ -20097,7 +20125,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             return false;
         }
 
-        const info = isTargetValidAndOnScreen(target, {
+        const info = getAutomaticTargetInfo(target, {
             returnDetails: true,
             maxDx: 8,
             maxDy: 6
@@ -20212,6 +20240,22 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     function invalidateCandidateSnapshot() {
         state.candidateSnapshotAt = 0;
         state.candidateSnapshot = null;
+    }
+
+    // A failed off-screen chase must not blacklist normal visible combat.
+    // Visible acquisition still runs its own live Anti-KS/Ignore/area checks.
+    function rememberOffscreenHuntSkippedTarget(target, now = Date.now(), skipMs = 500) {
+        if (target?.id == null) return false;
+        const map=state.offscreenHuntSkippedIds;
+        for (const [id,until] of map) if (until<=now) map.delete(id);
+        map.set(target.id,now+Math.max(250,Number(skipMs)||0));
+        while (map.size>64) map.delete(map.keys().next().value);
+        return true;
+    }
+    function isOffscreenHuntTargetSkipped(target, now = Date.now()) {
+        const map=state.offscreenHuntSkippedIds;
+        for (const [id,until] of map) if (until<=now) map.delete(id);
+        return target?.id != null && (map.get(target.id)||0)>now;
     }
 
     function rememberSkippedTarget(target, now = Date.now(), skipMs = 500) {
@@ -20500,7 +20544,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
         // getNearbyMonsters(false) avoids an initial nearest-distance sort;
         // this list is sorted exactly once below using the real selection score.
-        const scoredCandidates = getNearbyMonsters(false)
+        const scoredCandidates = getNearbyMonsters(false, {ignoreModeLos: config.kiteMode === true})
         .filter((monster) => {
             // pruneSkippedTargets() already ran once above. Calling
             // isTargetSkipped() here used to prune the same map again for every
@@ -20522,7 +20566,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             if (dist > maxDist)
                 return false;
 
-            const info = isTargetValidAndOnScreen(monster, {
+            const info = getAutomaticTargetInfo(monster, {
                 returnDetails: true,
                 maxDx: 8,
                 maxDy: 6
@@ -22446,6 +22490,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         clearCurrentFollowTarget();
         state.kiteWaypointIndex = null;
         state.skippedTargetIds.clear();
+        state.offscreenHuntSkippedIds.clear();
+        kiteAcquisitionRoutes.clear();
         reachCache.clear();
         targetApproachReadings.clear();
         specialAreaTargetReachCache.clear();
@@ -23522,6 +23568,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                  : [];
         }
         Object.assign(config, nextConfig);
+        kiteAcquisitionRoutes.clear();
         if (!config.kiteMode) clearKiteLosRecovery("Kite disabled");
 
         if (!config.offscreenHuntLootFirst)
