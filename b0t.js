@@ -3414,7 +3414,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.236",
+        version: "1.6.237",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -49408,24 +49408,35 @@ window.__minibiaBotBundle.installFollowingItemGuard = function(bot) {
         timer=null;const h=hold;if(!h?.pending||disposed)return;
         if(bot.actions?.isHalted?.()){finish("Automation halted — move not sent");return;}
         const client=window.gameClient,player=client?.player,me=pos(player?.getPosition?.());
-        if(client!==h.client||player!==h.player||!me||me.z!==h.item.position.z||
-            (h.sent&&distance(me,h.destination)>0)){finish("Position changed");return;}
+        if(client!==h.client||player!==h.player||!me||me.z!==h.item.position.z){finish("Position changed");return;}
         if(!h.sent)h.destination=me;
         const source=tileAt(h.item.position),target=tileAt(h.destination);
         if(h.sent&&loaded(source)&&loaded(target)&&quantity(source,h.item)<=h.sourceBefore-h.item.count&&
             quantity(target,h.item)>=h.targetBefore+h.item.count){
             finish("Moved to your tile");return;
         }
-        if(Date.now()-h.at>=3000){finish("Move not confirmed");return;}
+        // A native step already in flight can finish after StopWalk, leaving
+        // this appearance out of reach. Keep watching for its next relocation
+        // throughout the existing 10s pause instead of abandoning it after 3s.
+        if(Date.now()-h.at>=10000){finish("Move not confirmed");return;}
         player.prunePreWalks?.();
         const busy=player.isMoving?.()===true||(player.__preWalks?.length||0)>0;
         if(!h.sent&&!busy&&loaded(source)&&loaded(target)){
             if(distance(me,h.item.position)===0){finish("Item is already on your tile");return;}
-            if(distance(me,h.item.position)!==1||me.z!==h.item.position.z){finish("Item is out of reach");return;}
+            if(distance(me,h.item.position)!==1){
+                message="Waiting for the following item to return within reach";render();
+                timer=window.setTimeout(tick,100);return;
+            }
             const items=source.items||[],matches=items.map((it,index)=>({it,index})).filter(({it})=>sameItem(identity(it),h.item));
             const found=matches.find(({index})=>index===h.item.index)||(matches.length===1?matches[0]:null);
-            if(!found||!movable(found.it)){finish("Item disappeared or changed");return;}
+            if(!found){
+                message="Waiting for the following item to reappear";render();
+                timer=window.setTimeout(tick,100);return;
+            }
+            if(!movable(found.it)){finish("Item is no longer movable");return;}
             if(found.index>=254||count(found.it)!==h.item.count){finish("Item stack changed");return;}
+            if(h.attempts>=3){finish("Move retry limit reached");return;}
+            if(Date.now()<h.retryAt){timer=window.setTimeout(tick,100);return;}
             h.sourceBefore=quantity(source,h.item);h.targetBefore=quantity(target,h.item);
             const from={which:source,index:found.index},to={which:target,index:0xFF};
             try{
@@ -49434,11 +49445,18 @@ window.__minibiaBotBundle.installFollowingItemGuard = function(bot) {
                 // The checked adjacent source prevents Mouse.sendItemMove from
                 // starting an autowalk. Keep the client's normal move gates.
                 const send=()=>{
+                    // Shared actions may defer/decline this callback. Check the
+                    // hold and live item again at dispatch, and count actual tries.
+                    if(hold!==h||!h.pending||disposed||Date.now()-h.at>=10000||h.attempts>=3)return false;
+                    const current=pos(player.getPosition?.());
+                    if(!current||current.z!==h.item.position.z||distance(current,h.destination)!==0||
+                        distance(current,h.item.position)!==1||source.items?.[found.index]!==found.it)return false;
+                    h.attempts++;h.retryAt=Date.now()+750;
                     const before=client.networkManager?.nPacketsSent;
                     const result=client.mouse.sendItemMove(from,to,h.item.count);
                     const after=client.networkManager?.nPacketsSent;
                     if(result===false||(Number.isFinite(before)&&Number.isFinite(after)&&after<=before)){
-                        finish("Move was not sent");return false;
+                        message="Move was not sent — retrying within the pause";render();return false;
                     }
                     h.sent=true;message="Move requested — waiting for ground updates";render();return true;
                 };
@@ -49452,7 +49470,7 @@ window.__minibiaBotBundle.installFollowingItemGuard = function(bot) {
         const client=window.gameClient,player=client?.player;
         if(!client||!player)return;
         const wasTargeting=bot.attack?.isRunning?.()===true;
-        hold={client,player,item,destination:pos(player.getPosition?.()),at:Date.now(),pending:true,sent:false,wasTargeting};
+        hold={client,player,item,destination:pos(player.getPosition?.()),at:Date.now(),pending:true,sent:false,attempts:0,retryAt:0,wasTargeting};
         const expectedHold=hold;
         // The pause deadline is independent of the item-move attempt. Success,
         // failure, missing updates or a finished move must never cancel it.
@@ -49475,7 +49493,8 @@ window.__minibiaBotBundle.installFollowingItemGuard = function(bot) {
         bot.log("Following item detected — CaveBot and Targeting paused",{item:{cid:item.cid,sid:item.sid,name:item.name},position:item.position,evidence:chain.map(x=>({at:x.at,cid:x.cid,sid:x.sid,position:x.position,player:x.player}))});
         try{if(bot.groundSpawnLogger?.enabled?.())bot.groundSpawnLogger.snapshot("following-item-detected");}catch(e){}
         bot.ui?.refreshAutoAttackStatus?.();
-        // A single bounded attempt, after the current packet handler returns.
+        // Try after the current handler returns; up to three move requests may
+        // follow relocations, without extending the fixed 10s resume deadline.
         if(pauseFailed){finish("Could not pause automation — move not sent");return;}
         timer=window.setTimeout(tick,50);
     }
@@ -49491,7 +49510,22 @@ window.__minibiaBotBundle.installFollowingItemGuard = function(bot) {
         for(const [key,at]of corpses)if(now-at>1000)corpses.delete(key);
         const packetType=window.gameClient?.itemDefinitionsBySid?.[Number(event.packet?.sid)]?.properties?.type||window.gameClient?.itemDefinitionsByCid?.[Number(event.packet?.id)]?.properties?.type;
         if(event.kind==="add"&&packetType==="corpse"&&p){corpses.set(pkey(p),now);while(corpses.size>64)corpses.delete(corpses.keys().next().value);}
-        if(hold){if(hold.pending&&timer==null)timer=window.setTimeout(tick,0);return;}
+        if(hold){
+            const h=hold;
+            if(h.pending){
+                const next=candidate(event);
+                // Follow only the already confirmed item identity. Unrelated
+                // ground loot must not replace the source of a pending move.
+                if(next&&sameItem(next,h.item)&&sourceGone(h.item)&&
+                    pkey(next.position)!==pkey(h.item.position)&&now-h.item.at<=7000){
+                    h.item=next;h.sent=false;h.destination=next.player;
+                    message="Following item relocated — retrying from its new tile";render();
+                    cancelTimer();
+                }
+                if(timer==null)timer=window.setTimeout(tick,0);
+            }
+            return;
+        }
         if(now<muteUntil||bot.actions?.isHalted?.())return;
         for(const previous of chain){
             if(event.kind!=="remove"||pkey(p)!==pkey(previous.position))continue;
@@ -49542,7 +49576,7 @@ window.__minibiaBotBundle.installFollowingItemGuard = function(bot) {
     const off=bot.clientEvents?.subscribe?.(['ground-item','session'],receive);
     bot.followingItemGuard={config,enabled,captureTile,mount,updateConfig,resume:()=>release(),isHolding:()=>!!hold,
         start:()=>updateConfig({enabled:true}),stop:options=>{if(options?.persistEnabled===false){running=false;release(false);return;}return updateConfig({enabled:false});},
-        status:()=>({enabled:enabled(),holding:!!hold,message,pauseRemainingMs:hold?Math.max(0,hold.at+10000-Date.now()):0,appearances:chain.length,pending:hold?.pending===true,item:hold?{cid:hold.item.cid,sid:hold.item.sid,name:hold.item.name}:null})};
+        status:()=>({enabled:enabled(),holding:!!hold,message,pauseRemainingMs:hold?Math.max(0,hold.at+10000-Date.now()):0,appearances:chain.length,pending:hold?.pending===true,moveAttempts:hold?.attempts??0,item:hold?{cid:hold.item.cid,sid:hold.item.sid,name:hold.item.name}:null})};
     bot.addCleanup(()=>{disposed=true;off?.();release(false);views.clear();});
 };
 
