@@ -1098,25 +1098,38 @@ addCleanup(() => {
     }
 
     let lastFollowFloorFailure = null;
-    const followFloorState = {client:null,player:null,lastSeen:null,lastStep:null,trail:[],evidence:null,blocked:false,routeChanged:false};
+    const followFloorState = {client:null,player:null,lastSeen:null,lastStep:null,lastSharedFloor:null,trail:[],evidence:null,blocked:false,routeChanged:false};
     const followFloorPosition = p => p && [p.x,p.y,p.z].every(v=>Number.isFinite(Number(v)))
         ? {x:Number(p.x),y:Number(p.y),z:Number(p.z)} : null;
     const followFloorDistance = (a,b) => a && b && a.z===b.z ? Math.max(Math.abs(a.x-b.x),Math.abs(a.y-b.y)) : Infinity;
     function clearFollowFloorTracking() {
         followFloorState.client=followFloorState.player=followFloorState.lastSeen=followFloorState.lastStep=followFloorState.evidence=null;
+        followFloorState.lastSharedFloor=null;
         followFloorState.trail=[]; followFloorState.blocked=false; followFloorState.routeChanged=false;
         customFollowState.transitionReason=""; customFollowState.transitionDestinationKey=null;
+    }
+    function isFollowTeleportThing(thing) {
+        if (!thing) return false;
+        const client=window.gameClient;
+        const def=client?.itemDefinitionsBySid?.[thing.sid] || client?.itemDefinitionsByCid?.[thing.id];
+        const sid=Number(thing.sid);
+        // This scripted portal has no floorchange/type in the item definitions.
+        // Match its exact SID, using CID only when the thing has no SID.
+        return (sid>0 ? sid===1397 : Number(thing.id)===1959) ||
+            def?.properties?.type==="teleport" ||
+            /\bteleport/.test(String(def?.properties?.name || thing.name || "").toLowerCase());
     }
     function followTransitionThing(thing) {
         const client=window.gameClient;
         const def=client?.itemDefinitionsBySid?.[thing?.sid] || client?.itemDefinitionsByCid?.[thing?.id];
         const name=String(def?.properties?.name || thing?.name || "").toLowerCase();
-        return !!(def?.properties?.floorchange || def?.properties?.type==="teleport" ||
+        return !!(def?.properties?.floorchange || isFollowTeleportThing(thing) ||
             [1948,1968,435].includes(Number(thing?.id)) || /\b(rope spot|ladder|stairs|staircase|hole|trapdoor|teleport)\b/.test(name));
     }
     function getFollowTransitionInfo(tile) {
         if (!tile || !tile.id || tile.__isPlaceholder) return null;
         const client=window.gameClient;
+        if ([tile,...(tile.items || [])].some(isFollowTeleportThing)) return {kind:"step",delta:0,teleport:true};
         for (const thing of [tile,...(tile.items || [])]) {
             if (!thing) continue;
             const def=client?.itemDefinitionsBySid?.[thing.sid] || client?.itemDefinitionsByCid?.[thing.id];
@@ -1125,9 +1138,12 @@ addCleanup(() => {
             if (/\brope spot\b/.test(name)) return {kind:"rope",delta:-1};
             if (/\b(closed hole|loose stone pile|stone pile|gravel pile|dirt pile|diggable|sand hole)\b/.test(name)) return {kind:"shovel",delta:1};
             const floor=def?.properties?.floorchange;
-            if ([1948,1968,435].includes(Number(thing.id)) || /\bladder\b/.test(name))
-                return {kind:"use",delta:floor ? (floor==="down"?1:-1) : 0};
+            // Explicit floorchange metadata describes a step-on transition,
+            // including ground sprites named "ladder" (SID 3135 / CID 482).
+            // Only ladders without that metadata need an adjacent Use action.
             if (floor) return {kind:"step",delta:floor==="down"?1:-1};
+            if ([1948,1968,435].includes(Number(thing.id)) || /\bladder\b/.test(name))
+                return {kind:"use",delta:Number(thing.sid)===1386 || Number(thing.id)===1948 ? -1 : 0};
             if (/\b(open hole|hole|open trapdoor)\b/.test(name) && !/closed/.test(name)) return {kind:"step",delta:1};
         }
         return null;
@@ -1144,13 +1160,12 @@ addCleanup(() => {
             const p={x:from.x+dx,y:from.y+dy,z:from.z},tile=getFollowFloorTile(p);
             let info=getFollowTransitionInfo(tile);
             if (info?.delta===1 && to.z<from.z && [tile,...(tile?.items || [])].some(t=>/\bhole\b/.test(String(window.gameClient?.itemDefinitionsByCid?.[t?.id]?.properties?.name || t?.name || "").toLowerCase()))) info={kind:"rope",delta:-1};
-            if (!info || (info.delta && Math.sign(to.z-from.z)!==info.delta)) continue;
+            if (!info || (from.z===to.z && !info.teleport) ||
+                (info.delta && Math.sign(to.z-from.z)!==info.delta)) continue;
             const sourceDistance=Math.max(Math.abs(dx),Math.abs(dy));
+            if (from.z===to.z && sourceDistance>1) continue;
             const exitDistance=Math.max(Math.abs(p.x-to.x),Math.abs(p.y-to.y));
-            const teleport=[tile,...(tile?.items || [])].some(t=>{
-                const def=window.gameClient?.itemDefinitionsBySid?.[t?.sid] || window.gameClient?.itemDefinitionsByCid?.[t?.id];
-                return def?.properties?.type==="teleport" || /\bteleport/.test(String(def?.properties?.name || t?.name || "").toLowerCase());
-            });
+            const teleport=info.teleport === true;
             if (sourceDistance>1 && !teleport && exitDistance>2) continue;
             const score=sourceDistance*10+exitDistance;
             candidates.push({position:p,...info,score,sourceDistance,exitDistance});
@@ -1166,15 +1181,28 @@ addCleanup(() => {
         // Side-by-side tiles of one staircase can tie in Chebyshev distance.
         // Prefer the tile aligned with the observed entrance and exit; retain
         // uncertainty for distinct transitions or equally aligned entrances.
-        if (tied.some(c=>c.kind!=="step" || !c.delta || c.delta!==tied[0].delta ||
-            tied.some(other=>followFloorDistance(c.position,other.position)>1))) return null;
+        if (tied.some(c=>c.kind!=="step" || !c.delta || c.delta!==tied[0].delta)) return null;
+        // A three-wide stair is one connected entrance. Requiring every pair
+        // to be adjacent rejects its two outer tiles before alignment can pick
+        // the centre. Disconnected entrances remain ambiguous.
+        const connected=new Set([tied[0]]);
+        let grew=true;
+        while (grew) {
+            grew=false;
+            for (const candidate of tied) if (!connected.has(candidate) && [...connected].some(other=>
+                Math.abs(candidate.position.x-other.position.x)+Math.abs(candidate.position.y-other.position.y)===1)) {
+                connected.add(candidate);grew=true;
+            }
+        }
+        if (connected.size!==tied.length) return null;
         const alignment=c=>Math.abs(c.position.x-from.x)+Math.abs(c.position.y-from.y)+
             Math.abs(c.position.x-to.x)+Math.abs(c.position.y-to.y);
         tied.sort((a,b)=>alignment(a)-alignment(b));
         return alignment(tied[0])<alignment(tied[1]) ? tied[0] : null;
     }
     function captureFollowFloorDiagnostics() {
-        const client=window.gameClient,from=followFloorState.evidence?.from || followFloorState.lastSeen?.position;
+        const client=window.gameClient,from=followFloorState.evidence?.from || followFloorState.trail[0]?.position ||
+            followFloorState.lastSeen?.position || followFloorPosition(client?.player?.getPosition?.());
         const samples=[];
         const thing=t=>{
             if (!t) return null;
@@ -1189,18 +1217,23 @@ addCleanup(() => {
                 {position,loaded:true,transition:getFollowTransitionInfo(tile),ground:thing(tile),items:(tile.items || []).slice(0,8).map(thing)});
         }
         return {at:Date.now(),version:customFollowBot?.version || window.minibiaBot?.version || null,
-            name:customFollowState.name,enabled:customFollowState.followFloors,reason:customFollowState.transitionReason,
+            name:customFollowState.name,active:customFollowState.active,mode:customFollowState.mode,
+            enabled:customFollowState.followFloors,distance:customFollowState.distance,reason:customFollowState.transitionReason,
             player:followFloorPosition(client?.player?.getPosition?.()),leader:followFloorState.lastSeen,
-            evidence:followFloorState.evidence,lastStep:followFloorState.lastStep,pending:followFloorState.trail,samples};
+            evidence:followFloorState.evidence,lastStep:followFloorState.lastStep,
+            lastSharedFloor:followFloorState.lastSharedFloor,pending:followFloorState.trail,samples};
     }
     function getFollowDiagnostics() {
         // Freeze only serializable snapshots, with one retained failure report.
         return JSON.parse(JSON.stringify({current:captureFollowFloorDiagnostics(),lastFailure:lastFollowFloorFailure}));
     }
     function rememberFollowFloorChange(from,to,at=Date.now(),confirmed=true) {
-        if (!from || !to || from.z===to.z || followFloorState.blocked) return;
+        if (!from || !to || followFloorState.blocked || (from.z===to.z && followFloorDistance(from,to)===0)) return;
         const entrance=selectFollowTransition(from,to);
-        if (!entrance) { followFloorState.evidence={from,to,at}; return; }
+        if (!entrance) {
+            if (from.z!==to.z) followFloorState.evidence={from,to,at};
+            return;
+        }
         const key=`${entrance.position.x},${entrance.position.y},${from.z}>${to.z}`;
         const previous=followFloorState.trail.find(hop=>hop.key===key ||
             (confirmed && hop.inferred && followFloorDistance(hop.position,entrance.position)===0));
@@ -1216,6 +1249,23 @@ addCleanup(() => {
         followFloorState.trail.push({...entrance,key,exit:{...to},at,inferred:!confirmed,startedAt:0,attempts:0,actionAt:0,approach:null});
         followFloorState.evidence=null;
     }
+    function rememberFollowPortalEntrance(position,at=Date.now()) {
+        const info=getFollowTransitionInfo(getFollowFloorTile(position));
+        if (!info?.teleport || followFloorState.blocked) return;
+        if (followFloorState.trail.some(hop=>followFloorDistance(hop.position,position)===0)) return;
+        if (followFloorState.trail.length>=4) {
+            followFloorState.blocked=true;customFollowState.transitionReason="Too many unseen floor changes";return;
+        }
+        if (!followFloorState.trail.length) followFloorState.routeChanged=true;
+        followFloorState.trail.push({position:{...position},...info,key:`${position.x},${position.y},${position.z}>portal`,
+            exit:null,at,inferred:true,startedAt:0,attempts:0,actionAt:0,approach:null});
+    }
+    function noteFollowSharedFloor(id,position,at) {
+        const player=window.gameClient?.player;
+        const own=followFloorPosition(player?.getPosition?.());
+        if (position && own && position.z===own.z && Number(id)!==Number(player?.id))
+            followFloorState.lastSharedFloor={id,position:{...position},at};
+    }
     function observeFollowLeaderEvent(kind,packet) {
         if (!customFollowState.active || !customFollowState.followFloors) return;
         const client=window.gameClient,player=client?.player;
@@ -1224,29 +1274,49 @@ addCleanup(() => {
         }
         const id=typeof packet==="number"?packet:packet?.id;
         const target=client?.world?.getCreature?.(id) || client?.world?.activeCreatures?.[id];
+        if (Number(id)===Number(player?.id)) {
+            const from=followFloorPosition(player?.getPosition?.()),to=followFloorPosition(packet?.position);
+            const hop=followFloorState.trail[0];
+            // Same-floor portal exits can be only a few squares away. Proximity
+            // to the exit is not completion: require our own server transition.
+            if (hop?.teleport && from && to && followFloorDistance(from,to)>0 &&
+                (kind==="teleport" || followFloorDistance(from,to)>1) &&
+                followFloorDistance(from,hop.position)<=1 &&
+                (!hop.exit || followFloorDistance(to,hop.exit)<=2)) {
+                hop.completed=true;hop.exit={...to};
+            }
+            return;
+        }
         if (!target) {
             const previous=followFloorState.lastSeen,to=followFloorPosition(packet?.position);
             // Leaving the visible creature list can precede the floor packet.
             // Match only the recently observed leader ID in this same session.
             if (kind!=="remove" && to && previous && Number(id)===Number(previous.id) &&
                 Number(id)!==Number(player?.id) && Date.now()-previous.at<=5000) {
-                if (previous.position.z!==to.z) rememberFollowFloorChange(previous.position,to);
+                noteFollowSharedFloor(previous.id,previous.position,previous.at);
+                if (previous.position.z!==to.z || kind==="teleport" || followFloorDistance(previous.position,to)>1)
+                    rememberFollowFloorChange(previous.position,to);
+                noteFollowSharedFloor(previous.id,to,Date.now());
                 followFloorState.lastSeen={id:previous.id,position:to,at:Date.now()};
             }
             return;
         }
         if (String(target.name || "").toLowerCase()!==customFollowState.name.toLowerCase() || target.id===player?.id) return;
         const health=target.state?.health ?? target.health;
-        if (health!=null && Number(health)<=0) { followFloorState.trail=[];followFloorState.evidence=null;followFloorState.lastSeen=null;return; }
+        if (health!=null && Number(health)<=0) { followFloorState.trail=[];followFloorState.evidence=null;followFloorState.lastSeen=null;followFloorState.lastSharedFloor=null;return; }
         const from=followFloorPosition(target.getPosition?.() || target.__position),to=followFloorPosition(packet?.position);
         if (!from) return;
+        noteFollowSharedFloor(target.id,from,Date.now());
+        noteFollowSharedFloor(target.id,to,Date.now());
         followFloorState.lastSeen={id:target.id,position:to || from,at:Date.now()};
-        if (to && to.z!==from.z) rememberFollowFloorChange(from,to);
+        if (to && (to.z!==from.z || kind==="teleport" || followFloorDistance(from,to)>1))
+            rememberFollowFloorChange(from,to);
         if (kind==="move" && to && from.z===to.z && followFloorDistance(from,to)===1)
             followFloorState.lastStep={from,to,at:Date.now()};
         if (kind==="remove") {
             const info=getFollowTransitionInfo(getFollowFloorTile(from));
-            if (info?.delta) rememberFollowFloorChange(from,{...from,z:from.z+info.delta},Date.now(),false);
+            if (info?.teleport) rememberFollowPortalEntrance(from);
+            else if (info?.delta) rememberFollowFloorChange(from,{...from,z:from.z+info.delta},Date.now(),false);
             else {
                 // Some stair crossings remove the leader before an on-stair
                 // position is broadcast. Use only the immediately forward stair
@@ -1255,8 +1325,8 @@ addCleanup(() => {
                 if (step && Date.now()-step.at<2000 && followFloorDistance(step.to,from)===0) {
                     const ahead={x:from.x+step.to.x-step.from.x,y:from.y+step.to.y-step.from.y,z:from.z};
                     const tile=getFollowFloorTile(ahead),next=getFollowTransitionInfo(tile);
-                    const hole=[tile,...(tile?.items || [])].some(t=>/\bhole\b/.test(String(window.gameClient?.itemDefinitionsByCid?.[t?.id]?.properties?.name || t?.name || "").toLowerCase()));
-                    if (next?.kind==="step" && next.delta && !hole)
+                    if (next?.teleport) rememberFollowPortalEntrance(ahead);
+                    else if (next?.kind==="step" && next.delta)
                         rememberFollowFloorChange(from,{...ahead,z:ahead.z+next.delta},Date.now(),false);
                 }
             }
@@ -1270,8 +1340,20 @@ addCleanup(() => {
         const to=followFloorPosition(target?.getPosition?.() || target?.__position);
         if (!to) return;
         const previous=followFloorState.lastSeen;
-        if (previous && previous.id===target.id && now-previous.at<=10000 && previous.position.z!==to.z)
+        if (previous && Number(previous.id)===Number(target.id) && now-previous.at<=10000 &&
+            (previous.position.z!==to.z || followFloorState.trail.some(hop=>hop.teleport && hop.inferred && !hop.exit)))
             rememberFollowFloorChange(previous.position,to,now);
+        // Manifest/map updates can expose the leader's new floor before the
+        // next Follow tick. Preserve the last confirmed position on OUR floor
+        // independently of lastSeen, which keeps updating on the exit floor.
+        const source=followFloorState.lastSharedFloor;
+        const own=followFloorPosition(player?.getPosition?.());
+        if (!followFloorState.trail.length && !followFloorState.evidence && !followFloorState.blocked &&
+            source && own && own.z!==to.z && source.position.z===own.z &&
+            Number(source.id)===Number(target.id) && now-source.at<=10000) {
+            rememberFollowFloorChange(source.position,to,source.at);
+        }
+        noteFollowSharedFloor(target.id,to,now);
         followFloorState.lastSeen={id:target.id,position:to,at:now};
     }
     function canContinueFloorFollow(name) {
@@ -1318,7 +1400,8 @@ addCleanup(() => {
         const pos=followFloorPosition(window.gameClient?.player?.getPosition?.());
         if (!pos) return true;
         let hop=followFloorState.trail[0];
-        while (hop && pos.z===hop.exit.z && followFloorDistance(pos,hop.exit)<=6) {
+        while (hop && (hop.completed || (hop.exit && hop.position.z!==hop.exit.z &&
+            pos.z===hop.exit.z && followFloorDistance(pos,hop.exit)<=6))) {
             followFloorState.trail.shift();stopCustomFollowAutoWalk("floor transition complete");
             customFollowState.transitionDestinationKey=null;hop=followFloorState.trail[0];
         }
@@ -1349,7 +1432,9 @@ addCleanup(() => {
         if (!hop.startedAt) hop.startedAt=now;
         if (pos.z!==hop.position.z || now-hop.at>=30000 || now-hop.startedAt>=20000 || (hop.attempts>=3 && now-hop.actionAt>=1500)) {
             followFloorState.blocked=true;customFollowState.transitionReason="Transition failed — restart Follow to retry";
-            stopCustomFollowAutoWalk("transition timeout");return true;
+            stopCustomFollowAutoWalk("transition timeout");
+            lastFollowFloorFailure=JSON.parse(JSON.stringify(captureFollowFloorDiagnostics()));
+            return true;
         }
         const tile=getFollowFloorTile(hop.position),info=getFollowTransitionInfo(tile);
         if (!info) {customFollowState.transitionReason="Waiting for transition tile";return true;}
@@ -1490,6 +1575,7 @@ addCleanup(() => {
     function isFollowFloorChangeTile(tile) {
         if (!tile)
             return false;
+        if (getFollowTransitionInfo(tile)?.kind==="step") return true;
 
         try {
             const defs =
@@ -2004,12 +2090,6 @@ addCleanup(() => {
                         dx !== 0 &&
                         dy !== 0;
 
-                    if (goalRange > 0 && diagonal) {
-                        const p=currentNode.__position;
-                        const sideOptions={allowNonPvpPlayerPassThrough:options.allowNonPvpPlayerPassThrough===true};
-                        if ([[dx,0],[0,dy]].some(([sx,sy]) => !isFollowFieldPassableTile(
-                            getFollowFloorTile({x:Number(p.x)+sx,y:Number(p.y)+sy,z:p.z}),sideOptions))) continue;
-                    }
                     // The native eight-neighbour path search validates the
                     // destination, not the two tiles beside a diagonal step.
 
@@ -2958,15 +3038,8 @@ addCleanup(() => {
             if (!isFollowFieldPassableTile(client.world.getTileFromWorldPosition?.(
                 new Position(step.x, step.y, step.z)), options))
                 return false;
-            if (dx && dy) {
-                const sideOptions = { allowNonPvpPlayerPassThrough: client.__worldPvp === false };
-                for (const [x, y] of [[Number(previous.x) + dx, Number(previous.y)],
-                    [Number(previous.x), Number(previous.y) + dy]]) {
-                    if (!isFollowFieldPassableTile(client.world.getTileFromWorldPosition?.(
-                        new Position(x, y, step.z)), sideOptions))
-                        return false;
-                }
-            }
+            // Match the route search and native eight-neighbour movement:
+            // only the entered tile can block this diagonal step.
             previous = step;
         }
         return true;
@@ -3476,7 +3549,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.249",
+        version: "1.6.255",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -5669,7 +5742,7 @@ window.__minibiaBotBundle.installItemAlertItems = function(bot) {
             if(alertRemoved===removed)alertRemoved=()=>{};
         });
     }
-    bot.itemAlertItems={catalog,resolve,suggestions,fromItem,request,reading,key,mount,
+    bot.itemAlertItems={catalog,resolve,suggestions,fromItem,captureItem,request,reading,key,mount,
         edit:alert=>editActiveAlert(alert),removed:alert=>alertRemoved(alert),cancelCapture:()=>cancelActiveCapture()};
     bot.addCleanup(()=>{disposed=true;cancelActiveCapture();rows=[];catalogRef=null;});
 };
@@ -24967,6 +25040,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         teleportRecoveryLastDistance: null,
 
         pendingTransitionSource: null,
+        autoTransitionAttempt: null,
+        autoTransitionFailure: null,
         pausedForCombat: false,
 
         // v1.5.55: external owners (currently distant-corpse Looter) can pause
@@ -25904,6 +25979,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     // state so an edited route gets a clean recovery context.
     function resetRecoveryContext(reason = "route changed") {
         failedRecoveryTiles.clear();
+        state.autoTransitionAttempt=null;
+        state.autoTransitionFailure=null;
         state.recoveryDestinationWatch=null;
         clearPostScriptHandoff(reason);
         // Manual jumps/route edits supersede any logical branch segment.
@@ -29175,35 +29252,17 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         return things.some(t => t?.id !== undefined && holeItemIds.has(t.id));
     }
     function isRopeSpotTile(tile) {
-        if (!tile)
+        if (!tile) return false;
+        const things=getTileThings(tile);
+        // Automatic roping needs explicit rope-spot evidence. Multi-use only
+        // describes how an object is used; it does not make it a rope target.
+        // A downward floorchange always wins over a name on a stacked item.
+        if (things.some(thing=>String(getThingDefinition(thing.id)?.properties?.floorchange || "").toLowerCase()==="down"))
             return false;
-
-        // Prefer the explicit definition/name when available.
-        if (tileHasNamedThing(tile, "rope spot"))
-            return true;
-
-        // Some Minibia rope spots do not expose the literal name through the
-        // client definition table. The native client still recognises them as
-        // non-pickupable multi-use world objects (see its double-tap/use path).
-        // Reuse that behavioural signal so Auto Transitions sees the same rope
-        // targets a player can actually use with a rope.
-        return getTileThings(tile).some(thing => {
-            if (!thing)
-                return false;
-            const name = getThingName(thing);
-            if (name && /\brope\b/i.test(name))
-                return true;
-            try {
-                const multiUse = typeof thing.isMultiUse === "function" && thing.isMultiUse();
-                const pickupable = typeof thing.isPickupable === "function" && thing.isPickupable();
-                if (multiUse && !pickupable)
-                    return true;
-            } catch (e) {}
-            return false;
-        });
+        return things.some(thing=>/\brope[ -]+spot\b/.test(getThingName(thing)));
     }
     function isRopeTargetTile(tile) {
-        return isHoleTile(tile) || isRopeSpotTile(tile);
+        return isRopeSpotTile(tile);
     }
 
     function isShovelTargetThing(thing) {
@@ -29248,6 +29307,12 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
         const goingDown = waypoint.z > position.z;
         const goingUp = waypoint.z < position.z;
+
+        // Never select a downward hole/stair while looking for a way UP.
+        // Apply this before rope-name and native step-on fallbacks.
+        if (goingUp && getTileThings(tile).some(thing=>
+            String(getThingDefinition(thing.id)?.properties?.floorchange || "").toLowerCase()==="down"))
+            return false;
 
         // Direction-specific tool targets must be checked before generic
         // floor-change classification. Rope spots are often usable multi-use
@@ -31796,7 +31861,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             }
             if(Number(reading.count)<=0)return false;
             if(typeof HotbarUsePacket!=='function'||!client?.send)return false;
-            client.send(new HotbarUsePacket(cid,0,3,0,targetPosition));return true;
+            return client.send(new HotbarUsePacket(cid,0,3,0,targetPosition))!==false;
         }
         if(!tool||!targetTile)return false;
         const source={which:tool.which,index:tool.index},target={which:targetTile,index:0xFF};
@@ -32002,8 +32067,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         // Allow use if on the same tile OR adjacent
         if (!isSameTile(playerPos, targetPosition) && !isAdjacentTile(playerPos, targetPosition)) {
             const adj = findAdjacentWalkablePosition(targetPosition, playerPos);
-            if (adj)
-                return goToPosition(adj);
+            return adj ? goToPosition(adj) : false;
         }
         if(!sendToolUse(tool,targetTile,targetPosition,now))return false;
         state.lastStairsUseAt = now;
@@ -32033,6 +32097,11 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             return false;
         if (now - state.lastStairsUseAt < 1200)
             return true;
+
+        // Learned entries also pass through here and may contain an old,
+        // incorrect hole/rope classification. Revalidate the live tile before
+        // any automatic use or walk onto a transition in the wrong direction.
+        if (!isTransitionCandidateTile(targetTile,waypoint,position)) return false;
 
         if (waypoint?.z < position.z && isRopeTargetTile(targetTile)) {
             return useRopeOnTile(targetTile, targetPos, now);
@@ -32084,6 +32153,48 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         );
     }
 
+    function noteAutoTransitionUse(source,waypoint,now) {
+        const position=normalizePosition(bot.getPlayerPosition());
+        if (!position) return;
+        const key=`${state.currentIndex}:${position.z}>${waypoint.z}`;
+        let attempt=state.autoTransitionAttempt;
+        if (!attempt || attempt.key!==key) {
+            attempt={key,index:state.currentIndex,fromZ:position.z,targetZ:waypoint.z,
+                startedAt:now,lastActionAt:now,attempts:0,source:null};
+            state.autoTransitionAttempt=attempt;
+        }
+        attempt.source=normalizePosition(source);
+        attempt.lastActionAt=now;
+        attempt.attempts++;
+    }
+    function confirmAutoTransitionFloor(position) {
+        const attempt=state.autoTransitionAttempt;
+        if (!attempt || !position || position.z===attempt.fromZ) return false;
+        state.autoTransitionAttempt=null;
+        state.autoTransitionFailure=null;
+        bot.log("Cave: Auto Transitions observed floor change", {
+            source:attempt.source,fromZ:attempt.fromZ,toZ:position.z,targetZ:attempt.targetZ
+        });
+        return true;
+    }
+    function waitForAutoTransition(waypoint,position,now) {
+        if (confirmAutoTransitionFloor(position)) return false;
+        const attempt=state.autoTransitionAttempt;
+        if (!attempt) return false;
+        if (config.autoTransitions!==true || attempt.index!==state.currentIndex || attempt.targetZ!==waypoint.z) {
+            state.autoTransitionAttempt=null;return false;
+        }
+        // A sent tool command is not a successful transition. Wait for the
+        // server, then allow at most three actual uses on this floor/waypoint.
+        if (now-attempt.lastActionAt<2000) return true;
+        if (attempt.attempts<3) return false;
+        state.autoTransitionFailure={...attempt,source:attempt.source?{...attempt.source}:null,at:now,player:{...position}};
+        bot.log("Cave: Auto Transitions failed — 3 uses without a floor change; stopping CaveBot",state.autoTransitionFailure);
+        haltCaveNavigationForSafety();
+        try { bot.notify?.server?.("CaveBot stopped: automatic floor transition failed. Check the rope spot or use a manual transition waypoint.","red"); } catch (error) {}
+        return true;
+    }
+
     function handleFloorChange(waypoint, now = Date.now()) {
         if (config.autoTransitions !== true)
             return false;
@@ -32091,6 +32202,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         const position = normalizePosition(bot.getPlayerPosition());
         if (!position || !waypoint || position.z === waypoint.z)
             return false;
+
+        if (waitForAutoTransition(waypoint,position,now)) return true;
 
         // First prefer a local visible transition. This is intentionally bounded
         // by autoTransitionRadius to avoid selecting unrelated city stairs.
@@ -32106,11 +32219,12 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             const moved = useFloorChangeTile(visible, waypoint, now);
             if (moved) {
                 if (state.lastStairsUseAt !== beforeUseAt) {
+                    noteAutoTransitionUse(visible.position,waypoint,now);
                     const key = `${visible.position.x},${visible.position.y},${visible.position.z}->${waypoint.z}`;
                     if (state.lastAutoProbeKey !== key || now - state.lastAutoProbeLogAt > 1500) {
                         state.lastAutoProbeKey = key;
                         state.lastAutoProbeLogAt = now;
-                        bot.log("cave auto transition used", {
+                        bot.log("cave auto transition command sent", {
                             tileX: visible.position.x,
                             tileY: visible.position.y,
                             tileZ: visible.position.z,
@@ -32132,11 +32246,12 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 const moved = useFloorChangeTile(ropeTarget, waypoint, now);
                 if (moved) {
                     if (state.lastStairsUseAt !== beforeUseAt) {
+                        noteAutoTransitionUse(ropeTarget.position,waypoint,now);
                         const key = `${ropeTarget.position.x},${ropeTarget.position.y},${ropeTarget.position.z}->${waypoint.z}`;
                         if (state.lastAutoProbeKey !== key || now - state.lastAutoProbeLogAt > 1500) {
                             state.lastAutoProbeKey = key;
                             state.lastAutoProbeLogAt = now;
-                            bot.log("cave auto transition rope target", {
+                            bot.log("cave auto transition rope command sent", {
                                 tileX: ropeTarget.position.x,
                                 tileY: ropeTarget.position.y,
                                 tileZ: ropeTarget.position.z,
@@ -32168,10 +32283,11 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             const moved = useFloorChangeTile(target, waypoint, now);
             if (moved) {
                 if (state.lastStairsUseAt !== beforeUseAt) {
+                    noteAutoTransitionUse(known.from,waypoint,now);
                     const key = `${getPositionKey(known.from)}->${getPositionKey(known.to)}`;
                     if (state.lastTransitionLogKey !== key) {
                         state.lastTransitionLogKey = key;
-                        bot.log("cave using learned floor transition", {
+                        bot.log("cave learned floor transition command sent", {
                             from: known.from,
                             to: known.to,
                             waypoint
@@ -34087,6 +34203,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             scheduleNextTick();
             return;
         }
+        confirmAutoTransitionFloor(livePosition);
         if (state.positionUnavailable) {
             const now = Date.now();
             state.positionUnavailable = false;
@@ -36959,6 +37076,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             return false;
         }
         Object.assign(config, overrides, { enabled: true });
+        state.autoTransitionAttempt=null;
+        state.autoTransitionFailure=null;
         config.tickMs = 500;
         persistConfig();
         const pos = normalizePosition(bot.getPlayerPosition());
@@ -37182,6 +37301,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     function stop(options = {}) {
         const shouldPersist = options.persistEnabled !== false;
         state.recoveryDestinationWatch=null;
+        state.autoTransitionAttempt=null;
         state.running = false;
         detachCaveEvents();
         bot.stopScriptFollowForCaveNavigation?.();
@@ -37679,6 +37799,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         );
 
         config.autoTransitions = config.autoTransitions === true;
+        if (!config.autoTransitions) state.autoTransitionAttempt=null;
         config.autoTransitionRadius = Math.max(2, Math.min(8,
             Math.trunc(Number(config.autoTransitionRadius) || 6)));
         config.tickMs = 500;
@@ -37959,6 +38080,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             version: bot.version, running: state.running, waypoint: state.currentIndex + 1,
             from, goal: goal ? cloneValue(goal) : null,
             ignoreFields: config.ignoreFields, tolerance: config.waypointTolerance,
+            autoTransitionAttempt: state.autoTransitionAttempt ? cloneValue(state.autoTransitionAttempt) : null,
+            autoTransitionFailure: state.autoTransitionFailure ? cloneValue(state.autoTransitionFailure) : null,
             pausedForCombat: state.pausedForCombat, externalPauses: Array.from(state.externalPauseReasons || []),
             playerMoving: client?.player?.isMoving?.() === true,
             pendingPredictions: client?.player?.__preWalks?.length || 0,
@@ -58175,11 +58298,17 @@ function upgradeSectionHeaders(panel) {
 #minibia-bot-panel .mb-tools-pickup-radius input {width:56px;min-width:0;padding:3px 5px;}
 #minibia-bot-panel .mb-tools-pickup-fold {border-top:1px solid rgba(255,255,255,.08);margin-top:7px;padding-top:5px;}
 #minibia-bot-panel .mb-tools-pickup-fold > summary {cursor:pointer;font-size:11px;line-height:1.5;color:var(--mb-hub-text-2);}
-#minibia-bot-panel .mb-tools-pickup-ignore {display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:6px;}
-#minibia-bot-panel .mb-tools-pickup-ignore .mb-field {margin:0;min-width:0;}
-#minibia-bot-panel .mb-tools-pickup-ignore input {min-width:0;padding:4px 6px;}
-#minibia-bot-panel .mb-tools-pickup-footer {display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:6px;}
-#minibia-bot-panel .mb-tools-pickup-footer .mb-small-note {flex:1;min-width:160px;}
+#minibia-bot-panel .mb-pickup-ignore-add {display:flex;align-items:center;gap:5px;margin-top:6px;}
+#minibia-bot-panel .mb-pickup-ignore-add input {flex:1;width:0;min-width:0;padding:4px 6px;}
+#minibia-bot-panel .mb-pickup-ignore-add .mb-tools-picker {width:26px;min-width:26px;padding:3px;}
+#minibia-bot-panel .mb-pickup-ignore-list {display:flex;flex-direction:column;gap:4px;max-height:112px;overflow:auto;margin-top:6px;}
+#minibia-bot-panel .mb-pickup-ignore-entry {display:flex;align-items:center;gap:6px;padding:3px 6px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:4px;font-size:11px;}
+#minibia-bot-panel .mb-pickup-ignore-entry > span {flex:1;min-width:0;overflow-wrap:anywhere;}
+#minibia-bot-panel .mb-pickup-ignore-entry button {padding:0 5px;line-height:18px;}
+#minibia-bot-panel .mb-pickup-ignore-status {margin-top:5px;}
+#minibia-bot-panel .mb-pickup-ignore-status:empty {display:none;}
+#minibia-bot-panel .mb-pickup-ignore-status[data-error="true"] {color:#ffaaaa;}
+
 
 `;
         document.head.appendChild(style);
@@ -58570,13 +58699,16 @@ function upgradeSectionHeaders(panel) {
       <label class="mb-tools-pickup-radius"><span>Radius (tiles)</span><input type="number" id="minibia-bot-auto-pickup-radius" min="1" max="3" value="2"></label>
       <span class="mb-small-note" id="minibia-bot-auto-pickup-status" aria-live="polite">Off</span>
     </div>
-    <details class="mb-tools-pickup-fold">
-      <summary>Ignored items</summary>
-      <div class="mb-tools-pickup-ignore">
-        <label class="mb-field"><span class="mb-field-label">Item IDs</span><input type="text" id="minibia-bot-auto-pickup-ignore-ids" placeholder="1234, 5678"></label>
-        <label class="mb-field"><span class="mb-field-label">Item names</span><input type="text" id="minibia-bot-auto-pickup-ignore-names" placeholder="Dirt, Sand, Rubbish"></label>
+    <details class="mb-tools-pickup-fold" data-pickup-ignore open>
+      <summary>Ignored items<span data-pickup-ignore-count></span></summary>
+      <div class="mb-pickup-ignore-add">
+        <input type="text" data-pickup-ignore-input list="minibia-bot-pickup-ignore-choices" placeholder="Item name or ID" aria-label="Item to ignore" autocomplete="off">
+        <datalist id="minibia-bot-pickup-ignore-choices" data-pickup-ignore-choices></datalist>
+        <button type="button" class="mb-small-button mb-tools-picker" data-pickup-ignore-pick aria-pressed="false" aria-label="Pick an item to ignore" title="Click, then click an item in a backpack, equipment slot or on the ground">🔍</button>
+        <button type="button" class="mb-small-button" data-pickup-ignore-add>Add</button>
       </div>
-      <div class="mb-tools-pickup-footer"><button type="button" class="mb-small-button" id="minibia-bot-auto-pickup-save-blacklist">Save Blacklist</button><span class="mb-small-note">Comma-separated. Names match part of the item name.</span></div>
+      <div class="mb-pickup-ignore-list" data-pickup-ignore-list></div>
+      <div class="mb-small-note mb-pickup-ignore-status" data-pickup-ignore-status aria-live="polite"></div>
     </details>
   </div>
 
@@ -59941,68 +60073,8 @@ function upgradeSectionHeaders(panel) {
             });
         }
 
-        // ---- AutoPickup blacklist UI ----
-        const pickupIgnoreIds = document.getElementById("minibia-bot-auto-pickup-ignore-ids");
-        const pickupIgnoreNames = document.getElementById("minibia-bot-auto-pickup-ignore-names");
-        const pickupSaveBlacklist = document.getElementById("minibia-bot-auto-pickup-save-blacklist");
-
-        function refreshAutoPickupBlacklist() {
-            const status = bot.autoPickup?.status?.();
-            if (!status)
-                return;
-            const cfg = status.config;
-            if (pickupIgnoreIds && document.activeElement !== pickupIgnoreIds) {
-                pickupIgnoreIds.value = (cfg.ignoredItemIds || []).join(", ");
-            }
-            if (pickupIgnoreNames && document.activeElement !== pickupIgnoreNames) {
-                pickupIgnoreNames.value = (cfg.ignoredItemNames || []).join(", ");
-            }
-        }
-
-        function saveAutoPickupBlacklist() {
-            const ids = pickupIgnoreIds?.value?.split(",")
-                .map(s => s.trim())
-                .filter(Boolean)
-                .map(Number)
-                .filter(Number.isFinite) || [];
-            const names = pickupIgnoreNames?.value?.split(",")
-                .map(s => s.trim())
-                .filter(Boolean) || [];
-            bot.autoPickup.updateConfig({
-                ignoredItemIds: ids,
-                ignoredItemNames: names,
-            });
-            refreshAutoPickupBlacklist();
-            bot.log("[AutoPickup] Blacklist saved", {
-                ids,
-                names
-            });
-        }
-
-        if (pickupSaveBlacklist) {
-            pickupSaveBlacklist.addEventListener("click", saveAutoPickupBlacklist);
-        }
-        if (pickupIgnoreIds) {
-            pickupIgnoreIds.addEventListener("blur", saveAutoPickupBlacklist);
-            pickupIgnoreIds.addEventListener("keydown", function (e) {
-                if (e.key === "Enter") {
-                    e.preventDefault();
-                    saveAutoPickupBlacklist();
-                }
-            });
-        }
-        if (pickupIgnoreNames) {
-            pickupIgnoreNames.addEventListener("blur", saveAutoPickupBlacklist);
-            pickupIgnoreNames.addEventListener("keydown", function (e) {
-                if (e.key === "Enter") {
-                    e.preventDefault();
-                    saveAutoPickupBlacklist();
-                }
-            });
-        }
-
-        // Initial sync
-        setTimeout(refreshAutoPickupBlacklist, 100);
+        // ---- AutoPickup ignore list: per-item edits save immediately. ----
+        bot.autoPickup?.mountIgnoreList?.(panel);
 
         const autoPickupToggle = document.getElementById("minibia-bot-auto-pickup-enabled");
         const autoPickupRadius = document.getElementById("minibia-bot-auto-pickup-radius");
@@ -66357,10 +66429,79 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
         delayMs: 0, // retired: process item-add events without an artificial wait
         walkTimeoutMs: 5000, // give up walking after this long
         ignoredItemIds: [], // array of item client IDs (CID) to ignore
-        ignoredItemNames: [], // array of item name substrings to ignore (case-insensitive)
+        ignoredItemNames: [], // legacy exact-name entries, case-insensitive
+        ignoredItems: [], // selected items, with exact server identity
     }, bot.storage.get(configStorageKey, {}));
     // Carry over radius and ignored items; retire delay values in old saves.
     config.cooldownMs = config.delayMs = 0;
+
+    const itemIdNumber = value => (typeof value === "number" || (typeof value === "string" && /^\d+$/.test(value.trim()))) && Number.isInteger(Number(value)) && Number(value) > 0 && Number(value) <= 65535 ? Number(value) : null;
+    const ignoreName = value => typeof value === "string" ? value.trim().replace(/\s+/g, " ").toLowerCase() : "";
+    const ignoreValues = value => Array.isArray(value) ? value : typeof value === "string" ? value.split(/[,;\n]/) : [];
+    const ignoredItemKey = item => `${item.sid ? `sid:${item.sid}` : `cid:${item.id}`}:${item.fluidType == null ? "all" : item.fluidType}`;
+    function normalizeIgnoredItem(value) {
+        if (!value || typeof value !== "object") return null;
+        const sid = itemIdNumber(value.sid), id = itemIdNumber(value.id);
+        if (!sid && !id) return null;
+        const fluidType = value.fluidType == null ? null : Number(value.fluidType);
+        if (fluidType !== null && (!Number.isInteger(fluidType) || fluidType < 0 || fluidType > 255)) return null;
+        return { sid, id, fluidType, name: typeof value.name === "string" ? value.name.trim().slice(0, 160) : "" };
+    }
+    function normalizeIgnoreConfig() {
+        config.ignoredItemIds = [...new Set(ignoreValues(config.ignoredItemIds).map(itemIdNumber).filter(Boolean))];
+        config.ignoredItemNames = [...new Set(ignoreValues(config.ignoredItemNames).map(ignoreName).filter(Boolean))];
+        const items = new Map();
+        for (const value of Array.isArray(config.ignoredItems) ? config.ignoredItems : []) {
+            const item = normalizeIgnoredItem(value);
+            if (item) items.set(ignoredItemKey(item), item);
+        }
+        config.ignoredItems = [...items.values()];
+    }
+    normalizeIgnoreConfig();
+
+    function pickupItemName(item) {
+        const client = window.gameClient;
+        return (client?.itemDefinitionsBySid?.[item?.sid] || client?.itemDefinitionsByCid?.[item?.id])?.properties?.name || item?.name || "";
+    }
+    function getIgnoredItems() {
+        const client = window.gameClient;
+        return [
+            ...config.ignoredItems.map(item => ({ ...item, key: `item:${ignoredItemKey(item)}`,
+                name: item.name || pickupItemName(item) || `Item ${item.sid || item.id}` })),
+            ...config.ignoredItemIds.map(id => ({ key: `cid:${id}`, id, name: client?.itemDefinitionsByCid?.[id]?.properties?.name || `Item ${id}` })),
+            ...config.ignoredItemNames.map(name => ({ key: `name:${name}`, name }))
+        ];
+    }
+    function addIgnoredItem(value) {
+        const item = normalizeIgnoredItem(value);
+        if (!item) return false;
+        const key = ignoredItemKey(item);
+        if (config.ignoredItems.some(entry => ignoredItemKey(entry) === key)) return false;
+        config.ignoredItems.push(item);
+        persistConfig();
+        return true;
+    }
+    function removeIgnoredItem(key) {
+        if (typeof key !== "string") return false;
+        const before = getIgnoredItems().length;
+        config.ignoredItems = config.ignoredItems.filter(item => `item:${ignoredItemKey(item)}` !== key);
+        config.ignoredItemIds = config.ignoredItemIds.filter(id => `cid:${id}` !== key);
+        config.ignoredItemNames = config.ignoredItemNames.filter(name => `name:${name}` !== key);
+        if (getIgnoredItems().length === before) return false;
+        persistConfig();
+        return true;
+    }
+
+    // Legacy names are exact matches now. Empty/malformed saved entries can
+    // never match every drop or throw out of the client's item-add handler.
+    function isItemIgnored(itemId, itemName, itemSid = null, fluidType = null) {
+        const id = itemIdNumber(itemId), sid = itemIdNumber(itemSid), name = ignoreName(itemName);
+        if (id && config.ignoredItemIds.includes(id)) return true;
+        if (name && config.ignoredItemNames.some(pattern => ignoreName(pattern) === name)) return true;
+        return config.ignoredItems.some(item =>
+            (item.sid ? sid === item.sid : id === item.id) &&
+            (item.fluidType == null || item.fluidType === (Number(fluidType) || 0)));
+    }
 
     function persistConfig() {
         bot.storage.set(configStorageKey, {
@@ -66371,6 +66512,7 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
             walkTimeoutMs: config.walkTimeoutMs,
             ignoredItemIds: config.ignoredItemIds,
             ignoredItemNames: config.ignoredItemNames,
+            ignoredItems: config.ignoredItems,
         });
     }
 
@@ -66383,24 +66525,6 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
             return tile.items[tile.items.length - 1];
         }
         return null;
-    }
-
-    // ---- Blacklist check ----
-    function isItemIgnored(itemId, itemName) {
-        // Check by ID
-        if (config.ignoredItemIds.includes(itemId)) {
-            return true;
-        }
-        // Check by name (case-insensitive substring match)
-        if (itemName) {
-            const lowerName = itemName.toLowerCase();
-            for (const pattern of config.ignoredItemNames) {
-                if (lowerName.includes(pattern.toLowerCase())) {
-                    return true;
-                }
-            }
-        }
-        return false;
     }
 
     // ---- Core pickup logic with walk and pause ----
@@ -66420,9 +66544,8 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
         }
 
         // Extra safety: re-check blacklist just before picking up
-        const def = gameClient.itemDefinitionsByCid?.[topItem.id];
-        const name = def?.properties?.name || "";
-        if (isItemIgnored(topItem.id, name)) {
+        const name = pickupItemName(topItem);
+        if (isItemIgnored(topItem.id, name, topItem.sid, topItem.fluidType)) {
             bot.log(`[AutoPickup] Skipping blacklisted item ${topItem.id} (${name})`);
             if (callback)
                 callback(false);
@@ -66601,9 +66724,8 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
 
             // ---- BLACKLIST CHECK (early) ----
             const itemId = packet.id;
-            const def = gameClient.itemDefinitionsByCid?.[itemId];
-            const name = def?.properties?.name || "";
-            if (isItemIgnored(itemId, name)) {
+            const name = pickupItemName(packet);
+            if (isItemIgnored(itemId, name, packet.sid, packet.fluidType)) {
                 bot.log(`[AutoPickup] Ignoring blacklisted item ${itemId} (${name}) at ${pos.x},${pos.y},${pos.z}`);
                 return result;
             }
@@ -66629,9 +66751,8 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
                         abandon();
                         return;
                     }
-                    const def2 = gameClient.itemDefinitionsByCid?.[topItem.id];
-                    const name2 = def2?.properties?.name || "";
-                    if (isItemIgnored(topItem.id, name2)) {
+                    const name2 = pickupItemName(topItem);
+                    if (isItemIgnored(topItem.id, name2, topItem.sid, topItem.fluidType)) {
                         abandon();
                         return;
                     }
@@ -66677,6 +66798,7 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
         Object.assign(config, overrides, {
             enabled: true, cooldownMs: 0, delayMs: 0
         });
+        normalizeIgnoreConfig();
         persistConfig();
         if (state.running) {
             bot.log("[AutoPickup] already running");
@@ -66727,17 +66849,8 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
     }
 
     function updateConfig(next = {}) {
-        if (next.ignoredItemIds !== undefined) {
-            next.ignoredItemIds = Array.isArray(next.ignoredItemIds)
-                 ? next.ignoredItemIds.map(id => Number(id)).filter(Number.isFinite)
-                 : [];
-        }
-        if (next.ignoredItemNames !== undefined) {
-            next.ignoredItemNames = Array.isArray(next.ignoredItemNames)
-                 ? next.ignoredItemNames.map(s => String(s).trim()).filter(Boolean)
-                 : [];
-        }
         Object.assign(config, next);
+        normalizeIgnoreConfig();
         if (config.radius < 1)
             config.radius = 1;
         config.cooldownMs = config.delayMs = 0;
@@ -66751,6 +66864,108 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
         return {
             ...config
         };
+    }
+
+    function mountIgnoreList(panel) {
+        const section = panel?.querySelector("[data-pickup-ignore]");
+        if (!section || section.dataset.bound) return;
+        section.dataset.bound = "true";
+        const q = name => section.querySelector(`[data-pickup-ignore-${name}]`);
+        const input = q("input"), pick = q("pick"), addButton = q("add"), list = q("list"), choices = q("choices"), status = q("status"), count = q("count");
+        let capturing = false, timer = null;
+        const bindings = [];
+        const bind = (el, event, fn) => { el?.addEventListener(event, fn); bindings.push(() => el?.removeEventListener(event, fn)); };
+        const message = (text, error = false) => { status.textContent = text; status.dataset.error = String(error); };
+        function render() {
+            list.replaceChildren();
+            const entries = getIgnoredItems();
+            count.textContent = entries.length ? ` (${entries.length})` : "";
+            if (!entries.length) {
+                const empty = document.createElement("span"); empty.className = "mb-small-note";
+                empty.textContent = "No ignored items"; list.appendChild(empty);
+            }
+            for (const entry of entries) {
+                const row = document.createElement("div"); row.className = "mb-pickup-ignore-entry";
+                const name = document.createElement("span"); name.textContent = entry.name;
+                name.title = entry.sid ? `SID ${entry.sid} · ID ${entry.id || "unknown"}` : entry.id ? `ID ${entry.id}` : "Exact item name";
+                const remove = document.createElement("button"); remove.type = "button";
+                remove.className = "mb-small-button"; remove.textContent = "×";
+                remove.title = `Remove ${entry.name}`; remove.setAttribute("aria-label", remove.title);
+                remove.dataset.ignoreKey = entry.key;
+                row.appendChild(name); row.appendChild(remove); list.appendChild(row);
+            }
+        }
+        function suggestions() {
+            choices.replaceChildren();
+            for (const item of bot.itemAlertItems?.suggestions?.(input.value) || []) {
+                const option = document.createElement("option"); option.value = item.choice; choices.appendChild(option);
+            }
+        }
+        function cancelCapture() {
+            capturing = false;
+            if (timer !== null) clearTimeout(timer);
+            timer = null;
+            document.removeEventListener("click", captureClick, true);
+            document.removeEventListener("keydown", captureKey, true);
+            pick.setAttribute("aria-pressed", "false");
+        }
+        function add(item) {
+            const added = addIgnoredItem(item);
+            message(added ? `Ignoring ${item.name || "item"}` : "That item is already ignored.");
+            input.value = ""; cancelCapture(); render();
+        }
+        function addTyped() {
+            const value = input.value.trim();
+            if (!value) { message("Choose an item or use the magnifying glass.", true); return; }
+            if (/^\d+$/.test(value)) {
+                const id = itemIdNumber(value);
+                if (!id) { message("Enter a valid item ID.", true); return; }
+                const candidates = (bot.itemAlertItems?.catalog?.() || []).filter(item => item.id === id && !item.fluidType);
+                if (candidates.length > 1) { message("Several items share that ID. Choose its name or pick the item.", true); return; }
+                if (candidates.length === 1) add({ ...candidates[0], fluidType: null });
+                else add({ id, name: pickupItemName({ id }) || `Item ${id}` });
+                return;
+            }
+            const result = bot.itemAlertItems?.resolve?.(value);
+            if (!result?.item) { message(result?.error || "Item names are loading. Try the picker.", true); return; }
+            add(result.item);
+        }
+        function captureClick(event) {
+            if (!capturing) return;
+            if (panel.contains(event.target)) {
+                if (!section.contains(event.target)) { cancelCapture(); message("Selection cancelled."); }
+                return;
+            }
+            let item;
+            try { item = bot.itemAlertItems?.fromItem?.(bot.itemAlertItems?.captureItem?.(event)); }
+            catch (error) { message("Could not read that item. Try another slot.", true); return; }
+            if (!item) { message("Click an item in a backpack, equipment slot or on the ground.", true); return; }
+            event.preventDefault(); event.stopImmediatePropagation(); add(item);
+        }
+        function captureKey(event) {
+            if (event.key !== "Escape") return;
+            event.preventDefault(); event.stopImmediatePropagation(); cancelCapture(); message("Selection cancelled.");
+        }
+        bind(pick, "click", () => {
+            if (capturing) { cancelCapture(); message("Selection cancelled."); return; }
+            bot.itemAlertItems?.cancelCapture?.(); bot.itemDropper?.cancelCapture?.();
+            bot.looter?.clearCaptureMode?.(); bot.equipRing?.clearCaptureMode?.(); bot.bootsSwapper?.clearCaptureMode?.();
+            capturing = true; pick.setAttribute("aria-pressed", "true");
+            message("Click an item to ignore. Escape cancels.");
+            document.addEventListener("click", captureClick, true);
+            document.addEventListener("keydown", captureKey, true);
+            timer = setTimeout(() => { cancelCapture(); message("Item selection timed out."); }, 20000);
+        });
+        bind(addButton, "click", addTyped);
+        bind(input, "focus", suggestions);
+        bind(input, "input", () => { cancelCapture(); message(""); suggestions(); });
+        bind(input, "keydown", event => { if (event.key === "Enter") { event.preventDefault(); addTyped(); } });
+        bind(list, "click", event => {
+            const button = event.target?.closest?.("[data-ignore-key]");
+            if (button && list.contains(button) && removeIgnoredItem(button.dataset.ignoreKey)) { render(); message("Item removed."); }
+        });
+        render();
+        bot.addCleanup(() => { cancelCapture(); bindings.forEach(unbind => unbind()); });
     }
 
     if (config.enabled) {
@@ -66767,6 +66982,7 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
         status,
         isBusy: () => state.pickupInProgress,
         updateConfig,
+        getIgnoredItems, addIgnoredItem, removeIgnoredItem, mountIgnoreList,
         config,
     };
 };
