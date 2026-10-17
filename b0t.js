@@ -3414,7 +3414,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.237",
+        version: "1.6.239",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -9380,6 +9380,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         enabled: false,
         preferredTargetNames: [],
         preferredMatchMode: "exact",
+        targetPriorityNames: [],
+        targetPriorityMatchMode: "exact",
         ignoredTargetNames: [],
         antiKSEnabled: true,
         antiKSSelfRange: 2,
@@ -9485,6 +9487,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         fastReacquireMs: 150,
     },
             storedConfig);
+    config.targetPriorityNames = normalizeTargetPriorityNames(config.targetPriorityNames);
+    config.targetPriorityMatchMode = config.targetPriorityMatchMode === "includes" ? "includes" : "exact";
     if (config.targetHotbarSlot == null && storedConfig.hotbarSlot != null) {
         config.targetHotbarSlot = storedConfig.hotbarSlot;
     }
@@ -10261,6 +10265,34 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         );
 
         return true;
+    }
+
+    function normalizeTargetPriorityNames(value) {
+        const seen = new Set();
+        return (Array.isArray(value) ? value : []).map(n => String(n ?? "").trim().slice(0, 64))
+            .filter(name => {
+                const key = normalizeCreatureName(name);
+                if (!key || seen.has(key)) return false;
+                seen.add(key);
+                return true;
+            }).slice(0, 100);
+    }
+
+    function getTargetPriorityRank(creature) {
+        const names = config.targetPriorityNames;
+        if (!names.length) return 0;
+        const name = normalizeCreatureName(creature?.name);
+        const index = names.findIndex(value => {
+            const entry = normalizeCreatureName(value);
+            return name === entry || (config.targetPriorityMatchMode === "includes" && name.includes(entry));
+        });
+        // Explicit attack order comes first. Preserve the existing preferred
+        // tier and ordinary targeting among monsters absent from the list.
+        return index >= 0 ? index : names.length + (isPreferredCreature(creature) ? 0 : 1);
+    }
+
+    function compareTargetPriority(a, b) {
+        return getTargetPriorityRank(a) - getTargetPriorityRank(b);
     }
 
     function getPreferredTargetNames() {
@@ -12978,7 +13010,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                         !preferredBestApproach?.reachable
                             ? probePreferredCreatureBlock(best, now)
                             : null;
+                    const priorityDifference = compareTargetPriority(best, current);
+                    const priorityUpgrade = priorityDifference < 0;
                     const preferredUpgrade =
+                        priorityDifference === 0 &&
                         !state.preferredAccessBlocked &&
                         bestInfo.preferred &&
                         !currentInfo.preferred &&
@@ -13100,8 +13135,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                         bestScoreInfo.samples >= minSamples;
 
                     const clearlyBetter =
-                        sampleReady &&
-                        scoreAdvantage >= scoreThreshold;
+                        priorityUpgrade || (priorityDifference === 0 && sampleReady && scoreAdvantage >= scoreThreshold);
 
                     state.lastRetargetRawAdvantage =
                         rawScoreAdvantage;
@@ -13167,7 +13201,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                     // bounce between preferred mobs as their routes change.
                     // Dead, invalid, unreachable and stuck handoffs above
                     // still release this target when needed.
-                    const preferredTargetProtected = currentInfo.preferred;
+                    const preferredTargetProtected = currentInfo.preferred && !priorityUpgrade;
                     const manualTargetProtected = isManualTargetProtected(current, now);
                     if (preferredTargetProtected) resetRetargetCandidate();
 
@@ -13193,6 +13227,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                     if (!manualTargetProtected && (preferredUpgrade || (ordinaryRetargetReady && clearlyBetter))) {
                         const reason = preferredUpgrade
                             ? "switching to preferred target"
+                            : priorityUpgrade
+                                ? "switching to higher attack priority"
                             : (config.meleeMode && !config.kiteMode
                                 ? "switching to better approach route"
                                 : "switching to clearly closer target");
@@ -13437,6 +13473,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
     function sortMonstersByPriority(monsters) {
         return [...monsters].sort((a, b) => {
+            const priority = compareTargetPriority(a, b);
+            if (priority) return priority;
             const sa = getCreaturePriorityScore(a);
             const sb = getCreaturePriorityScore(b);
             if (sa !== sb)
@@ -14333,6 +14371,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 const bVisible = visibleCandidates.has(b) ? 1 : 0;
                 if (aVisible !== bVisible)
                     return bVisible - aVisible;
+                const priority = compareTargetPriority(a, b);
+                if (priority) return priority;
                 const aPreferred = isPreferredCreature(a) ? 1 : 0;
                 const bPreferred = isPreferredCreature(b) ? 1 : 0;
                 if (aPreferred !== bPreferred)
@@ -15023,6 +15063,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 return true;
             })
             .sort((a, b) => {
+                const priority = compareTargetPriority(a, b);
+                if (priority) return priority;
                 const ap = normalizePosition(
                     a.getPosition?.() || a.__position
                 );
@@ -16774,6 +16816,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         }
 
         tracked.sort((a, b) => {
+            const priority = compareTargetPriority(a.creature, b.creature);
+            if (priority) return priority;
             if (a.distance !== b.distance)
                 return a.distance - b.distance;
             return Number(a.creature?.id || 0) - Number(b.creature?.id || 0);
@@ -16848,6 +16892,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 score: getCreatureSelectionScore(monster)
             }))
             .sort((a, b) => {
+                const priority = compareTargetPriority(a.monster, b.monster);
+                if (priority) return priority;
                 if (a.score !== b.score)
                     return a.score - b.score;
                 return Number(a.monster?.id || 0) - Number(b.monster?.id || 0);
@@ -18099,6 +18145,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
         if (!config.lureSmartTargeting) {
             return candidates.sort((a, b) => {
+                const priority = compareTargetPriority(a, b);
+                if (priority) return priority;
                 const da = getCreatureDistanceFromPlayer(a);
                 const db = getCreatureDistanceFromPlayer(b);
                 if (da !== db)
@@ -18151,6 +18199,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 healthPct,
                 trailing,
                 leashMob,
+                forcedLastMob,
                 score:
                     forcedLastMob
                         ? -100000
@@ -18165,6 +18214,9 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         });
 
         scored.sort((a, b) => {
+            if (a.forcedLastMob !== b.forcedLastMob) return a.forcedLastMob ? -1 : 1;
+            const priority = compareTargetPriority(a.monster, b.monster);
+            if (priority) return priority;
             if (a.score !== b.score)
                 return a.score - b.score;
             const ah = Number.isFinite(a.healthPct) ? a.healthPct : -1;
@@ -20605,6 +20657,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
         const candidates = scoredCandidates
         .sort((left, right) => {
+            const priority = compareTargetPriority(left.monster, right.monster);
+            if (priority) return priority;
             const ruleDiff = (bot.combatRules?.targetPriority?.(left.monster) ?? 0) -
                 (bot.combatRules?.targetPriority?.(right.monster) ?? 0);
             if (ruleDiff) return ruleDiff;
@@ -22422,6 +22476,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             }
         );
 
+        config.targetPriorityNames = normalizeTargetPriorityNames(config.targetPriorityNames);
+        config.targetPriorityMatchMode = config.targetPriorityMatchMode === "includes" ? "includes" : "exact";
         if (config.kiteMode)
             config.useClientChase = false;
 
@@ -23567,6 +23623,15 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         if (nextConfig.fastReacquireMs !== undefined) {
             const value = Number(nextConfig.fastReacquireMs);
             nextConfig.fastReacquireMs = Number.isFinite(value) ? Math.max(50, Math.min(500, value)) : config.fastReacquireMs;
+        }
+        const priorityChanged = nextConfig.targetPriorityNames !== undefined || nextConfig.targetPriorityMatchMode !== undefined;
+        if (nextConfig.targetPriorityNames !== undefined)
+            nextConfig.targetPriorityNames = normalizeTargetPriorityNames(nextConfig.targetPriorityNames);
+        if (nextConfig.targetPriorityMatchMode !== undefined)
+            nextConfig.targetPriorityMatchMode = nextConfig.targetPriorityMatchMode === "includes" ? "includes" : "exact";
+        if (priorityChanged) {
+            resetRetargetCandidate();
+            state.retargetScoreHistory.clear();
         }
         if (nextConfig.preferredTargetNames !== undefined) {
             nextConfig.preferredTargetNames = Array.isArray(nextConfig.preferredTargetNames)
@@ -47522,6 +47587,122 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
     };
 };
 
+// -- TEMPLE XLOG
+window.__minibiaBotBundle.installTempleXlogModule = function installTempleXlogModule(bot) {
+    const configStorageKey = "minibiaBot.templeXlog.config";
+    const config = { enabled: bot.storage.get(configStorageKey, {})?.enabled === true };
+    let timerId = null;
+    let triggered = false;
+    let disposed = false;
+    let seen = new WeakSet();
+
+    function persistConfig() {
+        bot.storage.set(configStorageKey, { ...config });
+    }
+
+    function consoleEntries() {
+        const channels = window.gameClient?.interface?.channelManager?.channels;
+        if (!Array.isArray(channels)) return [];
+        return channels.filter(channel => String(channel?.name || "").trim().toLowerCase() === "console")
+            .flatMap(channel => Array.isArray(channel.__contents) ? channel.__contents : []);
+    }
+
+    function clearTimer() {
+        if (timerId !== null) clearInterval(timerId);
+        timerId = null;
+    }
+
+    function refreshUi() {
+        const toggle = document.getElementById("minibia-bot-temple-xlog-enabled");
+        if (toggle) toggle.checked = config.enabled;
+        const reconnectToggle = document.getElementById("minibia-bot-reconnect-enabled");
+        if (triggered && reconnectToggle) reconnectToggle.checked = false;
+    }
+
+    function disconnect(message) {
+        triggered = true;
+        clearTimer();
+        bot.log("Temple XLOG: sent-to-temple message detected; closing connection.", { message });
+        // No delayed recovery or reconnect may undo this logout.
+        try { bot.actions?.halt?.(); } catch (e) { bot.log("Temple XLOG: action halt failed", e); }
+        try { bot.reconnect?.disable?.(); } catch (e) { bot.log("Temple XLOG: reconnect disable failed", e); }
+        try { bot.gmKillSwitch?.cancel?.("Temple XLOG"); } catch (e) { bot.log("Temple XLOG: restart cancellation failed", e); }
+        for (const name of ["followingItemGuard", "gmChatMonitor", "autoPickup", "looter", "cave", "attack",
+                            "runeShooter", "rune", "heal", "invisible", "magicShield", "equipRing", "bootsSwapper",
+                            "itemDropper", "eat", "conjureFood", "paladin", "slimeTrainer", "monkTrainer", "talk",
+                            "antiAfk", "fisher", "woodcutting", "mining", "smithing", "cooking", "comboBot"]) {
+            try { bot[name]?.stop?.({ persistEnabled: false }); }
+            catch (e) { bot.log(`Temple XLOG: failed to stop ${name}`, e); }
+        }
+        try {
+            const client = window.gameClient;
+            if (typeof client?.disconnect === "function") client.disconnect();
+            else if (typeof client?.networkManager?.close === "function") client.networkManager.close();
+            else bot.log("Temple XLOG: connection close is unavailable.");
+        } catch (e) {
+            bot.log("Temple XLOG: disconnect failed", e);
+        } finally {
+            refreshUi();
+        }
+    }
+
+    function checkChat() {
+        if (disposed || !config.enabled || triggered) return;
+        try {
+            for (const entry of consoleEntries()) {
+                if (!entry || typeof entry !== "object" || seen.has(entry)) continue;
+                seen.add(entry);
+                const message = String(entry.message || entry.text || "");
+                if (/\bsent\s+to\s+temple\b/i.test(message)) {
+                    disconnect(message);
+                    break;
+                }
+            }
+        } catch (e) {
+            bot.log("Temple XLOG: Console scan failed", e);
+        }
+    }
+
+    function start() {
+        if (disposed || timerId !== null || triggered) return false;
+        // Ignore existing chat history on enable/reload. Channel entries are
+        // stable message objects; WeakSet does not retain discarded chat lines.
+        seen = new WeakSet();
+        for (const entry of consoleEntries()) {
+            if (entry && typeof entry === "object") seen.add(entry);
+        }
+        config.enabled = true;
+        persistConfig();
+        timerId = setInterval(checkChat, 250);
+        refreshUi();
+        return true;
+    }
+
+    function stop() {
+        clearTimer();
+        config.enabled = false;
+        triggered = false;
+        seen = new WeakSet();
+        persistConfig();
+        refreshUi();
+        return true;
+    }
+
+    function updateConfig(next = {}) {
+        if (next.enabled === true) start();
+        else if (next.enabled === false) stop();
+        return { ...config };
+    }
+
+    bot.templeXlog = {
+        config, start, stop, updateConfig,
+        status: () => ({ running: timerId !== null && !triggered, triggered, config: { ...config } }),
+    };
+    bot.addCleanup(() => { disposed = true; clearTimer(); seen = new WeakSet(); });
+    if (config.enabled) start();
+};
+
+
 // -- PINK SKULL DISCONNECT
 
 window.__minibiaBotBundle.installPinkSkullDetectorModule = function installPinkSkullDetectorModule(bot) {
@@ -47720,6 +47901,7 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
         "minibiaBot.messageAlert.config",
         "minibiaBot.antibot.config",
         "minibiaBot.gmChatMonitor.config",
+        "minibiaBot.templeXlog.config",
         "minibiaBot.groundSpawnLogger.config",
         "minibiaBot.followingItemGuard.config",
         "minibiaBot.follow.floors",
@@ -54072,7 +54254,28 @@ function upgradeSectionHeaders(panel) {
     }
 
     // ---- REFRESH FUNCTIONS (tie UI to bot state) ----
+    function refreshAutoAttackPriorityStatus(options = {}) {
+        const input = document.getElementById("minibia-bot-auto-attack-priority-names");
+        const mode = document.getElementById("minibia-bot-auto-attack-priority-match-mode");
+        const config = bot.attack?.config || {};
+        if (input && (options.force || document.activeElement !== input))
+            input.value = (config.targetPriorityNames || []).join("\n");
+        if (mode && (options.force || document.activeElement !== mode))
+            mode.value = config.targetPriorityMatchMode === "includes" ? "includes" : "exact";
+    }
+
+    function saveAutoAttackPriorityConfig() {
+        const input = document.getElementById("minibia-bot-auto-attack-priority-names");
+        const mode = document.getElementById("minibia-bot-auto-attack-priority-match-mode");
+        bot.attack?.updateConfig?.({
+            targetPriorityNames: parsePreferredTargetNames(input?.value || ""),
+            targetPriorityMatchMode: mode?.value === "includes" ? "includes" : "exact"
+        });
+        refreshAutoAttackPriorityStatus({ force: true });
+    }
+
     function refreshAutoAttackPreferredStatus(options = {}) {
+        refreshAutoAttackPriorityStatus(options);
         const force = options.force === true;
         const input = document.getElementById("minibia-bot-auto-attack-preferred-names");
         const modeSelect = document.getElementById("minibia-bot-auto-attack-preferred-match-mode");
@@ -57648,6 +57851,7 @@ function upgradeSectionHeaders(panel) {
       <label class="mb-toggle"><input type="checkbox" id="minibia-bot-gm-chat-monitor"><span>GM Auto Respond</span></label>
       <label class="mb-toggle"><input type="checkbox" id="minibia-bot-antibot-creature-enabled"><span>Anti-bot creature</span></label>
       <label class="mb-toggle"><input type="checkbox" id="minibia-bot-pink-skull-enabled" /><span>Pinkskull XLOG</span></label>
+      <label class="mb-toggle" title="Close connection on a new Console message containing sent to temple. Disables Auto-Reconnect."><input type="checkbox" id="minibia-bot-temple-xlog-enabled" /><span>Temple XLOG</span></label>
     </div>
     <details class="mb-alert-fold">
       <summary>Game master names</summary>
@@ -58081,6 +58285,19 @@ function upgradeSectionHeaders(panel) {
       </div>
 
       <div style="display:grid; gap:8px;">
+        <div style="display:flex; gap:6px; align-items:end; flex-wrap:wrap;">
+          <label class="mb-field" style="flex:1; min-width:120px;">
+            <span class="mb-field-label" style="font-size:10px;">Attack Order · highest first</span>
+            <textarea id="minibia-bot-auto-attack-priority-names" aria-label="Attack order, one mob per line, highest first" placeholder="Dragon Lord&#10;Dragon&#10;Dragon Hatchling" style="min-height:54px;padding:3px 4px;font-size:11px;resize:vertical;"></textarea>
+          </label>
+          <label class="mb-field" style="flex:0 0 104px;">
+            <span class="mb-field-label" style="font-size:10px;">Match Mode</span>
+            <select id="minibia-bot-auto-attack-priority-match-mode" style="padding:3px 4px;font-size:11px;">
+              <option value="exact">Exact</option><option value="includes">Contains</option>
+            </select>
+          </label>
+          <button type="button" class="mb-small-button" id="minibia-bot-auto-attack-priority-save" style="padding:3px 10px;font-size:11px;width:auto;">Save</button>
+        </div>
 
         <div>
           <div style="display:flex; gap:6px; align-items:end; flex-wrap:wrap;">
@@ -61234,6 +61451,15 @@ function upgradeSectionHeaders(panel) {
             });
         }
 
+        const templeXlogToggle = panel.querySelector("#minibia-bot-temple-xlog-enabled");
+        if (templeXlogToggle) {
+            templeXlogToggle.checked = bot.templeXlog?.config?.enabled === true;
+            templeXlogToggle.addEventListener("change", function () {
+                bot.templeXlog?.updateConfig?.({ enabled: this.checked });
+                this.checked = bot.templeXlog?.config?.enabled === true;
+            });
+        }
+
         // ---- X-Ray enable checkbox (was: overlay-toggle button) ----
         const xrayEnabled = document.getElementById("minibia-bot-xray-enabled");
         if (xrayEnabled) {
@@ -63051,6 +63277,18 @@ function upgradeSectionHeaders(panel) {
             refreshPanicItemAlertsList();
         }, 2000);
         bot.addCleanup(() => window.clearInterval(audioAlertRefresh));
+
+        const priorityInput = document.getElementById("minibia-bot-auto-attack-priority-names");
+        const priorityMode = document.getElementById("minibia-bot-auto-attack-priority-match-mode");
+        priorityInput?.addEventListener("blur", saveAutoAttackPriorityConfig);
+        priorityInput?.addEventListener("keydown", event => {
+            if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+                event.preventDefault();
+                saveAutoAttackPriorityConfig();
+            }
+        });
+        priorityMode?.addEventListener("change", saveAutoAttackPriorityConfig);
+        document.getElementById("minibia-bot-auto-attack-priority-save")?.addEventListener("click", saveAutoAttackPriorityConfig);
 
         // Save match-mode changes immediately, before periodic status refresh.
         // The explicit Save button also commits the current names and mode.
@@ -66364,6 +66602,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         currentBundle.installAntiBotCreatureModule(bot);
         currentBundle.installAutoPickupModule(bot);
         currentBundle.installItemIdDisplayModule(bot);
+        currentBundle.installTempleXlogModule(bot);
 
         bot.ui.inject();
 
@@ -66441,6 +66680,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
                 ["messageAlert", "minibiaBot.messageAlert.config"],
                 ["antiBotMonitor", "minibiaBot.antibot.config"],
                 ["gmChatMonitor", "minibiaBot.gmChatMonitor.config"],
+                ["templeXlog", "minibiaBot.templeXlog.config"],
                 ["groundSpawnLogger", "minibiaBot.groundSpawnLogger.config"],
                 ["followingItemGuard", "minibiaBot.followingItemGuard.config"],
                 ["antiBotCreature", "minibiaBot.antiBotCreature.config"],
