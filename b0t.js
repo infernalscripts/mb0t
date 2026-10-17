@@ -3476,7 +3476,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.248",
+        version: "1.6.249",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -48005,7 +48005,9 @@ window.__minibiaBotBundle.installPauseHotkeyModule = function installPauseHotkey
                 (temporaryHold && bot.attack?.config?.enabled === true),
         };
         paused = true; // Gate starts and direct actions before stopping work.
-        safely("CaveBot pause", () => bot.cave?.pauseMovement?.("pause-hotkey"));
+        // Fully disable CaveBot, including its timers and active waypoint work.
+        // The snapshot remembers whether the next press should start it again.
+        safely("CaveBot stop", () => bot.cave?.stop?.());
         safely("Targeting stop", () => bot.attack?.stop?.({ persistEnabled: false }));
         // Stopping the Targeting loop alone leaves the server's target active.
         const client = window.gameClient, player = client?.player;
@@ -48018,8 +48020,8 @@ window.__minibiaBotBundle.installPauseHotkeyModule = function installPauseHotkey
             player.setTarget?.(null);
             if (typeof TargetPacket === "function") client?.send?.(new TargetPacket(0));
         });
-        bot.log("Pause shortcut: CaveBot and Targeting paused");
-        safely("notification", () => bot.notify?.server?.("CaveBot + Targeting paused", "yellow"));
+        bot.log("Pause shortcut: CaveBot off, Targeting paused");
+        safely("notification", () => bot.notify?.server?.("CaveBot off · Targeting paused", "yellow"));
         refreshModules();
         return true;
     }
@@ -48028,7 +48030,6 @@ window.__minibiaBotBundle.installPauseHotkeyModule = function installPauseHotkey
         const previous = snapshot;
         paused = false;
         snapshot = null;
-        safely("CaveBot release", () => bot.cave?.resumeMovement?.("pause-hotkey"));
         const sameSession = previous?.client === window.gameClient && previous?.player === window.gameClient?.player;
         const canRestore = sameSession && !bot.actions?.isHalted?.() &&
             !bot.gmKillSwitch?.isActive?.() && !bot.followingItemGuard?.isHolding?.() &&
@@ -48036,11 +48037,16 @@ window.__minibiaBotBundle.installPauseHotkeyModule = function installPauseHotkey
         if (canRestore) {
             if (previous.attack && bot.attack?.config?.enabled === true && !bot.attack?.isRunning?.())
                 safely("Targeting resume", () => bot.attack?.start?.());
-            if (previous.cave && bot.cave?.config?.enabled === true && !bot.cave?.isRunning?.())
-                safely("CaveBot resume", () => bot.cave?.start?.());
+            // stop() persisted enabled=false; start() turns CaveBot fully on.
+            if (previous.cave && !bot.cave?.isRunning?.())
+                safely("CaveBot start", () => bot.cave?.start?.());
         }
-        bot.log("Pause shortcut: pause released");
-        safely("notification", () => bot.notify?.server?.("CaveBot + Targeting pause released", "white"));
+        bot.log("Pause shortcut: stop released", {
+            caveRunning: bot.cave?.isRunning?.() === true,
+            targetingRunning: bot.attack?.isRunning?.() === true
+        });
+        safely("notification", () => bot.notify?.server?.(
+            bot.cave?.isRunning?.() ? "CaveBot on · shortcut released" : "Shortcut released · CaveBot off", "white"));
         refreshModules();
         return true;
     }
@@ -48087,9 +48093,9 @@ window.__minibiaBotBundle.installPauseHotkeyModule = function installPauseHotkey
         const refresh = () => {
             keyButton.textContent = capturing ? "Press a key…" : label();
             keyButton.setAttribute("aria-pressed", String(capturing));
-            action.textContent = paused ? "Resume" : "Pause";
+            action.textContent = paused ? "Resume" : "Stop";
             action.setAttribute("aria-pressed", String(paused));
-            status.textContent = paused ? "Paused" : "Ready";
+            status.textContent = paused ? "CaveBot off" : "Ready";
             section.dataset.paused = String(paused);
         };
         keyButton.addEventListener("click", change);
@@ -48112,7 +48118,6 @@ window.__minibiaBotBundle.installPauseHotkeyModule = function installPauseHotkey
         window.removeEventListener("keydown", onKeyDown, true);
         window.removeEventListener("keyup", onKeyUp, true);
         window.removeEventListener("blur", cancelCapture);
-        safely("cleanup", () => bot.cave?.resumeMovement?.("pause-hotkey"));
         views.clear(); consumedKeys.clear();
     });
 };
@@ -58493,13 +58498,13 @@ function upgradeSectionHeaders(panel) {
 <!-- Utility Tab -->
 <div class="mb-tab-panel" data-tab-panel="utility">
   <div class="mb-section mb-pause-shortcut" data-pause-shortcut>
-    <div class="mb-section-title"><span class="mb-title-text">Pause shortcut</span><span class="mb-small-note" data-pause-status aria-live="polite">Ready</span></div>
+    <div class="mb-section-title"><span class="mb-title-text">Stop / resume shortcut</span><span class="mb-small-note" data-pause-status aria-live="polite">Ready</span></div>
     <div class="mb-pause-controls">
       <button type="button" class="mb-small-button mb-pause-key" data-pause-key aria-label="Change pause shortcut" aria-pressed="false" title="Click, then press a key or key combination. Escape cancels.">Delete</button>
       <span class="mb-small-note">CaveBot + Targeting</span>
-      <button type="button" class="mb-small-button" data-pause-action aria-pressed="false">Pause</button>
+      <button type="button" class="mb-small-button" data-pause-action aria-pressed="false">Stop</button>
     </div>
-    <div class="mb-small-note mb-pause-note">Healing stays active. Click the key to change it.</div>
+    <div class="mb-small-note mb-pause-note">Stops CaveBot and pauses Targeting. Healing stays active. Click the key to change it.</div>
   </div>
 
   <!-- Tools -->
