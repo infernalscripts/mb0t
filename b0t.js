@@ -3476,7 +3476,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.247",
+        version: "1.6.248",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -26081,22 +26081,40 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         persistActivePreset();
     }
 
-    // ---- Simple walkability (copied from attack module) ----
-    // Custom helper: checks if any creature (player or monster) is standing on the tile
+    // Use the client's server-mirroring occupancy rule: non-PvP players
+    // and player summons are passable except on/next to depot lockers.
+    // Unknown world rules or a missing native helper remain blocking.
+    function canCavePassThroughCreatures(tile, creatures) {
+        if (!creatures.length) return true;
+        const client = window.gameClient;
+        if (client?.player?.outfit?.verifiedGhost === true) return true;
+        if (client?.__worldPvp !== false) return false;
+        try {
+            return tile?.__nonPvpPassThrough?.(creatures) === true;
+        } catch (error) {
+            return false;
+        }
+    }
+
+    // activeCreatures catches occupants whose tile.monsters entry is stale,
+    // without turning passable non-PvP players into an extra obstacle.
     function isTileOccupiedByCreature(x, y, z) {
-        const creatures = window.gameClient?.world?.activeCreatures || {};
-        const player = window.gameClient?.player;
+        const client = window.gameClient;
+        const creatures = client?.world?.activeCreatures || {};
+        const player = client?.player;
+        const blockers = [];
         for (const id in creatures) {
             const c = creatures[id];
-            // Skip self
-            if (c.id === player?.id)
+            if (!c || c.id === player?.id || c.outfit?.verifiedGhost === true)
                 continue;
             const pos = c.getPosition?.() || c.__position;
             if (pos && Math.trunc(pos.x) === Math.trunc(x) && Math.trunc(pos.y) === Math.trunc(y) && Math.trunc(pos.z) === Math.trunc(z)) {
-                return true;
+                blockers.push(c);
             }
         }
-        return false;
+        if (!blockers.length) return false;
+        const tile = client?.world?.getTileFromWorldPosition?.(new Position(x, y, z));
+        return !canCavePassThroughCreatures(tile, blockers);
     }
 
     function isTileWalkable(x, y, z, ignoreCreatures = false) {
@@ -29893,9 +29911,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             return false;
         }
 
-        // Live movement still treats creatures as blockers. Static Lure route
-        // planning uses caveFieldPassableStatic() so current mobs do not make
-        // magic fields look like permanent walls.
+        // Live movement respects native non-PvP pass-through. Static Lure
+        // planning ignores creatures so mobs do not become permanent walls.
         const player =
             window.gameClient?.player;
         const blockers =
@@ -29920,7 +29937,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 return true;
             });
 
-        if (blockers.length)
+        if (!canCavePassThroughCreatures(tile, blockers))
             return false;
 
         // v1.6.44: tile.monsters can lag the authoritative active-creature
@@ -37925,7 +37942,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 ground: read(tile, true),
                 items: (tile.items || []).slice(0,8).map(item => read(item)),
                 creatures: Array.from(tile.monsters || []).filter(c => c !== client?.player)
-                    .slice(0,8).map(c => ({id:c.id,name:c.name,moving:c.isMoving?.() === true})),
+                    .slice(0,8).map(c => ({id:c.id,name:c.name,type:c.type,moving:c.isMoving?.() === true})),
                 rejectedForMs: Math.max(0, until - now)
             };
         };
