@@ -3476,7 +3476,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.244",
+        version: "1.6.247",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -5446,6 +5446,235 @@ window.__minibiaBotBundle.installXrayModule = function installXrayModule(bot) {
  *    position. Also includes a sound‑only "player on‑screen" alert.
  * ==================================================================================
  */
+// Server item definitions power Item Count Alerts; no hardcoded name-to-ID table.
+window.__minibiaBotBundle.installItemAlertItems = function(bot) {
+    let catalogRef = null, rows = [], disposed = false;
+    let cancelActiveCapture = () => {};
+    let editActiveAlert = () => false, alertRemoved = () => {};
+    const integer = value => Number.isInteger(Number(value)) && Number(value)>0 && Number(value)<=65535 ? Number(value) : null;
+    const text = value => String(value || "").trim().toLowerCase().replace(/\s+/g," ");
+    const fluid = value => Math.max(0,Math.min(255,Math.trunc(Number(value)||0)));
+    const key = item => integer(item?.sid) && !fluid(item?.fluidType)
+        ? `sid:${Number(item.sid)}` : `${Number(item?.id)}:${fluid(item?.fluidType)}`;
+    function fluidName(type) {
+        const proto = typeof FluidThing === "function" ? FluidThing.prototype : null;
+        try { return proto?.getFluidName?.call({fluidType:type,FLUID_TYPES:proto.FLUID_TYPES}) || ""; }
+        catch { return ""; }
+    }
+    function catalog() {
+        const client=window.gameClient;
+        let defs=client?.itemDefinitionsBySid;
+        if (!defs || !Object.keys(defs).length) defs=client?.itemDefinitions;
+        if (defs===catalogRef && rows.length) return rows;
+        const entries=Object.entries(defs || {});
+        catalogRef=defs; rows=[];
+        const add = item => {
+            item.choice=`${item.name} [SID ${item.sid}${item.fluidType?`, fluid ${item.fluidType}`:""}]`;
+            item.search=text(item.name); rows.push(item);
+        };
+        for (const [sidValue,def] of entries) {
+            const sid=integer(sidValue),id=integer(def?.id),name=String(def?.properties?.name || def?.name || "").trim();
+            if (!sid || !id || !name) continue;
+            add({sid,id,name,fluidType:0});
+            if (def?.properties?.type!=="fluidContainer") continue;
+            const proto=typeof FluidThing==="function"?FluidThing.prototype:null;
+            for (const type of [...new Set(Object.values(proto?.FLUID_TYPES || {}).map(Number))]) {
+                const content=fluidName(type);
+                if (!type || !content) continue;
+                add({sid,id,fluidType:type,name:text(name)==="vial"?content:`${name} of ${content}`});
+            }
+        }
+        const names=new Map();
+        for(const row of rows)names.set(row.search,(names.get(row.search)||0)+1);
+        for(const row of rows)if(names.get(row.search)===1)row.choice=row.name;
+        rows.sort((a,b)=>a.name.localeCompare(b.name)||a.sid-b.sid||a.fluidType-b.fluidType);
+        return rows;
+    }
+    function resolve(value) {
+        const query=text(value),list=catalog();
+        const chosen=list.find(row=>text(row.choice)===query);
+        if (chosen) return {item:{...chosen}};
+        const matches=list.filter(row=>row.search===query);
+        if (matches.length===1) return {item:{...matches[0]}};
+        return {error:!list.length?"Item names are loading. Try again after the game connects.":
+            matches.length>1?"Several items have this name. Choose the exact entry from the suggestions.":
+            "Choose an item from the suggestions, pick an item, or enter its exact name."};
+    }
+    function suggestions(value,limit=50) {
+        const query=text(value);
+        return catalog().filter(row=>!query || text(row.choice).includes(query))
+            .sort((a,b)=>Number(!a.search.startsWith(query))-Number(!b.search.startsWith(query))||a.name.localeCompare(b.name)||a.sid-b.sid)
+            .slice(0,limit);
+    }
+    function fromItem(item) {
+        const id=integer(item?.id),type=fluid(item?.fluidType);
+        if (!id) return null;
+        const candidates=catalog().filter(row=>row.id===id&&!row.fluidType);
+        const sid=integer(item?.sid) || (candidates.length===1?candidates[0].sid:null);
+        if (!sid) return null; // A shared sprite cannot identify its server variant.
+        const base=candidates.find(row=>row.sid===sid);
+        if (!base) return null;
+        const variant=catalog().find(row=>row.sid===sid&&row.fluidType===type);
+        return {...(variant || base),fluidType:type};
+    }
+    function request(alerts) {
+        const exact=alerts.filter(a=>integer(a?.sid)&&!fluid(a.fluidType)).map(a=>Number(a.sid));
+        const legacy=alerts.filter(a=>!integer(a?.sid)||fluid(a.fluidType)).map(a=>({id:Number(a.id),fluidType:fluid(a.fluidType)}));
+        if (exact.length) bot.sidInventory?.request?.([...new Set(exact)]);
+        if (legacy.length) bot.requestItemCounts?.(legacy);
+    }
+    function reading(item) {
+        const result=integer(item?.sid)&&!fluid(item.fluidType)
+            ? bot.sidInventory?.reading?.(Number(item.sid))
+            : bot.getItemCountReading?.(Number(item?.id),fluid(item?.fluidType));
+        return result && Number.isFinite(Number(result.count)) && Date.now()-Number(result.at)<=15000 ? result : null;
+    }
+    function captureItem(event) {
+        const client=window.gameClient,slot=event.target?.closest?.(".slot[slotindex]");
+        if (slot) {
+            const index=Number(slot.getAttribute("slotindex")),panel=slot.closest?.("[containerindex]");
+            if (panel) {
+                const raw=client?.player?.__openedContainers;
+                const containers=raw instanceof Map?[...raw.values()]:raw instanceof Set?[...raw]:Array.isArray(raw)?raw:Object.values(raw||{});
+                return containers.find(c=>Number(c?.__containerId)===Number(panel.getAttribute("containerindex")))?.getSlotItem?.(index);
+            }
+            const equipment=client?.player?.equipment;
+            for (let i=0;i<(equipment?.slots?.length||0);i++) {
+                const element=equipment.slots[i]?.element;
+                if (element && (element===slot || element.contains?.(slot))) return equipment.getSlotItem?.(i);
+            }
+        }
+        if (event.target?.id==="screen") {
+            const object=client?.mouse?.getWorldObject?.(event);
+            return object?.which?.peekItem?.(object.index);
+        }
+        return null;
+    }
+    function mount(panel,onAdded) {
+        const q=id=>panel.querySelector(`#minibia-bot-panic-item-alert-${id}`);
+        const name=q("name"),manual=q("id"),type=q("fluid-type"),threshold=q("threshold"),add=q("add"),pick=q("pick"),choices=q("choices"),status=q("status");
+        if (!name || !add || name.dataset.itemAlertBound) return;
+        name.dataset.itemAlertBound="true";
+        const cancel=q("cancel"),form=q("form"),formTitle=q("form-title");
+        let selected=null,capturing=false,captureTimer=null,editingKey=null;
+        const bindings=[];
+        const bind=(el,event,fn)=>{if(el){el.addEventListener(event,fn);bindings.push(()=>el.removeEventListener(event,fn));}};
+        const message=(value,error=false)=>{if(status){status.textContent=value;status.style.color=error?"#ffaaaa":"";}};
+        const cancelCapture=()=>{
+            capturing=false;
+            if(captureTimer!==null)clearTimeout(captureTimer);
+            captureTimer=null;
+            document.removeEventListener("click",captureClick,true);
+            document.removeEventListener("keydown",captureKey,true);
+            pick?.setAttribute("aria-pressed","false");
+        };
+        const choose=item=>{
+            selected={...item};name.value=item.choice;manual.value="";type.value=item.fluidType;
+            message(`Selected: ${item.name} · SID ${item.sid} · ID ${item.id}${item.fluidType?` · fluid ${item.fluidType}`:""}`);
+            cancelCapture();
+        };
+        function captureClick(event) {
+            if(!capturing || panel.contains(event.target))return;
+            let item;
+            try {item=fromItem(captureItem(event));}catch(error){message("Could not read that item. Try another slot.",true);return;}
+            if(!item){message("Select an item with a known server ID, or use the name suggestions.",true);return;}
+            event.preventDefault();event.stopImmediatePropagation();choose(item);
+        }
+        function captureKey(event) {
+            if(event.key!=="Escape")return;
+            event.preventDefault();event.stopImmediatePropagation();cancelCapture();message("Selection cancelled.");
+        }
+        function refreshSuggestions() {
+            if(disposed)return;
+            choices?.replaceChildren();
+            for(const item of suggestions(name.value)) {
+                const option=document.createElement("option");option.value=item.choice;option.label=item.name;choices?.appendChild(option);
+            }
+        }
+        bind(name,"focus",refreshSuggestions);
+        bind(name,"input",()=>{
+            cancelCapture();selected=null;manual.value="";refreshSuggestions();
+            if(!name.value.trim()){message("");return;}
+            const result=resolve(name.value);
+            if(result.item){selected=result.item;type.value=selected.fluidType;message(`ID ${selected.id} · SID ${selected.sid}`);}
+            else message(result.error);
+        });
+        bind(manual,"input",()=>{selected=null;message("Manual item ID mode");});
+        bind(pick,"click",()=>{
+            if(capturing){cancelCapture();message("Selection cancelled.");return;}
+            cancelActiveCapture();
+            bot.itemDropper?.cancelCapture?.();bot.looter?.clearCaptureMode?.();bot.equipRing?.clearCaptureMode?.();bot.bootsSwapper?.clearCaptureMode?.();
+            capturing=true;cancelActiveCapture=cancelCapture;pick.setAttribute("aria-pressed","true");
+            message("Click an item in a backpack, equipment slot or on the ground. Escape cancels.");
+            document.addEventListener("click",captureClick,true);document.addEventListener("keydown",captureKey,true);
+            captureTimer=setTimeout(()=>{cancelCapture();message("Item selection timed out.");},20000);
+        });
+        function resetEditor(notice="") {
+            cancelCapture();editingKey=null;selected=null;
+            name.value="";manual.value="";type.value="0";threshold.value="10";
+            add.textContent="Add";
+            if(cancel)cancel.hidden=true;
+            if(formTitle)formTitle.textContent="Add item alert";
+            message(notice);
+        }
+        function editAlert(alert) {
+            const current=(bot.panic?.config?.itemAlerts||[]).find(a=>key(a)===key(alert));
+            if(!current){message("This alert was removed. Refresh the list and try again.",true);return false;}
+            cancelCapture();editingKey=key(current);
+            const definition=current.sid?catalog().find(row=>row.sid===Number(current.sid)&&row.fluidType===fluid(current.fluidType)):null;
+            selected=current.sid?{...current,choice:definition?.choice||current.name}:null;
+            name.value=selected?.choice||current.name||"";
+            manual.value=current.sid?"":String(current.id);
+            type.value=fluid(current.fluidType);threshold.value=current.threshold;
+            add.textContent="Save changes";
+            if(cancel)cancel.hidden=false;
+            if(formTitle)formTitle.textContent="Edit item alert";
+            if(form)form.open=true;
+            message(`Editing ${current.name}. Save changes to update this alert.`);
+            form?.scrollIntoView?.({block:"nearest"});name.focus?.();
+            return true;
+        }
+        const removed=alert=>{if(editingKey===key(alert))resetEditor("Alert removed.");};
+        editActiveAlert=editAlert;alertRemoved=removed;
+        bind(cancel,"click",()=>resetEditor("Edit cancelled."));
+        function addAlert() {
+            let item;
+            if(manual?.value.trim()) {
+                const id=integer(manual.value);
+                if(!id){message("Enter a valid item ID from 1 to 65535.",true);return;}
+                item={id,fluidType:fluid(type?.value),name:name.value.trim()||`Item ${id}`};
+            } else {
+                const result=selected?{item:selected}:resolve(name.value);
+                if(!result.item){message(result.error,true);return;}
+                item={...result.item,fluidType:fluid(type?.value)};
+            }
+            const current=(bot.panic?.config?.itemAlerts||[]).slice();
+            const editing=editingKey!==null;
+            const index=editing?current.findIndex(a=>key(a)===editingKey):-1;
+            if(editing&&index<0){message("This alert was removed. Cancel this edit and choose another alert.",true);return;}
+            if(current.some((a,i)=>i!==index&&key(a)===key(item))){message("This item is already listed.",true);return;}
+            const updated={...(index>=0?current[index]:{}),id:item.id,fluidType:item.fluidType,
+                name:item.name,threshold:Math.max(1,Math.trunc(Number(threshold?.value)||1)),
+                cooldownMs:index>=0?current[index].cooldownMs??30000:30000};
+            if(item.sid)updated.sid=item.sid;else delete updated.sid;
+            if(index>=0)current[index]=updated;else current.push(updated);
+            bot.panic.updateConfig({itemAlerts:current});onAdded?.();
+            resetEditor(editing?"Item alert updated.":"Item alert added.");
+        }
+        bind(add,"click",addAlert);
+        for(const input of [name,manual])bind(input,"keydown",event=>{if(event.key==="Enter"){event.preventDefault();addAlert();}});
+        bot.addCleanup(()=>{
+            cancelCapture();for(const off of bindings)off();
+            if(editActiveAlert===editAlert)editActiveAlert=()=>false;
+            if(alertRemoved===removed)alertRemoved=()=>{};
+        });
+    }
+    bot.itemAlertItems={catalog,resolve,suggestions,fromItem,request,reading,key,mount,
+        edit:alert=>editActiveAlert(alert),removed:alert=>alertRemoved(alert),cancelCapture:()=>cancelActiveCapture()};
+    bot.addCleanup(()=>{disposed=true;cancelActiveCapture();rows=[];catalogRef=null;});
+};
+
+
 window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) {
     const configStorageKey = "minibiaBot.panic.config";
     const state = {
@@ -6488,10 +6717,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
             const requestInterval = Math.max(2000, Number(config.itemAlertsRefreshMs) || 5000);
             if (now - lastRequest >= requestInterval) {
                 state.itemCountRequestAt = now;
-                const requestItems = config.itemAlerts
-                    .filter(a => a && Number.isFinite(a.id))
-                    .map(a => ({ id: a.id, fluidType: a.fluidType || 0 }));
-                if (requestItems.length) bot.requestItemCounts(requestItems);
+                bot.itemAlertItems.request(config.itemAlerts);
             }
 
             for (const a of config.itemAlerts) {
@@ -6502,14 +6728,12 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
                 // their configured fluid type. Never treat an unknown reading as
                 // zero and never fall back to only-open-container totals.
                 const fluidType = Math.max(0, Math.trunc(Number(a.fluidType) || 0));
-                const reading = typeof bot.getItemCountReading === "function"
-                    ? bot.getItemCountReading(a.id, fluidType)
-                    : null;
+                const reading = bot.itemAlertItems.reading(a);
                 if (!reading) continue;
                 const count = Math.max(0, Math.trunc(Number(reading.count) || 0));
 
                 if (count < a.threshold) {
-                    const alertKey = `${a.id}:${Number(a.fluidType) || 0}`;
+                    const alertKey = bot.itemAlertItems.key(a);
                     const last = state.itemAlertLast[alertKey] || 0;
                     const cd = Math.max(1000, a.cooldownMs || 30000);
                     if (now - last >= cd) {
@@ -6519,7 +6743,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
                         showAudioAlertNotification(
                             "📦 ITEM LOW",
                             `${a.name || a.id}${fluidLabel}: ${count}/${a.threshold}`,
-                            `audio-item-${a.id}-${Number(a.fluidType) || 0}`
+                            `audio-item-${alertKey}`
                         );
                         bot.log(`Audio alert: ${a.name || a.id}${fluidLabel} low (${count}/${a.threshold})`);
                     }
@@ -6692,6 +6916,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
             next.itemAlerts = next.itemAlerts
                 .map(a => ({
                         id: Number(a?.id),
+                        ...(Number.isInteger(Number(a?.sid)) && Number(a.sid)>0 && Number(a.sid)<=65535 ? {sid:Number(a.sid)} : {}),
                         fluidType: Math.max(0, Math.trunc(Number(a?.fluidType) || 0)),
                         name: String(a?.name || "").trim() || `Item ${a?.id}`,
                         threshold: Math.max(1, Math.trunc(Number(a?.threshold) || 1)),
@@ -18728,6 +18953,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         return !!state.running &&
             !!config.enabled &&
             !!config.lureMode &&
+            !state.protectionZoneBlocked &&
             !!state.lureActive;
     }
 
@@ -19288,10 +19514,17 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             "protection zone",
             { quiet: true }
         );
+        clearLureState("protection zone", now);
+        stopManualTargetPursuitAutoWalk("protection zone");
         setClientChaseMode(false);
         state._chaseEnabledForDistance = false;
         state.movementOwner = null;
         state.movementOwnedUntil = 0;
+        state.engagedTargetId = null;
+        state.combatStartedAt = 0;
+        // A Kite retreat is temporary; PZ movement returns to the route index
+        // saved before combat, once, without changing manual target selection.
+        if (state.kiteOriginalIndex !== null) restoreKiteIndex();
 
         // If mb0t owns the current target, release it once so CaveBot and other
         // movement modules do not remain paused by a stale combat target while
@@ -19455,6 +19688,13 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     function refreshMovementOwnership(now = Date.now()) {
         if (!state.running || !config.enabled)
             return false;
+        // Public status reads must not recreate the owner cleared by the PZ
+        // attack guard earlier in this tick, including for manual targets.
+        if (isProtectionZoneBlocked(now)) {
+            state.movementOwner = null;
+            state.movementOwnedUntil = 0;
+            return false;
+        }
 
         // Off-screen Hunt intentionally has no combat target yet. Keep CaveBot
         // paused while this Targeting-owned movement is active anyway.
@@ -19970,7 +20210,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function isCombatActive() {
-        if (!config.enabled || !state.running)
+        if (!config.enabled || !state.running || isProtectionZoneBlocked())
             return false;
 
         // Lure may keep a monster selected for attacks, but CaveBot must not
@@ -33981,6 +34221,12 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         }
 
         function hasValidTarget() {
+            // An outside monster or a retained manual target cannot reserve
+            // movement while Targeting is unable to fight from inside PZ.
+            if (bot.attack?.isProtectionZoneBlocked?.()) {
+                resumeAfterCombat("targeting paused in protection zone");
+                return false;
+            }
             // Lure Mode deliberately attacks through route movement. A valid
             // target during lure must never pause CaveBot.
             if (bot.attack?.isLureActive?.()) {
@@ -42497,6 +42743,9 @@ window.__minibiaBotBundle.installMovementPatch = function installMovementPatch(b
 
         // Helper: does the player have a valid target (alive, on screen)?
         function hasValidTarget(client) {
+            // Retained targets cannot block route packets while attacks are
+            // suspended in a protection zone.
+            if (bot.attack?.isProtectionZoneBlocked?.()) return false;
             const p = client.player;
             if (!p)
                 return false;
@@ -42556,6 +42805,7 @@ window.__minibiaBotBundle.installMovementPatch = function installMovementPatch(b
                     if (
                         value !== null &&
                         value !== undefined &&
+                        bot.attack?.isProtectionZoneBlocked?.() !== true &&
                         bot.attack?.isLureActive?.() !== true
                     ) {
                         const sameTargetingPursuit =
@@ -49801,6 +50051,47 @@ window.__minibiaBotBundle.installFollowingItemGuard = function(bot) {
     const config={enabled:bot.storage.get(key,{})?.enabled===true};
     let running=config.enabled,disposed=false,chain=[],hold=null,timer=null,resumeTimer=null,message="Watching",muteUntil=0;
     const views=new Set(),corpses=new Map();
+    // A distinct two-pulse rising chime, synthesized locally without audio files.
+    let soundContext=null,lastSoundAt=-Infinity;
+    const soundNodes=new Set();
+    function primeSound() {
+        if(disposed)return null;
+        try {
+            if(!soundContext){const AudioCtx=window.AudioContext||window.webkitAudioContext;if(!AudioCtx)return null;soundContext=new AudioCtx();}
+            if(soundContext.state==="suspended")soundContext.resume().catch(()=>{});
+            return soundContext;
+        }catch{return null;}
+    }
+    function playAlertSound() {
+        const ctx=primeSound(),at=Date.now();
+        if(!ctx||disposed||at-lastSoundAt<2500)return false;
+        lastSoundAt=at;
+        const play=()=>{
+            if(disposed||ctx.state!=="running")return false;
+            const start=ctx.currentTime+.015;
+            const notes=[[0,520,780,.18],[.24,520,780,.18],[.65,880,1320,.22],[.96,1046,1568,.22],[1.30,1318,1975,.40],[1.85,659,440,.32]];
+            for(const [delay,from,to,duration]of notes){
+                const osc=ctx.createOscillator(),gain=ctx.createGain(),begin=start+delay,end=begin+duration;
+                osc.type="triangle";osc.frequency.setValueAtTime(from,begin);osc.frequency.exponentialRampToValueAtTime(to,end);
+                gain.gain.setValueAtTime(.001,begin);gain.gain.exponentialRampToValueAtTime(.22,begin+.02);gain.gain.exponentialRampToValueAtTime(.001,end);
+                osc.connect(gain);gain.connect(ctx.destination);
+                const node={osc,gain};soundNodes.add(node);
+                osc.onended=()=>{osc.disconnect();gain.disconnect();soundNodes.delete(node);};
+                osc.start(begin);osc.stop(end+.01);
+            }
+            return true;
+        };
+        if(ctx.state==="running")return play();
+        ctx.resume().then(play).catch(()=>{});return true;
+    }
+    document.addEventListener("pointerdown",primeSound,true);
+    document.addEventListener("keydown",primeSound,true);
+    bot.addCleanup(()=>{
+        document.removeEventListener("pointerdown",primeSound,true);document.removeEventListener("keydown",primeSound,true);
+        for(const {osc,gain}of soundNodes){try{osc.stop();osc.disconnect();gain.disconnect();}catch{}}
+        soundNodes.clear();const ctx=soundContext;soundContext=null;if(ctx)ctx.close().catch(()=>{});
+    });
+
     const pos=value=>{const p=value?.getPosition?.()||value;return p&&[p.x,p.y,p.z].every(Number.isFinite)?{x:p.x,y:p.y,z:p.z}:null;};
     const pkey=p=>p?`${p.x},${p.y},${p.z}`:null;
     const distance=(a,b)=>a&&b?Math.max(Math.abs(a.x-b.x),Math.abs(a.y-b.y)):Infinity;
@@ -49937,7 +50228,7 @@ window.__minibiaBotBundle.installFollowingItemGuard = function(bot) {
                 if(typeof TargetPacket==="function")client.send(new TargetPacket(0));
             }
         }catch(error){bot.log("Following item: movement stop failed",String(error?.message||error));}
-        try{bot.playAlarm?.();}catch(error){bot.log("Following item: alert failed",String(error?.message||error));}
+        try{playAlertSound();}catch(error){bot.log("Following item: alert failed",String(error?.message||error));}
         bot.log("Following item detected — CaveBot and Targeting paused",{item:{cid:item.cid,sid:item.sid,name:item.name},position:item.position,evidence:chain.map(x=>({at:x.at,cid:x.cid,sid:x.sid,position:x.position,player:x.player}))});
         try{if(bot.groundSpawnLogger?.enabled?.())bot.groundSpawnLogger.snapshot("following-item-detected");}catch(e){}
         bot.ui?.refreshAutoAttackStatus?.();
@@ -50015,14 +50306,15 @@ window.__minibiaBotBundle.installFollowingItemGuard = function(bot) {
         label.title='Detect repeated movable item spawns following your movement. Alert, pause CaveBot/Targeting for 10 seconds, and try moving the item onto your tile.';
         label.innerHTML='<input type="checkbox"><span>Following Item</span>';grid.appendChild(label);
         const row=document.createElement('div');row.className='mb-alert-actions';row.style.cssText='align-items:center;flex-wrap:wrap;margin-top:5px';
-        row.innerHTML='<span class="mb-small-note" data-following-status></span><button type="button" class="mb-small-button" data-following-resume>Resume now</button>';grid.after(row);
+        row.innerHTML='<span class="mb-small-note" data-following-status></span><button type="button" class="mb-small-button" data-following-test-sound>Test sound</button><button type="button" class="mb-small-button" data-following-resume>Resume now</button>';grid.after(row);
         const input=label.querySelector('input'),status=row.querySelector('[data-following-status]'),resume=row.querySelector('[data-following-resume]');
-        const refresh=()=>{input.checked=config.enabled;status.textContent=config.enabled||hold?message+(hold?" · 10s pause":""):"";row.style.display=config.enabled||hold?'flex':'none';resume.hidden=!hold;};
+        const refresh=()=>{input.checked=config.enabled;status.textContent=config.enabled||hold?message+(hold?" · 10s pause":""):"";row.style.display='flex';resume.hidden=!hold;};
+        row.querySelector('[data-following-test-sound]').addEventListener('click',playAlertSound);
         input.addEventListener('change',()=>updateConfig({enabled:input.checked}));resume.addEventListener('click',()=>release());views.add(refresh);refresh();
         bot.addCleanup(()=>{views.delete(refresh);label.remove();row.remove();});
     }
     const off=bot.clientEvents?.subscribe?.(['ground-item','session'],receive);
-    bot.followingItemGuard={config,enabled,captureTile,mount,updateConfig,resume:()=>release(),isHolding:()=>!!hold,
+    bot.followingItemGuard={config,enabled,captureTile,mount,updateConfig,playAlertSound,resume:()=>release(),isHolding:()=>!!hold,
         start:()=>updateConfig({enabled:true}),stop:options=>{if(options?.persistEnabled===false){running=false;release(false);return;}return updateConfig({enabled:false});},
         status:()=>({enabled:enabled(),holding:!!hold,message,pauseRemainingMs:hold?Math.max(0,hold.at+10000-Date.now()):0,appearances:chain.length,pending:hold?.pending===true,moveAttempts:hold?.attempts??0,item:hold?{cid:hold.item.cid,sid:hold.item.sid,name:hold.item.name}:null})};
     bot.addCleanup(()=>{disposed=true;off?.();release(false);views.clear();});
@@ -57070,6 +57362,12 @@ function upgradeSectionHeaders(panel) {
 #minibia-bot-panel .mb-dropper-empty {padding:8px;text-align:center;font-size:11px;color:#948c79;border:1px dashed #4b4536;border-radius:5px;}
 #minibia-bot-panel #minibia-bot-item-dropper-status {margin-top:6px;overflow-wrap:anywhere;}
 
+#minibia-bot-panel .mb-alert-item-main {display:flex;align-items:flex-end;gap:6px;}
+#minibia-bot-panel .mb-alert-item-main .mb-field {flex:1;min-width:0;}
+#minibia-bot-panel .mb-alert-item-threshold {width:90px;}
+#minibia-bot-panel #minibia-bot-panic-item-alert-status {overflow-wrap:anywhere;}
+#minibia-bot-panel #minibia-bot-panic-item-alert-pick[aria-pressed="true"] {color:#ffe098;border-color:#d2b96e;}
+
 /* Pause shortcut: matches the compact Utility controls. */
 #minibia-bot-panel .mb-pause-shortcut .mb-section-title {display:flex;align-items:center;justify-content:space-between;gap:8px;}
 #minibia-bot-panel .mb-pause-controls {display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
@@ -58120,19 +58418,16 @@ function upgradeSectionHeaders(panel) {
             </label><label class="mb-field">
               <span class="mb-field-label">Repeat (s)</span>
               <input type="number" id="minibia-bot-panic-low-cap-repeat" min="1" value="30">
-            </label></div></div></div></details></div><div class="mb-section"><div class="mb-section-title"><span class="mb-title-text">Item Count Alerts</span></div><div id="minibia-bot-panic-item-alerts-list" class="mb-list"></div><details class="mb-alert-fold"><summary>Add item alert</summary><div class="mb-alert-fold-body"><div class="mb-alert-grid"><label class="mb-field">
-          <span class="mb-field-label">Item ID</span>
-          <input type="text" id="minibia-bot-panic-item-alert-id" placeholder="2874">
-        </label><label class="mb-field">
-          <span class="mb-field-label">Name</span>
-          <input type="text" id="minibia-bot-panic-item-alert-name" placeholder="Mana Fluid">
-        </label><label class="mb-field">
-          <span class="mb-field-label">Below</span>
-          <input type="number" id="minibia-bot-panic-item-alert-threshold" min="1" value="10">
-        </label><label class="mb-field">
-          <span class="mb-field-label">Fluid</span>
-          <input type="number" id="minibia-bot-panic-item-alert-fluid-type" min="0" max="255" value="0" placeholder="0">
-        </label></div><div class="mb-alert-actions"><button type="button" class="mb-small-button" id="minibia-bot-panic-item-alert-add">Add</button></div><details class="mb-alert-fold"><summary>Item ID examples</summary><div class="mb-alert-fold-body"><div class="mb-small-note">Common IDs: 3160 UH · 2874:7 MP · 2874:10 HP.</div></div></details></div></details></div>  <div class="mb-section mb-alert-antibot">
+            </label></div></div></div></details></div><div class="mb-section"><div class="mb-section-title"><span class="mb-title-text">Item Count Alerts</span></div><div id="minibia-bot-panic-item-alerts-list" class="mb-list"></div><details class="mb-alert-fold" id="minibia-bot-panic-item-alert-form"><summary id="minibia-bot-panic-item-alert-form-title">Add item alert</summary><div class="mb-alert-fold-body">
+  <div class="mb-alert-item-main">
+    <label class="mb-field"><span class="mb-field-label">Item name</span><input type="text" id="minibia-bot-panic-item-alert-name" list="minibia-bot-panic-item-alert-choices" placeholder="Type an item name…" autocomplete="off"></label>
+    <button type="button" class="mb-small-button" id="minibia-bot-panic-item-alert-pick" aria-pressed="false" title="Click, then click an item in a backpack, equipment slot or on the ground">Pick item</button>
+  </div>
+  <datalist id="minibia-bot-panic-item-alert-choices"></datalist>
+  <div class="mb-alert-actions"><label class="mb-field mb-alert-item-threshold"><span class="mb-field-label">Alert below</span><input type="number" id="minibia-bot-panic-item-alert-threshold" min="1" value="10"></label><button type="button" class="mb-small-button" id="minibia-bot-panic-item-alert-add">Add</button><button type="button" class="mb-small-button" id="minibia-bot-panic-item-alert-cancel" hidden>Cancel</button></div>
+  <div class="mb-small-note" id="minibia-bot-panic-item-alert-status" aria-live="polite"></div>
+  <details class="mb-alert-fold"><summary>Manual ID / fluid</summary><div class="mb-alert-fold-body mb-alert-grid"><label class="mb-field"><span class="mb-field-label">Item ID (optional)</span><input type="text" id="minibia-bot-panic-item-alert-id" placeholder="Client item ID"></label><label class="mb-field"><span class="mb-field-label">Fluid type</span><input type="number" id="minibia-bot-panic-item-alert-fluid-type" min="0" max="255" value="0"></label></div></details>
+</div></details></div>  <div class="mb-section mb-alert-antibot">
     <div class="mb-section-title"><span class="mb-title-text">🤖 Anti-Bot &amp; GM Protection</span></div>
     <div class="mb-alert-toggle-grid">
       <label class="mb-toggle"><input type="checkbox" id="minibia-bot-gm-chat-monitor"><span>GM Auto Respond</span></label>
@@ -63462,7 +63757,15 @@ function upgradeSectionHeaders(panel) {
                 row.style.cssText = "display:flex;justify-content:space-between;align-items:center;padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.05);";
                 const label = document.createElement("span");
                 const fluidSuffix = Number(a.fluidType) > 0 ? ` fluid ${a.fluidType}` : "";
-                label.textContent = `${a.name} (${a.id}${fluidSuffix}) — alert below ${a.threshold}`;
+                label.textContent = `${a.name} (${a.sid?`SID ${a.sid}`:a.id}${fluidSuffix}) — alert below ${a.threshold}`;
+                label.style.cssText = "min-width:0;overflow-wrap:anywhere;flex:1;";
+                const actions = document.createElement("div");
+                actions.style.cssText = "display:flex;gap:4px;flex:0 0 auto;align-items:center;";
+                const editBtn = document.createElement("button");
+                editBtn.type = "button";
+                editBtn.className = "mb-small-button";
+                editBtn.textContent = "Edit";
+                editBtn.addEventListener("click", () => bot.itemAlertItems.edit(a));
                 const removeBtn = document.createElement("button");
                 removeBtn.type = "button";
                 removeBtn.className = "mb-small-button";
@@ -63471,13 +63774,17 @@ function upgradeSectionHeaders(panel) {
                 removeBtn.addEventListener("click", () => {
                     const current = (bot.panic.config.itemAlerts || []).slice();
                     current.splice(idx, 1);
+                    bot.itemAlertItems.removed(a);
                     bot.panic.updateConfig({
                         itemAlerts: current
                     });
                     refreshPanicItemAlertsList();
                 });
+                actions.appendChild(editBtn);
+                actions.appendChild(removeBtn);
                 row.appendChild(label);
-                row.appendChild(removeBtn);
+                row.style.gap = "8px";
+                row.appendChild(actions);
                 list.appendChild(row);
             });
         }
@@ -63558,43 +63865,8 @@ function upgradeSectionHeaders(panel) {
             });
         }
 
-        // Add an item alert
-        if (audioIds.itemAdd) {
-            const addItemAlert = () => {
-                const id = Number(audioIds.itemId?.value);
-                if (!Number.isFinite(id) || id <= 0) {
-                    bot.log("Item alert: enter a valid item ID.");
-                    return;
-                }
-                const fluidType = Math.max(0, Math.trunc(Number(audioIds.itemFluidType?.value) || 0));
-                const name = audioIds.itemName?.value?.trim() || `Item ${id}`;
-                const threshold = Math.max(1, Number(audioIds.itemThresh?.value) || 1);
-                const current = (bot.panic.config.itemAlerts || []).slice();
-                if (current.some(a => a.id === id && (Number(a.fluidType) || 0) === fluidType)) {
-                    bot.log(`Item alert: ${id}${fluidType ? `:${fluidType}` : ""} already listed.`);
-                    return;
-                }
-                current.push({
-                    id,
-                    fluidType,
-                    name,
-                    threshold,
-                    cooldownMs: 30000,
-                });
-                bot.panic.updateConfig({ itemAlerts: current });
-                refreshPanicItemAlertsList();
-                if (audioIds.itemId) audioIds.itemId.value = "";
-                if (audioIds.itemName) audioIds.itemName.value = "";
-                if (audioIds.itemFluidType) audioIds.itemFluidType.value = "0";
-                if (audioIds.itemThresh) audioIds.itemThresh.value = "10";
-            };
-            audioIds.itemAdd.addEventListener("click", addItemAlert);
-            if (audioIds.itemId) {
-                audioIds.itemId.addEventListener("keydown", (e) => {
-                    if (e.key === "Enter") { e.preventDefault(); addItemAlert(); }
-                });
-            }
-        }
+        // Names and clicked items use server identities; manual IDs remain available.
+        bot.itemAlertItems.mount(panel, refreshPanicItemAlertsList);
 
         // Initial paint + periodic refresh (in case another tab changes them)
         setTimeout(() => {
@@ -66870,6 +67142,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         bot.hasNavigationObstacle = currentBundle.hasNavigationObstacle;
         bot.isPlankBridgeGround = currentBundle.isPlankBridgeGround;
         currentBundle.installClientImprovements(bot);
+        currentBundle.installItemAlertItems(bot);
         currentBundle.installClientEvents(bot);
         currentBundle.installClientExtras(bot);
         currentBundle.installObservability(bot);
@@ -67103,6 +67376,11 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
                 return;
             bot._combatMonitorInterval = setInterval(() => {
                 const now = Date.now();
+                if (bot.attack?.isProtectionZoneBlocked?.(now)) {
+                    bot._wasInCombat = false;
+                    bot._combatCooldownUntil = 0;
+                    return;
+                }
                 const hasTarget = !!(window.gameClient?.player?.__target ||
                     window.gameClient?.player?.getTarget?.() ||
                     bot.attack?.getCurrentTarget?.());
