@@ -926,13 +926,14 @@ addCleanup(() => {
     // batches so movement stays smooth while still reacting to a moving player.
     //
     // Modes:
-    //   pvp    -> route to the best adjacent tile beside the followed player.
+    //   pvp    -> stop within the configured distance (default: adjacent).
     //   nonpvp -> route to the followed player's exact tile and deliberately
     //             allow that one occupied destination so we can try to stack.
     const customFollowState = {
         active: false,
         name: "",
         mode: "pvp",
+        distance: 1,
         // Optional PvP behavior: when true, standalone Follow keeps ownership
         // of its own short A* AutoWalk batches even while a combat target exists.
         allowDuringTarget: false,
@@ -1008,10 +1009,33 @@ addCleanup(() => {
         customFollowTimer = timerId;
     }
 
+    function normalizeFollowDistance(value) {
+        const number = Number(value);
+        return Number.isFinite(number) ? Math.max(1, Math.min(10, Math.trunc(number))) : 1;
+    }
+
+    function setCustomFollowDistance(value) {
+        const next = normalizeFollowDistance(value);
+        if (next !== customFollowState.distance) {
+            stopCustomFollowAutoWalk("follow distance changed");
+            customFollowState.distance = next;
+            customFollowState.retryAt = 0;
+        }
+        return next;
+    }
+
+    function isCustomFollowInRange(playerPos, targetPos, mode) {
+        if (!playerPos || !targetPos || Number(playerPos.z) !== Number(targetPos.z)) return false;
+        const distance = Math.max(Math.abs(Number(playerPos.x) - Number(targetPos.x)),
+            Math.abs(Number(playerPos.y) - Number(targetPos.y)));
+        return distance <= (mode === "nonpvp" ? 0 : customFollowState.distance);
+    }
+
     function startCustomFollow(name, mode, options = {}, owner = null) {
         if (customFollowDestroyed)
             return false;
         customFollowBot = owner || window.minibiaBot;
+        setCustomFollowDistance(options.distance ?? 1);
         mode = mode === "nonpvp" && window.gameClient?.__worldPvp === false ? "nonpvp" : "pvp";
         if (customFollowState.name !== name || customFollowState.mode !== mode) {
             clearFollowFloorTracking();
@@ -1868,6 +1892,14 @@ addCleanup(() => {
             return [];
         }
 
+        // Range-follow uses one bounded Dijkstra search to the first safe
+        // tile in range, rather than running A* separately for every edge tile.
+        const goalRange = Math.max(0, Math.min(10, Math.trunc(Number(options.goalRange) || 0)));
+        const reached = node => node === to || (goalRange > 0 &&
+            Number(node.__position?.z) === Number(to.__position?.z) &&
+            Math.max(Math.abs(Number(node.__position?.x) - Number(to.__position?.x)),
+                Math.abs(Number(node.__position?.y) - Number(to.__position?.y))) <= goalRange);
+        let rangeNodes = 0;
         try {
             pf.__dirtyNodes
                 ?.forEach?.(
@@ -1877,7 +1909,7 @@ addCleanup(() => {
 
             pf.__dirtyNodes =
                 new Array(from);
-            from.__h =
+            from.__h = goalRange > 0 ? 0 :
                 pf.heuristic(
                     from,
                     to
@@ -1893,7 +1925,8 @@ addCleanup(() => {
                 const currentNode =
                     openHeap.pop();
 
-                if (currentNode === to)
+                if (goalRange > 0 && ++rangeNodes > 8000) return [];
+                if (reached(currentNode))
                     return pf.pathTo(
                         currentNode
                     );
@@ -1971,6 +2004,12 @@ addCleanup(() => {
                         dx !== 0 &&
                         dy !== 0;
 
+                    if (goalRange > 0 && diagonal) {
+                        const p=currentNode.__position;
+                        const sideOptions={allowNonPvpPlayerPassThrough:options.allowNonPvpPlayerPassThrough===true};
+                        if ([[dx,0],[0,dy]].some(([sx,sy]) => !isFollowFieldPassableTile(
+                            getFollowFloorTile({x:Number(p.x)+sx,y:Number(p.y)+sy,z:p.z}),sideOptions))) continue;
+                    }
                     // The native eight-neighbour path search validates the
                     // destination, not the two tiles beside a diagonal step.
 
@@ -2034,7 +2073,7 @@ addCleanup(() => {
                             true;
                         neighbourNode.__parent =
                             currentNode;
-                        neighbourNode.__h =
+                        neighbourNode.__h = goalRange > 0 ? 0 :
                             neighbourNode.__h ||
                             pf.heuristic(
                                 neighbourNode,
@@ -2254,6 +2293,7 @@ addCleanup(() => {
             };
         }
 
+        const followDistance = normalizeFollowDistance(routeOptions.followDistance ?? 1);
         const dxToTarget =
             Math.abs(
                 targetNorm.x -
@@ -2269,7 +2309,7 @@ addCleanup(() => {
             Math.max(
                 dxToTarget,
                 dyToTarget
-            ) <= 1
+            ) <= followDistance
         ) {
             return {
                 atGoal: true,
@@ -2281,6 +2321,21 @@ addCleanup(() => {
                 targetPosition:
                     targetNorm
             };
+        }
+
+        if (followDistance > 1) {
+            const targetTile = world.getTileFromWorldPosition?.(new Position(targetNorm.x, targetNorm.y, targetNorm.z));
+            if (!targetTile) return null;
+            const path = searchFollowPathIgnoringFields(startTile, targetTile, {
+                goalRange: followDistance, freshNeighbours: true,
+                specialAreaPurpose, allowNonPvpPlayerPassThrough
+            });
+            if (!path.length) return null;
+            const pathPositions = path.map(tile => ({ x: Number(tile.__position.x),
+                y: Number(tile.__position.y), z: Number(tile.__position.z) }));
+            return { atGoal: false, mode: normalizedMode, path, pathPositions,
+                pathSteps: path.length, fieldTileCount: path.filter(followTileHasMagicField).length,
+                destination: pathPositions[pathPositions.length - 1], targetPosition: targetNorm };
         }
 
         const offsets = [
@@ -3022,6 +3077,13 @@ addCleanup(() => {
             return false;
         }
 
+        // Cancel a still-queued batch as soon as the leader comes within
+        // range. Do this before cache reuse or a failed-route retry cooldown.
+        if (isCustomFollowInRange(player.getPosition?.(), target.getPosition?.() || target.__position, normalizedMode)) {
+            releaseCustomFollowArrivalHold();
+            stopCustomFollowAutoWalk(normalizedMode === "nonpvp" ? "stacked on followed player" : "within follow distance");
+            return true;
+        }
         if (now < customFollowState.retryAt)
             return false;
         // Check at most three queued steps against live occupants. An unchanged,
@@ -3034,7 +3096,7 @@ addCleanup(() => {
             getFollowCustomRoute(
                 target,
                 normalizedMode,
-                { allowNonPvpPlayerPassThrough: window.gameClient?.__worldPvp === false }
+                { allowNonPvpPlayerPassThrough: window.gameClient?.__worldPvp === false, followDistance: customFollowState.distance }
             );
 
         if (!route) {
@@ -3414,7 +3476,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.241",
+        version: "1.6.244",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -4255,6 +4317,8 @@ addCleanup(() => {
             }
             return customFollowState.followFloors;
         },
+
+        setFollowDistance(value) { return setCustomFollowDistance(value); },
 
         setFollowDuringTarget(enabled) {
             customFollowState.allowDuringTarget =
@@ -40329,130 +40393,174 @@ window.__minibiaBotBundle.installMessageAlertModule = function installMessageAle
 
 window.__minibiaBotBundle.installAntiBotMonitorModule = function installAntiBotMonitorModule(bot) {
     const configStorageKey = "minibiaBot.antibot.config";
+    const saved = bot.storage.get(configStorageKey, {});
+    const config = { enabled: saved?.enabled === true, closeWindowOnCheck: saved?.closeWindowOnCheck === true };
     const state = {
-        running: false,
-        timerId: null,
-        lastTriggerAt: 0,
-        cooldownMs: 30000,
+        running: false, timerId: null, closeVerifyTimerId: null,
+        lastTriggerAt: 0, cooldownMs: 30000, closeRequested: false, disposed: false,
+    };
+    let seen = new WeakSet();
+    const safely = (label, action) => {
+        try { return action(); }
+        catch (e) { bot.log(`Anti-Bot: ${label} failed`, e); }
     };
 
-    // Load persisted config
-    const config = Object.assign({
-        enabled: false
-    },
-            bot.storage.get(configStorageKey, {}));
-
     function persistConfig() {
-        bot.storage.set(configStorageKey, {
-            enabled: config.enabled
-        });
+        bot.storage.set(configStorageKey, { ...config });
+    }
+
+    function consoleEntries() {
+        const channels = window.gameClient?.interface?.channelManager?.channels;
+        if (!Array.isArray(channels)) return [];
+        const channel = channels.find(ch => ch?.name === "Console");
+        return Array.isArray(channel?.__contents) ? channel.__contents : [];
+    }
+
+    function rememberCurrentMessages() {
+        seen = new WeakSet();
+        for (const entry of consoleEntries()) {
+            if (entry && typeof entry === "object") seen.add(entry);
+        }
+    }
+
+    function refreshUi() {
+        const enabled = document.getElementById("minibia-bot-antibot-enabled");
+        const close = document.getElementById("minibia-bot-antibot-close-window");
+        if (enabled) enabled.checked = state.running;
+        if (close) close.checked = config.closeWindowOnCheck;
+        if (state.closeRequested) {
+            const reconnect = document.getElementById("minibia-bot-reconnect-enabled");
+            if (reconnect) reconnect.checked = false;
+        }
+    }
+
+    function closeGameWindow() {
+        if (state.closeRequested || state.disposed) return;
+        state.closeRequested = true;
+        state.running = false;
+        if (state.timerId !== null) clearTimeout(state.timerId);
+        state.timerId = null;
+        // Disconnect before requesting close: browser policy may keep this tab open.
+        safely("action halt", () => bot.actions?.halt?.());
+        safely("reconnect disable", () => bot.reconnect?.disable?.());
+        safely("restart cancellation", () => bot.gmKillSwitch?.cancel?.("Anti-Bot window close"));
+        for (const name of ["followingItemGuard", "gmChatMonitor", "autoPickup", "looter", "cave", "attack",
+                            "runeShooter", "rune", "heal", "invisible", "magicShield", "equipRing", "bootsSwapper",
+                            "itemDropper", "eat", "conjureFood", "paladin", "slimeTrainer", "monkTrainer", "talk",
+                            "antiAfk", "fisher", "woodcutting", "mining", "smithing", "cooking", "comboBot"]) {
+            safely(`stop ${name}`, () => bot[name]?.stop?.({ persistEnabled: false }));
+        }
+        const client = window.gameClient;
+        let disconnected = false;
+        if (typeof client?.disconnect === "function") {
+            try { client.disconnect(); disconnected = true; }
+            catch (e) { bot.log("Anti-Bot: disconnect failed", e); }
+        }
+        if (!disconnected) {
+            if (typeof client?.networkManager?.close === "function")
+                safely("connection close", () => client.networkManager.close());
+            else bot.log("Anti-Bot: connection close is unavailable.");
+        }
+        refreshUi();
+        bot.log("Anti-Bot: requesting game window close");
+        safely("window close", () => window.close());
+        state.closeVerifyTimerId = setTimeout(() => {
+            state.closeVerifyTimerId = null;
+            if (state.disposed || window.closed) return;
+            bot.log("Anti-Bot: browser kept the game tab open; automatic reconnect is disabled.");
+            safely("notification", () => bot.notify?.server?.("Anti-bot check: window close blocked. Check connection status.", "yellow"));
+        }, 250);
+    }
+
+    function playAlert(message, now) {
+        state.lastTriggerAt = now;
+        safely("alarm", () => bot.playAntiBotAlarm?.());
+        bot.log("Anti-Bot check triggered", { message });
+    }
+
+    function checkChat() {
+        if (!state.running || state.disposed || state.closeRequested) return;
+        try {
+            const now = Date.now();
+            for (const entry of consoleEntries()) {
+                const object = entry && typeof entry === "object";
+                const fresh = object && !seen.has(entry);
+                if (object) seen.add(entry);
+                const message = String(entry?.message || "").toLowerCase();
+                if (!message.includes("bot")) continue; // Same trigger as the existing alert.
+                const time = entry?.__time ? new Date(entry.__time).getTime() : 0;
+                if (time && now - time > 5000) continue;
+                // Closing needs a new message, even if the sound is on cooldown.
+                // Enabling the option must never close a tab for old chat history.
+                if (config.closeWindowOnCheck && fresh) {
+                    playAlert(message, now);
+                    closeGameWindow();
+                    return;
+                }
+                if (now - state.lastTriggerAt > state.cooldownMs) playAlert(message, now);
+            }
+        } catch (e) {
+            bot.log("Anti-Bot monitor error", e);
+        }
+        scheduleNext();
+    }
+
+    function scheduleNext() {
+        if (!state.running || state.disposed || state.closeRequested) return;
+        state.timerId = setTimeout(checkChat, 2000);
     }
 
     function start() {
-        if (state.running)
-            return;
+        if (state.running || state.disposed || state.closeRequested) return false;
+        rememberCurrentMessages();
         config.enabled = true;
         persistConfig();
         state.running = true;
         bot.log("Anti-Bot monitor started");
         checkChat();
-        // Update UI checkbox if exists
-        const toggle = document.getElementById("minibia-bot-antibot-enabled");
-        if (toggle)
-            toggle.checked = true;
+        refreshUi();
+        return true;
     }
 
     function stop() {
-        if (!state.running)
-            return;
+        state.running = false;
         config.enabled = false;
+        if (state.timerId !== null) clearTimeout(state.timerId);
+        state.timerId = null;
         persistConfig();
-        state.running = false;
-        if (state.timerId) {
-            clearTimeout(state.timerId);
-            state.timerId = null;
-        }
+        refreshUi();
         bot.log("Anti-Bot monitor stopped");
-        // Update UI checkbox if exists
-        const toggle = document.getElementById("minibia-bot-antibot-enabled");
-        if (toggle)
-            toggle.checked = false;
+        return true;
     }
 
-    function checkChat() {
-        if (!state.running)
-            return;
-
-        try {
-            const channels = window.gameClient?.interface?.channelManager?.channels || [];
-            const consoleChannel = channels.find(ch => ch?.name === "Console");
-            if (!consoleChannel) {
-                scheduleNext();
-                return;
-            }
-
-            const contents = consoleChannel.__contents || [];
-            const now = Date.now();
-
-            for (const entry of contents) {
-                const message = String(entry?.message || "").toLowerCase();
-                if (message.includes("bot")) {
-                    const time = entry?.__time ? new Date(entry.__time).getTime() : 0;
-                    if (time && now - time > 5000)
-                        continue;
-                    if (now - state.lastTriggerAt > state.cooldownMs) {
-                        state.lastTriggerAt = now;
-                        bot.playAntiBotAlarm?.();
-                        bot.log("Anti-Bot check triggered", {
-                            message
-                        });
-                        break;
-                    }
-                }
-            }
-        } catch (e) {
-            bot.log("Anti-Bot monitor error", e);
+    function updateConfig(next = {}) {
+        if (state.disposed) return { ...config };
+        if (typeof next.closeWindowOnCheck === "boolean") {
+            if (next.closeWindowOnCheck && !config.closeWindowOnCheck) rememberCurrentMessages();
+            config.closeWindowOnCheck = next.closeWindowOnCheck;
         }
-
-        scheduleNext();
+        if (next.enabled === true) start();
+        else if (next.enabled === false) stop();
+        persistConfig();
+        refreshUi();
+        return { ...config };
     }
 
-    function scheduleNext() {
-        if (!state.running)
-            return;
-        state.timerId = setTimeout(checkChat, 2000);
-    }
-
-    function status() {
-        return {
-            running: state.running,
-            config: {
-                ...config
-            }
-        };
-    }
-
-    // ---- Auto-start if enabled ----
-    if (config.enabled) {
-        start();
-    }
-
-    // ---- Public API ----
     bot.antiBotMonitor = {
-        start,
-        stop,
-        status,
-        config,
+        start, stop, updateConfig, config,
+        status: () => ({ running: state.running, closeRequested: state.closeRequested, config: { ...config } }),
     };
-
     bot.addCleanup(() => {
+        state.disposed = true;
         state.running = false;
-        if (state.timerId) {
-            clearTimeout(state.timerId);
-            state.timerId = null;
-        }
+        if (state.timerId !== null) clearTimeout(state.timerId);
+        if (state.closeVerifyTimerId !== null) clearTimeout(state.closeVerifyTimerId);
+        state.timerId = state.closeVerifyTimerId = null;
+        seen = new WeakSet();
     });
+    if (config.enabled) start();
 };
+
 
 //***************
 // EXORI NODULE
@@ -48062,6 +48170,7 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
         "minibiaBot.groundSpawnLogger.config",
         "minibiaBot.followingItemGuard.config",
         "minibiaBot.follow.floors",
+        "minibiaBot.follow.distance",
         "minibiaBot.antiBotCreature.config",
         "minibiaBot.tormentedGhost.config", // legacy key; deleted by AntiBotCreature on startup
         "minibiaBot.keyringToggle.config",
@@ -51285,6 +51394,7 @@ window.__minibiaBotBundle.installFisherModule = function installFisherModule(bot
         captureHandler: null,
         lastFishAt: 0,
         lastFishCountRequestAt: 0,
+        unavailableTileKey: null,
     };
 
     const config = Object.assign({
@@ -51412,9 +51522,14 @@ window.__minibiaBotBundle.installFisherModule = function installFisherModule(bot
         const pos = new Position(tile.x, tile.y, tile.z);
         const worldTile = window.gameClient?.world?.getTileFromWorldPosition?.(pos);
         if (!worldTile) {
-            bot.log("Fisher: Tile not loaded or invalid");
+            const tileKey = `${tile.x},${tile.y},${tile.z}`;
+            if (state.unavailableTileKey !== tileKey) {
+                state.unavailableTileKey = tileKey;
+                bot.log("Fisher: selected tile is off-screen or unloaded — waiting", { tile: { ...tile } });
+            }
             return false;
         }
+        state.unavailableTileKey = null;
 
         // Use rod on tile
         try {
@@ -51523,6 +51638,7 @@ window.__minibiaBotBundle.installFisherModule = function installFisherModule(bot
             return false;
         }
         state.running = true;
+        state.unavailableTileKey = null;
         state.lastFishAt = 0;
         state.lastFishCountRequestAt = 0;
         requestFishCount(Date.now(), true);
@@ -54480,6 +54596,8 @@ function upgradeSectionHeaders(panel) {
         if (!toggle)
             return;
         const status = bot.antiBotMonitor?.status?.();
+        const closeWindowToggle = document.getElementById("minibia-bot-antibot-close-window");
+        if (closeWindowToggle) closeWindowToggle.checked = status?.config?.closeWindowOnCheck === true;
         if (status) {
             toggle.checked = status.running;
         } else {
@@ -57978,7 +58096,7 @@ function upgradeSectionHeaders(panel) {
 </div>
 
 <!-- Alert Tab -->
-<div class="mb-tab-panel mb-alert-compact" data-tab-panel="alert"><div class="mb-section"><div class="mb-section-title"><span class="mb-title-text">⚠️ Alerts</span></div><div class="mb-alert-toggle-grid"><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-player-alert"><span>Player on screen</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-antibot-enabled"><span>Anti-bot check</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-player-attack-alert"><span>Player attack</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-message-alert"><span>Message</span></label><label class="mb-toggle" title="Plays a descending tone when your target dies"><input type="checkbox" id="minibia-bot-panic-target-death-beep"><span>Target death</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-low-health-beep"><span>Low health</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-mana-full-beep"><span>Mana full</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-no-target-beep"><span>No target</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-low-cap-beep"><span>Low capacity</span></label></div><details class="mb-alert-fold"><summary>Player alert settings</summary><div class="mb-alert-fold-body"><label class="mb-field"><span class="mb-field-label">Player alert cooldown (s)</span><input type="number" id="minibia-bot-panic-player-cooldown" min="10" value="10"></label></div></details><details class="mb-alert-fold"><summary>Thresholds &amp; repeat timing</summary><div class="mb-alert-fold-body"><div class="mb-alert-setting-group"><div class="mb-alert-setting-title">Low health</div><div class="mb-alert-grid"><label class="mb-field">
+<div class="mb-tab-panel mb-alert-compact" data-tab-panel="alert"><div class="mb-section"><div class="mb-section-title"><span class="mb-title-text">⚠️ Alerts</span></div><div class="mb-alert-toggle-grid"><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-player-alert"><span>Player on screen</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-antibot-enabled"><span>Anti-bot check</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-player-attack-alert"><span>Player attack</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-message-alert"><span>Message</span></label><label class="mb-toggle" title="Plays a descending tone when your target dies"><input type="checkbox" id="minibia-bot-panic-target-death-beep"><span>Target death</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-low-health-beep"><span>Low health</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-mana-full-beep"><span>Mana full</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-no-target-beep"><span>No target</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-low-cap-beep"><span>Low capacity</span></label></div><details class="mb-alert-fold"><summary>Anti-bot check settings</summary><div class="mb-alert-fold-body"><label class="mb-toggle"><input type="checkbox" id="minibia-bot-antibot-close-window"><span>Close game window</span></label><div class="mb-small-note">Requires Anti-bot check. Disconnects first; tab closing depends on browser permissions.</div></div></details><details class="mb-alert-fold"><summary>Player alert settings</summary><div class="mb-alert-fold-body"><label class="mb-field"><span class="mb-field-label">Player alert cooldown (s)</span><input type="number" id="minibia-bot-panic-player-cooldown" min="10" value="10"></label></div></details><details class="mb-alert-fold"><summary>Thresholds &amp; repeat timing</summary><div class="mb-alert-fold-body"><div class="mb-alert-setting-group"><div class="mb-alert-setting-title">Low health</div><div class="mb-alert-grid"><label class="mb-field">
               <span class="mb-field-label">Threshold %</span>
               <input type="number" id="minibia-bot-panic-low-health-threshold" min="1" max="99" value="50">
             </label><label class="mb-field">
@@ -58833,9 +58951,9 @@ function upgradeSectionHeaders(panel) {
       <span class="mb-title-text">🚶 Auto Follow</span>
     </div>
     <div class="mb-stack">
-      <div class="mb-field">
-        <span class="mb-field-label">Player Name</span>
-        <input type="text" id="minibia-bot-follow-name" placeholder="Enter player name" />
+      <div class="mb-form-grid">
+        <label class="mb-field"><span class="mb-field-label">Player Name</span><input type="text" id="minibia-bot-follow-name" placeholder="Enter player name" /></label>
+        <label class="mb-field"><span class="mb-field-label">Follow distance (tiles)</span><input type="number" id="minibia-bot-follow-distance" min="1" max="10" step="1" value="1" title="Stop within 1–10 tiles. Non-PvP stacking ignores this setting." /></label>
       </div>
       <label class="mb-toggle">
         <input type="checkbox" id="minibia-bot-follow-nonpvp" />
@@ -59892,6 +60010,11 @@ function upgradeSectionHeaders(panel) {
             panel.querySelector(
                 "#minibia-bot-follow-during-target"
             );
+        const followDistanceInput=panel.querySelector("#minibia-bot-follow-distance");
+        const getFollowDistance=() => {
+            const value=Number(followDistanceInput?.value);
+            return Number.isFinite(value)?Math.max(1,Math.min(10,Math.trunc(value))):1;
+        };
         const followFloorsToggle=panel.querySelector("#minibia-bot-follow-floors");
         const getFollowFloors=() => followFloorsToggle?.checked === true;
         const followStatus =
@@ -59925,6 +60048,7 @@ function upgradeSectionHeaders(panel) {
         }
 
         function refreshFollowStatus() {
+            if(followDistanceInput)followDistanceInput.disabled=getFollowMode()==="nonpvp";
             const transitionReason=bot.followStatus?.()?.transitionReason;
             if (followEnabled && transitionReason && followStatus) {
                 followStatus.textContent=transitionReason;
@@ -59952,7 +60076,7 @@ function upgradeSectionHeaders(panel) {
                                     ? " + target"
                                     : ""
                             })`
-                            : `Following (PvP adjacent${
+                            : `Following (PvP · ${getFollowDistance()} tile${getFollowDistance()===1?"":"s"}${
                                 getFollowDuringTarget()
                                     ? " + target"
                                     : ""
@@ -60030,6 +60154,8 @@ function upgradeSectionHeaders(panel) {
                 )
             );
             localStorage.setItem("minibiaBot.follow.floors",JSON.stringify(getFollowFloors()));
+            localStorage.setItem("minibiaBot.follow.distance",JSON.stringify(getFollowDistance()));
+            bot.setFollowDistance?.(getFollowDistance());
             bot.setFollowFloors?.(getFollowFloors());
             bot.setFollowDuringTarget?.(
                 getFollowDuringTarget()
@@ -60118,6 +60244,7 @@ function upgradeSectionHeaders(panel) {
                 {
                     mode,
                     continuous: false,
+                    distance: getFollowDistance(),
                     followFloors: getFollowFloors(),
                     allowDuringTarget:
                         getFollowDuringTarget()
@@ -60156,6 +60283,7 @@ function upgradeSectionHeaders(panel) {
                                 mode:
                                     getFollowMode(),
                                 continuous: false,
+                                distance: getFollowDistance(),
                                 followFloors: getFollowFloors(),
                                 allowDuringTarget:
                                     getFollowDuringTarget()
@@ -60183,6 +60311,11 @@ function upgradeSectionHeaders(panel) {
                     localStorage.getItem(
                         "minibiaBot.follow.nonpvp"
                     );
+                if (followDistanceInput) {
+                    followDistanceInput.value=localStorage.getItem("minibiaBot.follow.distance")??"1";
+                    followDistanceInput.value=getFollowDistance();
+                    bot.setFollowDistance?.(getFollowDistance());
+                }
                 if (followFloorsToggle) {
                     followFloorsToggle.checked=localStorage.getItem("minibiaBot.follow.floors")==="true";
                     bot.setFollowFloors?.(followFloorsToggle.checked);
@@ -60222,6 +60355,7 @@ function upgradeSectionHeaders(panel) {
                     startFollow();
                 }
             } catch (e) {}
+            refreshFollowStatus();
 
             followToggle.addEventListener(
                 "change",
@@ -60258,6 +60392,13 @@ function upgradeSectionHeaders(panel) {
                     }
                 );
         }
+
+        if (followDistanceInput) followDistanceInput.addEventListener("change",function () {
+            this.value=getFollowDistance();
+            localStorage.setItem("minibiaBot.follow.distance",JSON.stringify(getFollowDistance()));
+            bot.setFollowDistance?.(getFollowDistance());
+            if(followEnabled)startFollow();else refreshFollowStatus();
+        });
 
         if (followFloorsToggle) followFloorsToggle.addEventListener("change",function () {
             localStorage.setItem("minibiaBot.follow.floors",JSON.stringify(this.checked));
@@ -60724,6 +60865,15 @@ function upgradeSectionHeaders(panel) {
                 } else {
                     bot.antiBotMonitor.stop();
                 }
+            });
+        }
+
+        const antiBotCloseWindow = panel.querySelector("#minibia-bot-antibot-close-window");
+        if (antiBotCloseWindow) {
+            antiBotCloseWindow.checked = bot.antiBotMonitor?.config?.closeWindowOnCheck === true;
+            antiBotCloseWindow.addEventListener("change", function () {
+                bot.antiBotMonitor?.updateConfig?.({ closeWindowOnCheck: this.checked });
+                refreshAntiBotStatus();
             });
         }
 
