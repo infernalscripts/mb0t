@@ -3414,7 +3414,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.239",
+        version: "1.6.241",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -12494,6 +12494,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function tryAttack() {
+        if (bot.pauseHotkey?.isPaused?.()) return false;
         applyCombatRuleMode();
         const decision=withTargetingSnapshot(tryAttackDecision);
         const spell=bot.combatRules?.trySpellRules?.()===true;
@@ -21948,6 +21949,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function syncMeleeChase(now = Date.now()) {
+        if (bot.pauseHotkey?.isPaused?.()) return false;
         // v1.6.47: Melee is the ONLY permission for ordinary target pursuit.
         // Client Chase is an engine selector, not an independent permission.
         // Melee ON + Client Chase ON  => native client chase.
@@ -22378,6 +22380,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
     // ---- ATTACK / RUNE ACTIONS ----
     function canAttack(now = Date.now(), candidates = null) {
+        if (bot.pauseHotkey?.isPaused?.()) return false;
         if (isProtectionZoneBlocked(now)) {
             state.protectionZonePreventedTargets++;
             return false;
@@ -22466,6 +22469,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function start(overrides = {}) {
+        if (bot.pauseHotkey?.isPaused?.()) return false;
         Object.assign(
             config,
             stripLegacyAttackRuneConfig(
@@ -24413,6 +24417,7 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
     function tick() {
         if (!state.running) return;
         try {
+            if (bot.pauseHotkey?.isPaused?.()) return;
             const now = Date.now();
             if(bot.combatRules?.config?.unified && !bot.attack?.isRunning?.())return;
             if (!config.enabled || bot.actions?.isHalted?.() ||
@@ -30820,6 +30825,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     }
 
     function goToWaypoint(waypoint) {
+        if (bot.pauseHotkey?.isPaused?.()) return false;
         // If this is a script-only waypoint, nothing to move
         if (!waypoint || waypoint.x === undefined || waypoint.x === null) {
             return true;
@@ -33733,6 +33739,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     function tick() {
         if (!state.running)
             return;
+        if (bot.pauseHotkey?.isPaused?.()) { scheduleNextTick(); return; }
         refreshCavePacketBatch();
 
         // The client may replace #cancelmessage/#notification on reconnect.
@@ -36614,6 +36621,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
     // ---- PUBLIC API ----
     function start(overrides = {}) {
+        if (bot.pauseHotkey?.isPaused?.()) return false;
         if(bot.clientExtras?.canStart?.()===false)return false;
         if (!route.length) {
             bot.log("cave bot cannot start without waypoints");
@@ -47587,6 +47595,154 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
     };
 };
 
+// -- CAVEBOT / TARGETING PAUSE SHORTCUT
+window.__minibiaBotBundle.installPauseHotkeyModule = function installPauseHotkeyModule(bot) {
+    const key = "minibiaBot.pauseHotkey.config";
+    const defaultBinding = { code: "Delete", ctrl: false, alt: false, shift: false, meta: false };
+    const saved = bot.storage.get(key, {});
+    const binding = value => value && typeof value.code === "string" &&
+        /^(?:Key[A-Z]|Digit[0-9]|Numpad\w+|F(?:[1-9]|1[0-9]|2[0-4])|Delete|Insert|Home|End|PageUp|PageDown|Pause|ScrollLock|Backspace|Space|Tab|Arrow(?:Up|Down|Left|Right)|BracketLeft|BracketRight|Backslash|Semicolon|Quote|Comma|Period|Slash|Backquote|Minus|Equal|Enter|Escape)$/.test(value.code)
+        ? { code: value.code, ctrl: value.ctrl === true, alt: value.alt === true, shift: value.shift === true, meta: value.meta === true }
+        : { ...defaultBinding };
+    const config = { binding: binding(saved?.binding) };
+    let paused = false, disposed = false, capturing = false, snapshot = null;
+    const views = new Set(), consumedKeys = new Set();
+    const safely = (label, fn) => { try { return fn(); } catch (e) { bot.log(`Pause shortcut: ${label} failed`, e); } };
+    function label() {
+        const b = config.binding;
+        const name = b.code.replace(/^Key/, "").replace(/^Digit/, "").replace(/^Arrow/, "");
+        return [b.ctrl && "Ctrl", b.alt && "Alt", b.shift && "Shift", b.meta && "Meta", name].filter(Boolean).join(" + ");
+    }
+    function render() { for (const fn of views) fn(); }
+    function refreshModules() {
+        safely("Targeting refresh", () => bot.ui?.refreshAutoAttackStatus?.());
+        safely("CaveBot refresh", () => bot.ui?.refreshCaveStatus?.());
+        render();
+    }
+    function pause() {
+        if (disposed || paused || bot.actions?.isHalted?.()) return false;
+        const temporaryHold = bot.followingItemGuard?.isHolding?.() || bot.gmKillSwitch?.isActive?.();
+        snapshot = {
+            client: window.gameClient, player: window.gameClient?.player,
+            cave: bot.cave?.isRunning?.() === true ||
+                (temporaryHold && bot.cave?.config?.enabled === true),
+            attack: bot.attack?.isRunning?.() === true ||
+                (temporaryHold && bot.attack?.config?.enabled === true),
+        };
+        paused = true; // Gate starts and direct actions before stopping work.
+        safely("CaveBot pause", () => bot.cave?.pauseMovement?.("pause-hotkey"));
+        safely("Targeting stop", () => bot.attack?.stop?.({ persistEnabled: false }));
+        // Stopping the Targeting loop alone leaves the server's target active.
+        const client = window.gameClient, player = client?.player;
+        safely("walk cancellation", () => {
+            client?.world?.pathfinder?.setPathfindCache?.(null);
+            if (typeof StopWalkPacket === "function") client?.send?.(new StopWalkPacket());
+        });
+        safely("target cancellation", () => {
+            if (!player?.__target && !player?.getTarget?.()) return;
+            player.setTarget?.(null);
+            if (typeof TargetPacket === "function") client?.send?.(new TargetPacket(0));
+        });
+        bot.log("Pause shortcut: CaveBot and Targeting paused");
+        safely("notification", () => bot.notify?.server?.("CaveBot + Targeting paused", "yellow"));
+        refreshModules();
+        return true;
+    }
+    function resume() {
+        if (disposed || !paused) return false;
+        const previous = snapshot;
+        paused = false;
+        snapshot = null;
+        safely("CaveBot release", () => bot.cave?.resumeMovement?.("pause-hotkey"));
+        const sameSession = previous?.client === window.gameClient && previous?.player === window.gameClient?.player;
+        const canRestore = sameSession && !bot.actions?.isHalted?.() &&
+            !bot.gmKillSwitch?.isActive?.() && !bot.followingItemGuard?.isHolding?.() &&
+            window.gameClient?.networkManager?.isConnected?.() === true;
+        if (canRestore) {
+            if (previous.attack && bot.attack?.config?.enabled === true && !bot.attack?.isRunning?.())
+                safely("Targeting resume", () => bot.attack?.start?.());
+            if (previous.cave && bot.cave?.config?.enabled === true && !bot.cave?.isRunning?.())
+                safely("CaveBot resume", () => bot.cave?.start?.());
+        }
+        bot.log("Pause shortcut: pause released");
+        safely("notification", () => bot.notify?.server?.("CaveBot + Targeting pause released", "white"));
+        refreshModules();
+        return true;
+    }
+    const toggle = () => paused ? resume() : pause();
+    const editable = event => [event.target, document.activeElement, ...(event.composedPath?.() || [])]
+        .some(el => el?.isContentEditable || el?.closest?.('input, textarea, select, [role="textbox"], [contenteditable]:not([contenteditable="false"])'));
+    function consume(event) { event.preventDefault(); event.stopImmediatePropagation(); }
+    function onKeyDown(event) {
+        if (disposed || event.isComposing) return;
+        if (capturing) {
+            consume(event);
+            consumedKeys.add(event.code);
+            if (event.repeat) return;
+            if (event.code === "Escape") { capturing = false; render(); return; }
+            if (/^(?:Control|Alt|Shift|Meta)/.test(event.code)) return;
+            const next = binding({ code: event.code, ctrl: event.ctrlKey, alt: event.altKey, shift: event.shiftKey, meta: event.metaKey });
+            if (next.code !== event.code) return;
+            config.binding = next;
+            bot.storage.set(key, { binding: { ...next } });
+            capturing = false;
+            render();
+            return;
+        }
+        const b = config.binding;
+        if (editable(event) || event.code !== b.code || !!event.ctrlKey !== b.ctrl ||
+            !!event.altKey !== b.alt || !!event.shiftKey !== b.shift || !!event.metaKey !== b.meta) return;
+        consume(event);
+        const alreadyHeld = consumedKeys.has(event.code);
+        consumedKeys.add(event.code);
+        if (!event.repeat && !alreadyHeld) toggle();
+    }
+    function onKeyUp(event) {
+        if (!consumedKeys.delete(event.code)) return;
+        consume(event);
+    }
+    function cancelCapture() { capturing = false; consumedKeys.clear(); render(); }
+    function mount(panel) {
+        const section = panel?.querySelector('[data-pause-shortcut]');
+        if (!section) return;
+        const keyButton = section.querySelector('[data-pause-key]');
+        const action = section.querySelector('[data-pause-action]');
+        const status = section.querySelector('[data-pause-status]');
+        const change = () => { capturing = !capturing; render(); };
+        const refresh = () => {
+            keyButton.textContent = capturing ? "Press a key…" : label();
+            keyButton.setAttribute("aria-pressed", String(capturing));
+            action.textContent = paused ? "Resume" : "Pause";
+            action.setAttribute("aria-pressed", String(paused));
+            status.textContent = paused ? "Paused" : "Ready";
+            section.dataset.paused = String(paused);
+        };
+        keyButton.addEventListener("click", change);
+        action.addEventListener("click", toggle);
+        views.add(refresh); refresh();
+        bot.addCleanup(() => {
+            views.delete(refresh);
+            keyButton.removeEventListener("click", change);
+            action.removeEventListener("click", toggle);
+        });
+    }
+    // Capture before the game's document listeners; never touch text editing.
+    window.addEventListener("keydown", onKeyDown, true);
+    window.addEventListener("keyup", onKeyUp, true);
+    window.addEventListener("blur", cancelCapture);
+    bot.pauseHotkey = { config, mount, pause, resume, toggle, isPaused: () => paused,
+        status: () => ({ paused, capturing, key: label(), config: { binding: { ...config.binding } } }) };
+    bot.addCleanup(() => {
+        disposed = true; paused = false; snapshot = null;
+        window.removeEventListener("keydown", onKeyDown, true);
+        window.removeEventListener("keyup", onKeyUp, true);
+        window.removeEventListener("blur", cancelCapture);
+        safely("cleanup", () => bot.cave?.resumeMovement?.("pause-hotkey"));
+        views.clear(); consumedKeys.clear();
+    });
+};
+
+
 // -- TEMPLE XLOG
 window.__minibiaBotBundle.installTempleXlogModule = function installTempleXlogModule(bot) {
     const configStorageKey = "minibiaBot.templeXlog.config";
@@ -47902,6 +48058,7 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
         "minibiaBot.antibot.config",
         "minibiaBot.gmChatMonitor.config",
         "minibiaBot.templeXlog.config",
+        "minibiaBot.pauseHotkey.config",
         "minibiaBot.groundSpawnLogger.config",
         "minibiaBot.followingItemGuard.config",
         "minibiaBot.follow.floors",
@@ -54072,6 +54229,9 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
             details.append(summary,...Array.from(inventorySection.childNodes));inventorySection.append(details);inventorySection.classList.add('mb-resupply-inventory');
         }
 
+        const utility=tab("utility"),pauseShortcut=utility?.querySelector("[data-pause-shortcut]");
+        if(pauseShortcut)utility.append(pauseShortcut);
+
         const targeting=tab('targeting'),core=panel.querySelector('#minibia-bot-auto-attack-enabled')?.closest('.mb-section');
         const extract=id=>{const toggle=panel.querySelector(id),h=toggle?.closest('.mb-section-title'),section=h?.parentElement;if(!section||!targeting)return null;section.classList.add('mb-section');section.style.cssText='';h.classList.remove('mb-section-title--sub');h.style.cssText='';targeting.append(section);return section;};
         const rune=extract('#minibia-bot-rune-shooter-enabled');
@@ -56792,6 +56952,15 @@ function upgradeSectionHeaders(panel) {
 #minibia-bot-panel .mb-dropper-empty {padding:8px;text-align:center;font-size:11px;color:#948c79;border:1px dashed #4b4536;border-radius:5px;}
 #minibia-bot-panel #minibia-bot-item-dropper-status {margin-top:6px;overflow-wrap:anywhere;}
 
+/* Pause shortcut: matches the compact Utility controls. */
+#minibia-bot-panel .mb-pause-shortcut .mb-section-title {display:flex;align-items:center;justify-content:space-between;gap:8px;}
+#minibia-bot-panel .mb-pause-controls {display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
+#minibia-bot-panel .mb-pause-key {min-width:72px;}
+#minibia-bot-panel [data-pause-action] {margin-left:auto;min-width:62px;}
+#minibia-bot-panel .mb-pause-note {margin-top:5px;}
+#minibia-bot-panel .mb-pause-key[aria-pressed="true"],
+#minibia-bot-panel [data-pause-shortcut][data-paused="true"] [data-pause-status] {color:#ffe098;border-color:#d2b96e;}
+
 /* Compact Tools: balanced toggles and matching equipment controls. */
 #minibia-bot-panel .mb-tools-toggle-grid {
   display: grid;
@@ -57893,6 +58062,15 @@ function upgradeSectionHeaders(panel) {
 
 <!-- Utility Tab -->
 <div class="mb-tab-panel" data-tab-panel="utility">
+  <div class="mb-section mb-pause-shortcut" data-pause-shortcut>
+    <div class="mb-section-title"><span class="mb-title-text">Pause shortcut</span><span class="mb-small-note" data-pause-status aria-live="polite">Ready</span></div>
+    <div class="mb-pause-controls">
+      <button type="button" class="mb-small-button mb-pause-key" data-pause-key aria-label="Change pause shortcut" aria-pressed="false" title="Click, then press a key or key combination. Escape cancels.">Delete</button>
+      <span class="mb-small-note">CaveBot + Targeting</span>
+      <button type="button" class="mb-small-button" data-pause-action aria-pressed="false">Pause</button>
+    </div>
+    <div class="mb-small-note mb-pause-note">Healing stays active. Click the key to change it.</div>
+  </div>
 
   <!-- Tools -->
   <div class="mb-section mb-tools-section">
@@ -58792,6 +58970,7 @@ function upgradeSectionHeaders(panel) {
         bot.observability?.mount?.(panel);
         bot.groundSpawnLogger?.mount?.(panel);
         bot.followingItemGuard?.mount?.(panel);
+        bot.pauseHotkey?.mount?.(panel);
         bot.curePoison?.mount?.(panel);
         organizePanelSections(panel);
 
@@ -66603,6 +66782,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         currentBundle.installAutoPickupModule(bot);
         currentBundle.installItemIdDisplayModule(bot);
         currentBundle.installTempleXlogModule(bot);
+        currentBundle.installPauseHotkeyModule(bot);
 
         bot.ui.inject();
 
@@ -66681,6 +66861,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
                 ["antiBotMonitor", "minibiaBot.antibot.config"],
                 ["gmChatMonitor", "minibiaBot.gmChatMonitor.config"],
                 ["templeXlog", "minibiaBot.templeXlog.config"],
+                ["pauseHotkey", "minibiaBot.pauseHotkey.config"],
                 ["groundSpawnLogger", "minibiaBot.groundSpawnLogger.config"],
                 ["followingItemGuard", "minibiaBot.followingItemGuard.config"],
                 ["antiBotCreature", "minibiaBot.antiBotCreature.config"],
