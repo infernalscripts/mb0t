@@ -3567,7 +3567,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.258",
+        version: "1.6.259",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -58351,7 +58351,7 @@ function upgradeSectionHeaders(panel) {
 <div class="mb-titlebar">
   <div class="mb-title">mb0t <span class="mb-title-version">v${String(bot.version || "?")}</span></div>
   <div class="mb-title-status">
-    <span class="mb-run-indicator" id="minibia-bot-title-cave-status" data-running="false"><span class="mb-run-dot"></span><span class="mb-run-label">🏃‍♂️‍➡️</span></span>
+    <span class="mb-run-indicator" id="minibia-bot-title-cave-status" data-running="false"><span class="mb-run-dot"></span><span class="mb-run-label">🏃</span></span>
     <span class="mb-run-indicator" id="minibia-bot-title-attack-status" data-running="false"><span class="mb-run-dot"></span><span class="mb-run-label">⚔️</span></span>
   </div>
   <div class="mb-title-actions">
@@ -58360,7 +58360,7 @@ function upgradeSectionHeaders(panel) {
 </div>
 <div class="mb-collapsed-module-rows" aria-label="Quick module toggles">
   <div class="mb-collapsed-module-row" aria-label="Movement and combat">
-    <button type="button" class="mb-run-indicator mb-collapsed-module-button" id="minibia-bot-collapsed-cave" title="Cavebot"><span class="mb-run-dot"></span><span class="mb-run-label">🏃‍♂️‍➡️</span></button>
+    <button type="button" class="mb-run-indicator mb-collapsed-module-button" id="minibia-bot-collapsed-cave" title="Cavebot"><span class="mb-run-dot"></span><span class="mb-run-label">🏃</span></button>
     <button type="button" class="mb-run-indicator mb-collapsed-module-button" id="minibia-bot-collapsed-attack" title="Targeting"><span class="mb-run-dot"></span><span class="mb-run-label">⚔️</span></button>
     <button type="button" class="mb-run-indicator mb-collapsed-module-button" id="minibia-bot-collapsed-heal" title="Healing"><span class="mb-run-dot"></span><span class="mb-run-label">💚</span></button>
     <button type="button" class="mb-run-indicator mb-collapsed-module-button" id="minibia-bot-collapsed-rune" title="Mana Training"><span class="mb-run-dot"></span><span class="mb-run-label">✨</span></button>
