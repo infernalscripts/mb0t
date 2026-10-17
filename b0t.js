@@ -1209,7 +1209,9 @@ addCleanup(() => {
             const def=client?.itemDefinitionsBySid?.[t.sid] || client?.itemDefinitionsByCid?.[t.id];
             return {cid:t.id,sid:t.sid ?? client?.sidByCid?.[t.id] ?? null,name:def?.properties?.name || t.name || null,
                 floorchange:def?.properties?.floorchange || null,type:def?.properties?.type || null,flags:def?.flags ?? null,
-                walkable:t.isWalkable?.() ?? null};
+                walkable:t.isWalkable?.() ?? null,
+                notPathable:typeof PropBitFlag !== "undefined" && typeof t.hasFlag === "function"
+                    ? !!t.hasFlag(PropBitFlag.prototype.flags.DatFlagNotPathable) : null};
         };
         if (from) for(let dy=-4;dy<=4;dy++) for(let dx=-4;dx<=4;dx++) {
             const position={x:from.x+dx,y:from.y+dy,z:from.z},tile=getFollowFloorTile(position);
@@ -1221,7 +1223,10 @@ addCleanup(() => {
             enabled:customFollowState.followFloors,distance:customFollowState.distance,reason:customFollowState.transitionReason,
             player:followFloorPosition(client?.player?.getPosition?.()),leader:followFloorState.lastSeen,
             evidence:followFloorState.evidence,lastStep:followFloorState.lastStep,
-            lastSharedFloor:followFloorState.lastSharedFloor,pending:followFloorState.trail,samples};
+            lastSharedFloor:followFloorState.lastSharedFloor,pending:followFloorState.trail,
+            movement:{destination:customFollowState.destinationKey,steps:customFollowState.batchPathPositions,
+                progress:customFollowState.progressKey,progressAt:customFollowState.progressAt,
+                lastStopReason:customFollowState.lastStopReason || null},samples};
     }
     function getFollowDiagnostics() {
         // Freeze only serializable snapshots, with one retained failure report.
@@ -1769,6 +1774,18 @@ addCleanup(() => {
         return false;
     }
 
+    function isFollowWalkableParcel(item) {
+        if (!item || item.isWalkable?.() !== true) return false;
+        const client = window.gameClient;
+        const def = client?.itemDefinitionsByCid?.[item.id];
+        if ((Number(def?.flags) & 1) !== 0) return false;
+        const sid = Number(item.sid ?? def?.sid ?? client?.sidByCid?.[item.id]);
+        // Parcel sprites can carry DAT NotPathable while still allowing steps.
+        // Override only that routing hint, never their live walkability or the
+        // ground/other objects beneath and above them.
+        return sid === 2595 || sid === 2596;
+    }
+
     function isFollowFieldPassableTile(
         tile,
         options = {}
@@ -1847,8 +1864,8 @@ addCleanup(() => {
             }
         } catch (e) {}
 
-        // Ignore only magic-field stack items. Walls/furniture/etc remain hard
-        // blockers.
+        // Ignore magic fields and verified walkable object routing hints.
+        // Every other stack obstacle still blocks the tile.
         for (const item of items) {
             if (
                 !item ||
@@ -1856,6 +1873,7 @@ addCleanup(() => {
                     item
                 ) ||
                 isKnownFollowWalkableObject(item) ||
+                isFollowWalkableParcel(item) ||
                 (transitionDestination && followTransitionThing(item))
             ) {
                 continue;
@@ -3549,7 +3567,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.255",
+        version: "1.6.258",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -50134,17 +50152,30 @@ window.__minibiaBotBundle.installClientImprovements = function(bot) {
 
 window.__minibiaBotBundle.installClientExtras=function(bot){
  const key='minibiaBot.clientExtras.config';const config={blessingGuard:false,maxLoss:10,minPilgrimages:0,requireTemple:false,requireWard:false,conditions:[],...bot.storage.get(key,{})};
- let inventory=[],loot=null,tasks=null,quests=null,blessings=null,disposed=false,player=null,inventoryAt=0;const fired=new Set(),cleanups=[];let renderUi=()=>{},lastInventoryRequest=0;
+ let inventory=[],loot=null,tasks=null,quests=null,blessings=null,disposed=false,player=null,inventoryAt=0,tasksAt=0,questsAt=0,progressClient=null;const fired=new Set(),cleanups=[];let renderUi=()=>{},lastInventoryRequest=0;
  config.conditions=Array.isArray(config.conditions)?config.conditions:[];
  const persist=()=>bot.storage.set(key,{...config});
- const sync=()=>{const p=window.gameClient?.player;if(p!==player){player=p;inventory=[];loot=tasks=quests=blessings=null;inventoryAt=0;fired.clear();}};
+ const sync=()=>{const c=window.gameClient,p=c?.player;if(p!==player||c!==progressClient){progressClient=c;player=p;inventory=[];loot=tasks=quests=blessings=null;inventoryAt=tasksAt=questsAt=0;fired.clear();}};
  const textCommand=cmd=>window.gameClient?.interface?.channelManager?.sendMessageText?.(cmd,undefined,true);
  function hook(name,accept){const proto=typeof PacketReader!=='undefined'?PacketReader.prototype:null,original=proto?.[name];if(typeof original!=='function')return;const wrapper=function(...args){const result=original.apply(this,args);if(!disposed){sync();accept(result);renderUi();}return result;};proto[name]=wrapper;cleanups.push(()=>{if(proto[name]===wrapper)proto[name]=original;});}
  hook('readInventoryList',r=>{inventory=Array.isArray(r?.items)?r.items:[];inventoryAt=Date.now();});
- hook('readLootListInfo',r=>{if(r)loot=r;});hook('readTaskInfo',r=>{tasks=r;evaluate();});hook('readQuestLog',r=>{quests=r;evaluate();});hook('readBlessingUpdate',r=>{blessings=r;});
+ hook('readLootListInfo',r=>{if(r)loot=r;});hook('readTaskInfo',r=>{if(r&&['hunting','magic','delivery'].some(k=>r[k]&&typeof r[k].active==='boolean')){tasks=r;tasksAt=Date.now();evaluate();}});hook('readQuestLog',r=>{if(r&&Array.isArray(r.achievements)&&Array.isArray(r.questChests)){quests=r;questsAt=Date.now();evaluate();}});hook('readBlessingUpdate',r=>{blessings=r;});
  function requestInventory(){sync();const now=Date.now();if(now-lastInventoryRequest<1000)return false;if(typeof InventoryListQueryPacket!=='function'||!window.gameClient?.send)return false;lastInventoryRequest=now;window.gameClient.send(new InventoryListQueryPacket());return true;}
- function rows(){const result=[];for(const kind of ['hunting','magic','delivery']){const t=tasks?.[kind];if(t?.active)result.push({kind:'task',name:String(t.name||t.monster||kind),current:Number(t.progress)||0,required:Number(t.count)||0,completed:!!t.claimed||(Number(t.count)>0&&Number(t.progress)>=Number(t.count))});}for(const q of quests?.achievements||[])result.push({kind:'quest',name:String(q.name),current:Number(q.current)||0,required:Number(q.required)||0,completed:!!q.completed});for(const q of quests?.questChests||[])result.push({kind:'quest',name:String(q.name),current:q.completed?1:0,required:1,completed:!!q.completed});return result;}
- function matches(rule){sync();const name=String(rule.name||'').trim().toLowerCase();if(!name)return false;const row=rows().find(r=>r.kind===rule.kind&&r.name.toLowerCase()===name);if(!row)return false;return rule.condition==='count'?row.current>=Math.max(0,Number(rule.count)||0):row.completed;}
+ function rows(){
+  sync();const result=[],count=n=>Number.isFinite(Number(n))&&n!=null?Math.max(0,Number(n)):null;
+  for(const type of ['hunting','magic','delivery']){
+   const t=tasks?.[type];if(!t?.active)continue;
+   const name=String(t.name||t.monster||(type==='delivery'?'Delivery Errand':type));
+   const required=type==='delivery'?1:count(t.count),current=type==='delivery'?(t.claimed?1:0):count(t.progress);
+   result.push({key:`task:${type}:${name}`,kind:'task',category:{hunting:'Hunting task',magic:'Magic task',delivery:'Delivery task'}[type],name,legacyName:String(t.name||t.monster||type),current,required,
+    completed:!!t.claimed||(required>0&&current!=null&&current>=required),claimed:!!t.claimed,updatedAt:tasksAt});
+  }
+  for(const q of quests?.achievements||[])result.push({key:`quest:${q.id}`,kind:'quest',category:Number(q.id)>=59000?'Quest':'Achievement',name:String(q.name),
+   current:count(q.current),required:count(q.required),completed:!!q.completed,updatedAt:questsAt});
+  for(const q of quests?.questChests||[])result.push({key:`chest:${q.name}`,kind:'quest',category:'Quest chest',name:String(q.name),current:q.completed?1:0,required:1,completed:!!q.completed,updatedAt:questsAt});
+  return result;
+ }
+ function matches(rule){sync();const name=String(rule.name||'').trim().toLowerCase();if(!name)return false;const row=rows().find(r=>r.kind===rule.kind&&(r.name.toLowerCase()===name||r.legacyName?.toLowerCase()===name));if(!row)return false;return rule.condition==='count'?row.current!=null&&row.current>=Math.max(0,Number(rule.count)||0):row.completed;}
  function evaluate(){if(disposed||!bot.cave?.isRunning?.())return;for(let i=0;i<config.conditions.length;i++){const r=config.conditions[i];if(!r.enabled||fired.has(i)||!matches(r))continue;if(r.action==='label'){if(!String(r.label||'').trim())continue;const ok=bot.goToLabel?.(r.label);if(!ok){fired.add(i);bot.log('Progress condition: label not found: '+r.label);continue;}}else bot.cave.stop();fired.add(i);bot.log('Progress condition reached: '+r.name);break;}}
  function canStart(){sync();if(!config.blessingGuard)return true;const b=blessings||window.gameClient?.player?.blessings;const ok=!!b&&Number(b.lossPercent)<=Number(config.maxLoss)&&Number(b.pilgrimageCount)>=Number(config.minPilgrimages)&&(!config.requireTemple||b.hasTemple)&&(!config.requireWard||b.hasWard);if(!ok)bot.log('CaveBot start blocked by blessing protection settings; check Status');return ok;}
  function applyNative(values){const client=window.gameClient,settings=client?.interface?.settings;if(!settings?.__state||typeof AutoLootSettingsPacket!=='function'||!client.send)throw new Error('Native settings unavailable');const ids=['auto-loot-gold','auto-loot-food','auto-open-corpse','auto-refill-ammo','auto-eat-food','auto-convert-loot','reopen-containers'];const flags=ids.map(id=>!!values[id]);client.send(new AutoLootSettingsPacket(...flags));for(let i=0;i<ids.length;i++){settings.__state[ids[i]]=flags[i];const input=document.getElementById(ids[i]);if(input)input.checked=flags[i];}try{localStorage.setItem('settings',JSON.stringify(settings.__state));}catch(e){}return true;}
@@ -59506,6 +59537,29 @@ function upgradeSectionHeaders(panel) {
     </div>
   </div>
 
+  <div class="mb-section">
+    <div class="mb-section-title">
+      <input type="checkbox" id="minibia-bot-task-tracker-enabled" class="mb-title-toggle" />
+      <span class="mb-title-text">⚑ Task &amp; Quest Tracker</span>
+    </div>
+    <div class="mb-stack">
+      <input type="search" id="minibia-bot-task-tracker-search" placeholder="Find a task, quest or achievement…" aria-label="Search tasks and quests" />
+      <div style="display:flex;align-items:center;gap:6px;">
+        <select id="minibia-bot-task-tracker-select" aria-label="Task or quest to add" style="flex:1;width:100%;min-width:0;">
+          <option value="">Refresh to load tasks and quests…</option>
+        </select>
+        <button type="button" class="mb-small-button" id="minibia-bot-task-tracker-add" disabled>Add</button>
+      </div>
+      <div id="minibia-bot-task-tracker-list" style="max-height:220px;overflow:auto;"></div>
+      <div style="display:flex;align-items:center;gap:6px;">
+        <button type="button" class="mb-small-button" id="minibia-bot-task-tracker-refresh">Refresh list</button>
+        <span class="mb-small-note">Updates every 15s while enabled.</span>
+      </div>
+      <div class="mb-small-note" id="minibia-bot-task-tracker-status"></div>
+      <div class="mb-small-note">Shows each tracked counter beside TTL, even when the Performance overlay is off.</div>
+    </div>
+  </div>
+
   <!-- Name Spoofer -->
   <div class="mb-section">
     <div class="mb-section-title">
@@ -64387,7 +64441,9 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
     let ttlLastUpdateAt = 0;
     let ttlRow = null;
     function updateTTLRow() {
-        if (uiTweaksDestroyed || !config.ttlEnabled) return;
+        if (uiTweaksDestroyed) return;
+        bot.taskTracker?.renderOverlay?.();
+        if (!config.ttlEnabled) return;
         const overlay = document.getElementById("debug-statistics")
             || document.getElementById("debugger-statistics")
             || document.getElementById("debug-overlay")
@@ -64410,7 +64466,7 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
     let ttlInstallTimer = null;
 
     function installTTL() {
-        if (uiTweaksDestroyed || !config.ttlEnabled) return;
+        if (uiTweaksDestroyed || (!config.ttlEnabled && !bot.taskTracker?.enabled?.())) return;
         const instance = window.gameClient?.renderer?.debugger;
         if (ttlState.installed && ttlState.debuggerInstance === instance) return;
         if (ttlState.installed) uninstallTTL();
@@ -64435,7 +64491,7 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
         ttlState.installed = true;
         updateTTLRow();
         ttlState.intervalId = setInterval(() => {
-            if (uiTweaksDestroyed || !config.ttlEnabled) return;
+            if (uiTweaksDestroyed || (!config.ttlEnabled && !bot.taskTracker?.enabled?.())) return;
             installTTL(); // Rebind if reconnect replaces the debugger instance.
             updateTTLRow();
         }, 1000);
@@ -64464,7 +64520,8 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
     }
 
     function applyTTL() {
-        if (config.ttlEnabled) {
+        if (!config.ttlEnabled) { ttlRow?.remove(); ttlRow=null; ttlLastUpdateAt=0; }
+        if (config.ttlEnabled || bot.taskTracker?.enabled?.()) {
             installTTL();
         } else {
             uninstallTTL();
@@ -64795,6 +64852,7 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
 
 // ---- Bind controls to the panel's UI Tweaks tab ----
 function bindControls(panel) {
+    bot.taskTracker?.mount(panel);
     if (!panel || panel.dataset.uiTweaksBound === "true") return;
     panel.dataset.uiTweaksBound = "true";
 
@@ -64964,6 +65022,240 @@ function bindControls(panel) {
         uninstallTTL,
         bindControls, 
     };
+};
+
+window.__minibiaBotBundle.installProgressTracker = function installProgressTracker(bot) {
+    const storageKey = 'minibiaBot.taskTracker.config';
+    const config = Object.assign({enabled:false, selectedKey:'', selectedName:''}, bot.storage.get(storageKey, {}));
+    config.enabled = config.enabled === true;
+    config.selectedKey = String(config.selectedKey || '');
+    config.selectedName = String(config.selectedName || '');
+    const saved = Array.isArray(config.tracked) ? config.tracked :
+        config.selectedKey ? [{key:config.selectedKey,name:config.selectedName}] : [];
+    const seen = new Set();
+    config.tracked = saved.filter(entry => {
+        if (!entry || typeof entry.key !== 'string' || !entry.key || seen.has(entry.key)) return false;
+        seen.add(entry.key); return true;
+    }).map(entry => ({key:entry.key,name:String(entry.name || 'Selected task')}));
+    delete config.selectedKey; delete config.selectedName;
+    let disposed = false, client = null, player = null, manager = null, channels = null;
+    let restoreBindings = () => {}, pendingTask = null, sendingTask = false;
+    let lastTaskRequest = null, lastQuestRequest = null, initialRefresh = true;
+    let overlayRow = null, overlayAt = 0, controls = null, listSignature = '';
+    const persist = () => bot.storage.set(storageKey, {...config});
+    const taskPayload = data => data && ['hunting','magic','delivery'].some(k =>
+        data[k] && typeof data[k] === 'object' && typeof data[k].active === 'boolean');
+
+    function ensureSession() {
+        const next = window.gameClient, nextPlayer = next?.player;
+        const mm = next?.interface?.modalManager, cm = next?.interface?.channelManager;
+        if (next === client && nextPlayer === player && mm === manager && cm === channels) return;
+        restoreBindings();
+        client = next; player = nextPlayer; manager = mm; channels = cm;
+        pendingTask = null; lastTaskRequest = lastQuestRequest = null; initialRefresh = true;
+        overlayAt = 0; listSignature = '';
+        const boundClient = client, boundPlayer = player;
+        const open = mm?.open, send = cm?.sendMessageText;
+        let openWrapper = null, sendWrapper = null;
+        if (typeof open === 'function' && typeof send === 'function') {
+            openWrapper = function(id, info) {
+                const pending = pendingTask;
+                // /task normally opens the Journal. Consume only a response to
+                // this tracker's outstanding read, leaving other modals alone.
+                if (!disposed && window.gameClient === boundClient && boundClient?.player === boundPlayer &&
+                    id === 'task-info-modal' && taskPayload(info) && pending && Date.now() <= pending.until) {
+                    pendingTask = null;
+                    const modal = mm.get?.(id);
+                    if (modal) modal.__info = info;
+                    return modal || null;
+                }
+                return open.apply(this, arguments);
+            };
+            sendWrapper = function(text) {
+                // A manual /task always retains the game's normal open behavior.
+                if (!sendingTask && /^\/task(?:\s|$)/i.test(String(text).trim())) pendingTask = null;
+                return send.apply(this, arguments);
+            };
+            mm.open = openWrapper; cm.sendMessageText = sendWrapper;
+        }
+        restoreBindings = () => {
+            if (mm?.open === openWrapper) mm.open = open;
+            if (cm?.sendMessageText === sendWrapper) cm.sendMessageText = send;
+        };
+    }
+
+    function request(kind) {
+        if (disposed) return false;
+        ensureSession();
+        if (!player || client?.isConnected?.() === false) return false;
+        const now = Date.now();
+        const last = kind === 'task' ? lastTaskRequest : lastQuestRequest;
+        if (last !== null && now - last < 2000) return false;
+        try {
+            if (kind === 'task') {
+                if (!manager || !channels || typeof manager.open !== 'function' || typeof channels.sendMessageText !== 'function') return false;
+                if (pendingTask && now <= pendingTask.until) return false;
+                lastTaskRequest = now;
+                pendingTask = {until:now + 10000};
+                sendingTask = true;
+                try { channels.sendMessageText('/task', undefined, true); }
+                finally { sendingTask = false; }
+            } else {
+                if (typeof QuestLogPacket !== 'function' || typeof client.send !== 'function') return false;
+                lastQuestRequest = now;
+                client.send(new QuestLogPacket(0));
+            }
+            return true;
+        } catch (error) {
+            if (kind === 'task') pendingTask = null;
+            return false;
+        }
+    }
+
+    function refresh() {
+        const tasks = request('task'), quests = request('quest');
+        if (tasks || quests) initialRefresh = false;
+        return tasks || quests;
+    }
+    function currentRows() { return bot.progress?.rows?.() || []; }
+    function trackedRows() {
+        const rows = new Map(currentRows().map(row => [row.key,row]));
+        return config.tracked.map(entry => ({entry,row:rows.get(entry.key) || null}));
+    }
+    function label(row, entry = null) {
+        if (!row) return entry ? `${entry.name} · Waiting for server progress` : 'Add a task or quest to track';
+        const count = row.required > 0 ? `${row.current ?? '?'} / ${row.required}` : (row.completed ? 'Complete' : 'In progress');
+        const done = row.completed ? (row.claimed ? ' · Claimed ✓' : ' · Complete ✓') : '';
+        const stale = Date.now() - row.updatedAt > 45000 ? ' · last received' : '';
+        return `${row.name} · ${count}${done}${stale}`;
+    }
+
+    function renderOverlay() {
+        if (disposed || !config.enabled) { overlayRow?.remove(); overlayRow = null; return; }
+        const overlay = document.getElementById('debug-statistics') || document.getElementById('debugger-statistics')
+            || document.getElementById('debug-overlay') || document.getElementById('performance-overlay');
+        if (!overlay) return;
+        if (!overlayRow) {
+            overlayRow = document.createElement('div'); overlayRow.id = 'mb-task-tracker-inline-row';
+            Object.assign(overlayRow.style, {color:'#a9d8ff',fontWeight:'bold',marginTop:'2px',pointerEvents:'none'});
+            overlayAt = 0;
+        }
+        if (!overlayAt || Date.now() - overlayAt >= 1000) {
+            overlayAt = Date.now();
+            overlayRow.replaceChildren();
+            const tracked = trackedRows();
+            if (!tracked.length) overlayRow.textContent = '⚑ Add a task or quest to track';
+            for (const {entry,row} of tracked) {
+                const line = document.createElement('div');
+                line.textContent = '⚑ ' + label(row,entry);
+                line.style.color = row?.completed ? '#9f9' : '#a9d8ff';
+                overlayRow.appendChild(line);
+            }
+        }
+        // The native HUD replaces innerHTML on every statistics update.
+        if (overlayRow.parentElement !== overlay) overlay.appendChild(overlayRow);
+    }
+
+    function setEnabled(enabled) {
+        config.enabled = enabled === true; persist(); overlayAt = 0;
+        ensureSession();
+        if (config.enabled) refresh();
+        else { overlayRow?.remove(); overlayRow = null; }
+        bot.uiTweaks?.applyTTL?.(); renderControls(); renderOverlay();
+    }
+    function choose(key) {
+        const row = currentRows().find(row => row.key === key);
+        if (!row || config.tracked.some(entry => entry.key === key)) return false;
+        config.tracked.push({key:row.key,name:row.name});
+        persist(); overlayAt = 0; listSignature = '';
+        if (controls) controls.select.value = '';
+        if (config.enabled) request(row.kind);
+        renderControls(); renderOverlay();
+        return true;
+    }
+    function remove(key) {
+        config.tracked = config.tracked.filter(entry => entry.key !== key);
+        persist(); overlayAt = 0; listSignature = '';
+        renderControls(); renderOverlay();
+    }
+    function renderControls() {
+        if (!controls) return;
+        const {enabled, search, select, status, add, list} = controls;
+        enabled.checked = config.enabled;
+        const rows = currentRows(), query = search.value.trim().toLowerCase();
+        const keys = new Set(config.tracked.map(entry => entry.key));
+        const signature = JSON.stringify([query,config.tracked,rows.map(r => [r.key,r.name,r.category])]);
+        if (signature !== listSignature) {
+            listSignature = signature;
+            const previous = select.value; select.replaceChildren();
+            const option = (value,text) => { const el=document.createElement('option');el.value=value;el.textContent=text;select.appendChild(el); };
+            option('', rows.length ? 'Choose another task or quest…' : 'Refresh to load tasks and quests…');
+            const available = rows.filter(row => !keys.has(row.key) && `${row.name} ${row.category}`.toLowerCase().includes(query));
+            for (const row of available) option(row.key, `${row.category} · ${row.name}`);
+            select.value = available.some(row => row.key === previous) ? previous : '';
+        }
+        add.disabled = !select.value;
+        const tracked = trackedRows();
+        // Rebuild the small selected list only when its displayed content changes.
+        const trackedSignature = JSON.stringify(tracked.map(({entry,row}) => [entry.key,label(row,entry)]));
+        if (trackedSignature !== controls.trackedSignature) {
+            controls.trackedSignature = trackedSignature; list.replaceChildren();
+            for (const {entry,row} of tracked) {
+                const line = document.createElement('div');
+                line.style.cssText = 'display:flex;align-items:center;gap:6px;padding:5px 0;border-bottom:1px solid #333';
+                const text = document.createElement('span');text.textContent=label(row,entry);text.style.cssText='flex:1;min-width:0;overflow-wrap:anywhere';
+                const button = document.createElement('button');button.type='button';button.className='mb-small-button';button.textContent='Remove';
+                button.setAttribute('aria-label','Remove '+entry.name+' from tracker');
+                button.dataset.trackerKey=entry.key;
+                line.appendChild(text);line.appendChild(button);list.appendChild(line);
+            }
+        }
+        status.textContent = config.tracked.length ? `${config.tracked.length} tracked · Updates every 15s while enabled.`
+            : rows.length ? `${rows.length} available · Choose an entry and click Add.` : 'Refresh the list, then add what you want to track.';
+    }
+    function mount(panel) {
+        if (disposed || controls) return;
+        const get = id => panel.querySelector('#minibia-bot-task-tracker-' + id);
+        const enabled = get('enabled'), search = get('search'), select = get('select'), refreshButton = get('refresh'), status = get('status'), add = get('add'), list = get('list');
+        if (!enabled || !search || !select || !refreshButton || !status || !add || !list) return;
+        controls = {enabled,search,select,status,add,list};
+        const bindings = [[enabled,'change',()=>setEnabled(enabled.checked)], [search,'input',renderControls],
+            [select,'change',()=>{ add.disabled = !select.value; }], [add,'click',()=>choose(select.value)],
+            [list,'click',event=>{
+                const button = event.target.closest('button[data-tracker-key]');
+                if (button && list.contains(button)) remove(button.dataset.trackerKey);
+            }], [refreshButton,'click',()=>{
+                const requested = refresh(); renderControls();
+                if (requested) status.textContent = 'Refreshing task and quest progress…';
+            }]];
+        for (const [el,event,fn] of bindings) el.addEventListener(event,fn);
+        controls.cleanup = () => { for (const [el,event,fn] of bindings) el.removeEventListener(event,fn); };
+        renderControls();
+    }
+    function tick() {
+        if (disposed) return;
+        ensureSession();
+        if (config.enabled && player) {
+            if (initialRefresh) refresh();
+            else {
+                // A single snapshot contains every entry of that source type.
+                // Multiple counters never multiply requests to the server.
+                const kinds = new Set(config.tracked.map(entry => entry.key.startsWith('task:') ? 'task' : 'quest'));
+                for (const kind of kinds) {
+                    const last = kind === 'task' ? lastTaskRequest : lastQuestRequest;
+                    if (last === null || Date.now() - last >= 15000) request(kind);
+                }
+            }
+        }
+        renderControls(); renderOverlay();
+    }
+    bot.taskTracker = {config,enabled:()=>!disposed && config.enabled,mount,refresh,choose,remove,setEnabled,renderOverlay};
+    const timer = setInterval(tick, 1000);
+    bot.addCleanup(() => {
+        disposed = true; clearInterval(timer); restoreBindings(); pendingTask = null;
+        controls?.cleanup?.(); controls = null; overlayRow?.remove(); overlayRow = null;
+    });
+    tick(); bot.uiTweaks?.applyTTL?.();
 };
 
 window.__minibiaBotBundle.installCustomNotificationModule = function installCustomNotificationModule(bot) {
@@ -67430,6 +67722,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         currentBundle.installExoriModule(bot);
         currentBundle.installSupportModule(bot);
         currentBundle.installUiTweaksModule(bot);
+        currentBundle.installProgressTracker(bot);
         currentBundle.installDepositerModule(bot);
         currentBundle.installNpcSupplyBuyerModule(bot);
         currentBundle.installBankNpcModule(bot);
