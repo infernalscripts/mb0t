@@ -3567,7 +3567,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.259",
+        version: "1.6.260",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -59530,6 +59530,12 @@ function upgradeSectionHeaders(panel) {
       <div class="mb-small-note">Displays remaining time until next level (requires Debugger overlay).</div>
 
       <label class="mb-toggle" style="margin-top:8px;">
+        <input type="checkbox" id="minibia-bot-ui-soul-enabled" />
+        <span>Show Soul Points</span>
+      </label>
+      <div class="mb-small-note">Shows current soul points beside TTL and task counters, even with Performance switched off.</div>
+
+      <label class="mb-toggle" style="margin-top:8px;">
         <input type="checkbox" id="minibia-bot-ui-show-item-ids" />
         <span>Show SID / CID when looking at items</span>
       </label>
@@ -64264,6 +64270,7 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
         spoofedName: "",
         hideFloatingPopups: false,
         ttlEnabled: false,
+        soulEnabled: false,
         hideLootMessages: false,
     }, bot.storage.get(configStorageKey, {}));
 
@@ -64440,15 +64447,35 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
 
     let ttlLastUpdateAt = 0;
     let ttlRow = null;
+    let soulRow = null;
+    function updateSoulRow(overlay) {
+        if (uiTweaksDestroyed || !config.soulEnabled) return;
+        if (!soulRow) {
+            soulRow = document.createElement("div");
+            soulRow.id = "soul-inline-row";
+            Object.assign(soulRow.style, {color:"#b9cfff",fontWeight:"bold",marginTop:"2px",pointerEvents:"none"});
+        }
+        // SOUL property packets update the current player's state directly.
+        // Missing data is unknown, including worlds with soul points disabled.
+        const value = window.gameClient?.player?.state?.soul;
+        const known = typeof value === "number" && Number.isFinite(value) && value >= 0;
+        const text = "Soul: " + (known ? Math.trunc(value) : "—");
+        if (soulRow.textContent !== text) soulRow.textContent = text;
+        soulRow.title = known ? "Current soul points" : "Soul points have not been received from the server";
+        if (soulRow.parentElement !== overlay) overlay.appendChild(soulRow);
+    }
+
     function updateTTLRow() {
         if (uiTweaksDestroyed) return;
         bot.taskTracker?.renderOverlay?.();
-        if (!config.ttlEnabled) return;
+        if (!config.ttlEnabled && !config.soulEnabled) return;
         const overlay = document.getElementById("debug-statistics")
             || document.getElementById("debugger-statistics")
             || document.getElementById("debug-overlay")
             || document.getElementById("performance-overlay");
         if (!overlay) return;
+        updateSoulRow(overlay);
+        if (!config.ttlEnabled) return;
         if (!ttlRow) {
             ttlRow = document.getElementById("ttl-inline-row") || document.createElement("div");
             ttlRow.id = "ttl-inline-row";
@@ -64466,7 +64493,7 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
     let ttlInstallTimer = null;
 
     function installTTL() {
-        if (uiTweaksDestroyed || (!config.ttlEnabled && !bot.taskTracker?.enabled?.())) return;
+        if (uiTweaksDestroyed || (!config.ttlEnabled && !config.soulEnabled && !bot.taskTracker?.enabled?.())) return;
         const instance = window.gameClient?.renderer?.debugger;
         if (ttlState.installed && ttlState.debuggerInstance === instance) return;
         if (ttlState.installed) uninstallTTL();
@@ -64491,7 +64518,7 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
         ttlState.installed = true;
         updateTTLRow();
         ttlState.intervalId = setInterval(() => {
-            if (uiTweaksDestroyed || (!config.ttlEnabled && !bot.taskTracker?.enabled?.())) return;
+            if (uiTweaksDestroyed || (!config.ttlEnabled && !config.soulEnabled && !bot.taskTracker?.enabled?.())) return;
             installTTL(); // Rebind if reconnect replaces the debugger instance.
             updateTTLRow();
         }, 1000);
@@ -64515,14 +64542,18 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
         ttlRow?.remove();
         ttlRow = null;
         document.getElementById("ttl-inline-row")?.remove();
+        soulRow?.remove(); soulRow = null;
+        document.getElementById("soul-inline-row")?.remove();
         ttlState.installed = false;
         bot.log("[TTL] Hook uninstalled.");
     }
 
     function applyTTL() {
         if (!config.ttlEnabled) { ttlRow?.remove(); ttlRow=null; ttlLastUpdateAt=0; }
-        if (config.ttlEnabled || bot.taskTracker?.enabled?.()) {
+        if (!config.soulEnabled) { soulRow?.remove(); soulRow=null; }
+        if (config.ttlEnabled || config.soulEnabled || bot.taskTracker?.enabled?.()) {
             installTTL();
+            updateTTLRow();
         } else {
             uninstallTTL();
         }
@@ -64863,6 +64894,7 @@ function bindControls(panel) {
     const applySpooferBtn = panel.querySelector("#minibia-bot-ui-apply-spoofer");
     const hidePopupsCheck = panel.querySelector("#minibia-bot-ui-hide-popups");
     const ttlCheck       = panel.querySelector("#minibia-bot-ui-ttl-enabled");
+    const soulCheck      = panel.querySelector("#minibia-bot-ui-soul-enabled");
     const hideLootCheck  = panel.querySelector("#minibia-bot-ui-hide-loot-messages");
 
     function refreshUI() {
@@ -64872,6 +64904,7 @@ function bindControls(panel) {
         if (spoofNameInput) spoofNameInput.value   = config.spoofedName || "";
         if (hidePopupsCheck) hidePopupsCheck.checked = config.hideFloatingPopups;
         if (ttlCheck)       ttlCheck.checked       = config.ttlEnabled;
+        if (soulCheck)      soulCheck.checked      = config.soulEnabled;
     }
 
     if (wideCheck) {
@@ -64920,6 +64953,13 @@ function bindControls(panel) {
     if (ttlCheck) {
         ttlCheck.addEventListener("change", function () {
             config.ttlEnabled = this.checked;
+            persistConfig();
+            applyTTL();
+        });
+    }
+    if (soulCheck) {
+        soulCheck.addEventListener("change", function () {
+            config.soulEnabled = this.checked;
             persistConfig();
             applyTTL();
         });
