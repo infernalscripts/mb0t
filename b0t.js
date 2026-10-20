@@ -4075,7 +4075,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.291",
+        version: "1.6.292",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -9356,6 +9356,7 @@ window.__minibiaBotBundle.installAutoHasteModule = function installAutoHasteModu
         controls.pauseWhileFighting.checked=config.pauseWhileFighting;
         if (document.activeElement!==controls.spell) controls.spell.value=config.spell;
         controls.status.textContent=state.reason;
+        controls.status.hidden=!state.running || /^(Ready|Haste active|Strong Haste active|Waiting for haste confirmation|Waiting for spell cooldown|Waiting for healing|Waiting for target to clear|Waiting for action)$/.test(state.reason);
     }
     function tryCast(now=Date.now()) {
         const gate=gates(now);state.reason=gate.reason;
@@ -40543,6 +40544,7 @@ window.__minibiaBotBundle.installAutoEatModule = function installAutoEatModule(b
         controls.item.title = food ? `${food.name || "Food"} · SID ${food.sid} · CID ${food.id}` : "Enter a food SID or CID, or use the picker";
         controls.pick.setAttribute("aria-pressed", String(capturing));
         if (!capturing && !controls.error) controls.status.textContent = state.reason;
+        controls.status.hidden = !capturing && !controls.error && (!state.running || ["Ready", "Food active", "Waiting for food timer"].includes(state.reason));
     }
     function cancelCapture() {
         capturing = false;
@@ -40631,7 +40633,7 @@ window.__minibiaBotBundle.installAutoEatModule = function installAutoEatModule(b
         const save = () => {
             const result = selectFood(item.value);
             controls.error = !result.ok;
-            if (!result.ok) { status.textContent = result.error; return; }
+            if (!result.ok) { status.textContent = result.error; status.hidden = false; return; }
             render(true);
         };
         bind(enabled, "change", () => { enabled.checked ? start() : stop(); onToggle(); render(); });
@@ -57160,7 +57162,7 @@ function upgradeSectionHeaders(panel) {
         const label = document.getElementById("minibia-bot-boots-swapper-status");
         if (label) {
             label.textContent = status?.reason || "";
-            label.hidden = !status?.running && !status?.selecting;
+            label.hidden = !status?.selecting && (!status?.running || /boots equipped$|^(Swap cooldown|Waiting for boots swap|Waiting for other action)$|^Switching to/.test(status?.reason || ""));
         }
     }
 
@@ -58743,97 +58745,45 @@ function upgradeSectionHeaders(panel) {
 #minibia-bot-panel .mb-pause-key[aria-pressed="true"],
 #minibia-bot-panel [data-pause-shortcut][data-paused="true"] [data-pause-status] {color:#ffe098;border-color:#d2b96e;}
 
-/* Compact Tools: balanced toggles and matching equipment controls. */
-#minibia-bot-panel .mb-tools-toggle-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 2px 18px;
+/* Compact Tools: one list of controls with matching item pickers. */
+#minibia-bot-panel .mb-tools-section {container-type:inline-size;padding:10px 12px;}
+#minibia-bot-panel .mb-tools-toggle-grid {display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:3px 12px;}
+#minibia-bot-panel .mb-tools-section .mb-toggle {margin:0;min-height:22px;font-size:11px;box-sizing:border-box;}
+#minibia-bot-panel .mb-tools-control-list {margin-top:7px;}
+#minibia-bot-panel .mb-tools-control {display:grid;grid-template-columns:102px minmax(0,1fr);align-items:center;gap:4px 9px;padding:8px 0;border-top:1px solid rgba(255,255,255,.07);}
+#minibia-bot-panel .mb-tools-control > .mb-toggle,
+#minibia-bot-panel .mb-tools-control-label .mb-toggle {font-weight:600;}
+#minibia-bot-panel .mb-tools-control-label {display:flex;align-items:center;gap:5px;flex-wrap:wrap;}
+#minibia-bot-panel .mb-tools-count {font-size:10px;color:#aaa;white-space:nowrap;}
+#minibia-bot-panel .mb-tools-value {display:grid;grid-template-columns:minmax(0,1fr) 26px;gap:5px;min-width:0;}
+#minibia-bot-panel .mb-tools-value input,
+#minibia-bot-panel .mb-tools-boot-value input,
+#minibia-bot-panel .mb-tools-haste-fields select {width:100%;min-width:0;height:26px;padding:3px 5px;box-sizing:border-box;border-radius:3px;font-size:11px;}
+#minibia-bot-panel .mb-tools-value input {text-align:left;}
+#minibia-bot-panel .mb-tools-section .mb-tools-picker {width:26px;height:26px;min-width:26px;padding:0;border-radius:3px;font-size:12px;line-height:1;}
+#minibia-bot-panel .mb-tools-picker[aria-pressed="true"] {border-color:#dbc691;}
+#minibia-bot-panel .mb-tools-haste-fields {display:grid;grid-template-columns:minmax(100px,1fr) auto;align-items:center;gap:8px;min-width:0;}
+#minibia-bot-panel .mb-tools-section .mb-tools-option {font-size:10px;white-space:nowrap;}
+#minibia-bot-panel .mb-tools-boots-values {display:grid;grid-template-columns:repeat(auto-fit,minmax(125px,1fr));gap:6px 10px;min-width:0;}
+#minibia-bot-panel .mb-tools-boot-value {display:grid;grid-template-columns:42px minmax(0,1fr) 26px;align-items:center;gap:4px;min-width:0;}
+#minibia-bot-panel .mb-tools-boot-value label {font-size:10px;color:var(--mb-hub-text-2,#bdbdbd);}
+#minibia-bot-panel .mb-tools-boot-value input {text-align:center;}
+#minibia-bot-panel .mb-tools-inline-status {grid-column:2;min-width:0;margin:0;font-size:10px;overflow-wrap:anywhere;}
+#minibia-bot-panel .mb-tools-inline-status[hidden] {display:none!important;}
+#minibia-bot-panel .mb-tools-options {grid-column:2;min-width:0;}
+#minibia-bot-panel .mb-tools-options > summary,
+#minibia-bot-panel .mb-tools-more > summary {cursor:pointer;font-size:10px;line-height:1.6;color:var(--mb-hub-muted,#aaa);}
+#minibia-bot-panel .mb-tools-ring-options {display:flex;flex-direction:column;gap:3px;padding:5px 0 1px;}
+#minibia-bot-panel .mb-tools-section .mb-tools-ring-options .mb-toggle {font-size:10px;}
+#minibia-bot-panel .mb-tools-more {border-top:1px solid rgba(255,255,255,.07);margin-top:2px;padding-top:7px;}
+#minibia-bot-panel .mb-tools-more > summary {font-size:11px;color:var(--mb-hub-text-2,#bdbdbd);}
+#minibia-bot-panel .mb-tools-more > .mb-tools-toggle-grid {margin-top:7px;}
+#minibia-bot-panel .mb-tools-more:has(input:checked) > summary::after {content:" · active";font-size:10px;color:#9bb88c;}
+@container (max-width:340px) {
+  #minibia-bot-panel .mb-tools-control {grid-template-columns:minmax(0,1fr);gap:5px;}
+  #minibia-bot-panel .mb-tools-inline-status,
+  #minibia-bot-panel .mb-tools-options {grid-column:1;}
 }
-#minibia-bot-panel .mb-tools-toggle-grid .mb-toggle {
-  margin: 0;
-  min-height: 22px;
-  box-sizing: border-box;
-}
-#minibia-bot-panel .mb-tools-equipment {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
-  gap: 8px;
-  margin-top: 10px;
-  padding-top: 10px;
-  border-top: 1px solid rgba(255,255,255,.08);
-}
-#minibia-bot-panel .mb-tools-equip-card {
-  display: flex;
-  flex-direction: column;
-  gap: 7px;
-  min-width: 0;
-  padding: 9px;
-  border: 1px solid rgba(255,255,255,.1);
-  border-radius: 4px;
-  background: rgba(0,0,0,.12);
-}
-#minibia-bot-panel .mb-tools-equip-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 6px;
-  min-height: 20px;
-}
-#minibia-bot-panel .mb-tools-equip-header .mb-toggle {
-  margin: 0;
-  font-weight: bold;
-}
-#minibia-bot-panel .mb-tools-count,
-#minibia-bot-panel .mb-tools-cooldown {
-  font-size: 10px;
-  color: #aaa;
-  white-space: nowrap;
-}
-#minibia-bot-panel .mb-tools-item-row {
-  display: grid;
-  grid-template-columns: 60px minmax(0, 1fr) 26px;
-  align-items: center;
-  gap: 5px;
-  min-width: 0;
-}
-#minibia-bot-panel .mb-tools-item-row label {
-  font-size: 10px;
-  color: #bdbdbd;
-}
-#minibia-bot-panel .mb-tools-item-row input {
-  min-width: 0;
-  height: 26px;
-  padding: 3px 4px;
-  border-radius: 3px;
-  text-align: center;
-}
-#minibia-bot-panel .mb-tools-item-row .mb-tools-picker {
-  width: 26px;
-  height: 26px;
-  min-width: 26px;
-  padding: 0;
-  border-radius: 3px;
-  font-size: 12px;
-  line-height: 1;
-}
-#minibia-bot-panel .mb-tools-picker[aria-pressed="true"] {
-  border-color: #dbc691;
-}
-#minibia-bot-panel .mb-tools-ring-options {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-#minibia-bot-panel .mb-tools-ring-options .mb-toggle {
-  font-size: 10px;
-  margin: 0;
-}
-#minibia-bot-panel .mb-tools-status {
-  font-size: 10px;
-  color: #aaa;
-  overflow-wrap: anywhere;
-}
-#minibia-bot-panel .mb-tools-status[hidden] { display: none; }
 
 /* ── Lists ── */
 #minibia-bot-panel .mb-list {
@@ -59853,75 +59803,78 @@ function upgradeSectionHeaders(panel) {
       <label class="mb-toggle"><input type="checkbox" id="minibia-bot-auto-magic-shield-enabled" /><span>Utamo Vita</span></label>
       <label class="mb-toggle" title="Conjure food when food time is below 60 seconds and mana is at least 30"><input type="checkbox" id="minibia-bot-conjure-food-enabled" /><span>Conjure Food</span></label>
       <label class="mb-toggle"><input type="checkbox" id="minibia-bot-auto-invisible-enabled" /><span>Invisible</span></label>
-      <label class="mb-toggle"><input type="checkbox" id="minibia-bot-light-hack-enabled" /><span>Light Hack (Full)</span></label>
-      <label class="mb-toggle"><input type="checkbox" id="minibia-bot-light-hack-legit-enabled" /><span>Light Hack (Utevo)</span></label>
-      <label class="mb-toggle"><input type="checkbox" id="minibia-bot-antiafk-enabled" /><span>Anti-AFK</span></label>
-      <label class="mb-toggle"><input type="checkbox" id="minibia-bot-autostacker-enabled" /><span>Auto Stacker</span></label>
-      <label class="mb-toggle"><input type="checkbox" id="minibia-bot-reconnect-enabled" /><span>Auto-Reconnect</span></label>
-      <label class="mb-toggle"><input type="checkbox" id="minibia-bot-autostacker-convert-currency" /><span>Convert Currency</span></label>
     </div>
 
-    <div class="mb-tools-equip-card" style="margin-top:8px;">
-      <div class="mb-tools-equip-header">
+    <div class="mb-tools-control-list">
+      <div class="mb-tools-control">
         <label class="mb-toggle"><input type="checkbox" id="minibia-bot-auto-eat-enabled" /><span>Eat Food</span></label>
+        <div class="mb-tools-value">
+          <input type="text" id="minibia-bot-auto-eat-item" placeholder="Food ID" autocomplete="off" aria-label="Food item ID or name" />
+          <button type="button" class="mb-small-button mb-tools-picker" id="minibia-bot-auto-eat-pick" title="Pick food from a bag, equipment slot or the ground" aria-label="Pick food item" aria-pressed="false">🔍</button>
+        </div>
+        <span class="mb-tools-inline-status mb-small-note" id="minibia-bot-auto-eat-status" aria-live="polite" hidden></span>
       </div>
-      <div class="mb-tools-item-row">
-        <label for="minibia-bot-auto-eat-item">Food</label>
-        <input type="text" id="minibia-bot-auto-eat-item" placeholder="Item ID" autocomplete="off" aria-label="Food item ID or name" />
-        <button type="button" class="mb-small-button mb-tools-picker" id="minibia-bot-auto-eat-pick" title="Pick food from a bag, equipment slot or the ground" aria-label="Pick food item" aria-pressed="false">🔍</button>
-      </div>
-      <div class="mb-small-note" id="minibia-bot-auto-eat-status">Off</div>
-    </div>
 
-    <div class="mb-tools-equip-card" style="margin-top:8px;">
-      <div class="mb-tools-equip-header">
-        <label class="mb-toggle"><input type="checkbox" id="minibia-bot-haste-enabled" /><span>Auto Haste</span></label>
-        <select id="minibia-bot-haste-spell" aria-label="Auto Haste spell" style="width:auto;min-width:130px;">
-          <option value="haste">Haste</option>
-          <option value="strong">Strong Haste</option>
-        </select>
+      <div class="mb-tools-control">
+        <label class="mb-toggle" title="Casts your selected spell when neither haste effect is active."><input type="checkbox" id="minibia-bot-haste-enabled" /><span>Auto Haste</span></label>
+        <div class="mb-tools-haste-fields">
+          <select id="minibia-bot-haste-spell" aria-label="Auto Haste spell">
+            <option value="haste">Haste</option>
+            <option value="strong">Strong Haste</option>
+          </select>
+          <label class="mb-toggle mb-tools-option" title="Stop auto haste while you have an attack target; resume when the target clears."><input type="checkbox" id="minibia-bot-haste-pause-fighting" /><span>Skip combat</span></label>
+        </div>
+        <span class="mb-tools-inline-status mb-small-note" id="minibia-bot-haste-status" aria-live="polite" hidden></span>
       </div>
-      <div class="mb-small-note">Casts your selected spell when neither haste effect is active.</div>
-      <label class="mb-toggle" title="Resumes automatically when your attack target clears."><input type="checkbox" id="minibia-bot-haste-pause-fighting" /><span>Stop while fighting a target</span></label>
-      <div class="mb-small-note" id="minibia-bot-haste-status">Off</div>
-    </div>
 
-    <div class="mb-tools-equipment">
-      <div class="mb-tools-equip-card">
-        <div class="mb-tools-equip-header">
+      <div class="mb-tools-control">
+        <div class="mb-tools-control-label">
           <label class="mb-toggle"><input type="checkbox" id="minibia-bot-equip-ring-enabled" /><span>Equip Ring</span></label>
           <span class="mb-tools-count" id="minibia-bot-equip-ring-count" title="Server inventory count"></span>
         </div>
-        <div class="mb-tools-item-row">
-          <label for="minibia-bot-equip-ring-id">Ring ID</label>
+        <div class="mb-tools-value">
           <input type="number" id="minibia-bot-equip-ring-id" min="0" max="65535" step="1" placeholder="Any ring" title="Ring item ID. Empty or 0 = any ring." aria-label="Ring item ID" />
           <button type="button" class="mb-small-button mb-tools-picker" id="minibia-bot-equip-ring-select" title="Click, then click a ring in a backpack or equipment slot" aria-label="Select ring item ID" aria-pressed="false">🔍</button>
         </div>
-        <div class="mb-tools-ring-options">
-          <label class="mb-toggle" title="Safely stow the selected ring when mana is 98% or higher"><input type="checkbox" id="minibia-bot-equip-ring-unequip-98" /><span>Unequip at 98% mana</span></label>
-          <label class="mb-toggle" title="Alert when the server reports no matching ring in your inventory"><input type="checkbox" id="minibia-bot-equip-ring-warn" /><span>Alert missing ring</span></label>
-        </div>
+        <details class="mb-tools-options">
+          <summary>Ring options</summary>
+          <div class="mb-tools-ring-options">
+            <label class="mb-toggle" title="Safely stow the selected ring when mana is 98% or higher"><input type="checkbox" id="minibia-bot-equip-ring-unequip-98" /><span>Unequip at 98% mana</span></label>
+            <label class="mb-toggle" title="Alert when the server reports no matching ring in your inventory"><input type="checkbox" id="minibia-bot-equip-ring-warn" /><span>Alert missing ring</span></label>
+          </div>
+        </details>
       </div>
-      <div class="mb-tools-equip-card">
-        <div class="mb-tools-equip-header">
-          <label class="mb-toggle"><input type="checkbox" id="minibia-bot-boots-swapper-enabled" /><span>Boots Swapper</span></label>
-          <span class="mb-tools-cooldown" title="2-second swap cooldown; waits for 2 seconds without a target before switching back">2s</span>
+
+      <div class="mb-tools-control">
+        <label class="mb-toggle" title="Swap boots for idle and combat, with a 2-second cooldown."><input type="checkbox" id="minibia-bot-boots-swapper-enabled" /><span>Boots</span></label>
+        <div class="mb-tools-boots-values">
+          <div class="mb-tools-boot-value">
+            <label for="minibia-bot-boots-idle-id">Idle</label>
+            <input type="number" id="minibia-bot-boots-idle-id" min="1" max="65535" step="1" placeholder="ID" title="Boots to wear without a target" />
+            <button type="button" class="mb-small-button mb-tools-picker" id="minibia-bot-boots-idle-select" title="Pick no-target boots from a backpack or equipment slot" aria-label="Select no-target boots ID" aria-pressed="false">🔍</button>
+          </div>
+          <div class="mb-tools-boot-value">
+            <label for="minibia-bot-boots-combat-id">Combat</label>
+            <input type="number" id="minibia-bot-boots-combat-id" min="1" max="65535" step="1" placeholder="ID" title="Boots to wear with a selected target" />
+            <button type="button" class="mb-small-button mb-tools-picker" id="minibia-bot-boots-combat-select" title="Pick targeting boots from a backpack or equipment slot" aria-label="Select targeting boots ID" aria-pressed="false">🔍</button>
+          </div>
         </div>
-        <div class="mb-tools-item-row">
-          <label for="minibia-bot-boots-idle-id">No target</label>
-          <input type="number" id="minibia-bot-boots-idle-id" min="1" max="65535" step="1" placeholder="Boots ID" title="Boots to wear without a target" />
-          <button type="button" class="mb-small-button mb-tools-picker" id="minibia-bot-boots-idle-select" title="Pick no-target boots from a backpack or equipment slot" aria-label="Select no-target boots ID" aria-pressed="false">🔍</button>
-        </div>
-        <div class="mb-tools-item-row">
-          <label for="minibia-bot-boots-combat-id">Targeting</label>
-          <input type="number" id="minibia-bot-boots-combat-id" min="1" max="65535" step="1" placeholder="Boots ID" title="Boots to wear with a selected target" />
-          <button type="button" class="mb-small-button mb-tools-picker" id="minibia-bot-boots-combat-select" title="Pick targeting boots from a backpack or equipment slot" aria-label="Select targeting boots ID" aria-pressed="false">🔍</button>
-        </div>
-        <span class="mb-tools-status" id="minibia-bot-boots-swapper-status" aria-live="polite" hidden></span>
+        <span class="mb-tools-inline-status mb-tools-status" id="minibia-bot-boots-swapper-status" aria-live="polite" hidden></span>
       </div>
     </div>
-  </div>
 
+    <details class="mb-tools-more">
+      <summary title="Lighting, Anti-AFK, reconnect and inventory tools">Utilities</summary>
+      <div class="mb-tools-toggle-grid">
+        <label class="mb-toggle"><input type="checkbox" id="minibia-bot-light-hack-enabled" /><span>Light Hack (Full)</span></label>
+        <label class="mb-toggle"><input type="checkbox" id="minibia-bot-light-hack-legit-enabled" /><span>Light Hack (Utevo)</span></label>
+        <label class="mb-toggle"><input type="checkbox" id="minibia-bot-antiafk-enabled" /><span>Anti-AFK</span></label>
+        <label class="mb-toggle"><input type="checkbox" id="minibia-bot-reconnect-enabled" /><span>Auto-Reconnect</span></label>
+        <label class="mb-toggle"><input type="checkbox" id="minibia-bot-autostacker-enabled" /><span>Auto Stacker</span></label>
+        <label class="mb-toggle"><input type="checkbox" id="minibia-bot-autostacker-convert-currency" /><span>Convert Currency</span></label>
+      </div>
+    </details>
+  </div>
 
   <!-- Auto Pickup -->
   <div class="mb-section mb-tools-pickup">
@@ -59931,7 +59884,7 @@ function upgradeSectionHeaders(panel) {
       <span class="mb-small-note" id="minibia-bot-auto-pickup-status" aria-live="polite">Off</span>
     </div>
     <div class="mb-small-note">Collects during combat. While following, only the priority item takes a detour; other drops must be within reach.</div>
-    <details class="mb-tools-pickup-fold" data-pickup-priority open>
+    <details class="mb-tools-pickup-fold" data-pickup-priority>
       <summary>Priority item</summary>
       <label class="mb-small-note" style="display:flex;align-items:center;gap:6px;margin-top:6px;"><input type="checkbox" data-pickup-priority-enabled>Pause Follow until collected</label>
       <div class="mb-pickup-ignore-add">
@@ -59945,7 +59898,7 @@ function upgradeSectionHeaders(panel) {
       <div class="mb-small-note">Uses pickup radius. Follow resumes after pickup; failed attempts time out.</div>
       <div class="mb-small-note mb-pickup-ignore-status" data-pickup-priority-status role="status" aria-live="polite"></div>
     </details>
-    <details class="mb-tools-pickup-fold" data-pickup-allow open>
+    <details class="mb-tools-pickup-fold" data-pickup-allow>
       <summary>Selected items<span data-pickup-allow-count></span></summary>
       <label class="mb-small-note" style="display:flex;align-items:center;gap:6px;margin-top:6px;"><input type="checkbox" data-pickup-allow-enabled>Only pick up selected items</label>
       <div class="mb-pickup-ignore-add">
@@ -59958,7 +59911,7 @@ function upgradeSectionHeaders(panel) {
       <div class="mb-small-note">Applies to priority pickup too. Ignored items and corpses are always skipped.</div>
       <div class="mb-small-note mb-pickup-ignore-status" data-pickup-allow-status aria-live="polite"></div>
     </details>
-    <details class="mb-tools-pickup-fold" data-pickup-ignore open>
+    <details class="mb-tools-pickup-fold" data-pickup-ignore>
       <summary>Ignored items<span data-pickup-ignore-count></span></summary>
       <div class="mb-pickup-ignore-add">
         <input type="text" data-pickup-ignore-input list="minibia-bot-pickup-ignore-choices" placeholder="Item name or ID" aria-label="Item to ignore" autocomplete="off">
