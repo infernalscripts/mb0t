@@ -4075,7 +4075,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.292",
+        version: "1.6.293",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -58737,7 +58737,6 @@ function upgradeSectionHeaders(panel) {
 #minibia-bot-panel #minibia-bot-panic-item-alert-pick[aria-pressed="true"] {color:#ffe098;border-color:#d2b96e;}
 
 /* Pause shortcut: matches the compact Utility controls. */
-#minibia-bot-panel .mb-pause-shortcut .mb-section-title {display:flex;align-items:center;justify-content:space-between;gap:8px;}
 #minibia-bot-panel .mb-pause-controls {display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
 #minibia-bot-panel .mb-pause-key {min-width:72px;}
 #minibia-bot-panel [data-pause-action] {margin-left:auto;min-width:62px;}
@@ -59787,10 +59786,10 @@ function upgradeSectionHeaders(panel) {
 <!-- Utility Tab -->
 <div class="mb-tab-panel" data-tab-panel="utility">
   <div class="mb-section mb-pause-shortcut" data-pause-shortcut>
-    <div class="mb-section-title"><label class="mb-toggle"><input type="checkbox" data-pause-enabled aria-label="Enable keyboard stop / resume shortcut" /><span class="mb-title-text">Stop / resume shortcut</span></label><span class="mb-small-note" data-pause-status aria-live="polite">Shortcut off</span></div>
+    <div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-pause-enabled aria-label="Enable keyboard stop / resume shortcut" /><span class="mb-title-text">Stop / resume shortcut</span></div>
     <div class="mb-pause-controls">
       <button type="button" class="mb-small-button mb-pause-key" data-pause-key aria-label="Change pause shortcut" aria-pressed="false" title="Click, then press a key or key combination. Escape cancels.">Delete</button>
-      <span class="mb-small-note">CaveBot + Targeting</span>
+      <span class="mb-small-note" data-pause-status aria-live="polite" title="CaveBot + Targeting">Shortcut off</span>
       <button type="button" class="mb-small-button" data-pause-action aria-pressed="false">Stop</button>
     </div>
     <div class="mb-small-note mb-pause-note">Enable to use the key. Stops CaveBot and pauses Targeting; healing stays active. Click the key to change it.</div>
