@@ -4075,7 +4075,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.289",
+        version: "1.6.291",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -10282,6 +10282,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
         // v1.5.44: ignored names are a hard veto for every mb0t-created
         // target path, including access-clear and lure emergency overrides.
+        ignoredTrap: null,
         ignoredAutoTargetRejects: 0,
         ignoredAutoTargetReleases: 0,
         ignoredAccessBlockersSkipped: 0,
@@ -10544,6 +10545,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         targetPriorityNames: [],
         targetPriorityMatchMode: "exact",
         ignoredTargetNames: [],
+        attackIgnoredWhenTrapped: false,
         antiKSEnabled: true,
         antiKSSelfRange: 2,
         antiKSOtherRange: 2,
@@ -11345,9 +11347,152 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         );
     }
 
-    function isIgnoredTargetCreature(creature) {
+    function isConfiguredIgnoredCreature(creature) {
         return !!creature && (isIgnoredTargetName(creature.name) ||
             bot.combatRules?.targetRule?.(creature)?.mode === 'ignore');
+    }
+
+    function clearIgnoredTrapEscape(reason, release = true) {
+        const id = state.ignoredTrap?.targetId;
+        const current = getCurrentTarget();
+        if (release && id != null && current?.id === id && state.autoTargetId === id) {
+            clearCurrentTarget(); clearEngagedTarget();
+            state.movementOwner = null; state.movementOwnedUntil = 0;
+        }
+        state.ignoredTrap = null;
+        invalidateCandidateSnapshot();
+    }
+
+    function probeIgnoredTrapEscape(from) {
+        const client = window.gameClient, active = client?.world?.activeCreatures || {};
+        const creatures = active instanceof Map ? [...active.values()] : Object.values(active);
+        if (!creatures.some(c => isConfiguredIgnoredCreature(c) && isNativeVisibleMonster(c, true) &&
+            getChebyshevDistance(from, c.getPosition?.() || c.__position) <= 1)) return null;
+        const key = p => `${p.x},${p.y}`;
+        const occupants = new Map();
+        for (const creature of creatures) {
+            const p = normalizePosition(creature?.getPosition?.() || creature?.__position);
+            const health = Number(creature?.state?.health ?? creature?.health);
+            if (!p || p.z !== from.z || creature.id === client.player?.id || (Number.isFinite(health) && health <= 0)) continue;
+            const k = key(p); if (!occupants.has(k)) occupants.set(k, []);
+            occupants.get(k).push(creature);
+        }
+        // Only ordinary, loaded same-floor waypoints participate in route
+        // blockage checks. Script/transition behavior remains CaveBot's job.
+        const wp = bot.cave?.isRunning?.() && !bot.cave?.isMovementPaused?.() ? bot.cave?.getCurrentWaypoint?.() : null;
+        const goal = wp && !wp.script && !wp.rope && !wp.shovel && !wp.ladder && Number(wp.z) === from.z &&
+            Math.max(Math.abs(wp.x-from.x),Math.abs(wp.y-from.y)) <= 5 ? normalizePosition(wp) : null;
+        const tolerance = wp?.stand ? 0 : Math.max(0, Number(bot.cave?.config?.waypointTolerance) || 0);
+        const atGoal = p => goal && getChebyshevDistance(p, goal) <= tolerance;
+        const cache = new Map();
+        function step(fromPos, to, removeIgnored) {
+            if (!isTargetingStepPolicyAllowed(fromPos, to, "combat")) return null;
+            const k = key(to);
+            let reading = cache.get(k);
+            if (!reading) {
+                const tile = getTileAtPosition(to);
+                const staticAllowed = isSafeTargetApproachTile(to.x, to.y, to.z, true);
+                const blocked = staticAllowed && isTileOccupiedByCreature(to.x, to.y, to.z);
+                const list = [...(occupants.get(k) || [])];
+                for (const entry of tile?.monsters?.values?.() || []) {
+                    const c = (active instanceof Map ? active.get(entry?.id) : active[entry?.id]) || entry;
+                    const pos = normalizePosition(c?.getPosition?.() || c?.__position);
+                    if (pos && key(pos) === k && pos.z === to.z && !list.some(other => other.id === c.id) && !(Number(c.state?.health ?? c.health) <= 0)) list.push(c);
+                }
+                const ignored = list.filter(c => isConfiguredIgnoredCreature(c) && isNativeVisibleMonster(c, true));
+                const remaining = list.filter(c => !ignored.includes(c));
+                const removable = blocked && ignored.length > 0 && canTargetPassThroughCreatures(tile, remaining);
+                // Prefer the same blocker while it still seals the route.
+                ignored.sort((a,b) => Number(b.id === state.ignoredTrap?.targetId) - Number(a.id === state.ignoredTrap?.targetId));
+                reading = { staticAllowed, blocked, removable, first: ignored[0] || null };
+                cache.set(k, reading);
+            }
+            if (!reading.staticAllowed || (reading.blocked && !(removeIgnored && reading.removable))) return null;
+            return reading;
+        }
+        function search(removeIgnored) {
+            const queue = [{ ...from, first: null }], seen = new Set([key(from)]);
+            let escape = null, destination = null;
+            const offsets = [[0,-1],[1,0],[0,1],[-1,0],[-1,-1],[1,-1],[-1,1],[1,1]];
+            // Bounded loaded search; no native pathfinder cache is mutated.
+            for (let i=0; i<queue.length && i<169; i++) {
+                const p = queue[i], distance = getChebyshevDistance(from,p);
+                if (distance >= 4 && !escape) escape = p;
+                if (atGoal(p)) { destination = p; break; }
+                if (!goal && escape) break;
+                for (const [dx,dy] of offsets) {
+                    const next = {x:p.x+dx,y:p.y+dy,z:from.z};
+                    if (getChebyshevDistance(from,next)>6 || seen.has(key(next))) continue;
+                    const reading = step(p,next,removeIgnored);
+                    if (!reading) continue;
+                    seen.add(key(next));
+                    queue.push({...next,first:p.first || (reading.blocked ? reading.first : null)});
+                }
+            }
+            return { escape, destination };
+        }
+        const live = search(false);
+        if (live.destination || (!goal && live.escape)) return null;
+        const cleared = search(true);
+        const path = goal && !live.destination && cleared.destination ? cleared.destination : !live.escape ? cleared.escape : null;
+        const target = path?.first;
+        const pos = normalizePosition(target?.getPosition?.() || target?.__position);
+        if (!target || !pos || getChebyshevDistance(from,pos)>1) return null;
+        return { target, reason: goal && path === cleared.destination ? "ignored monster blocks CaveBot route" : "ignored monster seals escape" };
+    }
+
+    function syncIgnoredTrapEscape(now = Date.now()) {
+        const client = window.gameClient, player = client?.player;
+        const current = getCurrentTarget();
+        if (config.attackIgnoredWhenTrapped !== true || !state.running || !config.enabled || !player ||
+            !(player.state?.health > 0) || !(client.networkManager?.isConnected?.() === true || client.isConnected?.() === true) ||
+            isProtectionZoneBlocked(now) || bot.pauseHotkey?.isPaused?.() || bot.actions?.isHalted?.() || bot.gmKillSwitch?.isActive?.() ||
+            bot.autoPickup?.ownsMovement?.() || (current && state.autoTargetId !== current.id)) {
+            if (state.ignoredTrap) clearIgnoredTrapEscape("inactive");
+            return false;
+        }
+        const pos = normalizePosition(bot.getPlayerPosition());
+        if (!pos) { if (state.ignoredTrap) clearIgnoredTrapEscape("position unavailable"); return false; }
+        const positionKey = `${pos.x},${pos.y},${pos.z}`;
+        const moving = player.isMoving?.() || player.__preWalks?.length;
+        if (state.ignoredTrap?.key !== positionKey) {
+            if (state.ignoredTrap) clearIgnoredTrapEscape("movement resumed");
+            state.ignoredTrap = {key:positionKey,since:now,lastProbeAt:0,targetId:null,reason:null};
+            return false;
+        }
+        const trap = state.ignoredTrap;
+        if (now - trap.since < 1500 || (moving && now - trap.since < 2000)) return false;
+        if (trap.targetId != null && !isNativeVisibleMonster(current, true)) {
+            clearIgnoredTrapEscape("blocker removed"); return false;
+        }
+        if (now - trap.lastProbeAt < 500) return trap.targetId != null;
+        trap.lastProbeAt = now;
+        const probe = probeIgnoredTrapEscape(pos);
+        if (!probe || getAntiKSBlockReason(probe.target, getAntiKSContext(now), now) || isTargetSkipped(probe.target,now)) {
+            if (trap.targetId != null) clearIgnoredTrapEscape("escape opened or target blocked");
+            return false;
+        }
+        if (trap.targetId === probe.target.id && current?.id === trap.targetId) return true;
+        if (trap.targetId != null) clearIgnoredTrapEscape("different blocker");
+        state.ignoredTrap = {...trap,targetId:probe.target.id,reason:probe.reason};
+        // This one target is exempt from Ignore. All normal validation,
+        // visibility, Anti-KS and Special Area gates still run in the setter.
+        if (!setCurrentTarget(probe.target)) { clearIgnoredTrapEscape("target rejected"); return false; }
+        clearOffscreenHunt("clearing ignored trap",{quiet:true});
+        clearLureOffscreenPull("clearing ignored trap",{quiet:true});
+        clearLureState("clearing ignored trap",now);
+        clearPreferredAccessState("clearing ignored trap",now,false);
+        clearOrdinaryAccessState("clearing ignored trap",now,false);
+        stopManualTargetPursuitAutoWalk("clearing ignored trap");
+        setClientChaseMode(0); state._chaseEnabledForDistance = false;
+        bot.log("Targeting: clearing ignored trap blocker",{id:probe.target.id,name:probe.target.name,reason:probe.reason});
+        return true;
+    }
+
+    function isIgnoredTargetCreature(creature) {
+        const exception = config.attackIgnoredWhenTrapped === true && state.running && config.enabled &&
+            state.ignoredTrap?.targetId != null && creature?.id === state.ignoredTrap.targetId;
+        return !exception && isConfiguredIgnoredCreature(creature);
     }
 
     function noteIgnoredTargetEvent(
@@ -13781,16 +13926,19 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         // v1.5.01: stop before target selection, chase, kite, or rune work.
         // This is proactive (native tile/icon) with server cancel-message
         // fallback, so TargetPacket(target.id) is normally never attempted in PZ.
-        if (suspendTargetingForProtectionZone(now))
+        if (suspendTargetingForProtectionZone(now)) {
+            if (state.ignoredTrap) clearIgnoredTrapEscape("protection zone");
             return false;
+        }
 
         // v1.5.31: visibility lifecycle guard must run before syncLureMode().
         // Otherwise an off-screen target can keep stale combat ownership alive
         // while lure/normal branches disagree about who owns movement.
         releaseCurrentTargetIfOffScreen(now);
 
-        // v1.5.44: ignored names are an unconditional veto for mb0t-owned
-        // targets. This also handles changing the Ignore list mid-fight.
+        if (syncIgnoredTrapEscape(now)) return true;
+
+        // Ignored names remain a veto outside the verified trap exception.
         releaseIgnoredAutoTarget(now);
 
         // v1.6.87: a hunt destination is not a combat target. Resolve visible
@@ -20755,6 +20903,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function resetAttackSessionState(reason = "session changed") {
+        clearIgnoredTrapEscape(reason, false);
         clearKiteLosRecovery("Kite player session changed");
         clearOffscreenHunt(
             reason,
@@ -23809,6 +23958,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function stop(options = {}) {
+        clearIgnoredTrapEscape("Targeting stopped");
         clearCombatRuleMode();
         const shouldPersist = options.persistEnabled !== false;
         state.running = false;
@@ -24355,6 +24505,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             ordinaryAccess: getOrdinaryAccessInfo(),
             ordinaryAccessBlocked:
                 isOrdinaryAccessBlocked(),
+            ignoredTrapEscape: state.ignoredTrap ? {...state.ignoredTrap} : null,
             ignoredAutoTargetRejects:
                 state.ignoredAutoTargetRejects || 0,
             ignoredAutoTargetReleases:
@@ -24945,7 +25096,9 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                  ? nextConfig.ignoredTargetNames.map(n => String(n).trim()).filter(Boolean)
                  : [];
         }
+        if (nextConfig.attackIgnoredWhenTrapped !== undefined) nextConfig.attackIgnoredWhenTrapped = nextConfig.attackIgnoredWhenTrapped === true;
         Object.assign(config, nextConfig);
+        if (!config.attackIgnoredWhenTrapped && state.ignoredTrap) clearIgnoredTrapEscape("option disabled");
         kiteAcquisitionRoutes.clear();
         if (!config.kiteMode) clearKiteLosRecovery("Kite disabled");
 
@@ -40205,38 +40358,64 @@ window.__minibiaBotBundle.installBootsSwapperModule = function installBootsSwapp
  */
 window.__minibiaBotBundle.installAutoEatModule = function installAutoEatModule(bot) {
     const configStorageKey = "minibiaBot.eat.config";
-    const state = {
-        running: false,
-        timerId: null,
-        lastFoodAt: 0
+    const saved = bot.storage.get(configStorageKey, {});
+    const id = value => Number.isInteger(Number(value)) && Number(value) > 0 && Number(value) <= 65535 ? Number(value) : 0;
+    const cleanItem = item => id(item?.sid) && id(item?.id) ? { sid: id(item.sid), id: id(item.id), name: String(item.name || "").trim() } : null;
+    const config = {
+        enabled: saved?.enabled === true, tickMs: 1000,
+        eatCooldownMs: Math.max(1000, Number(saved?.eatCooldownMs) || 60000),
+        food: cleanItem(saved?.food),
     };
-
-    const config = Object.assign({
-        tickMs: 1000,
-        eatCooldownMs: 60000,
-        eatHotbarSlot: 10,
-        enabled: false,
-    },
-            bot.storage.get(configStorageKey, {}));
-    config.tickMs = 1000;
-
+    const state = { running: false, timerId: null, lastFoodAt: null, client: null, player: null, reason: "Off", errorAt: null };
+    let disposed = false, controls = null, capturing = false, captureTimer = null;
+    // Import an existing food binding once; subsequent uses never depend on a slot.
+    let legacySlot = saved?.food === undefined && Number.isInteger(Number(saved?.eatHotbarSlot)) && Number(saved.eatHotbarSlot) >= 1 && Number(saved.eatHotbarSlot) <= 12 ? Number(saved.eatHotbarSlot) : null;
     function persistConfig() {
-        bot.storage.set(configStorageKey, {
-            ...config
-        });
+        bot.storage.set(configStorageKey, { ...config, ...(!config.food && legacySlot ? { eatHotbarSlot: legacySlot } : {}) });
+    }
+    function foodRows() {
+        const foods = typeof HotbarAddModal === "function" ? HotbarAddModal.USABLE_FOOD_SIDS : null;
+        return (bot.itemAlertItems?.catalog?.() || []).filter(item => !item.fluidType && (!foods || foods[item.sid]));
+    }
+    function currentFood() {
+        if (!config.food) return null;
+        // SID is authoritative; refresh the CID/name if definitions changed.
+        return foodRows().find(item => item.sid === config.food.sid) || null;
+    }
+    function migrateFood() {
+        if (config.food || !legacySlot) return;
+        const item = window.gameClient?.interface?.hotbarManager?.slots?.[legacySlot - 1]?.item;
+        const selected = bot.itemAlertItems?.fromItem?.(item);
+        if (!selected || !foodRows().some(row => row.sid === selected.sid)) return;
+        config.food = cleanItem(selected); legacySlot = null; persistConfig();
+    }
+    function setFood(item) {
+        const selected = item && foodRows().find(row => row.sid === Number(item.sid) && row.id === Number(item.id));
+        if (item && !selected) return false;
+        const next = selected ? cleanItem(selected) : null;
+        if (config.food?.sid !== next?.sid || config.food?.id !== next?.id) state.lastFoodAt = null;
+        config.food = next;
+        legacySlot = null;
+        persistConfig(); cancelCapture();
+        state.reason = state.running ? (selected ? "Ready" : "Choose food") : "Off";
+        render(true); return true;
+    }
+    function selectFood(value) {
+        const text = String(value || "").trim();
+        if (!text) return { ok: setFood(null) };
+        const rows = foodRows();
+        let matches;
+        if (/^\d+$/.test(text)) {
+            const number = id(text);
+            matches = rows.filter(item => number && (item.sid === number || item.id === number));
+        } else {
+            const name = text.toLowerCase();
+            matches = rows.filter(item => item.name.toLowerCase() === name || item.choice?.toLowerCase() === name);
+        }
+        if (matches.length !== 1) return { ok: false, error: matches.length > 1 ? "Shared item ID — use the picker." : rows.length ? "Food not found. Enter its ID or use the picker." : "Waiting for food definitions." };
+        return { ok: setFood(matches[0]) };
     }
 
-    function normalizeHotbarSlot(slot) {
-        const v = Number(slot);
-        if (!Number.isFinite(v))
-            return null;
-        const n = Math.trunc(v);
-        if (n < 1 || n > 12)
-            return null;
-        return n;
-    }
-
-    // ---- Improved food timer reader ----
     function readFoodTimer() {
         // 1) Try internal skill-window property (updated by FOOD_TIMER packet)
         try {
@@ -40316,145 +40495,160 @@ window.__minibiaBotBundle.installAutoEatModule = function installAutoEatModule(b
     }
 
     function tryEat() {
-        if (!config.enabled) {
-            bot.log("Eat: disabled");
-            return false;
+        if (disposed || !state.running || !config.enabled) return false;
+        const client = window.gameClient, player = client?.player;
+        if (client !== state.client || player !== state.player) {
+            state.client = client; state.player = player; state.lastFoodAt = null;
         }
-        if (isSated()) {
-            // Log only once in a while to avoid spam
-            if (!tryEat._lastLoggedSated || Date.now() - tryEat._lastLoggedSated > 30000) {
-                tryEat._lastLoggedSated = Date.now();
-                const food = readFoodTimer();
-                bot.log("Eat: isSated() true, not eating. Food timer:", food);
+        const waiting = reason => { state.reason = reason; return false; };
+        if (!player || !(client.networkManager?.isConnected?.() === true || client.isConnected?.() === true) || !(player.state?.health > 0)) return waiting("Waiting for character");
+        if (bot.actions?.isHalted?.() || bot.gmKillSwitch?.isActive?.()) return waiting("Waiting");
+        migrateFood();
+        const food = currentFood();
+        if (!food) return waiting(config.food ? "Waiting for food definitions" : "Choose food");
+        if (isSated()) return waiting("Food active");
+        if (state.lastFoodAt !== null && Date.now() - state.lastFoodAt < config.eatCooldownMs) return waiting("Waiting for food timer");
+        const hm = client.interface?.hotbarManager;
+        if (typeof hm?.__handleItemUseWithMode !== "function" || typeof hm.__findItemInInventory !== "function") return waiting("Waiting for hotbar");
+        const sent = bot.actions?.runShared?.("auto-eat", bot.actions.priorities.UTILITY, () => {
+            // Recheck after acquiring the shared action budget.
+            if (disposed || !state.running || !config.enabled || window.gameClient !== client || client.player !== player ||
+                bot.actions?.isHalted?.() || bot.gmKillSwitch?.isActive?.() || isSated() || currentFood()?.sid !== food.sid) return false;
+            if (!(client.networkManager?.isConnected?.() === true || client.isConnected?.() === true) || !(player.state?.health > 0)) return false;
+            const found = hm.__findItemInInventory(food.id, 0, food.sid);
+            const variants = (bot.itemAlertItems?.catalog?.() || []).filter(item => item.id === food.id && !item.fluidType);
+            const unique = variants.length === 1 && variants[0].sid === food.sid;
+            const item = found?.container?.getSlotItem?.(found.slotIndex);
+            // The server hotbar fallback carries CID only. Never let a shared
+            // sprite silently choose a different food; use its exact visible slot.
+            if (found && (Number(item?.id) !== food.id || (Number(item?.sid) !== food.sid && !(unique && !id(item?.sid))))) {
+                state.reason = "Open the bag containing this food"; return false;
             }
-            return false;
-        }
-        if (Date.now() - state.lastFoodAt < config.eatCooldownMs) {
-            return false;
-        }
-        const slot = normalizeHotbarSlot(config.eatHotbarSlot);
-        if (!slot) {
-            bot.log("Eat: invalid hotbar slot", config.eatHotbarSlot);
-            return false;
-        }
-        const clicked = bot.actions.runShared('auto-eat',
-            bot.actions.priorities.UTILITY, () => bot.clickHotbar(slot - 1));
-        if (clicked) {
-            state.lastFoodAt = Date.now();
-            bot.log("used eat hotkey", {
-                slot
-            });
-        } else {
-            bot.log("Eat: clickHotbar failed for slot", slot);
-        }
-        return clicked;
+            if (!found && !unique) { state.reason = "Open the bag containing this food"; return false; }
+            if (found && player.getTile?.() == null) { state.reason = "Waiting for character"; return false; }
+            hm.__handleItemUseWithMode({ id: food.id, sid: food.sid, fluidType: 0 }, "self");
+            return true;
+        }) === true;
+        if (sent) {
+            state.lastFoodAt = Date.now(); state.reason = "Waiting for food timer";
+            bot.log("Eat: used food", { name: food.name, sid: food.sid, cid: food.id });
+        } else if (!state.reason.startsWith("Open the bag") && state.reason !== "Waiting for character") state.reason = "Waiting for action";
+        return sent;
     }
-
-    function scheduleNextTick() {
-        if (!state.running)
+    function render(force = false) {
+        if (!controls) return;
+        const food = currentFood() || config.food;
+        controls.enabled.checked = state.running;
+        if (force || document.activeElement !== controls.item) controls.item.value = food?.name || (food ? String(food.sid) : "");
+        controls.item.title = food ? `${food.name || "Food"} · SID ${food.sid} · CID ${food.id}` : "Enter a food SID or CID, or use the picker";
+        controls.pick.setAttribute("aria-pressed", String(capturing));
+        if (!capturing && !controls.error) controls.status.textContent = state.reason;
+    }
+    function cancelCapture() {
+        capturing = false;
+        if (captureTimer !== null) window.clearTimeout(captureTimer);
+        captureTimer = null;
+        document.removeEventListener("click", captureClick, true);
+        document.removeEventListener("keydown", captureKey, true);
+        controls?.pick.setAttribute("aria-pressed", "false");
+    }
+    function captureClick(event) {
+        if (!capturing) return;
+        if (controls?.panel.contains(event.target)) {
+            if (event.target !== controls.pick && !controls.pick.contains?.(event.target)) { cancelCapture(); render(); }
             return;
-        state.timerId = window.setTimeout(() => tick(), config.tickMs);
+        }
+        const raw = bot.itemAlertItems?.captureItem?.(event);
+        if (!raw) return;
+        // Selecting must not also use, move, or target the clicked object.
+        event.preventDefault(); event.stopImmediatePropagation();
+        const item = bot.itemAlertItems?.fromItem?.(raw);
+        if (!item || !setFood(item)) { controls.status.textContent = "Select a food item."; return; }
+        controls.error = false; render(true);
     }
-
+    function captureKey(event) {
+        if (event.key !== "Escape") return;
+        event.preventDefault(); event.stopImmediatePropagation(); cancelCapture(); render();
+    }
+    function startCapture() {
+        if (!controls || disposed) return false;
+        if (capturing) { cancelCapture(); render(); return false; }
+        bot.itemAlertItems?.cancelCapture?.(); bot.itemDropper?.cancelCapture?.();
+        bot.autoPickup?.cancelCapture?.(); bot.looter?.clearCaptureMode?.();
+        bot.equipRing?.clearCaptureMode?.(); bot.bootsSwapper?.clearCaptureMode?.();
+        capturing = true; controls.error = false;
+        controls.status.textContent = "Click food in a bag or equipment slot. Esc cancels.";
+        document.addEventListener("click", captureClick, true);
+        document.addEventListener("keydown", captureKey, true);
+        captureTimer = window.setTimeout(() => { cancelCapture(); render(); }, 20000);
+        render(); return true;
+    }
     function tick() {
-        if (!state.running)
-            return;
-        try {
-            tryEat();
-        } catch (e) {
-            bot.log("auto eat tick failed", e?.message || e);
-        } finally {
-            scheduleNextTick();
+        state.timerId = null;
+        if (disposed || !state.running) return;
+        try { tryEat(); }
+        catch (error) {
+            state.reason = "Waiting for character";
+            if (state.errorAt === null || Date.now() - state.errorAt >= 15000) {
+                state.errorAt = Date.now(); bot.log("Eat: " + (error?.message || error));
+            }
         }
+        render();
+        if (!disposed && state.running) state.timerId = window.setTimeout(tick, config.tickMs);
     }
-
     function start(overrides = {}) {
-        Object.assign(config, overrides, {
-            enabled: true
-        });
-        config.tickMs = 1000;
-        persistConfig();
-        if (state.running) {
-            bot.log("auto eat already running");
-            return false;
-        }
-        state.running = true;
-        bot.log("auto eat started", {
-            eatCooldownMs: config.eatCooldownMs,
-            eatHotbarSlot: config.eatHotbarSlot
-        });
-        tick();
-        return true;
+        if (disposed) return false;
+        updateConfig(overrides); config.enabled = true; persistConfig();
+        if (state.running) return false;
+        state.running = true; tick(); return true;
     }
-
     function stop(options = {}) {
-        const shouldPersist = options.persistEnabled !== false;
         state.running = false;
-        if (state.timerId != null) {
-            window.clearTimeout(state.timerId);
-            state.timerId = null;
-        }
-        if (shouldPersist) {
-            config.enabled = false;
-            persistConfig();
-        }
-        bot.log("auto eat stopped");
-        return true;
+        if (state.timerId !== null) window.clearTimeout(state.timerId);
+        state.timerId = null; state.reason = "Off";
+        cancelCapture();
+        if (options.persistEnabled !== false) { config.enabled = false; persistConfig(); }
+        render(); return true;
     }
-
+    function updateConfig(next = {}) {
+        if (disposed) return { ...config };
+        if (Object.hasOwn(next, "food")) setFood(next.food);
+        if (Object.hasOwn(next, "eatCooldownMs")) config.eatCooldownMs = Math.max(1000, Number(next.eatCooldownMs) || 60000);
+        persistConfig(); render(); return { ...config, food: config.food && { ...config.food } };
+    }
     function status() {
-        const food = readFoodTimer();
-        return {
-            running: state.running,
-            config: {
-                ...config
-            },
-            lastFoodAt: state.lastFoodAt,
-            isSated: isSated(),
-            foodTimer: food,
+        return { running: state.running, config: { ...config, food: config.food && { ...config.food } },
+            lastFoodAt: state.lastFoodAt, isSated: isSated(), foodTimer: readFoodTimer(), reason: state.reason, capturing };
+    }
+    function mount(panel, onToggle = () => {}) {
+        if (!panel || controls || disposed) return;
+        const q = name => panel.querySelector(`#minibia-bot-auto-eat-${name}`);
+        const enabled = q("enabled"), item = q("item"), pick = q("pick"), status = q("status");
+        if (!enabled || !item || !pick || !status) return;
+        const bindings = [];
+        const bind = (el, name, fn) => { el.addEventListener(name, fn); bindings.push(() => el.removeEventListener(name, fn)); };
+        controls = { panel, enabled, item, pick, status, error: false, cleanup: () => bindings.forEach(off => off()) };
+        const save = () => {
+            const result = selectFood(item.value);
+            controls.error = !result.ok;
+            if (!result.ok) { status.textContent = result.error; return; }
+            render(true);
         };
+        bind(enabled, "change", () => { enabled.checked ? start() : stop(); onToggle(); render(); });
+        bind(item, "change", save);
+        bind(item, "keydown", event => { if (event.key === "Enter") { event.preventDefault(); save(); } });
+        bind(item, "focus", () => item.select?.());
+        bind(item, "input", () => { cancelCapture(); controls.error = false; });
+        bind(pick, "click", startCapture);
+        migrateFood(); render(true);
     }
-
-    function updateConfig(nextConfig = {}) {
-        if (nextConfig.eatHotbarSlot !== undefined) {
-            nextConfig.eatHotbarSlot = normalizeHotbarSlot(nextConfig.eatHotbarSlot) ?? config.eatHotbarSlot;
-        }
-        if (nextConfig.eatCooldownMs !== undefined) {
-            nextConfig.eatCooldownMs = Math.max(0, Number(nextConfig.eatCooldownMs) || 0);
-        }
-        Object.assign(config, nextConfig);
-        config.tickMs = 1000;
-        persistConfig();
-        bot.log("auto eat config updated", {
-            ...config
-        });
-        return {
-            ...config
-        };
-    }
-
-    if (config.enabled)
-        start();
-
-    bot.eat = {
-        start,
-        stop,
-        status,
-        updateConfig,
-        isSated,
-        tryEat,
-        normalizeHotbarSlot,
-        readFoodTimer,
-        config,
-    };
-    bot.startAutoEat = start;
-    bot.stopAutoEat = stop;
-    if (bot.rune) {
-        bot.rune.startAutoEat = start;
-        bot.rune.stopAutoEat = stop;
-        bot.rune.tryEat = tryEat;
-        bot.rune.isSated = isSated;
-    }
+    bot.eat = { start, stop, status, updateConfig, isSated, tryEat, readFoodTimer, config,
+        mount, refreshUi: render, selectFood, setFood, cancelCapture, currentFood };
+    bot.startAutoEat = start; bot.stopAutoEat = stop;
+    if (bot.rune) Object.assign(bot.rune, { startAutoEat: start, stopAutoEat: stop, tryEat, isSated });
+    bot.addCleanup(() => { disposed = true; stop({ persistEnabled: false }); controls?.cleanup(); controls = null; });
+    migrateFood();
+    if (config.enabled) start();
 };
 
 /**
@@ -40733,7 +40927,7 @@ window.__minibiaBotBundle.installConjureFoodModule = function installConjureFood
         state.lastError = null;
 
         try {
-            // If normal Eat Food is also enabled, give its configured hotbar food
+            // If normal Eat Food is also enabled, give its selected food
             // one short chance first. If it succeeds, do not waste 30 mana.
             if (bot.eat?.status?.().running && hunger.hungry) {
                 await sleep(1100);
@@ -56045,6 +56239,8 @@ function upgradeSectionHeaders(panel) {
         const statusLabel = document.getElementById("minibia-bot-auto-attack-ignored-status");
         const attackConfig = bot.attack?.status?.().config || bot.attack?.config || {};
         const ignored = Array.isArray(attackConfig.ignoredTargetNames) ? attackConfig.ignoredTargetNames : [];
+        const escapeToggle = document.getElementById("minibia-bot-auto-attack-ignored-trap");
+        if (escapeToggle) escapeToggle.checked = attackConfig.attackIgnoredWhenTrapped === true;
 
         // --- CHANGE: join with newline instead of comma ---
         if (input && (force || document.activeElement !== input)) {
@@ -56925,15 +57121,7 @@ function upgradeSectionHeaders(panel) {
     }
 
     function refreshAutoEatStatus() {
-        const toggle = document.getElementById("minibia-bot-auto-eat-enabled");
-        if (toggle)
-            toggle.checked = !!bot.eat?.status?.().running;
-
-        // Also update the hotkey input if it exists and isn't focused
-        const hotkeyInput = document.getElementById("minibia-bot-auto-eat-hotkey");
-        if (hotkeyInput && document.activeElement !== hotkeyInput) {
-            hotkeyInput.value = bot.eat?.config?.eatHotbarSlot ?? 10;
-        }
+        bot.eat?.refreshUi?.();
     }
 
     function refreshConjureFoodStatus() {
@@ -58566,17 +58754,6 @@ function upgradeSectionHeaders(panel) {
   min-height: 22px;
   box-sizing: border-box;
 }
-#minibia-bot-panel .mb-tools-food {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-#minibia-bot-panel .mb-tools-food input[type="number"] {
-  width: 42px;
-  height: 24px;
-  padding: 2px 4px;
-  text-align: center;
-}
 #minibia-bot-panel .mb-tools-equipment {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
@@ -59673,10 +59850,6 @@ function upgradeSectionHeaders(panel) {
   <div class="mb-section mb-tools-section">
     <div class="mb-section-title"><span class="mb-title-text">🛠️ Tools</span></div>
     <div class="mb-tools-toggle-grid">
-      <div class="mb-tools-food">
-        <label class="mb-toggle"><input type="checkbox" id="minibia-bot-auto-eat-enabled" /><span>Eat Food</span></label>
-        <input type="number" id="minibia-bot-auto-eat-hotkey" min="1" max="12" placeholder="10" title="Food hotkey slot" aria-label="Food hotkey slot" />
-      </div>
       <label class="mb-toggle"><input type="checkbox" id="minibia-bot-auto-magic-shield-enabled" /><span>Utamo Vita</span></label>
       <label class="mb-toggle" title="Conjure food when food time is below 60 seconds and mana is at least 30"><input type="checkbox" id="minibia-bot-conjure-food-enabled" /><span>Conjure Food</span></label>
       <label class="mb-toggle"><input type="checkbox" id="minibia-bot-auto-invisible-enabled" /><span>Invisible</span></label>
@@ -59686,6 +59859,18 @@ function upgradeSectionHeaders(panel) {
       <label class="mb-toggle"><input type="checkbox" id="minibia-bot-autostacker-enabled" /><span>Auto Stacker</span></label>
       <label class="mb-toggle"><input type="checkbox" id="minibia-bot-reconnect-enabled" /><span>Auto-Reconnect</span></label>
       <label class="mb-toggle"><input type="checkbox" id="minibia-bot-autostacker-convert-currency" /><span>Convert Currency</span></label>
+    </div>
+
+    <div class="mb-tools-equip-card" style="margin-top:8px;">
+      <div class="mb-tools-equip-header">
+        <label class="mb-toggle"><input type="checkbox" id="minibia-bot-auto-eat-enabled" /><span>Eat Food</span></label>
+      </div>
+      <div class="mb-tools-item-row">
+        <label for="minibia-bot-auto-eat-item">Food</label>
+        <input type="text" id="minibia-bot-auto-eat-item" placeholder="Item ID" autocomplete="off" aria-label="Food item ID or name" />
+        <button type="button" class="mb-small-button mb-tools-picker" id="minibia-bot-auto-eat-pick" title="Pick food from a bag, equipment slot or the ground" aria-label="Pick food item" aria-pressed="false">🔍</button>
+      </div>
+      <div class="mb-small-note" id="minibia-bot-auto-eat-status">Off</div>
     </div>
 
     <div class="mb-tools-equip-card" style="margin-top:8px;">
@@ -60153,7 +60338,7 @@ function upgradeSectionHeaders(panel) {
           </div>
 
           <div class="mb-small-note" id="minibia-bot-auto-attack-ignored-status" style="font-size:10px; margin-top:3px;">Ignored: none</div>
-          <div class="mb-small-note" style="font-size:10px;">Hard veto for mb0t auto-targeting.</div>
+          <label class="mb-toggle" title="Temporarily attack an ignored monster that traps you or blocks your CaveBot route. Resume movement as soon as the path opens."><input type="checkbox" id="minibia-bot-auto-attack-ignored-trap"><span>Attack ignored mobs when trapped</span></label>
         </div>
 
       </div>
@@ -63046,6 +63231,15 @@ function upgradeSectionHeaders(panel) {
             });
         }
 
+        const ignoredTrapToggle = panel.querySelector("#minibia-bot-auto-attack-ignored-trap");
+        if (ignoredTrapToggle) {
+            ignoredTrapToggle.checked = bot.attack?.config?.attackIgnoredWhenTrapped === true;
+            ignoredTrapToggle.addEventListener("change", () => {
+                bot.attack?.updateConfig?.({attackIgnoredWhenTrapped:ignoredTrapToggle.checked});
+                refreshAutoAttackIgnoredStatus();
+            });
+        }
+
         // Ignored monster save button
         const ignoredSaveBtn = panel.querySelector("#minibia-bot-auto-attack-ignored-save");
         const ignoredInput = panel.querySelector("#minibia-bot-auto-attack-ignored-names");
@@ -63144,36 +63338,7 @@ function upgradeSectionHeaders(panel) {
         }
 
         // ---- Auto Eat ----
-        const autoEatToggle = panel.querySelector("#minibia-bot-auto-eat-enabled");
-        const autoEatHotkeyInput = panel.querySelector("#minibia-bot-auto-eat-hotkey");
-
-        if (autoEatToggle) {
-            autoEatToggle.checked = !!bot.eat?.status?.().running;
-            autoEatToggle.addEventListener("change", function () {
-                if (this.checked) {
-                    bot.eat.start();
-                } else {
-                    bot.eat.stop();
-                }
-                refreshAutoEatStatus();
-                refreshCollapsedQuickModules();
-            });
-        }
-
-        if (autoEatHotkeyInput) {
-            // Load initial value from config
-            autoEatHotkeyInput.value = bot.eat?.config?.eatHotbarSlot ?? 10;
-            autoEatHotkeyInput.addEventListener("change", function () {
-                const val = Math.min(12, Math.max(1, Number(this.value) || 1));
-                this.value = String(val);
-                bot.eat.updateConfig({
-                    eatHotbarSlot: val
-                });
-                bot.log("Auto eat hotkey updated", {
-                    slot: val
-                });
-            });
-        }
+        bot.eat?.mount?.(panel, refreshCollapsedQuickModules);
 
         // ---- Conjure Food ----
         const conjureFoodToggle = panel.querySelector("#minibia-bot-conjure-food-enabled");
