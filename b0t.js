@@ -955,7 +955,15 @@ addCleanup(() => {
         retryAt: 0,
         progressKey: null,
         progressAt: 0,
-        batchPathPositions: []
+        batchPathPositions: [],
+        waitReason: "",
+        waitSince: 0,
+        waitPositionKey: null,
+        lastWaitLogAt: 0,
+        lastError: null,
+        lastWalk: null,
+        lastTransitionRecovery: null,
+        catchUpActive: false
     };
     let customFollowTimer = null;
     let customFollowDestroyed = false;
@@ -966,7 +974,8 @@ addCleanup(() => {
         if (followDecisionCreatures)
             return callback();
         const byPosition = new Map();
-        for (const creature of Object.values(window.gameClient?.world?.activeCreatures || {})) {
+        const active=window.gameClient?.world?.activeCreatures || {};
+        for (const creature of (active instanceof Map?active.values():Object.values(active))) {
             const pos = creature?.getPosition?.() || creature?.__position;
             if (!pos)
                 continue;
@@ -981,6 +990,36 @@ addCleanup(() => {
         } finally {
             followDecisionCreatures = null;
         }
+    }
+
+    function setCustomFollowWait(reason = "", now = Date.now(), detail = null, immediate = false) {
+        const state=customFollowState;
+        if (!reason) {
+            state.waitReason="";state.waitSince=0;state.waitPositionKey=null;
+            return;
+        }
+        let pos=null;
+        try {pos=window.gameClient?.player?.getPosition?.();} catch(error) {}
+        const key=pos?`${pos.x},${pos.y},${pos.z}`:null;
+        if (!state.waitReason || state.waitPositionKey!==key) state.waitSince=now;
+        state.waitReason=reason;state.waitPositionKey=key;
+        if (!immediate && now-state.waitSince<2000) return;
+        // One bounded current wait/error, no per-tick history or extra timer.
+        if (state.lastWaitLogAt && now-state.lastWaitLogAt<5000) return;
+        state.lastWaitLogAt=now;
+        console.warn(`[mbot] Follow: ${reason}`,{
+            player:state.name,mode:state.mode,distance:state.distance,
+            position:pos?{x:pos.x,y:pos.y,z:pos.z}:null,
+            destination:state.destinationKey,detail
+        });
+    }
+
+    function recordCustomFollowError(error, now = Date.now()) {
+        const message=String(error?.message || error || "Unknown Follow error").slice(0,500);
+        customFollowState.lastError={at:now,message};
+        customFollowState.failures++;
+        customFollowState.retryAt=now+500;
+        setCustomFollowWait("walk failed — retrying",now,message,true);
     }
 
     function scheduleCustomFollow() {
@@ -1001,7 +1040,7 @@ addCleanup(() => {
                 withFollowDecision(() => runCustomFollow(customFollowState.name, customFollowState.mode));
             } catch (error) {
                 stopCustomFollowAutoWalk("follow tick failed");
-                customFollowState.retryAt = Date.now() + 500;
+                recordCustomFollowError(error);
             } finally {
                 scheduleCustomFollow();
             }
@@ -1026,9 +1065,11 @@ addCleanup(() => {
 
     function isCustomFollowInRange(playerPos, targetPos, mode) {
         if (!playerPos || !targetPos || Number(playerPos.z) !== Number(targetPos.z)) return false;
-        const distance = Math.max(Math.abs(Number(playerPos.x) - Number(targetPos.x)),
-            Math.abs(Number(playerPos.y) - Number(targetPos.y)));
-        return distance <= (mode === "nonpvp" ? 0 : customFollowState.distance);
+        const distance = Math.hypot(Number(playerPos.x) - Number(targetPos.x),
+            Number(playerPos.y) - Number(targetPos.y));
+        if (mode==="nonpvp") return distance===0;
+        // Follow distance is a maximum, never a reason to back away.
+        return distance<=customFollowState.distance;
     }
 
     function startCustomFollow(name, mode, options = {}, owner = null) {
@@ -1062,15 +1103,30 @@ addCleanup(() => {
             window.clearTimeout(customFollowTimer);
             customFollowTimer = null;
         }
-        const result = withFollowDecision(() => runCustomFollow(name, mode, options));
-        scheduleCustomFollow();
-        return result;
+        try {
+            return withFollowDecision(() => runCustomFollow(name, mode, options));
+        } catch(error) {
+            stopCustomFollowAutoWalk("follow tick failed");
+            recordCustomFollowError(error);
+            return false;
+        } finally {
+            // A transient first-tick failure must not strand script Follow.
+            scheduleCustomFollow();
+        }
     }
 
     function endCustomFollow(reason) {
+        // Preserve the last active state before stop clears its leader/trail.
+        // A post-stop export must still explain a missing-leader shutdown.
+        if (customFollowState.active) {
+            try {lastFollowStopSnapshot=JSON.parse(JSON.stringify({...captureFollowFloorDiagnostics(),stopReason:reason}));} catch(e) {}
+        }
         clearFollowDoorTracking();
         clearFollowFloorTracking();
+        customFollowState.waitReason="";customFollowState.waitSince=0;
+        customFollowState.waitPositionKey=null;
         customFollowState.active = false;
+        customFollowState.catchUpActive = false;
         customFollowState.name = "";
         customFollowState.continuous = false;
         customFollowState.retryAt = 0;
@@ -1100,13 +1156,14 @@ addCleanup(() => {
     }
 
     let lastFollowFloorFailure = null;
-    const followFloorState = {client:null,player:null,lastSeen:null,lastStep:null,lastSharedFloor:null,trail:[],evidence:null,blocked:false,routeChanged:false};
+    let lastFollowStopSnapshot = null;
+    const followFloorState = {client:null,player:null,lastSeen:null,lastStep:null,lastSharedFloor:null,leaderName:"",trail:[],evidence:null,blocked:false,routeChanged:false,rejoinCheck:null,rejoinFallback:null};
     const followFloorPosition = p => p && [p.x,p.y,p.z].every(v=>Number.isFinite(Number(v)))
         ? {x:Number(p.x),y:Number(p.y),z:Number(p.z)} : null;
     const followFloorDistance = (a,b) => a && b && a.z===b.z ? Math.max(Math.abs(a.x-b.x),Math.abs(a.y-b.y)) : Infinity;
     function clearFollowFloorTracking() {
         followFloorState.client=followFloorState.player=followFloorState.lastSeen=followFloorState.lastStep=followFloorState.evidence=null;
-        followFloorState.lastSharedFloor=null;
+        followFloorState.lastSharedFloor=null;followFloorState.leaderName="";followFloorState.rejoinCheck=null;followFloorState.rejoinFallback=null;
         followFloorState.trail=[]; followFloorState.blocked=false; followFloorState.routeChanged=false;
         customFollowState.transitionReason=""; customFollowState.transitionDestinationKey=null;
     }
@@ -1236,25 +1293,45 @@ addCleanup(() => {
                 notPathable:typeof PropBitFlag !== "undefined" && typeof t.hasFlag === "function"
                     ? !!t.hasFlag(PropBitFlag.prototype.flags.DatFlagNotPathable) : null};
         };
-        if (from) for(let dy=-4;dy<=4;dy++) for(let dx=-4;dx<=4;dx++) {
-            const position={x:from.x+dx,y:from.y+dy,z:from.z},tile=getFollowFloorTile(position);
+        const own=followFloorPosition(client?.player?.getPosition?.());
+        const origins=from?[from]:[];
+        if (own && (!from || own.z!==from.z || followFloorDistance(own,from)>4)) origins.push(own);
+        for(const origin of origins) for(let dy=-4;dy<=4;dy++) for(let dx=-4;dx<=4;dx++) {
+            const position={x:origin.x+dx,y:origin.y+dy,z:origin.z},tile=getFollowFloorTile(position);
             samples.push(!tile || !tile.id || tile.__isPlaceholder ? {position,loaded:false} :
                 {position,loaded:true,transition:getFollowTransitionInfo(tile),ground:thing(tile),items:(tile.items || []).slice(0,8).map(thing)});
         }
         return {at:Date.now(),version:customFollowBot?.version || window.minibiaBot?.version || null,
             name:customFollowState.name,active:customFollowState.active,mode:customFollowState.mode,
             enabled:customFollowState.followFloors,distance:customFollowState.distance,reason:customFollowState.transitionReason,
+            wait:{reason:customFollowState.waitReason || null,since:customFollowState.waitSince || null,
+                lastError:customFollowState.lastError || null},
             player:followFloorPosition(client?.player?.getPosition?.()),leader:followFloorState.lastSeen,
+            leaderVisible:!!(followFloorState.lastSeen && (client?.world?.activeCreatures instanceof Map
+                ? client.world.activeCreatures.get(followFloorState.lastSeen.id)
+                : client?.world?.activeCreatures?.[followFloorState.lastSeen.id])),
+            leaderAgeMs:followFloorState.lastSeen?Math.max(0,Date.now()-followFloorState.lastSeen.at):null,
+            catchUp:{active:customFollowState.catchUpActive===true,maxSightingAgeMs:10000},
             evidence:followFloorState.evidence,lastStep:followFloorState.lastStep,
             lastSharedFloor:followFloorState.lastSharedFloor,pending:followFloorState.trail,
             movement:{destination:customFollowState.destinationKey,steps:customFollowState.batchPathPositions,
                 progress:customFollowState.progressKey,progressAt:customFollowState.progressAt,
-                lastStopReason:customFollowState.lastStopReason || null},
+                lastStopReason:customFollowState.lastStopReason || null,
+                lastWalk:customFollowState.lastWalk || null,
+                native:{active:client?.world?.pathfinder?.__isAutoWalking===true,
+                    destination:followFloorPosition(client?.world?.pathfinder?.__finalDestination),
+                    remainingSteps:client?.world?.pathfinder?.__autoWalkStepsRemaining || 0,
+                    followOwned:client?.__mbFollowAutoWalkActive===true,
+                    targetingOwned:client?.__mbTargetingAutoWalkActive===true,
+                    targetingOwner:client?.__mbTargetingAutoWalkOwner || null,
+                    playerMoving:client?.player?.isMoving?.()===true,
+                    predictions:client?.player?.__preWalks?.length || 0}},
+            lastTransitionRecovery:customFollowState.lastTransitionRecovery || null,
             door:followDoorState.last,samples};
     }
     function getFollowDiagnostics() {
         // Freeze only serializable snapshots, with one retained failure report.
-        return JSON.parse(JSON.stringify({current:captureFollowFloorDiagnostics(),lastFailure:lastFollowFloorFailure}));
+        return JSON.parse(JSON.stringify({current:captureFollowFloorDiagnostics(),lastFailure:lastFollowFloorFailure,lastStop:lastFollowStopSnapshot,pickup:(customFollowBot || window.minibiaBot)?.autoPickup?.diagnostics?.() || null}));
     }
     function rememberFollowFloorChange(from,to,at=Date.now(),confirmed=true) {
         if (!from || !to || followFloorState.blocked || (from.z===to.z && followFloorDistance(from,to)===0)) return;
@@ -1269,7 +1346,7 @@ addCleanup(() => {
         if (previous) {
             // A remove packet can only infer an exit. A later authoritative
             // floor update refines that same hop instead of adding a second one.
-            if (confirmed && previous.inferred) Object.assign(previous,entrance,{key,exit:{...to},inferred:false});
+            if (confirmed && previous.inferred) Object.assign(previous,entrance,{key,exit:{...to},inferred:false,notBefore:0});
             followFloorState.evidence=null;
             return;
         }
@@ -1295,6 +1372,64 @@ addCleanup(() => {
         if (position && own && position.z===own.z && Number(id)!==Number(player?.id))
             followFloorState.lastSharedFloor={id,position:{...position},at};
     }
+    function rememberFollowSurfaceUse(from,at=Date.now()) {
+        const own=followFloorPosition(window.gameClient?.player?.getPosition?.());
+        // Crossing the underground/surface boundary can remove the leader
+        // without sending its upstairs position to an underground observer.
+        // Infer only a known usable UP entrance beside its last visible tile,
+        // well inside our screen. Walking out of view must not trigger a rope.
+        if (!customFollowState.active || !customFollowState.followFloors || followFloorState.blocked ||
+            followFloorState.trail.length || followFloorState.evidence || !from || from.z!==8 || !own || own.z!==8 ||
+            Math.abs(from.x-own.x)>6 || Math.abs(from.y-own.y)>4) return false;
+        const choices=[];
+        for(let dy=-1;dy<=1;dy++)for(let dx=-1;dx<=1;dx++) {
+            const position={x:from.x+dx,y:from.y+dy,z:from.z};
+            const info=getFollowTransitionInfo(getFollowFloorTile(position));
+            if (info?.delta===-1 && (info.kind==="rope" || info.kind==="use"))
+                choices.push({position,...info,distance:Math.max(Math.abs(dx),Math.abs(dy))});
+        }
+        const onTile=choices.filter(c=>c.distance===0);
+        const entrance=onTile.length===1?onTile[0]:choices.length===1?choices[0]:null;
+        if (!entrance) return false;
+        // Anchor selection to the known entrance, not an invented leader step.
+        // A later authoritative teleport refines this inferred exit as usual.
+        rememberFollowFloorChange(entrance.position,{...entrance.position,z:7},at,false);
+        const hop=followFloorState.trail.find(h=>followFloorDistance(h.position,entrance.position)===0);
+        if(hop)hop.inference="adjacent surface use";
+        return !!hop;
+    }
+    function rememberFollowBoundaryStair(from, at = Date.now()) {
+        const state=followFloorState,client=window.gameClient;
+        const own=followFloorPosition(client?.player?.getPosition?.()),step=state.lastStep;
+        // Missing final stair steps at the surface boundary do not always send
+        // an upstairs/downstairs position. Only infer one unambiguous nearby
+        // entrance after fresh movement well inside the visible game area.
+        if (!customFollowState.active || !customFollowState.followFloors || state.blocked ||
+            state.trail.length || state.evidence || !from || !own || own.z!==from.z ||
+            ![7,8].includes(from.z) || Math.abs(from.x-own.x)>6 || Math.abs(from.y-own.y)>4 ||
+            !step || at-step.at<0 || at-step.at>1500 || followFloorDistance(step.to,from)!==0 ||
+            followFloorDistance(step.from,step.to)!==1) return false;
+        const delta=from.z===7?1:-1,choices=[],alternatives=[];
+        for(let dy=-1;dy<=1;dy++)for(let dx=-1;dx<=1;dx++) {
+            const position={x:from.x+dx,y:from.y+dy,z:from.z},tile=getFollowFloorTile(position);
+            const info=getFollowTransitionInfo(tile);
+            if (!info || !isFollowFieldPassableTile(tile,{allowTransitionDestination:true,
+                allowNonPvpPlayerPassThrough:client.__worldPvp===false})) continue;
+            alternatives.push(position);
+            if (info.kind!=="step" || info.delta!==delta || info.teleport) continue;
+            choices.push({position,...info,distance:Math.max(Math.abs(dx),Math.abs(dy))});
+        }
+        const onTile=choices.filter(c=>c.distance===0);
+        const entrance=onTile.length===1?onTile[0]:choices.length===1 && alternatives.length===1?choices[0]:null;
+        if (!entrance) return false;
+        rememberFollowFloorChange(entrance.position,{...entrance.position,z:from.z+delta},at,false);
+        const hop=state.trail.find(h=>followFloorDistance(h.position,entrance.position)===0);
+        if (!hop) return false;
+        hop.inference="single adjacent boundary stair after disappearance";
+        hop.notBefore=at+250;
+        return true;
+    }
+
     function observeFollowLeaderEvent(kind,packet) {
         if (!customFollowState.active || !customFollowState.followFloors) return;
         const client=window.gameClient,player=client?.player;
@@ -1305,6 +1440,7 @@ addCleanup(() => {
         const target=client?.world?.getCreature?.(id) || client?.world?.activeCreatures?.[id];
         if (Number(id)===Number(player?.id)) {
             const from=followFloorPosition(player?.getPosition?.()),to=followFloorPosition(packet?.position);
+            if (from && to && from.z!==to.z) restoreFollowRejoinTrail(to,Date.now());
             const hop=followFloorState.trail[0];
             // Same-floor portal exits can be only a few squares away. Proximity
             // to the exit is not completion: require our own server transition.
@@ -1318,6 +1454,11 @@ addCleanup(() => {
         }
         if (!target) {
             const previous=followFloorState.lastSeen,to=followFloorPosition(packet?.position);
+            if (kind==="remove" && previous && Number(id)===Number(previous.id) &&
+                Date.now()-previous.at<=1500) {
+                if (!rememberFollowSurfaceUse(previous.position,Date.now()))
+                    rememberFollowBoundaryStair(previous.position,Date.now());
+            }
             // Leaving the visible creature list can precede the floor packet.
             // Match only the recently observed leader ID in this same session.
             if (kind!=="remove" && to && previous && Number(id)===Number(previous.id) &&
@@ -1331,6 +1472,7 @@ addCleanup(() => {
             return;
         }
         if (String(target.name || "").toLowerCase()!==customFollowState.name.toLowerCase() || target.id===player?.id) return;
+        followFloorState.leaderName=customFollowState.name.trim().toLowerCase();
         const health=target.state?.health ?? target.health;
         if (health!=null && Number(health)<=0) { followFloorState.trail=[];followFloorState.evidence=null;followFloorState.lastSeen=null;followFloorState.lastSharedFloor=null;return; }
         const from=followFloorPosition(target.getPosition?.() || target.__position),to=followFloorPosition(packet?.position);
@@ -1343,10 +1485,18 @@ addCleanup(() => {
         if (kind==="move" && to && from.z===to.z && followFloorDistance(from,to)===1)
             followFloorState.lastStep={from,to,at:Date.now()};
         if (kind==="remove") {
+            const source=followFloorState.lastSharedFloor,own=followFloorPosition(player?.getPosition?.());
+            // A map update may already have moved the canonical leader object
+            // upstairs before its remove callback. The retained shared-floor
+            // position still supplies the real underground entrance evidence.
+            if (own?.z===8 && from.z===7 && source && Number(source.id)===Number(target.id) &&
+                source.position.z===8 && Date.now()-source.at<=10000)
+                rememberFollowFloorChange(source.position,from,Date.now());
             const info=getFollowTransitionInfo(getFollowFloorTile(from));
             if (info?.teleport) rememberFollowPortalEntrance(from);
             else if (info?.delta) rememberFollowFloorChange(from,{...from,z:from.z+info.delta},Date.now(),false);
             else {
+                if (rememberFollowSurfaceUse(from,Date.now())) return;
                 // Some stair crossings remove the leader before an on-stair
                 // position is broadcast. Use only the immediately forward stair
                 // from a recent confirmed step; never probe nearby exits.
@@ -1358,6 +1508,8 @@ addCleanup(() => {
                     else if (next?.kind==="step" && next.delta)
                         rememberFollowFloorChange(from,{...ahead,z:ahead.z+next.delta},Date.now(),false);
                 }
+                if (!followFloorState.trail.length && !followFloorState.evidence)
+                    rememberFollowBoundaryStair(from,Date.now());
             }
         }
     }
@@ -1368,6 +1520,7 @@ addCleanup(() => {
         }
         const to=followFloorPosition(target?.getPosition?.() || target?.__position);
         if (!to) return;
+        followFloorState.leaderName=customFollowState.name.trim().toLowerCase();
         const previous=followFloorState.lastSeen;
         if (previous && Number(previous.id)===Number(target.id) && now-previous.at<=10000 &&
             (previous.position.z!==to.z || followFloorState.trail.some(hop=>hop.teleport && hop.inferred && !hop.exit)))
@@ -1385,6 +1538,19 @@ addCleanup(() => {
         noteFollowSharedFloor(target.id,to,now);
         followFloorState.lastSeen={id:target.id,position:to,at:now};
     }
+    function getFollowCatchUpTarget(now = Date.now()) {
+        const state=followFloorState,client=window.gameClient,seen=state.lastSeen;
+        const own=followFloorPosition(client?.player?.getPosition?.());
+        if (!customFollowState.active || !seen || !own || state.client!==client || state.player!==client?.player ||
+            state.leaderName!==customFollowState.name.trim().toLowerCase() ||
+            Number(seen.id)===Number(client?.player?.id) || seen.position.z!==own.z ||
+            now-seen.at<0 || now-seen.at>10000 || state.blocked || state.evidence || state.trail.length) return null;
+        // Keep this as a route target only. It must never become a new sighting
+        // or extend its own lifetime when the leader is no longer visible.
+        const position={...seen.position};
+        return {id:seen.id,name:customFollowState.name,getPosition:()=>position};
+    }
+
     function canContinueFloorFollow(name) {
         if (!customFollowState.active || !customFollowState.followFloors || followFloorState.blocked ||
             followFloorState.client!==window.gameClient || followFloorState.player!==window.gameClient?.player ||
@@ -1412,12 +1578,144 @@ addCleanup(() => {
         player?.prunePreWalks?.();
         return !!player?.isMoving?.() || (Array.isArray(player?.__preWalks) && player.__preWalks.length>0);
     }
+    function restoreFollowRejoinTrail(position, now) {
+        const state=followFloorState,saved=state.rejoinFallback;
+        if (!saved) return false;
+        const seen=state.lastSeen;
+        if (now-saved.at>5000 || !customFollowState.active || !customFollowState.followFloors ||
+            !seen || Number(seen.id)!==Number(saved.leaderId) || seen.position.z!==saved.from.z) {
+            state.rejoinFallback=null;return false;
+        }
+        if (!position || position.z===saved.from.z || state.trail.length || state.evidence) return false;
+        // Match a late server crossing to the EXACT discarded exit and its
+        // recorded return entrance. Never guess an unrelated nearby stair.
+        const index=saved.trail.findIndex((hop,i)=>i>0 && hop.position.z===position.z &&
+            saved.trail[i-1].exit && followFloorDistance(position,saved.trail[i-1].exit)<=2 &&
+            followFloorDistance(position,hop.position)<=2);
+        if (index<0) return false;
+        state.trail=saved.trail.slice(index).map(hop=>({...hop,position:{...hop.position},
+            exit:hop.exit?{...hop.exit}:null,at:now,startedAt:0,attempts:0,actionAt:0,approach:null,completed:false}));
+        state.rejoinFallback=null;state.blocked=false;state.routeChanged=true;state.rejoinCheck=null;
+        customFollowState.transitionReason="Returning after queued stair crossing";
+        if (customFollowState.lastTransitionRecovery?.at===saved.at)
+            customFollowState.lastTransitionRecovery.lateCrossing={at:now,position:{...position},restored:state.trail.length};
+        console.info("[mbot] Follow: queued stair crossing completed; restoring recorded return",{
+            position,returnEntrance:state.trail[0].position
+        });
+        return true;
+    }
+
+    function rejoinFollowLeaderOnSameFloor(target, now) {
+        const state=followFloorState,client=window.gameClient;
+        const pos=followFloorPosition(client?.player?.getPosition?.());
+        const leader=followFloorPosition(target?.getPosition?.() || target?.__position);
+        if (!target || !pos || !leader || pos.z!==leader.z ||
+            (!state.trail.length && !state.evidence && !state.blocked)) return false;
+        // A same-floor portal still requires an observed crossing. Rejoining
+        // only supersedes stairs/holes/ladders when a normal route is available.
+        if (state.trail.some(hop=>hop.teleport)) return false;
+        // Do not forget the return while a step onto a stair is still in flight.
+        // StopWalk cannot revoke a crossing the server has already committed.
+        if (followFloorMovementPending()) return false;
+        if (client?.__mbFollowAutoWalkActive===true && client?.world?.pathfinder?.__isAutoWalking===true &&
+            (customFollowState.transitionDestinationKey || customFollowState.lastWalk?.purpose==="transition")) {
+            const destination=customFollowState.lastWalk?.targetPosition;
+            if (!destination || isCustomFollowBatchUsable({id:customFollowState.targetId ?? target.id,
+                getPosition:()=>destination},"pvp",now)) return false;
+        }
+        let steps=0;
+        if (!isCustomFollowInRange(pos,leader,customFollowState.mode)) {
+            const key=`${target.id}:${pos.x},${pos.y},${pos.z}:${leader.x},${leader.y},${leader.z}:${customFollowState.mode}:${customFollowState.distance}:`+
+                state.trail.map(hop=>hop.key).join("|");
+            if (state.rejoinCheck?.key===key && now-state.rejoinCheck.at<500) return false;
+            state.rejoinCheck={key,at:now};
+            const route=getFollowCustomRoute(target,customFollowState.mode,{
+                followDistance:customFollowState.distance,straightLineDistance:true,
+                allowNonPvpPlayerPassThrough:client?.__worldPvp===false,specialAreaPurpose:"route"
+            });
+            if (!route || (!route.atGoal && !route.pathPositions?.length)) return false;
+            steps=route.pathPositions?.length || 0;
+        }
+        // Keep one short-lived, bounded copy until any late movement packet
+        // has arrived. It is valid only for this client/player/leader session.
+        state.rejoinFallback=state.trail.length?{at:now,leaderId:target.id,from:{...pos},
+            trail:state.trail.map(hop=>({...hop,position:{...hop.position},exit:hop.exit?{...hop.exit}:null}))}:null;
+        customFollowState.lastTransitionRecovery={
+            at:now,reason:"leader reachable on same floor",player:pos,leader,
+            discarded:state.trail.map(hop=>({key:hop.key,position:{...hop.position},exit:hop.exit?{...hop.exit}:null})),
+            routeSteps:steps
+        };
+        state.trail=[];state.evidence=null;state.blocked=false;state.routeChanged=false;state.rejoinCheck=null;
+        customFollowState.transitionReason="";customFollowState.transitionDestinationKey=null;
+        // Cancel only our old stair batch; leave native movement predictions
+        // intact so the current physical step can finish normally.
+        stopCustomFollowAutoWalk("discarded old transitions — leader reachable on same floor");
+        console.info("[mbot] Follow: discarded old transitions; rejoining leader on same floor",{
+            player:customFollowState.name,position:pos,leader,steps
+        });
+        return true;
+    }
+
+    function retryFollowStepTransition(hop, pos, now) {
+        const client=window.gameClient,state=customFollowState;
+        const leaderId=followFloorState.lastSeen?.id || -1;
+        // A step-off is one short batch; let it finish before requesting return.
+        if (hop.reentryPhase==="return" && hop.stepOffPosition &&
+            isCustomFollowBatchUsable({id:leaderId,getPosition:()=>hop.stepOffPosition},"pvp",now)) {
+            state.transitionReason="Stepping off transition to retry";return true;
+        }
+        state.transitionReason="Waiting for floor-change confirmation";
+        if (!hop.stepArrivedAt) hop.stepArrivedAt=now;
+        if (now-hop.stepArrivedAt<1500) return true;
+        if (hop.attempts>=3) {
+            followFloorState.blocked=true;
+            state.transitionReason="Step-on transition failed after 3 retries — restart Follow to retry";
+            stopCustomFollowAutoWalk("step-on transition retry limit");
+            lastFollowFloorFailure=JSON.parse(JSON.stringify(captureFollowFloorDiagnostics()));
+            return true;
+        }
+        const source=getFollowFloorTile(pos),choices=[];
+        const options={freshNeighbours:true,specialAreaPurpose:"route",allowNonPvpPlayerPassThrough:client?.__worldPvp===false};
+        for(const [dx,dy] of [[0,-1],[1,0],[0,1],[-1,0]]) {
+            const position={x:pos.x+dx,y:pos.y+dy,z:pos.z},tile=getFollowFloorTile(position);
+            // Recovery may not accidentally enter a second hole, stair or portal.
+            if (!tile || getFollowTransitionInfo(tile) || !isFollowFieldPassableTile(tile,options)) continue;
+            const path=searchFollowPathIgnoringFields(source,tile,options);
+            if (path?.length===1) choices.push(position);
+        }
+        const approach=followFloorState.lastSharedFloor?.position;
+        if (approach?.z===pos.z) choices.sort((a,b)=>followFloorDistance(a,approach)-followFloorDistance(b,approach));
+        const destination=choices[0];
+        if (!destination) {state.transitionReason="No safe tile beside transition — waiting";return true;}
+        state.transitionReason="Stepping off transition to retry";
+        const sent=sendCustomFollowAutoWalk({id:leaderId,name:state.name,getPosition:()=>destination},{
+            targetPosition:destination,pathPositions:[destination],transitionDestination:false
+        },"pvp",now);
+        // A refused packet must not consume a retry; space later requests too.
+        hop.stepArrivedAt=now;
+        if (sent) {
+            hop.attempts++;hop.actionAt=now;hop.reentryPhase="return";hop.stepOffPosition={...destination};
+        }
+        return true;
+    }
+
     function runFollowFloorTransition(target,now) {
         if (!customFollowState.followFloors) return false;
         if (followFloorState.client!==window.gameClient || followFloorState.player!==window.gameClient?.player) {
             clearFollowFloorTracking();followFloorState.client=window.gameClient;followFloorState.player=window.gameClient?.player;
         }
         if (target) noteFollowLeaderPosition(target,now);
+        else {
+            const seen=followFloorState.lastSeen;
+            // Map/manifest replacement can remove the leader before a remove
+            // callback reaches us. Reuse only a recent same-session sighting.
+            if (seen && now-seen.at<=1500 && !rememberFollowSurfaceUse(seen.position,now))
+                rememberFollowBoundaryStair(seen.position,now);
+        }
+        // A late server floor packet can arrive after an old stair walk was
+        // cancelled. Recover its recorded return before looking for a new hop.
+        restoreFollowRejoinTrail(followFloorPosition(window.gameClient?.player?.getPosition?.()),now);
+        if (rejoinFollowLeaderOnSameFloor(target,now)) return false;
         if ((followFloorState.trail.length || followFloorState.evidence) && followFloorMovementPending()) {
             customFollowState.transitionReason="Finishing current step before transition";
             return true;
@@ -1436,8 +1734,8 @@ addCleanup(() => {
         }
         const leader=followFloorPosition(target?.getPosition?.() || target?.__position);
         // Confirm completion before retrying or timing out old entrance evidence.
-        // Keep any remaining hops: an up/down sequence may end on this floor
-        // even though the follower still has transitions to traverse.
+        // Rejoining above removes redundant hops only after proving a normal
+        // same-floor route. Otherwise retain the transitions we still need.
         if (!hop && leader && leader.z===pos.z) {
             followFloorState.evidence=null;followFloorState.blocked=false;
             customFollowState.transitionReason="";customFollowState.transitionDestinationKey=null;
@@ -1456,10 +1754,19 @@ addCleanup(() => {
         }
         hop=followFloorState.trail[0];
         if (!hop) {
-            customFollowState.transitionReason="Waiting for leader's transition";stopCustomFollowAutoWalk("leader changed floor");return true;
+            if (!leader && getFollowCatchUpTarget(now)) {
+                customFollowState.transitionReason="";
+                return false; // Continue normal same-floor walking to the last sighting.
+            }
+            customFollowState.transitionReason=leader && leader.z!==pos.z
+                ? "Waiting for leader's transition" : "Leader not visible — no confirmed transition";
+            stopCustomFollowAutoWalk(leader && leader.z!==pos.z?"leader changed floor":"leader not visible");return true;
+        }
+        if (hop.notBefore && now<hop.notBefore) {
+            customFollowState.transitionReason="Checking leader's stair disappearance";return true;
         }
         if (!hop.startedAt) hop.startedAt=now;
-        if (pos.z!==hop.position.z || now-hop.at>=30000 || now-hop.startedAt>=20000 || (hop.attempts>=3 && now-hop.actionAt>=1500)) {
+        if (pos.z!==hop.position.z || now-hop.at>=30000 || now-hop.startedAt>=20000 || (hop.kind!=="step" && hop.attempts>=3 && now-hop.actionAt>=1500)) {
             followFloorState.blocked=true;customFollowState.transitionReason="Transition failed — restart Follow to retry";
             stopCustomFollowAutoWalk("transition timeout");
             lastFollowFloorFailure=JSON.parse(JSON.stringify(captureFollowFloorDiagnostics()));
@@ -1471,9 +1778,13 @@ addCleanup(() => {
         const tool=hop.kind==="rope" || hop.kind==="shovel" || hop.kind==="use";
         const distance=followFloorDistance(pos,hop.position);
         const stepOff=hop.kind==="shovel" && distance===0;
-        if ((tool && distance<=1 && !stepOff) || (!tool && distance===0)) {
+        if (hop.kind==="step" && distance===0) {
+            if (info.kind!=="step") {customFollowState.transitionReason="Transition tile changed — waiting";return true;}
+            return retryFollowStepTransition(hop,pos,now);
+        }
+        if (tool && distance<=1 && !stepOff) {
             stopCustomFollowAutoWalk("using leader's transition");
-            customFollowState.transitionReason=`Following ${hop.kind==="step"?"floor change":hop.kind}`;
+            customFollowState.transitionReason=`Following ${hop.kind}`;
             if (now-hop.actionAt<1500 || window.gameClient?.player?.isMoving?.()) return true;
             let sent=false;
             if (hop.kind==="rope" || hop.kind==="shovel") sent=followFloorTool(hop.kind,hop.position,now);
@@ -1523,8 +1834,9 @@ addCleanup(() => {
             customFollowState.transitionReason="Transition route blocked";return true;
         }
         customFollowState.transitionReason="Walking to leader's transition";
-        sendCustomFollowAutoWalk(stub,{targetPosition:destination,transitionDestination:!tool,
+        const sent=sendCustomFollowAutoWalk(stub,{targetPosition:destination,transitionDestination:!tool,
             pathPositions:path.map(t=>followFloorPosition(t.__position || t.getPosition?.()))},"pvp",now);
+        if (sent && hop.kind==="step") {hop.reentryPhase="waiting";hop.stepArrivedAt=0;}
         return true;
     }
 
@@ -1542,8 +1854,8 @@ addCleanup(() => {
             window.gameClient?.world
                 ?.activeCreatures || {};
 
-        for (const id in creatures) {
-            const creature = creatures[id];
+        const values=creatures instanceof Map?creatures.values():Object.values(creatures);
+        for (const creature of values) {
 
             if (
                 creature?.name &&
@@ -1844,7 +2156,7 @@ addCleanup(() => {
                 allowNonPvpPlayerPassThrough:client.__worldPvp===false});
             route={targetPosition:to,pathPositions:(path || []).map(t=>followFloorPosition(t.__position || t.getPosition?.()))};
         } else route=getFollowCustomRoute(target,"pvp",{followDistance:options.followDistance ?? customFollowState.distance,
-            allowNonPvpPlayerPassThrough:client.__worldPvp===false,allowClosedDoors:true});
+            straightLineDistance:true,allowNonPvpPlayerPassThrough:client.__worldPvp===false,allowClosedDoors:true});
         if (!route?.pathPositions?.length) return false;
         const index=route.pathPositions.findIndex(p=>getFollowClosedDoor(getFollowFloorTile(p)));
         if (index<0) return false;
@@ -2131,10 +2443,14 @@ addCleanup(() => {
         // Range-follow uses one bounded Dijkstra search to the first safe
         // tile in range, rather than running A* separately for every edge tile.
         const goalRange = Math.max(0, Math.min(10, Math.trunc(Number(options.goalRange) || 0)));
-        const reached = node => node === to || (goalRange > 0 &&
-            Number(node.__position?.z) === Number(to.__position?.z) &&
-            Math.max(Math.abs(Number(node.__position?.x) - Number(to.__position?.x)),
-                Math.abs(Number(node.__position?.y) - Number(to.__position?.y))) <= goalRange);
+        const goalMinRange=Math.max(0,Math.min(goalRange,Number(options.goalMinRange)||0));
+        const reached = node => {
+            if (node===to && !(goalRange>0 && goalMinRange>0)) return true;
+            if (!(goalRange>0) || Number(node.__position?.z)!==Number(to.__position?.z)) return false;
+            const dx=Number(node.__position?.x)-Number(to.__position?.x),dy=Number(node.__position?.y)-Number(to.__position?.y);
+            const distance=options.straightLineDistance===true ? Math.hypot(dx,dy) : Math.max(Math.abs(dx),Math.abs(dy));
+            return distance>=goalMinRange && distance<=goalRange;
+        };
         let rangeNodes = 0;
         try {
             pf.__dirtyNodes
@@ -2399,7 +2715,7 @@ addCleanup(() => {
                 ? "lure"
                 : routeOptions?.specialAreaPurpose === "combat"
                     ? "combat"
-                    : null;
+                    : routeOptions?.specialAreaPurpose === "route" ? "route" : null;
 
         const allowNonPvpPlayerPassThrough =
             normalizedMode === "nonpvp" || routeOptions.allowNonPvpPlayerPassThrough === true;
@@ -2537,12 +2853,9 @@ addCleanup(() => {
                 playerNorm.y
             );
 
-        if (
-            Math.max(
-                dxToTarget,
-                dyToTarget
-            ) <= followDistance
-        ) {
+        const straightLineDistance=routeOptions.straightLineDistance===true;
+        const distanceToTarget=straightLineDistance ? Math.hypot(dxToTarget,dyToTarget) : Math.max(dxToTarget,dyToTarget);
+        if (distanceToTarget<=followDistance) {
             return {
                 atGoal: true,
                 mode:
@@ -2555,11 +2868,11 @@ addCleanup(() => {
             };
         }
 
-        if (followDistance > 1) {
+        if (followDistance > 1 || straightLineDistance) {
             const targetTile = world.getTileFromWorldPosition?.(new Position(targetNorm.x, targetNorm.y, targetNorm.z));
             if (!targetTile) return null;
             const path = searchFollowPathIgnoringFields(startTile, targetTile, {
-                goalRange: followDistance, freshNeighbours: true,
+                goalRange: followDistance, straightLineDistance, freshNeighbours: true,
                 specialAreaPurpose, allowNonPvpPlayerPassThrough, allowClosedDoors
             });
             if (!path.length) return null;
@@ -2626,7 +2939,8 @@ addCleanup(() => {
                     {
                         specialAreaPurpose,
                         allowNonPvpPlayerPassThrough,
-                        allowClosedDoors
+                        allowClosedDoors,
+                        freshNeighbours:routeOptions.freshNeighbours===true
                     }
                 );
 
@@ -2738,6 +3052,7 @@ addCleanup(() => {
         const client =
             window.gameClient;
 
+        customFollowState.lastStopReason=reason;
         if (
             client
                 ?.__mbFollowAutoWalkActive !==
@@ -2799,6 +3114,7 @@ addCleanup(() => {
         mode,
         now = Date.now()
     ) {
+        if (window.minibiaBot?.autoPickup?.isFollowPaused?.()) return false;
         const client =
             window.gameClient;
         const player =
@@ -2857,7 +3173,7 @@ addCleanup(() => {
                 targetPosKey &&
             customFollowState.destinationKey ===
                 destinationKey &&
-            pf.__isAutoWalking
+            pf.__isAutoWalking && isCustomFollowBatchUsable(target,mode,now)
         ) {
             return true;
         }
@@ -3044,11 +3360,8 @@ addCleanup(() => {
             client.__mbFollowAutoWalkPermit =
                 client.__mbFollowAllowDuringTarget === true;
 
-            client.send(
-                new AutoWalkPacket(
-                    directions
-                )
-            );
+            if (client.send(new AutoWalkPacket(directions))===false)
+                throw new Error("Follow AutoWalk request was rejected");
 
             client.__mbFollowAutoWalkPermit =
                 false;
@@ -3066,6 +3379,12 @@ addCleanup(() => {
             }));
             customFollowState.progressKey = `${playerPos.x},${playerPos.y},${playerPos.z}`;
             customFollowState.progressAt = now;
+            customFollowState.lastWalk={at:now,player:{x:Number(playerPos.x),y:Number(playerPos.y),z:Number(playerPos.z)},
+                targetId:target.id,targetPosition:{x:Number(targetPos.x),y:Number(targetPos.y),z:Number(targetPos.z)},
+                destination:{x:Number(plannedDestination.x),y:Number(plannedDestination.y),z:Number(plannedDestination.z)},
+                steps:batch.map(p=>({x:Number(p.x),y:Number(p.y),z:Number(p.z)})),
+                purpose:route.transitionDestination===true?"transition":(customFollowState.catchUpActive
+                    ? "catch up to last known leader" : (customFollowState.transitionReason || "follow leader"))};
             customFollowState.batches++;
             customFollowState.lastBatchAt =
                 now;
@@ -3107,7 +3426,7 @@ addCleanup(() => {
                 0;
             pf.__finalDestination =
                 null;
-            customFollowState.failures++;
+            recordCustomFollowError(e,now);
             return false;
         }
     }
@@ -3148,9 +3467,15 @@ addCleanup(() => {
         const pos = player?.getPosition?.();
         const targetPos = target?.getPosition?.() || target?.__position;
         if (!pos || !targetPos || client.__mbFollowAutoWalkActive !== true ||
-            !pf?.__isAutoWalking || customFollowState.targetId !== target.id ||
-            customFollowState.targetPosKey !== `${targetPos.x},${targetPos.y},${targetPos.z}`)
+            !pf?.__isAutoWalking || customFollowState.targetId !== target.id)
             return false;
+        const targetKey=`${targetPos.x},${targetPos.y},${targetPos.z}`;
+        const changed=customFollowState.targetPosKey!==targetKey;
+        if (changed) {
+            const previous=String(customFollowState.targetPosKey || "").split(",").map(Number);
+            if (previous.length!==3 || !previous.every(Number.isFinite) || previous[2]!==Number(targetPos.z) ||
+                Math.max(Math.abs(previous[0]-targetPos.x),Math.abs(previous[1]-targetPos.y))>2) return false;
+        }
 
         const key = `${pos.x},${pos.y},${pos.z}`;
         if (customFollowState.progressKey !== key) {
@@ -3173,8 +3498,15 @@ addCleanup(() => {
         const remaining = batch.slice(passed + 1);
         if (!remaining.length)
             return false;
+        if (changed) {
+            const end=remaining[remaining.length-1];
+            const distance=p=>Math.hypot(Number(p.x)-targetPos.x,Number(p.y)-targetPos.y);
+            if (Number(end.z)!==Number(targetPos.z) || distance(end)>distance(pos)+1e-9) return false;
+        }
         let previous = pos;
         for (const step of remaining) {
+            if (customFollowState.catchUpActive && window.minibiaBot?.specialAreas?.getPositionPolicy?.(
+                step,{purpose:"route"})?.allowed===false) return false;
             const dx = step.x - Number(previous.x);
             const dy = step.y - Number(previous.y);
             if (step.z !== Number(previous.z) || Math.abs(dx) > 1 || Math.abs(dy) > 1 ||
@@ -3208,8 +3540,10 @@ addCleanup(() => {
         const player =
             window.gameClient?.player;
 
-        if (!player)
+        if (!player) {
+            setCustomFollowWait("client not ready — waiting",now);
             return false;
+        }
 
         const normalizedMode =
             mode === "nonpvp" && window.gameClient?.__worldPvp === false
@@ -3242,6 +3576,12 @@ addCleanup(() => {
                 customFollowState.allowDuringTarget === true;
         }
 
+        // Keep Follow enabled while Auto Pickup owns a priority-item excursion.
+        // Its ordinary timer continues, so it resumes on the first tick after
+        // the native game confirms the ground item is gone.
+        if (window.minibiaBot?.autoPickup?.isFollowPaused?.()) {
+            setCustomFollowWait("waiting for priority item pickup",now);return true;
+        }
         clearLegacyNativeFollow();
 
         // Default remains unchanged: combat owns movement while a live target
@@ -3264,22 +3604,39 @@ addCleanup(() => {
                 stopCustomFollowAutoWalk(
                     "combat target active"
                 );
+                setCustomFollowWait("combat owns movement",now);
                 return false;
             }
         }
 
-        const target =
+        customFollowState.catchUpActive=false;
+        let target =
             findFollowCreatureByName(
                 customFollowState.name
             );
 
         const targetHealth=target?.state?.health ?? target?.health;
+        if (!customFollowState.followFloors && target && target.id!==player.id &&
+            !(targetHealth!=null && Number(targetHealth)<=0)) {
+            if (followFloorState.client!==followClient || followFloorState.player!==player) {
+                clearFollowFloorTracking();followFloorState.client=followClient;followFloorState.player=player;
+            }
+            const position=followFloorPosition(target.getPosition?.() || target.__position);
+            if (position) {
+                followFloorState.leaderName=customFollowState.name.trim().toLowerCase();
+                followFloorState.lastSeen={id:target.id,position,at:now};
+            }
+        }
         if (targetHealth != null && Number(targetHealth)<=0) {
             clearFollowFloorTracking();
         } else if (target?.id !== player.id && runFollowFloorTransition(target,now)) {
+            setCustomFollowWait(customFollowState.transitionReason || "waiting for floor transition",now);
             return true;
         }
 
+        const catchingUp=!target;
+        if (!target) target=getFollowCatchUpTarget(now);
+        customFollowState.catchUpActive=catchingUp && !!target;
         if (
             !target ||
             target.id === player.id
@@ -3287,6 +3644,7 @@ addCleanup(() => {
             stopCustomFollowAutoWalk(
                 "follow player unavailable"
             );
+            setCustomFollowWait("leader not visible — waiting to reacquire",now);
             return false;
         }
 
@@ -3301,13 +3659,15 @@ addCleanup(() => {
             stopCustomFollowAutoWalk(
                 "follow player dead"
             );
+            setCustomFollowWait("leader is dead",now);
             return false;
         }
 
         // Cancel a still-queued batch as soon as the leader comes within
         // range. Do this before cache reuse or a failed-route retry cooldown.
         if (isCustomFollowInRange(player.getPosition?.(), target.getPosition?.() || target.__position, normalizedMode)) {
-            releaseCustomFollowArrivalHold();
+            setCustomFollowWait(catchingUp?"Leader not visible — reached last known follow range":"",now);
+            if (!catchingUp) releaseCustomFollowArrivalHold();
             stopCustomFollowAutoWalk(normalizedMode === "nonpvp" ? "stacked on followed player" : "within follow distance");
             return true;
         }
@@ -3315,28 +3675,37 @@ addCleanup(() => {
             return false;
         // Check at most three queued steps against live occupants. An unchanged,
         // progressing batch needs no new A* searches and no stop/re-send churn.
-        if (isCustomFollowBatchUsable(target, normalizedMode, now))
-            return true;
+        if (isCustomFollowBatchUsable(target, normalizedMode, now)) {
+            setCustomFollowWait(catchingUp?"Catching up to leader's last known position":"",now);return true;
+        }
+        if (window.gameClient?.__mbFollowAutoWalkActive && customFollowState.progressAt &&
+            now-customFollowState.progressAt>=1500)
+            setCustomFollowWait("movement stalled — retrying route",now,null,true);
         stopCustomFollowAutoWalk("follow batch finished, changed or blocked");
 
         const route =
             getFollowCustomRoute(
                 target,
                 normalizedMode,
-                { allowNonPvpPlayerPassThrough: window.gameClient?.__worldPvp === false, followDistance: customFollowState.distance }
+                { allowNonPvpPlayerPassThrough: window.gameClient?.__worldPvp === false,
+                    followDistance: customFollowState.distance, straightLineDistance:true, specialAreaPurpose:catchingUp?"route":null }
             );
 
-        if (!route && normalizedMode==="pvp" && runFollowDoorRoute(target,now)) return true;
+        if (!route && !catchingUp && normalizedMode==="pvp" && runFollowDoorRoute(target,now)) {
+            setCustomFollowWait(customFollowState.transitionReason || "waiting for door",now);return true;
+        }
         if (!route) {
             customFollowState.retryAt = now + 500;
             stopCustomFollowAutoWalk(
                 "no safe custom follow route"
             );
+            setCustomFollowWait("no safe route — retrying",now);
             return false;
         }
 
         if (route.atGoal) {
-            releaseCustomFollowArrivalHold();
+            setCustomFollowWait(catchingUp?"Leader not visible — reached last known follow range":"",now);
+            if (!catchingUp) releaseCustomFollowArrivalHold();
             stopCustomFollowAutoWalk(
                 normalizedMode ===
                     "nonpvp"
@@ -3347,8 +3716,10 @@ addCleanup(() => {
         }
 
         const sent = sendCustomFollowAutoWalk(target, route, normalizedMode, now);
-        if (!sent)
+        if (!sent) {
             customFollowState.retryAt = now + 500;
+            setCustomFollowWait("walk unavailable — retrying",now);
+        } else setCustomFollowWait(catchingUp?"Catching up to leader's last known position":"",now);
         return sent;
     }
 
@@ -3704,7 +4075,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.266",
+        version: "1.6.289",
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -4338,7 +4709,7 @@ addCleanup(() => {
         },
 
         // ---- PICK UP ITEM FROM GROUND TO BACKPACK ----
-        pickUpItem(x, y, z) {
+        pickUpItem(x, y, z, selection = null) {
             const pos = {
                 x,
                 y,
@@ -4352,8 +4723,20 @@ addCleanup(() => {
                 return false;
             }
 
-            // 2. Get the top item on that tile
-            const item = getTopItemOnTile(tile);
+            // Priority pickup can select an exact item below another ground
+            // object. Native Tile.peekItem uses the same zero-based item index.
+            let sourceIndex = 0xFF;
+            let item = getTopItemOnTile(tile);
+            if (selection) {
+                const items = Array.isArray(tile.items) ? tile.items : [];
+                sourceIndex = -1;
+                for (let i = items.length - 1; i >= 0; i--) {
+                    const candidate = items[i];
+                    if ((selection.sid ? Number(candidate?.sid) === Number(selection.sid) : Number(candidate?.id) === Number(selection.id)) &&
+                        (selection.fluidType == null || (Number(candidate?.fluidType) || 0) === Number(selection.fluidType))) {sourceIndex = i;break;}
+                }
+                item = sourceIndex >= 0 ? items[sourceIndex] : null;
+            }
             if (!item) {
                 this.log(`No item found on ground at ${x},${y},${z}.`);
                 return false;
@@ -4405,7 +4788,7 @@ addCleanup(() => {
             const count = item.count || item.getCount?.() || 1;
             const from = {
                 which: tile,
-                index: 0xFF
+                index: sourceIndex
             };
             const to = {
                 which: targetContainer,
@@ -4414,7 +4797,7 @@ addCleanup(() => {
 
             try {
                 if (window.gameClient?.send && typeof ItemMovePacket === 'function') {
-                    window.gameClient.send(new ItemMovePacket(from, to, count));
+                    if (window.gameClient.send(new ItemMovePacket(from, to, count)) === false) return false;
                     this.log(`Picked up item ${item.id} (${count}x) from ground ${x},${y},${z} to container slot ${targetSlot}`);
                     return true;
                 }
@@ -4625,10 +5008,49 @@ addCleanup(() => {
             );
         },
 
-        stopFollowMovement() {
-            return stopCustomFollowAutoWalk(
-                "combat owns movement"
-            );
+        // Auto Pickup shares Follow's loaded-map, field-aware A* planner.
+        // This sender has no Follow state and approaches an adjacent pickup tile.
+        walkPickupRoute(position) {
+            const client=window.gameClient,player=client?.player,pf=client?.world?.pathfinder;
+            const from=player?.getPosition?.();
+            if (!from || !pf || !position || Number(from.z)!==Number(position.z) ||
+                typeof AutoWalkPacket!=="function" || typeof Position!=="function" ||
+                this.actions?.isHalted?.() || this.followingItemGuard?.isHolding?.()) return false;
+            const route=getFollowCustomRoute({id:-1,getPosition:()=>position},"pvp",{
+                followDistance:1,specialAreaPurpose:"route",freshNeighbours:true,allowNonPvpPlayerPassThrough:client.__worldPvp===false
+            });
+            if (!route || route.atGoal || !route.pathPositions?.length) return false;
+            const steps=route.pathPositions.slice(0,32),directions=[];
+            let previous=from;
+            for (const step of steps) {
+                const dx=Number(step.x)-Number(previous.x),dy=Number(step.y)-Number(previous.y);
+                if (Number(step.z)!==Number(from.z) || Math.max(Math.abs(dx),Math.abs(dy))!==1 ||
+                    !this.isFollowRoutePositionPassable(step,{allowNonPvpPlayerPassThrough:client.__worldPvp===false})) return false;
+                const direction=getFollowMoveDirection(dx,dy);
+                if (direction==null) return false;
+                directions.push(direction);previous=step;
+            }
+            const destination={...steps[steps.length-1]};
+            // Keep the native walk state in sync so server movement animates
+            // normally and cannot fall back into native field-blocking findPath.
+            pf.setPathfindCache?.(null);
+            pf.__pathfindCache=[];pf.__hybridPath=null;pf.__minimapWaypoints=null;
+            pf.__recentMinimapStarts=[];pf.__lastCancelPosition=null;pf.__autowalkStepHistory=[];
+            pf.__finalDestination=new Position(destination.x,destination.y,destination.z);
+            pf.__isAutoWalking=true;pf.__autoWalkStepsRemaining=directions.length;
+            pf.__autowalkStartPosition={x:from.x,y:from.y,z:from.z};
+            pf.__autowalkStartedAt=typeof performance!=="undefined"?performance.now():Date.now();
+            try {
+                client.keyboard?.noteAutowalk?.();
+                if (client.send(new AutoWalkPacket(directions))===false) {
+                    pf.setPathfindCache?.(null);return false;
+                }
+            } catch(error) {pf.setPathfindCache?.(null);return false;}
+            return {destination,steps:directions.length};
+        },
+
+        stopFollowMovement(reason = "combat owns movement") {
+            return stopCustomFollowAutoWalk(reason);
         },
 
         // Script Follow lasts until the next Cave navigation request. Panel
@@ -4640,8 +5062,8 @@ addCleanup(() => {
             return true;
         },
 
-        stopFollow: function () {
-            endCustomFollow("follow disabled");
+        stopFollow: function (reason = "follow disabled") {
+            endCustomFollow(reason);
             clearLegacyNativeFollow();
             this.log("Stopped following.");
             return true;
@@ -5745,17 +6167,108 @@ window.__minibiaBotBundle.installItemAlertItems = function(bot) {
         const variant=catalog().find(row=>row.sid===sid&&row.fluidType===type);
         return {...(variant || base),fluidType:type};
     }
+    // Counts from the SID/trade query and hotbar query can cover different
+    // equipment slots. Keep this reconciliation local to alerts: healing and
+    // Weapon Equipper must retain their existing server-count semantics.
+    const ammoCountScopes=new Set(),countSamples=new Map();
+    const countVariants=new Map();
+    let countClient=null,countPlayer=null,countCatalog=null;
+    function syncCounts() {
+        const client=window.gameClient,player=client?.player;
+        if (client!==countClient || player!==countPlayer) {
+            countClient=client;countPlayer=player;ammoCountScopes.clear();countSamples.clear();
+        }
+        return player;
+    }
+    function countIdentity(item) {
+        const sid=integer(item?.sid),id=integer(item?.id),type=fluid(item?.fluidType);
+        catalog();
+        if (countCatalog!==catalogRef) {countCatalog=catalogRef;countVariants.clear();}
+        let variants=countVariants.get(id);
+        if (!variants) {
+            variants=Object.entries(catalogRef||{}).filter(([sid,def])=>integer(sid)&&Number(def?.id)===id).map(([sid])=>Number(sid));
+            countVariants.set(id,variants);
+            while(countVariants.size>512)countVariants.delete(countVariants.keys().next().value);
+        }
+        return {sid,id,type,unique:variants.length===1&&(!sid||variants[0]===sid)};
+    }
+    function matchingCount(thing,identity) {
+        if (!thing || Number(thing.id)!==identity.id || fluid(thing.fluidType)!==identity.type) return 0;
+        if (identity.sid && Number(thing.sid)!==identity.sid &&
+            !(identity.unique&&!integer(thing.sid))) return 0;
+        const n=Number(typeof thing.getCount==="function"?thing.getCount():thing.count??1);
+        return Number.isFinite(n)&&n>=0?Math.trunc(n):0;
+    }
+    function ammoSnapshot(identity) {
+        const player=syncCounts(),equipment=player?.equipment;
+        // Slot 9 is the native quiver/ammunition slot. Hands are deliberately
+        // excluded: the server already counts equipped spears correctly.
+        const equipped=matchingCount(equipment?.getSlotItem?.(9),identity);
+        const raw=player?.__openedContainers;
+        const containers=Array.isArray(raw)?raw:typeof raw?.values==="function"?[...raw.values()]:Object.values(raw||{});
+        let visible=0;
+        const seen=new Set();
+        for (const container of containers) {
+            if (!container || container===equipment || seen.has(container) || typeof container.getSlotItem!=="function") continue;
+            const token=container.__containerId ?? container;
+            if (seen.has(token)) continue;
+            seen.add(container);seen.add(token);
+            const size=Math.min(255,Math.max(0,Number(container.size)||container.slots?.length||0));
+            for(let i=0;i<size;i++) visible+=matchingCount(container.getSlotItem(i),identity);
+        }
+        return {equipped,visible,signature:`${equipped}:${visible}`};
+    }
+    function freshCount(result) {
+        return result && Number.isSafeInteger(Number(result.count)) && Number(result.count)>=0 &&
+            Number.isFinite(Number(result.at)) && Date.now()-Number(result.at)>=0 && Date.now()-Number(result.at)<=15000 ? result : null;
+    }
     function request(alerts) {
-        const exact=alerts.filter(a=>integer(a?.sid)&&!fluid(a.fluidType)).map(a=>Number(a.sid));
-        const legacy=alerts.filter(a=>!integer(a?.sid)||fluid(a.fluidType)).map(a=>({id:Number(a.id),fluidType:fluid(a.fluidType)}));
-        if (exact.length) bot.sidInventory?.request?.([...new Set(exact)]);
-        if (legacy.length) bot.requestItemCounts?.(legacy);
+        syncCounts();
+        const exact=new Set(),legacy=new Map();
+        for (const item of alerts) {
+            const identity=countIdentity(item);
+            if (!identity.id) continue;
+            const sample=ammoSnapshot(identity);
+            countSamples.set(key(item),{...sample,at:Date.now()});
+            if (identity.sid&&!identity.type) exact.add(identity.sid);
+            // The hotbar total is comparable to an exact SID only when that
+            // CID has one server variant. Never mix shared-sprite variants.
+            if (!identity.sid||identity.type||identity.unique)
+                legacy.set(`${identity.id}:${identity.type}`,{id:identity.id,fluidType:identity.type});
+        }
+        while(countSamples.size>512)countSamples.delete(countSamples.keys().next().value);
+        if (exact.size) bot.sidInventory?.request?.([...exact]);
+        if (legacy.size) bot.requestItemCounts?.([...legacy.values()]);
     }
     function reading(item) {
-        const result=integer(item?.sid)&&!fluid(item.fluidType)
-            ? bot.sidInventory?.reading?.(Number(item.sid))
-            : bot.getItemCountReading?.(Number(item?.id),fluid(item?.fluidType));
-        return result && Number.isFinite(Number(result.count)) && Date.now()-Number(result.at)<=15000 ? result : null;
+        if (!syncCounts()) return null;
+        const identity=countIdentity(item),sample=ammoSnapshot(identity);
+        const exact=identity.sid&&!identity.type;
+        const primary=freshCount(exact?bot.sidInventory?.reading?.(identity.sid):
+            bot.getItemCountReading?.(identity.id,identity.type));
+        const alternate=exact&&identity.unique?freshCount(bot.getItemCountReading?.(identity.id,0)):null;
+        const requested=countSamples.get(key(item));
+        const sources=[{result:primary,source:exact?`sid:${identity.sid}`:`cid:${identity.id}:${identity.type}`},
+            {result:alternate,source:`cid:${identity.id}:0`}].filter(entry=>entry.result&&(!requested||Number(entry.result.at)>=requested.at));
+        if (!sources.length) return null; // Unknown/stale is never zero.
+        const normalize=({result,source})=>{
+            let count=Number(result.count);
+            if (sample.equipped>0 && count<sample.equipped+sample.visible && !ammoCountScopes.has(source)) {
+                // A stable, post-request reading below the matching items we
+                // can already see proves that this count omits the ammo stack.
+                // Do not infer scope from a reply predating an inventory move.
+                if (!requested || Number(result.at)<requested.at || requested.signature!==sample.signature) return null;
+                ammoCountScopes.add(source);
+                while(ammoCountScopes.size>512)ammoCountScopes.delete(ammoCountScopes.values().next().value);
+            }
+            if (ammoCountScopes.has(source)) count+=sample.equipped;
+            return {...result,count,serverCount:Number(result.count),equippedAmmo:sample.equipped,source};
+        };
+        const candidates=sources.map(normalize).filter(Boolean);
+        if (!candidates.length) {request([item]);return null;}
+        // Both are server readings of this same item; use the inclusive total
+        // rather than summing them (which would count the same inventory twice).
+        return candidates.reduce((best,r)=>!best||r.count>best.count?r:best,null);
     }
     function captureItem(event) {
         const client=window.gameClient,slot=event.target?.closest?.(".slot[slotindex]");
@@ -5899,7 +6412,8 @@ window.__minibiaBotBundle.installItemAlertItems = function(bot) {
     }
     bot.itemAlertItems={catalog,resolve,suggestions,fromItem,captureItem,request,reading,key,mount,
         edit:alert=>editActiveAlert(alert),removed:alert=>alertRemoved(alert),cancelCapture:()=>cancelActiveCapture()};
-    bot.addCleanup(()=>{disposed=true;cancelActiveCapture();rows=[];catalogRef=null;});
+    bot.addCleanup(()=>{disposed=true;cancelActiveCapture();rows=[];catalogRef=null;
+        ammoCountScopes.clear();countSamples.clear();countVariants.clear();countCatalog=null;countClient=countPlayer=null;});
 };
 
 
@@ -8786,7 +9300,7 @@ window.__minibiaBotBundle.installAutoInvisibleModule = function installAutoInvis
 window.__minibiaBotBundle.installAutoHasteModule = function installAutoHasteModule(bot) {
     const key="minibiaBot.haste.config";
     const saved=bot.storage.get(key,{});
-    const config={enabled:saved?.enabled===true,spell:saved?.spell==="strong"?"strong":"haste"};
+    const config={enabled:saved?.enabled===true,spell:saved?.spell==="strong"?"strong":"haste",pauseWhileFighting:saved?.pauseWhileFighting===true};
     const state={running:false,timer:null,client:null,player:null,lastAttemptAt:null,reason:"Off",errorAt:null};
     let disposed=false,controls=null;
     const persist=()=>bot.storage.set(key,{...config});
@@ -8822,6 +9336,7 @@ window.__minibiaBotBundle.installAutoHasteModule = function installAutoHasteModu
         if (bot.actions?.isHalted?.() || bot.gmKillSwitch?.isActive?.()) return block("Waiting");
         const health=player.state?.health,mana=player.state?.mana;
         if (typeof health!=="number" || !Number.isFinite(health) || health<=0) return block("Waiting for character");
+        if (config.pauseWhileFighting && (player.getTarget?.() || player.__target)) return block("Waiting for target to clear");
         const hasted=condition(player,"HASTE",14),strong=condition(player,"STRONG_HASTE",17);
         if (hasted===null || strong===null) return block("Waiting for character status");
         if (hasted || strong) return block(strong?"Strong Haste active":"Haste active");
@@ -8838,6 +9353,7 @@ window.__minibiaBotBundle.installAutoHasteModule = function installAutoHasteModu
     function render() {
         if (!controls) return;
         controls.enabled.checked=state.running;
+        controls.pauseWhileFighting.checked=config.pauseWhileFighting;
         if (document.activeElement!==controls.spell) controls.spell.value=config.spell;
         controls.status.textContent=state.reason;
     }
@@ -8882,6 +9398,7 @@ window.__minibiaBotBundle.installAutoHasteModule = function installAutoHasteModu
     function updateConfig(next={}) {
         if (disposed) return {...config};
         if (Object.hasOwn(next,"spell")) config.spell=next.spell==="strong"?"strong":"haste";
+        if (Object.hasOwn(next,"pauseWhileFighting")) config.pauseWhileFighting=next.pauseWhileFighting===true;
         if (Object.hasOwn(next,"enabled")) next.enabled===true?start():stop();
         else persist();
         state.reason=state.running?gates().reason:"Off";render();return {...config};
@@ -8889,13 +9406,16 @@ window.__minibiaBotBundle.installAutoHasteModule = function installAutoHasteModu
     function mount(panel) {
         if (!panel || controls || disposed) return;
         const get=name=>panel.querySelector('#minibia-bot-haste-'+name);
-        const enabled=get('enabled'),spell=get('spell'),status=get('status');
-        if (!enabled || !spell || !status) return;
+        const enabled=get('enabled'),spell=get('spell'),status=get('status'),pauseWhileFighting=get('pause-fighting');
+        if (!enabled || !spell || !status || !pauseWhileFighting) return;
         const onEnable=()=>enabled.checked?start():stop(),onSpell=()=>updateConfig({spell:spell.value});
-        controls={enabled,spell,status,cleanup:()=>{
+        const onPauseFighting=()=>updateConfig({pauseWhileFighting:pauseWhileFighting.checked});
+        controls={enabled,spell,status,pauseWhileFighting,cleanup:()=>{
             enabled.removeEventListener('change',onEnable);spell.removeEventListener('change',onSpell);
+            pauseWhileFighting.removeEventListener('change',onPauseFighting);
         }};
-        enabled.addEventListener('change',onEnable);spell.addEventListener('change',onSpell);render();
+        enabled.addEventListener('change',onEnable);spell.addEventListener('change',onSpell);
+        pauseWhileFighting.addEventListener('change',onPauseFighting);render();
     }
     bot.haste={config,start,stop,updateConfig,mount,tryCast,isRunning:()=>state.running,
         status:()=>({running:state.running,config:{...config},lastAttemptAt:state.lastAttemptAt,reason:state.reason})};
@@ -10036,7 +10556,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         keepFront: false,
 
         // v1.5.53: smoother route-aware kite defaults. Kite movement is
-        // cardinal-first; diagonal movement is emergency fallback only.
+        // cardinal-first unless Diagonal positioning is enabled too.
         kiteRetreatWaypointTolerance: 2,
         // Keep a target briefly before ordinary distance-based retargeting. A
         // preferred target can still pre-empt immediately.
@@ -11540,41 +12060,59 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     // ---- Simple walkability ----
-    function isTileOccupiedByCreature(x, y, z) {
+    function canTargetPassThroughCreatures(tile,creatures) {
+        if (!creatures.length) return true;
+        const client=window.gameClient;
+        if (client?.player?.outfit?.verifiedGhost===true) return true;
+        if (client?.__worldPvp!==false) return false;
+        try {
+            // Native rule checks every occupant and preserves depot restrictions.
+            return tile?.__nonPvpPassThrough?.(creatures)===true;
+        } catch(error) {return false;}
+    }
+
+    function isTileOccupiedByCreature(x,y,z) {
+        const client=window.gameClient,active=client?.world?.activeCreatures || {};
+        const self=client?.player,key=`${Number(x)},${Number(y)},${Number(z)}`;
+        const live=c=>{
+            if (!c || c===self || c.id===self?.id || c.outfit?.verifiedGhost===true) return false;
+            const hp=Number(c.state?.health ?? c.health);
+            return !(Number.isFinite(hp) && hp<=0);
+        };
+        const position=c=>c?.getPosition?.() || c?.__position;
+        const positionKey=p=>p?`${Number(p.x)},${Number(p.y)},${Number(p.z)}`:null;
+        const values=()=>active instanceof Map?active.values():Object.values(active);
+        let blockers;
         if (targetingSnapshot) {
             if (!targetingSnapshot.occupied) {
-                const active = window.gameClient?.world?.activeCreatures || {};
-                const values = active instanceof Map ? active.values() : Object.values(active);
-                const selfId = window.gameClient?.player?.id;
-                const occupied = new Set();
-                for (const creature of values) {
-                    if (!creature || creature.id === selfId) continue;
-                    const hp = Number(creature.state?.health ?? creature.health);
-                    if (Number.isFinite(hp) && hp <= 0) continue;
-                    const pos = creature.getPosition?.() || creature.__position;
-                    if (pos) occupied.add(`${Number(pos.x)},${Number(pos.y)},${Number(pos.z)}`);
+                // Retain identities, not just occupied coordinates: a player-only
+                // square can be passable while a mixed monster/player square is not.
+                const occupied=new Map();
+                for (const c of values()) {
+                    if (!live(c)) continue;
+                    const k=positionKey(position(c));
+                    if (k===null) continue;
+                    if (!occupied.has(k)) occupied.set(k,[]);
+                    occupied.get(k).push(c);
                 }
-                targetingSnapshot.occupied = occupied;
+                targetingSnapshot.occupied=occupied;
             }
-            return targetingSnapshot.occupied.has(`${Number(x)},${Number(y)},${Number(z)}`);
+            blockers=[...(targetingSnapshot.occupied.get(key)||[])];
+        } else {
+            blockers=[];
+            for (const c of values()) if (live(c) && positionKey(position(c))===key) blockers.push(c);
         }
-        const creatures = window.gameClient?.world?.activeCreatures || {};
-        const values = creatures instanceof Map
-            ? Array.from(creatures.values())
-            : Object.values(creatures);
-        const selfId = window.gameClient?.player?.id;
-        for (const c of values) {
-            if (!c || c.id === selfId)
-                continue;
-            const hp = Number(c.state?.health ?? c.health);
-            if (Number.isFinite(hp) && hp <= 0)
-                continue;
-            const pos = c.getPosition?.() || c.__position;
-            if (pos && Number(pos.x) === Number(x) && Number(pos.y) === Number(y) && Number(pos.z) === Number(z)) {
-                return true;
-            }
+        const tile=client?.world?.getTileFromWorldPosition?.(new Position(x,y,z));
+        const seen=new Set(blockers.map(c=>c.id ?? c));
+        // Merge the native tile stack too. Either collection can lag one packet;
+        // a live canonical position wins over a stale stack entry after a move.
+        for (const entry of tile?.monsters?.values?.() || []) {
+            const canonical=active instanceof Map?active.get(entry?.id):active[entry?.id];
+            const c=canonical || entry,p=position(c);
+            if (!live(c) || (p && positionKey(p)!==key) || seen.has(c.id ?? c)) continue;
+            seen.add(c.id ?? c);blockers.push(c);
         }
-        return false;
+        return blockers.length>0 && !canTargetPassThroughCreatures(tile,blockers);
     }
 
     function isTileWalkable(x, y, z, ignoreCreatures = false) {
@@ -11757,6 +12295,20 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             getChebyshevDistance(pos,threat)<Math.min(2,getChebyshevDistance(origin,threat)));
     }
 
+    // Kite distance is a straight-line shooting radius in world tiles.
+    // Whole-tile destinations may lie just inside the circle; never outside.
+    function getKiteDistance(from,to) {
+        if (!from || !to || Number(from.z)!==Number(to.z)) return Infinity;
+        return Math.hypot(Number(from.x)-Number(to.x),Number(from.y)-Number(to.y));
+    }
+    function getKiteMinimumDistance(ideal) {
+        const distance=Math.max(1,Number(ideal)||1);
+        // Allow room to position diagonally, but never treat adjacent melee
+        // contact (including sqrt(2) diagonals) as a requested distance of 2+.
+        const minimum=distance-(isDiagonalKiteEnabled()?1:0.5);
+        return Math.max(distance>=2?1.5:1,minimum);
+    }
+
     function getKiteEscapeSpaceInfo(startPos,originPos,targetPos,currentTargetDist,idealDistance,mode="away",maxDepth=4) {
         state.kiteLookaheadChecks++;
         const empty={maxDepth:0,reachableCount:0,branchCount:0,horizonCount:0,reachesHorizon:false,isLocalPocket:true};
@@ -11786,7 +12338,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                     !policy({x:node.x,y:node.y+dy,z:startPos.z}))) continue;
                 const tile=getTileAtPosition(next);
                 if (!tile || tile.__isPlaceholder) continue;
-                if (mode==="away" && (getChebyshevDistance(next,targetPos)<currentTargetDist ||
+                if (mode==="away" && (getKiteDistance(next,targetPos)<currentTargetDist ||
                     entersKiteMonsterContact(next,originPos,threats))) continue;
                 seen.add(key);branches++;reachableCount++;
                 const depth=node.depth+1;furthest=Math.max(furthest,depth);
@@ -11798,6 +12350,23 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         if (reachesHorizon) state.kiteForwardEscapeHorizonHits++;
         else state.kiteLookaheadDeadEndPenalties++;
         return {maxDepth:furthest,reachableCount,branchCount,horizonCount,reachesHorizon,isLocalPocket:!reachesHorizon};
+    }
+
+    function isDiagonalKiteEnabled() {
+        return !!(config.kiteMode && config.keepDiagonal && !config.keepFront);
+    }
+    // Score POSITION relative to the monster, not the direction of our step.
+    // A cardinal sidestep can leave its wave line; a diagonal step can enter it.
+    function getKiteDiagonalAlignment(position,target) {
+        if (!position || !target || position.z!==target.z) return 0;
+        const dx=Math.abs(position.x-target.x),dy=Math.abs(position.y-target.y);
+        return Math.max(dx,dy)>0 ? Math.min(dx,dy)/Math.max(dx,dy) : 0;
+    }
+    function isDiagonalKiteStepPending() {
+        if (!isDiagonalKiteEnabled()) return false;
+        const player=window.gameClient?.player;
+        player?.prunePreWalks?.();
+        return !!player?.isMoving?.() || (Array.isArray(player?.__preWalks) && player.__preWalks.length>0);
     }
 
     function getKiteStepCandidates(
@@ -11816,7 +12385,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         );
 
         const currentTargetDist =
-            getChebyshevDistance(
+            getKiteDistance(
                 playerPos,
                 targetPos
             );
@@ -11862,7 +12431,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             }
 
             const nextTargetDist =
-                getChebyshevDistance(
+                getKiteDistance(
                     candidatePos,
                     targetPos
                 );
@@ -11870,6 +12439,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             const targetDelta =
                 nextTargetDist -
                 currentTargetDist;
+
+            // The configured radius is a hard outward limit. Closing from
+            // outside is allowed, but retreat/reposition may never exceed it.
+            if (mode!=="chase" && nextTargetDist>idealDistance+1e-9) continue;
 
             // Hard safety rule while too close: Kite must never voluntarily
             // step CLOSER to the engaged target.
@@ -11883,19 +12456,23 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 continue;
             }
 
-            // Chase is part of distance control, but never overshoot inside
-            // the requested kite distance.
+            // Chase closes an out-of-range gap and stops inside the allowed
+            // holding band without pushing into melee range.
             if (
                 mode === "chase" &&
                 (
                     nextTargetDist >=
                         currentTargetDist ||
                     nextTargetDist <
-                        idealDistance
+                        getKiteMinimumDistance(idealDistance)
                 )
             ) {
                 continue;
             }
+
+            const diagonalAlignment=getKiteDiagonalAlignment(candidatePos,targetPos);
+            if (mode==="position" && (nextTargetDist<getKiteMinimumDistance(idealDistance) ||
+                diagonalAlignment<=getKiteDiagonalAlignment(playerPos,targetPos))) continue;
 
             let routeProgress = 0;
             if (retreatWaypoint) {
@@ -11923,14 +12500,14 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 );
 
             const escapeSpace =
-                mode === "away"
+                mode !== "chase"
                     ? getKiteEscapeSpaceInfo(
                         candidatePos,
                         playerPos,
                         targetPos,
                         currentTargetDist,
                         idealDistance,
-                        mode,
+                        "away",
                         4
                     )
                     : {
@@ -11944,7 +12521,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
             let score = 0;
 
-            if (mode === "away") {
+            if (mode !== "chase") {
                 // Target separation is the primary objective. Route progress
                 // is secondary, so a retreat waypoint can never pull us back
                 // toward the monster just because it is geometrically closer.
@@ -12037,6 +12614,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 targetDelta,
                 routeProgress,
                 isDiagonalStep,
+                diagonalAlignment,
                 position: candidatePos,
                 positionKey:
                     getKitePositionKey(
@@ -12082,8 +12660,29 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
     function selectKiteMovementCandidate(candidates,mode="away") {
         if (!Array.isArray(candidates)) return null;
-        const usable=mode==="away" ? candidates.filter(c=>!c.deadEndTrap) : candidates;
-        if (mode==="away") state.kiteDeadEndHardRejects+=candidates.length-usable.length;
+        const usable=mode!=="chase" ? candidates.filter(c=>!c.deadEndTrap) : candidates;
+        if (mode!=="chase") state.kiteDeadEndHardRejects+=candidates.length-usable.length;
+        if (isDiagonalKiteEnabled()) {
+            let choices=usable.filter(c=>mode==="position" || (mode==="chase" ? c.targetDelta<0 : c.targetDelta>=0));
+            // First escape melee range using a safe separation step.
+            // Sideways movement is the fallback if boxed in.
+            if (mode==="away" && choices.some(c=>c.targetDelta>0)) choices=choices.filter(c=>c.targetDelta>0);
+            // Reach the spacing band in one step when possible, rather than
+            // taking an avoidable too-close diagonal merely for a better angle.
+            if (mode==="away") {
+                const inBand=choices.filter(c=>c.nextTargetDist>=getKiteMinimumDistance(config.idealDistance));
+                if (inBand.length) choices=inBand;
+            }
+            // A diagonal position does not require a diagonal walking step.
+            // Prefer quick cardinal movement after the safety/spacing filters;
+            // reserve slower diagonal steps for necessary retreat or pursuit.
+            const cardinals=choices.filter(c=>!c.isDiagonalStep);
+            if (cardinals.length || mode==="position") choices=cardinals;
+            choices.sort((a,b)=>(b.diagonalAlignment||0)-(a.diagonalAlignment||0) || b.score-a.score);
+            const selected=choices[0] || null;
+            if (selected) selected.__diagonalPreference=true;
+            return selected;
+        }
         const cardinals=usable.filter(c=>!c.isDiagonalStep);
         if (cardinals.length) {
             const nonBacktrack=cardinals.find(c=>!c.immediateBacktrack);
@@ -12147,10 +12746,11 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         if (dx === 0 && dy === 0)
             return [];
 
-        // Validated retreat diagonals stay one-step only. Cardinal movement is
-        // safe to batch briefly and remains the normal Kite preference.
+        // Reassess every step when diagonal positioning is enabled, because
+        // the monster can turn or move while we are leaving its wave line.
+        // Ordinary Kite retains its short cardinal batches.
         const limit =
-            candidate.isDiagonalStep
+            (candidate.isDiagonalStep || isDiagonalKiteEnabled() || mode==="position")
                 ? 1
                 : Math.max(
                     1,
@@ -12167,7 +12767,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             z: Number(playerPos.z)
         };
         let previousTargetDistance =
-            getChebyshevDistance(
+            getKiteDistance(
                 previous,
                 targetPos
             );
@@ -12188,19 +12788,22 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 break;
 
             const nextTargetDistance =
-                getChebyshevDistance(
+                getKiteDistance(
                     next,
                     targetPos
                 );
 
+            if (mode!=="chase" && nextTargetDistance>idealDistance+1e-9) break;
+            if (mode==="position" && (nextTargetDistance<getKiteMinimumDistance(idealDistance) || getKiteDiagonalAlignment(next,targetPos)<=getKiteDiagonalAlignment(previous,targetPos))) break;
+
             if (mode === "chase") {
-                // Chase must close distance but never step inside the requested
-                // Kite radius.
+                // Chase closes distance without overshooting the inner edge of
+                // the holding band.
                 if (
                     nextTargetDistance >=
                         previousTargetDistance ||
                     nextTargetDistance <
-                        idealDistance
+                        getKiteMinimumDistance(idealDistance)
                 ) {
                     break;
                 }
@@ -12208,8 +12811,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 // Retreat must never voluntarily move closer while we're under
                 // the requested Kite radius.
                 if (
-                    previousTargetDistance <
-                        idealDistance &&
+                    mode!=="position" && previousTargetDistance <
+                        getKiteMinimumDistance(idealDistance) &&
                     nextTargetDistance <
                         previousTargetDistance
                 ) {
@@ -12249,7 +12852,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             if (
                 mode === "away" &&
                 nextTargetDistance >=
-                    idealDistance
+                    getKiteMinimumDistance(idealDistance)
             ) {
                 break;
             }
@@ -12304,7 +12907,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         const mode =
             options.mode === "chase"
                 ? "chase"
-                : "away";
+                : options.mode === "position" ? "position" : "away";
 
         let moved = false;
         let finalDistance =
@@ -12369,7 +12972,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
                 if (finalPos) {
                     finalDistance =
-                        getChebyshevDistance(
+                        getKiteDistance(
                             finalPos,
                             targetPos
                         );
@@ -12411,8 +13014,14 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 return false;
             }
 
-            if (mode==="away" && getKiteEscapeSpaceInfo(liveNextPos,livePlayerPos,targetPos,
-                getChebyshevDistance(livePlayerPos,targetPos),idealDistance,"away",4).isLocalPocket)
+            const liveDistance=getKiteDistance(livePlayerPos,targetPos),nextDistance=getKiteDistance(liveNextPos,targetPos);
+            if (mode!=="chase" && nextDistance>idealDistance+1e-9) return false;
+            if (mode==="chase" && (nextDistance>=liveDistance || nextDistance<getKiteMinimumDistance(idealDistance))) return false;
+            if (mode==="away" && nextDistance<liveDistance) return false;
+            if (mode==="position" && (nextDistance<getKiteMinimumDistance(idealDistance) ||
+                getKiteDiagonalAlignment(liveNextPos,targetPos)<=getKiteDiagonalAlignment(livePlayerPos,targetPos))) return false;
+            if (mode!=="chase" && getKiteEscapeSpaceInfo(liveNextPos,livePlayerPos,targetPos,
+                getKiteDistance(livePlayerPos,targetPos),idealDistance,"away",4).isLocalPocket)
                 return false;
 
             keyboard.handleMoveKey(
@@ -12441,7 +13050,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
         if (candidate.isDiagonalStep) {
             state.kiteDiagonalFallbacks +=
-                candidate.__fallbackCounted
+                (candidate.__fallbackCounted || candidate.__diagonalPreference)
                     ? 0
                     : 1;
 
@@ -12487,7 +13096,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         }
 
         const dist =
-            getTileDistance(
+            getKiteDistance(
                 playerPos,
                 targetPos
             );
@@ -12498,8 +13107,12 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                     3
             );
 
-        // One-tile deadband: don't oscillate between chase and retreat.
-        if (dist <= ideal + 1) {
+        // Let an acknowledged physical step settle before planning the next
+        // diagonal position. No extra interval or movement owner is needed.
+        if (isDiagonalKiteStepPending()) return true;
+        // Any buffer stays INSIDE the configured shooting radius.
+        if (dist <= ideal + 1e-9) {
+            if (isDiagonalKiteEnabled()) return false;
             stopKiteAutoWalk(
                 "Kite chase reached distance deadband"
             );
@@ -12935,6 +13548,18 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     // ---- Kite: move backward along cave route, or away from target ----
+    function syncKiteDiagonalPosition(target,playerPos,targetPos,dist,ideal,now) {
+        // Once clear of the row/column, tolerate an oblique angle instead
+        // of continually walking to polish a perfect 45-degree position.
+        if (!isDiagonalKiteEnabled() || dist<getKiteMinimumDistance(ideal) || getKiteDiagonalAlignment(playerPos,targetPos)>=0.5) return false;
+        const candidates=getKiteStepCandidates(playerPos,targetPos,ideal,null,"position");
+        const candidate=selectKiteMovementCandidate(candidates,"position");
+        if (!candidate) return false;
+        return performKiteStep(candidate,"Kite diagonal positioning",dist,now,{
+            target,playerPos,targetPos,idealDistance:ideal,mode:"position"
+        });
+    }
+
     function syncKite(now) {
         if (bot.autoPickup?.ownsMovement?.()) return false;
         if (!config.kiteMode)
@@ -12952,9 +13577,11 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         if (!playerPos || !targetPos || playerPos.z !== targetPos.z)
             return false;
 
-        const dist = getTileDistance(playerPos, targetPos);
+        const dist = getKiteDistance(playerPos, targetPos);
         const ideal = Math.max(1, Number(config.idealDistance) || 3);
-        if (dist >= ideal) {
+        if (isDiagonalKiteStepPending()) return true;
+        if (dist >= getKiteMinimumDistance(ideal)) {
+            if (dist<=ideal+1e-9 && syncKiteDiagonalPosition(target,playerPos,targetPos,dist,ideal,now)) return true;
             stopKiteAutoWalk(
                 "Kite retreat reached ideal distance"
             );
@@ -14712,7 +15339,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     function findKiteShootingPath(target,from) {
         const targetPos=normalizePosition(target?.getPosition?.() || target?.__position);
         if (!from || !targetPos || from.z!==targetPos.z || typeof BinaryHeap!=="function") return null;
-        const range=Math.max(1,Math.min(7,Number(config.maxTargetDistance)||5));
+        const range=Math.max(1,Math.min(7,Number(config.maxTargetDistance)||5,Number(config.idealDistance)||3));
         const ideal=Math.max(1,Math.min(range,Number(config.idealDistance)||3));
         const open=new BinaryHeap(),costs=new Map();
         const start={position:from,g:0,__f:0,parent:null};
@@ -14728,9 +15355,9 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         while (open.size()>0 && processed++<1200) {
             const node=open.pop(),pos=node.position;
             if (node.g!==costs.get(key(pos))) continue;
-            const distance=getTileDistance(pos,targetPos);
-            if (node.parent && distance<=range && getTargetLineOfSightInfo(target,pos).clear) {
-                if (distance>=Math.max(1,ideal-1) && distance<=ideal+1) return reconstruct(node);
+            const distance=getKiteDistance(pos,targetPos);
+            if (node.parent && distance>=getKiteMinimumDistance(ideal) && distance<=range && getTargetLineOfSightInfo(target,pos).clear) {
+                if (distance>=getKiteMinimumDistance(ideal) && distance<=ideal+1e-9) return reconstruct(node);
                 const score=node.g+Math.abs(distance-ideal)*200+(distance<ideal?400:0);
                 if (score<bestScore) {best=node;bestScore=score;}
             }
@@ -41108,7 +41735,10 @@ window.__minibiaBotBundle.installMessageAlertModule = function installMessageAle
 window.__minibiaBotBundle.installAntiBotMonitorModule = function installAntiBotMonitorModule(bot) {
     const configStorageKey = "minibiaBot.antibot.config";
     const saved = bot.storage.get(configStorageKey, {});
-    const config = { enabled: saved?.enabled === true, closeWindowOnCheck: saved?.closeWindowOnCheck === true };
+    const config = {
+        enabled: saved?.enabled === true, closeWindowOnCheck: saved?.closeWindowOnCheck === true,
+        lastXlogAt: Number.isFinite(saved?.lastXlogAt) && saved.lastXlogAt > 0 && saved.lastXlogAt <= 8640000000000000 ? saved.lastXlogAt : 0,
+    };
     const state = {
         running: false, timerId: null, closeVerifyTimerId: null,
         lastTriggerAt: 0, cooldownMs: 30000, closeRequested: false, disposed: false,
@@ -41121,6 +41751,13 @@ window.__minibiaBotBundle.installAntiBotMonitorModule = function installAntiBotM
 
     function persistConfig() {
         bot.storage.set(configStorageKey, { ...config });
+    }
+
+    function formatXlogTime() {
+        if (!config.lastXlogAt) return "";
+        const date = new Date(config.lastXlogAt);
+        const pad = value => String(value).padStart(2, "0");
+        return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
     }
 
     function consoleEntries() {
@@ -41142,6 +41779,11 @@ window.__minibiaBotBundle.installAntiBotMonitorModule = function installAntiBotM
         const close = document.getElementById("minibia-bot-antibot-close-window");
         if (enabled) enabled.checked = state.running;
         if (close) close.checked = config.closeWindowOnCheck;
+        const lastXlog = document.getElementById("minibia-bot-antibot-last-xlog");
+        if (lastXlog) {
+            lastXlog.hidden = !config.lastXlogAt;
+            lastXlog.textContent = config.lastXlogAt ? `Last anti-bot XLOG: ${formatXlogTime()} (local time)` : "";
+        }
         if (state.closeRequested) {
             const reconnect = document.getElementById("minibia-bot-reconnect-enabled");
             if (reconnect) reconnect.checked = false;
@@ -41151,6 +41793,11 @@ window.__minibiaBotBundle.installAntiBotMonitorModule = function installAntiBotM
     function closeGameWindow() {
         if (state.closeRequested || state.disposed) return;
         state.closeRequested = true;
+        const xlogAt = Date.now();
+        // Consume this close permission before disconnecting or navigating away.
+        // The next session may alert normally, but closing must be armed again.
+        config.closeWindowOnCheck = false;
+        safely("close option save", persistConfig);
         state.running = false;
         if (state.timerId !== null) clearTimeout(state.timerId);
         state.timerId = null;
@@ -41172,8 +41819,19 @@ window.__minibiaBotBundle.installAntiBotMonitorModule = function installAntiBotM
         }
         if (!disconnected) {
             if (typeof client?.networkManager?.close === "function")
-                safely("connection close", () => client.networkManager.close());
+                safely("connection close", () => { client.networkManager.close(); disconnected = true; });
             else bot.log("Anti-Bot: connection close is unavailable.");
+        }
+        if (disconnected) {
+            config.lastXlogAt = xlogAt;
+            safely("XLOG time save", persistConfig);
+            const time = formatXlogTime();
+            bot.log(`Anti-Bot XLOG: disconnect triggered at ${time} (local time)`);
+            safely("XLOG notification", () => bot.showPanelNotification?.(
+                "🤖 ANTI-BOT XLOG", `Disconnect triggered at:<br>${time} (local time)<br>Click to dismiss.`, "antibot", 0));
+        } else {
+            safely("XLOG notification", () => bot.showPanelNotification?.(
+                "🤖 ANTI-BOT XLOG", "Could not disconnect. Check connection status.<br>Click to dismiss.", "antibot", 0));
         }
         refreshUi();
         bot.log("Anti-Bot: requesting game window close");
@@ -41262,7 +41920,7 @@ window.__minibiaBotBundle.installAntiBotMonitorModule = function installAntiBotM
 
     bot.antiBotMonitor = {
         start, stop, updateConfig, config,
-        status: () => ({ running: state.running, closeRequested: state.closeRequested, config: { ...config } }),
+        status: () => ({ running: state.running, closeRequested: state.closeRequested, lastXlogTime: formatXlogTime(), config: { ...config } }),
     };
     bot.addCleanup(() => {
         state.disposed = true;
@@ -42987,6 +43645,7 @@ window.__minibiaBotBundle.installNotificationModule = function installNotificati
       .mb-notification.type-player { border-right-color: #ffaa44; }
       .mb-notification.type-gm { border-right-color: #cc88ff; }
       .mb-notification.type-antibot { border-right-color: #ffdd44; }
+      .mb-notification.type-following-item { border-right-color: #ffdd44; }
       .mb-notification.type-playerattack { border-right-color: #ff2222; }
       .mb-notification.type-message { border-right-color: #44aaff; }
       .mb-notification.type-audio-target-death { border-right-color: #bbbbbb; }
@@ -43048,7 +43707,8 @@ window.__minibiaBotBundle.installNotificationModule = function installNotificati
             }
         };
 
-        const timer = setTimeout(remove, duration);
+        // A zero duration keeps important notices visible until clicked.
+        const timer = duration === 0 ? null : setTimeout(remove, duration);
         activeNotifications.set(type, {
             element: item,
             timer
@@ -50398,7 +51058,7 @@ window.__minibiaBotBundle.installClientEvents = function installClientEvents(bot
             hook(handler,name,"map",(args,before) => {
                 // Keep every ground update in order; the ordinary map signal
                 // remains coalesced for navigation and healing listeners.
-                if (bot.groundSpawnLogger?.enabled?.() || bot.followingItemGuard?.enabled?.())
+                if (bot.groundSpawnLogger?.enabled?.() || bot.followingItemGuard?.enabled?.() || bot.autoPickup?.isRunning?.())
                     emit("ground-item",{kind,packet:args[0],before});
                 return {};
             },args => bot.groundSpawnLogger?.enabled?.()
@@ -50737,6 +51397,10 @@ window.__minibiaBotBundle.installFollowingItemGuard = function(bot) {
                 if(typeof TargetPacket==="function")client.send(new TargetPacket(0));
             }
         }catch(error){bot.log("Following item: movement stop failed",String(error?.message||error));}
+        // Resolve at detection time: the shared panel is installed later.
+        // Keep notification delivery independent of browser audio availability.
+        try{bot.showPanelNotification?.("📦 FOLLOWING ITEM","An item is repeatedly appearing beside your character.","following-item",15000);}
+        catch(error){bot.log("Following item: notification failed",String(error?.message||error));}
         try{playAlertSound();}catch(error){bot.log("Following item: alert failed",String(error?.message||error));}
         bot.log("Following item detected — CaveBot and Targeting paused",{item:{cid:item.cid,sid:item.sid,name:item.name},position:item.position,evidence:chain.map(x=>({at:x.at,cid:x.cid,sid:x.sid,position:x.position,player:x.player}))});
         try{if(bot.groundSpawnLogger?.enabled?.())bot.groundSpawnLogger.snapshot("following-item-detected");}catch(e){}
@@ -55399,6 +56063,11 @@ function upgradeSectionHeaders(panel) {
         const status = bot.antiBotMonitor?.status?.();
         const closeWindowToggle = document.getElementById("minibia-bot-antibot-close-window");
         if (closeWindowToggle) closeWindowToggle.checked = status?.config?.closeWindowOnCheck === true;
+        const lastXlog = document.getElementById("minibia-bot-antibot-last-xlog");
+        if (lastXlog) {
+            lastXlog.hidden = !status?.lastXlogTime;
+            lastXlog.textContent = status?.lastXlogTime ? `Last anti-bot XLOG: ${status.lastXlogTime} (local time)` : "";
+        }
         if (status) {
             toggle.checked = status.running;
         } else {
@@ -58909,7 +59578,7 @@ function upgradeSectionHeaders(panel) {
 </div>
 
 <!-- Alert Tab -->
-<div class="mb-tab-panel mb-alert-compact" data-tab-panel="alert"><div class="mb-section"><div class="mb-section-title"><span class="mb-title-text">⚠️ Alerts</span></div><div class="mb-alert-toggle-grid"><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-player-alert"><span>Player on screen</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-antibot-enabled"><span>Anti-bot check</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-player-attack-alert"><span>Player attack</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-message-alert"><span>Message</span></label><label class="mb-toggle" title="Plays a descending tone when your target dies"><input type="checkbox" id="minibia-bot-panic-target-death-beep"><span>Target death</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-low-health-beep"><span>Low health</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-mana-full-beep"><span>Mana full</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-no-target-beep"><span>No target</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-low-cap-beep"><span>Low capacity</span></label></div><details class="mb-alert-fold"><summary>Anti-bot check settings</summary><div class="mb-alert-fold-body"><label class="mb-toggle"><input type="checkbox" id="minibia-bot-antibot-close-window"><span>Close game window</span></label><div class="mb-small-note">Requires Anti-bot check. Disconnects first; tab closing depends on browser permissions.</div></div></details><details class="mb-alert-fold"><summary>Player alert settings</summary><div class="mb-alert-fold-body"><label class="mb-field"><span class="mb-field-label">Player alert cooldown (s)</span><input type="number" id="minibia-bot-panic-player-cooldown" min="10" value="10"></label></div></details><details class="mb-alert-fold"><summary>Thresholds &amp; repeat timing</summary><div class="mb-alert-fold-body"><div class="mb-alert-setting-group"><div class="mb-alert-setting-title">Low health</div><div class="mb-alert-grid"><label class="mb-field">
+<div class="mb-tab-panel mb-alert-compact" data-tab-panel="alert"><div class="mb-section"><div class="mb-section-title"><span class="mb-title-text">⚠️ Alerts</span></div><div class="mb-alert-toggle-grid"><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-player-alert"><span>Player on screen</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-antibot-enabled"><span>Anti-bot check</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-player-attack-alert"><span>Player attack</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-message-alert"><span>Message</span></label><label class="mb-toggle" title="Plays a descending tone when your target dies"><input type="checkbox" id="minibia-bot-panic-target-death-beep"><span>Target death</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-low-health-beep"><span>Low health</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-mana-full-beep"><span>Mana full</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-no-target-beep"><span>No target</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-low-cap-beep"><span>Low capacity</span></label></div><details class="mb-alert-fold"><summary>Anti-bot check settings</summary><div class="mb-alert-fold-body"><label class="mb-toggle"><input type="checkbox" id="minibia-bot-antibot-close-window"><span>Close game window</span></label><div class="mb-small-note">Requires Anti-bot check. Turns off after triggering. Disconnects first; tab closing depends on browser permissions.</div><div class="mb-small-note" id="minibia-bot-antibot-last-xlog" hidden></div></div></details><details class="mb-alert-fold"><summary>Player alert settings</summary><div class="mb-alert-fold-body"><label class="mb-field"><span class="mb-field-label">Player alert cooldown (s)</span><input type="number" id="minibia-bot-panic-player-cooldown" min="10" value="10"></label></div></details><details class="mb-alert-fold"><summary>Thresholds &amp; repeat timing</summary><div class="mb-alert-fold-body"><div class="mb-alert-setting-group"><div class="mb-alert-setting-title">Low health</div><div class="mb-alert-grid"><label class="mb-field">
               <span class="mb-field-label">Threshold %</span>
               <input type="number" id="minibia-bot-panic-low-health-threshold" min="1" max="99" value="50">
             </label><label class="mb-field">
@@ -59028,6 +59697,7 @@ function upgradeSectionHeaders(panel) {
         </select>
       </div>
       <div class="mb-small-note">Casts your selected spell when neither haste effect is active.</div>
+      <label class="mb-toggle" title="Resumes automatically when your attack target clears."><input type="checkbox" id="minibia-bot-haste-pause-fighting" /><span>Stop while fighting a target</span></label>
       <div class="mb-small-note" id="minibia-bot-haste-status">Off</div>
     </div>
 
@@ -59075,7 +59745,34 @@ function upgradeSectionHeaders(panel) {
       <label class="mb-tools-pickup-radius"><span>Radius (tiles)</span><input type="number" id="minibia-bot-auto-pickup-radius" min="1" max="3" value="2"></label>
       <span class="mb-small-note" id="minibia-bot-auto-pickup-status" aria-live="polite">Off</span>
     </div>
-    <div class="mb-small-note">Collects nearby drops during combat too.</div>
+    <div class="mb-small-note">Collects during combat. While following, only the priority item takes a detour; other drops must be within reach.</div>
+    <details class="mb-tools-pickup-fold" data-pickup-priority open>
+      <summary>Priority item</summary>
+      <label class="mb-small-note" style="display:flex;align-items:center;gap:6px;margin-top:6px;"><input type="checkbox" data-pickup-priority-enabled>Pause Follow until collected</label>
+      <div class="mb-pickup-ignore-add">
+        <input type="text" data-pickup-priority-input list="minibia-bot-pickup-priority-choices" placeholder="Item name or ID" aria-label="Priority pickup item" autocomplete="off">
+        <datalist id="minibia-bot-pickup-priority-choices" data-pickup-priority-choices></datalist>
+        <button type="button" class="mb-small-button mb-tools-picker" data-pickup-priority-pick aria-pressed="false" aria-label="Pick priority item" title="Click, then click an item in a backpack, equipment slot or on the ground">🔍</button>
+        <button type="button" class="mb-small-button" data-pickup-priority-save>Set</button>
+        <button type="button" class="mb-small-button" data-pickup-priority-clear>Clear</button>
+      </div>
+      <div class="mb-small-note" data-pickup-priority-selection>No priority item selected</div>
+      <div class="mb-small-note">Uses pickup radius. Follow resumes after pickup; failed attempts time out.</div>
+      <div class="mb-small-note mb-pickup-ignore-status" data-pickup-priority-status role="status" aria-live="polite"></div>
+    </details>
+    <details class="mb-tools-pickup-fold" data-pickup-allow open>
+      <summary>Selected items<span data-pickup-allow-count></span></summary>
+      <label class="mb-small-note" style="display:flex;align-items:center;gap:6px;margin-top:6px;"><input type="checkbox" data-pickup-allow-enabled>Only pick up selected items</label>
+      <div class="mb-pickup-ignore-add">
+        <input type="text" data-pickup-allow-input list="minibia-bot-pickup-allow-choices" placeholder="Item name or ID" aria-label="Item to collect" autocomplete="off">
+        <datalist id="minibia-bot-pickup-allow-choices" data-pickup-allow-choices></datalist>
+        <button type="button" class="mb-small-button mb-tools-picker" data-pickup-allow-pick aria-pressed="false" aria-label="Pick an item to collect" title="Click, then click an item in a backpack, equipment slot or on the ground">🔍</button>
+        <button type="button" class="mb-small-button" data-pickup-allow-add>Add</button>
+      </div>
+      <div class="mb-pickup-ignore-list" data-pickup-allow-list></div>
+      <div class="mb-small-note">Applies to priority pickup too. Ignored items and corpses are always skipped.</div>
+      <div class="mb-small-note mb-pickup-ignore-status" data-pickup-allow-status aria-live="polite"></div>
+    </details>
     <details class="mb-tools-pickup-fold" data-pickup-ignore open>
       <summary>Ignored items<span data-pickup-ignore-count></span></summary>
       <div class="mb-pickup-ignore-add">
@@ -59299,9 +59996,9 @@ function upgradeSectionHeaders(panel) {
     <div class="mb-section-title mb-section-title--sub"><span class="mb-title-text">Default Behavior</span></div>
     <div style="display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:7px;">
       <label class="mb-field"><span class="mb-field-label">Movement</span><select id="minibia-bot-targeting-default-mode"><option value="attack">Attack · no chase</option><option value="melee">Melee · bot chase</option><option value="client-chase">Client Chase</option><option value="kite">Kite</option><option value="lure">Lure</option><option value="custom" hidden>Saved combination</option></select></label>
-      <label class="mb-field"><span class="mb-field-label">Position</span><select id="minibia-bot-targeting-default-position"><option value="any">Any adjacent tile</option><option value="front">Front</option><option value="diagonal">Diagonal</option></select></label>
+      <label class="mb-field"><span class="mb-field-label">Position</span><select id="minibia-bot-targeting-default-position" title="Diagonal also prefers diagonal positions while kiting"><option value="any">Any adjacent tile</option><option value="front">Front</option><option value="diagonal">Diagonal</option></select></label>
       <label class="mb-field"><span class="mb-field-label">Max target distance</span><input type="number" id="minibia-bot-auto-attack-maxdist" min="1" max="10" value="5"></label>
-      <label class="mb-field" id="minibia-bot-targeting-kite-field"><span class="mb-field-label">Kite distance</span><input type="number" id="minibia-bot-auto-attack-ideal-dist" min="1" max="10" value="3"></label>
+      <label class="mb-field" id="minibia-bot-targeting-kite-field"><span class="mb-field-label">Kite distance</span><input title="Maximum straight-line distance, including diagonals" type="number" id="minibia-bot-auto-attack-ideal-dist" min="1" max="10" value="3"></label>
     </div>
     <div data-targeting-rules-host style="border-top:1px solid rgba(255,255,255,.08);margin-top:10px;padding-top:9px;"></div>
     <details class="mb-cave-details" style="margin-top:10px;"><summary>Advanced Targeting</summary>
@@ -59779,7 +60476,7 @@ function upgradeSectionHeaders(panel) {
     <div class="mb-stack">
       <div class="mb-form-grid">
         <label class="mb-field"><span class="mb-field-label">Player Name</span><input type="text" id="minibia-bot-follow-name" placeholder="Enter player name" /></label>
-        <label class="mb-field"><span class="mb-field-label">Follow distance (tiles)</span><input type="number" id="minibia-bot-follow-distance" min="1" max="10" step="1" value="1" title="Stop within 1–10 tiles. Non-PvP stacking ignores this setting." /></label>
+        <label class="mb-field"><span class="mb-field-label">Follow distance (tiles)</span><input type="number" id="minibia-bot-follow-distance" min="1" max="10" step="1" value="1" title="Maximum straight-line distance, including diagonals. Hold position when closer. Non-PvP stacking ignores this setting." /></label>
       </div>
       <label class="mb-toggle">
         <input type="checkbox" id="minibia-bot-follow-nonpvp" />
@@ -60482,6 +61179,8 @@ function upgradeSectionHeaders(panel) {
         }
 
         // ---- AutoPickup ignore list: per-item edits save immediately. ----
+        bot.autoPickup?.mountPriorityItem?.(panel);
+        bot.autoPickup?.mountAllowList?.(panel);
         bot.autoPickup?.mountIgnoreList?.(panel);
 
         const autoPickupToggle = document.getElementById("minibia-bot-auto-pickup-enabled");
@@ -60498,7 +61197,7 @@ function upgradeSectionHeaders(panel) {
                 autoPickupRadius.value = status.config.radius;
             }
             const label = document.getElementById("minibia-bot-auto-pickup-status");
-            const text = !status.running ? "Off" : status.pickupInProgress ? "Picking up…" : "Ready";
+            const text = !status.running ? "Off" : status.priorityPickup ? "Priority pickup…" : status.pickupInProgress ? "Picking up…" : "Ready";
             if (label && label.textContent !== text) label.textContent = text;
         }
 
@@ -60845,7 +61544,11 @@ function upgradeSectionHeaders(panel) {
 
         function refreshFollowStatus() {
             if(followDistanceInput)followDistanceInput.disabled=getFollowMode()==="nonpvp";
-            const transitionReason=bot.followStatus?.()?.transitionReason;
+            if (followEnabled && bot.autoPickup?.isFollowPaused?.() && followStatus) {
+                followStatus.textContent="Picking up priority item…";return;
+            }
+            const status=bot.followStatus?.();
+            const transitionReason=status?.waitReason || status?.transitionReason;
             if (followEnabled && transitionReason && followStatus) {
                 followStatus.textContent=transitionReason;
                 return;
@@ -60881,7 +61584,7 @@ function upgradeSectionHeaders(panel) {
             }
         }
 
-        function stopFollow() {
+        function stopFollow(reason = "follow disabled") {
             if (followInterval) {
                 clearInterval(
                     followInterval
@@ -60890,7 +61593,7 @@ function upgradeSectionHeaders(panel) {
             }
 
             followEnabled = false;
-            bot.stopFollow();
+            bot.stopFollow(reason);
             refreshFollowStatus();
 
             localStorage.setItem(
@@ -60957,80 +61660,16 @@ function upgradeSectionHeaders(panel) {
                 getFollowDuringTarget()
             );
 
-            function isLeaderAlive(
-                targetName
-            ) {
-                const world =
-                    window.gameClient
-                        ?.world;
-
-                if (!world)
-                    return false;
-
-                const creatures =
-                    world.activeCreatures ||
-                    {};
-                const lowerName =
-                    targetName
-                        .toLowerCase();
-
-                for (const id in creatures) {
-                    const c =
-                        creatures[id];
-
-                    if (!c.name)
-                        continue;
-
-                    if (
-                        c.name
-                            .toLowerCase() ===
-                        lowerName
-                    ) {
-                        const health =
-                            c.state?.health ??
-                            c.health;
-
-                        if (
-                            health !==
-                                undefined &&
-                            health <= 0
-                        ) {
-                            return false;
-                        }
-
-                        return true;
-                    }
+            function isLeaderAlive(targetName) {
+                const active=window.gameClient?.world?.activeCreatures;
+                if (!active) return null;
+                const values=active instanceof Map?active.values():Object.values(active);
+                for (const c of values) {
+                    if (String(c?.name || "").toLowerCase()!==targetName.toLowerCase()) continue;
+                    const health=c.state?.health ?? c.health;
+                    return !(health!=null && Number(health)<=0);
                 }
-
-                return false;
-            }
-
-            function hasTarget() {
-                const player =
-                    window.gameClient
-                        ?.player;
-
-                if (!player)
-                    return false;
-
-                const target =
-                    player.__target;
-
-                if (!target)
-                    return false;
-
-                const health =
-                    target.state?.health ??
-                    target.health;
-
-                if (
-                    health !== undefined &&
-                    health <= 0
-                ) {
-                    return false;
-                }
-
-                return true;
+                return null; // Missing is temporary: keep enabled and reacquire.
             }
 
             // First custom A* + AutoWalk attempt immediately. No native
@@ -61054,22 +61693,12 @@ function upgradeSectionHeaders(panel) {
                             return;
 
                         if (
-                            !isLeaderAlive(name) && !bot.canContinueFloorFollow?.(name)
+                            isLeaderAlive(name)===false
                         ) {
                             bot.log(
-                                `Follow: "${name}" is dead or missing, stopping.`
+                                `Follow: "${name}" is dead, stopping.`
                             );
-                            stopFollow();
-                            return;
-                        }
-
-                        // Default behavior stays unchanged unless the user
-                        // explicitly allows Follow to keep moving during combat.
-                        if (
-                            hasTarget() &&
-                            !getFollowDuringTarget()
-                        ) {
-                            bot.stopFollowMovement?.();
+                            stopFollow("leader is dead");
                             return;
                         }
 
@@ -67102,8 +67731,18 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
         ownedClient: null,
         ownedPlayer: null,
         pickupDestination: null,
+        routeDestination: null,
+        walkRequests: 0,
+        lastWalkRequestAt: 0,
         pathRequestInProgress: false,
         previousChaseMode: null,
+        priority: null,
+        priorityScanner: null,
+        priorityAttempts: new Map(),
+        eventsOff: null,
+        lastScanAt: null,
+        priorityScans: 0,
+        ordinaryFollowSkips: 0,
     };
 
     const config = Object.assign({
@@ -67112,9 +67751,13 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
         cooldownMs: 0, // retired: no per-tile pickup cooldown
         delayMs: 0, // retired: process item-add events without an artificial wait
         walkTimeoutMs: 5000, // give up walking after this long
+        priorityEnabled: false,
+        priorityItem: null,
         ignoredItemIds: [], // array of item client IDs (CID) to ignore
         ignoredItemNames: [], // legacy exact-name entries, case-insensitive
         ignoredItems: [], // selected items, with exact server identity
+        onlySelected: false,
+        allowedItems: [],
     }, bot.storage.get(configStorageKey, {}));
     // Carry over radius and ignored items; retire delay values in old saves.
     config.cooldownMs = config.delayMs = 0;
@@ -67140,6 +67783,13 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
             if (item) items.set(ignoredItemKey(item), item);
         }
         config.ignoredItems = [...items.values()];
+        config.onlySelected=config.onlySelected===true;
+        const allowed=new Map();
+        for (const value of Array.isArray(config.allowedItems)?config.allowedItems:[]) {
+            const item=normalizeIgnoredItem(value);
+            if (item) allowed.set(ignoredItemKey(item),item);
+        }
+        config.allowedItems=[...allowed.values()];
     }
     normalizeIgnoreConfig();
 
@@ -67176,6 +67826,28 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
         return true;
     }
 
+    function getAllowedItems() {
+        return config.allowedItems.map(item=>({...item,key:`item:${ignoredItemKey(item)}`,
+            name:item.name || pickupItemName(item) || `Item ${item.sid || item.id}`}));
+    }
+    function addAllowedItem(value) {
+        const item=normalizeIgnoredItem(value);
+        if (!item || config.allowedItems.some(row=>ignoredItemKey(row)===ignoredItemKey(item))) return false;
+        config.allowedItems.push(item);persistConfig();state.lastScanAt=null;return true;
+    }
+    function removeAllowedItem(key) {
+        const before=config.allowedItems.length;
+        config.allowedItems=config.allowedItems.filter(item=>`item:${ignoredItemKey(item)}`!==key);
+        if (before===config.allowedItems.length) return false;
+        persistConfig();state.lastScanAt=null;return true;
+    }
+    function isItemAllowed(item) {
+        return !config.onlySelected || config.allowedItems.some(selected=>matchesPriority(item,selected));
+    }
+    function pickupSelection(item) {
+        return {id:Number(item.id),sid:itemIdNumber(item.sid),fluidType:item.fluidType==null?null:Number(item.fluidType)};
+    }
+
     // Legacy names are exact matches now. Empty/malformed saved entries can
     // never match every drop or throw out of the client's item-add handler.
     function isItemIgnored(itemId, itemName, itemSid = null, fluidType = null) {
@@ -67187,16 +67859,182 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
             (item.fluidType == null || item.fluidType === (Number(fluidType) || 0)));
     }
 
+    // Corpse sprites can be moveable containers. They are never Auto Pickup
+    // candidates; use exact server definitions before the shared CID fallback.
+    function isPickupCorpse(item) {
+        const client = window.gameClient;
+        const definition = client?.itemDefinitionsBySid?.[item?.sid] ||
+            client?.itemDefinitionsByCid?.[item?.id];
+        return definition?.properties?.type === "corpse";
+    }
+    function isPickupCandidate(item) {
+        if (!item || isPickupCorpse(item) || !isItemAllowed(item)) return false;
+        const client=window.gameClient;
+        const definition=client?.itemDefinitionsBySid?.[item.sid] || client?.itemDefinitionsByCid?.[item.id];
+        if (["splash","magicfield"].includes(definition?.properties?.type)) return false;
+        // Use the native ground item's DAT pickup flag when available. Moveable
+        // scenery, effects and blood are not items we can put in a backpack.
+        return typeof item.isPickupable !== "function" || item.isPickupable();
+    }
+    function isFollowing() { return bot.followStatus?.()?.active === true; }
+    function skipsOrdinaryFollowWalk(position) {
+        const player=bot.getPlayerPosition();
+        if (!isFollowing() || !player || player.z!==position.z ||
+            Math.max(Math.abs(player.x-position.x),Math.abs(player.y-position.y))<=1) return false;
+        state.ordinaryFollowSkips++;
+        return true;
+    }
+
+    let cancelPickupCapture=()=>{};
+    function normalizePriorityConfig() {
+        config.priorityEnabled=config.priorityEnabled===true;
+        config.priorityItem=normalizeIgnoredItem(config.priorityItem);
+    }
+    normalizePriorityConfig();
+    function matchesPriority(item,selected=config.priorityItem) {
+        if (!item || !selected) return false;
+        const matches=selected.sid?Number(item.sid)===selected.sid:Number(item.id)===selected.id;
+        return matches && (selected.fluidType==null || (Number(item.fluidType)||0)===selected.fluidType);
+    }
+    function priorityItemOnTile(tile,selected=config.priorityItem) {
+        const items=Array.isArray(tile?.items)?tile.items:[];
+        for(let i=items.length-1;i>=0;i--) {
+            const item=items[i];
+            if (isPickupCandidate(item) && matchesPriority(item,selected) && !isItemIgnored(item.id,pickupItemName(item),item.sid,item.fluidType)) return item;
+        }
+        return null;
+    }
+    function isFollowPaused() {
+        const p=state.priority;
+        return !!(state.running&&config.enabled&&config.priorityEnabled&&p&&state.pickupInProgress&&
+            p.client===window.gameClient&&p.player===window.gameClient?.player&&
+            bot.getPlayerPosition()?.z===p.position.z&&!bot.actions?.isHalted?.()&&!bot.followingItemGuard?.isHolding?.());
+    }
+    function scanPriorityGround() {
+        if (!state.running||!config.enabled||!config.priorityEnabled||!config.priorityItem||
+            bot.actions?.isHalted?.()||bot.followingItemGuard?.isHolding?.()) return false;
+        if (state.priority) return true;
+        const player=bot.getPlayerPosition(),client=window.gameClient;
+        if (!player||!client?.world?.getTileFromWorldPosition) return false;
+        const now=Date.now(),radius=Math.min(10,Math.max(1,Math.trunc(Number(config.radius)||5)));
+        if (state.lastScanAt!==null && now>=state.lastScanAt && now-state.lastScanAt<200) return false;
+        state.lastScanAt=now;state.priorityScans++;
+        const selectionKey=ignoredItemKey(config.priorityItem);
+        for(const [key,until] of state.priorityAttempts)if(until<=now)state.priorityAttempts.delete(key);
+        let best=null;
+        for(let dy=-radius;dy<=radius;dy++)for(let dx=-radius;dx<=radius;dx++) {
+            const distance=Math.max(Math.abs(dx),Math.abs(dy));
+            if (best&&distance>=best.distance) continue;
+            const position={x:player.x+dx,y:player.y+dy,z:player.z};
+            const key=`${position.x},${position.y},${position.z}:${selectionKey}`;
+            if (state.priorityAttempts.has(key)) continue;
+            const item=priorityItemOnTile(client.world.getTileFromWorldPosition(position));
+            if (item) best={position,item,distance,key};
+        }
+        if (!best) return false;
+        return claimPriorityCandidate(best,now);
+    }
+    // An item packet already identifies its tile. Inspect just that tile rather
+    // than running a full radius scan on every drop, splash and field update.
+    function tryPriorityAt(position) {
+        if (!state.running || !config.enabled || !config.priorityEnabled || !config.priorityItem ||
+            state.priority || bot.actions?.isHalted?.() || bot.followingItemGuard?.isHolding?.()) return false;
+        const player=bot.getPlayerPosition();
+        const distance=player && player.z===position.z ? Math.max(Math.abs(player.x-position.x),Math.abs(player.y-position.y)) : Infinity;
+        if (distance>Math.min(10,Math.max(1,Number(config.radius)||5))) return false;
+        const key=`${position.x},${position.y},${position.z}:${ignoredItemKey(config.priorityItem)}`;
+        const now=Date.now();
+        if ((state.priorityAttempts.get(key)||0)>now) return false;
+        const item=priorityItemOnTile(window.gameClient?.world?.getTileFromWorldPosition?.(position));
+        return item ? claimPriorityCandidate({position:{...position},item,distance,key},now) : false;
+    }
+    function claimPriorityCandidate(best,now) {
+        if (state.pickupInProgress) {++state.attemptToken;__resumeModules();}
+        // Retrying a blocked tile must leave Follow a chance to make progress.
+        state.priorityAttempts.set(best.key,now+Math.max(5000,Number(config.walkTimeoutMs)||5000)+5000);
+        while(state.priorityAttempts.size>128)state.priorityAttempts.delete(state.priorityAttempts.keys().next().value);
+        beginPriorityPickup(best);
+        return true;
+    }
+    function beginPriorityPickup(candidate) {
+        const client=window.gameClient,pf=client?.world?.pathfinder,selected={...config.priorityItem};
+        const focus={client,player:client?.player,position:{...candidate.position},selected,attempts:0,lastUse:0,startedAt:Date.now()};
+        state.priority=focus;state.pickupInProgress=true;
+        const token=++state.attemptToken;
+        try {
+            bot.stopFollowMovement?.("priority item pickup");
+            if (bot.cave?.status?.().running&&typeof bot.cave?.pauseMovement==="function") {
+                bot.cave.pauseMovement("auto-pickup");state.caveMovementPaused=true;
+            }
+            state.previousChaseMode=Number(client?.interface?.fightModeSelector?.currentChaseMode);
+            bot.attack?.yieldMovementForPickup?.();
+            state.ownedClient=client;state.ownedPlayer=client?.player;state.ownedPathfinder=pf||null;
+            state.pickupDestination={...focus.position};
+            pf?.setPathfindCache?.(null);
+        } catch(error) {__resumeModules();return;}
+        const tick=()=>{
+            if(token!==state.attemptToken||state.priority!==focus)return;
+            try {
+                if(!isFollowPaused()||!matchesPriority(candidate.item,config.priorityItem)) {__resumeModules();return;}
+                const current=bot.getPlayerPosition(),tile=window.gameClient?.world?.getTileFromWorldPosition?.(focus.position);
+                // The native item-remove/update packets are confirmation. A move
+                // request alone is not proof the server accepted the pickup.
+                const item=priorityItemOnTile(tile,selected);
+                if(!item) {__resumeModules();return;}
+                if(replacedPickupRoute()) {__resumeModules();return;}
+                const distance=Math.max(Math.abs(current.x-focus.position.x),Math.abs(current.y-focus.position.y));
+                const moving=pickupMovementPending();
+                if(distance<=1) {
+                    if(pf?.__finalDestination&&samePosition(pf.__finalDestination,state.routeDestination))pf.setPathfindCache?.(null);
+                    if(moving)return;
+                    const now=Date.now();
+                    if(focus.attempts&&now-focus.lastUse<750)return;
+                    if(focus.attempts>=3)return;
+                    focus.attempts++;focus.lastUse=now;
+                    if(!__doPickup(focus.position,item.id,null,selected))__resumeModules();
+                    return;
+                }
+                if(moving||pf?.__isAutoWalking)return;
+                if(!requestPickupWalk())__resumeModules();
+            } catch(error) {bot.log('[AutoPickup] Priority pickup failed:',error);__resumeModules();}
+        };
+        state.walkInterval=setInterval(tick,100);
+        state.walkTimer=setTimeout(()=>{if(token===state.attemptToken&&state.priority===focus)__resumeModules();},Math.max(2000,Number(config.walkTimeoutMs)||5000));
+        tick();
+    }
+    function syncPriorityScanner() {
+        const enabled=state.running&&config.enabled&&config.priorityEnabled&&!!config.priorityItem;
+        if(!enabled) {
+            if(state.priorityScanner!==null)clearInterval(state.priorityScanner);
+            state.priorityScanner=null;
+            if(state.priority) {++state.attemptToken;__resumeModules();}
+            return;
+        }
+        if(state.priorityScanner===null)state.priorityScanner=setInterval(scanPriorityGround,200);
+        scanPriorityGround();
+    }
+    function setPriorityItem(item) {
+        const selected=normalizeIgnoredItem(item);
+        if(!selected)return false;
+        updateConfig({priorityItem:selected,priorityEnabled:true});
+        return true;
+    }
+    function clearPriorityItem() {updateConfig({priorityItem:null,priorityEnabled:false});}
+
     function persistConfig() {
         bot.storage.set(configStorageKey, {
             enabled: config.enabled,
             radius: config.radius,
+            priorityEnabled: config.priorityEnabled,
+            priorityItem: config.priorityItem,
             cooldownMs: config.cooldownMs,
             delayMs: config.delayMs,
             walkTimeoutMs: config.walkTimeoutMs,
             ignoredItemIds: config.ignoredItemIds,
             ignoredItemNames: config.ignoredItemNames,
             ignoredItems: config.ignoredItems,
+            onlySelected: config.onlySelected,
+            allowedItems: config.allowedItems,
         });
     }
 
@@ -67211,8 +68049,18 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
         return null;
     }
 
+    function getPickupItemOnTile(tile) {
+        if (!config.onlySelected) return getTopItemOnTile(tile);
+        const items=Array.isArray(tile?.items)?tile.items:[];
+        for (let i=items.length-1;i>=0;i--) {
+            const item=items[i];
+            if (isPickupCandidate(item) && !isItemIgnored(item.id,pickupItemName(item),item.sid,item.fluidType)) return item;
+        }
+        return null;
+    }
+
     // ---- Core pickup logic with walk and pause ----
-    function __doPickup(pos, itemId, callback) {
+    function __doPickup(pos, itemId, callback, selection = null) {
         if (bot.followingItemGuard?.isHolding?.()) { callback?.(false); return false; }
         const tile = gameClient.world.getTileFromWorldPosition(pos);
         if (!tile) {
@@ -67220,8 +68068,8 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
                 callback(false);
             return false;
         }
-        const topItem = getTopItemOnTile(tile);
-        if (!topItem || topItem.id !== itemId) {
+        const topItem = selection ? priorityItemOnTile(tile, selection) : getPickupItemOnTile(tile);
+        if (!isPickupCandidate(topItem) || topItem.id !== itemId) {
             if (callback)
                 callback(false);
             return false;
@@ -67236,7 +68084,8 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
             return false;
         }
 
-        const success = bot.pickUpItem(pos.x, pos.y, pos.z);
+        const exact=selection || (config.onlySelected?pickupSelection(topItem):null);
+        const success = exact ? bot.pickUpItem(pos.x, pos.y, pos.z, exact) : bot.pickUpItem(pos.x, pos.y, pos.z);
         if (callback)
             callback(success);
         return success;
@@ -67275,7 +68124,7 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
         const previousChaseMode = state.previousChaseMode;
         // Never cancel a route that another module or a manual click replaced.
         if (sameSession && pf === client?.world?.pathfinder &&
-            samePosition(pf?.__finalDestination, state.pickupDestination)) {
+            samePosition(pf?.__finalDestination, state.routeDestination)) {
             try { pf.setPathfindCache?.(null); } catch (e) {}
             pf.__finalDestination = null;
             pf.__isAutoWalking = false;
@@ -67283,10 +68132,12 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
             pf.__hybridPath = null;
         }
         state.ownedPathfinder = state.ownedClient = state.ownedPlayer = null;
-        state.pickupDestination = null;
+        state.pickupDestination = state.routeDestination = null;
+        state.walkRequests=0;state.lastWalkRequestAt=0;
         state.pathRequestInProgress = false;
         state.previousChaseMode = null;
         state.pickupInProgress = false;
+        state.priority = null;
 
         if (state.caveMovementPaused) {
             try { bot.cave?.resumeMovement?.("auto-pickup"); } catch (e) {}
@@ -67304,13 +68155,38 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
         }
     }
 
-    function __walkAndPickup(pos, itemId) {
+    function replacedPickupRoute() {
+        const destination=state.ownedPathfinder?.__finalDestination;
+        return !!destination && !!state.routeDestination && !samePosition(destination,state.routeDestination);
+    }
+    function requestPickupWalk() {
+        if (!ownsMovement() || replacedPickupRoute() || state.walkRequests>=3 ||
+            typeof bot.walkPickupRoute!=="function") return false;
+        const now=Date.now();
+        if (state.walkRequests && now-state.lastWalkRequestAt<500) return true;
+        state.walkRequests++;state.lastWalkRequestAt=now;
+        state.pathRequestInProgress=true;
+        try {
+            const route=bot.walkPickupRoute(state.pickupDestination);
+            if (!route?.destination) return false;
+            state.routeDestination={...route.destination};return true;
+        } catch(error) {bot.log('[AutoPickup] A* pickup route failed:',error);return false;}
+        finally {state.pathRequestInProgress=false;}
+    }
+    function pickupMovementPending() {
+        const player=window.gameClient?.player;
+        player?.prunePreWalks?.();
+        return !!player?.isMoving?.() || (Array.isArray(player?.__preWalks)&&player.__preWalks.length>0);
+    }
+
+    function __walkAndPickup(pos, itemId, selection=null) {
         if (state.pickupInProgress || bot.followingItemGuard?.isHolding?.() || bot.actions?.isHalted?.())
             return;
         const playerPos = bot.getPlayerPosition();
         if (!playerPos || playerPos.z !== pos.z ||
             Math.max(Math.abs(pos.x - playerPos.x), Math.abs(pos.y - playerPos.y)) > config.radius)
             return;
+        if (skipsOrdinaryFollowWalk(pos)) return;
         state.pickupInProgress = true;
         const token = ++state.attemptToken;
         const finish = () => {
@@ -67321,7 +68197,7 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
                     Math.max(Math.abs(pos.x - current.x), Math.abs(pos.y - current.y)) <= 1;
                 if (inReach && (!state.ownedPathfinder || ownsMovement()) &&
                     !bot.actions?.isHalted?.() && !bot.followingItemGuard?.isHolding?.()) {
-                    __doPickup(pos, itemId);
+                    __doPickup(pos, itemId, null, selection);
                 }
             } finally {
                 __resumeModules();
@@ -67335,7 +68211,7 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
 
         const client = window.gameClient;
         const pf = client?.world?.pathfinder;
-        if (!pf?.findPath) { __resumeModules(); return; }
+        if (!pf || !bot.walkPickupRoute) { __resumeModules(); return; }
         try {
             if (bot.cave?.status?.().running && typeof bot.cave?.pauseMovement === "function") {
                 bot.cave.pauseMovement("auto-pickup");
@@ -67353,9 +68229,7 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
             if (Number(selector?.currentChaseMode) === 2) selector.setChaseMode?.(0);
             pf.setPathfindCache?.(null);
             pf.__finalDestination = null;
-            state.pathRequestInProgress = true;
-            try { pf.findPath(playerPos, state.pickupDestination); }
-            finally { state.pathRequestInProgress = false; }
+            if (!pickupMovementPending() && !requestPickupWalk()) {__resumeModules();return;}
         } catch (e) {
             bot.log('[AutoPickup] Could not start pickup path:', e);
             __resumeModules();
@@ -67365,23 +68239,119 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
         state.walkInterval = setInterval(() => {
             if (token !== state.attemptToken || !state.pickupInProgress) return;
             const current = bot.getPlayerPosition();
-            if (!ownsMovement() || bot.followingItemGuard?.isHolding?.() || bot.actions?.isHalted?.() ||
+            if (skipsOrdinaryFollowWalk(pos) || !ownsMovement() || bot.followingItemGuard?.isHolding?.() || bot.actions?.isHalted?.() ||
                 !current || current.z !== pos.z ||
-                (pf.__finalDestination && !samePosition(pf.__finalDestination, state.pickupDestination))) {
+                replacedPickupRoute()) {
                 __resumeModules();
                 return;
             }
+            const tile=window.gameClient?.world?.getTileFromWorldPosition?.(pos);
+            const item=selection?priorityItemOnTile(tile,selection):getPickupItemOnTile(tile);
+            if (!isPickupCandidate(item) || isItemIgnored(item.id,pickupItemName(item),item.sid,item.fluidType)) {__resumeModules();return;}
             if (Math.max(Math.abs(pos.x - current.x), Math.abs(pos.y - current.y)) <= 1) finish();
+            else if (!pickupMovementPending() && !pf.__isAutoWalking && !requestPickupWalk()) __resumeModules();
         }, 100);
         state.walkTimer = setTimeout(() => {
             if (token === state.attemptToken) finish();
         }, config.walkTimeoutMs);
     }
 
+    function processItemAdd(packet, result) {
+        if (!state.running || !config.enabled)
+            return result;
+
+        const pos = packet.position;
+        if (!pos)
+            return result;
+
+        const playerPos = bot.getPlayerPosition();
+        if (!playerPos)
+            return result;
+
+        const dx = Math.abs(pos.x - playerPos.x);
+        const dy = Math.abs(pos.y - playerPos.y);
+        if (dx > config.radius || dy > config.radius || pos.z !== playerPos.z) {
+            return result;
+        }
+
+        // ---- BLACKLIST CHECK (early) ----
+        const itemId = packet.id;
+        if (!isPickupCandidate(packet)) return result;
+        const name = pickupItemName(packet);
+        if (isItemIgnored(itemId, name, packet.sid, packet.fluidType)) {
+            bot.log(`[AutoPickup] Ignoring blacklisted item ${itemId} (${name}) at ${pos.x},${pos.y},${pos.z}`);
+            return result;
+        }
+
+        if (config.priorityEnabled && matchesPriority(packet)) {
+            tryPriorityAt(pos);
+            return result;
+        }
+        if (skipsOrdinaryFollowWalk(pos)) return result;
+        const pickupClient=window.gameClient,pickupPlayer=pickupClient?.player;
+        const tileKey = `${pos.x},${pos.y},${pos.z}`;
+        // Duplicate packet events for a tile share one bounded pending job.
+        // Serialize pickup walks while allowing combat to continue.
+        if (state.pendingTiles.has(tileKey) || state.pendingTiles.size >= 64)
+            return result;
+        state.pendingTiles.add(tileKey);
+        const pickupPos = { x: pos.x, y: pos.y, z: pos.z };
+        const schedulePickup = (attempt) => {
+            const delayedJob = setTimeout(() => {
+                state.delayedJobs.delete(delayedJob);
+                const abandon = () => state.pendingTiles.delete(tileKey);
+                if (!state.running || !config.enabled || bot.actions?.isHalted?.() ||
+                    window.gameClient!==pickupClient || window.gameClient?.player!==pickupPlayer) {
+                    abandon();
+                    return;
+                }
+                const tile = gameClient.world?.getTileFromWorldPosition(pickupPos);
+                const topItem = getPickupItemOnTile(tile);
+                if (!isPickupCandidate(topItem)) {
+                    abandon();
+                    return;
+                }
+                const name2 = pickupItemName(topItem);
+                if (isItemIgnored(topItem.id, name2, topItem.sid, topItem.fluidType)) {
+                    abandon();
+                    return;
+                }
+                if (config.priorityEnabled && matchesPriority(topItem)) {
+                    abandon();tryPriorityAt(pickupPos);return;
+                }
+                if (skipsOrdinaryFollowWalk(pickupPos)) { abandon();return; }
+                if (state.pickupInProgress || bot.followingItemGuard?.isHolding?.()) {
+                    if (attempt < 30) schedulePickup(attempt + 1);
+                    else abandon();
+                    return;
+                }
+                abandon();
+                __walkAndPickup(pickupPos, topItem.id, config.onlySelected?pickupSelection(topItem):null);
+            }, attempt === 0 ? 0 : 500);
+            state.delayedJobs.add(delayedJob);
+        };
+        schedulePickup(0);
+
+        return result;
+    }
+
     // ---- Hook PacketHandler.handleItemAdd ----
     function installHook() {
-        if (state.patched)
+        if (state.patched) return;
+        if (bot.clientEvents?.subscribe) {
+            state.eventsOff=bot.clientEvents.subscribe(["ground-item","session"],event=>{
+                if (!state.running || !config.enabled) return;
+                if (event.client!==window.gameClient || event.player!==window.gameClient?.player) return;
+                if (event.type==="session") {
+                    ++state.attemptToken;clearPickupTimers();__resumeModules();
+                    state.priorityAttempts.clear();state.lastScanAt=null;
+                } else if (event.kind==="add") processItemAdd(event.packet);
+            });
+            state.patched=true;
+            bot.clientEvents.ensureBound?.();
             return;
+        }
+        // Compatibility for standalone installations without the event service.
         const handler = gameClient?.networkManager?.packetHandler;
         if (!handler || typeof handler.handleItemAdd !== "function") {
             if (state.running && config.enabled && state.hookRetryTimer === null)
@@ -67398,70 +68368,7 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
         const wrapper = function (packet) {
             const result = original.call(this, packet);
 
-            if (!state.running || !config.enabled)
-                return result;
-
-            const pos = packet.position;
-            if (!pos)
-                return result;
-
-            const playerPos = bot.getPlayerPosition();
-            if (!playerPos)
-                return result;
-
-            const dx = Math.abs(pos.x - playerPos.x);
-            const dy = Math.abs(pos.y - playerPos.y);
-            if (dx > config.radius || dy > config.radius || pos.z !== playerPos.z) {
-                return result;
-            }
-
-            // ---- BLACKLIST CHECK (early) ----
-            const itemId = packet.id;
-            const name = pickupItemName(packet);
-            if (isItemIgnored(itemId, name, packet.sid, packet.fluidType)) {
-                bot.log(`[AutoPickup] Ignoring blacklisted item ${itemId} (${name}) at ${pos.x},${pos.y},${pos.z}`);
-                return result;
-            }
-
-            const tileKey = `${pos.x},${pos.y},${pos.z}`;
-            // Duplicate packet events for a tile share one bounded pending job.
-            // Serialize pickup walks while allowing combat to continue.
-            if (state.pendingTiles.has(tileKey) || state.pendingTiles.size >= 64)
-                return result;
-            state.pendingTiles.add(tileKey);
-            const pickupPos = { x: pos.x, y: pos.y, z: pos.z };
-            const schedulePickup = (attempt) => {
-                const delayedJob = setTimeout(() => {
-                    state.delayedJobs.delete(delayedJob);
-                    const abandon = () => state.pendingTiles.delete(tileKey);
-                    if (!state.running || !config.enabled || bot.actions?.isHalted?.()) {
-                        abandon();
-                        return;
-                    }
-                    const tile = gameClient.world?.getTileFromWorldPosition(pickupPos);
-                    const topItem = getTopItemOnTile(tile);
-                    if (!topItem) {
-                        abandon();
-                        return;
-                    }
-                    const name2 = pickupItemName(topItem);
-                    if (isItemIgnored(topItem.id, name2, topItem.sid, topItem.fluidType)) {
-                        abandon();
-                        return;
-                    }
-                    if (state.pickupInProgress || bot.followingItemGuard?.isHolding?.()) {
-                        if (attempt < 30) schedulePickup(attempt + 1);
-                        else abandon();
-                        return;
-                    }
-                    abandon();
-                    __walkAndPickup(pickupPos, topItem.id);
-                }, attempt === 0 ? 0 : 500);
-                state.delayedJobs.add(delayedJob);
-            };
-            schedulePickup(0);
-
-            return result;
+            return processItemAdd(packet, result);
         };
 
         state.hookWrapper = wrapper;
@@ -67475,6 +68382,7 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
             clearTimeout(state.hookRetryTimer);
             state.hookRetryTimer = null;
         }
+        state.eventsOff?.();state.eventsOff=null;
         if (!state.patched) return;
         if (state.hookOwner?.handleItemAdd === state.hookWrapper)
             state.hookOwner.handleItemAdd = state.originalHandleItemAdd;
@@ -67487,12 +68395,16 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
 
     // ---- Start / Stop ----
     function start(overrides = {}) {
+        if (state.startupTimer!==null) clearTimeout(state.startupTimer);
+        state.startupTimer=null;
         Object.assign(config, overrides, {
             enabled: true, cooldownMs: 0, delayMs: 0
         });
         normalizeIgnoreConfig();
+        normalizePriorityConfig();
         persistConfig();
         if (state.running) {
+            syncPriorityScanner();
             bot.log("[AutoPickup] already running");
             return false;
         }
@@ -67501,6 +68413,7 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
         state.pickupInProgress = false;
         state.caveMovementPaused = false;
         installHook();
+        syncPriorityScanner();
         bot.log("[AutoPickup] started", {
             radius: config.radius,
             delayMs: config.delayMs
@@ -67512,6 +68425,9 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
         const shouldPersist = options.persistEnabled !== false;
         state.running = false;
         ++state.attemptToken;
+        if (state.priorityScanner !== null) clearInterval(state.priorityScanner);
+        state.priorityScanner = null;
+        state.priorityAttempts.clear();state.lastScanAt=null;
         if (state.startupTimer !== null) {
             clearTimeout(state.startupTimer);
             state.startupTimer = null;
@@ -67537,13 +68453,17 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
             },
             patched: state.patched,
             pickupInProgress: state.pickupInProgress,
+            priorityPickup: !!state.priority,
             caveMovementPaused: state.caveMovementPaused,
         };
     }
 
     function updateConfig(next = {}) {
+        if (state.priority && ("priorityItem" in next || next.priorityEnabled === false)) {++state.attemptToken;__resumeModules();}
         Object.assign(config, next);
         normalizeIgnoreConfig();
+        normalizePriorityConfig();
+        state.lastScanAt=null;
         if (config.radius < 1)
             config.radius = 1;
         config.cooldownMs = config.delayMs = 0;
@@ -67554,16 +68474,23 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
             start();
         if (!config.enabled && state.running)
             stop();
+        syncPriorityScanner();
         return {
             ...config
         };
     }
 
-    function mountIgnoreList(panel) {
-        const section = panel?.querySelector("[data-pickup-ignore]");
+    function mountIgnoreList(panel) {mountItemList(panel,false);}
+    function mountAllowList(panel) {mountItemList(panel,true);}
+    function mountItemList(panel, allowed) {
+        const kind=allowed?"allow":"ignore";
+        const entries=allowed?getAllowedItems:getIgnoredItems;
+        const addEntry=allowed?addAllowedItem:addIgnoredItem;
+        const removeEntry=allowed?removeAllowedItem:removeIgnoredItem;
+        const section = panel?.querySelector(`[data-pickup-${kind}]`);
         if (!section || section.dataset.bound) return;
         section.dataset.bound = "true";
-        const q = name => section.querySelector(`[data-pickup-ignore-${name}]`);
+        const q = name => section.querySelector(`[data-pickup-${kind}-${name}]`);
         const input = q("input"), pick = q("pick"), addButton = q("add"), list = q("list"), choices = q("choices"), status = q("status"), count = q("count");
         let capturing = false, timer = null;
         const bindings = [];
@@ -67571,20 +68498,21 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
         const message = (text, error = false) => { status.textContent = text; status.dataset.error = String(error); };
         function render() {
             list.replaceChildren();
-            const entries = getIgnoredItems();
-            count.textContent = entries.length ? ` (${entries.length})` : "";
-            if (!entries.length) {
+            const rows = entries();
+            if (allowed) q("enabled").checked=config.onlySelected;
+            count.textContent = rows.length ? ` (${rows.length})` : "";
+            if (!rows.length) {
                 const empty = document.createElement("span"); empty.className = "mb-small-note";
-                empty.textContent = "No ignored items"; list.appendChild(empty);
+                empty.textContent = allowed?"No items selected. When enabled, nothing will be collected.":"No ignored items"; list.appendChild(empty);
             }
-            for (const entry of entries) {
+            for (const entry of rows) {
                 const row = document.createElement("div"); row.className = "mb-pickup-ignore-entry";
                 const name = document.createElement("span"); name.textContent = entry.name;
                 name.title = entry.sid ? `SID ${entry.sid} · ID ${entry.id || "unknown"}` : entry.id ? `ID ${entry.id}` : "Exact item name";
                 const remove = document.createElement("button"); remove.type = "button";
                 remove.className = "mb-small-button"; remove.textContent = "×";
                 remove.title = `Remove ${entry.name}`; remove.setAttribute("aria-label", remove.title);
-                remove.dataset.ignoreKey = entry.key;
+                remove.dataset[allowed?"allowKey":"ignoreKey"] = entry.key;
                 row.appendChild(name); row.appendChild(remove); list.appendChild(row);
             }
         }
@@ -67603,8 +68531,8 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
             pick.setAttribute("aria-pressed", "false");
         }
         function add(item) {
-            const added = addIgnoredItem(item);
-            message(added ? `Ignoring ${item.name || "item"}` : "That item is already ignored.");
+            const added = addEntry(item);
+            message(added ? `${allowed?"Added":"Ignoring"} ${item.name || "item"}` : "That item is already listed.");
             input.value = ""; cancelCapture(); render();
         }
         function addTyped() {
@@ -67641,10 +68569,11 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
         }
         bind(pick, "click", () => {
             if (capturing) { cancelCapture(); message("Selection cancelled."); return; }
+            cancelPickupCapture();cancelPickupCapture=cancelCapture;
             bot.itemAlertItems?.cancelCapture?.(); bot.itemDropper?.cancelCapture?.();
             bot.looter?.clearCaptureMode?.(); bot.equipRing?.clearCaptureMode?.(); bot.bootsSwapper?.clearCaptureMode?.();
             capturing = true; pick.setAttribute("aria-pressed", "true");
-            message("Click an item to ignore. Escape cancels.");
+            message(`Click an item to ${allowed?"collect":"ignore"}. Escape cancels.`);
             document.addEventListener("click", captureClick, true);
             document.addEventListener("keydown", captureKey, true);
             timer = setTimeout(() => { cancelCapture(); message("Item selection timed out."); }, 20000);
@@ -67654,11 +68583,59 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
         bind(input, "input", () => { cancelCapture(); message(""); suggestions(); });
         bind(input, "keydown", event => { if (event.key === "Enter") { event.preventDefault(); addTyped(); } });
         bind(list, "click", event => {
-            const button = event.target?.closest?.("[data-ignore-key]");
-            if (button && list.contains(button) && removeIgnoredItem(button.dataset.ignoreKey)) { render(); message("Item removed."); }
+            const button = event.target?.closest?.(allowed?"[data-allow-key]":"[data-ignore-key]");
+            if (button && list.contains(button) && removeEntry(button.dataset[allowed?"allowKey":"ignoreKey"])) { render(); message("Item removed."); }
         });
+        if (allowed) bind(q("enabled"),"change",()=>{updateConfig({onlySelected:q("enabled").checked});render();});
         render();
         bot.addCleanup(() => { cancelCapture(); bindings.forEach(unbind => unbind()); });
+    }
+
+    function mountPriorityItem(panel) {
+        const section=panel?.querySelector('[data-pickup-priority]');
+        if(!section||section.dataset.bound)return;
+        section.dataset.bound='true';
+        const q=n=>section.querySelector(`[data-pickup-priority-${n}]`);
+        const enabled=q('enabled'),input=q('input'),pick=q('pick'),save=q('save'),clear=q('clear'),choices=q('choices'),selection=q('selection'),status=q('status');
+        const bindings=[];let capturing=false,timer=null;
+        const bind=(el,event,fn)=>{el?.addEventListener(event,fn);bindings.push(()=>el?.removeEventListener(event,fn));};
+        const message=(text,error=false)=>{status.textContent=text;status.dataset.error=String(error);};
+        function render(){enabled.checked=config.priorityEnabled;selection.textContent=config.priorityItem?`Selected: ${config.priorityItem.name||'Item '+(config.priorityItem.sid||config.priorityItem.id)}`:'No priority item selected';}
+        function cancelCapture(){capturing=false;if(timer!==null)clearTimeout(timer);timer=null;pick.setAttribute('aria-pressed','false');document.removeEventListener('click',captureClick,true);document.removeEventListener('keydown',captureKey,true);}
+        function choose(item){if(!setPriorityItem(item))return;cancelCapture();input.value=item.choice||item.name||String(item.id);render();message(isItemIgnored(item.id,item.name,item.sid,item.fluidType)?'This item is ignored. Remove it from Ignored items to collect it.':state.running?'Priority item saved.':'Saved. Enable Auto Pickup to collect it.',isItemIgnored(item.id,item.name,item.sid,item.fluidType));}
+        function saveTyped(){
+            const value=input.value.trim();
+            if(/^\d+$/.test(value)) {
+                const id=itemIdNumber(value),matches=(bot.itemAlertItems?.catalog?.()||[]).filter(i=>i.id===id&&!i.fluidType);
+                if(!id){message('Enter a valid item ID.',true);return;}
+                if(matches.length>1){message('Several items share that ID. Choose its name or pick the item.',true);return;}
+                choose(matches[0]||{id,name:pickupItemName({id})||`Item ${id}`,fluidType:null});return;
+            }
+            const result=bot.itemAlertItems?.resolve?.(value);
+            if(!result?.item){message(result?.error||'Choose an item or use the magnifying glass.',true);return;}
+            choose(result.item);
+        }
+        function captureClick(event){
+            if(!capturing)return;
+            if(panel.contains(event.target)){if(!section.contains(event.target)){cancelCapture();message('Selection cancelled.');}return;}
+            const item=bot.itemAlertItems?.fromItem?.(bot.itemAlertItems?.captureItem?.(event));
+            if(!item){message('Click an item in a backpack, equipment slot or on the ground.',true);return;}
+            event.preventDefault();event.stopImmediatePropagation();choose(item);
+        }
+        function captureKey(event){if(event.key==='Escape'){event.preventDefault();event.stopImmediatePropagation();cancelCapture();message('Selection cancelled.');}}
+        bind(enabled,'change',()=>{updateConfig({priorityEnabled:enabled.checked});render();});
+        bind(save,'click',saveTyped);bind(clear,'click',()=>{cancelCapture();clearPriorityItem();input.value='';render();message('Priority item cleared.');});
+        bind(input,'input',()=>{cancelCapture();message('');choices.replaceChildren();for(const item of bot.itemAlertItems?.suggestions?.(input.value)||[]){const option=document.createElement('option');option.value=item.choice;choices.appendChild(option);}});
+        bind(input,'keydown',event=>{if(event.key==='Enter'){event.preventDefault();saveTyped();}});
+        bind(pick,'click',()=>{
+            if(capturing){cancelCapture();message('Selection cancelled.');return;}
+            cancelPickupCapture();bot.itemAlertItems?.cancelCapture?.();bot.itemDropper?.cancelCapture?.();bot.looter?.clearCaptureMode?.();bot.equipRing?.clearCaptureMode?.();bot.bootsSwapper?.clearCaptureMode?.();
+            capturing=true;cancelPickupCapture=cancelCapture;pick.setAttribute('aria-pressed','true');message('Click the item to prioritize. Escape cancels.');
+            document.addEventListener('click',captureClick,true);document.addEventListener('keydown',captureKey,true);
+            timer=setTimeout(()=>{cancelCapture();message('Item selection timed out.');},20000);
+        });
+        input.value=config.priorityItem?.name||'';render();
+        bot.addCleanup(()=>{cancelCapture();bindings.forEach(off=>off());});
     }
 
     if (config.enabled) {
@@ -67673,11 +68650,20 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
         start,
         stop,
         status,
+        isRunning: () => state.running,
+        diagnostics: () => ({running:state.running,busy:state.pickupInProgress,
+            priority:!!state.priority,position:state.pickupDestination ? {...state.pickupDestination} : null,
+            heldForMs:state.priority ? Math.max(0,Date.now()-state.priority.startedAt) : 0,
+            pendingTiles:state.pendingTiles.size,delayedJobs:state.delayedJobs.size,
+            backoffEntries:state.priorityAttempts.size,priorityScans:state.priorityScans,
+            ordinaryFollowSkips:state.ordinaryFollowSkips,sharedEvents:!!state.eventsOff}),
         isBusy: () => state.pickupInProgress,
         ownsMovement,
         isRequestingMovement: () => state.pathRequestInProgress && ownsMovement(),
         updateConfig,
         getIgnoredItems, addIgnoredItem, removeIgnoredItem, mountIgnoreList,
+        mountPriorityItem, setPriorityItem, clearPriorityItem, isFollowPaused,
+        getAllowedItems, addAllowedItem, removeAllowedItem, mountAllowList,
         config,
     };
 };
