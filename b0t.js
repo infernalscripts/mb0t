@@ -4075,7 +4075,27 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.303",
+        version: "1.6.309",
+        // Native duration is frames, not milliseconds; it already includes
+        // ground friction, current speed/paralysis, and diagonal step cost.
+        getMovementStallTimeout(baseMs = 1500) {
+            const base=Math.max(250,Number(baseMs)||1500);
+            try {
+                const client=window.gameClient,player=client?.player;
+                const stepMs=Number(player?.getStepDuration?.(player?.getTile?.())) * Number(client?.getTickInterval?.());
+                if (Number.isFinite(stepMs) && stepMs>0) return Math.max(base,stepMs*2+250);
+            } catch(e) {}
+            return base;
+        },
+        isLiveItemSource(source, expectedItem = null) {
+            try {
+                const owner=source?.which;
+                if (!owner) return false;
+                const live=typeof owner.peekItem==="function" ? owner.peekItem(source.index)
+                    : owner.getSlotItem?.(source.index);
+                return !!live && (!expectedItem || live===expectedItem);
+            } catch(e) { return false; }
+        },
         isWalkableParcel: isFollowWalkableParcel,
         addCleanup,
         items: itemsApi,
@@ -12215,6 +12235,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     function canTargetPassThroughCreatures(tile,creatures) {
         if (!creatures.length) return true;
         const client=window.gameClient;
+        // Reuse the new native Chancellor rule independently of PvP mode.
+        try { creatures=creatures.filter(c=>tile?.__chancellorPasses?.(c)!==true); }
+        catch(e) { return false; }
+        if (!creatures.length) return true;
         if (client?.player?.outfit?.verifiedGhost===true) return true;
         if (client?.__worldPvp!==false) return false;
         try {
@@ -12515,7 +12539,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         return Math.max(dx,dy)>0 ? Math.min(dx,dy)/Math.max(dx,dy) : 0;
     }
     function isDiagonalKiteStepPending() {
-        if (!isDiagonalKiteEnabled()) return false;
+        if (!isDiagonalKiteEnabled() && !config.kiteLureMode) return false;
         const player=window.gameClient?.player;
         player?.prunePreWalks?.();
         return !!player?.isMoving?.() || (Array.isArray(player?.__preWalks) && player.__preWalks.length>0);
@@ -12589,7 +12613,9 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 continue;
             }
 
+            if (config.kiteLureMode && isKiteLureStepBlocked(playerPos,candidatePos)) continue;
             if (config.kiteLureMode && mode === "chase" && !isKiteLurePullPathSafe([candidatePos],playerPos)) continue;
+            if (config.kiteLureMode && mode !== "chase" && !hasKiteLureEscape(candidatePos,playerPos)) continue;
 
             const nextTargetDist =
                 getKiteDistance(
@@ -13351,6 +13377,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 "away"
             );
 
+        if (!candidate && config.kiteLureMode && tryKiteLureEmergencyEscape(now,true)) return true;
         return performKiteStep(
             candidate,
             "kite away fallback",
@@ -16447,14 +16474,96 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             .sort((a,b) => getKiteDistance(from,a.getPosition?.() || a.__position) - getKiteDistance(from,b.getPosition?.() || b.__position))[0] || null;
     }
 
-    function isKiteLurePullPathSafe(path, from, passing = false) {
+    // A free destination is not enough: keep a forward/side escape corridor
+    // after passing a pack. The tile we just came from is not an escape route.
+    function isKiteLureStepBlocked(from,to,now=Date.now()) {
+        const blocked=state.kiteLureBlockedSteps;
+        if (!blocked || !from || !to) return false;
+        for (const [key,until] of blocked) if (until<=now) blocked.delete(key);
+        return blocked.has(`${getKitePositionKey(from)}>${getKitePositionKey(to)}`);
+    }
+
+    // Observe occupied tiles rather than queued/predicted walking. Stop an
+    // unproductive pull before it can repeatedly bounce against bad geometry.
+    function observeKiteLureRouteProgress(from,now) {
+        const pullTarget=getActiveLureOffscreenPullTarget();
+        const target=pullTarget || getEngagedTarget();
+        if (!target) { state.kiteLureRouteWatch=null; return false; }
+        const key=getKitePositionKey(from);
+        let watch=state.kiteLureRouteWatch;
+        if (!watch || watch.id!==target.id || now-watch.seenAt>2000 || now<watch.seenAt) {
+            watch=state.kiteLureRouteWatch={id:target.id,key,movedAt:now,seenAt:now,history:[key]};
+        }
+        watch.seenAt=now;
+        if (key!==watch.key) {
+            watch.history.push(key);
+            if (watch.history.length>6) watch.history.shift();
+            watch.key=key;watch.movedAt=now;
+        }
+        const h=watch.history;
+        const bouncing=h.length>=4 && h.at(-1)===h.at(-3) && h.at(-2)===h.at(-4);
+        const circling=h.length>=6 && new Set(h).size<=3;
+        const path=state.manualPursuitAutoWalkPathPositions || [];
+        const at=path.findIndex(p=>getKitePositionKey(p)===key);
+        const next=at>=0 ? path[at+1] : path[0];
+        const stalled=!!(pullTarget && next && state.lureOffscreenPullLastMoveAt>0 && now-watch.movedAt>=(bot.getMovementStallTimeout?.(1500)||1500));
+        if (!bouncing && !circling && !stalled) return false;
+        if (!state.kiteLureBlockedSteps) state.kiteLureBlockedSteps=new Map();
+        if (stalled && next) state.kiteLureBlockedSteps.set(`${key}>${getKitePositionKey(next)}`,now+8000);
+        if (bouncing || circling) {
+            const previous=h.at(-2);
+            if (previous) state.kiteLureBlockedSteps.set(`${key}>${previous}`,now+6000);
+        }
+        while (state.kiteLureBlockedSteps.size>64)
+            state.kiteLureBlockedSteps.delete(state.kiteLureBlockedSteps.keys().next().value);
+        if (pullTarget) rememberSkippedTarget(pullTarget,now,6000);
+        clearLureOffscreenPull("blocked or oscillating lure route",{quiet:true});
+        stopKiteAutoWalk("blocked or oscillating lure route");
+        state.lureOffscreenPullRetryAfter=now+1200;
+        state.kiteLureRouteWatch=null;
+        bot.log("Kite Lure: blocked/looping route cancelled; trying another escape",{stalled,bouncing,circling});
+        return true;
+    }
+
+    function hasKiteLureEscape(position, origin, threats = getKiteRetreatThreats()) {
+        if (!position || !origin) return false;
+        const contacts=p=>threats.filter(t=>t.z===p.z && getChebyshevDistance(p,t)<=1).length;
+        const contactCount=contacts(position);
+        if (contactCount>=2 && contactCount>=contacts(origin)) return false;
+        const dx=position.x-origin.x,dy=position.y-origin.y;
+        const queue=[position],seen=new Set([getKitePositionKey(position),getKitePositionKey(origin)]);
+        for (let cursor=0;cursor<queue.length && cursor<80;cursor++) {
+            const node=queue[cursor];
+            if (getChebyshevDistance(node,position)>=4) return true;
+            for (const [sx,sy] of [[0,-1],[1,0],[0,1],[-1,0],[-1,-1],[1,-1],[-1,1],[1,1]]) {
+                const next={x:node.x+sx,y:node.y+sy,z:position.z},key=getKitePositionKey(next);
+                if (seen.has(key) || isKiteLureStepBlocked(node,next) || getChebyshevDistance(next,position)>4 ||
+                    (next.x-position.x)*dx+(next.y-position.y)*dy<0) continue;
+                const tile=getTileAtPosition(next);
+                if (!tile?.id || tile.__isPlaceholder || !isSafeTileForKite(next) ||
+                    !isTargetingStepPolicyAllowed(node,next) || contacts(next)>=2) continue;
+                if (sx && sy && (!isSafeTileForKite({x:node.x+sx,y:node.y,z:position.z}) ||
+                    !isSafeTileForKite({x:node.x,y:node.y+sy,z:position.z}))) continue;
+                seen.add(key);queue.push(next);
+            }
+        }
+        return false;
+    }
+
+    function isKiteLurePullPathSafe(path, from, passing = false, checkEscape = true) {
         // Passing a pack may temporarily use less than the holding distance.
         // Adjacent free tiles are allowed during a pull; normal chase retains its band.
         const minimum = passing ? 1 : Math.max(1.5, getKiteMinimumDistance(Math.max(1, Number(config.idealDistance) || 3)));
         const threats = getKiteRetreatThreats();
-        return path.every(step => step && Number(step.z) === Number(from.z) &&
-            (passing || !entersKiteMonsterContact(step,from,threats)) &&
-            threats.every(threat => getKiteDistance(step,threat) >= minimum));
+        let previous=from;
+        return path.every(step => {
+            const safe=step && Number(step.z)===Number(from.z) && !isKiteLureStepBlocked(previous,step) &&
+                (passing || !entersKiteMonsterContact(step,previous,threats)) &&
+                threats.every(threat=>getKiteDistance(step,threat)>=minimum) &&
+                (!checkEscape || hasKiteLureEscape(step,previous,threats));
+            previous=step;
+            return safe;
+        });
     }
 
     // Observe damage before movement can consume the combat tick. Walking
@@ -16491,6 +16600,64 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         return false;
     }
 
+    // Gathering is optional; escaping pack pressure is not constrained by
+    // shooting radius, diagonal preference, or a perfect four-tile corridor.
+    function tryKiteLureEmergencyEscape(now=Date.now(), force=false) {
+        if (!config.kiteLureMode || bot.autoPickup?.ownsMovement?.()) return false;
+        const from=normalizePosition(bot.getPlayerPosition());
+        if (!from) return false;
+        const threats=getKiteRetreatThreats().filter(t=>t.z===from.z);
+        const near=threats.filter(t=>getChebyshevDistance(from,t)<=2).length;
+        const surrounding=threats.filter(t=>getChebyshevDistance(from,t)<=3).length;
+        if (!force && near<2 && surrounding<3) return false;
+        // Let a physical step finish, including a slow/paralyzed step.
+        // A new preferred angle is not a reason to interrupt it.
+        const player=window.gameClient?.player;
+        player?.prunePreWalks?.();
+        if (player?.isMoving?.() || player?.__preWalks?.length) return true;
+        const contacts=p=>threats.filter(t=>getChebyshevDistance(p,t)<=1).length;
+        const before=contacts(from);
+        const choices=[];
+        for (const [dx,dy] of [[0,-1],[1,0],[0,1],[-1,0],[-1,-1],[1,-1],[-1,1],[1,1]]) {
+            const pos={x:from.x+dx,y:from.y+dy,z:from.z};
+            if (!isSafeTileForKite(pos) || !isTargetingStepPolicyAllowed(from,pos) ||
+                isKiteLureStepBlocked(from,pos,now) || contacts(pos)>before) continue;
+            if (dx && dy && (!isSafeTileForKite({x:from.x+dx,y:from.y,z:from.z}) ||
+                !isSafeTileForKite({x:from.x,y:from.y+dy,z:from.z}))) continue;
+            const nearest=Math.min(...threats.map(t=>getKiteDistance(pos,t)));
+            const pressure=threats.reduce((sum,t)=>sum+1/Math.max(1,getKiteDistance(pos,t)),0);
+            const room=hasKiteLureEscape(pos,from,threats);
+            choices.push({pos,room,dx,dy,diagonal:!!(dx&&dy),contacts:contacts(pos),score:-contacts(pos)*1000+nearest*90-pressure*90+
+                (room?100:0)-(isImmediateKiteBacktrack(pos)?35:0)-(dx&&dy?8:0)});
+        }
+        // Contact/escape safety wins first. Among equally safe exits, fast
+        // cardinal steps win over diagonal distance/angle improvements.
+        choices.sort((a,b)=>a.contacts-b.contacts || Number(b.room)-Number(a.room) ||
+            Number(a.diagonal)-Number(b.diagonal) || b.score-a.score);
+        let selected=choices[0];
+        const straight=choices.find(c=>c.dx===state.kiteLastMoveDx && c.dy===state.kiteLastMoveDy &&
+            selected && c.contacts===selected.contacts && c.room===selected.room &&
+            c.diagonal===selected.diagonal && c.score>=selected.score-40);
+        if (straight) selected=straight;
+        const next=selected?.pos;
+        if (!next) return false; // Fully occupied/solid exits cannot be walked through.
+        clearLureOffscreenPull("pack pressure; escape before gathering",{quiet:true});
+        state.lureOffscreenPullRetryAfter=now+1500;
+        const target=getEngagedTarget() || getKiteLureRetreatTarget();
+        if (!target) return false;
+        const moved=sendManualTargetPursuitAutoWalk(from,{pathPositions:[next]},target,
+            normalizePosition(target.getPosition?.() || target.__position),
+            "Kite Lure: escaping pack pressure",now,
+            {owner:"kite",maxSteps:1,refreshOnDestinationChange:true});
+        if (moved) {
+            state.kiteLurePhase="escaping";
+            state.kiteLastMoveDx=selected.dx;
+            state.kiteLastMoveDy=selected.dy;
+            recordObservedKitePosition(from,now);
+        }
+        return moved;
+    }
+
     function syncKiteLurePull(now = Date.now()) {
         if (!config.kiteLureMode || !state.running || !config.enabled) {
             if (state.kiteLurePhase) { clearLureOffscreenPull("Kite Lure ended",{quiet:true}); state.kiteLurePhase = null; }
@@ -16507,7 +16674,14 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         if (current && state.lastTargetOwner === "manual") {
             clearLureOffscreenPull("manual target",{quiet:true}); return false;
         }
+        if ((state.lureOffscreenPullActive || window.gameClient?.__mbTargetingAutoWalkOwner==="kite") &&
+            isDiagonalKiteStepPending()) return true;
+        if (observeKiteLureRouteProgress(from,now)) {
+            state.kiteLurePhase="kiting";
+            return syncKite(now);
+        }
         bot.cave?.passivelyAdvanceLureWaypoints?.(from,now);
+        if (tryKiteLureEmergencyEscape(now)) return true;
         const hp = current?.state?.health ?? current?.health;
         if (current && ((hp != null && Number(hp) <= 0) || !isTargetPolicyReachable(current,"combat",now) || releaseTargetForAntiKS(current,now))) {
             clearLureOffscreenPull("combat target needs revalidation",{quiet:true}); return false;
@@ -16803,12 +16977,12 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             for (const [dx,dy] of [[0,-1],[1,0],[0,1],[-1,0],[-1,-1],[1,-1],[-1,1],[1,1]]) {
                 const pos={x:node.pos.x+dx,y:node.pos.y+dy,z:from.z};
                 const key=getKitePositionKey(pos);
-                if (seen.has(key) || getChebyshevDistance(from,pos)>12) continue;
+                if (seen.has(key) || isKiteLureStepBlocked(node.pos,pos) || getChebyshevDistance(from,pos)>12) continue;
                 const tile=getTileAtPosition(pos);
                 if (!tile || !tile.id || tile.__isPlaceholder || !isSafeTileForKite(pos) ||
                     !isSafeTargetApproachTile(pos.x,pos.y,pos.z,false) ||
                     !isTargetingStepPolicyAllowed(node.pos,pos) ||
-                    !isKiteLurePullPathSafe([pos],node.pos,true)) continue;
+                    !isKiteLurePullPathSafe([pos],node.pos,true,node.depth<2)) continue;
                 if (dx && dy && (!isSafeTileForKite({x:node.pos.x+dx,y:node.pos.y,z:from.z}) ||
                     !isSafeTileForKite({x:node.pos.x,y:node.pos.y+dy,z:from.z}))) continue;
                 seen.add(key);
@@ -16963,7 +17137,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                     now;
             } else if (
                 state.lureOffscreenPullPlayerProgressAt > 0 &&
-                now - state.lureOffscreenPullPlayerProgressAt >= 2200
+                now - state.lureOffscreenPullPlayerProgressAt >= (bot.getMovementStallTimeout?.(2200)||2200)
             ) {
                 rememberSkippedTarget(target, now, 10000);
                 state.lureOffscreenPullRetryAfter =
@@ -23039,10 +23213,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             owner === "melee" ||
             owner === "hunt" ||
             owner === "pull";
-        const progressStallMs =
-            owner === "melee"
-                ? 1400
-                : 1700;
+        const progressStallBase = owner === "melee" ? 1400 : 1700;
+        const progressStallMs = bot.getMovementStallTimeout?.(progressStallBase) || progressStallBase;
         let stalePursuitAutoWalk = false;
 
         if (
@@ -27474,6 +27646,10 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     function canCavePassThroughCreatures(tile, creatures) {
         if (!creatures.length) return true;
         const client = window.gameClient;
+        // Reuse the new native Chancellor rule independently of PvP mode.
+        try { creatures=creatures.filter(c=>tile?.__chancellorPasses?.(c)!==true); }
+        catch(e) { return false; }
+        if (!creatures.length) return true;
         if (client?.player?.outfit?.verifiedGhost === true) return true;
         if (client?.__worldPvp !== false) return false;
         try {
@@ -44203,8 +44379,8 @@ window.__minibiaBotBundle.installNotificationModule = function installNotificati
         showNotification('👤 PLAYER', 'Player on screen', 'player');
         return orig.playPlayerAlarm.call(this);
     };
-    bot.playGMAlarm = function () {
-        showNotification('🛡️ GM', 'Game Master detected!', 'gm');
+    bot.playGMAlarm = function (notice = null) {
+        showNotification(notice?.title || '🛡️ GM', notice?.message || 'Game Master detected!', 'gm');
         return orig.playGMAlarm.call(this);
     };
     bot.playAntiBotAlarm = function () {
@@ -46608,6 +46784,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         }
 
         const sendDrop = () => {
+            if (bot.isLiveItemSource && !bot.isLiveItemSource({which:container,index:slot},item)) return false;
             const from = {
                 which: container,
                 index: slot
@@ -48880,6 +49057,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                             which: dest,
                             index: targetSlot
                         };
+                        if (bot.isLiveItemSource && !bot.isLiveItemSource(from,item)) return false;
 
                         if (
                             window.gameClient
@@ -49833,6 +50011,68 @@ window.__minibiaBotBundle.installTempleXlogModule = function installTempleXlogMo
 
 // -- PINK SKULL DISCONNECT
 
+window.__minibiaBotBundle.installChancellorAlertModule = function installChancellorAlertModule(bot) {
+    const key="minibiaBot.chancellorAlert.config";
+    const config={enabled:false,...bot.storage.get(key,{})};
+    let timer=null,seenNodes=new WeakSet(),visible=new Set();
+    const signatures=new Map(),alerts=new Map();
+    const named=name=>/^chancellor\s+\S/i.test(String(name||"").trim());
+    function chatNodes(){return Array.from(document.querySelectorAll("span.chat-message[name]"));}
+    function signature(node){return `${String(node.getAttribute("name")||"").trim().toLowerCase()}|${node.getAttribute("data-channel")||""}|${node.textContent||node.getAttribute("data-message")||""}`;}
+    function alert(name,source,now){
+        const id=String(name).trim().toLowerCase();
+        if (alerts.has(id) && now-alerts.get(id)<10000) return;
+        alerts.set(id,now);
+        const notice={title:"🛡️ CHANCELLOR",message:`${name} — ${source}`,type:"gm"};
+        if (bot.playGMAlarm) bot.playGMAlarm(notice);
+        else bot.showPanelNotification?.(notice.title,notice.message,notice.type);
+        bot.gmKillSwitch?.trigger?.({source:"chancellor-alert",delayMs:15000,details:{name,source}});
+        bot.log("Chancellor detected; pausing for 15 seconds",{name,source});
+    }
+    function tick(){
+        if (!config.enabled) return;
+        const now=Date.now(),self=window.gameClient?.player;
+        const nextVisible=new Set();
+        for(const creature of bot.xray?.getVisiblePlayers?.({sameFloorOnly:true})||[]){
+            if (!self || creature.id===self.id || creature===self) continue;
+            const pos=creature.getPosition?.()||creature.__position;
+            const mine=self.getPosition?.()||self.__position;
+            if (!pos || !mine || Number(pos.z)!==Number(mine.z)) continue;
+            if (!named(creature.name) && Number(creature.outfit?.id)!==302) continue;
+            const id=String(creature.id??creature.name);
+            nextVisible.add(id);
+            if (!visible.has(id)) alert(creature.name||"Chancellor","nearby",now);
+        }
+        visible=nextVisible;
+        for(const node of chatNodes()){
+            if (seenNodes.has(node)) continue;
+            seenNodes.add(node);
+            const name=String(node.getAttribute("name")||"").trim();
+            if (!named(name) || name.toLowerCase()===String(self?.name||"").trim().toLowerCase()) continue;
+            const sig=signature(node);
+            if (!signatures.has(sig)) alert(name,"chat message",now);
+            signatures.set(sig,now);
+        }
+        for(const [sig,at]of signatures)if(now-at>60000)signatures.delete(sig);
+        for(const [id,at]of alerts)if(now-at>60000)alerts.delete(id);
+        while(signatures.size>256)signatures.delete(signatures.keys().next().value);
+        while(alerts.size>64)alerts.delete(alerts.keys().next().value);
+    }
+    function stop(){if(timer!==null)clearInterval(timer);timer=null;visible.clear();seenNodes=new WeakSet();signatures.clear();alerts.clear();}
+    function start(){
+        stop();
+        if(!config.enabled)return;
+        // Existing chat is history; a live nearby Chancellor still alerts.
+        for(const node of chatNodes()){seenNodes.add(node);signatures.set(signature(node),Date.now());}
+        while(signatures.size>256)signatures.delete(signatures.keys().next().value);
+        timer=setInterval(tick,250);
+    }
+    function updateConfig(next={}){if(next.enabled!==undefined)config.enabled=!!next.enabled;bot.storage.set(key,{...config});start();}
+    bot.chancellorAlert={config,updateConfig,status:()=>({running:timer!==null})};
+    bot.addCleanup(stop);
+    start();
+};
+
 window.__minibiaBotBundle.installPinkSkullDetectorModule = function installPinkSkullDetectorModule(bot) {
     const configStorageKey = "minibiaBot.pinkSkull.config";
     let checkInterval = null;
@@ -49845,13 +50085,13 @@ window.__minibiaBotBundle.installPinkSkullDetectorModule = function installPinkS
         bot.storage.set(configStorageKey, { ...config });
     }
 
-    // DOM fallback: this client renders pink skulls with hue-rotate(280deg).
+    // Support the current dedicated pink sprite and the legacy hue filter.
     function isPinkViaDom(player) {
         try {
             const ce = player?.characterElement;
             const root = (ce?.element instanceof Element) ? ce.element
                 : (ce instanceof Element) ? ce
-                : document.getElementById('character-element-prototype');
+                : null; // Never inspect a hidden template or another player's skull.
             if (!root) return false;
             const skullIcon = root.querySelector('.skull-icon');
             if (!skullIcon) return false;
@@ -49859,6 +50099,9 @@ window.__minibiaBotBundle.installPinkSkullDetectorModule = function installPinkS
             if (computed.display === 'none' ||
                 computed.visibility === 'hidden' ||
                 Number(computed.opacity || 1) === 0) return false;
+            const spriteX=Number.parseFloat(computed.backgroundPositionX || skullIcon.style.backgroundPositionX || computed.backgroundPosition || "");
+            if (/skulls\.png(?:[?"')]|$)/i.test(computed.backgroundImage || "") && spriteX===-66)
+                return true; // New client's pink sprite: slot 6, 11px wide.
             const hueMatch = (computed.filter || '').match(/hue-rotate\(\s*(-?\d+(?:\.\d+)?)deg\s*\)/i);
             if (!hueMatch) return false;
             const hue = ((Number(hueMatch[1]) % 360) + 360) % 360;
@@ -49872,7 +50115,7 @@ window.__minibiaBotBundle.installPinkSkullDetectorModule = function installPinkS
         if (player?.skull === PINK_SKULL_VALUE)
             return { detected: true, method: `player.skull=${PINK_SKULL_VALUE}` };
         if (isPinkViaDom(player))
-            return { detected: true, method: "DOM hue-rotate(280deg)" };
+            return { detected: true, method: "DOM pink sprite/filter" };
         return { detected: false, method: null };
     }
 
@@ -60008,6 +60251,7 @@ function upgradeSectionHeaders(panel) {
     <div class="mb-section-title"><span class="mb-title-text">🤖 Anti-Bot &amp; GM Protection</span></div>
     <div class="mb-alert-toggle-grid">
       <label class="mb-toggle"><input type="checkbox" id="minibia-bot-gm-chat-monitor"><span>GM Auto Respond</span></label>
+      <label class="mb-toggle" title="GM alarm and 15-second pause for a nearby Chancellor or a new Chancellor chat message. No auto-reply."><input type="checkbox" id="minibia-bot-chancellor-alert"><span>Chancellor alert</span></label>
       <label class="mb-toggle"><input type="checkbox" id="minibia-bot-antibot-creature-enabled"><span>Anti-bot creature</span></label>
       <label class="mb-toggle"><input type="checkbox" id="minibia-bot-pink-skull-enabled" /><span>Pinkskull XLOG</span></label>
       <label class="mb-toggle" title="Close connection on a new Console message containing sent to temple. Disables Auto-Reconnect."><input type="checkbox" id="minibia-bot-temple-xlog-enabled" /><span>Temple XLOG</span></label>
@@ -63589,6 +63833,11 @@ function upgradeSectionHeaders(panel) {
             });
         }
 
+        const chancellorToggle=panel.querySelector("#minibia-bot-chancellor-alert");
+        if(chancellorToggle){
+            chancellorToggle.checked=bot.chancellorAlert?.config?.enabled===true;
+            chancellorToggle.addEventListener("change",function(){bot.chancellorAlert?.updateConfig?.({enabled:this.checked});});
+        }
         const templeXlogToggle = panel.querySelector("#minibia-bot-temple-xlog-enabled");
         if (templeXlogToggle) {
             templeXlogToggle.checked = bot.templeXlog?.config?.enabled === true;
@@ -69479,6 +69728,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         currentBundle.installLightHackModule(bot);
         currentBundle.installLightHackLegitModule(bot);
         currentBundle.installPinkSkullDetectorModule(bot);
+        currentBundle.installChancellorAlertModule(bot);
         currentBundle.installProfileModule(bot);
         currentBundle.installAntiAfkModule(bot);
         currentBundle.installFisherModule(bot);
@@ -69592,6 +69842,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
                 ["antiBotMonitor", "minibiaBot.antibot.config"],
                 ["gmChatMonitor", "minibiaBot.gmChatMonitor.config"],
                 ["templeXlog", "minibiaBot.templeXlog.config"],
+                ["chancellorAlert", "minibiaBot.chancellorAlert.config"],
                 ["pauseHotkey", "minibiaBot.pauseHotkey.config"],
                 ["groundSpawnLogger", "minibiaBot.groundSpawnLogger.config"],
                 ["followingItemGuard", "minibiaBot.followingItemGuard.config"],
