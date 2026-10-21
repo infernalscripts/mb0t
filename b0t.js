@@ -4075,7 +4075,8 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.293",
+        version: "1.6.303",
+        isWalkableParcel: isFollowWalkableParcel,
         addCleanup,
         items: itemsApi,
         actions: actionsApi,
@@ -9656,7 +9657,7 @@ window.__minibiaBotBundle.installAutoMagicShieldModule = function installAutoMag
  */
 window.__minibiaBotBundle.installCombatRulesModule = function(bot) {
     const key = 'minibiaBot.combatRules.config';
-    const modes = ['inherit','attack','melee','client-chase','kite','lure','ignore'];
+    const modes = ['inherit','attack','melee','client-chase','kite','kite-lure','lure','ignore'];
     const runes = ['sd','gfb','fb','hmm','lmm','explo'];
     const saved = bot.storage.get(key, {});
     const config = {...saved, enabled:true, unified:true, rules:saved.rules || []};
@@ -9702,6 +9703,7 @@ window.__minibiaBotBundle.installCombatRulesModule = function(bot) {
         persist();
     }
     function getDefaultMode(base = bot.attack?.getBaseConfig?.() || bot.attack?.config || {}) {
+        if (base.kiteLureMode) return 'kite-lure';
         if (base.lureMode && (base.kiteMode || base.useClientChase)) return 'custom';
         if (base.lureMode) return 'lure';
         if (base.kiteMode) return 'kite';
@@ -9713,7 +9715,7 @@ window.__minibiaBotBundle.installCombatRulesModule = function(bot) {
         const mode = patch.mode; delete patch.mode;
         if (modes.includes(mode) && !['inherit','ignore'].includes(mode)) Object.assign(patch, {
             meleeMode: ['melee','client-chase','lure'].includes(mode), useClientChase: mode === 'client-chase',
-            kiteMode: mode === 'kite', lureMode: mode === 'lure',
+            kiteMode: ['kite','kite-lure'].includes(mode), kiteLureMode: mode === 'kite-lure', lureMode: mode === 'lure',
         });
         const selectedPosition = patch.position; delete patch.position;
         if (['any','front','diagonal'].includes(selectedPosition)) Object.assign(patch, {
@@ -9898,7 +9900,7 @@ window.__minibiaBotBundle.installCombatRulesModule = function(bot) {
             <div class="mb-field"><span class="mb-field-label" data-cr="countLabel">Matching monsters</span><div class="cr-range"><input data-cr="minCount" type="number" min="1" max="100" value="1" aria-label="Minimum monster count"><span>–</span><input data-cr="maxCount" type="number" min="1" max="100" value="100" aria-label="Maximum monster count"></div></div>
             <label class="mb-field"><span class="mb-field-label">Rule role</span><select data-cr="role"><option value="target">Target + actions</option><option value="actions">Actions only</option></select></label>
             <label class="mb-field"><span class="mb-field-label">Match range · SQM</span><input data-cr="range" type="number" min="1" max="8" value="8"></label>
-            <label class="mb-field" data-cr="modeField"><span class="mb-field-label">Movement</span><select data-cr="mode"><option value="inherit">Use default</option><option value="attack">Attack · no chase</option><option value="melee">Melee · bot chase</option><option value="client-chase">Client Chase</option><option value="kite">Kite</option><option value="lure">Lure</option><option value="ignore">Ignore targeting</option></select></label>
+            <label class="mb-field" data-cr="modeField"><span class="mb-field-label">Movement</span><select data-cr="mode"><option value="inherit">Use default</option><option value="attack">Attack · no chase</option><option value="melee">Melee · bot chase</option><option value="client-chase">Client Chase</option><option value="kite">Kite</option><option value="kite-lure" title="Keep kiting while gathering monsters with offscreen pull">Kite Lure</option><option value="lure">Lure</option><option value="ignore">Ignore targeting</option></select></label>
             <label class="mb-field" data-cr="positionField"><span class="mb-field-label">Position</span><select data-cr="position"><option value="inherit">Use default</option><option value="any">Any adjacent tile</option><option value="front">Front</option><option value="diagonal">Diagonal</option></select></label>
             <label class="mb-field" data-cr="targetDistanceField"><span class="mb-field-label">Max target distance</span><input data-cr="targetDistance" type="number" min="1" max="10" placeholder="Default"></label>
             <label class="mb-field" data-cr="kiteDistanceField"><span class="mb-field-label">Kite distance</span><input data-cr="kiteDistance" type="number" min="1" max="10" placeholder="Default"></label>
@@ -9919,8 +9921,8 @@ window.__minibiaBotBundle.installCombatRulesModule = function(bot) {
         function showFields() {
             const targeting = q('role').value === 'target', mode = q('mode').value;
             for (const field of ['mode','position','targetDistance']) q(field+'Field').hidden = !targeting;
-            q('kiteDistanceField').hidden = !targeting || !['kite','inherit'].includes(mode);
-            for (const field of ['lureCount','lureRadius']) q(field+'Field').hidden = !targeting || !['lure','inherit'].includes(mode);
+            q('kiteDistanceField').hidden = !targeting || !['kite','kite-lure','inherit'].includes(mode);
+            for (const field of ['lureCount','lureRadius']) q(field+'Field').hidden = !targeting || !['lure','kite-lure','inherit'].includes(mode);
         }
         function reset() {
             edit = null;
@@ -9954,8 +9956,8 @@ window.__minibiaBotBundle.installCombatRulesModule = function(bot) {
                 for (const field of fields) r[field]=q(field).value;
                 for (const field of ['minHp','maxHp','minCount','maxCount','range','spellMana']) if(!String(r[field]).trim() || !Number.isFinite(Number(r[field]))) throw new Error('Enter valid HP, count, range and mana values.');
                 r.enabled=q('ruleEnabled').checked;r.targetEnabled=q('role').value==='target';
-                if(!['kite','inherit'].includes(r.mode))r.kiteDistance=null;
-                if(!['lure','inherit'].includes(r.mode)){r.lureCount=null;r.lureRadius=null;}
+                if(!['kite','kite-lure','inherit'].includes(r.mode))r.kiteDistance=null;
+                if(!['lure','kite-lure','inherit'].includes(r.mode)){r.lureCount=null;r.lureRadius=null;}
                 if(!r.targetEnabled) {r.mode='inherit';r.position='inherit';for(const field of ['targetDistance','kiteDistance','lureCount','lureRadius'])r[field]=null;}
                 // Preserve original action semantics for enable/disable edits.
                 const previous=edit==null?null:config.rules[edit], normalized=normalize(r);
@@ -10551,6 +10553,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         antiKSSelfRange: 2,
         antiKSOtherRange: 2,
         kiteMode: false,
+        kiteLureMode: false,
         idealDistance: 3,
         useClientChase: true,
         kiteStuckCount: 0,
@@ -10710,6 +10713,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         config.finishTargetDamageGraceMs = Math.max(500, Math.min(10000, Number(config.finishTargetDamageGraceMs) || 2500));
         config.manualTargetHoldMs = Math.max(500, Math.min(10000, Number(config.manualTargetHoldMs) || 3000));
         config.targetAckTimeoutMs = Math.max(400, Math.min(3000, Number(config.targetAckTimeoutMs) || 1200));
+        config.kiteLureMode = config.kiteLureMode === true;
+        if (config.kiteLureMode) Object.assign(config,{kiteMode:true,lureMode:false,meleeMode:false,useClientChase:false});
         config.lureMode = !!config.lureMode;
         config.lureMobThreshold = Math.max(1, Math.min(20, Math.trunc(Number(config.lureMobThreshold) || 3)));
         config.lureRadius = Math.max(1, Math.min(8, Math.trunc(Number(config.lureRadius) || 5)));
@@ -10771,10 +10776,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             lastCombatRuleMode = nextMode;
         }
         if (!rule) return;
-        const keys = ['meleeMode','useClientChase','kiteMode','lureMode','keepDiagonal','keepFront','idealDistance','maxTargetDistance','lureMobThreshold','lureRadius'];
+        const keys = ['meleeMode','useClientChase','kiteMode','kiteLureMode','lureMode','keepDiagonal','keepFront','idealDistance','maxTargetDistance','lureMobThreshold','lureRadius'];
         combatRuleModeBase = Object.fromEntries(keys.map(k => [k,config[k]]));
         if(rule.mode!=='inherit') Object.assign(config, {meleeMode:rule.mode==='melee'||rule.mode==='client-chase',
-            useClientChase:rule.mode==='client-chase', kiteMode:rule.mode==='kite', lureMode:rule.mode==='lure'});
+            useClientChase:rule.mode==='client-chase', kiteMode:['kite','kite-lure'].includes(rule.mode), kiteLureMode:rule.mode==='kite-lure', lureMode:rule.mode==='lure'});
         if(rule.position!=='inherit') Object.assign(config,{keepDiagonal:rule.position==='diagonal',keepFront:rule.position==='front'});
         for(const [field,key] of [['kiteDistance','idealDistance'],['targetDistance','maxTargetDistance'],['lureCount','lureMobThreshold'],['lureRadius','lureRadius']])
             if(rule[field]!=null)config[key]=rule[field];
@@ -11064,6 +11069,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
             try {
                 if (
+                    !bot.isWalkableParcel?.(item) &&
                     typeof PropBitFlag !==
                         "undefined" &&
                     typeof item.hasFlag ===
@@ -12431,7 +12437,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     function getKiteRetreatThreats() {
         if (targetingSnapshot?.kiteRetreatThreats) return targetingSnapshot.kiteRetreatThreats;
         const threats=Object.values(window.gameClient?.world?.activeCreatures || {})
-            .filter(m=>isKnownMonsterForOffscreenHunt(m)).map(m=>normalizePosition(m.getPosition?.() || m.__position)).filter(Boolean);
+            .filter(m=>isKnownMonsterForOffscreenHunt(m) && !isIgnoredTargetCreature(m)).map(m=>normalizePosition(m.getPosition?.() || m.__position)).filter(Boolean);
         if (targetingSnapshot) targetingSnapshot.kiteRetreatThreats=threats;
         return threats;
     }
@@ -12549,6 +12555,13 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             [-1, -1], [1, -1], [-1, 1], [1, 1]
         ];
 
+        // Gather toward an eligible off-screen mob instead of choosing an
+        // arbitrary retreat direction. Existing spacing/path safety still wins.
+        const gatherTarget = config.kiteLureMode && mode === "away"
+            ? getLureOffscreenPullCandidates(Date.now(), true).slice(0,4).find(m =>
+                findKiteLureForwardRoute(playerPos,normalizePosition(m.getPosition?.() || m.__position))) : null;
+        const gatherPos = normalizePosition(gatherTarget?.getPosition?.() || gatherTarget?.__position);
+        const gatherDistance = gatherPos ? getKiteDistance(playerPos,gatherPos) : 0;
         const candidates = [];
 
         for (const [dx, dy] of offsets) {
@@ -12575,6 +12588,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             ) {
                 continue;
             }
+
+            if (config.kiteLureMode && mode === "chase" && !isKiteLurePullPathSafe([candidatePos],playerPos)) continue;
 
             const nextTargetDist =
                 getKiteDistance(
@@ -12750,7 +12765,11 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                     100;
             }
 
+            const gatherProgress = gatherPos
+                ? gatherDistance - getKiteDistance(candidatePos,gatherPos) : 0;
+            score += gatherProgress * 180;
             candidates.push({
+                gatherProgress,
                 dx,
                 dy,
                 direction:
@@ -12824,7 +12843,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             // reserve slower diagonal steps for necessary retreat or pursuit.
             const cardinals=choices.filter(c=>!c.isDiagonalStep);
             if (cardinals.length || mode==="position") choices=cardinals;
-            choices.sort((a,b)=>(b.diagonalAlignment||0)-(a.diagonalAlignment||0) || b.score-a.score);
+            choices.sort((a,b)=>
+                (config.kiteLureMode && mode === "away"
+                    ? (b.gatherProgress || 0) - (a.gatherProgress || 0) : 0) ||
+                (b.diagonalAlignment||0)-(a.diagonalAlignment||0) || b.score-a.score);
             const selected=choices[0] || null;
             if (selected) selected.__diagonalPreference=true;
             return selected;
@@ -13215,6 +13237,11 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         if (!config.kiteMode)
             return false;
 
+        if (config.kiteLureMode) {
+            const nearest = getKiteLureRetreatTarget();
+            const from = normalizePosition(bot.getPlayerPosition());
+            if (nearest && getKiteDistance(from,nearest.getPosition?.() || nearest.__position) < Math.max(1.5,getKiteMinimumDistance(Number(config.idealDistance)||3))) return false;
+        }
         const target = getEngagedTarget();
         if (!target) {
             stopKiteAutoWalk(
@@ -13710,7 +13737,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         if (bot.autoPickup?.ownsMovement?.()) return false;
         if (!config.kiteMode)
             return false;
-        const target = getEngagedTarget();
+        const target = config.kiteLureMode ? getKiteLureRetreatTarget() || getEngagedTarget() : getEngagedTarget();
         if (!target) {
             stopKiteAutoWalk(
                 "Kite target cleared"
@@ -13733,6 +13760,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             );
             return false;
         }
+
+        if (config.kiteLureMode) return kiteAwayFallback(targetPos, playerPos, dist, now, target);
 
         const caveStatus = bot.cave?.status?.();
         const route = bot.cave?.getRoute?.() || [];
@@ -13938,6 +13967,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         releaseCurrentTargetIfOffScreen(now);
 
         if (syncIgnoredTrapEscape(now)) return true;
+        if (syncFleeingTarget(now)) return true;
+        if (syncKiteLurePull(now)) return true;
 
         // Ignored names remain a veto outside the verified trap exception.
         releaseIgnoredAutoTarget(now);
@@ -15707,7 +15738,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     const OFFSCREEN_HUNT_PAUSE_REASON = "offscreen-hunt";
 
     function isOffscreenHuntEnabled() {
-        return config.offscreenHuntEnabled === true || config.alphaHunterEnabled === true;
+        return !config.kiteLureMode && (config.offscreenHuntEnabled === true || config.alphaHunterEnabled === true);
     }
 
     function isAlphaHuntCreature(creature) {
@@ -16408,6 +16439,112 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         return false;
     }
 
+    function getKiteLureRetreatTarget() {
+        const from = normalizePosition(bot.getPlayerPosition());
+        if (!from) return null;
+        return getNearbyMonsters(false,{ignoreModeLos:true})
+            .filter(m => !bot.isPlayerSummon(m) && !isIgnoredTargetCreature(m))
+            .sort((a,b) => getKiteDistance(from,a.getPosition?.() || a.__position) - getKiteDistance(from,b.getPosition?.() || b.__position))[0] || null;
+    }
+
+    function isKiteLurePullPathSafe(path, from, passing = false) {
+        // Passing a pack may temporarily use less than the holding distance.
+        // Adjacent free tiles are allowed during a pull; normal chase retains its band.
+        const minimum = passing ? 1 : Math.max(1.5, getKiteMinimumDistance(Math.max(1, Number(config.idealDistance) || 3)));
+        const threats = getKiteRetreatThreats();
+        return path.every(step => step && Number(step.z) === Number(from.z) &&
+            (passing || !entersKiteMonsterContact(step,from,threats)) &&
+            threats.every(threat => getKiteDistance(step,threat) >= minimum));
+    }
+
+    // Observe damage before movement can consume the combat tick. Walking
+    // after a fleeing mob is not evidence that we can still finish it.
+    function syncFleeingTarget(now) {
+        const target = getCurrentTarget();
+        const hp = getCreatureHealthPercent(target);
+        const pos = normalizePosition(target?.getPosition?.() || target?.__position);
+        if (!target || !pos || !Number.isFinite(hp) || hp <= 0 ||
+            hp > Math.max(1, Math.min(90, Number(config.finishTargetHealthPct) || 30)) ||
+            state.lastTargetOwner === "manual" || state.ignoredTrap?.targetId === target.id) {
+            state.fleeingTarget = null;
+            return false;
+        }
+        let watch = state.fleeingTarget;
+        if (!watch || watch.target !== target || now < watch.damageAt || now - watch.seenAt > 2000) {
+            watch = state.fleeingTarget = { target, hp, damageAt: now, seenAt: now, pos: { ...pos }, moved: false };
+        }
+        if (hp < watch.hp) {
+            watch.damageAt = now;
+            watch.moved = false;
+        }
+        if (pos.x !== watch.pos.x || pos.y !== watch.pos.y || pos.z !== watch.pos.z)
+            watch.moved = true;
+        watch.hp = hp;
+        watch.pos = { ...pos };
+        watch.seenAt = now;
+        if (watch.moved && now - watch.damageAt >= 8000) {
+            clearLureOffscreenPull("fleeing target timeout", { quiet: true });
+            stopKiteAutoWalk("fleeing target timeout");
+            state.fleeingTarget = null;
+            return handoffTarget(target, "fleeing low-health target: no damage for 8s", now, 10000);
+        }
+        return false;
+    }
+
+    function syncKiteLurePull(now = Date.now()) {
+        if (!config.kiteLureMode || !state.running || !config.enabled) {
+            if (state.kiteLurePhase) { clearLureOffscreenPull("Kite Lure ended",{quiet:true}); state.kiteLurePhase = null; }
+            return false;
+        }
+        const player = window.gameClient?.player;
+        if (!player || isProtectionZoneBlocked(now) || bot.actions?.isHalted?.() || bot.gmKillSwitch?.isActive?.() ||
+            bot.pauseHotkey?.isPaused?.() || bot.autoPickup?.ownsMovement?.() || bot.followingItemGuard?.isHolding?.()) {
+            clearLureOffscreenPull("Kite Lure suspended",{quiet:true}); return false;
+        }
+        const from = normalizePosition(bot.getPlayerPosition());
+        if (!from) return false;
+        const current = getCurrentTarget();
+        if (current && state.lastTargetOwner === "manual") {
+            clearLureOffscreenPull("manual target",{quiet:true}); return false;
+        }
+        bot.cave?.passivelyAdvanceLureWaypoints?.(from,now);
+        const hp = current?.state?.health ?? current?.health;
+        if (current && ((hp != null && Number(hp) <= 0) || !isTargetPolicyReachable(current,"combat",now) || releaseTargetForAntiKS(current,now))) {
+            clearLureOffscreenPull("combat target needs revalidation",{quiet:true}); return false;
+        }
+        // Attack-through continues during collection; movement is controlled
+        // below and never becomes melee chase while gathering.
+        if(current && state.fleeingTarget?.target === current){
+            clearLureOffscreenPull("finishing low-health target",{quiet:true});
+            state.kiteLurePhase="finishing";
+            return false; // Normal chase/kite retains safe spacing while firing.
+        }
+        if (!current) triggerAttack(now);
+        const nearest = getKiteLureRetreatTarget();
+        const nearestPos = normalizePosition(nearest?.getPosition?.() || nearest?.__position);
+        const minimum = 1.5; // Passing is allowed inside the normal kite band.
+        const packTooClose = nearestPos && getKiteDistance(from,nearestPos) < minimum;
+        const batch = state.manualPursuitAutoWalkPathPositions || [];
+        const at = batch.findIndex(p => getKitePositionKey(p) === getKitePositionKey(from));
+        const queued = at >= 0 ? batch.slice(at+1) : batch;
+        if (state.lureOffscreenPullActive && !isKiteLurePullPathSafe(queued,from,true)) {
+            clearLureOffscreenPull("Kite Lure keeping distance",{quiet:true});
+            state.kiteLurePhase = "kiting";
+            // A mob entered the queued path: cancel it and try a fresh forward
+            // corridor before falling back to retreat.
+
+        }
+        const visibleMonsters = getLureVisibleMonsters().filter(m=>!isIgnoredTargetCreature(m));
+        const threshold = Math.max(1,Math.min(20,Number(config.lureMobThreshold)||3));
+        const caveRunning = bot.cave?.isRunning?.() === true;
+        const waypoint = caveRunning ? bot.cave?.getCurrentWaypoint?.() : {...from};
+        const context = {active:true,threshold,visibleMonsters,waypoint};
+        const pulling = syncLureOffscreenPull(context,now);
+        state.kiteLurePhase = pulling ? "pulling" : "kiting";
+        if (!pulling && packTooClose) return syncKite(now);
+        return pulling;
+    }
+
     const LURE_OFFSCREEN_PULL_PAUSE_REASON = "offscreen-lure-pull";
 
     function isPlainLurePullWaypoint(waypoint) {
@@ -16422,8 +16559,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             waypoint.ladder !== true;
     }
 
-    function getLureOffscreenPullCandidates(now = Date.now()) {
-        if (!config.lureOffscreenPullEnabled)
+    function getLureOffscreenPullCandidates(now = Date.now(), includeVisible = false) {
+        if (!config.lureOffscreenPullEnabled && !config.kiteLureMode)
             return [];
 
         if (
@@ -16456,7 +16593,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 // Acquisition is strictly off-screen. Once acquired, sync may
                 // continue approaching after it becomes visible until it enters
                 // the configured normal lure radius.
-                if (getNativeSmallScreenInfo(creature).visible)
+                if (!includeVisible && getNativeSmallScreenInfo(creature).visible)
                     return false;
 
                 const pos = normalizePosition(
@@ -16467,6 +16604,9 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
                 const distance = getTileDistance(me, pos);
                 if (!Number.isFinite(distance) || distance > range)
+                    return false;
+                // Steering seeks new mobs beyond the pack's holding radius.
+                if (includeVisible && getKiteDistance(me,pos) <= Math.max(1,Number(config.idealDistance)||3)+1)
                     return false;
 
                 if (!isTargetPolicyReachable(creature, "lure", now)) {
@@ -16597,8 +16737,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             !playerPos ||
             !targetPos ||
             playerPos.z !== targetPos.z ||
-            !caveStatus?.running ||
-            !isPlainLurePullWaypoint(waypoint)
+            (!caveStatus?.running && !config.kiteLureMode) ||
+            (caveStatus?.running && !isPlainLurePullWaypoint(waypoint))
         ) {
             return false;
         }
@@ -16618,6 +16758,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             `${Number(playerPos.x)},${Number(playerPos.y)},${Number(playerPos.z)}`;
         state.lureOffscreenPullPlayerProgressAt = now;
         state.lureOffscreenPullConsecutivePathFailures = 0;
+        state.lureOffscreenPullLastPathLength = null;
         state.lureOffscreenPullLastReason = "acquired nearby off-screen lure mob";
         state.lureOffscreenPullActivations++;
 
@@ -16637,13 +16778,60 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         ] || null;
     }
 
+    // Find a loaded corridor around the first pack, rather than finding a
+    // direct route through it and only discovering the collision at send time.
+    function findKiteLureForwardRoute(from, goal) {
+        if (!from || !goal || from.z !== goal.z) return null;
+        const startDistance = getKiteDistance(from,goal);
+        const queue = [{pos:from,parent:-1,depth:0}];
+        const seen = new Set([getKitePositionKey(from)]);
+        let best = 0, bestDistance = startDistance, reached = false;
+        const goalTile=getTileAtPosition(goal);
+        const goalLoaded=!!(goalTile?.id && !goalTile.__isPlaceholder);
+        const sightTarget={__position:goal};
+        for (let cursor=0;cursor<queue.length && cursor<600;cursor++) {
+            const node=queue[cursor];
+            const distance=getKiteDistance(node.pos,goal);
+            if (distance<bestDistance) { best=cursor; bestDistance=distance; }
+            // Being close through a wall is not an approach. A completed
+            // route must expose the mob through the real projectile geometry.
+            if (distance<=Math.max(2,Math.min(5,Number(config.lureRadius)||5)) &&
+                getTargetLineOfSightInfo(sightTarget,node.pos).clear) {
+                best=cursor; reached=true; break;
+            }
+            if (node.depth>=16) continue;
+            for (const [dx,dy] of [[0,-1],[1,0],[0,1],[-1,0],[-1,-1],[1,-1],[-1,1],[1,1]]) {
+                const pos={x:node.pos.x+dx,y:node.pos.y+dy,z:from.z};
+                const key=getKitePositionKey(pos);
+                if (seen.has(key) || getChebyshevDistance(from,pos)>12) continue;
+                const tile=getTileAtPosition(pos);
+                if (!tile || !tile.id || tile.__isPlaceholder || !isSafeTileForKite(pos) ||
+                    !isSafeTargetApproachTile(pos.x,pos.y,pos.z,false) ||
+                    !isTargetingStepPolicyAllowed(node.pos,pos) ||
+                    !isKiteLurePullPathSafe([pos],node.pos,true)) continue;
+                if (dx && dy && (!isSafeTileForKite({x:node.pos.x+dx,y:node.pos.y,z:from.z}) ||
+                    !isSafeTileForKite({x:node.pos.x,y:node.pos.y+dy,z:from.z}))) continue;
+                seen.add(key);
+                queue.push({pos,parent:cursor,depth:node.depth+1});
+            }
+        }
+        // A loaded, sealed target is not a frontier. Do not repeatedly walk
+        // up to its wall. Unknown map edges can still be approached cautiously.
+        if (goalLoaded && !reached) return null;
+        if (!best || (!reached && bestDistance>=startDistance-0.5)) return null;
+        const pathPositions=[];
+        for (let at=best;queue[at].parent>=0;at=queue[at].parent) pathPositions.push(queue[at].pos);
+        pathPositions.reverse();
+        return {pathPositions,atGoal:false,reachesPullTarget:reached};
+    }
+
     function syncLureOffscreenPull(context, now = Date.now()) {
         if (bot.autoPickup?.ownsMovement?.()) return false;
         const eligible =
             state.running &&
             config.enabled &&
-            config.lureMode &&
-            config.lureOffscreenPullEnabled &&
+            (config.lureMode || config.kiteLureMode) &&
+            (config.lureOffscreenPullEnabled || config.kiteLureMode) &&
             context?.active === true;
 
         if (!eligible) {
@@ -16651,6 +16839,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             return false;
         }
 
+        if (!config.kiteLureMode) {
+            bot.cave?.passivelyAdvanceLureWaypoints?.(normalizePosition(bot.getPlayerPosition()),now);
+            context={...context,waypoint:bot.cave?.getCurrentWaypoint?.() || context.waypoint};
+        }
         const threshold = Math.max(
             1,
             Math.min(20, Math.trunc(Number(context.threshold) || Number(config.lureMobThreshold) || 3))
@@ -16695,6 +16887,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         }
 
         let target = getActiveLureOffscreenPullTarget();
+        let preparedRoute = null;
 
         if (target && !isKnownMonsterForOffscreenHunt(target)) {
             clearLureOffscreenPull("creature disappeared or changed floor");
@@ -16712,6 +16905,18 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         if (!target) {
             const candidates = getLureOffscreenPullCandidates(now);
             target = candidates[0] || null;
+            if (config.kiteLureMode) {
+                const from=normalizePosition(bot.getPlayerPosition());
+                target=null;
+                // A sealed nearby mob must not starve reachable alternatives.
+                // Limit probes and retain the usual policy/Anti-KS filtering.
+                for (const candidate of candidates.slice(0,4)) {
+                    const pos=normalizePosition(candidate.getPosition?.() || candidate.__position);
+                    const candidateRoute=findKiteLureForwardRoute(from,pos);
+                    if (candidateRoute) { target=candidate; preparedRoute=candidateRoute; break; }
+                    rememberSkippedTarget(candidate,now,2500);
+                }
+            }
             if (!target)
                 return false;
             if (!beginLureOffscreenPull(target, now))
@@ -16807,7 +17012,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         }
 
         const screen = getNativeSmallScreenInfo(target);
-        if (screen.visible && distance <= lureRadius) {
+        if (screen.visible && distance <= lureRadius &&
+            (!config.kiteLureMode || getTargetLineOfSightInfo(target,playerPos).clear)) {
             clearLureOffscreenPull(
                 "creature entered normal lure radius",
                 { handoff: true }
@@ -16845,16 +17051,6 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             return false;
         }
 
-        if (
-            state.lureOffscreenPullLastProgressAt &&
-            now - state.lureOffscreenPullLastProgressAt >= noProgressMs
-        ) {
-            rememberSkippedTarget(target, now, 2500);
-            clearLureOffscreenPull(
-                `no pull progress for ${Math.round(noProgressMs / 1000)}s`
-            );
-            return false;
-        }
 
         if (distance <= 1) {
             rememberSkippedTarget(target, now, 2500);
@@ -16873,8 +17069,9 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         // leash raises state.lureMovementHeld, and clearLureOffscreenPull()
         // stops any currently queued Pull-owned AutoWalk batch.
 
-        let route =
-            typeof bot.getFollowRouteForCreature === "function"
+        let route = config.kiteLureMode
+            ? preparedRoute || findKiteLureForwardRoute(playerPos,targetPos)
+            : typeof bot.getFollowRouteForCreature === "function"
                 ? bot.getFollowRouteForCreature(
                     target,
                     "pvp",
@@ -16888,7 +17085,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             !Array.isArray(route.pathPositions) ||
             route.pathPositions.length === 0
         ) {
-            const fallbackRoute =
+            const fallbackRoute = config.kiteLureMode ? null :
                 findReachableAdjacentPath(
                     targetPos,
                     playerPos
@@ -16921,10 +17118,30 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             return false;
         }
 
+        // Shortening the actual corridor is progress even when rounding a
+        // wall initially moves farther from the mob in a straight line.
+        if (config.kiteLureMode) {
+            const remaining=route.pathPositions.length;
+            if (Number.isFinite(state.lureOffscreenPullLastPathLength) &&
+                remaining<state.lureOffscreenPullLastPathLength)
+                state.lureOffscreenPullLastProgressAt=now;
+            state.lureOffscreenPullLastPathLength=remaining;
+        }
+        if (
+            state.lureOffscreenPullLastProgressAt &&
+            now - state.lureOffscreenPullLastProgressAt >= noProgressMs
+        ) {
+            rememberSkippedTarget(target, now, 2500);
+            clearLureOffscreenPull(
+                `no pull progress for ${Math.round(noProgressMs / 1000)}s`
+            );
+            return false;
+        }
+
         // Do not freeze CaveBot merely because an off-screen candidate exists.
         // Take the reason-scoped Cave pause only when a real route is ready to
         // be handed to Targeting.
-        if (!state.lureOffscreenPullPauseHeld) {
+        if (!state.lureOffscreenPullPauseHeld && (!config.kiteLureMode || bot.cave?.isRunning?.())) {
             if (
                 bot.cave?.pauseMovement?.(
                     LURE_OFFSCREEN_PULL_PAUSE_REASON
@@ -16960,7 +17177,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 // Keep a live pack a little more conservative, but still send
                 // enough directions for smooth server AutoWalk. With no pack
                 // yet, use the same longer travel batch as Off-screen Hunt.
-                maxSteps: visibleCount > 0 ? 3 : 5,
+                maxSteps: config.kiteLureMode ? 2 : visibleCount > 0 ? 3 : 5,
                 // Do not rebuild merely because our own position changed and
                 // therefore the next short batch destination changed. A moved
                 // monster still refreshes immediately through targetPosKey.
@@ -22797,6 +23014,16 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             owner === "melee" &&
             targetMovedTiles <= 2;
 
+        if (owner === "pull" && config.kiteLureMode) {
+            const stored = state.manualPursuitAutoWalkPathPositions || [];
+            const at = stored.findIndex(p=>getKitePositionKey(p)===getKitePositionKey(playerPos));
+            const remaining = at>=0 ? stored.slice(at+1) : stored;
+            if (!isKiteLurePullPathSafe(batch,playerPos,true) ||
+                (client.__mbTargetingAutoWalkOwner==="pull" && !isKiteLurePullPathSafe(remaining,playerPos,true))) {
+                stopManualTargetPursuitAutoWalk("Kite Lure pack entered pull path");
+                return false;
+            }
+        }
         const storedPolicyBatchPassable=isStoredTargetingPolicyBatchPassable(playerPos,owner);
         const storedMeleeBatchPassable =
             owner !== "melee" ||
@@ -23926,6 +24153,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             }
         );
 
+        config.kiteLureMode = config.kiteLureMode === true;
+        if (config.kiteLureMode) Object.assign(config,{kiteMode:true,lureMode:false,meleeMode:false,useClientChase:false});
         config.targetPriorityNames = normalizeTargetPriorityNames(config.targetPriorityNames);
         config.targetPriorityMatchMode = config.targetPriorityMatchMode === "includes" ? "includes" : "exact";
         if (config.kiteMode)
@@ -24506,6 +24735,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             ordinaryAccess: getOrdinaryAccessInfo(),
             ordinaryAccessBlocked:
                 isOrdinaryAccessBlocked(),
+            kiteLurePhase: config.kiteLureMode ? state.kiteLurePhase || "kiting" : null,
             ignoredTrapEscape: state.ignoredTrap ? {...state.ignoredTrap} : null,
             ignoredAutoTargetRejects:
                 state.ignoredAutoTargetRejects || 0,
@@ -25098,7 +25328,9 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                  : [];
         }
         if (nextConfig.attackIgnoredWhenTrapped !== undefined) nextConfig.attackIgnoredWhenTrapped = nextConfig.attackIgnoredWhenTrapped === true;
+        if (nextConfig.kiteLureMode !== undefined) nextConfig.kiteLureMode = nextConfig.kiteLureMode === true;
         Object.assign(config, nextConfig);
+        if (config.kiteLureMode) Object.assign(config,{kiteMode:true,lureMode:false,meleeMode:false,useClientChase:false});
         if (!config.attackIgnoredWhenTrapped && state.ignoredTrap) clearIgnoredTrapEscape("option disabled");
         kiteAcquisitionRoutes.clear();
         if (!config.kiteMode) clearKiteLosRecovery("Kite disabled");
@@ -25112,7 +25344,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             if (hunted && !isAllowedOffscreenHuntCreature(hunted))
                 clearOffscreenHunt("creature does not match hunt mode", { quiet: true });
         }
-        if (!config.lureOffscreenPullEnabled || !config.lureMode) {
+        if (!config.kiteLureMode && (!config.lureOffscreenPullEnabled || !config.lureMode)) {
             clearLureOffscreenPull(
                 "Off-screen Pull disabled",
                 { quiet: true }
@@ -30854,6 +31086,38 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             waypoint.ladder !== true;
     }
 
+    // Lure detours may pass beside several Walk nodes while Targeting owns
+    // movement. Consume only a bounded, contiguous stretch in route order.
+    function passivelyAdvanceLureWaypoints(position, now = Date.now()) {
+        if (!state.running || !position || route.length<=1 ||
+            [...state.externalPauseReasons].some(reason=>reason!=="offscreen-lure-pull")) return 0;
+        if (observeTargetingOwnedRelocation(position,now)) return 0;
+        const direction=config.loopMode ? 1 : state.direction;
+        const tolerance=Math.max(2,Math.min(5,Number(config.waypointTolerance)||0));
+        let bestOffset=-1, bestDistance=Infinity;
+        let index=state.currentIndex;
+        for (let offset=0;offset<Math.min(12,route.length-1);offset++,index+=direction) {
+            // Do not wrap/reverse the route speculatively during a lure.
+            if (index<0 || index>=route.length) break;
+            const wp=route[index];
+            if (!isPassiveChaseAdvanceWaypoint(wp) || Number(wp.z)!==Number(position.z)) break;
+            const distance=getDistance(position,wp);
+            if (distance<=tolerance && distance<bestDistance) {
+                bestOffset=offset; bestDistance=distance;
+            }
+        }
+        if (bestOffset<0) return 0;
+        const oldIndex=state.currentIndex;
+        for (let n=0;n<=bestOffset;n++) advanceWaypoint();
+        resetWaypointProgressTracking(getCurrentWaypoint(),position,now);
+        state.lastPositionKey=getPositionKey(position);
+        state.stuckCount=0;
+        state.stuckRecoveryAttempts=0;
+        noteIntentionalLureNavigation("passed Walk waypoints while luring",now);
+        bot.log(`Cave: lure passed Walk waypoints #${oldIndex+1} – continuing at #${state.currentIndex+1}`);
+        return bestOffset+1;
+    }
+
     function passivelyAdvanceChaseWaypoints(
         position,
         previousPosition = null,
@@ -31017,7 +31281,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 continue;
             if (typeof item.isWalkable === "function" && !item.isWalkable())
                 return false;
-            if (typeof item.hasFlag === "function" &&
+            if (!bot.isWalkableParcel?.(item) && typeof item.hasFlag === "function" &&
                 typeof PropBitFlag !== "undefined" &&
                 item.hasFlag(PropBitFlag.prototype.flags.DatFlagNotPathable)) {
                 if (tile !== destination)
@@ -31035,7 +31299,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 onlyFieldNotPathable = false;
             }
             for (const item of items) {
-                if (isMagicFieldItem(item)) continue;
+                if (isMagicFieldItem(item) || bot.isWalkableParcel?.(item)) continue;
                 if (typeof item.hasFlag === "function" && typeof PropBitFlag !== "undefined" &&
                     item.hasFlag(PropBitFlag.prototype.flags.DatFlagNotPathable)) {
                     onlyFieldNotPathable = false;
@@ -39288,6 +39552,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         getPresetNames,
         getActivePresetName,
         getCurrentWaypoint,
+        passivelyAdvanceLureWaypoints,
         getLureBlockerId,
         getLureBlockedCreatureIds,
         getLureEmergencyClearId,
@@ -47360,7 +47625,8 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             return false;
         }
 
-        while (state.corpseQueue.length >= 8)
+        // Bounded memory while retaining larger simultaneous AoE kills.
+        while (state.corpseQueue.length >= 64)
             state.corpseQueue.shift();
 
         // Final invariant: corpse walking NEVER queues adjacent corpses.
@@ -47648,22 +47914,19 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                             creature.type === monsterType
                         );
 
-                    const currentTarget =
-                        bot.attack?.getCurrentTarget?.() ||
-                        window.gameClient?.player?.getTarget?.() ||
-                        null;
-
-                    const wasTargeted =
-                        creature &&
-                        currentTarget &&
-                        currentTarget.id === creature.id;
-
+                    // Every nearby monster death matters, including AoE kills
+                    // that never became the player's selected target.
                     if (
                         exactMonster &&
-                        wasTargeted &&
+                        !bot.isPlayerSummon?.(creature) &&
                         (!Number.isFinite(health) || health > 0)
                     ) {
-                        deathCandidate = creature;
+                        const position = creature.getPosition?.() || creature.__position;
+                        if (position) deathCandidate = {
+                            id: creature.id,
+                            name: creature.name,
+                            __position: { x: position.x, y: position.y, z: position.z }
+                        };
                     }
                 }
             } catch (e) {}
@@ -56767,7 +57030,7 @@ function upgradeSectionHeaders(panel) {
         const custom=modeSelect?.querySelector('option[value="custom"]');if(custom)custom.hidden=mode!=='custom';
         const positionSelect=document.getElementById('minibia-bot-targeting-default-position');
         if(positionSelect && document.activeElement!==positionSelect)positionSelect.value=attackConfig.keepFront?'front':attackConfig.keepDiagonal?'diagonal':'any';
-        const kiteField=document.getElementById('minibia-bot-targeting-kite-field');if(kiteField)kiteField.style.display=['kite','custom'].includes(mode)?'':'none';
+        const kiteField=document.getElementById('minibia-bot-targeting-kite-field');if(kiteField)kiteField.style.display=['kite','kite-lure','custom'].includes(mode)?'':'none';
         bot.combatRules?.refreshStatus?.();
         const inputs = {
             enabled: document.getElementById("minibia-bot-auto-attack-enabled"),
@@ -56864,7 +57127,9 @@ function upgradeSectionHeaders(panel) {
         }
         if (inputs.lureOffscreenPull) {
             inputs.lureOffscreenPull.checked =
-                attackConfig.lureOffscreenPullEnabled === true;
+                attackConfig.lureOffscreenPullEnabled === true || attackConfig.kiteLureMode === true;
+            inputs.lureOffscreenPull.disabled = attackConfig.kiteLureMode === true;
+            inputs.lureOffscreenPull.title = attackConfig.kiteLureMode ? "Automatic in Kite Lure mode" : "Pull nearby known monsters off screen";
         }
         if (
             inputs.lureOffscreenPullRange &&
@@ -56889,7 +57154,9 @@ function upgradeSectionHeaders(panel) {
                     : "slow";
         }
         if (inputs.lureStatus) {
-            if (!attackConfig.lureMode) {
+            if (attackConfig.kiteLureMode) {
+                inputs.lureStatus.textContent = `Kite Lure · ${status?.kiteLurePhase === "pulling" ? "gathering nearby monsters" : "keeping pack at kite distance"}`;
+            } else if (!attackConfig.lureMode) {
                 inputs.lureStatus.textContent = "Lure: off";
             } else if (status?.lureActive) {
                 const wp = status.lureWaypointIndex != null
@@ -60132,7 +60399,7 @@ function upgradeSectionHeaders(panel) {
     <div id="minibia-bot-targeting-active-rule" class="mb-small-note" style="margin:5px 0 9px;">Stopped</div>
     <div class="mb-section-title mb-section-title--sub"><span class="mb-title-text">Default Behavior</span></div>
     <div style="display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:7px;">
-      <label class="mb-field"><span class="mb-field-label">Movement</span><select id="minibia-bot-targeting-default-mode"><option value="attack">Attack · no chase</option><option value="melee">Melee · bot chase</option><option value="client-chase">Client Chase</option><option value="kite">Kite</option><option value="lure">Lure</option><option value="custom" hidden>Saved combination</option></select></label>
+      <label class="mb-field"><span class="mb-field-label">Movement</span><select id="minibia-bot-targeting-default-mode"><option value="attack">Attack · no chase</option><option value="melee">Melee · bot chase</option><option value="client-chase">Client Chase</option><option value="kite">Kite</option><option value="kite-lure" title="Keep kiting while gathering monsters with offscreen pull">Kite Lure</option><option value="lure">Lure</option><option value="custom" hidden>Saved combination</option></select></label>
       <label class="mb-field"><span class="mb-field-label">Position</span><select id="minibia-bot-targeting-default-position" title="Diagonal also prefers diagonal positions while kiting"><option value="any">Any adjacent tile</option><option value="front">Front</option><option value="diagonal">Diagonal</option></select></label>
       <label class="mb-field"><span class="mb-field-label">Max target distance</span><input type="number" id="minibia-bot-auto-attack-maxdist" min="1" max="10" value="5"></label>
       <label class="mb-field" id="minibia-bot-targeting-kite-field"><span class="mb-field-label">Kite distance</span><input title="Maximum straight-line distance, including diagonals" type="number" id="minibia-bot-auto-attack-ideal-dist" min="1" max="10" value="3"></label>
@@ -60151,7 +60418,7 @@ function upgradeSectionHeaders(panel) {
 
       <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
         <label class="mb-field" style="flex:0 0 88px;">
-          <span class="mb-field-label" style="font-size:10px;">Fight at mobs</span>
+          <span class="mb-field-label" style="font-size:10px;" title="Lure fights at this count; Kite Lure keeps kiting after gathering this many">Pack size</span>
           <input type="number" id="minibia-bot-auto-attack-lure-count" min="1" max="20" value="3" style="padding:3px 4px;font-size:11px;" />
         </label>
 
