@@ -4080,7 +4080,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.319",
+        version: "1.6.320",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -6469,6 +6469,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         itemCountRequestAt: 0,
         itemAlertLast: {}, // itemId -> timestamp
         lowCapBeepLast: 0,
+        alphaMonsterBeepLast: null,
     };
 
     const config = Object.assign({
@@ -6494,6 +6495,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         noTargetDelayMs: 10000,
         noTargetRepeatMs: 30000,
         lowCapBeep: false,
+        alphaMonsterBeep: false,
         lowCapThreshold: 100,
         lowCapRepeatMs: 30000,
         itemAlerts: [], // [{ id, name, threshold, cooldownMs }]
@@ -6619,6 +6621,24 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
                 }
             ]);
     }
+    function playAlphaMonsterBeep() {
+        // Distinct rising double call, synthesized by the shared alert audio engine.
+        playToneSequence([
+            { freq: 620, dur: 110, vol: 0.4 },
+            { freq: 930, dur: 110, delay: 140, vol: 0.4 },
+            { freq: 1240, dur: 200, delay: 280, vol: 0.4 },
+            { freq: 930, dur: 110, delay: 620, vol: 0.4 },
+            { freq: 1240, dur: 240, delay: 760, vol: 0.4 },
+        ]);
+    }
+
+    function getVisibleAlphaMonsters() {
+        if (!window.gameClient?.player || window.gameClient?.networkManager?.isConnected?.() === false) return [];
+        // This native visibility filter remains available while Targeting is off.
+        return (bot.attack?.getVisibleCombatMonsters?.() || []).filter(creature =>
+            Math.abs(Number(creature.__scale) - 1.3) < 0.01 || /^alpha\b/i.test(String(creature.name || '').trim()));
+    }
+
     function playManaFullBeep() {
         playToneSequence([{
                     freq: 1200,
@@ -7380,8 +7400,21 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
 
     function checkAudioAlerts(now) {
         const player = window.gameClient?.player;
-        if (!player)
+        if (!player) {
+            state.alphaMonsterBeepLast = null;
             return;
+        }
+
+        if (config.alphaMonsterBeep) {
+            const alphas = getVisibleAlphaMonsters();
+            if (!alphas.length) state.alphaMonsterBeepLast = null;
+            else if (state.alphaMonsterBeepLast === null || now - state.alphaMonsterBeepLast >= 2000) {
+                const first = state.alphaMonsterBeepLast === null;
+                state.alphaMonsterBeepLast = now;
+                playAlphaMonsterBeep();
+                if (first) showAudioAlertNotification("ALPHA MONSTER", alphas.map(c => c.name || "Alpha monster").join(", "), "audio-alpha-monster");
+            }
+        } else state.alphaMonsterBeepLast = null;
 
         const st = player.state || {};
         const health = Number(st.health || 0);
@@ -7584,6 +7617,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
             config.manaFullBeep ||
             config.noTargetBeep ||
             config.lowCapBeep ||
+            config.alphaMonsterBeep ||
             (config.itemAlerts && config.itemAlerts.length > 0));
     }
 
@@ -7619,6 +7653,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         }
         state.lastHealth = null;
         state.lastDamageEventKey = null;
+        state.alphaMonsterBeepLast = null;
         clearPendingReturn();
         bot.log("panic runner stopped");
         return true;
@@ -7683,6 +7718,10 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         }
         if (next.lowCapRepeatMs !== undefined) {
             next.lowCapRepeatMs = Math.max(1000, Number(next.lowCapRepeatMs) || 30000);
+        }
+        if (next.alphaMonsterBeep !== undefined) {
+            next.alphaMonsterBeep = !!next.alphaMonsterBeep;
+            if (next.alphaMonsterBeep !== config.alphaMonsterBeep) state.alphaMonsterBeepLast = null;
         }
         if (next.lowCapBeep !== undefined) {
             next.lowCapBeep = !!next.lowCapBeep;
@@ -7782,6 +7821,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         getTrustedNames,
         getGameMasterNames,
         playGenericBeepBloop,
+        getVisibleAlphaMonsters,
         config,
         cancelRestart: function () {
             return bot.gmKillSwitch?.cancel?.(
@@ -60467,7 +60507,7 @@ function upgradeSectionHeaders(panel) {
 </div>
 
 <!-- Alert Tab -->
-<div class="mb-tab-panel mb-alert-compact" data-tab-panel="alert"><div class="mb-section"><div class="mb-section-title"><span class="mb-title-text">⚠️ Alerts</span></div><div class="mb-alert-toggle-grid"><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-player-alert"><span>Player on screen</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-player-attack-alert"><span>Player attack</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-message-alert"><span>Message</span></label><label class="mb-toggle" title="Plays a descending tone when your target dies"><input type="checkbox" id="minibia-bot-panic-target-death-beep"><span>Target death</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-low-health-beep"><span>Low health</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-mana-full-beep"><span>Mana full</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-no-target-beep"><span>No target</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-low-cap-beep"><span>Low capacity</span></label></div><details class="mb-alert-fold"><summary>Player alert settings</summary><div class="mb-alert-fold-body"><label class="mb-field"><span class="mb-field-label">Player alert cooldown (s)</span><input type="number" id="minibia-bot-panic-player-cooldown" min="10" value="10"></label></div></details><details class="mb-alert-fold"><summary>Thresholds &amp; repeat timing</summary><div class="mb-alert-fold-body"><div class="mb-alert-setting-group"><div class="mb-alert-setting-title">Low health</div><div class="mb-alert-grid"><label class="mb-field">
+<div class="mb-tab-panel mb-alert-compact" data-tab-panel="alert"><div class="mb-section"><div class="mb-section-title"><span class="mb-title-text">⚠️ Alerts</span></div><div class="mb-alert-toggle-grid"><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-player-alert"><span>Player on screen</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-player-attack-alert"><span>Player attack</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-message-alert"><span>Message</span></label><label class="mb-toggle" title="Plays a descending tone when your target dies"><input type="checkbox" id="minibia-bot-panic-target-death-beep"><span>Target death</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-low-health-beep"><span>Low health</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-mana-full-beep"><span>Mana full</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-no-target-beep"><span>No target</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-low-cap-beep"><span>Low capacity</span></label><label class="mb-toggle" title="Repeats every 2 seconds while an alpha monster is on screen"><input type="checkbox" id="minibia-bot-panic-alpha-monster-beep"><span>Alpha monster</span></label></div><details class="mb-alert-fold"><summary>Player alert settings</summary><div class="mb-alert-fold-body"><label class="mb-field"><span class="mb-field-label">Player alert cooldown (s)</span><input type="number" id="minibia-bot-panic-player-cooldown" min="10" value="10"></label></div></details><details class="mb-alert-fold"><summary>Thresholds &amp; repeat timing</summary><div class="mb-alert-fold-body"><div class="mb-alert-setting-group"><div class="mb-alert-setting-title">Low health</div><div class="mb-alert-grid"><label class="mb-field">
               <span class="mb-field-label">Threshold %</span>
               <input type="number" id="minibia-bot-panic-low-health-threshold" min="1" max="99" value="50">
             </label><label class="mb-field">
@@ -65793,6 +65833,7 @@ function upgradeSectionHeaders(panel) {
             noTargetDelay: panel.querySelector("#minibia-bot-panic-no-target-delay"),
             noTargetRepeat: panel.querySelector("#minibia-bot-panic-no-target-repeat"),
             lowCap: panel.querySelector("#minibia-bot-panic-low-cap-beep"),
+            alphaMonster: panel.querySelector("#minibia-bot-panic-alpha-monster-beep"),
             lowCapThresh: panel.querySelector("#minibia-bot-panic-low-cap-threshold"),
             lowCapRepeat: panel.querySelector("#minibia-bot-panic-low-cap-repeat"),
             itemList: panel.querySelector("#minibia-bot-panic-item-alerts-list"),
@@ -65878,6 +65919,8 @@ function upgradeSectionHeaders(panel) {
                 audioIds.noTargetDelay.value = Math.round((c.noTargetDelayMs ?? 10000) / 1000);
             if (audioIds.noTargetRepeat && document.activeElement !== audioIds.noTargetRepeat)
                 audioIds.noTargetRepeat.value = Math.round((c.noTargetRepeatMs ?? 30000) / 1000);
+            if (audioIds.alphaMonster && document.activeElement !== audioIds.alphaMonster)
+                audioIds.alphaMonster.checked = !!c.alphaMonsterBeep;
             if (audioIds.lowCap && document.activeElement !== audioIds.lowCap)
                 audioIds.lowCap.checked = !!c.lowCapBeep;
             if (audioIds.lowCapThresh && document.activeElement !== audioIds.lowCapThresh)
@@ -65893,6 +65936,7 @@ function upgradeSectionHeaders(panel) {
             ["manaFull", "manaFullBeep"],
             ["noTarget", "noTargetBeep"],
             ["lowCap", "lowCapBeep"],
+            ["alphaMonster", "alphaMonsterBeep"],
         ];
         for (const [uiKey, cfgKey] of boolToggles) {
             const el = audioIds[uiKey];
