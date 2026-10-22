@@ -4080,7 +4080,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.320",
+        version: "1.6.322",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -8032,7 +8032,7 @@ window.__minibiaBotBundle.installRunemakerModule = function installRunemakerModu
         if(!state.running||!config.enabled||!player||player!==state.player||!(client.isConnected?.()===true||client.networkManager?.isConnected?.()===true))return false;
         if(bot.actions?.isHalted?.()||bot.gmKillSwitch?.isActive?.()||bot.pauseHotkey?.isPaused?.())return false;
         if(!row.count||row.count.count>=row.rule.count||!config.rules.some(r=>r.spellId===row.rule.spellId&&r.enabled))return false;
-        if(!book?.spells?.has(row.spell.sid)||typeof book.castSpell!=="function")return false;
+        if(!book?.spells?.has(row.spell.sid))return false;
         if(!(Number(player.state?.health)>0)||!Number.isFinite(Number(player.state?.mana))||Number(player.state.mana)<row.spell.mana)return false;
         const soulCost=Number(client.interface?.SOUL_COST?.[row.spell.sid]??client.interface?.DEFAULT_SOUL_COST??1);
         if(Number.isFinite(Number(player.state?.soul))&&Number(player.state.soul)<soulCost)return false;
@@ -8059,7 +8059,7 @@ window.__minibiaBotBundle.installRunemakerModule = function installRunemakerModu
         bot.actions?.runShared?.("runemaker",bot.actions.priorities.UTILITY,()=>{
             const fresh={...row,count:reading(row.spell,Date.now())};
             if(!permitted(fresh,Date.now()))return false;
-            player.spellbook.castSpell(row.spell.sid);sent=true;return true;
+            sent=!!bot.sendChat(row.spell.words);return sent;
         });
         if(sent){state.lastCastAt=now;state.pending={spell:row.spell,before:row.count.count,at:now};state.reason=`Making ${row.spell.name}`;refreshCounts(now,true);}
         return sent;
@@ -8070,7 +8070,7 @@ window.__minibiaBotBundle.installRunemakerModule = function installRunemakerModu
         const now=Date.now(),all=catalogue();
         for(const [id,label]of rows){const spell=all.find(s=>s.sid===id),r=spell?reading(spell,now):null;label.textContent=r?String(r.count):"?";}
     }
-    function tick(){state.timer=null;if(!state.running||disposed)return;try{attempt();}catch(e){state.reason="Runemaker waiting";bot.log("Runemaker tick failed",e?.message||e);}finally{updateStatus();if(state.running&&!disposed)state.timer=window.setTimeout(tick,500);}}
+    function tick(){state.timer=null;if(!state.running||disposed)return;try{attempt();}catch(e){state.reason="Runemaker waiting";bot.log("Runemaker tick failed",e?.message||e);}finally{updateStatus();if(state.running&&!disposed)state.timer=window.setTimeout(tick,250);}}
     function start(){if(disposed)return false;config.enabled=true;persist();if(state.running)return false;state.running=true;state.reason="Checking rune stock";tick();return true;}
     function stop(options={}){state.running=false;if(state.timer!==null)window.clearTimeout(state.timer);state.timer=null;state.pending=null;state.reason="Off";if(options.persistEnabled!==false){config.enabled=false;persist();}updateStatus();}
     function updateConfig(next={}){Object.assign(config,next);normalize();persist();if(state.running)refreshCounts(Date.now(),true);render();return config;}
@@ -8120,6 +8120,30 @@ window.__minibiaBotBundle.installRuneModule = function installRuneModule(bot) {
     },
             bot.storage.get(configStorageKey, {}));
     config.tickMs = 250;
+
+    let countRequestAt=0,countPlayer=null,countSessionAt=0,pendingCount=null;
+    function normalizeRules() {
+        if (!Array.isArray(config.rules)) config.rules=[{spellWords:config.runeSpellWords,minMana:config.runeManaCost,maxMana:100,itemId:0,itemCount:100,enabled:true}];
+        config.rules=config.rules.slice(0,40).map(r=>{const min=Math.max(0,Math.min(100,Number(r.minMana)||0));return {spellWords:String(r.spellWords||'').trim(),minMana:min,maxMana:Math.max(min,Math.min(100,Number(r.maxMana??100)||0)),itemId:Math.max(0,Math.trunc(Number(r.itemId)||0)),itemCount:Math.max(1,Math.trunc(Number(r.itemCount)||100)),enabled:r.enabled!==false};});
+    }
+    normalizeRules();
+    function trainingSpells(){return Array.from(window.gameClient?.interface?.SPELLS||[]).map(([sid,s])=>({...s,sid})).filter(s=>s.words);}
+    function resolveTrainingSpell(value){return bot.heal?.resolveSpell?.(value)||trainingSpells().find(s=>s.words.toLowerCase()===value.toLowerCase()||s.name?.toLowerCase()===value.toLowerCase())||{words:value,mana:0};}
+    function syncTrainingCounts(now){const p=window.gameClient?.player;if(p!==countPlayer){countPlayer=p;countSessionAt=now;countRequestAt=0;pendingCount=null;}if(now-countRequestAt>=2000){countRequestAt=now;const ids=[...new Set(config.rules.filter(r=>r.enabled&&r.itemId).map(r=>r.itemId))];if(ids.length)bot.requestItemCounts?.(ids.map(id=>({id,fluidType:0})));}}
+    function trainingCount(id,now){const r=bot.getItemCountReading?.(id,0);return r&&Number.isFinite(Number(r.count))&&r.at>=countSessionAt&&now-r.at<=12000?r:null;}
+    function selectTrainingRule(now=Date.now()) {
+        syncTrainingCounts(now);
+        if(pendingCount){const r=trainingCount(pendingCount.id,now);if(r&&r.at>=pendingCount.at&&r.count>pendingCount.before)pendingCount=null;else if(now-pendingCount.at<6000)return null;else pendingCount=null;}
+        const mana=bot.manaPercent(),absoluteMana=Number(bot.getPlayerState()?.mana)||0;
+        for(let index=0;index<config.rules.length;index++){
+            const rule=config.rules[index];if(!rule.enabled||!rule.spellWords||mana<rule.minMana||mana>rule.maxMana)continue;
+            const spell=resolveTrainingSpell(rule.spellWords);if(absoluteMana<Number(spell.mana||0))continue;
+            let count=null;
+            if(rule.itemId){count=trainingCount(rule.itemId,now);if(!count)return null;if(count.count>=rule.itemCount)continue;}
+            return {rule,spell,index,count};
+        }
+        return null;
+    }
 
     function persistConfig() {
         bot.storage.set(configStorageKey, {
@@ -8174,7 +8198,7 @@ window.__minibiaBotBundle.installRuneModule = function installRuneModule(bot) {
         }
         const hpPercent = hp.max > 0 ? (hp.current / hp.max) * 100 : 0;
         const enoughHp = hpPercent >= config.minHpPercent;
-        const enoughMana = bot.manaPercent() >= config.runeManaCost;
+        const enoughMana = !!selectTrainingRule(now);
         const enoughFood = food?.seconds == null || food.seconds >= config.minFoodSeconds;
         const cooldownElapsed = now - state.lastRuneAt;
         const cooldownRemaining = Math.max(0, config.runeCooldownMs - cooldownElapsed);
@@ -8195,18 +8219,23 @@ window.__minibiaBotBundle.installRuneModule = function installRuneModule(bot) {
     }
 
     function tryMakeRune() {
-        if (!canMakeRune() || bot.runemaker?.needsMana?.() || bot.heal?.needsPriorityAction?.() || bot.heal?.hasPendingAction?.())
+        if (!canMakeRune() || bot.heal?.needsPriorityAction?.() || bot.heal?.hasPendingAction?.())
             return false;
-        const spell = bot.heal?.resolveSpell?.(config.runeSpellWords);
-        if (spell?.sid != null && Number(bot.getPlayerState()?.mana) < Number(spell.mana)) return false;
-        const words = spell?.words || config.runeSpellWords;
-        const sent = bot.actions.runShared('rune-crafting',
-            bot.actions.priorities.UTILITY, () => {
-                if (bot.runemaker?.needsMana?.() || bot.heal?.needsPriorityAction?.() || bot.heal?.hasPendingAction?.()) return false;
-                return bot.sendChat(words);
-            });
-        if (sent)
+        const selected = selectTrainingRule();
+        if (!selected) return false;
+        const sent = bot.actions.runShared('mana-training', bot.actions.priorities.UTILITY, () => {
+            if (bot.heal?.needsPriorityAction?.() || bot.heal?.hasPendingAction?.() || bot.actions?.isHalted?.() || bot.gmKillSwitch?.isActive?.()) return false;
+            const fresh = selectTrainingRule();
+            if (!fresh || fresh.index !== selected.index) return false;
+            return bot.sendChat(fresh.spell.words);
+        });
+        if (sent) {
             state.lastRuneAt = Date.now();
+            if (selected.rule.itemId) {
+                pendingCount={id:selected.rule.itemId,before:selected.count.count,at:state.lastRuneAt};
+                bot.requestItemCounts?.([{id:selected.rule.itemId,fluidType:0}]);
+            }
+        }
         return sent;
     }
 
@@ -8268,6 +8297,7 @@ window.__minibiaBotBundle.installRuneModule = function installRuneModule(bot) {
             enabled: true
         });
         config.tickMs = 250;
+        normalizeRules();
         persistConfig();
         if (state.running) {
             bot.log("rune maker already running");
@@ -8318,6 +8348,8 @@ window.__minibiaBotBundle.installRuneModule = function installRuneModule(bot) {
         // Also used by the attack module – we keep it for compatibility.
         // This function is overridden by the attack module's updateConfig later.
         Object.assign(config, nextConfig);
+        normalizeRules();
+        pendingCount=null;
         persistConfig();
         bot.log("rune config updated", {
             ...config
@@ -8325,6 +8357,23 @@ window.__minibiaBotBundle.installRuneModule = function installRuneModule(bot) {
         return {
             ...config
         };
+    }
+
+    let trainerHost=null,editingRule=-1;
+    function mount(panel){
+        trainerHost=panel.querySelector('[data-mana-trainer-host]');if(!trainerHost)return;
+        trainerHost.innerHTML=`<div class="mb-section-title"><input type="checkbox" id="minibia-bot-rune-enabled" class="mb-title-toggle"><span class="mb-title-text">Mana Trainer</span></div><div data-mt-rules></div><div class="mb-small-note">First matching rule casts. Move rules to change priority.</div><div class="mb-mt-editor"><label class="mb-field"><span class="mb-field-label">Spell name / words</span><input data-mt-spell list="minibia-bot-training-spell-choices" autocomplete="off" placeholder="Spell name or words"><datalist id="minibia-bot-training-spell-choices"></datalist></label><div class="mb-mt-grid"><label class="mb-field"><span class="mb-field-label">Mana from %</span><input data-mt-min type="number" min="0" max="100" value="98"></label><label class="mb-field"><span class="mb-field-label">Mana to %</span><input data-mt-max type="number" min="0" max="100" value="100"></label><label class="mb-field"><span class="mb-field-label">Item condition</span><select data-mt-item></select></label><label class="mb-field"><span class="mb-field-label">Count below</span><input data-mt-count type="number" min="1" value="100"></label></div><div class="mb-mt-buttons"><button class="mb-small-button" data-mt-save>Add rule</button><button class="mb-small-button" data-mt-cancel hidden>Cancel</button></div></div>`;
+        const q=s=>trainerHost.querySelector(s),spell=q('[data-mt-spell]'),item=q('[data-mt-item]');
+        function choices(){const current=item.value;const list=q('datalist');list.replaceChildren();item.replaceChildren();const always=document.createElement('option');always.value='0';always.textContent='No item limit';item.append(always);const seen=new Set();for(const s of trainingSpells()){const o=document.createElement('option');o.value=s.words;o.label=`${s.name} (${s.mana} MP)`;list.append(o);if(s.runeId&&!seen.has(s.runeId)){seen.add(s.runeId);const option=document.createElement('option');option.value=String(s.runeId);option.textContent=s.name.replace(/^Conjure /i,'');item.append(option);}}if([...item.options].some(o=>o.value===current))item.value=current;itemChanged();}
+        function itemChanged(){q('[data-mt-count]').disabled=Number(item.value)===0;}
+        function reset(){editingRule=-1;spell.value='';q('[data-mt-min]').value='98';q('[data-mt-max]').value='100';item.value='0';q('[data-mt-count]').value='100';q('[data-mt-save]').textContent='Add rule';q('[data-mt-cancel]').hidden=true;itemChanged();}
+        function edit(index){const r=config.rules[index];editingRule=index;spell.value=r.spellWords;q('[data-mt-min]').value=r.minMana;q('[data-mt-max]').value=r.maxMana;item.value=String(r.itemId);q('[data-mt-count]').value=r.itemCount;q('[data-mt-save]').textContent='Save rule';q('[data-mt-cancel]').hidden=false;itemChanged();spell.focus();}
+        function draw(){const list=q('[data-mt-rules]');list.replaceChildren();config.rules.forEach((rule,index)=>{const row=document.createElement('div');row.className='mb-mt-rule';const top=document.createElement('div');top.className='mb-mt-rule-top';const title=document.createElement('label');const on=document.createElement('input');on.type='checkbox';on.checked=rule.enabled;on.setAttribute('aria-label',`Enable rule ${index+1}`);on.addEventListener('change',()=>{updateConfig({rules:config.rules.map((r,i)=>i===index?{...r,enabled:on.checked}:r)});draw();});const name=document.createElement('span');name.textContent=`${index+1}. ${resolveTrainingSpell(rule.spellWords).name||rule.spellWords}`;name.title=rule.spellWords;title.append(on,name);top.append(title);const buttons=document.createElement('div');buttons.className='mb-mt-actions';for(const [text,label,action,disabled]of[
+            ['↑','Move up',()=>move(index,-1),index===0],['↓','Move down',()=>move(index,1),index===config.rules.length-1],['Edit','Edit rule',()=>edit(index),false],['×','Remove rule',()=>{updateConfig({rules:config.rules.filter((_,i)=>i!==index)});reset();draw();},false]]){const button=document.createElement('button');button.type='button';button.className='mb-small-button';button.textContent=text;button.title=label;button.setAttribute('aria-label',label);button.disabled=disabled;button.addEventListener('click',action);buttons.append(button);}top.append(buttons);const summary=document.createElement('div');summary.className='mb-small-note';const itemSpell=trainingSpells().find(s=>Number(s.runeId)===rule.itemId);summary.textContent=`Mana ${rule.minMana}–${rule.maxMana}% · ${rule.itemId?`${itemSpell?.name.replace(/^Conjure /i,'')||'Item '+rule.itemId} below ${rule.itemCount}`:'Always cast'}`;row.append(top,summary);if(!rule.enabled)row.classList.add('mb-mt-disabled');list.append(row);});}
+        function move(index,delta){const rules=[...config.rules];[rules[index],rules[index+delta]]=[rules[index+delta],rules[index]];updateConfig({rules});reset();draw();}
+        q('#minibia-bot-rune-enabled').checked=state.running;q('#minibia-bot-rune-enabled').addEventListener('change',e=>e.target.checked?start():stop());
+        spell.addEventListener('focus',choices);spell.addEventListener('change',()=>{const s=resolveTrainingSpell(spell.value.trim());spell.value=s.words;const native=trainingSpells().find(x=>x.words===s.words);item.value=String(native?.runeId||0);itemChanged();});item.addEventListener('change',itemChanged);
+        q('[data-mt-save]').addEventListener('click',()=>{if(!spell.value.trim())return;const resolved=resolveTrainingSpell(spell.value.trim()),rule={spellWords:resolved.words,minMana:Number(q('[data-mt-min]').value),maxMana:Number(q('[data-mt-max]').value),itemId:Number(item.value),itemCount:Number(q('[data-mt-count]').value),enabled:editingRule>=0?config.rules[editingRule]?.enabled!==false:true};const rules=[...config.rules];if(editingRule>=0)rules[editingRule]=rule;else rules.push(rule);updateConfig({rules});reset();draw();});q('[data-mt-cancel]').addEventListener('click',reset);choices();draw();
     }
 
     if (config.enabled)
@@ -8338,6 +8387,8 @@ window.__minibiaBotBundle.installRuneModule = function installRuneModule(bot) {
         getGateStatus,
         canMakeRune,
         tryMakeRune,
+        mount,
+        selectTrainingRule,
         config,
         updateConfig,
     };
@@ -58866,6 +58917,21 @@ function upgradeSectionHeaders(panel) {
         const style = document.createElement("style");
         style.id = "minibia-bot-style";
         style.textContent = `
+#minibia-bot-panel .mb-mt-rule { padding:8px 0; border-bottom:1px solid #ffffff12; }
+#minibia-bot-panel .mb-mt-rule-top { display:flex; align-items:center; gap:6px; justify-content:space-between; }
+#minibia-bot-panel .mb-mt-rule-top > label { display:flex; align-items:center; gap:6px; min-width:0; font-size:12px; flex:1; }
+#minibia-bot-panel .mb-mt-rule-top > label span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#minibia-bot-panel .mb-mt-rule-top input[type=checkbox] { width:14px; min-width:14px; height:14px; flex:0 0 14px; margin:0; }
+#minibia-bot-panel .mb-mt-actions { display:flex; gap:4px; flex-shrink:0; }
+#minibia-bot-panel .mb-mt-actions button { padding:3px 6px; }
+#minibia-bot-panel .mb-mt-rule > .mb-small-note { margin:4px 0 0 22px; }
+#minibia-bot-panel .mb-mt-disabled > label, #minibia-bot-panel .mb-mt-disabled > .mb-small-note { opacity:.5; }
+#minibia-bot-panel .mb-mt-editor { margin-top:12px; }
+#minibia-bot-panel .mb-mt-grid { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:8px; margin-top:8px; }
+#minibia-bot-panel .mb-mt-grid .mb-field { min-width:0; margin:0; }
+#minibia-bot-panel .mb-mt-grid input, #minibia-bot-panel .mb-mt-grid select { width:100%; box-sizing:border-box; min-width:0; }
+#minibia-bot-panel .mb-mt-buttons { display:flex; gap:6px; margin-top:8px; }
+
 #minibia-bot-panel .mb-rm-row { display:grid; grid-template-columns:16px minmax(0,1fr) 48px 66px 26px; gap:6px; align-items:center; margin-bottom:8px; font-size:12px; }
 #minibia-bot-panel .mb-rm-row > span:nth-child(2) { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 #minibia-bot-panel .mb-rm-row input[type=number], #minibia-bot-panel .mb-rm-add input { width:100%; min-width:0; box-sizing:border-box; }
@@ -61322,24 +61388,7 @@ function upgradeSectionHeaders(panel) {
 <!-- Training Tab -->
 <div class="mb-tab-panel" data-tab-panel="training">
 
-  <!-- ML Trainer -->
-  <div class="mb-section">
-    <div class="mb-section-title">
-      <input type="checkbox" id="minibia-bot-rune-enabled" class="mb-title-toggle" />
-      <span class="mb-title-text">✨ ML Trainer</span>
-    </div>
-    <div class="mb-form-grid">
-      <label class="mb-field">
-        <span class="mb-field-label">Spell name / words</span>
-        <input type="text" id="minibia-bot-rune-spell" list="minibia-bot-training-spell-choices" autocomplete="off" placeholder="Spell name or words" />
-        <datalist id="minibia-bot-training-spell-choices"></datalist>
-      </label>
-      <label class="mb-field">
-        <span class="mb-field-label">Mana Percent</span>
-        <input type="number" id="minibia-bot-rune-mana" min="0" max="100" placeholder="98" />
-      </label>
-    </div>
-  </div>
+  <div class="mb-section" data-mana-trainer-host></div>
 
   <div class="mb-section" data-runemaker-host></div>
 
@@ -63193,63 +63242,9 @@ function upgradeSectionHeaders(panel) {
             });
         }
 
-        // ---- Rune trainer ----
-        const runeEnabledInput = panel.querySelector("#minibia-bot-rune-enabled");
-        const runeSpellInput = panel.querySelector("#minibia-bot-rune-spell");
-        const runeManaInput = panel.querySelector("#minibia-bot-rune-mana");
-
+        // ---- Mana Trainer and Runemaker ----
+        bot.rune?.mount?.(panel);
         bot.runemaker?.mount?.(panel);
-        function refreshTrainingSpellChoices() {
-            const list = panel.querySelector("#minibia-bot-training-spell-choices");
-            if (!list) return;
-            list.replaceChildren();
-            for (const [, spell] of window.gameClient?.interface?.SPELLS || []) {
-                if (!spell?.words) continue;
-                const option = document.createElement("option");
-                option.value = spell.words;
-                option.label = `${spell.name || spell.words} (${Number(spell.mana) || 0} MP)`;
-                list.appendChild(option);
-            }
-        }
-        refreshTrainingSpellChoices();
-        if (runeSpellInput) {
-            runeSpellInput.addEventListener("focus", refreshTrainingSpellChoices);
-            runeSpellInput.value = bot.rune?.config?.runeSpellWords || "";
-            runeSpellInput.addEventListener("change", () => {
-                bot.rune.updateConfig({
-                    runeSpellWords: bot.heal?.resolveSpell?.(runeSpellInput.value.trim())?.words || runeSpellInput.value.trim()
-                });
-            });
-        }
-
-        if (runeManaInput) {
-            runeManaInput.value = String(bot.rune?.config?.runeManaCost ?? 0);
-            runeManaInput.addEventListener("change", () => {
-                const mana = Math.min(100, Math.max(0, Number(runeManaInput.value) || 0));
-                runeManaInput.value = String(mana);
-                bot.rune.updateConfig({
-                    runeManaCost: mana
-                });
-            });
-        }
-
-        if (runeEnabledInput) {
-            runeEnabledInput.checked = !!bot.rune?.status?.().running;
-            runeEnabledInput.addEventListener("change", function () {
-                const rawSpell = runeSpellInput?.value?.trim() || bot.rune.config.runeSpellWords;
-                const spell = bot.heal?.resolveSpell?.(rawSpell)?.words || rawSpell;
-                const mana = Math.min(100, Math.max(0, Number(runeManaInput?.value ?? bot.rune.config.runeManaCost) || 0));
-                if (this.checked) {
-                    bot.rune.start({
-                        runeSpellWords: spell,
-                        runeManaCost: mana
-                    });
-                } else {
-                    bot.rune.stop();
-                }
-                refreshRuneStatus();
-            });
-        }
 
         // ---- Set Home button ----
         const setHomeBtn = panel.querySelector("#minibia-bot-set-home");
