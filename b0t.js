@@ -4080,7 +4080,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.315",
+        version: "1.6.316",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -57798,14 +57798,25 @@ function upgradeSectionHeaders(panel) {
         }
         const cycleToggle=document.getElementById("minibia-bot-ring-cycle-enabled");
         if(cycleToggle)cycleToggle.checked=cycle.manaCycleEnabled===true;
+        const cycleOn=cycle.manaCycleEnabled===true;
+        const normalRow=document.getElementById("minibia-bot-ring-normal-row");
+        if(normalRow)normalRow.hidden=!cycleOn;
+        const lowField=document.getElementById("minibia-bot-ring-low-field");
+        if(lowField)lowField.hidden=!cycleOn;
+        const primaryLabel=document.getElementById("minibia-bot-ring-primary-label");
+        if(primaryLabel)primaryLabel.textContent=cycleOn?"Recovery":"Ring";
+        if(idInput)idInput.placeholder=cycleOn?"Ring ID":"Any ring";
         if(unequip98Toggle)unequip98Toggle.disabled=cycle.manaCycleEnabled===true;
         const cycleStatus=document.getElementById("minibia-bot-ring-cycle-status");
         if(cycleStatus){
             const defs=window.gameClient?.itemDefinitionsByCid || {};
             const ringName=id=>defs[id]?.properties?.name || (id?`Ring ${id}`:"Select ring");
-            cycleStatus.textContent=cycle.manaCycleEnabled
-                ? !(cycle.ringId && cycle.cycleRingId) ? "Select both rings to start the cycle."
-                : `${ringName(cycle.ringId)} ≤${cycle.cycleLow}% → ${ringName(cycle.cycleRingId)} ≥${cycle.cycleHigh}%` : "";
+            const incomplete=cycleOn && !(cycle.ringId && cycle.cycleRingId);
+            cycleStatus.hidden=!incomplete;
+            cycleStatus.textContent=incomplete?"Select both rings to start the cycle.":"";
+            if(idInput && cycle.ringId)idInput.title=ringName(cycle.ringId);
+            const normalInput=document.getElementById("minibia-bot-ring-cycle-id");
+            if(normalInput && cycle.cycleRingId)normalInput.title=ringName(cycle.cycleRingId);
         }
         const warnToggle = document.getElementById("minibia-bot-equip-ring-warn");
         if (warnToggle) warnToggle.checked = !!bot.equipRing?.config?.warnMissingRing;
@@ -59383,11 +59394,20 @@ function upgradeSectionHeaders(panel) {
 #minibia-bot-panel .mb-tools-options > summary,
 #minibia-bot-panel .mb-tools-more > summary {cursor:pointer;font-size:10px;line-height:1.6;color:var(--mb-hub-muted,#aaa);}
 #minibia-bot-panel .mb-tools-ring-options {display:flex;flex-direction:column;gap:3px;padding:5px 0 1px;}
-#minibia-bot-panel .mb-tools-cycle-grid {display:grid;grid-template-columns:1fr 1fr;gap:6px;min-width:0;}
-#minibia-bot-panel .mb-tools-cycle-grid label {min-width:0;font-size:10px;}
-#minibia-bot-panel .mb-tools-cycle-grid input {width:100%;box-sizing:border-box;min-width:0;}
-#minibia-bot-panel .mb-tools-cycle-row {display:grid;grid-template-columns:minmax(0,1fr) 26px;gap:4px;}
-#minibia-bot-panel .mb-tools-cycle-row input {width:100%;min-width:0;box-sizing:border-box;}
+#minibia-bot-panel .mb-tools-ring-control .mb-ring-mode {justify-self:end;font-size:10px;}
+#minibia-bot-panel .mb-ring-editor {grid-column:1/-1;min-width:0;display:flex;flex-direction:column;gap:5px;}
+#minibia-bot-panel .mb-ring-row {display:grid;grid-template-columns:62px minmax(50px,1fr) 26px 96px;align-items:center;gap:5px;min-width:0;}
+#minibia-bot-panel .mb-ring-row > label {font-size:10px;color:var(--mb-hub-text-2,#bdbdbd);}
+#minibia-bot-panel .mb-ring-row input {width:100%;min-width:0;box-sizing:border-box;text-align:center;}
+#minibia-bot-panel .mb-ring-threshold {display:flex;align-items:center;gap:4px;white-space:nowrap;}
+#minibia-bot-panel .mb-ring-threshold input {width:42px;}
+#minibia-bot-panel .mb-ring-row[hidden],#minibia-bot-panel .mb-ring-threshold[hidden],#minibia-bot-panel .mb-ring-status[hidden] {display:none!important;}
+#minibia-bot-panel .mb-ring-status {margin:0;font-size:10px;overflow-wrap:anywhere;}
+#minibia-bot-panel .mb-tools-ring-control > .mb-tools-options {grid-column:1/-1;}
+@container (max-width:340px) {
+ #minibia-bot-panel .mb-ring-row {grid-template-columns:52px minmax(40px,1fr) 26px 92px;gap:3px;}
+ #minibia-bot-panel .mb-tools-ring-control .mb-ring-mode {justify-self:start;}
+}
 #minibia-bot-panel .mb-tools-section .mb-tools-ring-options .mb-toggle {font-size:10px;}
 #minibia-bot-panel .mb-tools-more {border-top:1px solid rgba(255,255,255,.07);margin-top:2px;padding-top:7px;}
 #minibia-bot-panel .mb-tools-more > summary {font-size:11px;color:var(--mb-hub-text-2,#bdbdbd);}
@@ -60444,30 +60464,31 @@ function upgradeSectionHeaders(panel) {
         <span class="mb-tools-inline-status mb-small-note" id="minibia-bot-haste-status" aria-live="polite" hidden></span>
       </div>
 
-      <div class="mb-tools-control">
+      <div class="mb-tools-control mb-tools-ring-control">
         <div class="mb-tools-control-label">
           <label class="mb-toggle"><input type="checkbox" id="minibia-bot-equip-ring-enabled" /><span>Equip Ring</span></label>
           <span class="mb-tools-count" id="minibia-bot-equip-ring-count" title="Server inventory count"></span>
         </div>
-        <div class="mb-tools-value">
-          <input type="number" id="minibia-bot-equip-ring-id" min="0" max="65535" step="1" placeholder="Any ring" title="Ring item ID. Empty or 0 = any ring." aria-label="Ring item ID" />
-          <button type="button" class="mb-small-button mb-tools-picker" id="minibia-bot-equip-ring-select" title="Click, then click a ring in a backpack or equipment slot" aria-label="Select ring item ID" aria-pressed="false">🔍</button>
-        </div>
-        <details class="mb-tools-options">
-          <summary>Ring options</summary>
-          <div class="mb-tools-ring-options">
-            <label class="mb-toggle"><input type="checkbox" id="minibia-bot-ring-cycle-enabled"><span>Mana cycle</span></label>
-            <div class="mb-small-note">Recovery ring: select it above. Switch to it at the lower threshold and keep it until the upper threshold.</div>
-            <div class="mb-tools-cycle-grid">
-              <label class="mb-field"><span class="mb-field-label">Recovery at mana ≤ %</span><input type="number" id="minibia-bot-ring-cycle-low" min="0" max="99" value="20"></label>
-              <label class="mb-field"><span class="mb-field-label">Normal at mana ≥ %</span><input type="number" id="minibia-bot-ring-cycle-high" min="1" max="100" value="80"></label>
-            </div>
-            <div class="mb-tools-cycle-row"><input type="number" id="minibia-bot-ring-cycle-id" min="1" max="65535" placeholder="Normal ring ID" aria-label="Normal ring ID"><button type="button" class="mb-small-button mb-tools-picker" id="minibia-bot-ring-cycle-pick" title="Pick normal ring">🔍</button></div>
-            <div class="mb-small-note" id="minibia-bot-ring-cycle-status"></div>
-            <label class="mb-toggle" title="Safely stow the selected ring when mana is 98% or higher"><input type="checkbox" id="minibia-bot-equip-ring-unequip-98" /><span>Unequip at 98% mana</span></label>
-            <label class="mb-toggle" title="Alert when the server reports no matching ring in your inventory"><input type="checkbox" id="minibia-bot-equip-ring-warn" /><span>Alert missing ring</span></label>
+        <label class="mb-toggle mb-ring-mode"><input type="checkbox" id="minibia-bot-ring-cycle-enabled"><span>Mana cycle</span></label>
+        <div class="mb-ring-editor">
+          <div class="mb-ring-row">
+            <label id="minibia-bot-ring-primary-label" for="minibia-bot-equip-ring-id">Ring</label>
+            <input type="number" id="minibia-bot-equip-ring-id" min="0" max="65535" step="1" placeholder="Any ring" aria-label="Recovery ring ID">
+            <button type="button" class="mb-small-button mb-tools-picker" id="minibia-bot-equip-ring-select" title="Pick recovery ring" aria-label="Pick recovery ring" aria-pressed="false">🔍</button>
+            <label class="mb-ring-threshold" id="minibia-bot-ring-low-field" title="Switch to recovery ring when mana falls to this percentage" hidden><span>≤</span><input type="number" id="minibia-bot-ring-cycle-low" min="0" max="99" value="20" aria-label="Low mana threshold"><span>% MP</span></label>
           </div>
-        </details>
+          <div class="mb-ring-row" id="minibia-bot-ring-normal-row" hidden>
+            <label for="minibia-bot-ring-cycle-id">Normal</label>
+            <input type="number" id="minibia-bot-ring-cycle-id" min="1" max="65535" placeholder="Ring ID" aria-label="Normal ring ID">
+            <button type="button" class="mb-small-button mb-tools-picker" id="minibia-bot-ring-cycle-pick" title="Pick normal ring" aria-label="Pick normal ring">🔍</button>
+            <label class="mb-ring-threshold" title="Switch to normal ring when mana reaches this percentage"><span>≥</span><input type="number" id="minibia-bot-ring-cycle-high" min="1" max="100" value="80" aria-label="High mana threshold"><span>% MP</span></label>
+          </div>
+          <div class="mb-small-note mb-ring-status" id="minibia-bot-ring-cycle-status" hidden></div>
+        </div>
+        <details class="mb-tools-options"><summary>More options</summary><div class="mb-tools-ring-options">
+          <label class="mb-toggle" title="Safely stow the selected ring when mana is 98% or higher"><input type="checkbox" id="minibia-bot-equip-ring-unequip-98"><span>Unequip at 98% mana</span></label>
+          <label class="mb-toggle"><input type="checkbox" id="minibia-bot-equip-ring-warn"><span>Alert missing ring</span></label>
+        </div></details>
       </div>
 
       <div class="mb-tools-control">
