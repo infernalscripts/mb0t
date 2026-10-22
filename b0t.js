@@ -1075,7 +1075,12 @@ addCleanup(() => {
     function startCustomFollow(name, mode, options = {}, owner = null) {
         if (customFollowDestroyed)
             return false;
-        customFollowBot = owner || window.minibiaBot;
+        const followOwner=owner || window.minibiaBot;
+        // A panel refresh must not replace the continuous arrival task owned
+        // by a Cave Script (or cancel its 120ms continuation timer).
+        if (customFollowState.waitingForArrival && options.continuous===false &&
+            followOwner?.cave?.isWaypointScriptActive?.()) return true;
+        customFollowBot = followOwner;
         setCustomFollowDistance(options.distance ?? 1);
         mode = mode === "nonpvp" && window.gameClient?.__worldPvp === false ? "nonpvp" : "pvp";
         if (customFollowState.name !== name || customFollowState.mode !== mode) {
@@ -4075,7 +4080,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.310",
+        version: "1.6.315",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -16645,10 +16650,17 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         state.lureOffscreenPullRetryAfter=now+1500;
         const target=getEngagedTarget() || getKiteLureRetreatTarget();
         if (!target) return false;
-        const moved=sendManualTargetPursuitAutoWalk(from,{pathPositions:[next]},target,
+        const escapePath=[next];
+        if (!selected.diagonal && selected.room) {
+            const second={x:next.x+selected.dx,y:next.y+selected.dy,z:next.z};
+            if (isSafeTileForKite(second) && isTargetingStepPolicyAllowed(next,second) &&
+                !isKiteLureStepBlocked(next,second,now) && contacts(second)<=contacts(next) &&
+                hasKiteLureEscape(second,next,threats)) escapePath.push(second);
+        }
+        const moved=sendManualTargetPursuitAutoWalk(from,{pathPositions:escapePath},target,
             normalizePosition(target.getPosition?.() || target.__position),
             "Kite Lure: escaping pack pressure",now,
-            {owner:"kite",maxSteps:1,refreshOnDestinationChange:true});
+            {owner:"kite",maxSteps:escapePath.length,refreshOnDestinationChange:true});
         if (moved) {
             state.kiteLurePhase="escaping";
             state.kiteLastMoveDx=selected.dx;
@@ -16658,8 +16670,40 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         return moved;
     }
 
+    function getKiteLurePullRadius(now=Date.now()) {
+        // During an entry, do not hand movement back at the doorway merely
+        // because the mob is already inside the usual collection radius.
+        return config.kiteLureMode && state.kiteLureEntryUntil>now
+            ? 2 : Math.max(2,Math.min(5,Number(config.lureRadius)||5));
+    }
+
+    function tryKiteLureForwardEntry(from,now) {
+        const threats=getKiteRetreatThreats().filter(t=>t.z===from.z);
+        const adjacent=threats.filter(t=>getChebyshevDistance(from,t)<=1).length;
+        const close=threats.filter(t=>getChebyshevDistance(from,t)<=2).length;
+        const around=threats.filter(t=>getChebyshevDistance(from,t)<=3).length;
+        if (adjacent>1 || close>2 || around>3) { state.kiteLureEntryUntil=0; return false; }
+        const continuing=state.kiteLureEntryUntil>now;
+        if (!continuing && close<2) return false;
+        const caveRunning=bot.cave?.isRunning?.()===true;
+        const waypoint=caveRunning?bot.cave?.getCurrentWaypoint?.():{...from};
+        if (!isPlainLurePullWaypoint(waypoint)) return false;
+        const visibleMonsters=getLureVisibleMonsters().filter(m=>!isIgnoredTargetCreature(m));
+        const threshold=Math.max(1,Math.min(20,Number(config.lureMobThreshold)||3));
+        if (visibleMonsters.length>=threshold) { state.kiteLureEntryUntil=0; return false; }
+        if (!getActiveLureOffscreenPullTarget() && !getLureOffscreenPullCandidates(now).length) return false;
+        if (!continuing) state.kiteLureEntryUntil=now+4000;
+        if (!syncLureOffscreenPull({active:true,threshold,visibleMonsters,waypoint},now)) {
+            state.kiteLureEntryUntil=0;
+            return false;
+        }
+        state.kiteLurePhase="entering";
+        return true;
+    }
+
     function syncKiteLurePull(now = Date.now()) {
         if (!config.kiteLureMode || !state.running || !config.enabled) {
+            state.kiteLureEntryUntil=0;
             if (state.kiteLurePhase) { clearLureOffscreenPull("Kite Lure ended",{quiet:true}); state.kiteLurePhase = null; }
             return false;
         }
@@ -16681,11 +16725,12 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             return syncKite(now);
         }
         bot.cave?.passivelyAdvanceLureWaypoints?.(from,now);
-        if (tryKiteLureEmergencyEscape(now)) return true;
         const hp = current?.state?.health ?? current?.health;
         if (current && ((hp != null && Number(hp) <= 0) || !isTargetPolicyReachable(current,"combat",now) || releaseTargetForAntiKS(current,now))) {
             clearLureOffscreenPull("combat target needs revalidation",{quiet:true}); return false;
         }
+        if (tryKiteLureForwardEntry(from,now)) return true;
+        if (tryKiteLureEmergencyEscape(now)) return true;
         // Attack-through continues during collection; movement is controlled
         // below and never becomes melee chase while gathering.
         if(current && state.fleeingTarget?.target === current){
@@ -16954,7 +16999,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
     // Find a loaded corridor around the first pack, rather than finding a
     // direct route through it and only discovering the collision at send time.
-    function findKiteLureForwardRoute(from, goal) {
+    function findKiteLureForwardRoute(from, goal, allowDiagonal = false) {
         if (!from || !goal || from.z !== goal.z) return null;
         const startDistance = getKiteDistance(from,goal);
         const queue = [{pos:from,parent:-1,depth:0}];
@@ -16969,12 +17014,13 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             if (distance<bestDistance) { best=cursor; bestDistance=distance; }
             // Being close through a wall is not an approach. A completed
             // route must expose the mob through the real projectile geometry.
-            if (distance<=Math.max(2,Math.min(5,Number(config.lureRadius)||5)) &&
+            if (distance<=getKiteLurePullRadius() &&
                 getTargetLineOfSightInfo(sightTarget,node.pos).clear) {
                 best=cursor; reached=true; break;
             }
-            if (node.depth>=16) continue;
+            if (node.depth>=24) continue;
             for (const [dx,dy] of [[0,-1],[1,0],[0,1],[-1,0],[-1,-1],[1,-1],[-1,1],[1,1]]) {
+                if (dx && dy && !allowDiagonal) continue;
                 const pos={x:node.pos.x+dx,y:node.pos.y+dy,z:from.z};
                 const key=getKitePositionKey(pos);
                 if (seen.has(key) || isKiteLureStepBlocked(node.pos,pos) || getChebyshevDistance(from,pos)>12) continue;
@@ -16991,8 +17037,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         }
         // A loaded, sealed target is not a frontier. Do not repeatedly walk
         // up to its wall. Unknown map edges can still be approached cautiously.
-        if (goalLoaded && !reached) return null;
-        if (!best || (!reached && bestDistance>=startDistance-0.5)) return null;
+        if ((goalLoaded && !reached) || !best || (!reached && bestDistance>=startDistance-0.5))
+            return allowDiagonal ? null : findKiteLureForwardRoute(from,goal,true);
         const pathPositions=[];
         for (let at=best;queue[at].parent>=0;at=queue[at].parent) pathPositions.push(queue[at].pos);
         pathPositions.reverse();
@@ -17110,9 +17156,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             3,
             Math.min(20, Math.trunc(Number(config.lureOffscreenPullRange) || 10))
         );
-        const lureRadius = Math.max(
-            1,
-            Math.min(8, Math.trunc(Number(config.lureRadius) || 5))
+        const lureRadius = config.kiteLureMode ? getKiteLurePullRadius(now) : Math.max(
+            1,Math.min(8,Math.trunc(Number(config.lureRadius)||5))
         );
         const distance = getTileDistance(playerPos, targetPos);
 
@@ -17338,6 +17383,17 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
         const firstPullBatch =
             state.lureOffscreenPullLastMoveAt <= 0;
+        let pullBatchSteps=config.kiteLureMode ? 2 : visibleCount>0 ? 3 : 5;
+        if (config.kiteLureMode && route.pathPositions.length) {
+            let previous=playerPos,axis=null,straight=0;
+            for(const step of route.pathPositions.slice(0,4)) {
+                const dx=step.x-previous.x,dy=step.y-previous.y;
+                const direction=`${dx},${dy}`;
+                if ((dx && dy) || (axis && axis!==direction)) break;
+                axis=direction;straight++;previous=step;
+            }
+            if (straight>=2) pullBatchSteps=straight;
+        }
 
         const moved = sendManualTargetPursuitAutoWalk(
             playerPos,
@@ -17351,7 +17407,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 // Keep a live pack a little more conservative, but still send
                 // enough directions for smooth server AutoWalk. With no pack
                 // yet, use the same longer travel batch as Off-screen Hunt.
-                maxSteps: config.kiteLureMode ? 2 : visibleCount > 0 ? 3 : 5,
+                maxSteps: pullBatchSteps,
                 // Do not rebuild merely because our own position changed and
                 // therefore the next short batch destination changed. A moved
                 // monster still refreshes immediately through targetPosKey.
@@ -31262,36 +31318,30 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             waypoint.ladder !== true;
     }
 
-    // Lure detours may pass beside several Walk nodes while Targeting owns
-    // movement. Consume only a bounded, contiguous stretch in route order.
+    // Lure movement completes only the current Walk node at the normal
+    // Skip SQM tolerance, then advances once in the configured route order.
     function passivelyAdvanceLureWaypoints(position, now = Date.now()) {
         if (!state.running || !position || route.length<=1 ||
             [...state.externalPauseReasons].some(reason=>reason!=="offscreen-lure-pull")) return 0;
         if (observeTargetingOwnedRelocation(position,now)) return 0;
-        const direction=config.loopMode ? 1 : state.direction;
-        const tolerance=Math.max(2,Math.min(5,Number(config.waypointTolerance)||0));
-        let bestOffset=-1, bestDistance=Infinity;
-        let index=state.currentIndex;
-        for (let offset=0;offset<Math.min(12,route.length-1);offset++,index+=direction) {
-            // Do not wrap/reverse the route speculatively during a lure.
-            if (index<0 || index>=route.length) break;
-            const wp=route[index];
-            if (!isPassiveChaseAdvanceWaypoint(wp) || Number(wp.z)!==Number(position.z)) break;
-            const distance=getDistance(position,wp);
-            if (distance<=tolerance && distance<bestDistance) {
-                bestOffset=offset; bestDistance=distance;
-            }
-        }
-        if (bestOffset<0) return 0;
+        // A nearby later node can be the other side of a loop or a return
+        // leg. It does not prove the CURRENT waypoint has been passed.
+        const sampleKey=`${state.routeRevision}:${getPositionKey(position)}`;
+        if (state.lurePassiveSampleKey===sampleKey) return 0;
+        state.lurePassiveSampleKey=sampleKey;
+        const waypoint=getCurrentWaypoint();
+        if (!isPassiveChaseAdvanceWaypoint(waypoint) ||
+            Number(waypoint.z)!==Number(position.z) || !isAtWaypoint(position,waypoint)) return 0;
         const oldIndex=state.currentIndex;
-        for (let n=0;n<=bestOffset;n++) advanceWaypoint();
+        advanceWaypoint();
+        if (state.currentIndex===oldIndex) return 0;
         resetWaypointProgressTracking(getCurrentWaypoint(),position,now);
         state.lastPositionKey=getPositionKey(position);
         state.stuckCount=0;
         state.stuckRecoveryAttempts=0;
-        noteIntentionalLureNavigation("passed Walk waypoints while luring",now);
-        bot.log(`Cave: lure passed Walk waypoints #${oldIndex+1} – continuing at #${state.currentIndex+1}`);
-        return bestOffset+1;
+        noteIntentionalLureNavigation("reached current Walk waypoint while luring",now);
+        bot.log(`Cave: lure reached Walk waypoint #${oldIndex+1} – continuing at #${state.currentIndex+1}`);
+        return 1;
     }
 
     function passivelyAdvanceChaseWaypoints(
@@ -39862,11 +39912,19 @@ window.__minibiaBotBundle.installEquipRingModule = function installEquipRingModu
         ringId: 0,              // Client/inventory ID (CID); 0 = any ring.
         unequipRingAt98: false, // When enabled, stow the selected ring at >=98% mana.
         warnMissingRing: false, // Optional, throttled warning.
+        manaCycleEnabled: false,
+        cycleRingId: 0,
+        cycleLow: 20,
+        cycleHigh: 80,
         enabled: false,
     }, bot.storage.get(configStorageKey, {}));
 
     function normalizeConfig() {
         config.tickMs = 1000;
+        config.manaCycleEnabled=config.manaCycleEnabled===true;
+        config.cycleRingId=Number.isSafeInteger(Number(config.cycleRingId)) && Number(config.cycleRingId)>0 && Number(config.cycleRingId)<=65535 ? Number(config.cycleRingId) : 0;
+        config.cycleLow=Math.max(0,Math.min(99,Number.isFinite(Number(config.cycleLow))?Number(config.cycleLow):20));
+        config.cycleHigh=Math.max(config.cycleLow+1,Math.min(100,Number.isFinite(Number(config.cycleHigh))?Number(config.cycleHigh):80));
         config.ringId = Number.isSafeInteger(Number(config.ringId)) && Number(config.ringId) > 0
             && Number(config.ringId) <= 65535 ? Number(config.ringId) : 0;
         config.equipCooldownMs = Math.max(1000, Math.min(60000, Number(config.equipCooldownMs) || 1500));
@@ -39892,10 +39950,25 @@ window.__minibiaBotBundle.installEquipRingModule = function installEquipRingModu
     }
     function shouldUnequipForMana() {
         const manaPercent = getManaPercent();
-        return config.unequipRingAt98 === true && Number.isFinite(manaPercent) && manaPercent >= 98;
+        return (!config.manaCycleEnabled && config.unequipRingAt98 === true) && Number.isFinite(manaPercent) && manaPercent >= 98;
     }
 
-    function getConfiguredRingSid(ringId = config.ringId) {
+    function getDesiredRingId() { return config.manaCycleEnabled ? (state.desiredRingId ?? config.ringId) : config.ringId; }
+    function updateManaCycle() {
+        if (!config.manaCycleEnabled) { state.cyclePhase=null;state.desiredRingId=null;return; }
+        const mana=getManaPercent();
+        if (!Number.isFinite(mana)) return;
+        let phase=state.cyclePhase;
+        if (!phase) phase=mana<=config.cycleLow ? "recovery" : mana>=config.cycleHigh ? "normal"
+            : matchesSelectedRing(getEquippedRing(),config.ringId) ? "recovery" : "normal";
+        if (phase==="normal" && mana<=config.cycleLow) phase="recovery";
+        else if (phase==="recovery" && mana>=config.cycleHigh) phase="normal";
+        const id=phase==="recovery" ? config.ringId : config.cycleRingId;
+        if (state.desiredRingId!==id) { state.lastCountRequestAt=0;state.retryAfter=0; }
+        state.desiredRingId=id;state.cyclePhase=phase;
+    }
+
+    function getConfiguredRingSid(ringId = getDesiredRingId()) {
         if (!ringId) return 0;
         const sid = Number(window.gameClient?.sidByCid?.[ringId]);
         return Number.isSafeInteger(sid) && sid > 0 ? sid : 0;
@@ -39911,16 +39984,16 @@ window.__minibiaBotBundle.installEquipRingModule = function installEquipRingModu
         };
     }
     function requestSelectedRingCount(now = Date.now(), force = false) {
-        if (!config.ringId || typeof bot.requestItemCounts !== "function") return false;
+        if (!getDesiredRingId() || typeof bot.requestItemCounts !== "function") return false;
         if (!force && now - state.lastCountRequestAt < config.countRefreshMs) return false;
         state.lastCountRequestAt = now;
-        return !!bot.requestItemCounts([{ id: config.ringId, fluidType: 0 }]);
+        return !!bot.requestItemCounts([{ id: getDesiredRingId(), fluidType: 0 }]);
     }
     function getSelectedRingCountState(now = Date.now()) {
-        if (!config.ringId || typeof bot.getItemCountReading !== "function") {
+        if (!getDesiredRingId() || typeof bot.getItemCountReading !== "function") {
             return { known: false, fresh: false, count: null, at: 0 };
         }
-        const reading = bot.getItemCountReading(config.ringId, 0);
+        const reading = bot.getItemCountReading(getDesiredRingId(), 0);
         if (!reading) return { known: false, fresh: false, count: null, at: 0 };
         const age = Math.max(0, now - Number(reading.at || 0));
         return {
@@ -39935,8 +40008,8 @@ window.__minibiaBotBundle.installEquipRingModule = function installEquipRingModu
     // Keep this inside the Equip Ring module so the subscription exists whenever
     // the module exists, regardless of whether Alert missing ring is enabled.
     function handleItemCountUpdate(reading) {
-        if (!reading || !config.ringId) return;
-        if (Number(reading.itemId) !== Number(config.ringId)) return;
+        if (!reading || !getDesiredRingId()) return;
+        if (Number(reading.itemId) !== Number(getDesiredRingId())) return;
         if (Math.max(0, Math.trunc(Number(reading.fluidType) || 0)) !== 0) return;
 
         if (typeof bot.ui?.refreshEquipRingStatus === "function") {
@@ -39969,7 +40042,7 @@ window.__minibiaBotBundle.installEquipRingModule = function installEquipRingModu
         const slot = String(def?.properties?.slotType || def?.properties?.slot || "").trim().toLowerCase();
         return slot === "ring" || /\bring\b/i.test(getItemName(item));
     }
-    function matchesSelectedRing(item, wantedId = config.ringId) {
+    function matchesSelectedRing(item, wantedId = getDesiredRingId()) {
         if (!item) return false;
         if (!wantedId) return isRingItem(item);
         if (Number(item.id) === wantedId) return isRingItem(item);
@@ -39981,7 +40054,7 @@ window.__minibiaBotBundle.installEquipRingModule = function installEquipRingModu
         return !!dormant && Number(dormant.id) === wantedId && isRingItem(item);
     }
     function ringSatisfied(worn) {
-        return config.ringId ? matchesSelectedRing(worn) : !!worn;
+        return getDesiredRingId() ? matchesSelectedRing(worn) : !!worn;
     }
     function findBestRingSource() {
         const eq = getEquipment();
@@ -39996,7 +40069,7 @@ window.__minibiaBotBundle.installEquipRingModule = function installEquipRingModu
             for (let i = 0; i < countSlots; i++) {
                 const item = container.getSlotItem(i);
                 if (!item || !isRingItem(item)) continue;
-                if (config.ringId && Number(item.id) !== config.ringId) continue;
+                if (getDesiredRingId() && Number(item.id) !== getDesiredRingId()) continue;
                 const count = (typeof item.getCount === "function" ? item.getCount() : item.count) || 1;
                 if (count > bestCount) {
                     bestCount = count;
@@ -40043,7 +40116,8 @@ window.__minibiaBotBundle.installEquipRingModule = function installEquipRingModu
         refreshCaptureUi();
     }
 
-    function startCaptureRing() {
+    function startCaptureRing(field = "ringId") {
+        const captureKey=field==="cycleRingId" ? "cycleRingId" : "ringId";
         bot.itemDropper?.cancelCapture?.();
         if (state.captureMode) {
             clearCaptureMode();
@@ -40112,7 +40186,7 @@ window.__minibiaBotBundle.installEquipRingModule = function installEquipRingModu
             }
 
             const visibleId = Number(item.id || 0);
-            updateConfig({ ringId: capturedId });
+            updateConfig({ [captureKey]: capturedId });
             requestSelectedRingCount(Date.now(), true);
             bot.log("Equip Ring: captured ring ID", {
                 ringId: capturedId,
@@ -40134,6 +40208,7 @@ window.__minibiaBotBundle.installEquipRingModule = function installEquipRingModu
         const player = window.gameClient?.player || null;
         const eq = player?.equipment || null;
         if (state.player !== player || state.equipment !== eq) {
+            state.cyclePhase=null;state.desiredRingId=null;
             state.player = player;
             state.equipment = eq;
             state.pending = null;
@@ -40202,10 +40277,10 @@ window.__minibiaBotBundle.installEquipRingModule = function installEquipRingModu
         if (!config.warnMissingRing || now - state.lastSupplyWarningAt < 60000) return;
         // For a configured ring, only call it missing when the SERVER has
         // recently confirmed a zero count. This includes closed/nested bags.
-        if (config.ringId) {
+        if (getDesiredRingId()) {
             if (!countState?.fresh || countState.count !== 0) return;
             state.lastSupplyWarningAt = now;
-            bot.log("Equip Ring: server item count is 0", { ringId: config.ringId });
+            bot.log("Equip Ring: server item count is 0", { ringId: getDesiredRingId() });
             return;
         }
         state.lastSupplyWarningAt = now;
@@ -40213,6 +40288,7 @@ window.__minibiaBotBundle.installEquipRingModule = function installEquipRingModu
     }
     function getGateStatus(now = Date.now()) {
         const eq = syncSession();
+        updateManaCycle();
         reconcilePending(now);
         const worn = getEquippedRing();
         const satisfied = ringSatisfied(worn);
@@ -40225,7 +40301,7 @@ window.__minibiaBotBundle.installEquipRingModule = function installEquipRingModu
         // ring is already equipped. The UI count should describe supply state,
         // not only whether Equip Ring currently needs to act. Requests remain
         // rate-limited by requestSelectedRingCount().
-        if (config.ringId) {
+        if (getDesiredRingId()) {
             requestSelectedRingCount(now);
             countState = getSelectedRingCountState(now);
         }
@@ -40234,7 +40310,7 @@ window.__minibiaBotBundle.installEquipRingModule = function installEquipRingModu
         }
 
         const manaPercent = getManaPercent();
-        const unequipForMana = config.unequipRingAt98 === true &&
+        const unequipForMana = (!config.manaCycleEnabled && config.unequipRingAt98 === true) &&
             Number.isFinite(manaPercent) && manaPercent >= 98;
 
         const remaining = Math.max(0,
@@ -40244,11 +40320,14 @@ window.__minibiaBotBundle.installEquipRingModule = function installEquipRingModu
         // the ring exists somewhere in the full inventory, including closed
         // backpacks. Unknown/stale counts do not block the HotbarManager from
         // trying its own server-side fallback.
-        const available = config.ringId
+        const available = getDesiredRingId()
             ? !(countState.fresh && countState.count === 0)
             : !!source;
 
         return {
+            cyclePhase:state.cyclePhase || null,
+            desiredRingId:getDesiredRingId(),
+            cycleReady:!config.manaCycleEnabled || !!(config.ringId && config.cycleRingId),
             hasEquipment: !!eq,
             hasRingEquipped: !!worn,
             hasSelectedRingEquipped: satisfied,
@@ -40258,12 +40337,12 @@ window.__minibiaBotBundle.installEquipRingModule = function installEquipRingModu
             serverCount: countState.count,
             awaitingConfirmation: pending,
             manaPercent,
-            unequipRingAt98: config.unequipRingAt98 === true,
+            unequipRingAt98: (!config.manaCycleEnabled && config.unequipRingAt98 === true),
             shouldUnequipForMana: unequipForMana,
             cooldownReady: remaining === 0,
             cooldownRemainingMs: remaining,
             source,
-            canEquip: !!eq && !unequipForMana && !satisfied && !pending && available && remaining === 0,
+            canEquip: (!config.manaCycleEnabled || (Number.isFinite(manaPercent) && !!(config.ringId && config.cycleRingId))) && !!eq && !unequipForMana && !satisfied && !pending && available && remaining === 0,
             canUnequip: !!eq && unequipForMana && satisfied && !pending && remaining === 0,
         };
     }
@@ -40294,7 +40373,7 @@ window.__minibiaBotBundle.installEquipRingModule = function installEquipRingModu
         // SERVER can find the ring in closed/nested inventory. For "any ring"
         // we still need a locally visible source to know which CID to request.
         const source = gate.source;
-        const requestedId = config.ringId || Number(source?.item?.id || 0);
+        const requestedId = getDesiredRingId() || Number(source?.item?.id || 0);
         const itemConfig = getRingItemConfig(requestedId, source?.item || null);
         if (!itemConfig) return false;
 
@@ -40310,7 +40389,7 @@ window.__minibiaBotBundle.installEquipRingModule = function installEquipRingModu
         state.pending = {
             type: "equip",
             at: now,
-            ringId: config.ringId,
+            ringId: getDesiredRingId(),
             sourceId: itemConfig.id,
             name: source?.name || getItemDefinition({ id: itemConfig.id, sid: itemConfig.sid })?.properties?.name || "ring",
             previousWorn,
@@ -40344,7 +40423,7 @@ window.__minibiaBotBundle.installEquipRingModule = function installEquipRingModu
         // Ring hotbar toggle useMode=5 lets the SERVER stow the worn ring into
         // any available inventory backpack, including closed/nested bags. This
         // is safer than picking an arbitrary visible destination slot here.
-        const requestedId = config.ringId || getCapturedRingId(worn) || Number(worn.id || 0);
+        const requestedId = getDesiredRingId() || getCapturedRingId(worn) || Number(worn.id || 0);
         const itemConfig = getRingItemConfig(requestedId, worn);
         if (!itemConfig) return false;
 
@@ -40359,7 +40438,7 @@ window.__minibiaBotBundle.installEquipRingModule = function installEquipRingModu
         state.pending = {
             type: "unequip",
             at: now,
-            ringId: config.ringId,
+            ringId: getDesiredRingId(),
             sourceId: itemConfig.id,
             name: getItemName(worn) || getItemDefinition({ id: itemConfig.id, sid: itemConfig.sid })?.properties?.name || "ring",
             previousWorn: worn,
@@ -40442,7 +40521,7 @@ window.__minibiaBotBundle.installEquipRingModule = function installEquipRingModu
         bot.clientEvents?.ensureBound();
         attachRingEvents();
         requestSelectedRingCount(Date.now(), true);
-        bot.log("Equip Ring started", { ringId: config.ringId || "any" });
+        bot.log("Equip Ring started", { ringId: getDesiredRingId() || "any" });
         tick();
         return true;
     }
@@ -40474,13 +40553,18 @@ window.__minibiaBotBundle.installEquipRingModule = function installEquipRingModu
             lastConfirmedAt: state.lastConfirmedAt,
             failedAttempts: state.failedAttempts,
             selectingRing: state.captureMode,
+            cyclePhase:state.cyclePhase,
+            selectedRingId:getDesiredRingId(),
         };
     }
     function updateConfig(nextConfig = {}) {
         const oldId = config.ringId;
+        const oldCycle=JSON.stringify([config.manaCycleEnabled,config.cycleRingId,config.cycleLow,config.cycleHigh]);
         Object.assign(config, nextConfig);
         normalizeConfig();
-        if (config.ringId !== oldId) {
+        if (config.ringId !== oldId || oldCycle!==JSON.stringify([config.manaCycleEnabled,config.cycleRingId,config.cycleLow,config.cycleHigh])) {
+            state.cyclePhase=null;
+            state.desiredRingId=null;
             state.pending = null;
             state.lastActionAt = 0;
             state.lastEquipAt = 0;
@@ -57693,7 +57777,7 @@ function upgradeSectionHeaders(panel) {
         }
         const countLabel = document.getElementById("minibia-bot-equip-ring-count");
         if (countLabel) {
-            const ringId = Number(bot.equipRing?.config?.ringId || 0);
+            const ringId = Number(status?.selectedRingId || bot.equipRing?.config?.ringId || 0);
             if (!ringId) {
                 countLabel.textContent = "";
                 countLabel.title = "Set a ring ID to use the server-side item count.";
@@ -57707,6 +57791,22 @@ function upgradeSectionHeaders(panel) {
         }
         const unequip98Toggle = document.getElementById("minibia-bot-equip-ring-unequip-98");
         if (unequip98Toggle) unequip98Toggle.checked = !!bot.equipRing?.config?.unequipRingAt98;
+        const cycle=bot.equipRing?.config || {};
+        for(const [suffix,key] of [["low","cycleLow"],["high","cycleHigh"],["id","cycleRingId"]]){
+            const input=document.getElementById(`minibia-bot-ring-cycle-${suffix}`);
+            if(input && document.activeElement!==input)input.value=cycle[key] || (suffix==="id"?"":0);
+        }
+        const cycleToggle=document.getElementById("minibia-bot-ring-cycle-enabled");
+        if(cycleToggle)cycleToggle.checked=cycle.manaCycleEnabled===true;
+        if(unequip98Toggle)unequip98Toggle.disabled=cycle.manaCycleEnabled===true;
+        const cycleStatus=document.getElementById("minibia-bot-ring-cycle-status");
+        if(cycleStatus){
+            const defs=window.gameClient?.itemDefinitionsByCid || {};
+            const ringName=id=>defs[id]?.properties?.name || (id?`Ring ${id}`:"Select ring");
+            cycleStatus.textContent=cycle.manaCycleEnabled
+                ? !(cycle.ringId && cycle.cycleRingId) ? "Select both rings to start the cycle."
+                : `${ringName(cycle.ringId)} ≤${cycle.cycleLow}% → ${ringName(cycle.cycleRingId)} ≥${cycle.cycleHigh}%` : "";
+        }
         const warnToggle = document.getElementById("minibia-bot-equip-ring-warn");
         if (warnToggle) warnToggle.checked = !!bot.equipRing?.config?.warnMissingRing;
     }
@@ -59283,6 +59383,11 @@ function upgradeSectionHeaders(panel) {
 #minibia-bot-panel .mb-tools-options > summary,
 #minibia-bot-panel .mb-tools-more > summary {cursor:pointer;font-size:10px;line-height:1.6;color:var(--mb-hub-muted,#aaa);}
 #minibia-bot-panel .mb-tools-ring-options {display:flex;flex-direction:column;gap:3px;padding:5px 0 1px;}
+#minibia-bot-panel .mb-tools-cycle-grid {display:grid;grid-template-columns:1fr 1fr;gap:6px;min-width:0;}
+#minibia-bot-panel .mb-tools-cycle-grid label {min-width:0;font-size:10px;}
+#minibia-bot-panel .mb-tools-cycle-grid input {width:100%;box-sizing:border-box;min-width:0;}
+#minibia-bot-panel .mb-tools-cycle-row {display:grid;grid-template-columns:minmax(0,1fr) 26px;gap:4px;}
+#minibia-bot-panel .mb-tools-cycle-row input {width:100%;min-width:0;box-sizing:border-box;}
 #minibia-bot-panel .mb-tools-section .mb-tools-ring-options .mb-toggle {font-size:10px;}
 #minibia-bot-panel .mb-tools-more {border-top:1px solid rgba(255,255,255,.07);margin-top:2px;padding-top:7px;}
 #minibia-bot-panel .mb-tools-more > summary {font-size:11px;color:var(--mb-hub-text-2,#bdbdbd);}
@@ -60351,6 +60456,14 @@ function upgradeSectionHeaders(panel) {
         <details class="mb-tools-options">
           <summary>Ring options</summary>
           <div class="mb-tools-ring-options">
+            <label class="mb-toggle"><input type="checkbox" id="minibia-bot-ring-cycle-enabled"><span>Mana cycle</span></label>
+            <div class="mb-small-note">Recovery ring: select it above. Switch to it at the lower threshold and keep it until the upper threshold.</div>
+            <div class="mb-tools-cycle-grid">
+              <label class="mb-field"><span class="mb-field-label">Recovery at mana ≤ %</span><input type="number" id="minibia-bot-ring-cycle-low" min="0" max="99" value="20"></label>
+              <label class="mb-field"><span class="mb-field-label">Normal at mana ≥ %</span><input type="number" id="minibia-bot-ring-cycle-high" min="1" max="100" value="80"></label>
+            </div>
+            <div class="mb-tools-cycle-row"><input type="number" id="minibia-bot-ring-cycle-id" min="1" max="65535" placeholder="Normal ring ID" aria-label="Normal ring ID"><button type="button" class="mb-small-button mb-tools-picker" id="minibia-bot-ring-cycle-pick" title="Pick normal ring">🔍</button></div>
+            <div class="mb-small-note" id="minibia-bot-ring-cycle-status"></div>
             <label class="mb-toggle" title="Safely stow the selected ring when mana is 98% or higher"><input type="checkbox" id="minibia-bot-equip-ring-unequip-98" /><span>Unequip at 98% mana</span></label>
             <label class="mb-toggle" title="Alert when the server reports no matching ring in your inventory"><input type="checkbox" id="minibia-bot-equip-ring-warn" /><span>Alert missing ring</span></label>
           </div>
@@ -61806,6 +61919,14 @@ function upgradeSectionHeaders(panel) {
                 refreshBootsSwapperStatus();
             });
         }
+        for (const [id,key] of [["enabled","manaCycleEnabled"],["low","cycleLow"],["high","cycleHigh"],["id","cycleRingId"]]) {
+            const input=panel.querySelector(`#minibia-bot-ring-cycle-${id}`);
+            if (!input) continue;
+            if (id==="enabled") input.checked=bot.equipRing?.config?.[key]===true;
+            else input.value=bot.equipRing?.config?.[key] || (id==="id"?"":0);
+            input.addEventListener("change",()=>{bot.equipRing?.updateConfig?.({[key]:id==="enabled"?input.checked:Number(input.value)});refreshEquipRingStatus();});
+        }
+        panel.querySelector("#minibia-bot-ring-cycle-pick")?.addEventListener("click",()=>bot.equipRing?.startCaptureRing?.("cycleRingId"));
         if (equipRingWarn) {
             equipRingWarn.checked = !!bot.equipRing?.config?.warnMissingRing;
             equipRingWarn.addEventListener("change", function () {
@@ -62198,6 +62319,10 @@ function upgradeSectionHeaders(panel) {
                 followStatus.textContent="Picking up priority item…";return;
             }
             const status=bot.followStatus?.();
+            if (followEnabled && status?.waitingForArrival && followStatus) {
+                followStatus.textContent="Paused for CaveBot follow…";
+                return;
+            }
             const transitionReason=status?.waitReason || status?.transitionReason;
             if (followEnabled && transitionReason && followStatus) {
                 followStatus.textContent=transitionReason;
@@ -62243,7 +62368,7 @@ function upgradeSectionHeaders(panel) {
             }
 
             followEnabled = false;
-            bot.stopFollow(reason);
+            if (!bot.followStatus?.().waitingForArrival) bot.stopFollow(reason);
             refreshFollowStatus();
 
             localStorage.setItem(
@@ -62304,12 +62429,6 @@ function upgradeSectionHeaders(panel) {
             );
             localStorage.setItem("minibiaBot.follow.floors",JSON.stringify(getFollowFloors()));
             localStorage.setItem("minibiaBot.follow.distance",JSON.stringify(getFollowDistance()));
-            bot.setFollowDistance?.(getFollowDistance());
-            bot.setFollowFloors?.(getFollowFloors());
-            bot.setFollowDuringTarget?.(
-                getFollowDuringTarget()
-            );
-
             function isLeaderAlive(targetName) {
                 const active=window.gameClient?.world?.activeCreatures;
                 if (!active) return null;
@@ -62321,6 +62440,13 @@ function upgradeSectionHeaders(panel) {
                 }
                 return null; // Missing is temporary: keep enabled and reacquire.
             }
+
+            if (!bot.followStatus?.().waitingForArrival) {
+            bot.setFollowDistance?.(getFollowDistance());
+            bot.setFollowFloors?.(getFollowFloors());
+            bot.setFollowDuringTarget?.(
+                getFollowDuringTarget()
+            );
 
             // First custom A* + AutoWalk attempt immediately. No native
             // FollowPacket is used to start or maintain PvP-tab Auto Follow.
@@ -62336,11 +62462,17 @@ function upgradeSectionHeaders(panel) {
                 }
             );
 
+            }
+
             followInterval =
                 setInterval(
                     () => {
                         if (!followEnabled)
                             return;
+                        if (bot.followStatus?.().waitingForArrival) {
+                            refreshFollowStatus();
+                            return;
+                        }
 
                         if (
                             isLeaderAlive(name)===false
