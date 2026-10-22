@@ -4080,7 +4080,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.324",
+        version: "1.6.325",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -41105,6 +41105,7 @@ window.__minibiaBotBundle.installAutoEatModule = function installAutoEatModule(b
         food: cleanItem(saved?.food),
     };
     const state = { running: false, timerId: null, lastFoodAt: null, client: null, player: null, reason: "Off", errorAt: null };
+    let lastReportedBlock=null;
     let disposed = false, controls = null, capturing = false, captureTimer = null;
     // Import an existing food binding once; subsequent uses never depend on a slot.
     let legacySlot = saved?.food === undefined && Number.isInteger(Number(saved?.eatHotbarSlot)) && Number(saved.eatHotbarSlot) >= 1 && Number(saved.eatHotbarSlot) <= 12 ? Number(saved.eatHotbarSlot) : null;
@@ -41159,10 +41160,15 @@ window.__minibiaBotBundle.installAutoEatModule = function installAutoEatModule(b
         try {
             const skillWin = window.gameClient?.interface?.windowManager?.getWindow?.("skill-window");
             if (skillWin) {
+                // The native client updates this field from FOOD_TIMER packets,
+                // including while the displayed skill row is hidden or absent.
+                if (Number.isFinite(skillWin.__foodTimerSeconds) && skillWin.__foodTimerSeconds >= 0) {
+                    return { source: 'skillWin.__foodTimerSeconds', seconds: skillWin.__foodTimerSeconds };
+                }
                 // Method
                 if (typeof skillWin.getFoodTimer === 'function') {
                     const val = skillWin.getFoodTimer();
-                    if (typeof val === 'number' && val >= 0) {
+                    if (Number.isFinite(val) && val >= 0) {
                         return {
                             source: 'skillWin.getFoodTimer()',
                             seconds: val
@@ -41209,13 +41215,6 @@ window.__minibiaBotBundle.installAutoEatModule = function installAutoEatModule(b
         const food = readFoodTimer();
         if (food && food.seconds !== undefined && food.seconds !== null) {
             const sated = food.seconds > 0;
-            // Log once per minute if we are using a non‑zero timer to see what's happening
-            if (sated && food.seconds < 30) {
-                // If timer says we have less than 30 seconds, we should be considered hungry,
-                // but the bot may not eat because it thinks we are sated. We'll force hunger
-                // if the timer is < 30 seconds to trigger eating earlier.
-                // Actually, we want to eat when timer is 0, not before. So keep as is.
-            }
             return sated;
         }
 
@@ -41248,6 +41247,7 @@ window.__minibiaBotBundle.installAutoEatModule = function installAutoEatModule(b
         if (state.lastFoodAt !== null && Date.now() - state.lastFoodAt < config.eatCooldownMs) return waiting("Waiting for food timer");
         const hm = client.interface?.hotbarManager;
         if (typeof hm?.__handleItemUseWithMode !== "function" || typeof hm.__findItemInInventory !== "function") return waiting("Waiting for hotbar");
+        state.reason = "Waiting for action";
         const sent = bot.actions?.runShared?.("auto-eat", bot.actions.priorities.UTILITY, () => {
             // Recheck after acquiring the shared action budget.
             if (disposed || !state.running || !config.enabled || window.gameClient !== client || client.player !== player ||
@@ -41269,7 +41269,7 @@ window.__minibiaBotBundle.installAutoEatModule = function installAutoEatModule(b
         }) === true;
         if (sent) {
             state.lastFoodAt = Date.now(); state.reason = "Waiting for food timer";
-            bot.log("Eat: used food", { name: food.name, sid: food.sid, cid: food.id });
+            bot.log("Eat: requested food", { name: food.name, sid: food.sid, cid: food.id });
         } else if (!state.reason.startsWith("Open the bag") && state.reason !== "Waiting for character") state.reason = "Waiting for action";
         return sent;
     }
@@ -41280,8 +41280,8 @@ window.__minibiaBotBundle.installAutoEatModule = function installAutoEatModule(b
         if (force || document.activeElement !== controls.item) controls.item.value = food?.name || (food ? String(food.sid) : "");
         controls.item.title = food ? `${food.name || "Food"} · SID ${food.sid} · CID ${food.id}` : "Enter a food SID or CID, or use the picker";
         controls.pick.setAttribute("aria-pressed", String(capturing));
-        if (!capturing && !controls.error) controls.status.textContent = state.reason;
-        controls.status.hidden = !capturing && !controls.error && (!state.running || ["Ready", "Food active", "Waiting for food timer"].includes(state.reason));
+        if (!capturing && !controls.error) controls.status.textContent = state.reason === "Food active" ? `Food active · ${readFoodTimer()?.seconds ?? "?"}s remaining` : state.reason;
+        controls.status.hidden = !capturing && !controls.error && (!state.running || ["Ready", "Waiting for food timer"].includes(state.reason));
     }
     function cancelCapture() {
         capturing = false;
@@ -41322,6 +41322,16 @@ window.__minibiaBotBundle.installAutoEatModule = function installAutoEatModule(b
         captureTimer = window.setTimeout(() => { cancelCapture(); render(); }, 20000);
         render(); return true;
     }
+    function reportBlockedReason() {
+        if (!state.running || state.reason === lastReportedBlock) return;
+        lastReportedBlock = state.reason;
+        bot.log("Eat: " + state.reason, {
+            food: currentFood()?.name || config.food?.name || null,
+            sid: config.food?.sid || null,
+            foodTimer: readFoodTimer(),
+            cooldownRemainingMs: state.lastFoodAt === null ? 0 : Math.max(0, config.eatCooldownMs - (Date.now() - state.lastFoodAt)),
+        });
+    }
     function tick() {
         state.timerId = null;
         if (disposed || !state.running) return;
@@ -41332,6 +41342,7 @@ window.__minibiaBotBundle.installAutoEatModule = function installAutoEatModule(b
                 state.errorAt = Date.now(); bot.log("Eat: " + (error?.message || error));
             }
         }
+        reportBlockedReason();
         render();
         if (!disposed && state.running) state.timerId = window.setTimeout(tick, config.tickMs);
     }
@@ -41339,6 +41350,7 @@ window.__minibiaBotBundle.installAutoEatModule = function installAutoEatModule(b
         if (disposed) return false;
         updateConfig(overrides); config.enabled = true; persistConfig();
         if (state.running) return false;
+        lastReportedBlock = null;
         state.running = true; tick(); return true;
     }
     function stop(options = {}) {
