@@ -4103,7 +4103,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.326",
+        version: "1.6.327",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -9971,7 +9971,7 @@ window.__minibiaBotBundle.installCombatRulesModule = function(bot) {
         return bot.attack?.updateConfig?.(patch);
     }
     function syncActions() {
-        const running = bot.attack?.isRunning?.() === true;
+        const running = bot.attack?.isRunning?.() === true && !bot.attack?.isKnightBoxSuppressed?.();
         const needsRunes = running && config.rules.some(r => r.enabled && r.rune);
         const worker = bot.runeShooter;
         if (needsRunes && worker && !worker.status?.().running) worker.start();
@@ -9981,7 +9981,7 @@ window.__minibiaBotBundle.installCombatRulesModule = function(bot) {
         if (bot.exori?.status?.().running) bot.exori.stop({ persistEnabled: false });
     }
     function targetingStatus() {
-        const running = bot.attack?.isRunning?.() === true;
+        const running = bot.attack?.isRunning?.() === true && !bot.attack?.isKnightBoxSuppressed?.();
         const current = bot.attack?.getCurrentTarget?.();
         const rule = running ? activeTargetRule() : null;
         const index = rule ? config.rules.indexOf(rule) : -1;
@@ -10063,6 +10063,7 @@ window.__minibiaBotBundle.installCombatRulesModule = function(bot) {
     }
     function exoriRule(list){return config.enabled?config.rules.find(r=>r.spellWords.toLowerCase()==='exori'&&meetsCount(r,list))||null:null;}
     function trySpellRules() {
+        if(bot.attack?.isKnightBoxSuppressed?.())return false;
         const block=reason=>{spellState.blockedReason=reason;return false;};
         const client=window.gameClient, now=Date.now();
         if(!config.enabled||!bot.attack?.isRunning?.()||bot.actions?.isHalted?.()||!client?.networkManager?.isConnected?.())return block('inactive');
@@ -11630,10 +11631,11 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         invalidateCandidateSnapshot();
     }
 
-    function probeIgnoredTrapEscape(from) {
+    function probeIgnoredTrapEscape(from, allMonsters = false) {
+        const removableCreature=c=>allMonsters || isConfiguredIgnoredCreature(c);
         const client = window.gameClient, active = client?.world?.activeCreatures || {};
         const creatures = active instanceof Map ? [...active.values()] : Object.values(active);
-        if (!creatures.some(c => isConfiguredIgnoredCreature(c) && isNativeVisibleMonster(c, true) &&
+        if (!creatures.some(c => removableCreature(c) && isNativeVisibleMonster(c, true) &&
             getChebyshevDistance(from, c.getPosition?.() || c.__position) <= 1)) return null;
         const key = p => `${p.x},${p.y}`;
         const occupants = new Map();
@@ -11649,7 +11651,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         const wp = bot.cave?.isRunning?.() && !bot.cave?.isMovementPaused?.() ? bot.cave?.getCurrentWaypoint?.() : null;
         const goal = wp && !wp.script && !wp.rope && !wp.shovel && !wp.ladder && Number(wp.z) === from.z &&
             Math.max(Math.abs(wp.x-from.x),Math.abs(wp.y-from.y)) <= 5 ? normalizePosition(wp) : null;
-        const tolerance = wp?.stand ? 0 : Math.max(0, Number(bot.cave?.config?.waypointTolerance) || 0);
+        const tolerance = wp?.knightBox ? 1 : wp?.stand ? 0 : Math.max(0, Number(bot.cave?.config?.waypointTolerance) || 0);
         const atGoal = p => goal && getChebyshevDistance(p, goal) <= tolerance;
         const cache = new Map();
         function step(fromPos, to, removeIgnored) {
@@ -11666,7 +11668,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                     const pos = normalizePosition(c?.getPosition?.() || c?.__position);
                     if (pos && key(pos) === k && pos.z === to.z && !list.some(other => other.id === c.id) && !(Number(c.state?.health ?? c.health) <= 0)) list.push(c);
                 }
-                const ignored = list.filter(c => isConfiguredIgnoredCreature(c) && isNativeVisibleMonster(c, true));
+                const ignored = list.filter(c => removableCreature(c) && isNativeVisibleMonster(c, true));
                 const remaining = list.filter(c => !ignored.includes(c));
                 const removable = blocked && ignored.length > 0 && canTargetPassThroughCreatures(tile, remaining);
                 // Prefer the same blocker while it still seals the route.
@@ -11757,6 +11759,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function isIgnoredTargetCreature(creature) {
+        const knight=state.knightBoxPolicy;
+        if(knight?.active&&knight.blockerId!=null)return creature?.id!==knight.blockerId;
         const exception = config.attackIgnoredWhenTrapped === true && state.running && config.enabled &&
             state.ignoredTrap?.targetId != null && creature?.id === state.ignoredTrap.targetId;
         return !exception && isConfiguredIgnoredCreature(creature);
@@ -14207,7 +14211,29 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         return moved;
     }
 
+    function setKnightBoxGate(policy) {
+        state.knightBoxPolicy=policy?.active?policy:null;
+        if(!policy?.active||policy.targeting){state.knightBoxHeld=false;return;}
+        if(!state.knightBoxHeld||getCurrentTarget()){
+            clearIgnoredTrapEscape('Knight Box travel');clearCombatRuleMode();
+            clearOffscreenHunt('Knight Box travel',{quiet:true});clearLureOffscreenPull('Knight Box travel',{quiet:true});
+            clearLureState('Knight Box travel',Date.now());
+            stopKiteAutoWalk('Knight Box travel');stopManualTargetPursuitAutoWalk('Knight Box travel');
+            setClientChaseMode(0);state._chaseEnabledForDistance=false;clearCurrentTarget();clearEngagedTarget();clearCurrentFollowTarget();
+            state.movementOwner=null;state.movementOwnedUntil=0;state.knightBoxHeld=true;
+        }
+        bot.combatRules?.syncActions?.();
+    }
+    function isKnightBoxSuppressed(){return !!state.knightBoxPolicy?.active&&!state.knightBoxPolicy.targeting;}
+
     function tryAttack() {
+        setKnightBoxGate(bot.cave?.getKnightBoxPolicy?.());
+        if(isKnightBoxSuppressed())return false;
+        const knightBlocker=state.knightBoxPolicy?.blockerId;
+        if(knightBlocker!=null){
+            const blocker=Object.values(window.gameClient?.world?.activeCreatures||{}).find(c=>c.id===knightBlocker);
+            if(blocker&&getCurrentTarget()?.id!==knightBlocker)setCurrentTarget(blocker);
+        }
         if (bot.pauseHotkey?.isPaused?.()) return false;
         applyCombatRuleMode();
         const decision=withTargetingSnapshot(tryAttackDecision);
@@ -25902,6 +25928,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             return getTargetLineOfSightInfo({ getPosition: () => position }).clear === true;
         },
         getLureVisibleMonsterSnapshot,
+        setKnightBoxGate,
+        isKnightBoxSuppressed,
+        probeKnightBoxBlocker: from => probeIgnoredTrapEscape(from,true),
+        getKnightBoxMonsters: () => Object.values(window.gameClient?.world?.activeCreatures||{}).filter(c=>isNativeVisibleMonster(c,true)&&!isConfiguredIgnoredCreature(c)),
         getCurrentTarget,
         getCurrentFollowTarget,
         isRunning: () => state.running,
@@ -28030,6 +28060,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             waypoint.y !== null &&
             !waypoint.script &&
             !waypoint.stand &&
+            !waypoint.knightBox &&
             !waypoint.rope &&
             !waypoint.shovel &&
             !waypoint.ladder;
@@ -30567,7 +30598,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         stand,
         rope,
         shovel,
-        ladder;
+        ladder,
+        knightBox;
         if (Array.isArray(waypoint)) {
             [x, y, z] = waypoint;
             stand = rope = shovel = ladder = false;
@@ -30594,6 +30626,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             rope = waypoint.rope === true;
             shovel = waypoint.shovel === true;
             ladder = waypoint.ladder === true;
+            knightBox = waypoint.knightBox === true;
         }
         const hasCoords = Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z);
         const hasScript = script !== undefined && script.length > 0;
@@ -30609,6 +30642,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             rope: !!rope,
             shovel: !!shovel,
             ladder: !!ladder,
+            knightBox: !!knightBox,
         };
     }
 
@@ -31534,7 +31568,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         const d = getDistanceToWaypoint(position, waypoint);
         if (!Number.isFinite(d))
             return false;
-        return d <= Math.max(0, Number(config.waypointTolerance) || 0);
+        return d <= (waypoint?.knightBox ? 1 : Math.max(0, Number(config.waypointTolerance) || 0));
     }
 
     // v1.6.39: while Targeting owns movement, CaveBot may passively complete
@@ -31548,6 +31582,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             Number.isFinite(Number(waypoint.z)) &&
             !waypoint.script &&
             waypoint.stand !== true &&
+            waypoint.knightBox !== true &&
             waypoint.rope !== true &&
             waypoint.shovel !== true &&
             waypoint.ladder !== true;
@@ -32797,7 +32832,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     function recoverStalledCaveWalk(waypoint, position, now = Date.now()) {
         const watch = state.frontierMotionWatch;
         if (!watch) return false;
-        if (!waypoint || waypoint.script || waypoint.stand || waypoint.rope || waypoint.shovel || waypoint.ladder || watch.index !== state.currentIndex ||
+        if (!waypoint || waypoint.script || waypoint.knightBox || waypoint.stand || waypoint.rope || waypoint.shovel || waypoint.ladder || watch.index !== state.currentIndex ||
             watch.revision !== state.routeRevision || isSameTile(position, waypoint) ||
             watch.pf !== window.gameClient?.world?.pathfinder || watch.pf.__finalDestination != null) {
             state.frontierMotionWatch = null;
@@ -33107,7 +33142,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             return true;
         if (Number(from.z) !== Number(waypoint.z)) return false;
 
-        const isSpecialWaypoint = !!(waypoint.stand || waypoint.rope || waypoint.shovel || waypoint.ladder || waypoint.script);
+        const isSpecialWaypoint = !!(waypoint.knightBox || waypoint.stand || waypoint.rope || waypoint.shovel || waypoint.ladder || waypoint.script);
         if (!isSpecialWaypoint && isCaveSingleStepPending(waypoint)) return true;
         if (!isSpecialWaypoint &&
             bot.specialAreas?.hasActiveAreasForFloor?.(from.z, { purpose: "route" })) {
@@ -36007,6 +36042,55 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
      * logic that waits for pathfinder to give up (__finalDestination === null)
      * and for a time threshold before skipping.
      */
+    const knightBoxState={active:false,targeting:false,phase:'off',index:null,quietAt:null,positionKey:null,positionAt:0,probeAt:0,blockerId:null};
+    function getKnightBoxPolicy(){return state.running&&route.some(w=>w.knightBox)?{...knightBoxState}:null;}
+    function publishKnightBox(){bot.attack?.setKnightBoxGate?.(getKnightBoxPolicy());}
+    function syncKnightBox(position,now=Date.now()) {
+        if(!state.running||!route.some(w=>w.knightBox)) {knightBoxState.active=false;publishKnightBox();return false;}
+        knightBoxState.active=true;
+        const wp=getCurrentWaypoint(),key=getPositionKey(position);
+        if(knightBoxState.positionKey!==key){knightBoxState.positionKey=key;knightBoxState.positionAt=now;if(knightBoxState.phase!=='fight')knightBoxState.blockerId=null;}
+        if(knightBoxState.index!==state.currentIndex){knightBoxState.index=state.currentIndex;knightBoxState.phase='travel';knightBoxState.quietAt=null;knightBoxState.blockerId=null;}
+        const near=wp?.knightBox&&!wp.script&&Number(wp.z)===position.z&&Math.max(Math.abs(wp.x-position.x),Math.abs(wp.y-position.y))<=1;
+        if(near&&knightBoxState.phase!=='fight'){
+            knightBoxState.phase='fight';knightBoxState.quietAt=null;knightBoxState.blockerId=null;
+            stopCaveMovementNow();bot.log(`Cave: Knight Box #${state.currentIndex+1} — fighting`);
+        }
+        if(knightBoxState.phase==='fight'){
+            knightBoxState.targeting=true;publishKnightBox();
+            if(!bot.attack?.isRunning?.())bot.attack?.start?.();
+            const monsters=bot.attack?.getKnightBoxMonsters?.()||[];
+            if(monsters.length||bot.attack?.isCombatActive?.())knightBoxState.quietAt=null;
+            else if(knightBoxState.quietAt===null)knightBoxState.quietAt=now;
+            if(knightBoxState.quietAt!==null&&now-knightBoxState.quietAt>=1000){
+                const completed=state.currentIndex;advanceWaypoint();knightBoxState.index=state.currentIndex;
+                knightBoxState.phase='travel';knightBoxState.targeting=false;knightBoxState.quietAt=null;
+                knightBoxState.positionAt=now;publishKnightBox();
+                resetWaypointProgressTracking(getCurrentWaypoint(),position,now);state.lastPathAt=0;state.pausedForCombat=false;
+                bot.log(`Cave: Knight Box #${completed+1} cleared — continuing at #${state.currentIndex+1}`);
+            } else {
+                resetWaypointProgressTracking(wp,position,now);state.lastPositionKey=key;state.stuckCount=0;
+            }
+            return true;
+        }
+        // Prove a creature obstruction using the existing bounded two-pass
+        // trap probe: live geometry first, then the same route without monsters.
+        if(now-knightBoxState.positionAt>=1500&&now-knightBoxState.probeAt>=500&&!isMovementPausedExternally()&&!wp?.script){
+            knightBoxState.probeAt=now;
+            const probe=bot.attack?.probeKnightBoxBlocker?.(position);
+            const id=probe?.target?.id??null;
+            if(id!==knightBoxState.blockerId&&id!==null)bot.log('Cave: Knight Box — clearing travel blocker',{id,name:probe.target.name});
+            knightBoxState.blockerId=id;
+        }
+        knightBoxState.targeting=knightBoxState.blockerId!==null;
+        knightBoxState.phase=knightBoxState.targeting?'blocker':'travel';publishKnightBox();
+        if(knightBoxState.targeting){
+            stopCaveMovementNow();if(!bot.attack?.isRunning?.())bot.attack?.start?.();
+            resetWaypointProgressTracking(wp,position,now);state.lastPositionKey=key;state.stuckCount=0;return true;
+        }
+        return false;
+    }
+
     function tick() {
         if (!state.running)
             return;
@@ -36248,6 +36332,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             }
         }
 
+        if(syncKnightBox(livePosition,Date.now())){scheduleNextTick();return;}
         const shouldPause = hasValidTarget();
         if (shouldPause) {
             // v1.6.38: Targeting-owned movement is intentional navigation.
@@ -39137,6 +39222,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         state.recoveryDestinationWatch=null;
         state.autoTransitionAttempt=null;
         state.running = false;
+        knightBoxState.active=false;knightBoxState.index=null;knightBoxState.phase='off';knightBoxState.blockerId=null;
+        bot.attack?.setKnightBoxGate?.(null);
         detachCaveEvents();
         bot.stopScriptFollowForCaveNavigation?.();
         clearScriptTask("CaveBot stopped");
@@ -40013,6 +40100,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         getPresetNames,
         getActivePresetName,
         getCurrentWaypoint,
+        getKnightBoxPolicy,
         passivelyAdvanceLureWaypoints,
         getLureBlockerId,
         getLureBlockedCreatureIds,
@@ -58292,6 +58380,7 @@ function upgradeSectionHeaders(panel) {
             if (!displayText) {
                 displayText = "Script";
             }
+            if (wp.knightBox) displayText = "⚔ Knight Box · " + displayText;
             if (wp.stand) {
                 displayText = "📍 " + displayText;
             }
@@ -60992,6 +61081,7 @@ function upgradeSectionHeaders(panel) {
     </div>
     <div class="mb-cave-add-grid">
       <button type="button" class="mb-small-button" id="minibia-bot-cave-add-script">+ Script</button>
+      <button type="button" class="mb-small-button" id="minibia-bot-cave-add-knight-box" title="Travel with Targeting held; fight within 1 tile. Clear monsters if trapped.">+ Knight Box</button>
       <button type="button" class="mb-small-button" id="minibia-bot-cave-add-use" title="Add an item-use waypoint">+ Use</button>
       <button type="button" class="mb-small-button" id="minibia-bot-cave-move-up" title="Move selected waypoint up" aria-label="Move selected waypoint up">▲</button>
       <button type="button" class="mb-small-button" id="minibia-bot-cave-move-down" title="Move selected waypoint down" aria-label="Move selected waypoint down">▼</button>
@@ -65281,13 +65371,14 @@ function upgradeSectionHeaders(panel) {
                 stand: "Stand",
                 rope: "Rope",
                 shovel: "Shovel",
+                knightbox: "Knight Box",
                 ladder: "Ladder"
             };
             const waypoint = { x, y, z };
 
             if (Object.prototype.hasOwnProperty.call(labels, kind)) {
                 waypoint.label = labels[kind];
-                waypoint[kind] = true;
+                waypoint[kind === "knightbox" ? "knightBox" : kind] = true;
             }
 
             const route = bot.cave.getRoute();
@@ -65309,6 +65400,7 @@ function upgradeSectionHeaders(panel) {
             bot.log(`${labels[kind] || "Walk"} waypoint added at #${insertIndex + 1} (${x}, ${y}, ${z}).`);
         }
 
+        panel.querySelector("#minibia-bot-cave-add-knight-box")?.addEventListener("click", () => addDirectionalCaveWaypoint("knightbox"));
         addBtn?.addEventListener("click", () => addDirectionalCaveWaypoint("walk"));
         addStandBtn?.addEventListener("click", () => addDirectionalCaveWaypoint("stand"));
         addRopeBtn?.addEventListener("click", () => addDirectionalCaveWaypoint("rope"));
