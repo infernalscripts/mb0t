@@ -4103,7 +4103,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.330",
+        version: "1.6.361",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -7844,6 +7844,22 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         getTrustedNames,
         getGameMasterNames,
         playGenericBeepBloop,
+        testAudio: (name, notification = null) => {
+            const sounds={targetDeath:playTargetDeathBeep,lowHealth:playLowHealthBeep,manaFull:playManaFullBeep,
+                noTarget:playNoTargetBeep,itemLow:playItemLowBeep,lowCap:playItemLowBeep,alpha:playAlphaMonsterBeep,generic:playGenericBeepBloop,
+                player:()=>bot.playPlayerAlarm?.(),playerAttack:()=>bot.playPlayerAttackAlarm?.(),message:()=>bot.playMessageAlarm?.(),
+                gm:()=>bot.playGMAlarm?.(),antibot:()=>bot.playAntiBotAlarm?.(),alarm:()=>bot.playAlarm?.()};
+            const play=sounds[name];if(typeof play!=='function')return false;play();
+            const notices={
+                targetDeath:["TARGET DEATH","audio-target-death"],lowHealth:["LOW HEALTH","audio-low-health"],
+                manaFull:["MANA FULL","audio-mana-full"],noTarget:["NO TARGET","audio-no-target"],
+                lowCap:["LOW CAPACITY","audio-low-capacity"],itemLow:["ITEM COUNT ALERT","audio-item-test"],
+                alpha:["ALPHA MONSTER","audio-alpha-monster"],generic:["ANTI-BOT CREATURE","audio-creature"],
+            };
+            const notice=notices[name];
+            if(notice)showAudioAlertNotification(notification?.title||notice[0],notification?.message||"Sound test",notification?.type||notice[1]);
+            return true;
+        },
         getVisibleAlphaMonsters,
         config,
         cancelRestart: function () {
@@ -8032,9 +8048,9 @@ window.__minibiaBotBundle.installPlayerAttackMonitorModule = function installPla
  *    food are sufficient, respecting cooldowns.
  * ==================================================================================
  */
-window.__minibiaBotBundle.installRunemakerModule = function installRunemakerModule(bot) {
-    const key="minibiaBot.runemaker.config";
-    const config={enabled:false,rules:[],...bot.storage.get(key,{})};
+window.__minibiaBotBundle.installRunemakerModule = function installRunemakerModule(bot, options = {}) {
+    const key=options.storageKey||"minibiaBot.runemaker.config";
+    const config={enabled:false,rules:[],...options.initialConfig,...bot.storage.get(key,{})};
     const state={running:false,timer:null,lastCastAt:0,lastRequestAt:0,pending:null,player:null,sessionAt:0,retryAt:0,reason:"Off"};
     let editingSpellId=null;
     let disposed=false,host=null,rows=new Map(),select=null,quantity=null,enabled=null,statusLabel=null;
@@ -8044,7 +8060,7 @@ window.__minibiaBotBundle.installRunemakerModule = function installRunemakerModu
     function catalogue(){
         const spells=window.gameClient?.interface?.SPELLS;
         if(!spells?.[Symbol.iterator])return [];
-        return Array.from(spells).filter(([,s])=>s?.runeId && s.words && /\brune\b/i.test(s.description||s.name||"")).map(([sid,s])=>({...s,sid:Number(sid),itemId:Number(s.runeId),mana:Number(s.mana)||0})).sort((a,b)=>a.name.localeCompare(b.name));
+        return Array.from(spells).filter(([argumentsSid,s])=>s?.runeId && s.words && (options.spellIds?options.spellIds.includes(Number(argumentsSid)): /\brune\b/i.test(s.description||s.name||""))).map(([sid,s])=>({...s,sid:Number(sid),itemId:Number(s.runeId),mana:Number(s.mana)||0})).sort((a,b)=>options.spellIds?options.spellIds.indexOf(a.sid)-options.spellIds.indexOf(b.sid):a.name.localeCompare(b.name));
     }
     function syncSession(now){const player=window.gameClient?.player;if(state.player!==player){state.player=player;state.sessionAt=now;state.pending=null;state.lastRequestAt=0;state.retryAt=0;state.lastCastAt=0;}return player;}
     function reading(spell,now){const r=bot.getItemCountReading?.(spell.itemId,0);return r&&Number.isFinite(Number(r.count))&&Number(r.at)>=state.sessionAt&&now-Number(r.at)<=12000?{count:Math.max(0,Number(r.count)),at:Number(r.at)}:null;}
@@ -8072,11 +8088,11 @@ window.__minibiaBotBundle.installRunemakerModule = function installRunemakerModu
         if(state.pending){
             const pending=state.pending,r=reading(pending.spell,now);
             if(r&&r.at>=pending.at&&r.count>pending.before)state.pending=null;
-            else if(now-pending.at<6000){state.reason="Waiting for rune count update";return false;}
-            else{state.pending=null;state.retryAt=now+10000;state.reason="No rune count increase; retrying later";return false;}
+            else if(now-pending.at<6000){state.reason="Waiting for item count update";return false;}
+            else{state.pending=null;state.retryAt=now+10000;state.reason="No item count increase; retrying later";return false;}
         }
         const missing=deficits(now);
-        if(!missing.length){state.reason=config.rules.some(r=>r.enabled)?"Stock complete":"Add a rune below";return false;}
+        if(!missing.length){state.reason=config.rules.some(r=>r.enabled)?"Stock complete":"Add a rule";return false;}
         const row=missing.find(r=>permitted(r,now));
         if(!row){state.reason=missing.some(r=>!r.count)?"Waiting for server counts":"Waiting for mana, soul or spell readiness";return false;}
         let sent=false;
@@ -8094,7 +8110,7 @@ window.__minibiaBotBundle.installRunemakerModule = function installRunemakerModu
         const now=Date.now(),all=catalogue();
         for(const [id,label]of rows){const spell=all.find(s=>s.sid===id),r=spell?reading(spell,now):null;label.textContent=r?String(r.count):"?";}
     }
-    function tick(){state.timer=null;if(!state.running||disposed)return;try{attempt();}catch(e){state.reason="Runemaker waiting";bot.log("Runemaker tick failed",e?.message||e);}finally{updateStatus();if(state.running&&!disposed)state.timer=window.setTimeout(tick,250);}}
+    function tick(){state.timer=null;if(!state.running||disposed)return;try{attempt();}catch(e){state.reason="Runemaker waiting";bot.log(`${options.title||"Rune Crafter"} tick failed`,e?.message||e);}finally{updateStatus();if(state.running&&!disposed)state.timer=window.setTimeout(tick,250);}}
     function start(){if(disposed)return false;config.enabled=true;persist();if(state.running)return false;state.running=true;state.reason="Checking rune stock";tick();return true;}
     function stop(options={}){state.running=false;if(state.timer!==null)window.clearTimeout(state.timer);state.timer=null;state.pending=null;state.reason="Off";if(options.persistEnabled!==false){config.enabled=false;persist();}updateStatus();}
     function updateConfig(next={}){Object.assign(config,next);normalize();persist();if(state.running)refreshCounts(Date.now(),true);render();return config;}
@@ -8108,22 +8124,25 @@ window.__minibiaBotBundle.installRunemakerModule = function installRunemakerModu
             const count=document.createElement('span');count.className='mb-tools-count';rows.set(rule.spellId,count);
             const target=document.createElement('span');target.textContent=String(rule.count);target.className='mb-rm-target';
             const actions=document.createElement('div');actions.className='mb-rm-actions';
-            const edit=document.createElement('button');edit.type='button';edit.className='mb-small-button';edit.textContent='Edit';edit.title='Edit rune';edit.addEventListener('click',()=>{editingSpellId=rule.spellId;fillSelect();select.value=String(rule.spellId);quantity.value=String(rule.count);host.querySelector('.mb-rm-add').hidden=false;host.querySelector('[data-rm-add]').textContent='Save';select.focus();});
-            const remove=document.createElement('button');remove.type='button';remove.className='mb-small-button';remove.textContent='×';remove.title='Remove rune';remove.addEventListener('click',()=>{if(editingSpellId===rule.spellId)closeEditor();updateConfig({rules:config.rules.filter(r=>r.spellId!==rule.spellId)});});
+            const edit=document.createElement('button');edit.type='button';edit.className='mb-small-button';edit.textContent='Edit';edit.title='Edit rule';edit.addEventListener('click',()=>{editingSpellId=rule.spellId;fillSelect();select.value=String(rule.spellId);quantity.value=String(rule.count);host.querySelector('.mb-rm-add').hidden=false;host.querySelector('[data-rm-add]').textContent='Save';select.focus();});
+            const remove=document.createElement('button');remove.type='button';remove.className='mb-small-button';remove.textContent='×';remove.title='Remove rule';remove.addEventListener('click',()=>{if(editingSpellId===rule.spellId)closeEditor();updateConfig({rules:config.rules.filter(r=>r.spellId!==rule.spellId)});});
             actions.append(edit,remove);row.append(on,name,count,target,actions);list.appendChild(row);
         }
         fillSelect();updateStatus();
     }
     function closeEditor(){editingSpellId=null;if(host)host.querySelector('.mb-rm-add').hidden=true;}
-    function mount(panel){host=panel.querySelector('[data-runemaker-host]');if(!host)return;
-        host.innerHTML=`<div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-rm-enabled><span class="mb-title-text">Runemaker</span><button type="button" class="mb-small-button" data-rm-new>+ Rule</button></div><div class="mb-rm-row mb-rm-columns" aria-hidden="true"><span></span><span>Rune</span><span>Current</span><span>Target</span><span></span></div><div data-stock-runes></div><div class="mb-rm-add" hidden><label class="mb-field"><span class="mb-field-label">Rune</span><select aria-label="Rune type" data-rm-type></select></label><label class="mb-field"><span class="mb-field-label">Target count</span><input type="number" min="1" max="100000" value="100" aria-label="Rune target count" data-rm-count></label><div class="mb-rm-editor-actions"><button type="button" class="mb-small-button" data-rm-add>Add rule</button><button type="button" class="mb-small-button" data-rm-cancel>Cancel</button></div></div><div class="mb-small-note" data-rm-status></div>`;
+    function mount(panel){host=panel.querySelector(options.host||'[data-runemaker-host]');if(!host)return;
+        host.innerHTML=`<div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-rm-enabled><span class="mb-title-text">Rune Crafter</span><button type="button" class="mb-small-button" data-rm-new>+ Rule</button></div><div class="mb-rm-row mb-rm-columns" aria-hidden="true"><span></span><span>Rune</span><span>Current</span><span>Target</span><span></span></div><div data-stock-runes></div><div class="mb-rm-add" hidden><label class="mb-field"><span class="mb-field-label">Rune</span><select aria-label="Rune type" data-rm-type></select></label><label class="mb-field"><span class="mb-field-label">Target count</span><input type="number" min="1" max="100000" value="100" aria-label="Rune target count" data-rm-count></label><div class="mb-rm-editor-actions"><button type="button" class="mb-small-button" data-rm-add>Add rule</button><button type="button" class="mb-small-button" data-rm-cancel>Cancel</button></div></div><div class="mb-small-note" data-rm-status></div>`;
+        host.querySelector('.mb-title-text').textContent=options.title||'Rune Crafter';
+        if(options.itemLabel){host.querySelector('.mb-rm-columns > span:nth-child(2)').textContent=options.itemLabel;host.querySelector('.mb-rm-add .mb-field-label').textContent=options.itemLabel;host.querySelector('[data-rm-type]').setAttribute('aria-label',options.itemLabel+' spell');}
+        if(options.enabledId)host.querySelector('[data-rm-enabled]').id=options.enabledId;
         enabled=host.querySelector('[data-rm-enabled]');select=host.querySelector('[data-rm-type]');quantity=host.querySelector('[data-rm-count]');statusLabel=host.querySelector('[data-rm-status]');
         enabled.addEventListener('change',()=>enabled.checked?start():stop());select.addEventListener('focus',fillSelect);
         host.querySelector('[data-rm-new]').addEventListener('click',()=>{editingSpellId=null;fillSelect();quantity.value='100';host.querySelector('[data-rm-add]').textContent='Add rule';host.querySelector('.mb-rm-add').hidden=false;select.focus();});
         host.querySelector('[data-rm-cancel]').addEventListener('click',closeEditor);
         host.querySelector('[data-rm-add]').addEventListener('click',()=>{const id=Number(select.value);if(!catalogue().some(s=>s.sid===id))return;const previous=config.rules.find(r=>r.spellId===editingSpellId);const rule={spellId:id,count:Number(quantity.value),enabled:previous?.enabled!==false};let rules=[...config.rules];if(editingSpellId!==null){const index=rules.findIndex(r=>r.spellId===editingSpellId);rules=rules.filter(r=>r.spellId!==id||r.spellId===editingSpellId);const at=rules.findIndex(r=>r.spellId===editingSpellId);if(at>=0)rules[at]=rule;else rules.splice(Math.max(0,index),0,rule);}else{rules=rules.filter(r=>r.spellId!==id);rules.push(rule);}closeEditor();updateConfig({rules});});render();
     }
-    bot.runemaker={config,start,stop,updateConfig,mount,catalogue,needsMana,attempt,status:()=>({running:state.running,reason:state.reason,pending:!!state.pending})};
+    bot[options.moduleName||"runemaker"]={config,start,stop,updateConfig,mount,catalogue,needsMana,attempt,status:()=>({running:state.running,reason:state.reason,pending:!!state.pending})};
     bot.addCleanup(()=>{disposed=true;stop({persistEnabled:false});host=null;rows.clear();});
     if(config.enabled)start();
 };
@@ -8513,6 +8532,7 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
         const legacyCooldownSlot = normalizeHotbarSlot(rule.legacyCooldownSlot) ||
             (!["hotbar", "spell", "item"].includes(rule.source) ? normalizeHotbarSlot(rule.slot) || 1 : null);
         return {
+            enabled: rule.enabled !== false,
             source: getRuleSource(rule),
             ...(legacyCooldownSlot ? { legacyCooldownSlot } : {}),
             slot: normalizeHotbarSlot(rule.slot) || 1,
@@ -9006,7 +9026,7 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
     }
 
     function canUseRule(rule, now, stats) {
-        if (!rule) return false;
+        if (!rule || rule.enabled === false) return false;
         const source = getRuleSource(rule);
         var slot = normalizeHotbarSlot(rule.slot);
         if (source === "hotbar" && !slot) return false;
@@ -39001,7 +39021,6 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     // ---- PUBLIC API ----
     function start(overrides = {}) {
         if (bot.pauseHotkey?.isPaused?.()) return false;
-        if(bot.clientExtras?.canStart?.()===false)return false;
         if (!route.length) {
             bot.log("cave bot cannot start without waypoints");
             return false;
@@ -42880,7 +42899,7 @@ window.__minibiaBotBundle.installAntiBotMonitorModule = function installAntiBotM
         for (const name of ["followingItemGuard", "gmChatMonitor", "autoPickup", "looter", "cave", "attack",
                             "runeShooter", "rune", "heal", "invisible", "haste", "magicShield", "equipRing", "bootsSwapper",
                             "itemDropper", "eat", "conjureFood", "paladin", "slimeTrainer", "monkTrainer", "talk",
-                            "antiAfk", "fisher", "woodcutting", "mining", "smithing", "cooking", "comboBot"]) {
+                            "antiAfk", "fisher", "woodcutting", "mining", "smithing", "cooking", "comboBot", "holdTarget"]) {
             safely(`stop ${name}`, () => bot[name]?.stop?.({ persistEnabled: false }));
         }
         const client = window.gameClient;
@@ -44729,6 +44748,16 @@ window.__minibiaBotBundle.installNotificationModule = function installNotificati
       .mb-notification.type-audio-generic,
       .mb-notification.type-audio-creature { border-right-color: #66ccaa; }
       
+      /* Alert notifications share a red treatment; ordinary completion notices retain their style. */
+      .mb-notification:not(.type-depositer):not(.type-npc-supply-check) {
+        background: rgba(88, 17, 22, 0.96);
+        border-right-color: #ff454f;
+        color: #fff0f0;
+      }
+      .mb-notification:not(.type-depositer):not(.type-npc-supply-check) .mb-notif-title {
+        color: #ffb2b7;
+      }
+
       /* Highlight for selected waypoint */
       .mb-cave-waypoint-row[data-selected="true"] {
           background: rgba(200, 168, 78, 0.2) !important;
@@ -45314,6 +45343,44 @@ if (typeof window.__minibiaBotBundle === 'undefined') {
     window.__minibiaBotBundle = {};
 }
 
+window.__minibiaBotBundle.installHoldTargetModule=function(bot){
+    const key='minibiaBot.holdTarget.config',config={enabled:!!bot.storage.get(key,{})?.enabled};
+    let running=config.enabled,held=null,owner=null,lastAttempt=0,suppressed=null;
+    let packetOwner=null,originalBuffer=null,bufferWrapper=null,hadOwnBuffer=false,disposed=false;
+    function detachSend(){if(packetOwner?.getBuffer===bufferWrapper){if(hadOwnBuffer)packetOwner.getBuffer=originalBuffer;else delete packetOwner.getBuffer;}packetOwner=originalBuffer=bufferWrapper=null;}
+    function watchCancel(){const proto=typeof TargetPacket==='function'?TargetPacket.prototype:null;if(proto===packetOwner)return;detachSend();if(typeof proto?.getBuffer!=='function')return;packetOwner=proto;hadOwnBuffer=Object.hasOwn(proto,'getBuffer');originalBuffer=proto.getBuffer;const original=originalBuffer;bufferWrapper=function(){const bytes=original.apply(this,arguments);if(!disposed&&running&&bytes?.byteLength>=5){const view=new DataView(bytes.buffer,bytes.byteOffset||0,bytes.byteLength);if(view.getUint32(1,true)===0)release();}return bytes;};proto.getBuffer=bufferWrapper;}
+    const position=c=>c?.getPosition?.()||c?.__position||c?.position;
+    const paused=()=>bot.actions?.isHalted?.()||bot.gmKillSwitch?.isActive?.()||!window.gameClient?.networkManager?.isConnected?.();
+    function release(clear=false){const p=window.gameClient?.player;const id=held?.id??p?.__target?.id;suppressed=id??null;held=null;
+        if(clear&&p?.__target&&Number(p.__target.id)===Number(id)&&!paused()){p.setTarget(null);if(typeof TargetPacket==='function')window.gameClient.send(new TargetPacket(0));}
+        refreshUi();
+    }
+    function tick(){watchCancel();const gc=window.gameClient,p=gc?.player;if(p!==owner){owner=p;held=null;suppressed=null;}if(!running)return;
+        if(paused()){held=null;suppressed=p?.__target?.id??null;return;}
+        const current=p?.__target;
+        if(current&&Number(current.id)!==Number(suppressed)&&(!held||Number(current.id)!==held.id))held={id:Number(current.id),name:String(current.name||''),type:current.type};
+        if(!held)return;
+        let live=gc.world?.getCreature?.(held.id);
+        // Player names are unique; monster names are not an identity.
+        if(!live&&typeof CONST!=='undefined'&&held.type===CONST.TYPES?.PLAYER){const all=gc.world?.activeCreatures;const rows=all instanceof Map?[...all.values()]:Object.values(all||{});const matches=rows.filter(c=>c.type===held.type&&String(c.name||'').toLowerCase()===held.name.toLowerCase());if(matches.length===1){live=matches[0];held.id=Number(live.id);}}
+        if(!live)return;
+        if(live.state?.health!=null&&Number(live.state.health)<=0){release();return;}
+        const pp=position(p),cp=position(live);if(!pp||!cp||pp.z!==cp.z||Math.abs(pp.x-cp.x)>7||Math.abs(pp.y-cp.y)>5)return;
+        if(p.__target===live)return;
+        if(Date.now()-lastAttempt<500)return;
+        const action=()=>{p.setTarget(live);if(typeof TargetPacket!=='function')return false;gc.send(new TargetPacket(live.id));return true;};
+        const sent=bot.actions?.runShared?bot.actions.runShared('hold-target',bot.actions.priorities.COMBAT,action):action();if(sent)lastAttempt=Date.now();
+    }
+    function start(){running=true;config.enabled=true;suppressed=null;bot.storage.set(key,{...config});tick();refreshUi();}
+    function stop(options={}){running=false;held=null;suppressed=null;if(options.persistEnabled!==false){config.enabled=false;bot.storage.set(key,{...config});}refreshUi();}
+    function refreshUi(){const panel=document.getElementById('minibia-bot-panel');if(!panel)return;const toggle=panel.querySelector('[data-hold-target-enabled]'),label=panel.querySelector('[data-hold-target-status]');if(toggle)toggle.checked=running;if(label)label.textContent=running?(held?'Holding: '+held.name:'Select a target to hold'):'Stopped';}
+    function mount(panel){const host=panel.querySelector('[data-hold-target]');if(!host||host.dataset.bound)return;host.dataset.bound='true';host.querySelector('[data-hold-target-enabled]').addEventListener('change',e=>e.target.checked?start():stop());host.querySelector('[data-hold-target-release]').addEventListener('click',()=>release(true));refreshUi();}
+    const escape=e=>{if(e.key==='Escape'&&running&&!e.target?.closest?.('input,textarea,select,[contenteditable="true"]'))release();};document.addEventListener('keydown',escape);
+    watchCancel();const timer=setInterval(()=>{tick();refreshUi();},250);
+    bot.holdTarget={config,start,stop,tick,mount,updateConfig:next=>{if(next.enabled!==undefined)next.enabled?start():stop();return {...config};},release:()=>release(true),status:()=>({running,held:held?{...held}:null})};
+    bot.addCleanup(()=>{clearInterval(timer);document.removeEventListener('keydown',escape);disposed=true;detachSend();running=false;held=null;});
+};
+
 window.__minibiaBotBundle.installComboBotModule = function installComboBotModule(bot) {
     const configStorageKey = "minibiaBot.combo.config";
     const state = {
@@ -45322,7 +45389,7 @@ window.__minibiaBotBundle.installComboBotModule = function installComboBotModule
         originalSend: null,
         hookedSend: null,
         storageListener: null,
-        lastTriggerAt: 0,
+        lastTriggerAt: -Infinity,
         retryTimer: null,
         retryCount: 0,
         followInterval: null, // rune spam interval
@@ -45333,6 +45400,8 @@ window.__minibiaBotBundle.installComboBotModule = function installComboBotModule
 
     const config = Object.assign({
         mode: 'follower',
+        rune: 'sd',
+        attackTarget: true,
         hotkeySlot: 11,
         minMana: 0,
         cooldownMs: 2000, // rune spam interval (default 2s)
@@ -45342,6 +45411,8 @@ window.__minibiaBotBundle.installComboBotModule = function installComboBotModule
         leaderName: '',
     }, bot.storage.get(configStorageKey, {}));
 
+    if(!Object.hasOwn(bot.storage.get(configStorageKey,{}),'rune')&&Object.hasOwn(bot.storage.get(configStorageKey,{}),'hotkeySlot'))config.rune='hotkey';
+    let lastCountQuery=0;
     let damageOwner=null,damageOriginal=null,damageWrapper=null,watchTimer=null,burstTimer=null;
     let observedPlayer=null,lastLeaderHitAt=0,leaderSeenId=null;const hitBurst=new Map();
     const isObserved=()=>config.mode==='observed';
@@ -45349,7 +45420,7 @@ window.__minibiaBotBundle.installComboBotModule = function installComboBotModule
     function detachDamage(){if(damageOwner?.handleDamageEvent===damageWrapper)damageOwner.handleDamageEvent=damageOriginal;damageOwner=damageOriginal=damageWrapper=null;}
     function clearObservedTarget(){
         if(state.followInterval){clearInterval(state.followInterval);state.followInterval=null;}
-        const p=getPlayer();if(state.currentTargetId!=null&&Number(p?.__target?.id)===Number(state.currentTargetId)){p.setTarget(null);sendPacket('TargetPacket',0);}
+        const p=getPlayer();if(config.attackTarget&&state.currentTargetId!=null&&Number(p?.__target?.id)===Number(state.currentTargetId)){p.setTarget(null);sendPacket('TargetPacket',0);}
         state.currentTargetId=null;
     }
     function flushLeaderHits(){
@@ -45418,94 +45489,25 @@ window.__minibiaBotBundle.installComboBotModule = function installComboBotModule
     }
 
     // ---- Follower logic ----
-    function handleTarget(msg) {
-        const player = getPlayer();
-        const world = getWorld();
-        if (!player || !world)
-            return;
-
-        const targetId = msg.id;
-        const leaderId = msg.leaderId;
-
-        // Stop any existing intervals
-        if (state.followInterval) {
-            clearInterval(state.followInterval);
-            state.followInterval = null;
-        }
-        // If we have a target, stop requesting
-        if (state.requestInterval) {
-            clearInterval(state.requestInterval);
-            state.requestInterval = null;
-        }
-
-        // Clear target
-        if (targetId === 0) {
-            if (player.__target) {
-                player.setTarget(null);
-                sendPacket('TargetPacket', 0);
-                log('Target cleared.');
-            }
-            state.currentTargetId = null;
-            // Start requesting again (we lost target)
-            startRequestInterval();
-            return;
-        }
-
-        const creature = world.getCreature(targetId);
-        if (!creature) {
-            log('Target creature not found:', targetId);
-            // Creature might be gone – clear and request again
-            state.currentTargetId = null;
-            startRequestInterval();
-            return;
-        }
-
-        // Set target if different
-        if (player.__target !== creature) {
-            player.setTarget(creature);
-            sendPacket('TargetPacket', targetId);
-            log('Targeting', creature.name, '(', targetId, ')');
-        }
-        state.currentTargetId = targetId;
-
-        // ---- Auto Follow Leader (optional) ----
-        if (config.autoFollowLeader && leaderId) {
-            followLeaderById(leaderId);
-        } else if (config.autoFollowLeader && config.leaderName) {
-            followLeaderByName();
-        }
-
-        // ---- Start rune spam interval ----
-        triggerHotkey(); // fire once immediately
-        state.followInterval = setInterval(() => {
-            // Check that we still have a valid target
-            const currentTarget = player.__target;
-            if (!currentTarget || currentTarget.id !== state.currentTargetId) {
-                // Target lost – clear and restart request
-                state.currentTargetId = null;
-                clearInterval(state.followInterval);
-                state.followInterval = null;
-                startRequestInterval();
-                return;
-            }
-            // Check if creature still exists and is alive
-            const creature = world.getCreature(state.currentTargetId);
-            if (!creature || (creature.state && creature.state.health <= 0)) {
-                // Target dead – clear and stop
-                if (player.__target) {
-                    player.setTarget(null);
-                    sendPacket('TargetPacket', 0);
-                }
-                state.currentTargetId = null;
-                clearInterval(state.followInterval);
-                state.followInterval = null;
-                log('Target died, stopping rune spam.');
-                startRequestInterval();
-                return;
-            }
-            // All good – shoot again
-            triggerHotkey();
-        }, config.cooldownMs);
+    function handleTarget(msg){
+        if(!state.running||paused())return;
+        const id=Number(msg.id);if(!Number.isInteger(id)||id<0)return;
+        if(!id){const p=getPlayer();if(config.attackTarget&&p?.__target&&Number(p.__target.id)===Number(state.currentTargetId)){p.setTarget(null);sendPacket('TargetPacket',0);}state.currentTargetId=null;startRequestInterval();return;}
+        state.currentTargetId=id;
+        if(state.requestInterval){clearInterval(state.requestInterval);state.requestInterval=null;}
+        if(config.autoFollowLeader)followLeaderById(msg.leaderId);
+        comboTick();
+        if(!state.followInterval)state.followInterval=setInterval(comboTick,250);
+    }
+    function comboTick(){
+        if(!state.running||paused()||!state.currentTargetId)return;
+        const p=getPlayer(),creature=getWorld()?.getCreature(state.currentTargetId);
+        if(!creature)return;
+        if(creature.state?.health!=null&&Number(creature.state.health)<=0){state.currentTargetId=null;startRequestInterval();return;}
+        const pp=p?.getPosition?.()||p?.__position,cp=creature.getPosition?.()||creature.__position;
+        if(!pp||!cp||Number(pp.z)!==Number(cp.z)||Math.abs(pp.x-cp.x)>7||Math.abs(pp.y-cp.y)>5)return;
+        if(config.attackTarget&&p.__target!==creature){p.setTarget(creature);sendPacket('TargetPacket',creature.id);}
+        triggerHotkey(creature);
     }
 
     // ---- Request interval: ask leader for target every 500ms if we have none ----
@@ -45602,27 +45604,23 @@ window.__minibiaBotBundle.installComboBotModule = function installComboBotModule
         log('Following leader by name:', leader.name, '(', leader.id, ')');
     }
 
-    function triggerHotkey() {
-        if(paused())return;
+    function triggerHotkey(creature){
+        if(paused()||performance.now()-state.lastTriggerAt<config.cooldownMs)return;
         if(isObserved()&&(Date.now()-lastLeaderHitAt>8000||!getWorld()?.getCreature(leaderSeenId)))return;
         const heal=bot.heal;if(heal?.status?.().running&&(heal.hasPendingAction?.()||heal.needsPriorityAction?.()))return;
-        const gc = window.gameClient;
-        if (!gc || !gc.interface || !gc.interface.hotbarManager)
-            return;
-
-        const player = getPlayer();
-        if (!player)
-            return;
-
-        if (config.minMana > 0 && player.state.mana < config.minMana) {
-            return;
+        const gc=window.gameClient,p=getPlayer();if(!p||Number(p.state?.mana)<config.minMana)return;
+        if(config.rune==='none')return;
+        const hm=gc?.interface?.hotbarManager;let fire;
+        if(config.rune==='hotkey'){if(!config.attackTarget||!hm?.__handleClick)return;fire=()=>{hm.__handleClick(config.hotkeySlot);return true;};}
+        else{
+            const def=bot.runeShooter?.getRuneTypes?.().find(r=>r.key===config.rune);if(!def)return;
+            const cd=hm?.__getRuneEffectiveCooldown?.(true);if(cd&&performance.now()<cd.until)return;
+            if(Date.now()-lastCountQuery>=5000){lastCountQuery=Date.now();bot.requestItemCounts?.([{id:def.itemId,fluidType:0}]);}
+            const reading=bot.getItemCountReading?.(def.itemId,0);if(reading&&Date.now()-Number(reading.at)<15000&&Number(reading.count)===0)return;
+            if(typeof HotbarUsePacket!=='function')return;
+            fire=()=>{if(def.mode==='aoe'){const pos=creature.getPosition?.()||creature.__position;if(!pos)return false;gc.send(new HotbarUsePacket(def.itemId,0,3,0,pos));}else gc.send(new HotbarUsePacket(def.itemId,0,1,creature.id));return true;};
         }
-
-        const fire=()=>{gc.interface.hotbarManager.__handleClick(config.hotkeySlot);return true;};
-        const sent=bot.actions?.runShared?bot.actions.runShared("combo-hotkey",bot.actions.priorities.COMBAT,fire):fire();
-        if(!sent)return;
-        state.lastTriggerAt = performance.now();
-        log('Triggered hotkey slot', config.hotkeySlot + 1);
+        const sent=bot.actions?.runShared?bot.actions.runShared('combo-rune',bot.actions.priorities.COMBAT,fire):fire();if(sent)state.lastTriggerAt=performance.now();
     }
 
     function sendPacket(packetName, ...args) {
@@ -45811,6 +45809,7 @@ window.__minibiaBotBundle.installComboBotModule = function installComboBotModule
             state.requestInterval = null;
         }
         state.currentTargetId = null;
+        state.lastTriggerAt=-Infinity;
 
         if (state.originalSend && window.gameClient) {
             if (!state.hookedSend || window.gameClient.send === state.hookedSend) {
@@ -45900,7 +45899,7 @@ window.__minibiaBotBundle.installComboBotModule = function installComboBotModule
         status,
         updateConfig,
         config,
-        followLeaderNow,
+        followLeaderNow, tick:comboTick,
     };
 
     bot.addCleanup(() => {
@@ -45943,8 +45942,6 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
         ammoItemId: null, // null retains legacy weapon/held-item counting
         craftManaCost: 140,
         craftSpellWords: "exeta con",
-        highManaSpellWords: "utani hur",
-        highManaThreshold: 98,
         // Equipper settings
         equipEnabled: false,
         equipTickMs: 2000,
@@ -45952,6 +45949,7 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
         equipCooldownMs: 5000,
         equipThreshold: 7,
     }, stored);
+    delete config.highManaSpellWords;delete config.highManaThreshold;
 
     function validAmmoId(value) {
         const id = Number(value);
@@ -45972,8 +45970,6 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
             ammoItemId: config.ammoItemId,
             craftManaCost: config.craftManaCost,
             craftSpellWords: config.craftSpellWords,
-            highManaSpellWords: config.highManaSpellWords,
-            highManaThreshold: config.highManaThreshold,
             weaponId: config.weaponId,
             equipCooldownMs: config.equipCooldownMs,
             equipThreshold: config.equipThreshold,
@@ -46282,56 +46278,7 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
     }
 
     // ---- Crafter functions ----
-    function tryCraft() {
-        if (!config.craftEnabled)
-            return false;
-        const stats = readStats();
-        if (!stats)
-            return false;
-        const now = Date.now();
-        const manaPercent = getManaPercent(stats);
-
-        // Keep a current server-backed full-inventory count in the same cache
-        // populated by HOTBAR_ITEM_COUNT. The request is harmless if the hotbar
-        // already refreshed the same CID; both paths converge on one reading.
-        requestAmmoCount(now, false);
-        const ammoState = getAmmoCountState(now);
-
-        // High mana spell is independent of inventory-count availability.
-        if (manaPercent > config.highManaThreshold && config.highManaSpellWords) {
-            const sent = bot.actions.runShared('paladin-high-mana',
-                bot.actions.priorities.UTILITY, () => bot.sendChat(config.highManaSpellWords.trim()));
-            if (sent)
-                return true;
-        }
-
-        // Never treat an unknown/stale full-inventory count as zero. Wait for a
-        // fresh server reply before deciding that more ammo needs to be crafted.
-        if (!ammoState.known || !ammoState.fresh)
-            return false;
-
-        const ammo = ammoState.count;
-        if (ammo <= config.ammoThreshold) {
-            if (stats.mana.current >= config.craftManaCost && config.craftSpellWords) {
-                const sent = bot.actions.runShared('paladin-craft',
-                    bot.actions.priorities.UTILITY, () => bot.sendChat(config.craftSpellWords.trim()));
-                if (sent) {
-                    state.lastCraftAt = now;
-                    // Ask for a fresh authoritative count after the spell result
-                    // arrives; the normal next tick will consume the reply.
-                    state.lastAmmoCountRequestAt = 0;
-                    bot.log("Paladin: crafted ammo", {
-                        ammo,
-                        ammoItemId: ammoState.itemId,
-                        source: "server-hotbar-count",
-                        mana: stats.mana.current
-                    });
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
+    function tryCraft() { return bot.ammoCrafter?.attempt?.() || false; }
 
     // ---- Equipper functions ----
     function tryEquip() {
@@ -46401,38 +46348,8 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
     }
 
     // ---- Start / Stop ----
-    function startCraft(overrides = {}) {
-        Object.assign(config, overrides);
-        config.craftEnabled = true;
-        persistConfig();
-        if (state.running)
-            return false;
-        state.running = true;
-        state.lastAmmoCountRequestAt = 0;
-        state.ammoCountItemId = null;
-        requestAmmoCount(Date.now(), true);
-        bot.log("Paladin crafter started", {
-            craftSpellWords: config.craftSpellWords,
-            countSource: "server-hotbar-count",
-        });
-        craftTick();
-        return true;
-    }
-
-    function stopCraft(options = {}) {
-        const shouldPersist = options.persistEnabled !== false;
-        state.running = false;
-        if (state.timerId) {
-            clearTimeout(state.timerId);
-            state.timerId = null;
-        }
-        if (shouldPersist) {
-            config.craftEnabled = false;
-            persistConfig();
-        }
-        bot.log("Paladin crafter stopped");
-        return true;
-    }
+    function startCraft() { return bot.ammoCrafter?.start?.() || false; }
+    function stopCraft(options = {}) { return bot.ammoCrafter?.stop?.(options); }
 
     function startEquip(overrides = {}) {
         Object.assign(config, overrides);
@@ -46485,7 +46402,7 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
 
     function stop(options = {}) {
         let stopped = false;
-        if (state.running) {
+        if (bot.ammoCrafter?.status?.().running) {
             stopCraft(options);
             stopped = true;
         }
@@ -46500,7 +46417,7 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
         const stats = readStats();
         const ammoState = getAmmoCountState();
         return {
-            running: state.running,
+            running: bot.ammoCrafter?.status?.().running === true,
             equipRunning: state.equipRunning,
             config: {
                 ...config
@@ -46521,14 +46438,14 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
 
     function getKillSwitchSnapshot() {
         return {
-            craftRunning: state.running === true,
+            craftRunning: bot.ammoCrafter?.status?.().running === true,
             equipRunning: state.equipRunning === true,
-            craftEnabled: config.craftEnabled === true,
+            craftEnabled: bot.ammoCrafter?.config?.enabled === true,
             equipEnabled: config.equipEnabled === true,
             weaponId: config.weaponId ?? null,
             craftShouldRestore:
-                state.running === true ||
-                config.craftEnabled === true,
+                bot.ammoCrafter?.status?.().running === true ||
+                bot.ammoCrafter?.config?.enabled === true,
             equipShouldRestore:
                 state.equipRunning === true ||
                 config.equipEnabled === true
@@ -46545,7 +46462,7 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
             snapshot.equipRunning === true ||
             snapshot.equipEnabled === true;
 
-        if (craftShouldRestore && !state.running)
+        if (craftShouldRestore && !bot.ammoCrafter?.status?.().running)
             startCraft();
 
         if (equipShouldRestore && !state.equipRunning) {
@@ -46560,9 +46477,9 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
         return {
             craftShouldRestore,
             equipShouldRestore,
-            craftRunning: state.running === true,
+            craftRunning: bot.ammoCrafter?.status?.().running === true,
             equipRunning: state.equipRunning === true,
-            craftRestored: !craftShouldRestore || state.running === true,
+            craftRestored: !craftShouldRestore || bot.ammoCrafter?.status?.().running === true,
             equipRestored: !equipShouldRestore || state.equipRunning === true
         };
     }
@@ -46574,7 +46491,6 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
         config.ammoItemId = validAmmoId(config.ammoItemId);
         config.ammoThreshold = Math.max(0, Number(config.ammoThreshold) || 0);
         config.craftManaCost = Math.max(0, Number(config.craftManaCost) || 0);
-        config.highManaThreshold = Math.min(100, Math.max(0, Number(config.highManaThreshold) || 0));
         config.equipCooldownMs = Math.max(1000, Number(config.equipCooldownMs) || 5000);
         config.equipThreshold = Math.max(0, Number(config.equipThreshold) || 0);
         if (config.weaponId !== null && config.weaponId !== undefined) {
@@ -46603,8 +46519,6 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
     }
 
     // Auto-start if enabled (on load)
-    if (config.craftEnabled)
-        startCraft();
     if (config.equipEnabled && config.weaponId)
         startEquip();
 
@@ -47001,6 +46915,63 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         return null;
     }
 
+    // Root selection stays fixed. Overflow bags are discovered only through
+    // parent links or a confirmed open of a slot in that tree.
+    let overflowRoot=null,overflowOpen=null,overflowSlots=new Map(),overflowLastOpen=0;
+    function resetOverflow(){overflowRoot=null;overflowOpen=null;overflowSlots.clear();overflowLastOpen=0;}
+    function linkedOverflowChild(child,parent){
+        if(child===parent)return false;
+        const owner=child.__openedFromParent||child.__replacedParent;
+        return owner?owner===parent:Number(child.__parentCid)>0&&Number(child.__parentCid)===Number(parent.__containerId);
+    }
+    function overflowTree(root){
+        if(root!==overflowRoot){resetOverflow();overflowRoot=root;}
+        const all=getContainersArray(),tree=[root],seen=new Set(tree);
+        for(let i=0;i<tree.length&&tree.length<64;i++)for(const child of all){
+            if(!seen.has(child)&&linkedOverflowChild(child,tree[i])){seen.add(child);tree.push(child);if(tree.length>=64)break;}
+        }
+        if(overflowOpen){const pending=overflowOpen;
+            const fresh=all.filter(c=>!pending.before.has(c)&&Number(c.id)===Number(pending.item.id)&&linkedOverflowChild(c,pending.parent));
+            if(fresh.length===1){pending.entry.child=fresh[0];overflowOpen=null;}
+            else if(Date.now()-pending.at>=3000)overflowOpen=null;
+        }
+        // Prune replaced/closed containers; never hold an unbounded inventory history.
+        for(const parent of overflowSlots.keys())if(!seen.has(parent))overflowSlots.delete(parent);
+        return tree;
+    }
+    function bagItem(item){try{return !!item?.isContainer?.();}catch{return false;}}
+    function expandableOverflow(tree,now){
+        if(overflowOpen||tree.length>=64)return null;
+        for(const parent of tree){
+            let slots=overflowSlots.get(parent);if(!slots){slots=new Map();overflowSlots.set(parent,slots);}
+            for(const slot of slots.keys())if(slot>=parent.size||slots.get(slot).item!==parent.getSlotItem(slot))slots.delete(slot);
+            for(let slot=0;slot<parent.size;slot++){
+                const item=parent.getSlotItem(slot);if(!bagItem(item))continue;
+                const prior=slots.get(slot);if(prior&&(prior.child||now-prior.at<30000))continue;
+                // An already-open same-type child without a captured slot cannot
+                // be safely toggled. Use it, but do not guess which slot owns it.
+                const unknown=tree.some(c=>linkedOverflowChild(c,parent)&&Number(c.id)===Number(item.id)&&![...slots.values()].some(e=>e.child===c));
+                if(!unknown)return {parent,slot,item,slots};
+            }
+        }
+        return null;
+    }
+    function resolveLootDestination(root,now,openIfNeeded=false){
+        const tree=overflowTree(root);
+        for(const dest of tree){const slot=findEmptySlot(dest);if(slot!==-1)return {dest,slot,tree};}
+        const next=expandableOverflow(tree,now);
+        if(openIfNeeded&&next&&now-overflowLastOpen>=1200&&now-Number(bot.containerAcks?.lastReplyAt?.()||0)>=1200&&typeof ItemUsePacket==='function'&&window.gameClient?.send){
+            const {parent,slot,item,slots}=next;
+            const entry={item,at:now,child:null},pending={parent,item,entry,at:now,before:new Set(getContainersArray())};
+            // Register before send; container replies may be processed immediately.
+            overflowOpen=pending;slots.set(slot,entry);
+            const action=()=>{if(parent.getSlotItem(slot)!==item)return false;window.gameClient.send(new ItemUsePacket({which:parent,index:slot}));return true;};
+            let sent=false;try{sent=bot.actions?.runShared?bot.actions.runShared('looter-open-child',bot.actions.priorities.UTILITY,action):action();}catch{}
+            if(sent)overflowLastOpen=now;else{overflowOpen=null;slots.delete(slot);}
+        }
+        return {dest:null,slot:-1,tree,waiting:!!overflowOpen,expandable:!!next};
+    }
+
     function findEmptySlot(container) {
         if (!container)
             return -1;
@@ -47079,6 +47050,8 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
 
     function getNewOpenedContainer(baselineIds) {
         const containers = getContainersArray();
+        const root = getDestinationContainer();
+        const destinationTree = root ? overflowTree(root) : [];
         for (const container of containers) {
             const id = Number(container?.__containerId);
             if (
@@ -47087,6 +47060,8 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             ) {
                 continue;
             }
+
+            if(destinationTree.includes(container))continue;
 
             // Destination opening is not the corpse we are waiting for.
             if (
@@ -49251,12 +49226,13 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         })) return true;
         if (state.pendingMove && now-state.pendingMove.at<5000) return true;
         const dest=getDestinationContainer();
-        const canStore=dest && findEmptySlot(dest)!==-1;
+        const overflow=dest?resolveLootDestination(dest,now):null;
+        const canStore=overflow&&(overflow.dest||overflow.waiting||overflow.expandable);
         return getContainersArray().some(container=> {
             for (let slot=0;slot<container.size;slot++) {
                 const item=container.getSlotItem(slot),key=exactItemKey(item);
                 if (!state.trackedItems.has(key)) continue;
-                if (isDropTrackedItem(key) || (canStore && container.__containerId!==dest.__containerId))
+                if (isDropTrackedItem(key) || (canStore && !overflow.tree.includes(container)))
                     return true;
             }
             return false;
@@ -49411,10 +49387,10 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         }
 
         // Pass 2: normal tracked items go to the selected destination.
-        const dest =
-            getDestinationContainer();
+        const root = getDestinationContainer();
+        const overflow = root ? resolveLootDestination(root,now) : null;
 
-        if (!dest) {
+        if (!root) {
             if (
                 !state._lastDestLog ||
                 now -
@@ -49432,8 +49408,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
 
         for (const container of containers) {
             if (
-                container.__containerId ===
-                dest.__containerId
+                overflow.tree.includes(container)
             ) {
                 continue;
             }
@@ -49454,8 +49429,9 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                     continue;
                 }
 
-                const targetSlot =
-                    findEmptySlot(dest);
+                const target = resolveLootDestination(root,now,true);
+                const dest = target.dest;
+                const targetSlot = target.slot;
 
                 if (targetSlot === -1) {
                     if (
@@ -49466,7 +49442,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                         state.lastFullLogAt =
                             now;
                         bot.log(
-                            "Looter: destination container full"
+                            target.waiting ? "Looter: opening destination child container" : "Looter: destination and available child containers full"
                         );
                     }
                     return false;
@@ -49551,14 +49527,14 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                             String(container.__title || "")
                     }
                 );
+                const destCacheKey = `loot-target:${Number(dest.__containerId)}`;
                 bindLooterContainer(
-                    "destination",
+                    destCacheKey,
                     dest,
                     {
                         expectedId:
                             Number(dest.__containerId),
                         expectedTitle:
-                            state.destinationTitle ||
                             String(dest.__title || "")
                     }
                 );
@@ -49580,10 +49556,8 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                     count: item.count,
                     destId:
                         dest.__containerId,
-                    destCacheKey:
-                        "destination",
+                    destCacheKey,
                     destTitle:
-                        state.destinationTitle ||
                         String(dest.__title || ""),
                     targetSlot,
                     at: now
@@ -49705,6 +49679,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
     }
 
     function stop() {
+        resetOverflow();
         state.running = false;
         state.pendingMove = null;
         state.nearbyCorpseReadyUntil = 0;
@@ -50092,6 +50067,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                 return;
             }
 
+            resetOverflow();
             state.destinationId = containerId;
             state.destinationTitle = container.__title || null;
             persistConfig();
@@ -50371,7 +50347,7 @@ window.__minibiaBotBundle.installTempleXlogModule = function installTempleXlogMo
         for (const name of ["followingItemGuard", "gmChatMonitor", "autoPickup", "looter", "cave", "attack",
                             "runeShooter", "rune", "heal", "invisible", "haste", "magicShield", "equipRing", "bootsSwapper",
                             "itemDropper", "eat", "conjureFood", "paladin", "slimeTrainer", "monkTrainer", "talk",
-                            "antiAfk", "fisher", "woodcutting", "mining", "smithing", "cooking", "comboBot"]) {
+                            "antiAfk", "fisher", "woodcutting", "mining", "smithing", "cooking", "comboBot", "holdTarget"]) {
             try { bot[name]?.stop?.({ persistEnabled: false }); }
             catch (e) { bot.log(`Temple XLOG: failed to stop ${name}`, e); }
         }
@@ -50695,6 +50671,7 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
         "minibiaBot.specialAreas.config",
         "minibiaBot.support.config",
         "minibiaBot.combo.config",
+        "minibiaBot.holdTarget.config",
         "minibiaBot.autoPickup.config",
         "minibiaBot.antiAfk.config",
         "minibiaBot.fisher.config",
@@ -52281,15 +52258,13 @@ window.__minibiaBotBundle.installClientImprovements = function(bot) {
 };
 
 window.__minibiaBotBundle.installClientExtras=function(bot){
- const key='minibiaBot.clientExtras.config';const config={blessingGuard:false,maxLoss:10,minPilgrimages:0,requireTemple:false,requireWard:false,conditions:[],...bot.storage.get(key,{})};
- let inventory=[],loot=null,tasks=null,quests=null,blessings=null,disposed=false,player=null,inventoryAt=0,tasksAt=0,questsAt=0,progressClient=null;const fired=new Set(),cleanups=[];let renderUi=()=>{},lastInventoryRequest=0;
- config.conditions=Array.isArray(config.conditions)?config.conditions:[];
- const persist=()=>bot.storage.set(key,{...config});
- const sync=()=>{const c=window.gameClient,p=c?.player;if(p!==player||c!==progressClient){progressClient=c;player=p;inventory=[];loot=tasks=quests=blessings=null;inventoryAt=tasksAt=questsAt=0;fired.clear();}};
+ const config={};
+ let inventory=[],loot=null,tasks=null,quests=null,disposed=false,player=null,inventoryAt=0,tasksAt=0,questsAt=0,progressClient=null;const cleanups=[];let renderUi=()=>{},lastInventoryRequest=0;
+ const sync=()=>{const c=window.gameClient,p=c?.player;if(p!==player||c!==progressClient){progressClient=c;player=p;inventory=[];loot=tasks=quests=null;inventoryAt=tasksAt=questsAt=0;}};
  const textCommand=cmd=>window.gameClient?.interface?.channelManager?.sendMessageText?.(cmd,undefined,true);
  function hook(name,accept){const proto=typeof PacketReader!=='undefined'?PacketReader.prototype:null,original=proto?.[name];if(typeof original!=='function')return;const wrapper=function(...args){const result=original.apply(this,args);if(!disposed){sync();accept(result);renderUi();}return result;};proto[name]=wrapper;cleanups.push(()=>{if(proto[name]===wrapper)proto[name]=original;});}
  hook('readInventoryList',r=>{inventory=Array.isArray(r?.items)?r.items:[];inventoryAt=Date.now();});
- hook('readLootListInfo',r=>{if(r)loot=r;});hook('readTaskInfo',r=>{if(r&&['hunting','magic','delivery'].some(k=>r[k]&&typeof r[k].active==='boolean')){tasks=r;tasksAt=Date.now();evaluate();}});hook('readQuestLog',r=>{if(r&&Array.isArray(r.achievements)&&Array.isArray(r.questChests)){quests=r;questsAt=Date.now();evaluate();}});hook('readBlessingUpdate',r=>{blessings=r;});
+ hook('readLootListInfo',r=>{if(r)loot=r;});hook('readTaskInfo',r=>{if(r&&['hunting','magic','delivery'].some(k=>r[k]&&typeof r[k].active==='boolean')){tasks=r;tasksAt=Date.now();}});hook('readQuestLog',r=>{if(r&&Array.isArray(r.achievements)&&Array.isArray(r.questChests)){quests=r;questsAt=Date.now();}});
  function requestInventory(){sync();const now=Date.now();if(now-lastInventoryRequest<1000)return false;if(typeof InventoryListQueryPacket!=='function'||!window.gameClient?.send)return false;lastInventoryRequest=now;window.gameClient.send(new InventoryListQueryPacket());return true;}
  function rows(){
   sync();const result=[],count=n=>Number.isFinite(Number(n))&&n!=null?Math.max(0,Number(n)):null;
@@ -52306,19 +52281,15 @@ window.__minibiaBotBundle.installClientExtras=function(bot){
   return result;
  }
  function matches(rule){sync();const name=String(rule.name||'').trim().toLowerCase();if(!name)return false;const row=rows().find(r=>r.kind===rule.kind&&(r.name.toLowerCase()===name||r.legacyName?.toLowerCase()===name));if(!row)return false;return rule.condition==='count'?row.current!=null&&row.current>=Math.max(0,Number(rule.count)||0):row.completed;}
- function evaluate(){if(disposed||!bot.cave?.isRunning?.())return;for(let i=0;i<config.conditions.length;i++){const r=config.conditions[i];if(!r.enabled||fired.has(i)||!matches(r))continue;if(r.action==='label'){if(!String(r.label||'').trim())continue;const ok=bot.goToLabel?.(r.label);if(!ok){fired.add(i);bot.log('Progress condition: label not found: '+r.label);continue;}}else bot.cave.stop();fired.add(i);bot.log('Progress condition reached: '+r.name);break;}}
- function canStart(){sync();if(!config.blessingGuard)return true;const b=blessings||window.gameClient?.player?.blessings;const ok=!!b&&Number(b.lossPercent)<=Number(config.maxLoss)&&Number(b.pilgrimageCount)>=Number(config.minPilgrimages)&&(!config.requireTemple||b.hasTemple)&&(!config.requireWard||b.hasWard);if(!ok)bot.log('CaveBot start blocked by blessing protection settings; check Status');return ok;}
  function applyNative(values){const client=window.gameClient,settings=client?.interface?.settings;if(!settings?.__state||typeof AutoLootSettingsPacket!=='function'||!client.send)throw new Error('Native settings unavailable');const ids=['auto-loot-gold','auto-loot-food','auto-open-corpse','auto-refill-ammo','auto-eat-food','auto-convert-loot','reopen-containers'];const flags=ids.map(id=>!!values[id]);client.send(new AutoLootSettingsPacket(...flags));for(let i=0;i<ids.length;i++){settings.__state[ids[i]]=flags[i];const input=document.getElementById(ids[i]);if(input)input.checked=flags[i];}try{localStorage.setItem('settings',JSON.stringify(settings.__state));}catch(e){}return true;}
  function saveLoot(selected,enabled,routes){sync();if(!loot)throw new Error('Load server loot settings before saving');if(typeof LootListUpdatePacket!=='function'||!window.gameClient?.send)throw new Error('Server loot routing unavailable');const ids=[...new Set(selected.map(Number))];if(ids.length>500||ids.some(s=>!Number.isInteger(s)||s<=0||s>65535))throw new Error('Select up to 500 valid SIDs');const safe={};for(const sid of ids){const name=String(routes[sid]||'').trim();if(name.length>20)throw new Error('Backpack names must be 20 characters or fewer');if(name)safe[sid]=name;}window.gameClient.send(new LootListUpdatePacket(ids,!!enabled,safe));loot={...loot,selected:ids,enabled:!!enabled,routes:safe};return true;}
  function mount(panel){if(!panel||panel.querySelector('[data-client-extras]'))return;const sections=[];const section=(tab,title)=>{const host=panel.querySelector(`[data-tab-panel="${tab}"]`);if(!host)return null;const el=document.createElement('div');el.className='mb-section';el.setAttribute('data-client-extras','');const h=document.createElement('div');h.className='mb-section-title';const heading=document.createElement('span');heading.className='mb-title-text';heading.textContent=title;h.append(heading);el.append(h);host.prepend(el);sections.push(el);return el;};const make=(tag,parent,content)=>{const el=document.createElement(tag);if(content!=null)el.textContent=content;parent.append(el);return el;};const button=(parent,label,fn)=>{const b=make('button',parent,label);b.type='button';b.className='mb-small-button';b.addEventListener('click',()=>{try{fn();}catch(e){bot.log(e.message);message.textContent=e.message;}});return b;};const field=(parent,label,type='text',value='')=>{const l=make('label',parent);l.className='mb-field';make('span',l,label).className='mb-field-label';const i=make('input',l);i.type=type;i.value=value;if(type==='number')i.min='0';return i;};const check=(parent,label,value)=>{const l=make('label',parent);l.style.cssText='display:flex;align-items:center;gap:6px;margin:6px 0';const i=make('input',l);i.type='checkbox';i.checked=!!value;i.style.cssText='width:13px;min-width:13px;margin:0';make('span',l,label);return i;};const select=(parent,label,options)=>{const l=make('label',parent);l.className='mb-field';make('span',l,label);const s=make('select',l);for(const [value,name]of options){const o=make('option',s,name);o.value=value;}return s;};
  const inv=section('resupply','Inventory Browser');const message=make('div',inv);message.className='mb-small-note';const actions=make('div',inv);button(actions,'Refresh inventory',requestInventory);const search=field(inv,'Filter by name / SID / CID');const inventoryList=make('div',inv);inventoryList.style.cssText='max-height:260px;overflow:auto';let invSignature='';
- const routing=section('looter','Server Loot Routing');make('div',routing,'Loads and saves the game’s SID loot list. Fluid-specific rules stay in mb0t’s looter.').className='mb-small-note';const routeActions=make('div',routing);button(routeActions,'Load server settings',()=>textCommand('/lootlist'));const routeEnabled=check(routing,'Server loot list enabled',false);const routeList=make('div',routing);routeList.style.cssText='max-height:240px;overflow:auto';const routeSid=field(routing,'Item SID','number');const routeBag=field(routing,'Destination backpack name (blank = default)');let draft=null;button(routing,'Add / update route',()=>{if(!draft)throw new Error('Load server settings first');const sid=Number(routeSid.value);if(!Number.isInteger(sid)||sid<1||sid>65535)throw new Error('Invalid SID');if(!draft.selected.includes(sid))draft.selected.push(sid);draft.routes[sid]=routeBag.value.trim();renderRoutes();});button(routing,'Save to server',()=>{if(!draft)throw new Error('Load server settings first');saveLoot(draft.selected,routeEnabled.checked,draft.routes);message.textContent='Server loot settings sent.';});let lootRef=null;function renderRoutes(){routeList.replaceChildren();for(const sid of draft?.selected||[]){const line=make('div',routeList);line.style.cssText='display:flex;gap:6px;align-items:center;margin:4px 0';make('span',line,`${sid} → ${draft.routes[sid]||'default backpack'}`).style.flex='1';button(line,'Remove',()=>{draft.selected=draft.selected.filter(n=>n!==sid);delete draft.routes[sid];renderRoutes();});}}
- const protection=section('status','Blessing Protection');const blessingText=make('div',protection);blessingText.className='mb-small-note';const guard=check(protection,'Check protection before starting CaveBot',config.blessingGuard);const maxLoss=field(protection,'Maximum death loss %','number',config.maxLoss);maxLoss.max='100';const pilgrimages=field(protection,'Minimum pilgrimage blessings','number',config.minPilgrimages);const temple=check(protection,'Require temple blessing',config.requireTemple),ward=check(protection,'Require Martyr’s Ward',config.requireWard);for(const i of [guard,maxLoss,pilgrimages,temple,ward])i.addEventListener('change',()=>{Object.assign(config,{blessingGuard:guard.checked,maxLoss:Math.max(0,Math.min(100,Number(maxLoss.value)||0)),minPilgrimages:Math.max(0,Number(pilgrimages.value)||0),requireTemple:temple.checked,requireWard:ward.checked});persist();});
- const progress=section('cave','Task & Quest Conditions');const progressActions=make('div',progress);button(progressActions,'Refresh tasks',()=>textCommand('/task'));button(progressActions,'Refresh quests',()=>{if(typeof QuestLogPacket==='function')window.gameClient?.send?.(new QuestLogPacket());});const progressList=make('div',progress);progressList.className='mb-small-note';const kind=select(progress,'Type',[['task','Task'],['quest','Quest / achievement']]);const name=field(progress,'Exact task / quest name');const condition=select(progress,'Condition',[['complete','Complete'],['count','Progress at least']]);const count=field(progress,'Progress count','number',1);const action=select(progress,'Action',[['stop','Stop CaveBot'],['label','Jump to waypoint label']]);const label=field(progress,'Waypoint label');const ruleList=make('div',progress);function renderRules(){ruleList.replaceChildren();config.conditions.forEach((r,i)=>{const row=make('div',ruleList);const enabled=check(row,`${r.name}: ${r.condition==='count'?'>= '+r.count:'complete'} → ${r.action==='label'?r.label:'stop'}`,r.enabled);enabled.addEventListener('change',()=>{r.enabled=enabled.checked;fired.delete(i);persist();});button(row,'Remove',()=>{config.conditions.splice(i,1);fired.clear();persist();renderRules();});});}button(progress,'Add condition',()=>{if(!name.value.trim())throw new Error('Enter an exact task / quest name');if(action.value==='label'&&!label.value.trim())throw new Error('Enter a waypoint label');config.conditions.push({enabled:true,kind:kind.value,name:name.value.trim(),condition:condition.value,count:Math.max(0,Number(count.value)||0),action:action.value,label:label.value.trim()});persist();renderRules();});button(progress,'Rearm conditions',()=>{fired.clear();message.textContent='Conditions rearmed.';});make('div',progress,'Conditions run once per arm, from received task/quest progress. Refresh after progress changes. Scripts can use bot.progress.matches(rule) or bot.progress.branch(rule, label).').className='mb-small-note';renderRules();
- function render(){sync();if(!loot&&lootRef){lootRef=null;draft=null;routeList.replaceChildren();}if(loot&&loot!==lootRef){lootRef=loot;draft={selected:(loot.selected||[]).map(Number),routes:{...loot.routes}};routeEnabled.checked=loot.enabled!==false;renderRoutes();}if(protection.getClientRects().length){const b=blessings||window.gameClient?.player?.blessings;blessingText.textContent=b?`Pilgrimages ${b.pilgrimageCount} · Temple ${b.hasTemple?'yes':'no'} · Ward ${b.hasWard?'yes':'no'} · Death loss ${b.lossPercent}%`:'Blessing state unknown';}if(progress.getClientRects().length)progressList.textContent=rows().map(r=>`${r.kind}: ${r.name} ${r.current}/${r.required}${r.completed?' ✓':''}`).join(' · ')||'Refresh to load task / quest progress.';if(!inv.getClientRects().length)return;const query=search.value.trim().toLowerCase(),signature=inventoryAt+':'+query;if(signature===invSignature)return;invSignature=signature;inventoryList.replaceChildren();for(const item of inventory){const def=window.gameClient?.itemDefinitionsBySid?.[item.sid];const itemName=def?.properties?.name||'Item';const desc=`${itemName} · SID ${item.sid} / CID ${item.cid} · Fluid ${item.fluidType} · Tint ${item.tintId}`;if(query&&!desc.toLowerCase().includes(query))continue;const row=make('div',inventoryList);row.style.cssText='padding:6px 0;border-bottom:1px solid #444';make('div',row,desc);button(row,'Cooking',()=>{if(item.fluidType)throw new Error('Fluid containers cannot be added as cooking food');const foods=bot.cooking.config.foods;if(!foods.some(f=>f.sid===item.sid&&f.cid===item.cid))bot.cooking.updateConfig({foods:[...foods,{sid:item.sid,cid:item.cid}]});message.textContent='Food added to Cooking.';});button(row,'Supply',()=>{const rule=bot.npcSupplyBuyer.addRule(itemName,100,10,itemName);if(rule)bot.npcSupplyBuyer.updateRule(rule.id,{sid:item.sid,cid:item.cid,fluidType:item.fluidType});message.textContent='Exact item supply rule added; edit amounts in Resupply.';});button(row,'Loot route',()=>{if(item.fluidType)throw new Error('Use mb0t looter capture for fluid-specific rules');routeSid.value=item.sid;message.textContent='SID copied to Server Loot Routing in Looter.';});}if(!inventory.length)make('div',inventoryList,'Refresh to list items in open and closed backpacks.');}
- search.addEventListener('input',render);renderUi=render;render();const timer=setInterval(()=>{evaluate();render();},1000);cleanups.push(()=>{clearInterval(timer);search.removeEventListener('input',render);sections.forEach(s=>s.remove());renderUi=()=>{};});
+ const routing=section('diagnostics','Server Loot Routing');make('div',routing,'Loads and saves the game’s SID loot list. Fluid-specific rules stay in mb0t’s looter.').className='mb-small-note';const routeActions=make('div',routing);button(routeActions,'Load server settings',()=>textCommand('/lootlist'));const routeEnabled=check(routing,'Server loot list enabled',false);const routeList=make('div',routing);routeList.style.cssText='max-height:240px;overflow:auto';const routeSid=field(routing,'Item SID','number');const routeBag=field(routing,'Destination backpack name (blank = default)');let draft=null;button(routing,'Add / update route',()=>{if(!draft)throw new Error('Load server settings first');const sid=Number(routeSid.value);if(!Number.isInteger(sid)||sid<1||sid>65535)throw new Error('Invalid SID');if(!draft.selected.includes(sid))draft.selected.push(sid);draft.routes[sid]=routeBag.value.trim();renderRoutes();});button(routing,'Save to server',()=>{if(!draft)throw new Error('Load server settings first');saveLoot(draft.selected,routeEnabled.checked,draft.routes);message.textContent='Server loot settings sent.';});let lootRef=null;function renderRoutes(){routeList.replaceChildren();for(const sid of draft?.selected||[]){const line=make('div',routeList);line.style.cssText='display:flex;gap:6px;align-items:center;margin:4px 0';make('span',line,`${sid} → ${draft.routes[sid]||'default backpack'}`).style.flex='1';button(line,'Remove',()=>{draft.selected=draft.selected.filter(n=>n!==sid);delete draft.routes[sid];renderRoutes();});}}
+ function render(){sync();if(!loot&&lootRef){lootRef=null;draft=null;routeList.replaceChildren();}if(loot&&loot!==lootRef){lootRef=loot;draft={selected:(loot.selected||[]).map(Number),routes:{...loot.routes}};routeEnabled.checked=loot.enabled!==false;renderRoutes();}if(!inv.getClientRects().length)return;const query=search.value.trim().toLowerCase(),signature=inventoryAt+':'+query;if(signature===invSignature)return;invSignature=signature;inventoryList.replaceChildren();for(const item of inventory){const def=window.gameClient?.itemDefinitionsBySid?.[item.sid];const itemName=def?.properties?.name||'Item';const desc=`${itemName} · SID ${item.sid} / CID ${item.cid} · Fluid ${item.fluidType} · Tint ${item.tintId}`;if(query&&!desc.toLowerCase().includes(query))continue;const row=make('div',inventoryList);row.style.cssText='padding:6px 0;border-bottom:1px solid #444';make('div',row,desc);button(row,'Cooking',()=>{if(item.fluidType)throw new Error('Fluid containers cannot be added as cooking food');const foods=bot.cooking.config.foods;if(!foods.some(f=>f.sid===item.sid&&f.cid===item.cid))bot.cooking.updateConfig({foods:[...foods,{sid:item.sid,cid:item.cid}]});message.textContent='Food added to Cooking.';});button(row,'Supply',()=>{const rule=bot.npcSupplyBuyer.addRule(itemName,100,10,itemName);if(rule)bot.npcSupplyBuyer.updateRule(rule.id,{sid:item.sid,cid:item.cid,fluidType:item.fluidType});message.textContent='Exact item supply rule added; edit amounts in Resupply.';});button(row,'Loot route',()=>{if(item.fluidType)throw new Error('Use mb0t looter capture for fluid-specific rules');routeSid.value=item.sid;message.textContent='SID copied to Server Loot Routing in Looter.';});}if(!inventory.length)make('div',inventoryList,'Refresh to list items in open and closed backpacks.');}
+ search.addEventListener('input',render);renderUi=render;render();const timer=setInterval(()=>{render();},1000);cleanups.push(()=>{clearInterval(timer);search.removeEventListener('input',render);sections.forEach(s=>s.remove());renderUi=()=>{};});
  }
- bot.clientExtras={config,mount,canStart,requestInventory,saveLoot,applyNative,status:()=>{sync();return {inventory:inventory.map(i=>({...i})),inventoryAt,loot,blessings:blessings||window.gameClient?.player?.blessings};}};bot.progress={rows,matches,evaluate,branch:(rule,label)=>matches(rule)?bot.goToLabel(label):false,rearm:()=>fired.clear()};bot.addCleanup(()=>{disposed=true;cleanups.reverse().forEach(f=>f());fired.clear();inventory=[];});
+ bot.clientExtras={config,mount,requestInventory,saveLoot,applyNative,status:()=>{sync();return {inventory:inventory.map(i=>({...i})),inventoryAt,loot};}};bot.progress={rows,matches,branch:(rule,label)=>matches(rule)?bot.goToLabel(label):false};bot.addCleanup(()=>{disposed=true;cleanups.reverse().forEach(f=>f());inventory=[];});
 };
 
 window.__minibiaBotBundle.installCurePoisonModule=function(bot){
@@ -52616,10 +52587,9 @@ window.__minibiaBotBundle.installFollowingItemGuard = function(bot) {
         label.title='Detect repeated movable item spawns following your movement. Alert, pause CaveBot/Targeting for 10 seconds, and try moving the item onto your tile.';
         label.innerHTML='<input type="checkbox"><span>Following Item</span>';grid.appendChild(label);
         const row=document.createElement('div');row.className='mb-alert-actions';row.style.cssText='align-items:center;flex-wrap:wrap;margin-top:5px';
-        row.innerHTML='<span class="mb-small-note" data-following-status></span><button type="button" class="mb-small-button" data-following-test-sound>Test sound</button><button type="button" class="mb-small-button" data-following-resume>Resume now</button>';grid.after(row);
+        row.innerHTML='<span class="mb-small-note" data-following-status></span><button type="button" class="mb-small-button" data-following-resume>Resume now</button>';grid.after(row);
         const input=label.querySelector('input'),status=row.querySelector('[data-following-status]'),resume=row.querySelector('[data-following-resume]');
-        const refresh=()=>{input.checked=config.enabled;status.textContent=config.enabled||hold?message+(hold?" · 10s pause":""):"";row.style.display='flex';resume.hidden=!hold;};
-        row.querySelector('[data-following-test-sound]').addEventListener('click',playAlertSound);
+        const refresh=()=>{input.checked=config.enabled;status.textContent=config.enabled||hold?message+(hold?" · 10s pause":""):"";row.style.display=hold?'flex':'none';resume.hidden=!hold;};
         input.addEventListener('change',()=>updateConfig({enabled:input.checked}));resume.addEventListener('click',()=>release());views.add(refresh);refresh();
         bot.addCleanup(()=>{views.delete(refresh);label.remove();row.remove();});
     }
@@ -52750,7 +52720,7 @@ window.__minibiaBotBundle.installGroundSpawnLogger = function(bot) {
         return true;
     }
     function mount(panel) {
-        const tab = panel?.querySelector('[data-tab-panel="alert"]');
+        const tab = panel?.querySelector('[data-tab-panel="diagnostics"]');
         if (!tab || tab.querySelector('[data-ground-spawn-logger]')) return;
         const host = document.createElement("div"); host.className="mb-section";
         host.setAttribute("data-ground-spawn-logger","");
@@ -52777,11 +52747,8 @@ window.__minibiaBotBundle.installGroundSpawnLogger = function(bot) {
 
 
 window.__minibiaBotBundle.installObservability = function(bot) {
-    const storageKey='minibiaBot.supplyEstimates';
-    const saved=bot.storage.get(storageKey,{});
-    const config={enabled:!!saved.enabled,items:Array.isArray(saved.items)?saved.items.filter(x=>Number(x.cid)>0||Number(x.sid)>0).slice(0,20):[]};
-    let player=null,lastTick=0,lastQuery=0,disposed=false,excludeSupplyUntil=0;
-    const skills=new Map(),supplies=new Map(),views=[],liveSkills=new Map();
+    let player=null,lastTick=0,disposed=false;
+    const skills=new Map(),views=[],liveSkills=new Map();
     let skillOwner=null,skillOriginal=null,skillWrapper=null;
     function detachSkills(){if(skillOwner?.__handleSkillUpdate===skillWrapper)skillOwner.__handleSkillUpdate=skillOriginal;skillOwner=skillOriginal=skillWrapper=null;}
     function observeSkills(){
@@ -52793,7 +52760,7 @@ window.__minibiaBotBundle.installObservability = function(bot) {
         skillWrapper=function(type,points,...args){
             const result=original.call(this,type,points,...args);
             if(!disposed){sync();const name=this.__getSkillNameFromType(type);
-                if((name==='mining'||name==='woodcutting'||name==='smithing')&&Number.isFinite(Number(points))){
+                if((name==='mining'||name==='woodcutting'||name==='smithing'||name==='cooking')&&Number.isFinite(Number(points))){
                     const computed=this.__calculateSkillLevelAndPercentage?.(type,Number(points),window.gameClient?.player?.vocation||0);
                     liveSkills.set(name,{points:Number(points),level:computed?.level,percent:computed?.percentage});
                 }
@@ -52802,10 +52769,8 @@ window.__minibiaBotBundle.installObservability = function(bot) {
         };
         owner.__handleSkillUpdate=skillWrapper;
     }
-    const identity=x=>`${Number(x.sid)||0}:${Number(x.cid)||0}:${Number(x.fluidType)||0}`;
-    const persist=()=>bot.storage.set(storageKey,config);
     const duration=seconds=>!Number.isFinite(seconds)||seconds<0?'—':seconds<60?'<1m':`${Math.floor(seconds/3600)?Math.floor(seconds/3600)+'h ':''}${Math.floor(seconds%3600/60)}m`;
-    function sync(){const p=window.gameClient?.player;if(p!==player){player=p;skills.clear();supplies.clear();liveSkills.clear();lastTick=0;lastQuery=0;excludeSupplyUntil=0;}return p;}
+    function sync(){const p=window.gameClient?.player;if(p!==player){player=p;skills.clear();liveSkills.clear();lastTick=0;}return p;}
     function skillSnapshot(name){
         const p=sync(),native=p?.skills,live=liveSkills.get(name),points=Number(live?.points??native?.__skills?.[name]);
         if(!Number.isFinite(points)||typeof native?.__getSkillLevel!=='function'||typeof native?.__getRequiredSkillPoints!=='function')return null;
@@ -52819,42 +52784,10 @@ window.__minibiaBotBundle.installObservability = function(bot) {
         if(bot[name]?.status?.().running)state.elapsed+=elapsed;
         state.last=value.points;
     }
-    function reading(item){return Number(item.sid)>0?bot.sidInventory?.reading(Number(item.sid)):bot.getItemCountReading?.(Number(item.cid),Number(item.fluidType)||0);}
-    function sampleSupply(item,now){
-        const r=reading(item),key=identity(item);let s=supplies.get(key);
-        if(!r||now-Number(r.at)>15000){if(s)s.stale=true;return;}
-        if(excludeSupplyUntil>0&&(!s||r.at<=excludeSupplyUntil||s.needsBaseline)){
-            if(!s){s={count:Number(r.count),at:r.at,samples:[],stale:false};supplies.set(key,s);}
-            s.count=Number(r.count);s.at=r.at;s.stale=false;s.needsBaseline=r.at<=excludeSupplyUntil;return;
-        }
-        const count=Number(r.count);if(!Number.isFinite(count))return;
-        if(!s){s={count,at:r.at,samples:[],stale:false};supplies.set(key,s);}
-        s.stale=false;
-        if(r.at===s.at)return;
-        const gap=Number(r.at)-Number(s.at);
-        // A refill or reconnect gap starts a fresh observation window.
-        if(count>s.count||gap>20000)s.samples=[];
-        else if(gap>0)s.samples.push({at:Number(r.at),elapsed:gap,used:Math.max(0,s.count-count)});
-        s.count=count;s.at=r.at;
-        s.samples=s.samples.filter(x=>now-x.at<=900000).slice(-180);
-    }
-    function supplySnapshot(item){
-        const s=supplies.get(identity(item));if(!s||s.stale)return {count:null,rate:0,seconds:null};
-        const elapsed=s.samples.reduce((n,x)=>n+x.elapsed,0),used=s.samples.reduce((n,x)=>n+x.used,0),rate=elapsed>=10000&&used>0?used/elapsed*3600000:0;
-        return {count:s.count,rate,seconds:s.count===0?0:rate>0?s.count/rate*3600:null};
-    }
     function tick(){
         if(disposed)return;observeSkills();const p=sync(),now=Date.now(),connected=!!window.gameClient?.networkManager?.isConnected?.();
         const elapsed=lastTick?Math.max(0,Math.min(2000,now-lastTick)):0;lastTick=now;
-        if(p&&connected){for(const name of ['woodcutting','mining','smithing'])sampleSkill(name,elapsed);
-            if(config.enabled){
-                const transaction=['depositer','npcSupplyBuyer','bankNpc'].some(key=>bot[key]?.status?.().running);
-                if(transaction){excludeSupplyUntil=now+15000;for(const state of supplies.values())state.needsBaseline=true;}
-                if(now-lastQuery>=5000){lastQuery=now;
-                const sid=config.items.filter(x=>Number(x.sid)>0).map(x=>Number(x.sid));if(sid.length)bot.sidInventory?.request(sid);
-                const cid=config.items.filter(x=>!Number(x.sid)).map(x=>({id:Number(x.cid),fluidType:Number(x.fluidType)||0}));if(cid.length)bot.requestItemCounts?.(cid);
-            }for(const item of config.items)sampleSupply(item,now);}
-        }else for(const s of supplies.values())s.stale=true;
+        if(p&&connected)for(const name of ['woodcutting','mining','smithing','cooking'])sampleSkill(name,elapsed);
         for(const render of views)render();
     }
     function diagnostics(){
@@ -52880,13 +52813,14 @@ window.__minibiaBotBundle.installObservability = function(bot) {
         const button=(parent,text,fn)=>{const b=make('button',parent,text);b.type='button';b.className='mb-small-button';b.addEventListener('click',fn);return b;};
         const section=(parent,title)=>{const e=make('div',parent);e.className='mb-section';e.setAttribute('data-observability','');const h=make('div',e);h.className='mb-section-title';make('span',h,title).className='mb-title-text';return e;};
         const style=make('style',panel);style.textContent='#minibia-bot-panel .mb-observe-grid{display:grid;grid-template-columns:1fr 1fr;gap:5px 10px;font-size:11px;margin:8px 0}#minibia-bot-panel .mb-skill-progress{width:100%;height:8px;accent-color:#b69b55}#minibia-bot-panel .mb-observe-row{display:flex;justify-content:space-between;gap:8px;font-size:11px;padding:5px 0;border-bottom:1px solid rgba(180,170,140,.12)}#minibia-bot-panel .mb-observe-row span{overflow-wrap:anywhere;min-width:0}';
-        for(const [name,prefix]of [['woodcutting','wc'],['mining','mn'],['smithing','sm']]){
+        for(const [name,prefix]of [['woodcutting','wc'],['mining','mn'],['smithing','sm'],['cooking','cook']]){
             const status=panel.querySelector(`[data-${prefix}="status"]`);if(!status)continue;
             const block=make('div');block.className='prof-progress';status.after(block);const label=make('div',block);label.className='mb-small-note';
             const progress=make('progress',block);progress.className='mb-skill-progress';progress.max=100;progress.setAttribute('aria-label',name+' progress to next level');
             const statistics=make('details',block);make('summary',statistics,'Statistics');const metrics=make('div',statistics);metrics.className='mb-observe-grid';
             const cells=Array.from({length:4},()=>make('span',metrics));
             button(statistics,'Reset statistics',()=>skills.delete(name));
+            if(name!=='cooking'){
             const advanced=make('details',block);make('summary',advanced,'Limits & retry settings');
             const grid=make('div',advanced);grid.className='mb-observe-grid';
             const module=bot[name];
@@ -52895,33 +52829,17 @@ window.__minibiaBotBundle.installObservability = function(bot) {
                 input.addEventListener('change',()=>{module?.updateConfig?.({[key]:input.value});input.value=module?.config?.[key]??'';});
             }
             make('div',advanced,'0 disables a limit; retry 0 means manual retries. Stops when any enabled goal is reached. Item goals use total inventory count, including closed bags. The optional label selects a waypoint; Cavebot must already be running to continue.').className='mb-small-note';
+            }
             views.push(()=>{if(!block.getClientRects().length)return;const s=skillSnapshot(name);label.textContent=s?`Skill ${s.level} · ${s.percent.toFixed(1)}% to ${s.level+1}`:'Waiting for profession skills';progress.value=s?.percent||0;
                 const values=[`Gained: ${s?.gained.toLocaleString()||0}`,`Points/h: ${Math.round(s?.rate||0).toLocaleString()}`,`To level: ${duration(s?.seconds)}`,`Remaining: ${s?.remaining.toLocaleString()||'—'}`];cells.forEach((c,i)=>{if(c.textContent!==values[i])c.textContent=values[i];});});
         }
-        const host=panel.querySelector('[data-tab-panel="status"]');if(!host)return;
-        const supply=section(host,'Supply Time Remaining'),toggle=make('input');toggle.type='checkbox';toggle.className='mb-title-toggle';toggle.checked=config.enabled;supply.firstChild.prepend(toggle);
-        toggle.addEventListener('change',()=>{config.enabled=toggle.checked;supplies.clear();lastQuery=0;persist();});
-        const editor=make('details',supply);make('summary',editor,'+ Add supply');const form=make('div',editor);form.className='mb-observe-grid';
-        const field=(text,type)=>{const l=make('label',form);l.className='mb-field';make('span',l,text).className='mb-field-label';const i=make('input',l);i.type=type;if(type==='number'){i.min='0';i.max='65535';}return i;};
-        const name=field('Name','text'),sid=field('SID (exact item)','number'),cid=field('CID (optional with SID)','number'),fluid=field('Fluid type (CID only)','number');
-        const message=make('div',supply);message.className='mb-small-note';
-        button(editor,'Add supply',()=>{const item={name:name.value.trim(),sid:Number(sid.value)||0,cid:Number(cid.value)||0,fluidType:Number(fluid.value)||0};
-            if(!Number.isInteger(item.sid)||!Number.isInteger(item.cid)||!Number.isInteger(item.fluidType)||item.sid<0||item.sid>65535||item.cid<0||item.cid>65535||item.fluidType<0||item.fluidType>255||(!item.sid&&!item.cid)){message.textContent='Enter a valid SID or CID.';return;}
-            if(item.sid&&item.fluidType){message.textContent='For fluids, leave SID blank and use CID + fluid type.';return;}
-            if(config.items.length>=20){message.textContent='Maximum 20 supplies.';return;}
-            if(config.items.some(x=>identity(x)===identity(item))){message.textContent='This supply is already tracked.';return;}
-            config.items.push(item);persist();name.value=sid.value=cid.value=fluid.value='';message.textContent='';rebuild();});
-        button(supply,'Reset estimates',()=>supplies.clear());
-        const list=make('div',supply),supplyViews=[];
-        function rebuild(){list.replaceChildren();supplyViews.length=0;for(const item of config.items){const row=make('div',list);row.className='mb-observe-row';const text=make('span',row);button(row,'×',()=>{config.items=config.items.filter(x=>x!==item);supplies.delete(identity(item));persist();rebuild();});supplyViews.push(()=>{const s=supplySnapshot(item);text.textContent=`${item.name|| (item.sid?'SID '+item.sid:'CID '+item.cid+' / fluid '+item.fluidType)} · ${s.count??'—'} left · ${Math.round(s.rate)} /h · ${duration(s.seconds)} left`;});}}
-        rebuild();const note=make('details',supply);make('summary',note,'How estimates work');make('div',note,'Tracks count decreases over the last 15 minutes. Refilling resets the estimate. Known bot deposit, sell and resupply operations are excluded, including a 15-second confirmation buffer. Manual transfers can still affect estimates. SID distinguishes items sharing a CID; fluids use CID + fluid type. Enable monitoring to refresh inventory every 5 seconds.').className='mb-small-note';
-        views.push(()=>{if(supply.getClientRects().length){toggle.checked=config.enabled;supplyViews.forEach(fn=>fn());}});
+        const host=panel.querySelector('[data-tab-panel="diagnostics"]');if(!host)return;
         const diag=section(host,'Action Diagnostics'),details=make('details',diag);make('summary',details,'Show current actions');const rows=make('div',details);let signature='';
         views.push(()=>{if(!details.open||!diag.getClientRects().length)return;const data=diagnostics(),next=JSON.stringify(data);if(next===signature)return;signature=next;rows.replaceChildren();if(!data.length)make('div',rows,'No active modules').className='mb-small-note';for(const [label,text]of data){const row=make('div',rows);row.className='mb-observe-row';make('span',row,label);make('span',row,text);}});
         tick();
     }
-    bot.observability={mount,skillSnapshot,supplySnapshot,diagnostics,config,tick,reset:()=>{skills.clear();supplies.clear();}};
-    observeSkills();sync();const timer=setInterval(tick,1000);bot.addCleanup(()=>{disposed=true;clearInterval(timer);detachSkills();views.length=0;skills.clear();supplies.clear();liveSkills.clear();});
+    bot.observability={mount,skillSnapshot,diagnostics,tick,reset:()=>{skills.clear();}};
+    observeSkills();sync();const timer=setInterval(tick,1000);bot.addCleanup(()=>{disposed=true;clearInterval(timer);detachSkills();views.length=0;skills.clear();liveSkills.clear();});
 };
 
 /** Item Dropper — independent item/ground rules, normal acknowledged inventory moves. */
@@ -53476,38 +53394,38 @@ window.__minibiaBotBundle.installWoodcuttingModule = function(bot) {
     function mount(panel){
         const host=panel.querySelector('[data-tab-panel="professions"]');if(!host)return;
         host.innerHTML=`<style>
-#minibia-bot-panel [data-tab-panel="professions"] input.mb-title-toggle{width:13px!important;height:13px!important;min-width:13px!important;margin:0!important;padding:0!important;flex:0 0 13px;}
-#minibia-bot-panel [data-tab-panel="professions"] .prof-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:8px;}
-#minibia-bot-panel [data-tab-panel="professions"] .prof-grid .mb-field{margin:0;min-width:0;}
-#minibia-bot-panel [data-tab-panel="professions"] .prof-grid input{width:100%;box-sizing:border-box;}
-#minibia-bot-panel [data-tab-panel="professions"] .prof-actions{display:flex;align-items:center;gap:6px;margin-top:9px;}
-#minibia-bot-panel [data-tab-panel="professions"] .prof-status{font-size:11px;color:var(--mb-hub-muted,#afa897);margin-top:8px;line-height:1.4;overflow-wrap:anywhere;}
-#minibia-bot-panel [data-tab-panel="professions"] details{font-size:11px;margin-top:9px;line-height:1.5;}
-#minibia-bot-panel [data-tab-panel="professions"] summary{cursor:pointer;color:#bdb5a3;}
-#minibia-bot-panel [data-tab-panel="professions"] details .mb-hint{margin-top:6px;font-size:11px;overflow-wrap:anywhere;}
-#minibia-bot-panel [data-tab-panel="professions"] .prof-food-row{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:11px;padding:5px 0;border-bottom:1px solid rgba(180,170,140,.12);}
+#minibia-bot-panel .mb-professions-panel input.mb-title-toggle{width:13px!important;height:13px!important;min-width:13px!important;margin:0!important;padding:0!important;flex:0 0 13px;}
+#minibia-bot-panel .mb-professions-panel .prof-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:8px;}
+#minibia-bot-panel .mb-professions-panel .prof-grid .mb-field{margin:0;min-width:0;}
+#minibia-bot-panel .mb-professions-panel .prof-grid input{width:100%;box-sizing:border-box;}
+#minibia-bot-panel .mb-professions-panel .prof-actions{display:flex;align-items:center;gap:6px;margin-top:9px;}
+#minibia-bot-panel .mb-professions-panel .prof-status{font-size:11px;color:var(--mb-hub-muted,#afa897);margin-top:8px;line-height:1.4;overflow-wrap:anywhere;}
+#minibia-bot-panel .mb-professions-panel details{font-size:11px;margin-top:9px;line-height:1.5;}
+#minibia-bot-panel .mb-professions-panel summary{cursor:pointer;color:#bdb5a3;}
+#minibia-bot-panel .mb-professions-panel details .mb-hint{margin-top:6px;font-size:11px;overflow-wrap:anywhere;}
+#minibia-bot-panel .mb-professions-panel .prof-food-row{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:11px;padding:5px 0;border-bottom:1px solid rgba(180,170,140,.12);}
 
-#minibia-bot-panel [data-tab-panel="professions"] .mb-prof-card {padding:8px 10px;margin-bottom:7px;}
-#minibia-bot-panel [data-tab-panel="professions"] .mb-prof-card .mb-section-title {margin-bottom:6px;}
-#minibia-bot-panel [data-tab-panel="professions"] .mb-prof-card .prof-grid {gap:5px 8px;}
-#minibia-bot-panel [data-tab-panel="professions"] .mb-prof-card input:not([type="checkbox"]) {min-width:0;padding:4px 6px;}
-#minibia-bot-panel [data-tab-panel="professions"] .prof-toolbar {display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-top:6px;}
-#minibia-bot-panel [data-tab-panel="professions"] .prof-toolbar .mb-toggle {margin:0;padding:0;font-size:11px;}
-#minibia-bot-panel [data-tab-panel="professions"] .mb-prof-card button {padding:3px 8px;}
-#minibia-bot-panel [data-tab-panel="professions"] .mb-prof-card .prof-status {font-size:10px;margin-top:5px;line-height:1.4;}
-#minibia-bot-panel [data-tab-panel="professions"] .mb-prof-card details {border-top:1px solid rgba(255,255,255,.08);margin-top:6px;padding-top:5px;font-size:11px;}
-#minibia-bot-panel [data-tab-panel="professions"] .mb-prof-card summary {color:var(--mb-hub-text-2);line-height:1.5;}
-#minibia-bot-panel [data-tab-panel="professions"] .prof-fold-body {margin-top:6px;}
-#minibia-bot-panel [data-tab-panel="professions"] .prof-progress > .mb-small-note {margin:5px 0 3px;}
-#minibia-bot-panel [data-tab-panel="professions"] .prof-progress .mb-observe-grid {margin:6px 0;gap:5px 8px;}
-#minibia-bot-panel [data-tab-panel="professions"] .prof-progress .mb-field {margin:0;min-width:0;}
-#minibia-bot-panel [data-tab-panel="professions"] .prof-cook-toolbar {display:flex;align-items:end;flex-wrap:wrap;gap:6px 10px;}
-#minibia-bot-panel [data-tab-panel="professions"] .prof-cook-count {flex:1;min-width:140px;}
-#minibia-bot-panel [data-tab-panel="professions"] .prof-cook-count input {max-width:90px;}
-#minibia-bot-panel [data-tab-panel="professions"] .prof-cook-toolbar .prof-actions {flex-wrap:wrap;margin:0;}
-#minibia-bot-panel [data-tab-panel="professions"] .prof-food-list {max-height:140px;overflow:auto;margin-top:6px;}
-#minibia-bot-panel [data-tab-panel="professions"] .prof-food-row {gap:6px;padding:4px 0;}
-#minibia-bot-panel [data-tab-panel="professions"] .prof-food-row span {min-width:0;overflow-wrap:anywhere;}
+#minibia-bot-panel .mb-professions-panel .mb-prof-card {padding:8px 10px;margin-bottom:7px;}
+#minibia-bot-panel .mb-professions-panel .mb-prof-card .mb-section-title {margin-bottom:6px;}
+#minibia-bot-panel .mb-professions-panel .mb-prof-card .prof-grid {gap:5px 8px;}
+#minibia-bot-panel .mb-professions-panel .mb-prof-card input:not([type="checkbox"]) {min-width:0;padding:4px 6px;}
+#minibia-bot-panel .mb-professions-panel .prof-toolbar {display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-top:6px;}
+#minibia-bot-panel .mb-professions-panel .prof-toolbar .mb-toggle {margin:0;padding:0;font-size:11px;}
+#minibia-bot-panel .mb-professions-panel .mb-prof-card button {padding:3px 8px;}
+#minibia-bot-panel .mb-professions-panel .mb-prof-card .prof-status {font-size:10px;margin-top:5px;line-height:1.4;}
+#minibia-bot-panel .mb-professions-panel .mb-prof-card details {border-top:1px solid rgba(255,255,255,.08);margin-top:6px;padding-top:5px;font-size:11px;}
+#minibia-bot-panel .mb-professions-panel .mb-prof-card summary {color:var(--mb-hub-text-2);line-height:1.5;}
+#minibia-bot-panel .mb-professions-panel .prof-fold-body {margin-top:6px;}
+#minibia-bot-panel .mb-professions-panel .prof-progress > .mb-small-note {margin:5px 0 3px;}
+#minibia-bot-panel .mb-professions-panel .prof-progress .mb-observe-grid {margin:6px 0;gap:5px 8px;}
+#minibia-bot-panel .mb-professions-panel .prof-progress .mb-field {margin:0;min-width:0;}
+#minibia-bot-panel .mb-professions-panel .prof-cook-toolbar {display:flex;align-items:end;flex-wrap:wrap;gap:6px 10px;}
+#minibia-bot-panel .mb-professions-panel .prof-cook-count {flex:1;min-width:140px;}
+#minibia-bot-panel .mb-professions-panel .prof-cook-count input {max-width:90px;}
+#minibia-bot-panel .mb-professions-panel .prof-cook-toolbar .prof-actions {flex-wrap:wrap;margin:0;}
+#minibia-bot-panel .mb-professions-panel .prof-food-list {max-height:140px;overflow:auto;margin-top:6px;}
+#minibia-bot-panel .mb-professions-panel .prof-food-row {gap:6px;padding:4px 0;}
+#minibia-bot-panel .mb-professions-panel .prof-food-row span {min-width:0;overflow-wrap:anywhere;}
 </style><div class="mb-section mb-prof-card"><div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-wc="enabled"><span class="mb-title-text">Woodcutting</span></div><div class="prof-grid"><label class="mb-field"><span class="mb-field-label">Interval (s)</span><input data-wc="delay" type="number" min="0.35" max="10" step="0.001"></label><label class="mb-field"><span class="mb-field-label">Radius (tiles)</span><input data-wc="range" type="number" min="1" max="8"></label></div><div class="prof-toolbar"><label class="mb-toggle"><input type="checkbox" class="mb-title-toggle" data-wc="combat"><span>Attack while gathering</span></label><button type="button" class="mb-small-button" data-wc="reset" title="Retry stripped trees">Retry</button></div><div class="prof-status" data-wc="status"></div></div>`;
         const q=k=>host.querySelector(`[data-wc="${k}"]`);
         q('combat').checked=!!config.attackWhileGathering;q('combat').addEventListener('change',()=>updateConfig({attackWhileGathering:q('combat').checked}));
@@ -53973,7 +53891,7 @@ window.__minibiaBotBundle.installCookingModule=function(bot){
  function stop(options={}){running=false;if(timer!=null)window.clearInterval(timer);timer=null;stopWalk();clearCapture();cookingBatchActive=false;reason='Stopped';if(options.persistEnabled!==false){config.enabled=false;persist();}}
  function resetBatch(){if((pending&&Date.now()-pending.at<10000)||(splitPending&&Date.now()-splitPending.at<10000)){reason='Wait for the outstanding cooking action';return false;}pending=null;splitPending=null;batchSource=null;batchFood=null;foodCursor=0;reason='Ready to continue cooking';return true;}
  function updateConfig(next){if(next.foods!==undefined){config.foods=normalize(next.foods);cookingBatchActive=false;}if(next.cookAfter!==undefined)config.cookAfter=Math.max(1,Math.trunc(Number(next.cookAfter)||10));persist();}
- function mount(panel){const parent=panel.querySelector('[data-tab-panel="professions"]');if(!parent)return;const host=document.createElement('div');parent.appendChild(host);host.innerHTML=`<div class="mb-section mb-prof-card"><div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-cook="enabled"><span class="mb-title-text">Cooking</span></div><div class="prof-cook-toolbar"><label class="mb-field prof-cook-count"><span class="mb-field-label">Fish before cooking</span><input type="number" min="1" step="1" data-cook="cookAfter"></label><div class="prof-actions"><button type="button" class="mb-small-button" data-cook="pick" title="Click a food item to capture its exact SID and CID">🔍 Pick food</button><button type="button" class="mb-small-button" data-cook="reset" title="Retry cooking">Retry</button></div></div><div data-cook="list" class="prof-food-list"></div><div class="prof-status" data-cook="status"></div><details><summary>Add food by ID</summary><div class="prof-fold-body"><div class="prof-grid"><label class="mb-field"><span class="mb-field-label">Food SID</span><input type="number" min="1" data-cook="sid"></label><label class="mb-field"><span class="mb-field-label">Food CID</span><input type="number" min="1" data-cook="cid"></label></div><div class="prof-actions"><button type="button" class="mb-small-button" data-cook="add">Add food</button></div></div></details></div>`;
+ function mount(panel){const parent=panel.querySelector('[data-tab-panel="professions"]');if(!parent)return;const host=document.createElement('div');parent.appendChild(host);host.innerHTML=`<div class="mb-section mb-prof-card"><div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-cook="enabled"><span class="mb-title-text">Cooking</span></div><div class="prof-cook-toolbar"><label class="mb-field prof-cook-count"><span class="mb-field-label">Food before cooking</span><input type="number" min="1" step="1" data-cook="cookAfter"></label><div class="prof-actions"><button type="button" class="mb-small-button" data-cook="pick" title="Click a food item to capture its exact SID and CID">🔍 Pick food</button><button type="button" class="mb-small-button" data-cook="reset" title="Retry cooking">Retry</button></div></div><div data-cook="list" class="prof-food-list"></div><div class="prof-status" data-cook="status"></div><details><summary>Add food by ID</summary><div class="prof-fold-body"><div class="prof-grid"><label class="mb-field"><span class="mb-field-label">Food SID</span><input type="number" min="1" data-cook="sid"></label><label class="mb-field"><span class="mb-field-label">Food CID</span><input type="number" min="1" data-cook="cid"></label></div><div class="prof-actions"><button type="button" class="mb-small-button" data-cook="add">Add food</button></div></div></details></div>`;
  const q=k=>host.querySelector(`[data-cook="${k}"]`);
  const render=()=>{q('list').replaceChildren();for(const f of config.foods){const row=document.createElement('div');row.className='prof-food-row';const label=document.createElement('span');const definition=window.gameClient?.itemDefinitionsBySid?.[f.sid]||window.gameClient?.itemDefinitionsByCid?.[f.cid];label.textContent=`${definition?.properties?.name||('Food '+f.sid)}${isCookable(f)?'':' · not cookable'}`;label.title=`SID ${f.sid} · CID ${f.cid}`;const remove=document.createElement('button');remove.type='button';remove.className='mb-small-button';remove.textContent='Remove';remove.addEventListener('click',()=>{updateConfig({foods:config.foods.filter(r=>r!==f)});render();});row.append(label,remove);q('list').append(row);}};
  q('cookAfter').value=config.cookAfter;q('cookAfter').addEventListener('change',()=>{updateConfig({cookAfter:q('cookAfter').value});q('cookAfter').value=config.cookAfter;});
@@ -54799,8 +54717,9 @@ window.__minibiaBotBundle.installSupportModule = function installSupportModule(b
     const state = {
         running: false,
         timerId: null,
-        lastRuneHealAt: {},
-        lastSioHealAt: {},
+        lastByRule: new Map(),
+        lastByKind: new Map(),
+        lastQuery: 0,
         lastLogAt: {},
         actionInProgress: false,
     };
@@ -54822,12 +54741,20 @@ window.__minibiaBotBundle.installSupportModule = function installSupportModule(b
         debug: false,
     }, bot.storage.get(configStorageKey, {}));
 
-    // Migrate the old broken default once. A user who deliberately configured
-    // another CID keeps that value; only the known bad legacy default changes.
-    if (Number(config.runeItemId) === 236) {
-        config.runeItemId = 3160;
-        bot.storage.set(configStorageKey, { ...config });
+    const choices={ih:{label:'IH',id:3152,sid:2265,fluidType:0,kind:'rune'},uh:{label:'UH',id:3160,sid:2273,fluidType:0,kind:'rune'},life:{label:'Life Fluid',id:2874,sid:2006,fluidType:10,kind:'fluid'},mana:{label:'Mana Fluid',id:2874,sid:2006,fluidType:7,kind:'fluid'},sio:{label:'Exura Sio',kind:'spell'}};
+    let serial=0,renderRulesUi=()=>{};
+    const newId=()=>`support-${Date.now()}-${++serial}`;
+    function normalizeRules(rules){const ids=new Set();return (Array.isArray(rules)?rules:[]).filter(r=>r&&choices[r.item]).slice(0,100).map(r=>{
+        let id=String(r.id||newId());if(ids.has(id))id=newId();ids.add(id);
+        return {id,enabled:r.enabled!==false,item:r.item,target:String(r.target||'').trim().slice(0,60),resource:r.resource==='mana'?'mana':'hp',threshold:Math.max(0,Math.min(100,Number(r.threshold??50)||0)),cooldownMs:Math.max(100,Math.min(60000,Number(r.cooldownMs)||2000))};
+    });}
+    if(!Array.isArray(config.rules)){
+        config.rules=[];
+        if(config.sioEnabled)config.rules.push({item:'sio',threshold:config.sioThreshold,cooldownMs:config.sioCooldownMs});
+        if(config.runeEnabled)config.rules.push({item:Number(config.runeItemId)===3152?'ih':'uh',threshold:config.runeThreshold,cooldownMs:config.runeCooldownMs});
     }
+    config.rules=normalizeRules(config.rules);
+    for(const key of ['runeEnabled','runeItemId','runeThreshold','runeCooldownMs','sioEnabled','sioThreshold','sioCooldownMs'])delete config[key];
 
     function persistConfig() {
         bot.storage.set(configStorageKey, { ...config });
@@ -54904,51 +54831,19 @@ window.__minibiaBotBundle.installSupportModule = function installSupportModule(b
         return (health / maxHealth) * 100;
     }
 
-    function findItemInInventory(itemId) {
-        // Support is installed in its own module scope, so it must use the
-        // shared bot item API rather than the legacy global findItemById().
-        // The shared API returns the same { container, slot, item } shape.
-        return bot.items?.findByCid?.(itemId) || null;
+    function resolvedItem(rule){const item=choices[rule.item];return {...item,id:Number(window.gameClient?.itemDefinitionsBySid?.[item.sid]?.id)||item.id};}
+    function onCooldown(kind){const hm=window.gameClient?.interface?.hotbarManager;let cd;
+        try{cd=kind==='rune'?hm?.__getRuneEffectiveCooldown?.(false):kind==='fluid'?hm?.__getFluidEffectiveCooldown?.():null;}catch{}
+        return !!(cd&&performance.now()<cd.until);
     }
-
-    // If the rune is not locally visible, use a bound hotbar item as the
-    // authoritative source. HotbarManager will fall back to HotbarUsePacket,
-    // allowing the server to resolve items that live in closed/nested bags.
-    function findRuneHotbarBinding(itemId) {
-        const hm = window.gameClient?.interface?.hotbarManager;
-        if (!hm || !Array.isArray(hm.slots)) return null;
-
-        const wanted = Number(itemId);
-        for (let i = 0; i < hm.slots.length; i++) {
-            const slot = hm.slots[i];
-            const item = slot?.item;
-            if (!item || Number(item.id) !== wanted) continue;
-            return { hotbar: hm, slot, slotIndex: i, item };
-        }
+    function findSource(item){
+        const local=bot.items?.find?.({cid:item.id,predicate:i=>Number(i.fluidType||0)===item.fluidType});if(local)return local;
+        const hm=window.gameClient?.interface?.hotbarManager;
+        const bound=hm?.slots?.find(slot=>Number(slot?.item?.id)===item.id&&Number(slot.item.fluidType||0)===item.fluidType);
+        const reading=bot.getItemCountReading?.(item.id,item.fluidType);
+        if(bound||(reading&&Date.now()-Number(reading.at)<15000&&Number(reading.count)>0))return {kind:'hotbar',item:{id:item.id,fluidType:item.fluidType}};
         return null;
     }
-
-    function getRuneCooldown() {
-        const hm = window.gameClient?.interface?.hotbarManager;
-        if (!hm || typeof hm.__getRuneEffectiveCooldown !== 'function') return null;
-
-        const defs = window.gameClient?.itemDefinitionsByCid;
-        const def = defs ? defs[Number(config.runeItemId)] : null;
-        // UH is a healing rune. Unknown definitions are treated as non-aggressive
-        // rather than incorrectly blocking on the attack-rune bucket.
-        const isAttack = !!(def?.properties && def.properties.aggressive !== false);
-        try {
-            return hm.__getRuneEffectiveCooldown(isAttack);
-        } catch (e) {
-            return null;
-        }
-    }
-
-    function isRuneOnCooldown() {
-        const cd = getRuneCooldown();
-        return !!(cd && performance.now() < cd.until);
-    }
-
     function useItemOnCreature(source, creatureId) {
         try {
             const world = window.gameClient?.world;
@@ -54990,7 +54885,7 @@ window.__minibiaBotBundle.installSupportModule = function installSupportModule(b
             const from = { which: source.container, index: source.slot };
             if (typeof ItemUseOnCreaturePacket !== 'undefined') {
                 window.gameClient.send(new ItemUseOnCreaturePacket(from, creature.id));
-                logDebug(`Sent rune CID ${source.item?.id ?? config.runeItemId} -> ${creature.name} (${creature.id})`);
+                logDebug(`Sent rune CID ${source.item?.id} -> ${creature.name} (${creature.id})`);
                 return true;
             }
 
@@ -55026,75 +54921,27 @@ window.__minibiaBotBundle.installSupportModule = function installSupportModule(b
         return sent;
     }
 
-    function tryHealTarget(creature, now) {
-        if (!creature || state.actionInProgress) return false;
-
-        // Re-resolve immediately before acting. A player can disappear between
-        // the Xray scan and the send, especially during floor changes.
-        const current = window.gameClient?.world?.getCreature?.(creature.id);
-        if (!current) return false;
-        if (typeof CONST !== 'undefined' && CONST.TYPES?.PLAYER != null
-            && current.type !== CONST.TYPES.PLAYER) return false;
-
-        const name = String(current.name || creature.name || '').trim();
-        if (!name) return false;
-        const hpPercent = getCreatureHealthPercent(current);
-        if (hpPercent == null) return false;
-
-        // Sio first, preserving the existing module behaviour.
-        if (config.sioEnabled && hpPercent < config.sioThreshold) {
-            const key = normalizeName(name);
-            const lastSio = state.lastSioHealAt[key] || 0;
-            if (now - lastSio > config.sioCooldownMs) {
-                state.actionInProgress = true;
-                try {
-                    if (castSio(name)) {
-                        state.lastSioHealAt[key] = now;
-                        logDebug(`exura sio -> ${name} (HP ${hpPercent.toFixed(0)}%)`);
-                        return true;
-                    }
-                } finally {
-                    state.actionInProgress = false;
-                }
-            }
-        }
-
-        if (!config.runeEnabled || hpPercent >= config.runeThreshold) return false;
-
-        const key = normalizeName(name);
-        const lastRune = state.lastRuneHealAt[key] || 0;
-        if (now - lastRune <= config.runeCooldownMs) return false;
-        if (isRuneOnCooldown()) return false;
-
-        let source = findItemInInventory(config.runeItemId);
-        if (!source) {
-            const hotbar = findRuneHotbarBinding(config.runeItemId);
-            if (hotbar) source = { kind: 'hotbar', ...hotbar };
-        }
-
-        if (!source) {
-            logWithDebounce('noRune', `No rune CID ${config.runeItemId} in equipment/open containers or hotbar`, 30000);
-            return false;
-        }
-
-        const releaseAction = bot.actions?.tryAcquire?.('rune-heal', config.runeCooldownMs + 500) || null;
-        if (bot.actions && !releaseAction) return false;
-
-        state.actionInProgress = true;
-        try {
-            const success = bot.actions.runShared('support-rune',
-                bot.actions.priorities.SUPPORT, () => useItemOnCreature(source, current.id));
-            if (success) {
-                state.lastRuneHealAt[key] = now;
-                logDebug(`Rune CID ${config.runeItemId} -> ${name} (HP ${hpPercent.toFixed(0)}%)`);
-                return true;
-            }
-        } finally {
-            state.actionInProgress = false;
-            releaseAction?.();
-        }
-
-        return false;
+    function resourcePercent(creature,resource){
+        if(resource==='hp')return getCreatureHealthPercent(creature);
+        const value=creature?.state?.mana??creature?.mana,max=creature?.maxMana??creature?.manaMax??creature?.state?.maxMana??creature?.state?.manaMax;
+        return value!=null&&Number(max)>0?Number(value)/Number(max)*100:null;
+    }
+    function tryHealTarget(creature,now,rule){
+        if(!rule.enabled||state.actionInProgress)return false;
+        const current=window.gameClient?.world?.getCreature?.(creature.id);if(!current)return false;
+        if(typeof CONST!=='undefined'&&CONST.TYPES?.PLAYER!=null&&current.type!==CONST.TYPES.PLAYER)return false;
+        const name=String(current.name||'').trim();if(!name||(rule.target&&normalizeName(rule.target)!==normalizeName(name)))return false;
+        const percent=resourcePercent(current,rule.resource);if(percent==null||percent>=rule.threshold)return false;
+        const item=resolvedItem(rule),last=state.lastByRule.get(rule.id),kindLast=state.lastByKind.get(item.kind);
+        if((last!=null&&now-last<rule.cooldownMs)||(kindLast&&now-kindLast.at<kindLast.cooldownMs)||onCooldown(item.kind))return false;
+        const source=item.kind==='spell'?null:findSource(item);if(item.kind!=='spell'&&!source)return false;
+        state.actionInProgress=true;
+        try{
+            const sent=item.kind==='spell'?castSio(name):bot.actions.runShared('support-'+item.kind,bot.actions.priorities.SUPPORT,()=>useItemOnCreature(source,current.id));
+            if(!sent)return false;
+            state.lastByRule.set(rule.id,now);state.lastByKind.set(item.kind,{at:now,cooldownMs:rule.cooldownMs});
+            logDebug(`${item.label} -> ${name}`);return true;
+        }finally{state.actionInProgress=false;}
     }
 
     function tick() {
@@ -55135,9 +54982,11 @@ window.__minibiaBotBundle.installSupportModule = function installSupportModule(b
             }
         });
 
-        for (const creature of targets) {
-            if (tryHealTarget(creature, now)) break;
-        }
+        if(now-state.lastQuery>=5000){state.lastQuery=now;const items=config.rules.filter(r=>r.enabled&&r.item!=='sio').map(resolvedItem);if(items.length)bot.requestItemCounts?.(items.map(i=>({id:i.id,fluidType:i.fluidType})));}
+        // Rules run in list order; a blocked rune does not block fluids.
+        let sent=false;
+        for(const rule of config.rules){for(const creature of targets){if(tryHealTarget(creature,now,rule)){sent=true;break;}}if(sent)break;}
+
 
         scheduleNextTick();
     }
@@ -55178,51 +55027,51 @@ window.__minibiaBotBundle.installSupportModule = function installSupportModule(b
         return {
             running: state.running,
             actionInProgress: state.actionInProgress,
-            runeOnCooldown: isRuneOnCooldown(),
+            runeOnCooldown: onCooldown("rune"),
+            fluidOnCooldown: onCooldown("fluid"),
             config: { ...config },
         };
     }
 
     function updateConfig(next = {}) {
         Object.assign(config, next);
-        config.runeItemId = Math.max(1, Number(config.runeItemId) || 3160);
-        // If an old saved config sneaks back in from an older build, migrate it.
-        if (config.runeItemId === 236) config.runeItemId = 3160;
-        config.runeThreshold = Math.min(100, Math.max(0, Number(config.runeThreshold) || 0));
-        config.sioThreshold = Math.min(100, Math.max(0, Number(config.sioThreshold) || 0));
-        config.runeCooldownMs = Math.max(100, Number(config.runeCooldownMs) || 100);
-        config.sioCooldownMs = Math.max(100, Number(config.sioCooldownMs) || 100);
+        config.rules=normalizeRules(config.rules);
+        const active=new Set(config.rules.map(r=>r.id));for(const id of state.lastByRule.keys())if(!active.has(id))state.lastByRule.delete(id);
         persistConfig();
 
         if (config.enabled && !state.running) start();
         if (!config.enabled && state.running) stop();
+        renderRulesUi();
         return { ...config };
     }
 
-    function test() {
-        logImportant('=== TEST ===');
-        logImportant(`Config: ${JSON.stringify(config)}`);
-        const targets = getTargets();
-        logImportant(`Targets found: ${targets.length}`);
-        for (const t of targets) {
-            const hp = getCreatureHealthPercent(t);
-            logImportant(`${t.name} HP: ${hp == null ? 'unknown' : hp.toFixed(0)}%`);
+    function test(){return {targets:getTargets().map(t=>({name:t.name,hp:getCreatureHealthPercent(t)})),rules:config.rules};}
+
+    function mountRules(panel){
+        const host=panel.querySelector('[data-support-rules]');if(!host||host.dataset.bound)return;host.dataset.bound='true';
+        const list=host.querySelector('[data-support-list]'),editor=host.querySelector('[data-support-editor]');let editing=null;
+        const q=name=>host.querySelector(`[data-support-${name}]`);
+        const saveRules=rules=>updateConfig({rules});
+        function open(rule=null){editing=rule?.id||null;q('item').value=rule?.item||'uh';q('target').value=rule?.target||'';q('resource').value=rule?.resource||'hp';q('threshold').value=rule?.threshold??50;q('cooldown').value=(rule?.cooldownMs??2000)/1000;editor.hidden=false;q('item').focus();}
+        q('add').addEventListener('click',()=>open());q('cancel').addEventListener('click',()=>editor.hidden=true);
+        q('save').addEventListener('click',()=>{const previous=config.rules.find(r=>r.id===editing);const rule={id:editing||newId(),enabled:previous?.enabled!==false,item:q('item').value,target:q('target').value,resource:q('resource').value,threshold:Number(q('threshold').value),cooldownMs:Number(q('cooldown').value)*1000};
+            saveRules(editing?config.rules.map(r=>r.id===editing?rule:r):[...config.rules,rule]);editor.hidden=true;});
+        const button=(row,text,title,fn)=>{const el=document.createElement('button');el.type='button';el.className='mb-small-button';el.textContent=text;el.title=title;el.setAttribute('aria-label',title);el.addEventListener('click',fn);row.append(el);};
+        function render(){list.replaceChildren();if(!config.rules.length){const note=document.createElement('div');note.className='mb-small-note';note.textContent='No friend healing rules. Add a rule to get started.';list.append(note);}
+            config.rules.forEach((rule,index)=>{const row=document.createElement('div');row.className='mb-support-rule';const enabled=document.createElement('input');enabled.type='checkbox';enabled.checked=rule.enabled;enabled.setAttribute('aria-label','Enable '+choices[rule.item].label+' rule');enabled.addEventListener('change',()=>saveRules(config.rules.map(r=>r.id===rule.id?{...r,enabled:enabled.checked}:r)));const text=document.createElement('span');text.style.opacity=rule.enabled?'1':'.5';text.textContent=`${choices[rule.item].label} · ${rule.resource==='mana'?'MP':'HP'} < ${rule.threshold}% · ${rule.target||'Party / trusted'} · ${rule.cooldownMs/1000}s`;row.append(enabled,text);const actions=document.createElement('div');actions.className='mb-support-rule-actions';row.append(actions);
+                const move=delta=>{const rules=[...config.rules],next=index+delta;if(next<0||next>=rules.length)return;[rules[index],rules[next]]=[rules[next],rules[index]];saveRules(rules);};
+                button(actions,'↑','Move rule up',()=>move(-1));button(actions,'↓','Move rule down',()=>move(1));button(actions,'Edit','Edit rule',()=>open(rule));button(actions,'✕','Remove rule',()=>saveRules(config.rules.filter(r=>r.id!==rule.id)));list.append(row);
+            });
         }
-        const source = findItemInInventory(config.runeItemId) || (() => {
-            const h = findRuneHotbarBinding(config.runeItemId);
-            return h ? { kind: 'hotbar', ...h } : null;
-        })();
-        logImportant(`Rune CID ${config.runeItemId} found: ${source ? 'yes' : 'no'}`);
-        if (targets.length && source && !isRuneOnCooldown()) {
-            const first = targets[0];
-            logImportant(`Attempting rune heal on ${first.name}`);
-            const success = useItemOnCreature(source, first.id);
-            logImportant(`Rune use result: ${success ? 'success' : 'failed'}`);
-        } else if (!source) {
-            logImportant(`Rune CID ${config.runeItemId} not found in equipment/open containers or hotbar.`);
-        } else if (isRuneOnCooldown()) {
-            logImportant(`Rune CID ${config.runeItemId} is currently on cooldown.`);
-        }
+        for(const [field,key]of [['include-party','includeParty'],['include-trusted','includeTrusted']]){const input=panel.querySelector('#minibia-bot-support-'+field);input.checked=config[key]!==false;input.addEventListener('change',()=>updateConfig({[key]:input.checked}));}
+        panel.querySelector('#minibia-bot-support-enabled').addEventListener('change',e=>{e.target.checked?start():stop();refreshUi();});
+        renderRulesUi=render;render();refreshUi();
+    }
+    function refreshUi(){
+        const panel=document.getElementById('minibia-bot-panel');if(!panel)return;
+        const enabled=panel.querySelector('#minibia-bot-support-enabled');if(enabled&&document.activeElement!==enabled)enabled.checked=state.running;
+        for(const [field,key]of [['include-party','includeParty'],['include-trusted','includeTrusted']]){const el=panel.querySelector('#minibia-bot-support-'+field);if(el&&document.activeElement!==el)el.checked=config[key]!==false;}
+        const status=panel.querySelector('#minibia-bot-support-status');if(status)status.textContent=state.running?`Running · ${config.rules.filter(r=>r.enabled).length} active rules`:'Stopped';
     }
 
     bot.addCleanup(() => stop({ persistEnabled: false }));
@@ -55235,7 +55084,7 @@ window.__minibiaBotBundle.installSupportModule = function installSupportModule(b
         status,
         updateConfig,
         config,
-        test,
+        test, tick, mountRules, refreshUi,
     };
 };
 
@@ -56939,7 +56788,7 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
         const tab=name=>panel.querySelector(`[data-tab-panel="${name}"]`);
         const header=(section,title)=>{const h=Array.from(section?.querySelectorAll('.mb-section-title')||[]).find(h=>h.textContent.trim()===title);return h;};
         const moveToBottom=(name,title)=>{const host=tab(name);for(const s of host?.querySelectorAll(':scope > .mb-section')||[])if(header(s,title))host.append(s);};
-        moveToBottom('resupply','Inventory Browser');moveToBottom('looter','Server Loot Routing');moveToBottom('cave','Task & Quest Conditions');
+        moveToBottom('resupply','Inventory Browser');moveToBottom('diagnostics','Server Loot Routing');
         const inventorySection=Array.from(tab('resupply')?.querySelectorAll(':scope > .mb-section')||[]).find(s=>header(s,'Inventory Browser'));
         if(inventorySection&&!inventorySection.querySelector(':scope > details')){
             const heading=header(inventorySection,'Inventory Browser'),details=document.createElement('details'),summary=document.createElement('summary');
@@ -56947,8 +56796,7 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
             details.append(summary,...Array.from(inventorySection.childNodes));inventorySection.append(details);inventorySection.classList.add('mb-resupply-inventory');
         }
 
-        const utility=tab("utility"),pauseShortcut=utility?.querySelector("[data-pause-shortcut]");
-        if(pauseShortcut)utility.append(pauseShortcut);
+        const utility=tab("utility");
 
         const targeting=tab('targeting'),core=panel.querySelector('#minibia-bot-auto-attack-enabled')?.closest('.mb-section');
         const extract=id=>{const toggle=panel.querySelector(id),h=toggle?.closest('.mb-section-title'),section=h?.parentElement;if(!section||!targeting)return null;section.classList.add('mb-section');section.style.cssText='';h.classList.remove('mb-section-title--sub');h.style.cssText='';targeting.append(section);return section;};
@@ -56957,11 +56805,7 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
         const lists=listsTitle?.parentElement;if(lists){lists.classList.add('mb-section');lists.style.cssText='';listsTitle.classList.remove('mb-section-title--sub');listsTitle.style.cssText='';targeting.append(lists);}
         const rules=targeting?.querySelector('.mb-combat-rules');if(core)targeting.prepend(core);if(rune)targeting.append(rune);if(rules)targeting.append(rules);if(lists)targeting.append(lists);
         const cave=tab('cave');for(const title of ['Recovery Safety','Debug']){const h=Array.from(cave?.querySelectorAll('.mb-section-title')||[]).find(h=>h.textContent.trim()===title);const body=h?.parentElement;if(!body||body.tagName==='DETAILS')continue;const details=document.createElement('details');details.className='mb-cave-details';const summary=document.createElement('summary');summary.className='mb-section-title mb-section-title--sub';const label=document.createElement('span');label.className='mb-title-text';label.textContent=title;summary.append(label);details.append(summary);body.replaceWith(details);h.remove();details.append(...Array.from(body.childNodes));}
-        const status=tab('status');
-        const blessing=Array.from(status?.querySelectorAll(':scope > .mb-section')||[]).find(s=>header(s,'Blessing Protection'));
-        const quick=Array.from(status?.querySelectorAll(':scope > .mb-section')||[]).find(s=>s.querySelector('.mb-status-grid'));
-        if(quick&&blessing)quick.after(blessing);
-        for(const title of ['Waypoint Properties','Task & Quest Conditions']){
+        for(const title of ['Waypoint Properties']){
             const h=Array.from(cave?.querySelectorAll('.mb-section-title')||[]).find(h=>h.textContent.trim()===title);
             const body=h?.parentElement;if(!body||body.tagName==='DETAILS'||body.querySelector(':scope > details'))continue;
             const details=document.createElement('details');details.className='mb-cave-fold';
@@ -57065,72 +56909,6 @@ function upgradeSectionHeaders(panel) {
     });
 }
     
-    // Modules surfaced in the Status tab.
-    function getStatusTabModules() {
-        return [
-            {
-                key: "cave",
-                btnId: "minibia-bot-status-cave-toggle",
-                isRunning: () => !!bot.cave?.isRunning?.(),
-                start: () => bot.cave?.start?.(),
-                stop:  () => bot.cave?.stop?.(),
-            },
-            {
-                key: "attack",
-                btnId: "minibia-bot-status-attack-toggle",
-                isRunning: () => !!bot.attack?.status?.().running,
-                start: () => bot.attack?.start?.(),
-                stop:  () => bot.attack?.stop?.(),
-            },
-            {
-                key: "heal",
-                btnId: "minibia-bot-status-heal-toggle",
-                isRunning: () => !!bot.heal?.status?.().running,
-                start: () => bot.heal?.start?.(),
-                stop:  () => bot.heal?.stop?.(),
-            },
-            {
-                key: "looter",
-                btnId: "minibia-bot-status-looter-toggle",
-                isRunning: () => !!bot.looter?.status?.().running,
-                start: () => bot.looter?.start?.(),
-                stop:  () => bot.looter?.stop?.(),
-            },
-            {
-                key: "rune",
-                btnId: "minibia-bot-status-rune-toggle",
-                isRunning: () => !!bot.rune?.status?.().running,
-                start: () => bot.rune?.start?.(),
-                stop:  () => bot.rune?.stop?.(),
-            },
-            {
-                key: "paladin",
-                btnId: "minibia-bot-status-paladin-toggle",
-                // Paladin module exposes craft and equip separately.
-                // This Status card drives the crafter only.
-                isRunning: () => !!bot.paladin?.status?.().running,
-                start: () => bot.paladin?.startCraft?.(),
-                stop:  () => bot.paladin?.stopCraft?.(),
-            },
-        ];
-    }
-
-    function refreshStatusTab() {
-        const panel = document.getElementById("minibia-bot-panel");
-        if (!panel) return;
-        getStatusTabModules().forEach(m => {
-            const card = panel.querySelector(`[data-status-module="${m.key}"]`);
-            if (!card) return;
-            let running = false;
-            try { running = !!m.isRunning(); } catch { running = false; }
-            card.dataset.running = running ? "true" : "false";
-            const textEl = card.querySelector(".mb-status-text");
-            if (textEl) textEl.textContent = running ? "Running" : "Idle";
-            const btn = card.querySelector(".mb-status-toggle");
-            if (btn) btn.textContent = running ? "Stop" : "Start";
-        });
-    }
-
     // ---- REFRESH FUNCTIONS (tie UI to bot state) ----
     function refreshAutoAttackPriorityStatus(options = {}) {
         const input = document.getElementById("minibia-bot-auto-attack-priority-names");
@@ -57309,7 +57087,8 @@ function upgradeSectionHeaders(panel) {
                     row.style.cssText = "display:flex;justify-content:space-between;align-items:center;gap:8px;padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.05);";
 
                     const label = document.createElement("span");
-                    label.textContent = String(id).startsWith('legacy:')?`${name} · re-track for SID`:`${name} · SID ${String(id).split(':')[0]} / CID ${String(id).split(':')[1]} / Fluid ${String(id).split(':')[2]||0}`;
+                    label.textContent = String(id).startsWith('legacy:') ? `${name} · re-track` : name;
+                    label.title = String(id).startsWith('legacy:') ? 'Re-track this item to capture its exact SID.' : `SID ${String(id).split(':')[0]} · CID ${String(id).split(':')[1]} · Fluid ${String(id).split(':')[2]||0}`;
                     label.style.cssText = "flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
 
                     const actions = document.createElement("div");
@@ -57342,6 +57121,8 @@ function upgradeSectionHeaders(panel) {
                     removeBtn.type = "button";
                     removeBtn.className = "mb-small-button";
                     removeBtn.textContent = "✕";
+                    removeBtn.title = "Remove tracked item";
+                    removeBtn.setAttribute("aria-label","Remove " + name);
                     removeBtn.style.cssText = "width:24px;padding:2px;background:#5a2020;color:#ff8888;border-color:#883030;";
                     removeBtn.addEventListener("click", () => {
                         bot.looter.removeTrackedItem(id);
@@ -57458,6 +57239,8 @@ function upgradeSectionHeaders(panel) {
     }
 
     function clearHealRuleForm() {
+        const editor=document.getElementById("minibia-bot-heal-editor");
+        if(editor)editor.hidden=true;
         setHealRuleFormValues({ source: "hotbar", slot: 1 });
         document.getElementById("minibia-bot-heal-save").textContent = "Add Rule";
         healEditIndex = null;
@@ -57476,9 +57259,18 @@ function upgradeSectionHeaders(panel) {
         rules.forEach((rule, index) => {
             const row = document.createElement("div");
             row.className = "mb-list-row";
-            row.style.cssText = "display:grid;grid-template-columns:1fr auto auto;gap:6px;align-items:center;padding:4px 0;border-bottom:1px solid rgba(255,255,255,0.08);";
+            row.style.cssText = "display:grid;grid-template-columns:14px minmax(0,1fr) auto auto;gap:6px;align-items:center;padding:4px 0;border-bottom:1px solid rgba(255,255,255,0.08);";
+            const enabled=document.createElement("input");
+            enabled.type="checkbox";enabled.checked=rule.enabled!==false;
+            enabled.style.cssText="width:14px;min-width:14px;margin:0;";
+            enabled.setAttribute("aria-label",`Enable healing rule ${index+1}`);
+            enabled.addEventListener("change",()=>{
+                const current=bot.heal.config.healRules.map((r,i)=>i===index?{...r,enabled:enabled.checked}:r);
+                bot.heal.updateConfig({healRules:current});refreshHealRules();
+            });row.appendChild(enabled);
             const info = document.createElement("div");
-            info.style.cssText = "display:flex;flex-wrap:wrap;gap:4px;align-items:center;font-size:11px;";
+            info.style.cssText = "display:flex;flex-wrap:wrap;gap:4px;align-items:center;font-size:11px;min-width:0;";
+            if(rule.enabled===false)info.style.opacity="0.45";
             const label = document.createElement("span"), source = bot.heal.getRuleSource(rule);
             if (source === "hotbar") label.textContent = `Hotbar Slot ${rule.slot}`;
             else if (source === "item") label.textContent = bot.heal.itemTypes[rule.item]?.label || "Choose an item";
@@ -57500,7 +57292,8 @@ function upgradeSectionHeaders(panel) {
             editBtn.type = "button"; editBtn.className = "mb-small-button"; editBtn.textContent = "Edit";
             editBtn.style.cssText = "width:auto;padding:2px 8px;";
             editBtn.addEventListener("click", () => {
-                healEditIndex = index; setHealRuleFormValues(rule);
+                healEditIndex = index; setHealRuleFormValues(bot.heal.config.healRules[index]);
+                document.getElementById("minibia-bot-heal-editor").hidden=false;
                 document.getElementById("minibia-bot-heal-save").textContent = "Update Rule";
             });
             row.appendChild(editBtn);
@@ -57529,6 +57322,7 @@ function upgradeSectionHeaders(panel) {
         const rules = bot.heal.config.healRules.slice();
         const old = healEditIndex == null ? null : rules[healEditIndex];
         const newRule = {
+            enabled: old?.enabled !== false,
             source: values.source,
             ...(old?.legacyCooldownSlot && values.source === old.source ? { legacyCooldownSlot: old.legacyCooldownSlot } : {}),
             slot: values.source === "hotbar" ? values.slot : old?.slot || 1,
@@ -58386,7 +58180,7 @@ function upgradeSectionHeaders(panel) {
             if (wp.x !== undefined && wp.x !== null) {
                 displayText = `${wp.x}, ${wp.y}, ${wp.z}`;
             }
-            if (wp.label) {
+            if (wp.label && !(wp.knightBox && /^(?:knight\s+)?box$/i.test(String(wp.label).trim()))) {
                 if (displayText) {
                     displayText = wp.label + ' (' + displayText + ')';
                 } else {
@@ -58396,7 +58190,7 @@ function upgradeSectionHeaders(panel) {
             if (!displayText) {
                 displayText = "Script";
             }
-            if (wp.knightBox) displayText = "⚔ Knight Box · " + displayText;
+            if (wp.knightBox) displayText = "⚔ Box · " + displayText;
             if (wp.stand) {
                 displayText = "📍 " + displayText;
             }
@@ -58985,18 +58779,24 @@ function upgradeSectionHeaders(panel) {
                 start: () => bot.magicShield?.start?.(),
                 stop: () => bot.magicShield?.stop?.()
             },
-        ];
+            {id:"minibia-bot-collapsed-weapon",headerId:'minibia-bot-paladin-equipper-enabled',isRunning:()=>!!bot.paladin?.status?.().equipRunning,start:()=>bot.paladin?.startEquip?.(),stop:()=>bot.paladin?.stopEquip?.()},
+            {id:"minibia-bot-collapsed-runemaker",headerId:null,isRunning:()=>!!bot.runemaker?.status?.().running,start:()=>bot.runemaker?.start?.(),stop:()=>bot.runemaker?.stop?.()},
+            {id:"minibia-bot-collapsed-support",headerId:'minibia-bot-support-enabled',isRunning:()=>!!bot.support?.status?.().running,start:()=>bot.support?.start?.(),stop:()=>bot.support?.stop?.()},
+            {id:"minibia-bot-collapsed-eat",headerId:'minibia-bot-auto-eat-enabled',isRunning:()=>!!bot.eat?.status?.().running,start:()=>bot.eat?.start?.(),stop:()=>bot.eat?.stop?.()},
+            {id:"minibia-bot-collapsed-follow",isRunning:()=>!!document.getElementById('minibia-bot-follow-enabled')?.checked,start:()=>document.getElementById('minibia-bot-follow-enabled')?.click(),stop:()=>document.getElementById('minibia-bot-follow-enabled')?.click()},
+        ].map(m=>({...m,expandedId:['heal','looter','eat','conjure-food','rune','runemaker','paladin','weapon'].includes(m.id.replace('minibia-bot-collapsed-',''))?m.id.replace('-collapsed-','-expanded-'):null}));
     }
 
     function refreshCollapsedQuickModules() {
         const panel = document.getElementById("minibia-bot-panel");
         if (!panel) return;
-        getCollapsedQuickModules().forEach(m => {
-            const btn = panel.querySelector(`#${m.id}`);
+        getCollapsedQuickModules().forEach(m => [m.id,m.expandedId].filter(Boolean).forEach(id => {
+            const btn = panel.querySelector(`#${id}`);
             if (!btn) return;
             let running = false;
             try { running = !!m.isRunning(); } catch {}
 
+            btn.setAttribute("aria-pressed",String(running));
             btn.dataset.running =
                 running ? "true" : "false";
 
@@ -59026,7 +58826,7 @@ function upgradeSectionHeaders(panel) {
             const caveDetail = movement?.safetyStopped ? ' – SAFETY STOP' :
                 running && movement?.mode ? ` – ${movement.mode}${movement.mode === 'Recovering' && movement.reason ? ` (${movement.reason})` : ''}` : '';
             btn.title = `${btn.dataset.mbBaseTitle} ${running ? "(running)" : "(stopped)"}${caveDetail}`;
-        });
+        }));
     }
 
     // ---- TITLE BAR RUN INDICATORS (clickable) ----
@@ -59046,12 +58846,14 @@ function upgradeSectionHeaders(panel) {
         } catch {}
         if (caveInd) {
             caveInd.dataset.running = caveRunning ? "true" : "false";
+            caveInd.setAttribute("aria-pressed",String(caveRunning));
             const movement = bot.cave?.getMovementSummary?.();
             caveInd.title = movement?.safetyStopped ? 'Cavebot – SAFETY STOP' :
                 caveRunning ? `Cavebot – ${movement?.mode || 'walking'}` : 'Cavebot stopped';
         }
         if (attackInd) {
             attackInd.dataset.running = attackRunning ? "true" : "false";
+            attackInd.setAttribute("aria-pressed",String(attackRunning));
             attackInd.title = attackRunning ? "Targeting running" : "Targeting stopped";
         }
     }
@@ -59064,6 +58866,19 @@ function upgradeSectionHeaders(panel) {
         const style = document.createElement("style");
         style.id = "minibia-bot-style";
         style.textContent = `
+#minibia-bot-panel .mb-audio-test-row { display:flex; align-items:center; gap:4px; min-width:0; }
+#minibia-bot-panel .mb-audio-test-row > label { flex:1; min-width:0; }
+#minibia-bot-panel button.mb-audio-test { flex:0 0 22px; width:22px; min-width:22px; height:22px; margin:0; padding:0; font-size:11px; line-height:20px; border-radius:4px; color:#d8c38b; }
+
+#minibia-bot-panel .mb-subtab-menu { display:flex; flex-wrap:wrap; gap:5px; padding:8px 8px 2px; }
+#minibia-bot-panel .mb-subtab-menu[hidden] { display:none; }
+#minibia-bot-panel .mb-subtab-button { width:auto; margin:0; padding:5px 9px; border:1px solid #444; border-radius:4px; background:#292929; color:#bdbdbd; font:inherit; font-size:11px; cursor:pointer; }
+#minibia-bot-panel .mb-subtab-button[data-active="true"] { color:#e1c57d !important; background:#38352d !important; border-color:#786b46 !important; }
+#minibia-bot-panel .mb-subtab-button:hover { color:#ead9ac; border-color:#82714c; }
+
+#minibia-bot-panel #minibia-bot-heal-new { margin-left:auto; order:2; flex-shrink:0; }
+#minibia-bot-panel #minibia-bot-heal-editor[hidden] { display:none; }
+
 #minibia-bot-panel .mb-mt-rule { padding:8px 0; border-bottom:1px solid #ffffff12; }
 #minibia-bot-panel .mb-mt-rule-top { display:flex; align-items:center; gap:6px; justify-content:space-between; }
 #minibia-bot-panel .mb-mt-rule-top > label { display:flex; align-items:center; gap:6px; min-width:0; font-size:12px; flex:1; }
@@ -59383,6 +59198,85 @@ function upgradeSectionHeaders(panel) {
   background: rgba(255, 255, 255, 0.08);
   color: #fff;
 }
+#minibia-bot-panel [data-heading-icon]::before {content:attr(data-heading-icon);display:inline-block;margin-right:5px;font-size:12px;line-height:1;letter-spacing:0;}
+#minibia-bot-panel .mb-support-rule {display:grid;grid-template-columns:14px minmax(0,1fr) auto;align-items:center;gap:5px 8px;padding:7px 0;border-bottom:1px solid rgba(255,255,255,.1);font-size:11px;}
+#minibia-bot-panel .mb-support-rule > input {width:13px;height:13px;margin:0;}
+#minibia-bot-panel .mb-support-rule-actions {display:flex;gap:4px;justify-content:flex-end;grid-column:3;}
+#minibia-bot-panel .mb-support-rule-actions button {padding:3px 7px;}
+#minibia-bot-panel [data-support-rules] > .mb-section-title::after {order:1;}
+#minibia-bot-panel [data-support-add] {order:2;}
+#minibia-bot-panel .mb-support-rule > span {min-width:0;overflow-wrap:anywhere;}
+#minibia-bot-panel .mb-support-editor {margin-top:8px;padding:8px;border:1px solid var(--mb-hub-edge);border-radius:4px;}
+#minibia-bot-panel .mb-support-editor[hidden] {display:none!important;}
+#minibia-bot-panel .mb-support-editor .mb-field {min-width:0;}
+#minibia-bot-panel .mb-looter-compact .mb-section {padding:8px 10px;}
+#minibia-bot-panel .mb-looter-compact .mb-section-title {margin-bottom:7px;}
+#minibia-bot-panel .mb-looter-destination {display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:10px;}
+#minibia-bot-panel .mb-looter-destination > span {min-width:0;overflow-wrap:anywhere;}
+#minibia-bot-panel .mb-looter-destination > button {flex:0 0 auto;}
+#minibia-bot-panel .mb-looter-add {display:flex;gap:4px;margin-bottom:6px;}
+#minibia-bot-panel .mb-looter-add input {flex:1;width:0;min-width:0;}
+#minibia-bot-panel .mb-looter-compact button {padding:4px 7px;}
+#minibia-bot-panel .mb-looter-items {max-height:230px;min-height:30px;overflow-y:auto;border:1px solid var(--mb-hub-edge);border-radius:4px;padding:3px 6px;font-size:11px;}
+#minibia-bot-panel .mb-looter-fold {border-top:1px solid rgba(255,255,255,.08);margin-top:8px;padding-top:5px;font-size:11px;}
+#minibia-bot-panel .mb-looter-fold > summary {cursor:pointer;color:var(--mb-hub-text-2);line-height:1.7;}
+#minibia-bot-panel .mb-looter-fold .mb-small-note {margin-top:5px;}
+#minibia-bot-panel .mb-looter-options {display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-top:6px;}
+#minibia-bot-panel .mb-looter-options .mb-toggle {margin:0;font-size:11px;}
+#minibia-bot-panel .mb-looter-options .mb-field {margin:0;width:110px;}
+#minibia-bot-panel .mb-looter-status {margin-top:8px;}
+#minibia-bot-panel .mb-targeting-compact .mb-section {padding:8px 10px;}
+#minibia-bot-panel .mb-targeting-compact .mb-field {min-width:0;margin-bottom:0;}
+#minibia-bot-panel .mb-targeting-compact .mb-field input,#minibia-bot-panel .mb-targeting-compact .mb-field select,#minibia-bot-panel .mb-targeting-compact textarea {min-width:0;box-sizing:border-box;}
+#minibia-bot-panel .mb-targeting-compact .mb-section-title {margin-bottom:6px;}
+#minibia-bot-panel .mb-targeting-compact .mb-toggle {font-size:11px;}
+#minibia-bot-panel .mb-targeting-compact button {padding:4px 7px;}
+#minibia-bot-panel .mb-targeting-fold {border-top:1px solid rgba(255,255,255,.08);margin-top:8px;padding-top:5px;}
+#minibia-bot-panel .mb-targeting-fold > summary {cursor:pointer;display:list-item;margin:0;padding:2px 0;font-size:11px;}
+#minibia-bot-panel .mb-targeting-fold > summary::after {display:none;}
+#minibia-bot-panel .mb-targeting-fold-body {padding:7px 0 2px;}
+#minibia-bot-panel .mb-targeting-compact .cr-toolbar {gap:8px;}
+#minibia-bot-panel .mb-targeting-options-grid {display:grid!important;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px 10px!important;align-items:end;}
+#minibia-bot-panel .mb-targeting-options-grid .mb-field {width:auto;min-width:0;margin:0;}
+#minibia-bot-panel .mb-targeting-compact .mb-field-label {display:block;font-size:10px;line-height:1.35;margin-bottom:4px;}
+#minibia-bot-panel .mb-targeting-compact input[type=number],#minibia-bot-panel .mb-targeting-compact select {width:100%;height:28px!important;min-height:28px;padding:4px 6px!important;font-size:11px!important;line-height:1.3;box-sizing:border-box;}
+#minibia-bot-panel .mb-targeting-options-grid .mb-field-label {white-space:normal;}
+#minibia-bot-panel .mb-targeting-compact .mb-toggle {display:flex;align-items:center;gap:6px;margin:0;min-height:28px;line-height:1.35;}
+#minibia-bot-panel .mb-targeting-compact input[type=checkbox] {width:14px;height:14px;min-width:14px;flex:0 0 14px;margin:0;padding:0;vertical-align:middle;}
+#minibia-bot-panel .mb-targeting-fold > summary {line-height:24px;font-size:11px;}
+#minibia-bot-panel .mb-targeting-fold > summary > .mb-title-text {display:inline-flex;align-items:center;vertical-align:middle;line-height:24px;}
+#minibia-bot-panel .mb-targeting-section-status {display:block;margin-top:7px;font-size:10px;color:var(--mb-hub-muted);}
+
+/* Shared field metrics cover static controls and dynamically mounted editors. */
+#minibia-bot-panel .mb-tab-content .mb-tab-panel input:not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]):not([type=file]):not([type=hidden]):not([type=button]):not([type=submit]),
+#minibia-bot-panel .mb-tab-content .mb-tab-panel select:not([multiple]) {
+  height:25px!important;min-height:25px!important;max-height:25px!important;
+  box-sizing:border-box!important;padding:3px 6px!important;min-width:0;
+  font-family:inherit!important;font-size:11px!important;line-height:17px!important;
+  border-radius:4px!important;vertical-align:middle;
+}
+#minibia-bot-panel .mb-tab-content .mb-tab-panel textarea {
+  box-sizing:border-box!important;padding:6px!important;min-width:0;min-height:56px;
+  font-family:inherit!important;font-size:11px!important;line-height:1.4!important;
+  border-radius:4px!important;vertical-align:top;
+}
+#minibia-bot-panel .mb-tab-content .mb-tab-panel input[type=checkbox],
+#minibia-bot-panel .mb-tab-content .mb-tab-panel input[type=radio] {
+  width:14px!important;height:14px!important;min-width:14px!important;max-width:14px!important;
+  min-height:14px!important;max-height:14px!important;box-sizing:border-box!important;
+  padding:0!important;margin:0!important;flex:0 0 14px!important;vertical-align:middle;
+}
+#minibia-bot-panel .mb-tab-content .mb-tab-panel .mb-field {min-width:0;}
+#minibia-bot-panel .mb-tab-content .mb-tab-panel .mb-field-label {
+  display:block;font-size:10px!important;line-height:1.35!important;margin:0 0 4px!important;
+}
+#minibia-bot-panel .mb-tab-content .mb-tab-panel .mb-toggle {
+  display:flex;align-items:center;gap:6px;line-height:1.35;
+}
+#minibia-bot-panel [data-combo-slot-field][hidden] {display:none!important;}
+#minibia-bot-panel .mb-title-status {flex-wrap:wrap;gap:3px;min-width:0;}
+#minibia-bot-panel .mb-expanded-module-button {cursor:pointer;padding:2px 4px;}
+#minibia-bot-panel[data-collapsed="true"] .mb-expanded-module-button {display:none!important;}
 #minibia-bot-panel .mb-collapsed-module-rows {
   display: none;
   flex-direction: column;
@@ -60503,8 +60397,16 @@ function upgradeSectionHeaders(panel) {
 <div class="mb-titlebar">
   <div class="mb-title">mb0t <span class="mb-title-version">v${String(bot.version || "?")}</span></div>
   <div class="mb-title-status">
-    <span class="mb-run-indicator" id="minibia-bot-title-cave-status" data-running="false"><span class="mb-run-dot"></span><span class="mb-run-label">🏃</span></span>
-    <span class="mb-run-indicator" id="minibia-bot-title-attack-status" data-running="false"><span class="mb-run-dot"></span><span class="mb-run-label">⚔️</span></span>
+    <button type="button" class="mb-run-indicator mb-expanded-module-button" id="minibia-bot-title-cave-status" title="Cavebot" aria-label="Cavebot" aria-pressed="false" data-running="false"><span class="mb-run-dot"></span><span class="mb-run-label">🏃</span></button>
+    <button type="button" class="mb-run-indicator mb-expanded-module-button" id="minibia-bot-title-attack-status" title="Targeting" aria-label="Targeting" aria-pressed="false" data-running="false"><span class="mb-run-dot"></span><span class="mb-run-label">⚔️</span></button>
+    <button type="button" class="mb-run-indicator mb-expanded-module-button" id="minibia-bot-expanded-heal" title="Healer" aria-label="Healer" aria-pressed="false"><span class="mb-run-dot"></span><span class="mb-run-label">💚</span></button>
+    <button type="button" class="mb-run-indicator mb-expanded-module-button" id="minibia-bot-expanded-looter" title="Looter" aria-label="Looter" aria-pressed="false"><span class="mb-run-dot"></span><span class="mb-run-label">💰</span></button>
+    <button type="button" class="mb-run-indicator mb-expanded-module-button" id="minibia-bot-expanded-eat" title="Eat Food" aria-label="Eat Food" aria-pressed="false"><span class="mb-run-dot"></span><span class="mb-run-label">🍎</span></button>
+    <button type="button" class="mb-run-indicator mb-expanded-module-button" id="minibia-bot-expanded-conjure-food" title="Conjure Food" aria-label="Conjure Food" aria-pressed="false"><span class="mb-run-dot"></span><span class="mb-run-label">🍖</span></button>
+    <button type="button" class="mb-run-indicator mb-expanded-module-button" id="minibia-bot-expanded-rune" title="Mana Trainer" aria-label="Mana Trainer" aria-pressed="false"><span class="mb-run-dot"></span><span class="mb-run-label">✨</span></button>
+    <button type="button" class="mb-run-indicator mb-expanded-module-button" id="minibia-bot-expanded-runemaker" title="Rune Crafter" aria-label="Rune Crafter" aria-pressed="false"><span class="mb-run-dot"></span><span class="mb-run-label">🔮</span></button>
+    <button type="button" class="mb-run-indicator mb-expanded-module-button" id="minibia-bot-expanded-paladin" title="Ammo Crafter" aria-label="Ammo Crafter" aria-pressed="false"><span class="mb-run-dot"></span><span class="mb-run-label">🏹</span></button>
+    <button type="button" class="mb-run-indicator mb-expanded-module-button" id="minibia-bot-expanded-weapon" title="Weapon Equipper" aria-label="Weapon Equipper" aria-pressed="false"><span class="mb-run-dot"></span><span class="mb-run-label">🗡️</span></button>
   </div>
   <div class="mb-title-actions">
     <button type="button" class="mb-icon-button" id="minibia-bot-collapse" title="Minimize">−</button>
@@ -60518,153 +60420,46 @@ function upgradeSectionHeaders(panel) {
     <button type="button" class="mb-run-indicator mb-collapsed-module-button" id="minibia-bot-collapsed-rune" title="Mana Training"><span class="mb-run-dot"></span><span class="mb-run-label">✨</span></button>
   </div>
   <div class="mb-collapsed-module-row" aria-label="Utility modules">
-    <button type="button" class="mb-run-indicator mb-collapsed-module-button" id="minibia-bot-collapsed-paladin" title="Spear Crafter"><span class="mb-run-dot"></span><span class="mb-run-label">🏹</span></button>
+    <button type="button" class="mb-run-indicator mb-collapsed-module-button" id="minibia-bot-collapsed-paladin" title="Ammo Crafter"><span class="mb-run-dot"></span><span class="mb-run-label">🏹</span></button>
     <button type="button" class="mb-run-indicator mb-collapsed-module-button" id="minibia-bot-collapsed-looter" title="Looter"><span class="mb-run-dot"></span><span class="mb-run-label">💰</span></button>
     <button type="button" class="mb-run-indicator mb-collapsed-module-button" id="minibia-bot-collapsed-fisher" title="Fishing"><span class="mb-run-dot"></span><span class="mb-run-label">🎣</span></button>
     <button type="button" class="mb-run-indicator mb-collapsed-module-button" id="minibia-bot-collapsed-equip-ring" title="Equip Ring"><span class="mb-run-dot"></span><span class="mb-run-label">💍</span></button>
   </div>
   <div class="mb-collapsed-module-row" aria-label="Combat support modules">
     <button type="button" class="mb-run-indicator mb-collapsed-module-button" id="minibia-bot-collapsed-conjure-food" title="Conjure Food"><span class="mb-run-dot"></span><span class="mb-run-label">🍖</span></button>
-    <button type="button" class="mb-run-indicator mb-collapsed-module-button" id="minibia-bot-collapsed-invisible" title="Invisible"><span class="mb-run-dot"></span><span class="mb-run-label">👻</span></button>
+    <button type="button" class="mb-run-indicator mb-collapsed-module-button" id="minibia-bot-collapsed-eat" title="Eat Food" aria-label="Eat Food" aria-pressed="false"><span class="mb-run-dot"></span><span class="mb-run-label">🍎</span></button>
     <button type="button" class="mb-run-indicator mb-collapsed-module-button" id="minibia-bot-collapsed-magic-shield" title="Utamo Vita (Mana Shield)"><span class="mb-run-dot"></span><span class="mb-run-label">🛡️</span></button>
     <button type="button" class="mb-run-indicator mb-collapsed-module-button" id="minibia-bot-collapsed-boots-swapper" title="Boots Swapper" aria-label="Boots Swapper"><span class="mb-run-dot"></span><span class="mb-run-label">🥾</span></button>
+  </div>
+  <div class="mb-collapsed-module-row" aria-label="Crafting and follow">
+<button type="button" class="mb-run-indicator mb-collapsed-module-button" id="minibia-bot-collapsed-weapon" title="Weapon Equipper" aria-label="Weapon Equipper" aria-pressed="false"><span class="mb-run-dot"></span><span class="mb-run-label">🗡️</span></button>
+<button type="button" class="mb-run-indicator mb-collapsed-module-button" id="minibia-bot-collapsed-runemaker" title="Rune Crafter" aria-label="Rune Crafter" aria-pressed="false"><span class="mb-run-dot"></span><span class="mb-run-label">🔮</span></button>
+<button type="button" class="mb-run-indicator mb-collapsed-module-button" id="minibia-bot-collapsed-follow" title="Auto Follow" aria-label="Auto Follow" aria-pressed="false"><span class="mb-run-dot"></span><span class="mb-run-label">👣</span></button>
+<button type="button" class="mb-run-indicator mb-collapsed-module-button" id="minibia-bot-collapsed-support" title="Heal Friend" aria-label="Heal Friend" aria-pressed="false"><span class="mb-run-dot"></span><span class="mb-run-label">🤝</span></button>
   </div>
 </div>
 
 <div class="mb-body">
   <div class="mb-tab-menu">
-    <button type="button" class="mb-tab-button" data-tab-button="status">📊 Status</button>
-    <button type="button" class="mb-tab-button" data-tab-button="cave">🏃‍♂️‍➡️ Cave Bot</button>
-    <button type="button" class="mb-tab-button" data-tab-button="resupply">📦 Resupply</button>
-    <button type="button" class="mb-tab-button" data-tab-button="targeting">️⚔️ Targeting</button>
-    <button type="button" class="mb-tab-button" data-tab-button="healing">💚 Healing</button>
-    <button type="button" class="mb-tab-button" data-tab-button="looter">💰 Looter</button>
-    <button type="button" class="mb-tab-button" data-tab-button="alert">⚠️ Alerts</button>
-    <button type="button" class="mb-tab-button" data-tab-button="professions">🪓 Professions</button>
-    <button type="button" class="mb-tab-button" data-tab-button="utility">🛠️ Tools</button>
-    <button type="button" class="mb-tab-button" data-tab-button="support">💕 Support</button>
-    <button type="button" class="mb-tab-button" data-tab-button="training">✨ Training</button>
-    <button type="button" class="mb-tab-button" data-tab-button="paladin">🏹 Distance</button>
-    <button type="button" class="mb-tab-button" data-tab-button="combo">💀 PVP</button>
-    <button type="button" class="mb-tab-button" data-tab-button="xray">🩻 X-Ray</button>
-    <button type="button" class="mb-tab-button" data-tab-button="talk">💬 Responder</button>
-    <button type="button" class="mb-tab-button" data-tab-button="blacklist">🗺️ Special Area</button>
-    <button type="button" class="mb-tab-button" data-tab-button="ui">🖥️ UI Tweaks</button>
-    <button type="button" class="mb-tab-button" data-tab-button="profiles">💾 Profiles</button>
+    <button type="button" class="mb-tab-button" data-tab-button="cave">Cave Bot</button>
+    <button type="button" class="mb-tab-button" data-tab-button="resupply">Resupply</button>
+    <button type="button" class="mb-tab-button" data-tab-button="targeting">Targeting</button>
+    <button type="button" class="mb-tab-button" data-tab-button="healing">Healing</button>
+    <button type="button" class="mb-tab-button" data-tab-button="looter">Looter</button>
+    <button type="button" class="mb-tab-button" data-tab-button="protection">Protection</button>
+    <button type="button" class="mb-tab-button" data-tab-button="professions">Professions</button>
+    <button type="button" class="mb-tab-button" data-tab-button="utility">Tools</button>
+    <button type="button" class="mb-tab-button" data-tab-button="training">Training</button>
+    <button type="button" class="mb-tab-button" data-tab-button="equipment">Equipment</button>
+    <button type="button" class="mb-tab-button" data-tab-button="combo">PVP</button>
+    <button type="button" class="mb-tab-button" data-tab-button="settings">Settings</button>
   </div>
 
   <div class="mb-tab-content">
 
 <div class="mb-tab-panel" data-tab-panel="professions"></div>
 
-<!-- Status Tab -->
-<div class="mb-tab-panel" data-tab-panel="status" data-active="true">
-  <div class="mb-section">
-    <div class="mb-section-title">
-      <span class="mb-title-text">📊 Quick Status</span>
-    </div>
-    <div class="mb-small-note" style="margin-bottom:10px;">
-      One-click start and stop for the core modules. Green dot = running.
-    </div>
-    <div class="mb-status-grid">
-
-      <div class="mb-status-card" data-status-module="cave">
-        <div class="mb-status-card-top">
-          <div class="mb-status-card-icon">🏃</div>
-          <div class="mb-status-card-info">
-            <div class="mb-status-card-name">Cave Bot</div>
-            <div class="mb-status-card-sub">Waypoint route</div>
-          </div>
-        </div>
-        <div class="mb-status-card-state">
-          <span class="mb-status-dot"></span>
-          <span class="mb-status-text">Idle</span>
-        </div>
-        <button type="button" class="mb-status-toggle" id="minibia-bot-status-cave-toggle">Start</button>
-      </div>
-
-      <div class="mb-status-card" data-status-module="attack">
-        <div class="mb-status-card-top">
-          <div class="mb-status-card-icon">⚔️</div>
-          <div class="mb-status-card-info">
-            <div class="mb-status-card-name">Targeting</div>
-            <div class="mb-status-card-sub">Auto attack</div>
-          </div>
-        </div>
-        <div class="mb-status-card-state">
-          <span class="mb-status-dot"></span>
-          <span class="mb-status-text">Idle</span>
-        </div>
-        <button type="button" class="mb-status-toggle" id="minibia-bot-status-attack-toggle">Start</button>
-      </div>
-
-      <div class="mb-status-card" data-status-module="heal">
-        <div class="mb-status-card-top">
-          <div class="mb-status-card-icon">💚</div>
-          <div class="mb-status-card-info">
-            <div class="mb-status-card-name">Healing</div>
-            <div class="mb-status-card-sub">HP &amp; Mana</div>
-          </div>
-        </div>
-        <div class="mb-status-card-state">
-          <span class="mb-status-dot"></span>
-          <span class="mb-status-text">Idle</span>
-        </div>
-        <button type="button" class="mb-status-toggle" id="minibia-bot-status-heal-toggle">Start</button>
-      </div>
-
-      <div class="mb-status-card" data-status-module="looter">
-        <div class="mb-status-card-top">
-          <div class="mb-status-card-icon">💰</div>
-          <div class="mb-status-card-info">
-            <div class="mb-status-card-name">Looter</div>
-            <div class="mb-status-card-sub">Tracked items</div>
-          </div>
-        </div>
-        <div class="mb-status-card-state">
-          <span class="mb-status-dot"></span>
-          <span class="mb-status-text">Idle</span>
-        </div>
-        <button type="button" class="mb-status-toggle" id="minibia-bot-status-looter-toggle">Start</button>
-      </div>
-
-      <div class="mb-status-card" data-status-module="rune">
-        <div class="mb-status-card-top">
-          <div class="mb-status-card-icon">✨</div>
-          <div class="mb-status-card-info">
-            <div class="mb-status-card-name">Mana Training</div>
-            <div class="mb-status-card-sub">Spell / rune loop</div>
-          </div>
-        </div>
-        <div class="mb-status-card-state">
-          <span class="mb-status-dot"></span>
-          <span class="mb-status-text">Idle</span>
-        </div>
-        <button type="button" class="mb-status-toggle" id="minibia-bot-status-rune-toggle">Start</button>
-      </div>
-
-      <div class="mb-status-card" data-status-module="paladin">
-        <div class="mb-status-card-top">
-          <div class="mb-status-card-icon">🏹</div>
-          <div class="mb-status-card-info">
-            <div class="mb-status-card-name">Spear Crafter</div>
-            <div class="mb-status-card-sub">Conjure ammunition</div>
-          </div>
-        </div>
-        <div class="mb-status-card-state">
-          <span class="mb-status-dot"></span>
-          <span class="mb-status-text">Idle</span>
-        </div>
-        <button type="button" class="mb-status-toggle" id="minibia-bot-status-paladin-toggle">Start</button>
-      </div>
-
-    </div>
-    <div class="mb-small-note" style="margin-top:10px;">
-      Tip: buttons always reflect the live module state. Use the other tabs for detailed configuration.
-    </div>
-  </div>
-</div>
-
+<div class="mb-tab-panel" data-tab-panel="diagnostics"></div>
 
 <!-- Healing Tab -->
 <div class="mb-tab-panel" data-tab-panel="healing">
@@ -60673,10 +60468,11 @@ function upgradeSectionHeaders(panel) {
     <div class="mb-section-title">
       <input type="checkbox" id="minibia-bot-auto-heal-enabled" class="mb-title-toggle" />
       <span class="mb-title-text">💚 Healing</span>
+      <button type="button" class="mb-small-button" id="minibia-bot-heal-new">+ Rule</button>
     </div>
 
     <div id="minibia-bot-heal-rules-list" class="mb-list" style="margin:8px 0;"></div>
-    <div class="mb-section" style="padding:10px;background:rgba(255,255,255,0.03);">
+    <div id="minibia-bot-heal-editor" class="mb-section" hidden style="padding:10px;background:rgba(255,255,255,0.03);">
       <div class="mb-section-title mb-section-title--sub" style="margin-top:0;">
         <span class="mb-title-text">Add / Edit Rule</span>
       </div>
@@ -61025,7 +60821,7 @@ function upgradeSectionHeaders(panel) {
     #minibia-bot-panel .mb-cave-compact .mb-toggle {margin:0;font-size:10px;gap:5px;}
     #minibia-bot-panel .mb-cave-compact .mb-cave-preset-row {display:grid;grid-template-columns:minmax(0,1fr) auto;gap:5px;align-items:center;}
     #minibia-bot-panel .mb-cave-compact .mb-cave-preset-actions {display:flex;gap:3px;align-items:center;}
-    #minibia-bot-panel .mb-cave-compact .mb-cave-preset-actions button {display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;min-width:28px;padding:2px;font-size:14px;white-space:nowrap;}
+    #minibia-bot-panel .mb-cave-compact .mb-cave-preset-actions button,#minibia-bot-panel .mb-cave-compact .mb-cave-preset-picker .mb-mobile-preset-arrow {display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box;flex:0 0 25px;width:25px;height:25px;min-width:25px;min-height:25px;padding:0;font-size:11px;line-height:1;white-space:nowrap;}
     #minibia-bot-panel .mb-cave-compact .mb-cave-preset-picker {display:flex;align-items:center;gap:4px;min-width:0;}
     #minibia-bot-panel .mb-cave-compact .mb-cave-preset-picker select {flex:1;min-width:0;}
     #minibia-bot-panel .mb-cave-compact .mb-mobile-preset-arrow {display:inline-flex;align-items:center;justify-content:center;width:25px;min-width:25px;padding:0;}
@@ -61037,6 +60833,8 @@ function upgradeSectionHeaders(panel) {
     #minibia-bot-panel .mb-cave-compact .mb-cave-direction select {width:48px;}
     #minibia-bot-panel .mb-cave-compact .mb-cave-add-grid {display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:4px;}
     #minibia-bot-panel .mb-cave-compact .mb-cave-add-grid + .mb-cave-add-grid {margin-top:4px;}
+    #minibia-bot-panel .mb-cave-compact .mb-cave-add-grid.mb-cave-add-grid--actions {grid-template-columns:repeat(3,minmax(0,1fr)) repeat(3,32px);}
+    #minibia-bot-panel .mb-cave-compact .mb-cave-add-grid > button {white-space:nowrap;min-width:0;}
     #minibia-bot-panel .mb-cave-compact #minibia-bot-cave-waypoint-list {max-height:150px;min-height:28px;overflow-y:auto;margin-top:6px;border:1px solid rgba(224,200,148,.18);border-radius:4px;padding:2px;font-size:10px;}
     #minibia-bot-panel .mb-cave-compact .mb-cave-waypoint-row {min-height:21px;box-sizing:border-box;}
     #minibia-bot-panel .mb-cave-compact .mb-cave-waypoint-row > span:nth-child(2) {flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
@@ -61095,9 +60893,9 @@ function upgradeSectionHeaders(panel) {
       <button type="button" class="mb-small-button" id="minibia-bot-cave-add-shovel">+ Shovel</button>
       <button type="button" class="mb-small-button" id="minibia-bot-cave-add-ladder">+ Ladder</button>
     </div>
-    <div class="mb-cave-add-grid">
+    <div class="mb-cave-add-grid mb-cave-add-grid--actions">
       <button type="button" class="mb-small-button" id="minibia-bot-cave-add-script">+ Script</button>
-      <button type="button" class="mb-small-button" id="minibia-bot-cave-add-knight-box" title="Travel with Targeting held; fight within 1 tile. Clear monsters if trapped.">+ Knight Box</button>
+      <button type="button" class="mb-small-button" id="minibia-bot-cave-add-knight-box" title="Travel with Targeting held; fight within 1 tile. Clear monsters if trapped.">+ Box</button>
       <button type="button" class="mb-small-button" id="minibia-bot-cave-add-use" title="Add an item-use waypoint">+ Use</button>
       <button type="button" class="mb-small-button" id="minibia-bot-cave-move-up" title="Move selected waypoint up" aria-label="Move selected waypoint up">▲</button>
       <button type="button" class="mb-small-button" id="minibia-bot-cave-move-down" title="Move selected waypoint down" aria-label="Move selected waypoint down">▼</button>
@@ -61356,47 +61154,7 @@ function upgradeSectionHeaders(panel) {
 <!-- Paladin Tab -->
 <div class="mb-tab-panel" data-tab-panel="paladin">
 
-  <!-- Ammo Crafter -->
-  <div class="mb-section">
-    <div class="mb-section-title">
-      <input type="checkbox" id="minibia-bot-paladin-crafter-enabled" class="mb-title-toggle" />
-      <span class="mb-title-text">🏹 Ammo Crafter</span>
-    </div>
-    <div class="mb-stack">
-      <div class="mb-form-grid">
-        <label class="mb-field" for="minibia-bot-paladin-ammo-threshold">
-          <span class="mb-field-label">Ammo Threshold</span>
-          <input type="number" id="minibia-bot-paladin-ammo-threshold" min="0" value="15" />
-        </label>
-        <label class="mb-field" for="minibia-bot-paladin-craft-mana">
-          <span class="mb-field-label">Craft Mana Cost</span>
-          <input type="number" id="minibia-bot-paladin-craft-mana" min="0" value="140" />
-        </label>
-      </div>
-
-      <div class="mb-form-grid">
-        <label class="mb-field" for="minibia-bot-paladin-craft-spell">
-          <span class="mb-field-label">Craft Spell Words</span>
-          <input type="text" id="minibia-bot-paladin-craft-spell" placeholder="exeta con" />
-        </label>
-        <label class="mb-field" for="minibia-bot-paladin-high-mana-spell">
-          <span class="mb-field-label">High Mana Spell</span>
-          <input type="text" id="minibia-bot-paladin-high-mana-spell" placeholder="utani hur" />
-        </label>
-      </div>
-
-      <div class="mb-form-grid">
-        <label class="mb-field" for="minibia-bot-paladin-high-mana-threshold">
-          <span class="mb-field-label">High Mana %</span>
-          <input type="number" id="minibia-bot-paladin-high-mana-threshold" min="0" max="100" value="98" />
-        </label>
-        <label class="mb-field" for="minibia-bot-paladin-ammo-id">
-          <span class="mb-field-label">Item ID</span>
-          <div style="display:flex;gap:5px;min-width:0;"><input type="number" id="minibia-bot-paladin-ammo-id" min="1" max="65535" step="1" placeholder="Auto (weapon / hand)" style="flex:1;min-width:0;width:0;" /><button type="button" class="mb-small-button" id="minibia-bot-paladin-capture-ammo" aria-label="Pick ammo item" title="Click ammo in a bag, equipment slot or on the ground" style="flex:0 0 32px;width:32px;padding:4px;">🔍</button></div>
-        </label>
-      </div>
-    </div>
-  </div>
+  <div class="mb-section" data-ammo-crafter-host></div>
 
   <!-- Weapon Equipper -->
   <div class="mb-section">
@@ -61435,39 +61193,17 @@ function upgradeSectionHeaders(panel) {
 </div>
 
 <!-- Looter Tab -->
-<div class="mb-tab-panel" data-tab-panel="looter">
-  <div class="mb-section">
-    <div class="mb-section-title">
-      <input type="checkbox" id="minibia-bot-looter-enabled" class="mb-title-toggle" />
-      <span class="mb-title-text">💰 Looter</span>
-    </div>
-    <div class="mb-stack">
-      <div style="display:flex; gap:6px;">
-        <button type="button" class="mb-small-button" id="minibia-bot-looter-select-dest" style="flex:1;">Set Destination</button>
-        <button type="button" class="mb-small-button" id="minibia-bot-looter-capture-item" style="flex:1;">Track Item</button>
-      </div>
-      <div class="mb-small-note" id="minibia-bot-looter-dest-status">No destination selected</div>
-      <label class="mb-toggle">
-        <input type="checkbox" id="minibia-bot-looter-walk-corpses" />
-        <span>Walk to distant corpses</span>
-      </label>
-      <label class="mb-inline" style="justify-content:space-between;gap:8px;">
-        <span>Max corpse distance</span>
-        <input type="number" id="minibia-bot-looter-corpse-distance" min="1" max="30" value="12" style="width:64px;" />
-      </label>
-      <div class="mb-small-note">When enabled, Looter waits until combat is clear, temporarily pauses CaveBot movement, walks beside a distant corpse, then immediately releases movement. Native auto-open and normal looting continue independently.</div>
-      <div class="mb-section-title mb-section-title--sub">
-        <span class="mb-title-text">Tracked Items</span>
-      </div>
-      <div id="minibia-bot-looter-item-list" style="max-height:150px; overflow-y:auto; border:1px solid rgba(224,200,148,0.2); border-radius:4px; padding:4px; font-size:11px;"></div>
-      <div class="mb-small-note" style="margin-top:3px;">Drop = move matching tracked loot to your current ground tile instead of the selected destination.</div>
-      <div style="display:flex; gap:6px; margin-top:4px;">
-        <input type="text" id="minibia-bot-looter-manual-input" placeholder="Item name" style="flex:1;" />
-        <button type="button" class="mb-small-button" id="minibia-bot-looter-manual-add">Add</button>
-      </div>
-      <div class="mb-small-note" id="minibia-bot-looter-status">Status: idle</div>
-    </div>
-  </div>
+<div class="mb-tab-panel mb-looter-compact" data-tab-panel="looter">
+ <div class="mb-section">
+  <div class="mb-section-title"><input type="checkbox" id="minibia-bot-looter-enabled" class="mb-title-toggle"><span class="mb-title-text">💰 Looter</span></div>
+  <div class="mb-looter-destination"><span class="mb-small-note" id="minibia-bot-looter-dest-status">No destination selected</span><button type="button" class="mb-small-button" id="minibia-bot-looter-select-dest" title="Choose the main loot container. Full containers overflow into child bags automatically.">Set Destination</button></div>
+  <div class="mb-section-title mb-section-title--sub"><span class="mb-title-text">Tracked Items</span></div>
+  <div class="mb-looter-add"><input type="text" id="minibia-bot-looter-manual-input" placeholder="Item name" aria-label="Item name"><button type="button" class="mb-small-button" id="minibia-bot-looter-manual-add">Add</button><button type="button" class="mb-small-button" id="minibia-bot-looter-capture-item" title="Click an item to track its exact identity" aria-label="Pick item">🔍</button></div>
+  <div id="minibia-bot-looter-item-list" class="mb-looter-items"></div>
+  <details class="mb-looter-fold"><summary>Corpse Walking</summary><div class="mb-looter-options"><label class="mb-toggle"><input type="checkbox" id="minibia-bot-looter-walk-corpses"><span>Walk to distant corpses</span></label><label class="mb-field"><span class="mb-field-label">Max distance (tiles)</span><input type="number" id="minibia-bot-looter-corpse-distance" min="1" max="30" value="12"></label></div><div class="mb-small-note">Walks to corpses once combat is clear, briefly pausing CaveBot movement.</div></details>
+  <details class="mb-looter-fold"><summary>Item options</summary><div class="mb-small-note">Drop places that item on the ground instead of in the destination. Hover an item name to see its SID, CID, and fluid type. Use the magnifying glass to capture an exact item.</div></details>
+  <div class="mb-small-note mb-looter-status" id="minibia-bot-looter-status">Status: idle</div>
+ </div>
 </div>
 
 <!-- Profiles Tab -->
@@ -61591,41 +61327,25 @@ function upgradeSectionHeaders(panel) {
 
 <!-- Combo Tab -->
 <div class="mb-tab-panel" data-tab-panel="combo">
-  <div class="mb-section">
-    <div class="mb-section-title">
-      <input type="checkbox" id="minibia-bot-combo-enabled" class="mb-title-toggle" />
-      <span class="mb-title-text">💀 ComboBot</span>
-    </div>
-    <div class="mb-stack">
-      <div class="mb-field">
-        <span class="mb-field-label">Mode</span>
-        <select id="minibia-bot-combo-mode">
-          <option value="leader">Leader</option>
-          <option value="follower">Follower (same browser)</option>
-          <option value="observed">Follower (leader hits — no leader bot)</option>
-        </select>
-      </div>
-
-      <div class="mb-field"><span class="mb-field-label">Leader name</span><input id="minibia-bot-combo-leader-name" placeholder="Exact player name" /></div>
-      <details><summary>Leader-hit mode</summary><div class="mb-small-note">Works across computers. Follows visible damage from the named leader. Area hits keep the current target when possible. Stops assisting after 8 seconds without a leader hit.</div></details>
-      <div class="mb-field">
-        <span class="mb-field-label">Hotkey Slot (1=F1 – 12=F12)</span>
-        <input type="number" id="minibia-bot-combo-slot" min="1" max="12" value="12" />
-      </div>
-
-      <div class="mb-field">
-        <span class="mb-field-label">Minimum Mana</span>
-        <input type="number" id="minibia-bot-combo-minmana" min="0" value="0" />
-      </div>
-
-      <div class="mb-field">
-        <span class="mb-field-label">Cooldown (ms)</span>
-        <input type="number" id="minibia-bot-combo-cooldown" min="100" value="1500" />
-      </div>
-
-      <div class="mb-small-note" id="minibia-bot-combo-status">Status: idle</div>
-    </div>
+ <div class="mb-section">
+  <div class="mb-section-title"><input type="checkbox" id="minibia-bot-combo-enabled" class="mb-title-toggle"><span class="mb-title-text">💀 ComboBot</span></div>
+  <div class="mb-form-grid">
+   <label class="mb-field"><span class="mb-field-label">Mode</span><select id="minibia-bot-combo-mode"><option value="leader">Leader</option><option value="follower">Follower (same browser)</option><option value="observed">Follower (leader hits)</option></select></label>
+   <label class="mb-field"><span class="mb-field-label">Leader name</span><input id="minibia-bot-combo-leader-name" placeholder="Exact player name"></label>
+   <label class="mb-field"><span class="mb-field-label">Attack rune</span><select id="minibia-bot-combo-rune"><option value="sd">Sudden Death</option><option value="hmm">Heavy Magic Missile</option><option value="lmm">Light Magic Missile</option><option value="gfb">Great Fireball</option><option value="fb">Fireball</option><option value="explo">Explosion</option><option value="none">None (target only)</option><option value="hotkey">Saved hotkey</option></select></label>
+   <label class="mb-field"><span class="mb-field-label">Cooldown (ms)</span><input type="number" id="minibia-bot-combo-cooldown" min="100" value="2000"></label>
+   <label class="mb-field"><span class="mb-field-label">Minimum mana</span><input type="number" id="minibia-bot-combo-minmana" min="0" value="0"></label>
+   <label class="mb-field" data-combo-slot-field hidden><span class="mb-field-label">Hotkey (1–12)</span><input type="number" id="minibia-bot-combo-slot" min="1" max="12" value="12"></label>
   </div>
+  <label class="mb-toggle" style="margin-top:8px"><input type="checkbox" id="minibia-bot-combo-attack-target"><span>Also attack the leader’s target</span></label>
+  <details style="margin-top:6px"><summary>How it works</summary><div class="mb-small-note">Leader broadcasts the selected target to followers in the same browser. Leader-hit mode assists visible hits without a leader bot. Runes aim at the shared target even when normal attacking is off. Area runes land on that target’s tile.</div></details>
+  <div class="mb-small-note" id="minibia-bot-combo-status">Stopped</div>
+ </div>
+ <div class="mb-section" data-hold-target>
+  <div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-hold-target-enabled><span class="mb-title-text">🎯 Hold Target</span></div>
+  <div style="display:flex;align-items:center;justify-content:space-between;gap:8px"><span class="mb-small-note" data-hold-target-status>Stopped</span><button type="button" class="mb-small-button" data-hold-target-release>Release</button></div>
+  <div class="mb-small-note" style="margin-top:6px">Reacquires your selected target when it returns to your floor. Cancel attack or press Escape to release it.</div>
+ </div>
 
   <!-- Auto Follow -->
   <div class="mb-section">
@@ -61656,44 +61376,23 @@ function upgradeSectionHeaders(panel) {
 
 <!-- Support Tab -->
 <div class="mb-tab-panel" data-tab-panel="support">
-  <div class="mb-section">
-    <div class="mb-section-title">
-      <input type="checkbox" id="minibia-bot-support-enabled" class="mb-title-toggle" />
-      <span class="mb-title-text">💕 Heal Friend / Support</span>
-    </div>
-    <div class="mb-stack">
-
-      <div class="mb-section-title mb-section-title--sub">
-        <input type="checkbox" id="minibia-bot-support-rune-enabled" class="mb-title-toggle" />
-        <span class="mb-title-text">Rune Healing</span>
-      </div>
-      <div class="mb-form-grid">
-        <label class="mb-field"><span class="mb-field-label">Rune Item ID (CID)</span><input type="number" id="minibia-bot-support-rune-itemid" min="1" value="3160" /></label>
-        <label class="mb-field"><span class="mb-field-label">HP Threshold %</span><input type="number" id="minibia-bot-support-rune-threshold" min="0" max="100" value="50" /></label>
-      </div>
-      <label class="mb-field"><span class="mb-field-label">Cooldown (ms)</span><input type="number" id="minibia-bot-support-rune-cooldown" min="100" value="2000" /></label>
-
-      <hr>
-
-      <div class="mb-section-title mb-section-title--sub">
-        <input type="checkbox" id="minibia-bot-support-sio-enabled" class="mb-title-toggle" />
-        <span class="mb-title-text">Exura Sio</span>
-      </div>
-      <div class="mb-form-grid">
-        <label class="mb-field"><span class="mb-field-label">HP Threshold %</span><input type="number" id="minibia-bot-support-sio-threshold" min="0" max="100" value="50" /></label>
-        <label class="mb-field"><span class="mb-field-label">Cooldown (ms)</span><input type="number" id="minibia-bot-support-sio-cooldown" min="100" value="2000" /></label>
-      </div>
-
-      <hr>
-
-      <div class="mb-section-title mb-section-title--sub">
-        <span class="mb-title-text">Targets</span>
-      </div>
-      <label class="mb-toggle"><input type="checkbox" id="minibia-bot-support-include-party" checked /><span>Include Party Members</span></label>
-      <label class="mb-toggle"><input type="checkbox" id="minibia-bot-support-include-trusted" checked /><span>Include Trusted Players</span></label>
-      <div class="mb-small-note" id="minibia-bot-support-status">Status: idle</div>
-    </div>
+ <div class="mb-section" data-support-rules>
+  <div class="mb-section-title"><input type="checkbox" id="minibia-bot-support-enabled" class="mb-title-toggle"><span class="mb-title-text">💕 Heal Friend</span><button type="button" class="mb-small-button" data-support-add style="margin-left:auto">+ Rule</button></div>
+  <div data-support-list></div>
+  <div data-support-editor hidden class="mb-support-editor">
+   <div class="mb-form-grid">
+    <label class="mb-field"><span class="mb-field-label">Use</span><select data-support-item><option value="ih">IH — Intense Healing</option><option value="uh">UH — Ultimate Healing</option><option value="life">Life Fluid</option><option value="mana">Mana Fluid</option><option value="sio">Exura Sio</option></select></label>
+    <label class="mb-field"><span class="mb-field-label">Friend name (optional)</span><input data-support-target placeholder="Party / trusted players"></label>
+    <label class="mb-field"><span class="mb-field-label">Friend resource</span><select data-support-resource><option value="hp">Health (HP)</option><option value="mana">Mana (when available)</option></select></label>
+    <label class="mb-field"><span class="mb-field-label">Below %</span><input data-support-threshold type="number" min="0" max="100" value="50"></label>
+    <label class="mb-field"><span class="mb-field-label">Cooldown (s)</span><input data-support-cooldown type="number" min="0.1" max="60" step="0.1" value="2"></label>
+   </div>
+   <div class="mb-small-note">Mana conditions wait for a known mana value. Other players’ mana may not be sent by the server.</div>
+   <div class="mb-support-rule-actions"><button type="button" class="mb-small-button" data-support-save>Save</button><button type="button" class="mb-small-button" data-support-cancel>Cancel</button></div>
   </div>
+  <details style="margin-top:8px"><summary>Targets</summary><label class="mb-toggle"><input type="checkbox" id="minibia-bot-support-include-party"><span>Party members</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-support-include-trusted"><span>Trusted players</span></label><div class="mb-small-note">Named rules apply to matching party or trusted players. Rules run from top to bottom; runes and fluids have separate cooldowns.</div></details>
+  <div class="mb-small-note" id="minibia-bot-support-status">Stopped</div>
+ </div>
 </div>
 
 <!-- UI Tweaks Tab -->
@@ -61729,9 +61428,9 @@ function upgradeSectionHeaders(panel) {
 
       <label class="mb-toggle" style="margin-top:8px;">
         <input type="checkbox" id="minibia-bot-ui-ttl-enabled" />
-        <span>Show Time‑To‑Level (TTL) in Performance Overlay</span>
+        <span>Show Time-To-Level (TTL)</span>
       </label>
-      <div class="mb-small-note">Displays remaining time until next level (requires Debugger overlay).</div>
+      <div class="mb-small-note">Shows time until the next level beside the other counters, even with Performance switched off.</div>
 
       <label class="mb-toggle" style="margin-top:8px;">
         <input type="checkbox" id="minibia-bot-ui-soul-enabled" />
@@ -62140,26 +61839,138 @@ function upgradeSectionHeaders(panel) {
         })();
 
         // ---- SETUP UI BEHAVIOR ----
-        // Tab switching
-        function setActiveBotTab(tabId) {
-            // Follow the moved controls when restoring the old saved tab.
-            if (tabId === "antibot") tabId = "alert";
-            panel.querySelectorAll(".mb-tab-button").forEach(btn => btn.dataset.active = btn.dataset.tabButton === tabId ? "true" : "false");
-            panel.querySelectorAll(".mb-tab-panel").forEach(tp => tp.dataset.active = tp.dataset.tabPanel === tabId ? "true" : "false");
-            try {
-                localStorage.setItem("minibia-bot-active-tab", tabId);
-            } catch {}
+        // Keep original leaf panels and control IDs intact for module mounts,
+        // refresh timers and saved selections. Only navigation is grouped.
+        const contentHost=panel.querySelector('.mb-tab-content');
+        const makeLeaf=id=>{const el=document.createElement('div');el.className='mb-tab-panel';el.dataset.tabPanel=id;contentHost.appendChild(el);return el;};
+        const skillsPanel=makeLeaf('skilltraining'),equipmentPanel=makeLeaf('equipment'),itemsPanel=makeLeaf('items');
+        const trainingPanel=panel.querySelector('[data-tab-panel="training"]');
+        const ammoHost=panel.querySelector('[data-ammo-crafter-host]');
+        if(ammoHost)trainingPanel.querySelector('[data-runemaker-host]').after(ammoHost);
+        for(const id of ['minibia-bot-slime-trainer-enabled','minibia-bot-monk-trainer-enabled']){
+            const section=panel.querySelector('#'+id)?.closest('.mb-section');if(section)skillsPanel.appendChild(section);
         }
-        panel.querySelectorAll(".mb-tab-button").forEach(btn => {
-            btn.addEventListener("click", () => setActiveBotTab(btn.dataset.tabButton));
-        });
-        const savedTab = (() => {
-            try {
-                return localStorage.getItem("minibia-bot-active-tab") || "healing";
-            } catch {
-                return "healing";
+        const equipmentSection=document.createElement('div');equipmentSection.className='mb-section mb-tools-section';
+        equipmentSection.innerHTML='<div class="mb-section-title"><span class="mb-title-text">Equipment</span></div><div class="mb-tools-control-list"></div>';
+        equipmentPanel.appendChild(equipmentSection);
+        for(const id of ['minibia-bot-equip-ring-enabled','minibia-bot-boots-swapper-enabled']){
+            const row=panel.querySelector('#'+id)?.closest('.mb-tools-control');if(row)equipmentSection.querySelector('.mb-tools-control-list').appendChild(row);
+        }
+        const weaponSection=panel.querySelector('#minibia-bot-paladin-equipper-enabled')?.closest('.mb-section');
+        if(weaponSection)equipmentPanel.appendChild(weaponSection);
+        for(const id of ['minibia-bot-auto-pickup-enabled','minibia-bot-item-dropper-enabled']){
+            const section=panel.querySelector('#'+id)?.closest('.mb-section');if(section)itemsPanel.appendChild(section);
+        }
+        const depotPanel=makeLeaf('depot'),bankPanel=makeLeaf('bank');
+        depotPanel.classList.add('mb-resupply-compact');bankPanel.classList.add('mb-resupply-compact');
+        const depotSection=panel.querySelector('#minibia-bot-depositer-workflow')?.closest('.mb-section');
+        const bankSection=panel.querySelector('#minibia-bot-bank-name')?.closest('.mb-section');
+        if(depotSection)depotPanel.appendChild(depotSection);
+        if(bankSection)bankPanel.appendChild(bankSection);
+        const professionsPanel=panel.querySelector('[data-tab-panel="professions"]');
+        professionsPanel?.classList.add('mb-professions-panel');
+        for(const [id,prefix] of [['mining','mn'],['smithing','sm'],['cooking','cook']]){
+            const leaf=makeLeaf(id);leaf.classList.add('mb-professions-panel');
+            const card=professionsPanel?.querySelector('[data-'+prefix+'="enabled"]')?.closest('.mb-prof-card');
+            if(card)leaf.appendChild(card.parentElement===professionsPanel?card:card.parentElement);
+        }
+        const shortcutsPanel=makeLeaf('shortcuts');
+        const shortcutSection=panel.querySelector('[data-pause-shortcut]');
+        if(shortcutSection)shortcutsPanel.appendChild(shortcutSection);
+        const targetingPanel=panel.querySelector('[data-tab-panel="targeting"]');
+        const targetRulesPanel=makeLeaf('targetrules'),targetListsPanel=makeLeaf('targetlists');
+        for(const leaf of [targetingPanel,targetRulesPanel,targetListsPanel])leaf?.classList.add('mb-targeting-compact');
+        const targetRuleBox=targetingPanel?.querySelector('.mb-combat-rules');
+        if(targetRuleBox){const section=document.createElement('div');section.className='mb-section';section.appendChild(targetRuleBox);targetRulesPanel.appendChild(section);}
+        const targetListsTitle=Array.from(targetingPanel?.querySelectorAll('.mb-section-title')||[]).find(h=>h.textContent.trim()==='Target Lists');
+        const targetListsSection=targetListsTitle?.parentElement;
+        if(targetListsSection){targetListsSection.classList.add('mb-section');targetListsSection.style.cssText='';targetListsTitle.classList.remove('mb-section-title--sub');targetListsTitle.style.cssText='';targetListsPanel.appendChild(targetListsSection);}
+        const targetAdvanced=Array.from(targetingPanel?.querySelectorAll('details')||[]).find(d=>d.querySelector(':scope > summary')?.textContent.trim()==='Advanced Targeting');
+        if(targetAdvanced){
+            for(const block of Array.from(targetAdvanced.children)){
+                if(block.tagName==='SUMMARY')continue;
+                const heading=block.querySelector(':scope > .mb-section-title');
+                if(!heading)continue;
+                const fold=document.createElement('details');fold.className='mb-targeting-fold';
+                const summary=document.createElement('summary');summary.className='mb-section-title mb-section-title--sub';
+                summary.append(...Array.from(heading.childNodes));heading.remove();fold.append(summary);
+                if(summary.querySelector('#minibia-bot-auto-attack-antiks'))fold.classList.add('mb-targeting-antiks');
+                const body=document.createElement('div');body.className='mb-targeting-fold-body';body.append(...Array.from(block.childNodes));fold.append(body);targetAdvanced.before(fold);
             }
-        })();
+            targetAdvanced.remove();
+        }
+        for(const fold of targetingPanel?.querySelectorAll('.mb-targeting-fold')||[]){
+            const body=fold.querySelector('.mb-targeting-fold-body');
+            const grid=document.createElement('div');grid.className='mb-targeting-options-grid';
+            const fields=Array.from(body.querySelectorAll('label.mb-field'));
+            const toggles=Array.from(body.querySelectorAll('label.mb-toggle'));
+            const antiKs=fold.querySelector('summary > input');
+            if(antiKs){const label=document.createElement('label');label.className='mb-toggle';const text=document.createElement('span');text.textContent='Enable Anti-Killsteal';label.append(antiKs,text);toggles.unshift(label);}
+            for(const field of fields){field.style.cssText='';const caption=field.querySelector('.mb-field-label');if(caption)caption.style.cssText='';const input=field.querySelector('input,select');if(input)input.style.cssText='';grid.appendChild(field);}
+            for(const toggle of toggles){toggle.style.cssText='';grid.appendChild(toggle);}
+            const status=body.querySelector('#minibia-bot-auto-attack-lure-status');
+            const pull=grid.querySelector('#minibia-bot-auto-attack-lure-offscreen-pull');
+            if(pull)pull.closest('label').title='Briefly pauses the current Walk waypoint to pull a nearby known monster.';
+            body.replaceChildren(grid);
+            if(status){status.style.cssText='';status.classList.add('mb-targeting-section-status');body.appendChild(status);}
+        }
+        const targetRulesHost=targetingPanel?.querySelector('[data-targeting-rules-host]');
+        if(targetRulesHost&&!targetRulesHost.children.length)targetRulesHost.style.display='none';
+        const interfacePanel=panel.querySelector('[data-tab-panel="ui"]');
+        const trackersPanel=makeLeaf('trackers'),namesPanel=makeLeaf('namespoofer');
+        const trackerSection=interfacePanel?.querySelector('#minibia-bot-task-tracker-enabled')?.closest('.mb-section');
+        const namesSection=interfacePanel?.querySelector('#minibia-bot-ui-name-spoofer-enabled')?.closest('.mb-section');
+        const overlaySection=document.createElement('div');overlaySection.className='mb-section';
+        overlaySection.innerHTML='<div class="mb-section-title"><span class="mb-title-text">📊 Overlays</span></div><div class="mb-stack"></div>';
+        trackersPanel.appendChild(overlaySection);
+        for(const id of ['minibia-bot-ui-ttl-enabled','minibia-bot-ui-soul-enabled']){
+            const row=interfacePanel?.querySelector('#'+id)?.closest('label');if(!row)continue;
+            const note=row.nextElementSibling?.classList.contains('mb-small-note')?row.nextElementSibling:null;
+            row.style.marginTop='0';overlaySection.querySelector('.mb-stack').appendChild(row);
+            if(note)overlaySection.querySelector('.mb-stack').appendChild(note);
+        }
+        if(trackerSection)trackersPanel.appendChild(trackerSection);
+        if(namesSection)namesPanel.appendChild(namesSection);
+        const botTabGroups=[
+            {id:'cave',label:'Cave Bot',tabs:[['cave','Route'],['blacklist','Areas'],['resupply','Supplies'],['depot','Depot'],['bank','Bank']]},
+            {id:'targeting',label:'Targeting',tabs:[['targeting','Behavior'],['targetrules','Rules'],['targetlists','Lists']]},
+            {id:'healing',label:'Healing',tabs:[['healing','Self'],['support','Friends']]},
+            {id:'looter',label:'Looter',tabs:[['looter','Looter']]},
+            {id:'protection',label:'Protection',tabs:[['alert','Alerts'],['gmprotection','GM Protection'],['talk','Responder']]},
+            {id:'professions',label:'Professions',tabs:[['professions','Woodcutting'],['mining','Mining'],['smithing','Smithing'],['cooking','Cooking']]},
+            {id:'utility',label:'Tools',tabs:[['utility','General'],['items','Items'],['ui','Interface'],['trackers','Trackers'],['namespoofer','Name Spoofer']]},
+            {id:'training',label:'Training',tabs:[['training','Crafting'],['skilltraining','Skill Training']]},
+            {id:'equipment',label:'Equipment',tabs:[['equipment','Equipment']]},
+            {id:'combo',label:'PVP',tabs:[['combo','PVP']]},
+            {id:'settings',label:'Settings',tabs:[['xray','X-Ray'],['profiles','Profiles'],['diagnostics','Diagnostics'],['shortcuts','Shortcuts']]},
+        ];
+        const tabContent=panel.querySelector('.mb-tab-content');
+        const gmPanel=document.createElement('div');gmPanel.className='mb-tab-panel mb-alert-compact';gmPanel.dataset.tabPanel='gmprotection';
+        const gmSection=panel.querySelector('.mb-alert-antibot');
+        if(gmSection)gmPanel.appendChild(gmSection);
+        tabContent.appendChild(gmPanel);
+        const subtabBar=document.createElement('div');subtabBar.className='mb-subtab-menu';subtabBar.setAttribute('role','tablist');subtabBar.setAttribute('aria-label','Section');tabContent.prepend(subtabBar);
+        const menu=panel.querySelector('.mb-tab-menu');menu.replaceChildren();
+        for(const group of botTabGroups){const button=document.createElement('button');button.type='button';button.className='mb-tab-button';button.dataset.tabButton=group.id;button.textContent=group.label;menu.appendChild(button);}
+        let lastSubtabs={};try{const saved=JSON.parse(localStorage.getItem('minibia-bot-active-subtabs')||'{}');if(saved&&typeof saved==='object'&&!Array.isArray(saved))lastSubtabs=saved;}catch{}
+        function setActiveBotTab(tabId,selectGroup=false) {
+            if(tabId==='status')tabId='diagnostics';
+            if(tabId==='antibot')tabId='gmprotection';
+            if(tabId==='paladin')tabId='training';
+            const leafGroup=botTabGroups.find(g=>g.tabs.some(([id])=>id===tabId));
+            const group=(selectGroup?botTabGroups.find(g=>g.id===tabId):leafGroup)||botTabGroups.find(g=>g.id===tabId)||botTabGroups.find(g=>g.id==='healing');
+            let leaf=(!selectGroup&&group.tabs.some(([id])=>id===tabId))?tabId:lastSubtabs[group.id];
+            if(!group.tabs.some(([id])=>id===leaf))leaf=group.tabs[0][0];
+            lastSubtabs[group.id]=leaf;
+            panel.querySelectorAll('.mb-tab-button').forEach(btn=>{const active=btn.dataset.tabButton===group.id;btn.dataset.active=String(active);btn.setAttribute('aria-pressed',String(active));});
+            panel.querySelectorAll('.mb-tab-panel').forEach(tp=>tp.dataset.active=String(tp.dataset.tabPanel===leaf));
+            subtabBar.replaceChildren();subtabBar.hidden=group.tabs.length<2;
+            for(const [id,label]of group.tabs){const button=document.createElement('button');button.type='button';button.className='mb-subtab-button';button.textContent=label;button.dataset.subtab=id;button.dataset.active=String(id===leaf);button.setAttribute('role','tab');button.setAttribute('aria-selected',String(id===leaf));button.addEventListener('click',()=>setActiveBotTab(id));subtabBar.appendChild(button);}
+            tabContent.scrollTop=0;
+            try{localStorage.setItem('minibia-bot-active-tab',leaf);localStorage.setItem('minibia-bot-active-subtabs',JSON.stringify(lastSubtabs));}catch{}
+        }
+        panel.querySelectorAll('.mb-tab-button').forEach(btn=>btn.addEventListener('click',()=>setActiveBotTab(btn.dataset.tabButton,true)));
+        const savedTab=(()=>{try{return localStorage.getItem('minibia-bot-active-tab')||'healing';}catch{return 'healing';}})();
         setActiveBotTab(savedTab);
 
         // Collapse button
@@ -62172,8 +61983,8 @@ function upgradeSectionHeaders(panel) {
         }
 
         // Collapsed quick module toggles
-        getCollapsedQuickModules().forEach(m => {
-            const btn = panel.querySelector(`#${m.id}`);
+        getCollapsedQuickModules().forEach(m => [m.id,m.expandedId].filter(Boolean).forEach(id => {
+            const btn = panel.querySelector(`#${id}`);
             if (!btn) return;
             btn.addEventListener("click", (e) => {
                 e.preventDefault();
@@ -62201,9 +62012,9 @@ function upgradeSectionHeaders(panel) {
                 try { refreshAutoInvisibleStatus?.(); } catch {}
                 try { refreshAutoMagicShieldStatus?.(); } catch {}
                 try { refreshTitlebarRunIndicators?.(); } catch {}
-                try { refreshStatusTab?.(); } catch {}
+                
             });
-        });
+        }));
 
         // Title bar click toggles
         const titleCave = panel.querySelector("#minibia-bot-title-cave-status");
@@ -62453,161 +62264,9 @@ function upgradeSectionHeaders(panel) {
         }
 
         // ---- Support Module UI ----
-        function refreshSupportStatus() {
-            const status = bot.support?.status?.();
-            if (!status)
-                return;
-
-            const ids = {
-                enabled: document.getElementById("minibia-bot-support-enabled"),
-                runeEnabled: document.getElementById("minibia-bot-support-rune-enabled"),
-                runeItemId: document.getElementById("minibia-bot-support-rune-itemid"),
-                runeThreshold: document.getElementById("minibia-bot-support-rune-threshold"),
-                runeCooldown: document.getElementById("minibia-bot-support-rune-cooldown"),
-                sioEnabled: document.getElementById("minibia-bot-support-sio-enabled"),
-                sioThreshold: document.getElementById("minibia-bot-support-sio-threshold"),
-                sioCooldown: document.getElementById("minibia-bot-support-sio-cooldown"),
-                includeParty: document.getElementById("minibia-bot-support-include-party"),
-                includeTrusted: document.getElementById("minibia-bot-support-include-trusted"),
-                statusLabel: document.getElementById("minibia-bot-support-status"),
-            };
-
-            const cfg = status.config;
-            if (ids.enabled && document.activeElement !== ids.enabled)
-                ids.enabled.checked = status.running;
-            if (ids.runeEnabled && document.activeElement !== ids.runeEnabled)
-                ids.runeEnabled.checked = cfg.runeEnabled;
-            if (ids.runeItemId && document.activeElement !== ids.runeItemId)
-                ids.runeItemId.value = cfg.runeItemId || 3160;
-            if (ids.runeThreshold && document.activeElement !== ids.runeThreshold)
-                ids.runeThreshold.value = cfg.runeThreshold || 50;
-            if (ids.runeCooldown && document.activeElement !== ids.runeCooldown)
-                ids.runeCooldown.value = cfg.runeCooldownMs || 2000;
-            if (ids.sioEnabled && document.activeElement !== ids.sioEnabled)
-                ids.sioEnabled.checked = cfg.sioEnabled;
-            if (ids.sioThreshold && document.activeElement !== ids.sioThreshold)
-                ids.sioThreshold.value = cfg.sioThreshold || 50;
-            if (ids.sioCooldown && document.activeElement !== ids.sioCooldown)
-                ids.sioCooldown.value = cfg.sioCooldownMs || 2000;
-            if (ids.includeParty && document.activeElement !== ids.includeParty)
-                ids.includeParty.checked = cfg.includeParty !== false;
-            if (ids.includeTrusted && document.activeElement !== ids.includeTrusted)
-                ids.includeTrusted.checked = cfg.includeTrusted !== false;
-            if (ids.statusLabel)
-                ids.statusLabel.textContent = status.running ? "Status: running" : "Status: idle";
-        }
-
-        // ---- Support event listeners ----
-        const supportEnabled = document.getElementById("minibia-bot-support-enabled");
-        if (supportEnabled) {
-            supportEnabled.addEventListener("change", function () {
-                if (this.checked)
-                    bot.support.start();
-                else
-                    bot.support.stop();
-                refreshSupportStatus();
-            });
-        }
-
-        const supportRuneEnabled = document.getElementById("minibia-bot-support-rune-enabled");
-        if (supportRuneEnabled) {
-            supportRuneEnabled.addEventListener("change", function () {
-                bot.support.updateConfig({
-                    runeEnabled: this.checked
-                });
-                refreshSupportStatus();
-            });
-        }
-
-        const supportRuneItemId = document.getElementById("minibia-bot-support-rune-itemid");
-        if (supportRuneItemId) {
-            supportRuneItemId.addEventListener("change", function () {
-                const val = Math.max(1, parseInt(this.value) || 3160);
-                this.value = val;
-                bot.support.updateConfig({
-                    runeItemId: val
-                });
-                refreshSupportStatus();
-            });
-        }
-
-        const supportRuneThreshold = document.getElementById("minibia-bot-support-rune-threshold");
-        if (supportRuneThreshold) {
-            supportRuneThreshold.addEventListener("change", function () {
-                const val = Math.min(100, Math.max(0, parseInt(this.value) || 50));
-                this.value = val;
-                bot.support.updateConfig({
-                    runeThreshold: val
-                });
-                refreshSupportStatus();
-            });
-        }
-
-        const supportRuneCooldown = document.getElementById("minibia-bot-support-rune-cooldown");
-        if (supportRuneCooldown) {
-            supportRuneCooldown.addEventListener("change", function () {
-                const val = Math.max(100, parseInt(this.value) || 2000);
-                this.value = val;
-                bot.support.updateConfig({
-                    runeCooldownMs: val
-                });
-                refreshSupportStatus();
-            });
-        }
-
-        const supportSioEnabled = document.getElementById("minibia-bot-support-sio-enabled");
-        if (supportSioEnabled) {
-            supportSioEnabled.addEventListener("change", function () {
-                bot.support.updateConfig({
-                    sioEnabled: this.checked
-                });
-                refreshSupportStatus();
-            });
-        }
-
-        const supportSioThreshold = document.getElementById("minibia-bot-support-sio-threshold");
-        if (supportSioThreshold) {
-            supportSioThreshold.addEventListener("change", function () {
-                const val = Math.min(100, Math.max(0, parseInt(this.value) || 50));
-                this.value = val;
-                bot.support.updateConfig({
-                    sioThreshold: val
-                });
-                refreshSupportStatus();
-            });
-        }
-
-        const supportSioCooldown = document.getElementById("minibia-bot-support-sio-cooldown");
-        if (supportSioCooldown) {
-            supportSioCooldown.addEventListener("change", function () {
-                const val = Math.max(100, parseInt(this.value) || 2000);
-                this.value = val;
-                bot.support.updateConfig({
-                    sioCooldownMs: val
-                });
-                refreshSupportStatus();
-            });
-        }
-
-        const supportIncludeParty = document.getElementById("minibia-bot-support-include-party");
-        if (supportIncludeParty) {
-            supportIncludeParty.addEventListener("change", function () {
-                bot.support.updateConfig({
-                    includeParty: this.checked
-                });
-                refreshSupportStatus();
-            });
-        }
-
-        const supportIncludeTrusted = document.getElementById("minibia-bot-support-include-trusted");
-        if (supportIncludeTrusted) {
-            supportIncludeTrusted.addEventListener("change", function () {
-                bot.support.updateConfig({
-                    includeTrusted: this.checked
-                });
-                refreshSupportStatus();
-            });
-        }
+        bot.support?.mountRules?.(panel);
+        bot.holdTarget?.mount?.(panel);
+        function refreshSupportStatus(){bot.support?.refreshUi?.();}
 
         // ---- Keep Diagonal ----
         const keepDiagonalToggle = document.getElementById("minibia-bot-auto-attack-keep-diagonal");
@@ -63080,140 +62739,12 @@ function upgradeSectionHeaders(panel) {
             bot.stopFollow?.();
         });
 
-        // ---- ComboBot: Leader Name & Auto Follow ----
-        const comboLeaderName = panel.querySelector("#minibia-bot-combo-leader-name");
-        const comboAutoFollow = panel.querySelector("#minibia-bot-combo-auto-follow");
-
-        if (comboLeaderName) {
-            comboLeaderName.addEventListener("change", function () {
-                bot.comboBot.updateConfig({
-                    leaderName: this.value
-                });
-                refreshComboStatus();
-            });
-        }
-
-        if (comboAutoFollow) {
-            comboAutoFollow.addEventListener("change", function () {
-                bot.comboBot.updateConfig({
-                    autoFollowLeader: this.checked
-                });
-                refreshComboStatus();
-            });
-        }
-
         // ---- ComboBot ----
-        const comboMode = panel.querySelector("#minibia-bot-combo-mode");
-        const comboToggle = panel.querySelector("#minibia-bot-combo-enabled");
-        const comboSlot = panel.querySelector("#minibia-bot-combo-slot");
-        const comboMinMana = panel.querySelector("#minibia-bot-combo-minmana");
-        const comboCooldown = panel.querySelector("#minibia-bot-combo-cooldown");
-        const comboStatus = panel.querySelector("#minibia-bot-combo-status");
-
-        function refreshComboStatus() {
-            const status = bot.comboBot?.status?.();
-            if (!status)
-                return;
-
-            if (comboToggle && document.activeElement !== comboToggle) {
-                comboToggle.checked = status.running;
-            }
-            if (comboMode && document.activeElement !== comboMode) {
-                comboMode.value = status.config.mode || 'follower';
-            }
-            if (comboSlot && document.activeElement !== comboSlot) {
-                comboSlot.value = (status.config.hotkeySlot ?? 11) + 1;
-            }
-            if (comboMinMana && document.activeElement !== comboMinMana) {
-                comboMinMana.value = status.config.minMana || 0;
-            }
-            if (comboCooldown && document.activeElement !== comboCooldown) {
-                comboCooldown.value = status.config.cooldownMs || 1500;
-            }
-            if (comboStatus) {
-                comboStatus.textContent = status.running ? `Running (${status.config.mode})` : "Idle";
-            }
-        }
-
-        // Toggle
-        if (comboToggle) {
-            comboToggle.checked = !!bot.comboBot?.status?.().running;
-            comboToggle.addEventListener("change", function () {
-                if (this.checked) {
-                    // Gather current settings
-                    const mode = comboMode?.value || 'follower';
-                    const slot = parseInt(comboSlot?.value) || 11;
-                    const minMana = parseInt(comboMinMana?.value) || 0;
-                    const cooldown = parseInt(comboCooldown?.value) || 1500;
-                    bot.comboBot.updateConfig({
-                        mode,
-                        hotkeySlot: slot,
-                        minMana,
-                        cooldownMs: cooldown,
-                    });
-                    bot.comboBot.start();
-                } else {
-                    bot.comboBot.stop();
-                }
-                refreshComboStatus();
-            });
-        }
-
-        // Mode change
-        if (comboMode) {
-            comboMode.addEventListener("change", function () {
-                const mode = this.value;
-                bot.comboBot.updateConfig({
-                    mode
-                });
-                // If running, restart to apply mode
-                if (bot.comboBot.status().running) {
-                    bot.comboBot.stop();
-                    bot.comboBot.start();
-                }
-                refreshComboStatus();
-            });
-        }
-
-        // Slot change
-        if (comboSlot) {
-            comboSlot.addEventListener("change", function () {
-                const val = Math.min(12, Math.max(1, parseInt(this.value) || 1));
-                this.value = val;
-                bot.comboBot.updateConfig({
-                    hotkeySlot: val - 1
-                });
-                refreshComboStatus();
-            });
-        }
-
-        // Min mana change
-        if (comboMinMana) {
-            comboMinMana.addEventListener("change", function () {
-                const val = Math.max(0, parseInt(this.value) || 0);
-                this.value = val;
-                bot.comboBot.updateConfig({
-                    minMana: val
-                });
-                refreshComboStatus();
-            });
-        }
-
-        // Cooldown change
-        if (comboCooldown) {
-            comboCooldown.addEventListener("change", function () {
-                const val = Math.max(100, parseInt(this.value) || 100);
-                this.value = val;
-                bot.comboBot.updateConfig({
-                    cooldownMs: val
-                });
-                refreshComboStatus();
-            });
-        }
-
-        // Periodic refresh (every 2s)
-        const comboStatusTimer = setInterval(refreshComboStatus, 2000);
-        bot.addCleanup(() => clearInterval(comboStatusTimer));
+        const comboFields={mode:panel.querySelector('#minibia-bot-combo-mode'),leaderName:panel.querySelector('#minibia-bot-combo-leader-name'),rune:panel.querySelector('#minibia-bot-combo-rune'),minMana:panel.querySelector('#minibia-bot-combo-minmana'),cooldownMs:panel.querySelector('#minibia-bot-combo-cooldown'),attackTarget:panel.querySelector('#minibia-bot-combo-attack-target'),hotkeySlot:panel.querySelector('#minibia-bot-combo-slot')};
+        function refreshComboStatus(){const status=bot.comboBot?.status?.();if(!status)return;for(const [key,input] of Object.entries(comboFields)){if(!input||document.activeElement===input)continue;if(input.type==='checkbox')input.checked=status.config[key]!==false;else input.value=key==='hotkeySlot'?Number(status.config[key]??11)+1:status.config[key]??'';}const toggle=panel.querySelector('#minibia-bot-combo-enabled');if(toggle)toggle.checked=status.running;panel.querySelector('[data-combo-slot-field]').hidden=status.config.rune!=='hotkey';panel.querySelector('#minibia-bot-combo-status').textContent=status.running?`Running · ${status.config.mode}${status.currentTargetId?' · Target '+status.currentTargetId:''}`:'Stopped';}
+        for(const [key,input] of Object.entries(comboFields))input?.addEventListener('change',()=>{let value=input.type==='checkbox'?input.checked:input.value;if(['minMana','cooldownMs','hotkeySlot'].includes(key))value=key==='hotkeySlot'?Math.max(0,Math.min(11,Number(value)-1)):Math.max(key==='cooldownMs'?100:0,Number(value)||0);bot.comboBot?.updateConfig({[key]:value});refreshComboStatus();});
+        panel.querySelector('#minibia-bot-combo-enabled')?.addEventListener('change',e=>{e.target.checked?bot.comboBot?.start():bot.comboBot?.stop();refreshComboStatus();});
+        refreshComboStatus();const comboStatusTimer=setInterval(refreshComboStatus,1000);bot.addCleanup(()=>clearInterval(comboStatusTimer));
 
         // ---- Outfit Randomizer ----
         const outfitToggle = panel.querySelector("#minibia-bot-outfit-randomizer-enabled");
@@ -64382,6 +63913,7 @@ function upgradeSectionHeaders(panel) {
         }
 
         // ---- Paladin UI listeners ----
+        bot.ammoCrafter?.mount?.(panel);
         const paladinCrafterToggle = document.getElementById("minibia-bot-paladin-crafter-enabled");
         const paladinEquipperToggle = document.getElementById("minibia-bot-paladin-equipper-enabled");
         const paladinAmmoId = document.getElementById("minibia-bot-paladin-ammo-id");
@@ -64389,8 +63921,6 @@ function upgradeSectionHeaders(panel) {
         const paladinAmmoThreshold = document.getElementById("minibia-bot-paladin-ammo-threshold");
         const paladinCraftMana = document.getElementById("minibia-bot-paladin-craft-mana");
         const paladinCraftSpell = document.getElementById("minibia-bot-paladin-craft-spell");
-        const paladinHighManaSpell = document.getElementById("minibia-bot-paladin-high-mana-spell");
-        const paladinHighManaThreshold = document.getElementById("minibia-bot-paladin-high-mana-threshold");
         const paladinEquipCooldown = document.getElementById("minibia-bot-paladin-equip-cooldown");
         const paladinEquipThreshold = document.getElementById("minibia-bot-paladin-equip-threshold");
         const paladinWeaponId = document.getElementById("minibia-bot-paladin-weapon-id");
@@ -64436,12 +63966,8 @@ function upgradeSectionHeaders(panel) {
             if (paladinCraftSpell && document.activeElement !== paladinCraftSpell) {
                 paladinCraftSpell.value = status.config.craftSpellWords || "";
             }
-            if (paladinHighManaSpell && document.activeElement !== paladinHighManaSpell) {
-                paladinHighManaSpell.value = status.config.highManaSpellWords || "";
-            }
-            if (paladinHighManaThreshold && document.activeElement !== paladinHighManaThreshold) {
-                paladinHighManaThreshold.value = status.config.highManaThreshold ?? 98;
-            }
+
+
             if (paladinEquipCooldown && document.activeElement !== paladinEquipCooldown) {
                 paladinEquipCooldown.value = status.config.equipCooldownMs ?? 5000;
             }
@@ -64462,28 +63988,6 @@ function upgradeSectionHeaders(panel) {
             bot.paladin.updateConfig({ammoItemId:this.value === "" ? null : id});
             refreshPaladinStatus();
         });
-
-        // ---- Crafter toggle ----
-        if (paladinCrafterToggle) {
-            paladinCrafterToggle.addEventListener("change", function () {
-                if (this.checked) {
-                    const selectedAmmoId=Number(paladinAmmoId?.value);
-                    const config = {
-                        ammoItemId: Number.isSafeInteger(selectedAmmoId) && selectedAmmoId > 0 && selectedAmmoId <= 65535 ? selectedAmmoId : null,
-                        ammoThreshold: parseInt(paladinAmmoThreshold?.value) || 4,
-                        craftManaCost: parseInt(paladinCraftMana?.value) || 140,
-                        craftSpellWords: paladinCraftSpell?.value?.trim() || "",
-                        highManaSpellWords: paladinHighManaSpell?.value?.trim() || "",
-                        highManaThreshold: parseInt(paladinHighManaThreshold?.value) || 98,
-                    };
-                    bot.paladin.updateConfig(config);
-                    bot.paladin.startCraft();
-                } else {
-                    bot.paladin.stopCraft();
-                }
-                refreshPaladinStatus();
-            });
-        }
 
         // ---- Equipper toggle ----
         if (paladinEquipperToggle) {
@@ -64554,22 +64058,7 @@ function upgradeSectionHeaders(panel) {
                 });
             });
         }
-        if (paladinHighManaSpell) {
-            paladinHighManaSpell.addEventListener("change", function () {
-                bot.paladin.updateConfig({
-                    highManaSpellWords: this.value.trim()
-                });
-            });
-        }
-        if (paladinHighManaThreshold) {
-            paladinHighManaThreshold.addEventListener("change", function () {
-                const val = Math.min(100, Math.max(0, parseInt(this.value) || 0));
-                this.value = val;
-                bot.paladin.updateConfig({
-                    highManaThreshold: val
-                });
-            });
-        }
+
         if (paladinEquipCooldown) {
             paladinEquipCooldown.addEventListener("change", function () {
                 const val = Math.max(1000, parseInt(this.value) || 1000);
@@ -64745,6 +64234,10 @@ function upgradeSectionHeaders(panel) {
         });
         refreshHealSpellChoices();
         refreshHealRuleFields();
+        panel.querySelector("#minibia-bot-heal-new")?.addEventListener("click",()=>{
+            clearHealRuleForm();
+            document.getElementById("minibia-bot-heal-editor").hidden=false;
+        });
         const healSave = panel.querySelector("#minibia-bot-heal-save");
         const healCancel = panel.querySelector("#minibia-bot-heal-cancel");
         if (healSave)
@@ -64798,7 +64291,6 @@ function upgradeSectionHeaders(panel) {
                 else bot.runeShooter?.stop?.();
                 refreshRuneShooterStatus();
                 refreshCollapsedQuickModules();
-                refreshStatusTab();
             });
         }
         if (runeShooterSave)
@@ -65387,7 +64879,7 @@ function upgradeSectionHeaders(panel) {
                 stand: "Stand",
                 rope: "Rope",
                 shovel: "Shovel",
-                knightbox: "Knight Box",
+                knightbox: "Box",
                 ladder: "Ladder"
             };
             const waypoint = { x, y, z };
@@ -66039,6 +65531,7 @@ function upgradeSectionHeaders(panel) {
                     });
                     refreshPanicItemAlertsList();
                 });
+                actions.appendChild(makeAudioTestButton(a.name || "item count",()=>bot.panic?.testAudio?.("itemLow",{message:`Sound test: ${a.name || "item count"}`,type:`audio-item-${idx}`})));
                 actions.appendChild(editBtn);
                 actions.appendChild(removeBtn);
                 row.appendChild(label);
@@ -66127,6 +65620,25 @@ function upgradeSectionHeaders(panel) {
             });
         }
 
+        function makeAudioTestButton(label, play) {
+            const button=document.createElement('button');button.type='button';button.className='mb-audio-test';button.textContent='►';
+            button.title=`Test ${label} sound`;button.setAttribute('aria-label',button.title);
+            button.addEventListener('click',event=>{event.preventDefault();event.stopPropagation();play();});return button;
+        }
+        function attachAudioTest(selector,play){
+            const input=panel.querySelector(selector),label=input?.closest('label');if(!label||label.parentElement?.classList.contains('mb-audio-test-row'))return;
+            const row=document.createElement('div');row.className='mb-audio-test-row';label.before(row);row.append(label,makeAudioTestButton(label.textContent.trim(),play));
+        }
+        for(const [id,sound]of [
+            ['minibia-bot-panic-player-alert','player'],['minibia-bot-player-attack-alert','playerAttack'],['minibia-bot-message-alert','message'],
+            ['minibia-bot-panic-target-death-beep','targetDeath'],['minibia-bot-panic-low-health-beep','lowHealth'],['minibia-bot-panic-mana-full-beep','manaFull'],
+            ['minibia-bot-panic-no-target-beep','noTarget'],['minibia-bot-panic-low-cap-beep','lowCap'],['minibia-bot-panic-alpha-monster-beep','alpha'],
+            ['minibia-bot-antibot-enabled','antibot'],['minibia-bot-gm-chat-monitor','gm'],['minibia-bot-chancellor-alert','gm'],
+            ['minibia-bot-antibot-creature-enabled','generic'],['minibia-bot-pink-skull-enabled','alarm'],
+            ['minibia-bot-panic-unknown','alarm'],['minibia-bot-panic-health','alarm'],
+        ])attachAudioTest('#'+id,()=>bot.panic?.testAudio?.(sound));
+        attachAudioTest('[data-following-item] input',()=>{bot.followingItemGuard?.playAlertSound?.();bot.showPanelNotification?.('FOLLOWING ITEM','Sound test','following-item',15000);});
+
         // Names and clicked items use server identities; manual IDs remain available.
         bot.itemAlertItems.mount(panel, refreshPanicItemAlertsList);
 
@@ -66183,38 +65695,29 @@ function upgradeSectionHeaders(panel) {
             });
         }
         
-        // ---- Status tab toggle buttons ----
-        getStatusTabModules().forEach(m => {
-            const btn = panel.querySelector(`#${m.btnId}`);
-            if (!btn) return;
-            btn.addEventListener("click", () => {
-                let running = false;
-                try { running = !!m.isRunning(); } catch { running = false; }
-
-                try {
-                    if (running) m.stop();
-                    else m.start();
-                } catch (error) {
-                    bot.log?.(`Status tab toggle failed for ${m.key}`, error?.message || error);
-                }
-
-                // Nudge the module-specific refresh functions so the other tabs
-                // show the new state immediately (they all read from the same source).
-                try { refreshCaveStatus?.(); }        catch {}
-                try { refreshAutoAttackStatus?.(); }  catch {}
-                try { refreshRuneShooterStatus?.(); } catch {}
-                try { refreshAutoHealStatus?.(); }    catch {}
-                try { refreshLooterStatus?.(); }      catch {}
-                try { refreshRuneStatus?.(); }        catch {}
-                try { refreshPaladinStatus?.(); }     catch {}
-                try { refreshTitlebarRunIndicators?.(); } catch {}
-
-                // And update this tab.
-                refreshStatusTab();
-            });
-        });
-
         // ---- OLDER EXISTING LISTENERS (reload, trusted, GM, rune, eat, invisible, shield, equip, talk, panic, xray, home) ----
+
+        // Header icons use generated content so title lookups keep their exact text.
+        function decorateSectionHeaders(){
+            const icons={
+                'Woodcutting':'🪓','Mining':'⛏️','Smithing':'⚒️','Cooking':'🍳',
+                'Mana Trainer':'✨','Rune Crafter':'🔮','Ammo Crafter':'🏹','Equipment':'🛡️',
+                'Item Count Alerts':'📦','Trusted Names':'🤝','Panic Runner':'🏃',
+                'Stop / resume shortcut':'⌨️','Waypoint Properties':'📍','Recovery Safety':'🛟','Debug':'🔧',
+                'Default Behavior':'⚙️','Off-screen Hunt':'🔭','Lure':'🧲','Anti-Killsteal':'🛡️',
+                'Action Safety':'🛡️','Target Lists':'📋','Tracked Items':'📦','Rune Healing':'🔮',
+                'Exura Sio':'💕','Targets':'🎯','Add / Edit Rule':'📝','Ground Spawn Logger':'📜',
+                'Inventory Browser':'🎒','Server Loot Routing':'📦',
+                'Action Diagnostics':'🔧','Spell Rules':'✨','Following Item':'📦'
+            };
+            panel.querySelectorAll('.mb-section-title').forEach(header=>{
+                const label=header.querySelector('.mb-title-text')||header;
+                const title=label.textContent.trim();
+                if(!title||/^[\p{Extended_Pictographic}⚑]/u.test(title))return;
+                label.dataset.headingIcon=icons[title]||'⚙️';
+            });
+        }
+        decorateSectionHeaders();
 
         // ---- INITIAL REFRESHES ----
         try {
@@ -66263,7 +65766,6 @@ function upgradeSectionHeaders(panel) {
             refreshPaladinStatus();
             refreshGmChatStatus();
             refreshAntiBotCreatureStatus();
-            refreshStatusTab();
             refreshCollapsedQuickModules();
             if (convertCurrencyToggle) {
                 convertCurrencyToggle.checked = bot.autoStacker?.config?.convertCurrency !== false;
@@ -66286,7 +65788,7 @@ function upgradeSectionHeaders(panel) {
         bot.addCleanup(() => window.clearInterval(talkTimer));
         const paladinTimer = window.setInterval(refreshPaladinStatus, 2000);
         bot.addCleanup(() => window.clearInterval(paladinTimer));
-        const statusTabTimer = window.setInterval(() => { refreshStatusTab(); refreshCollapsedQuickModules(); }, 1000);
+        const statusTabTimer = window.setInterval(() => { refreshCollapsedQuickModules(); }, 1000);
         bot.addCleanup(() => window.clearInterval(statusTabTimer));
         const looterTimer = window.setInterval(refreshLooterStatus, 1000);
         bot.addCleanup(() => window.clearInterval(looterTimer));
@@ -66360,7 +65862,6 @@ function upgradeSectionHeaders(panel) {
         refreshCaveTransitionStatus,
         getSavedPanelPosition,
         getSavedPanelCollapsed,
-        refreshStatusTab,
         setPanelCollapsed: (collapsed) => {
             const panel = document.getElementById("minibia-bot-panel");
             setPanelCollapsed(panel, collapsed);
@@ -69956,6 +69457,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
     const persistedEnabledModules = [
         ["rune", "minibiaBot.rune.config"],
         ["runemaker", "minibiaBot.runemaker.config"],
+        ["ammoCrafter", "minibiaBot.ammoCrafter.config"],
         ["heal", "minibiaBot.heal.config"],
         ["invisible", "minibiaBot.invisible.config"],
         ["haste", "minibiaBot.haste.config"],
@@ -70225,6 +69727,18 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         currentBundle.installSlimeTrainerModule(bot);
         currentBundle.installMonkTrainerModule(bot);
         currentBundle.installPaladinModule(bot);
+        {
+            const legacy=bot.storage.get("minibiaBot.paladin.config",{});
+            const spellIds=[61,32,31,63,64,65];
+            const words={"exeta con":61,"exevo con mort":32,"exevo con":31,"exevo con flam":63,"exevo con pox":64,"exevo con vis":65};
+            const oldSpell=words[String(legacy.craftSpellWords||"exeta con").trim().toLowerCase()];
+            currentBundle.installRunemakerModule(bot,{
+                moduleName:"ammoCrafter",storageKey:"minibiaBot.ammoCrafter.config",host:"[data-ammo-crafter-host]",
+                title:"Ammo Crafter",itemLabel:"Ammo",enabledId:"minibia-bot-paladin-crafter-enabled",spellIds,
+                initialConfig:{enabled:legacy.craftEnabled===true||legacy.enabled===true,
+                    rules:oldSpell&&Object.keys(legacy).length?[{spellId:oldSpell,count:Math.max(1,Number(legacy.ammoThreshold??15)||1),enabled:true}]:[]}
+            });
+        }
         currentBundle.installLooterModule(bot);
         currentBundle.installLightHackModule(bot);
         currentBundle.installLightHackLegitModule(bot);
@@ -70245,6 +69759,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         currentBundle.installMovementPatch(bot);
         currentBundle.installOutfitRandomizerModule(bot);
         currentBundle.installComboBotModule(bot);
+        currentBundle.installHoldTargetModule(bot);
         currentBundle.installExoriModule(bot);
         currentBundle.installSupportModule(bot);
         currentBundle.installUiTweaksModule(bot);
@@ -70306,6 +69821,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
             const modules = [
                 ["rune", "minibiaBot.rune.config"],
         ["runemaker", "minibiaBot.runemaker.config"],
+        ["ammoCrafter", "minibiaBot.ammoCrafter.config"],
                 ["heal", "minibiaBot.heal.config"],
                 ["invisible", "minibiaBot.invisible.config"],
                 ["haste", "minibiaBot.haste.config"],
@@ -70326,6 +69842,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
                 ["looter", "minibiaBot.looter.config"],
                 ["support", "minibiaBot.support.config"],
                 ["comboBot", "minibiaBot.combo.config"],
+                ["holdTarget", "minibiaBot.holdTarget.config"],
                 ["autoPickup", "minibiaBot.autoPickup.config"],
                 ["antiAfk", "minibiaBot.antiafk.config"],
                 ["fisher", "minibiaBot.fisher.config"],
