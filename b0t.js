@@ -4103,7 +4103,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.329",
+        version: "1.6.330",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -32298,53 +32298,6 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         return isCaveRoutePassable(tile, null);
     }
 
-    let rememberedCaveMap=null;
-    function getRememberedCaveRoute(from,to,now=Date.now()) {
-        const client=window.gameClient,db=client?.database;
-        const classify=typeof Minimap!=='undefined'?Minimap.prototype.__isWalkableColor:null;
-        if(!db?.getMinimapPixel||typeof classify!=='function'||from.z!==to.z)return null;
-        const key=`${state.routeRevision}:${state.currentIndex}:${getPositionKey(to)}`;
-        if(!rememberedCaveMap||rememberedCaveMap.client!==client||rememberedCaveMap.player!==client.player||rememberedCaveMap.key!==key){
-            const record={key,client,player:client.player,ready:!db.loadChunksForPath,started:now,path:null,fromKey:null,searched:0};
-            rememberedCaveMap=record;
-            if(db.loadChunksForPath)try{db.loadChunksForPath(new Position(from.x,from.y,from.z),new Position(to.x,to.y,to.z),()=>{if(rememberedCaveMap===record)record.ready=true;});}catch{record.ready=true;}
-        }
-        const record=rememberedCaveMap;
-        if(!record.ready&&now-record.started<4000)return {pending:true,path:[]};
-        const fromKey=getPositionKey(from);
-        if(record.fromKey===fromKey&&now-record.searched<1500)return {path:record.path||[]};
-        record.fromKey=fromKey;record.searched=now;
-        const cache=new Map(),nodes=new Map(),key2=p=>`${p.x},${p.y}`;
-        const minX=Math.min(from.x,to.x)-32,maxX=Math.max(from.x,to.x)+32,minY=Math.min(from.y,to.y)-32,maxY=Math.max(from.y,to.y)+32;
-        if(maxX-minX>256||maxY-minY>256)return {path:[]};
-        function allowed(p){
-            const k=key2(p);if(cache.has(k))return cache.get(k);
-            let result=false;
-            if(bot.specialAreas?.getPositionPolicy?.(p,{purpose:'route'})?.allowed!==false&&!bot.blacklist?.isBlacklisted(p.x,p.y,p.z)){
-                const tile=getTileAt(p);
-                if(tile&&tile.id!==0&&!tile.__isPlaceholder)result=isCaveFrontierPassableTile(tile);
-                else{const px=db.getMinimapPixel(p.x,p.y,p.z);result=!!px&&classify.call(Minimap.prototype,px.r,px.g,px.b,px.a)===true;}
-            }
-            cache.set(k,result);return result;
-        }
-        const h=p=>Math.abs(p.x-to.x)+Math.abs(p.y-to.y),heap=new BinaryHeap();
-        const start={...from,__g:0,__f:h(from),parent:null};nodes.set(key2(from),start);heap.push(start);
-        let expanded=0;
-        while(heap.size()&&expanded++<12000){
-            const cur=heap.pop();if(cur.closed)continue;cur.closed=true;
-            if(cur.x===to.x&&cur.y===to.y){const path=[];for(let n=cur;n;n=n.parent)path.push({x:n.x,y:n.y,z:from.z});record.path=path.reverse();return {path:record.path};}
-            for(const [dx,dy]of[[0,-1],[1,0],[0,1],[-1,0],[-1,-1],[1,-1],[-1,1],[1,1]]){
-                const p={x:cur.x+dx,y:cur.y+dy,z:from.z};
-                if(p.x<minX||p.x>maxX||p.y<minY||p.y>maxY||!allowed(p))continue;
-                // Prefer straight segments, using the same cost as loaded routing.
-                const g=cur.__g+(dx&&dy?3:1),k=key2(p),old=nodes.get(k);
-                if(old&&old.__g<=g)continue;
-                const node={...p,__g:g,__f:g+h(p),parent:cur};nodes.set(k,node);heap.push(node);
-            }
-        }
-        record.path=[];return {path:[]};
-    }
-
     function findCaveLoadedFrontierPath(fromPosition, waypoint, maxSegmentSteps = 10) {
         const from = normalizePosition(fromPosition);
         const to = normalizePosition(waypoint);
@@ -32371,17 +32324,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             Math.abs(to.x - from.x) +
             Math.abs(to.y - from.y);
 
-        const remembered=getRememberedCaveRoute(from,to);
-        if(remembered?.pending)return null;
-        const guide=new Map();
-        for(const pos of remembered?.path?.slice(1)||[]){
-            const tile=getTileAt(pos);
-            if(!tile||tile.id===0||tile.__isPlaceholder||!isCaveFrontierPassableTile(tile))break;
-            guide.set(getPositionKey(pos),guide.size+1);
-        }
-        if(remembered?.path?.length>1&&!guide.size)return null;
-        const guideEnd=[...guide.keys()].pop()||'';
-        const planKey = `${state.routeRevision}:${state.currentIndex}:${getPositionKey(to)}:${remembered?.path?.length?'remembered:'+guideEnd:'frontier'}`;
+        const planKey = `${state.routeRevision}:${state.currentIndex}:${getPositionKey(to)}`;
         const now = Date.now();
         const segmentLimit = Math.max(1, Math.min(10, Math.trunc(Number(maxSegmentSteps) || 10)));
         const makePlanSegment = plan => {
@@ -32404,7 +32347,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             plan.cursor = at;
             return { path, goal: to, startDistance, frontierDistance: plan.frontierDistance,
                 endpoint: positions[positions.length - 1], fullPathLength: plan.positions.length - at - 1,
-                iterations: plan.iterations, planKey, frontierGoal: plan.endpoint, detour: plan.detour, remembered:plan.remembered===true };
+                iterations: plan.iterations, planKey, frontierGoal: plan.endpoint, detour: plan.detour };
         };
         const cached = state.frontierRoutePlan;
         if (cached && cached.key === planKey && isSameTile(from, cached.endpoint) && cached.exits?.length &&
@@ -32451,7 +32394,6 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             const openHeap = new BinaryHeap();
             openHeap.push(startTile);
 
-            let guideNode=null,guideRank=0;
             let bestNode = null;
             let bestDistance = Infinity;
             let bestG = Infinity;
@@ -32469,8 +32411,6 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 if (currentNode !== startTile) {
                     const currentPos = normalizePosition(currentNode.__position);
                     if (currentPos) {
-                        const rank=guide.get(getPositionKey(currentPos))||0;
-                        if(rank>guideRank){guideRank=rank;guideNode=currentNode;}
                         const distance =
                             Math.abs(to.x - currentPos.x) +
                             Math.abs(to.y - currentPos.y);
@@ -32550,11 +32490,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 }
             }
 
-            if(guideNode){
-                bestNode=guideNode;
-                const p=normalizePosition(guideNode.__position);
-                bestDistance=Math.abs(to.x-p.x)+Math.abs(to.y-p.y);
-            } else if (destinationUnloaded && boundaryNode) {
+            if (destinationUnloaded && boundaryNode) {
                 bestNode = boundaryNode; bestDistance = boundaryDistance;
             } else if (bestDistance >= startDistance) {
                 // No unexplored exit and no approach progress: don't shuffle
@@ -32586,7 +32522,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                         bot.specialAreas?.getPositionPolicy?.(pos, { purpose: "route" })?.allowed !== false;
                 }) : [];
             const plan = { key: planKey, positions, cursor: 0, progressAt: now, exits,
-                endpoint, frontierDistance: bestDistance, iterations, detour, remembered:!!guideNode };
+                endpoint, frontierDistance: bestDistance, iterations, detour };
             const segment = makePlanSegment(plan);
             if (segment) state.frontierRoutePlan = plan;
             return segment;
@@ -33125,7 +33061,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 `walking loaded A* frontier ${state.frontierMotionWatch.positions.length - 1} step${state.frontierMotionWatch.positions.length === 2 ? "" : "s"} ` +
                 `toward (${waypoint.x}, ${waypoint.y}, ${waypoint.z})`,
                 { from: current, next: normalizePosition(routeInfo.path[0]?.__position),
-                  via: routeInfo.frontierGoal || routeInfo.endpoint, detour: !!routeInfo.detour, rememberedMap:routeInfo.remembered===true,
+                  via: routeInfo.frontierGoal || routeInfo.endpoint, detour: !!routeInfo.detour,
                   transport: state.frontierMotionWatch?.transport, sentSteps: state.frontierMotionWatch?.positions?.length - 1 }
             );
         }
@@ -39302,7 +39238,6 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         state.recoveryDestinationWatch=null;
         state.autoTransitionAttempt=null;
         state.running = false;
-        rememberedCaveMap=null;
         knightBoxState.active=false;knightBoxState.index=null;knightBoxState.phase='off';knightBoxState.blockerId=null;
         bot.attack?.setKnightBoxGate?.(null);
         detachCaveEvents();
