@@ -4080,7 +4080,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.322",
+        version: "1.6.324",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -8013,6 +8013,7 @@ window.__minibiaBotBundle.installRunemakerModule = function installRunemakerModu
     const key="minibiaBot.runemaker.config";
     const config={enabled:false,rules:[],...bot.storage.get(key,{})};
     const state={running:false,timer:null,lastCastAt:0,lastRequestAt:0,pending:null,player:null,sessionAt:0,retryAt:0,reason:"Off"};
+    let editingSpellId=null;
     let disposed=false,host=null,rows=new Map(),select=null,quantity=null,enabled=null,statusLabel=null;
     function normalize(){config.enabled=config.enabled===true;config.rules=(Array.isArray(config.rules)?config.rules:[]).filter(r=>Number.isSafeInteger(Number(r.spellId))&&Number(r.spellId)>0).map(r=>({spellId:Number(r.spellId),enabled:r.enabled!==false,count:Math.max(1,Math.min(100000,Math.trunc(Number(r.count)||100)))})).filter((r,i,list)=>list.findIndex(x=>x.spellId===r.spellId)===i).slice(0,40);}
     normalize();
@@ -8082,17 +8083,22 @@ window.__minibiaBotBundle.installRunemakerModule = function installRunemakerModu
             const on=document.createElement('input');on.type='checkbox';on.checked=rule.enabled;on.setAttribute('aria-label',`Enable ${spell?.name||'rune'}`);on.addEventListener('change',()=>updateConfig({rules:config.rules.map(r=>r.spellId===rule.spellId?{...r,enabled:on.checked}:r)}));
             const name=document.createElement('span');name.textContent=spell?.name||`Rune spell ${rule.spellId}`;name.title=[spell?.name,spell?.words].filter(Boolean).join(' · ');
             const count=document.createElement('span');count.className='mb-tools-count';rows.set(rule.spellId,count);
-            const target=document.createElement('input');target.type='number';target.min='1';target.max='100000';target.value=String(rule.count);target.title='Maintain this many';target.setAttribute('aria-label',`Target count for ${spell?.name||'rune'}`);target.addEventListener('change',()=>updateConfig({rules:config.rules.map(r=>r.spellId===rule.spellId?{...r,count:Number(target.value)}:r)}));
-            const remove=document.createElement('button');remove.type='button';remove.className='mb-small-button';remove.textContent='×';remove.title='Remove rune';remove.addEventListener('click',()=>updateConfig({rules:config.rules.filter(r=>r.spellId!==rule.spellId)}));
-            row.append(on,name,count,target,remove);list.appendChild(row);
+            const target=document.createElement('span');target.textContent=String(rule.count);target.className='mb-rm-target';
+            const actions=document.createElement('div');actions.className='mb-rm-actions';
+            const edit=document.createElement('button');edit.type='button';edit.className='mb-small-button';edit.textContent='Edit';edit.title='Edit rune';edit.addEventListener('click',()=>{editingSpellId=rule.spellId;fillSelect();select.value=String(rule.spellId);quantity.value=String(rule.count);host.querySelector('.mb-rm-add').hidden=false;host.querySelector('[data-rm-add]').textContent='Save';select.focus();});
+            const remove=document.createElement('button');remove.type='button';remove.className='mb-small-button';remove.textContent='×';remove.title='Remove rune';remove.addEventListener('click',()=>{if(editingSpellId===rule.spellId)closeEditor();updateConfig({rules:config.rules.filter(r=>r.spellId!==rule.spellId)});});
+            actions.append(edit,remove);row.append(on,name,count,target,actions);list.appendChild(row);
         }
         fillSelect();updateStatus();
     }
+    function closeEditor(){editingSpellId=null;if(host)host.querySelector('.mb-rm-add').hidden=true;}
     function mount(panel){host=panel.querySelector('[data-runemaker-host]');if(!host)return;
-        host.innerHTML=`<div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-rm-enabled><span class="mb-title-text">Runemaker</span></div><div class="mb-rm-row mb-rm-columns" aria-hidden="true"><span></span><span>Rune</span><span>Current</span><span>Target</span><span></span></div><div data-stock-runes></div><div class="mb-rm-add"><label class="mb-field"><span class="mb-field-label">Rune</span><select aria-label="Rune type" data-rm-type></select></label><label class="mb-field"><span class="mb-field-label">Target count</span><input type="number" min="1" max="100000" value="100" aria-label="Rune target count" data-rm-count></label><button type="button" class="mb-small-button" data-rm-add>Add</button></div><div class="mb-small-note" data-rm-status></div>`;
+        host.innerHTML=`<div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-rm-enabled><span class="mb-title-text">Runemaker</span><button type="button" class="mb-small-button" data-rm-new>+ Rule</button></div><div class="mb-rm-row mb-rm-columns" aria-hidden="true"><span></span><span>Rune</span><span>Current</span><span>Target</span><span></span></div><div data-stock-runes></div><div class="mb-rm-add" hidden><label class="mb-field"><span class="mb-field-label">Rune</span><select aria-label="Rune type" data-rm-type></select></label><label class="mb-field"><span class="mb-field-label">Target count</span><input type="number" min="1" max="100000" value="100" aria-label="Rune target count" data-rm-count></label><div class="mb-rm-editor-actions"><button type="button" class="mb-small-button" data-rm-add>Add rule</button><button type="button" class="mb-small-button" data-rm-cancel>Cancel</button></div></div><div class="mb-small-note" data-rm-status></div>`;
         enabled=host.querySelector('[data-rm-enabled]');select=host.querySelector('[data-rm-type]');quantity=host.querySelector('[data-rm-count]');statusLabel=host.querySelector('[data-rm-status]');
         enabled.addEventListener('change',()=>enabled.checked?start():stop());select.addEventListener('focus',fillSelect);
-        host.querySelector('[data-rm-add]').addEventListener('click',()=>{const id=Number(select.value);if(!catalogue().some(s=>s.sid===id))return;updateConfig({rules:[...config.rules.filter(r=>r.spellId!==id),{spellId:id,count:Number(quantity.value),enabled:true}]});});render();
+        host.querySelector('[data-rm-new]').addEventListener('click',()=>{editingSpellId=null;fillSelect();quantity.value='100';host.querySelector('[data-rm-add]').textContent='Add rule';host.querySelector('.mb-rm-add').hidden=false;select.focus();});
+        host.querySelector('[data-rm-cancel]').addEventListener('click',closeEditor);
+        host.querySelector('[data-rm-add]').addEventListener('click',()=>{const id=Number(select.value);if(!catalogue().some(s=>s.sid===id))return;const previous=config.rules.find(r=>r.spellId===editingSpellId);const rule={spellId:id,count:Number(quantity.value),enabled:previous?.enabled!==false};let rules=[...config.rules];if(editingSpellId!==null){const index=rules.findIndex(r=>r.spellId===editingSpellId);rules=rules.filter(r=>r.spellId!==id||r.spellId===editingSpellId);const at=rules.findIndex(r=>r.spellId===editingSpellId);if(at>=0)rules[at]=rule;else rules.splice(Math.max(0,index),0,rule);}else{rules=rules.filter(r=>r.spellId!==id);rules.push(rule);}closeEditor();updateConfig({rules});});render();
     }
     bot.runemaker={config,start,stop,updateConfig,mount,catalogue,needsMana,attempt,status:()=>({running:state.running,reason:state.reason,pending:!!state.pending})};
     bot.addCleanup(()=>{disposed=true;stop({persistEnabled:false});host=null;rows.clear();});
@@ -8362,17 +8368,18 @@ window.__minibiaBotBundle.installRuneModule = function installRuneModule(bot) {
     let trainerHost=null,editingRule=-1;
     function mount(panel){
         trainerHost=panel.querySelector('[data-mana-trainer-host]');if(!trainerHost)return;
-        trainerHost.innerHTML=`<div class="mb-section-title"><input type="checkbox" id="minibia-bot-rune-enabled" class="mb-title-toggle"><span class="mb-title-text">Mana Trainer</span></div><div data-mt-rules></div><div class="mb-small-note">First matching rule casts. Move rules to change priority.</div><div class="mb-mt-editor"><label class="mb-field"><span class="mb-field-label">Spell name / words</span><input data-mt-spell list="minibia-bot-training-spell-choices" autocomplete="off" placeholder="Spell name or words"><datalist id="minibia-bot-training-spell-choices"></datalist></label><div class="mb-mt-grid"><label class="mb-field"><span class="mb-field-label">Mana from %</span><input data-mt-min type="number" min="0" max="100" value="98"></label><label class="mb-field"><span class="mb-field-label">Mana to %</span><input data-mt-max type="number" min="0" max="100" value="100"></label><label class="mb-field"><span class="mb-field-label">Item condition</span><select data-mt-item></select></label><label class="mb-field"><span class="mb-field-label">Count below</span><input data-mt-count type="number" min="1" value="100"></label></div><div class="mb-mt-buttons"><button class="mb-small-button" data-mt-save>Add rule</button><button class="mb-small-button" data-mt-cancel hidden>Cancel</button></div></div>`;
+        trainerHost.innerHTML=`<div class="mb-section-title"><input type="checkbox" id="minibia-bot-rune-enabled" class="mb-title-toggle"><span class="mb-title-text">Mana Trainer</span><button type="button" class="mb-small-button" data-mt-new>+ Rule</button></div><div data-mt-rules></div><div class="mb-small-note">First matching rule casts. Move rules to change priority.</div><div class="mb-mt-editor" hidden><label class="mb-field"><span class="mb-field-label">Spell name / words</span><input data-mt-spell list="minibia-bot-training-spell-choices" autocomplete="off" placeholder="Spell name or words"><datalist id="minibia-bot-training-spell-choices"></datalist></label><div class="mb-mt-grid"><label class="mb-field"><span class="mb-field-label">Mana from %</span><input data-mt-min type="number" min="0" max="100" value="98"></label><label class="mb-field"><span class="mb-field-label">Mana to %</span><input data-mt-max type="number" min="0" max="100" value="100"></label><label class="mb-field"><span class="mb-field-label">Item condition</span><select data-mt-item></select></label><label class="mb-field"><span class="mb-field-label">Count below</span><input data-mt-count type="number" min="1" value="100"></label></div><div class="mb-mt-buttons"><button class="mb-small-button" data-mt-save>Add rule</button><button class="mb-small-button" data-mt-cancel hidden>Cancel</button></div></div>`;
         const q=s=>trainerHost.querySelector(s),spell=q('[data-mt-spell]'),item=q('[data-mt-item]');
         function choices(){const current=item.value;const list=q('datalist');list.replaceChildren();item.replaceChildren();const always=document.createElement('option');always.value='0';always.textContent='No item limit';item.append(always);const seen=new Set();for(const s of trainingSpells()){const o=document.createElement('option');o.value=s.words;o.label=`${s.name} (${s.mana} MP)`;list.append(o);if(s.runeId&&!seen.has(s.runeId)){seen.add(s.runeId);const option=document.createElement('option');option.value=String(s.runeId);option.textContent=s.name.replace(/^Conjure /i,'');item.append(option);}}if([...item.options].some(o=>o.value===current))item.value=current;itemChanged();}
         function itemChanged(){q('[data-mt-count]').disabled=Number(item.value)===0;}
-        function reset(){editingRule=-1;spell.value='';q('[data-mt-min]').value='98';q('[data-mt-max]').value='100';item.value='0';q('[data-mt-count]').value='100';q('[data-mt-save]').textContent='Add rule';q('[data-mt-cancel]').hidden=true;itemChanged();}
-        function edit(index){const r=config.rules[index];editingRule=index;spell.value=r.spellWords;q('[data-mt-min]').value=r.minMana;q('[data-mt-max]').value=r.maxMana;item.value=String(r.itemId);q('[data-mt-count]').value=r.itemCount;q('[data-mt-save]').textContent='Save rule';q('[data-mt-cancel]').hidden=false;itemChanged();spell.focus();}
+        function reset(){q('.mb-mt-editor').hidden=true;editingRule=-1;spell.value='';q('[data-mt-min]').value='98';q('[data-mt-max]').value='100';item.value='0';q('[data-mt-count]').value='100';q('[data-mt-save]').textContent='Add rule';q('[data-mt-cancel]').hidden=true;itemChanged();}
+        function edit(index){q('.mb-mt-editor').hidden=false;const r=config.rules[index];editingRule=index;spell.value=r.spellWords;q('[data-mt-min]').value=r.minMana;q('[data-mt-max]').value=r.maxMana;item.value=String(r.itemId);q('[data-mt-count]').value=r.itemCount;q('[data-mt-save]').textContent='Save rule';q('[data-mt-cancel]').hidden=false;itemChanged();spell.focus();}
         function draw(){const list=q('[data-mt-rules]');list.replaceChildren();config.rules.forEach((rule,index)=>{const row=document.createElement('div');row.className='mb-mt-rule';const top=document.createElement('div');top.className='mb-mt-rule-top';const title=document.createElement('label');const on=document.createElement('input');on.type='checkbox';on.checked=rule.enabled;on.setAttribute('aria-label',`Enable rule ${index+1}`);on.addEventListener('change',()=>{updateConfig({rules:config.rules.map((r,i)=>i===index?{...r,enabled:on.checked}:r)});draw();});const name=document.createElement('span');name.textContent=`${index+1}. ${resolveTrainingSpell(rule.spellWords).name||rule.spellWords}`;name.title=rule.spellWords;title.append(on,name);top.append(title);const buttons=document.createElement('div');buttons.className='mb-mt-actions';for(const [text,label,action,disabled]of[
             ['↑','Move up',()=>move(index,-1),index===0],['↓','Move down',()=>move(index,1),index===config.rules.length-1],['Edit','Edit rule',()=>edit(index),false],['×','Remove rule',()=>{updateConfig({rules:config.rules.filter((_,i)=>i!==index)});reset();draw();},false]]){const button=document.createElement('button');button.type='button';button.className='mb-small-button';button.textContent=text;button.title=label;button.setAttribute('aria-label',label);button.disabled=disabled;button.addEventListener('click',action);buttons.append(button);}top.append(buttons);const summary=document.createElement('div');summary.className='mb-small-note';const itemSpell=trainingSpells().find(s=>Number(s.runeId)===rule.itemId);summary.textContent=`Mana ${rule.minMana}–${rule.maxMana}% · ${rule.itemId?`${itemSpell?.name.replace(/^Conjure /i,'')||'Item '+rule.itemId} below ${rule.itemCount}`:'Always cast'}`;row.append(top,summary);if(!rule.enabled)row.classList.add('mb-mt-disabled');list.append(row);});}
         function move(index,delta){const rules=[...config.rules];[rules[index],rules[index+delta]]=[rules[index+delta],rules[index]];updateConfig({rules});reset();draw();}
         q('#minibia-bot-rune-enabled').checked=state.running;q('#minibia-bot-rune-enabled').addEventListener('change',e=>e.target.checked?start():stop());
         spell.addEventListener('focus',choices);spell.addEventListener('change',()=>{const s=resolveTrainingSpell(spell.value.trim());spell.value=s.words;const native=trainingSpells().find(x=>x.words===s.words);item.value=String(native?.runeId||0);itemChanged();});item.addEventListener('change',itemChanged);
+        q('[data-mt-new]').addEventListener('click',()=>{reset();choices();q('.mb-mt-editor').hidden=false;q('[data-mt-cancel]').hidden=false;spell.focus();});
         q('[data-mt-save]').addEventListener('click',()=>{if(!spell.value.trim())return;const resolved=resolveTrainingSpell(spell.value.trim()),rule={spellWords:resolved.words,minMana:Number(q('[data-mt-min]').value),maxMana:Number(q('[data-mt-max]').value),itemId:Number(item.value),itemCount:Number(q('[data-mt-count]').value),enabled:editingRule>=0?config.rules[editingRule]?.enabled!==false:true};const rules=[...config.rules];if(editingRule>=0)rules[editingRule]=rule;else rules.push(rule);updateConfig({rules});reset();draw();});q('[data-mt-cancel]').addEventListener('click',reset);choices();draw();
     }
 
@@ -58926,21 +58933,29 @@ function upgradeSectionHeaders(panel) {
 #minibia-bot-panel .mb-mt-actions button { padding:3px 6px; }
 #minibia-bot-panel .mb-mt-rule > .mb-small-note { margin:4px 0 0 22px; }
 #minibia-bot-panel .mb-mt-disabled > label, #minibia-bot-panel .mb-mt-disabled > .mb-small-note { opacity:.5; }
+#minibia-bot-panel [data-mt-new] { margin-left:auto; flex-shrink:0; order:2; }
+#minibia-bot-panel .mb-mt-editor[hidden] { display:none; }
 #minibia-bot-panel .mb-mt-editor { margin-top:12px; }
 #minibia-bot-panel .mb-mt-grid { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:8px; margin-top:8px; }
 #minibia-bot-panel .mb-mt-grid .mb-field { min-width:0; margin:0; }
 #minibia-bot-panel .mb-mt-grid input, #minibia-bot-panel .mb-mt-grid select { width:100%; box-sizing:border-box; min-width:0; }
 #minibia-bot-panel .mb-mt-buttons { display:flex; gap:6px; margin-top:8px; }
 
-#minibia-bot-panel .mb-rm-row { display:grid; grid-template-columns:16px minmax(0,1fr) 48px 66px 26px; gap:6px; align-items:center; margin-bottom:8px; font-size:12px; }
+#minibia-bot-panel .mb-rm-row { display:grid; grid-template-columns:16px minmax(0,1fr) 48px 48px 64px; gap:6px; align-items:center; margin-bottom:8px; font-size:12px; }
 #minibia-bot-panel .mb-rm-row > span:nth-child(2) { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 #minibia-bot-panel .mb-rm-row input[type=number], #minibia-bot-panel .mb-rm-add input { width:100%; min-width:0; box-sizing:border-box; }
 #minibia-bot-panel .mb-rm-row > .mb-tools-count { text-align:center; opacity:.7; font-size:12px; }
 #minibia-bot-panel .mb-rm-row > button { padding:3px; }
-#minibia-bot-panel .mb-rm-add { display:grid; grid-template-columns:minmax(0,1fr) 96px 42px; gap:8px; align-items:end; margin-top:12px; }
+#minibia-bot-panel .mb-rm-add { display:grid; grid-template-columns:minmax(0,1fr) 96px; gap:8px; align-items:end; margin-top:12px; }
 #minibia-bot-panel .mb-rm-add select { width:100%; min-width:0; }
 #minibia-bot-panel .mb-rm-add > label { min-width:0; margin:0; }
-#minibia-bot-panel .mb-rm-add > button { height:28px; margin-bottom:0; }
+#minibia-bot-panel .mb-rm-add[hidden] { display:none; }
+#minibia-bot-panel [data-rm-new] { margin-left:auto; order:2; flex-shrink:0; }
+#minibia-bot-panel .mb-rm-actions { display:flex; gap:4px; }
+#minibia-bot-panel .mb-rm-actions button { padding:3px 6px; }
+#minibia-bot-panel .mb-rm-target { text-align:center; }
+#minibia-bot-panel .mb-rm-editor-actions { grid-column:1/-1; display:flex; gap:6px; }
+#minibia-bot-panel .mb-rm-row > input[type=checkbox] { width:14px; min-width:14px; margin:0; }
 #minibia-bot-panel .mb-rm-columns { color:#cdbb8b; font-size:10px; margin-bottom:5px; }
 #minibia-bot-panel .mb-rm-columns > span:nth-child(3), #minibia-bot-panel .mb-rm-columns > span:nth-child(4) { text-align:center; }
 #minibia-bot-panel .mb-rm-columns[hidden] { display:none; }
