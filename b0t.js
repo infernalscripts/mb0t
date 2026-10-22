@@ -1323,6 +1323,7 @@ addCleanup(() => {
                 progress:customFollowState.progressKey,progressAt:customFollowState.progressAt,
                 lastStopReason:customFollowState.lastStopReason || null,
                 lastWalk:customFollowState.lastWalk || null,
+                lastBatchReplan:customFollowState.lastBatchReplan || null,
                 native:{active:client?.world?.pathfinder?.__isAutoWalking===true,
                     destination:followFloorPosition(client?.world?.pathfinder?.__finalDestination),
                     remainingSteps:client?.world?.pathfinder?.__autoWalkStepsRemaining || 0,
@@ -3506,7 +3507,29 @@ addCleanup(() => {
         if (changed) {
             const end=remaining[remaining.length-1];
             const distance=p=>Math.hypot(Number(p.x)-targetPos.x,Number(p.y)-targetPos.y);
-            if (Number(end.z)!==Number(targetPos.z) || distance(end)>distance(pos)+1e-9) return false;
+            if (Number(end.z)!==Number(targetPos.z)) return false;
+            // A short leader turn can leave a previously useful batch pointing
+            // backwards even when its endpoint is still closer. Re-route only
+            // in that case; keep genuine wall detours when the fresh path agrees.
+            const next = remaining[0];
+            if (distance(next)>distance(pos)+1e-9 || distance(end)>distance(pos)+1e-9) {
+                const fresh = getFollowCustomRoute(target, mode, mode === "nonpvp"
+                    ? { specialAreaPurpose:customFollowState.catchUpActive?"route":null }
+                    : { followDistance:customFollowState.distance,straightLineDistance:true,
+                        specialAreaPurpose:customFollowState.catchUpActive?"route":null });
+                const first = fresh?.pathPositions?.[0];
+                if (fresh?.atGoal || (first && (Number(first.x)!==Number(next.x) ||
+                    Number(first.y)!==Number(next.y) || Number(first.z)!==Number(next.z)))) {
+                    customFollowState.lastBatchReplan={at:now,reason:"leader moved; queued route points away",
+                        player:{x:Number(pos.x),y:Number(pos.y),z:Number(pos.z)},
+                        leader:{x:Number(targetPos.x),y:Number(targetPos.y),z:Number(targetPos.z)},
+                        discardedNext:{...next},replacementNext:first?{...first}:null};
+                    return false;
+                }
+                if (!fresh) return false;
+                // A confirmed detour needs no repeated search until the leader moves again.
+                customFollowState.targetPosKey = targetKey;
+            }
         }
         let previous = pos;
         for (const step of remaining) {
@@ -4080,7 +4103,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.325",
+        version: "1.6.326",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
