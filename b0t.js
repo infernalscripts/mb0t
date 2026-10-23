@@ -4103,7 +4103,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.371",
+        version: "1.6.373",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -51182,6 +51182,67 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
         return u;
     }
 
+    // Portable hunting setup; live config snapshots include unsaved editor changes.
+    const setupGroups = { targeting: ['attack','runeShooter','exori','combatRules'], healing: ['heal','support'] };
+    const setupClone = value => JSON.parse(JSON.stringify(value, (key, item) => {
+        if (['__proto__','prototype','constructor'].includes(key)) throw new Error('Invalid setting key.');
+        return item;
+    }));
+    const setupObject = value => value && typeof value === 'object' && !Array.isArray(value);
+    function validateSetup(value) {
+        const data = setupClone(value);
+        if (!setupObject(data) || data.format !== 'mb0t-setup' || data.version !== 1) throw new Error('Choose an mb0t setup file.');
+        if (data.waypoints != null && (!setupObject(data.waypoints) || !Array.isArray(data.waypoints.route) || !data.waypoints.route.length || !data.waypoints.route.every(w => setupObject(w) && Number.isFinite(w.x) && Number.isFinite(w.y) && Number.isFinite(w.z)))) throw new Error('Invalid waypoint route.');
+        for (const [group, modules] of Object.entries(setupGroups)) {
+            if (data[group] == null) continue;
+            if (!setupObject(data[group]) || !Object.keys(data[group]).length || Object.keys(data[group]).some(key => !modules.includes(key))) throw new Error('Invalid '+group+' settings.');
+            for (const config of Object.values(data[group])) {
+                if (!setupObject(config) || (['rules','healRules'].some(key => config[key] != null && (!Array.isArray(config[key]) || !config[key].every(setupObject))))) throw new Error('Invalid '+group+' rules.');
+            }
+        }
+        if (!data.waypoints && !data.targeting && !data.healing) throw new Error('This setup is empty.');
+        return data;
+    }
+    function exportSetup() {
+        const data = {format:'mb0t-setup',version:1,waypoints:bot.cave?.exportPreset?.() || null};
+        if (!data.waypoints?.route?.length) data.waypoints = null;
+        for (const [group, modules] of Object.entries(setupGroups)) {
+            data[group] = {};
+            for (const key of modules) if (bot[key]?.config) data[group][key] = setupClone(key === 'attack' ? (bot.attack.getBaseConfig?.() || bot.attack.config) : bot[key].config);
+            if (!Object.keys(data[group]).length) delete data[group];
+        }
+        return validateSetup(data);
+    }
+    function importSetup(value, selected) {
+        const data = validateSetup(value);
+        const parts = ['waypoints','targeting','healing'].filter(key => selected?.[key] === true);
+        if (!parts.length) throw new Error('Select at least one section.');
+        for (const part of parts) {
+            if (!data[part]) throw new Error('The file has no '+part+'.');
+            if (part !== 'waypoints') for (const key of Object.keys(data[part])) if (typeof bot[key]?.updateConfig !== 'function') throw new Error(key+' is unavailable.');
+        }
+        if (parts.includes('targeting')) bot.attack?.stop?.();
+        let routeName = '';
+        if (parts.includes('waypoints')) {
+            const preset = data.waypoints;
+            const base = String(preset.name || 'Imported route').trim().slice(0,48) || 'Imported route';
+            routeName = base;
+            for (let suffix=2; bot.cave.exportPreset(routeName); suffix++) routeName=base+' ('+suffix+')';
+            bot.cave.stop();
+            const result = bot.cave.mergePresets([{...preset,name:routeName}],true);
+            if (result.added !== 1) throw new Error('Could not import route.');
+            bot.cave.loadPreset(routeName);
+        }
+        for (const part of parts) {
+            if (part === 'waypoints') continue;
+            for (const key of setupGroups[part]) if (data[part][key]) {
+                bot[key].stop?.();
+                bot[key].updateConfig(key === 'combatRules' ? data[part][key] : {...data[part][key],enabled:false});
+            }
+        }
+        return {parts,routeName};
+    }
+
     bot.profiles = {
         list: listProfiles,
         save: saveProfile,
@@ -51193,6 +51254,7 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
         export: exportProfileToFile,
         import: importProfileFromFile,
         importWaypointsFromFile,
+        exportSetup, validateSetup, importSetup,
         usage: getUsage,
         printUsage,
         formatBytes,
@@ -60892,6 +60954,8 @@ function upgradeSectionHeaders(panel) {
         <button type="button" class="mb-small-button" id="minibia-bot-cave-preset-new" title="Add preset" aria-label="Add preset">+</button>
         <button type="button" class="mb-small-button" id="minibia-bot-cave-preset-rename" title="Rename preset" aria-label="Rename preset">⌫</button>
         <button type="button" class="mb-small-button" id="minibia-bot-cave-preset-export" title="Export preset" aria-label="Export preset">➜]</button>
+        <input type="file" id="minibia-bot-profile-import-waypoints-input" accept=".json,.txt" style="display:none;" />
+        <button type="button" class="mb-small-button" id="minibia-bot-profile-import-waypoints" title="Import waypoints" aria-label="Import waypoints">🗁</button>
         <button type="button" class="mb-small-button" id="minibia-bot-cave-preset-delete" title="Delete preset" aria-label="Delete preset">❌</button>
       </div>
     </div>
@@ -61224,7 +61288,7 @@ function upgradeSectionHeaders(panel) {
 <div class="mb-tab-panel" data-tab-panel="profiles">
   <div class="mb-section">
     <div class="mb-section-title">
-      <span class="mb-title-text">💾 Profile Manager</span>
+      <span class="mb-title-text">💾 Profiles</span>
     </div>
     <div class="mb-stack">
       <div class="mb-inline">
@@ -61238,27 +61302,44 @@ function upgradeSectionHeaders(panel) {
         <button type="button" class="mb-small-button" id="minibia-bot-profile-load">Load</button>
         <button type="button" class="mb-small-button" id="minibia-bot-profile-delete" style="background:#5a2020;border-color:#883030;">Delete</button>
       </div>
-      <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px; align-items:center;">
+      <div style="display:flex; gap:6px; align-items:center;">
         <button type="button" class="mb-small-button" id="minibia-bot-profile-export">Export Selected</button>
         <div style="display:flex; gap:6px; align-items:center;">
           <input type="file" id="minibia-bot-profile-import-input" accept=".json" style="display:none;" />
           <button type="button" class="mb-small-button" id="minibia-bot-profile-import">Import</button>
-          <input type="text" id="minibia-bot-profile-import-name" placeholder="Profile name (optional)" style="flex:1; padding:4px; font-size:11px;" />
+
         </div>
       </div>
       <div class="mb-small-note" id="minibia-bot-profile-status">Ready</div>
-      <div class="mb-small-note">Saves ALL bot settings into a named profile. Export to file, import from file.</div>
-      <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px; align-items:center; margin-top:4px;">
-        <button type="button" class="mb-small-button" id="minibia-bot-profile-export-waypoints">Export Waypoints</button>
-        <div style="display:flex; gap:6px; align-items:center;">
-          <input type="file" id="minibia-bot-profile-import-waypoints-input" accept=".json,.txt" style="display:none;" />
-          <button type="button" class="mb-small-button" id="minibia-bot-profile-import-waypoints">Import Waypoints</button>
+      <div class="mb-small-note">Full profiles include all bot settings.</div>
+      <details><summary class="mb-small-note" style="cursor:pointer;">Advanced</summary>
+        <input type="text" id="minibia-bot-profile-import-name" placeholder="Imported profile name (optional)" style="width:100%;margin-top:6px;" />
+        <div class="mb-inline" style="margin-top:6px;">
+          <button type="button" class="mb-small-button" id="minibia-bot-profile-force-save">💾 Force Save</button>
+          <button type="button" class="mb-small-button" id="minibia-bot-profile-delete-character" style="background:#5a2020;border-color:#883030;">🗑️ Delete Character Data</button>
+        </div>
+      </details>
+    </div>
+  </div>
+  <div class="mb-section">
+    <div class="mb-section-title"><span class="mb-title-text">📦 Setup File</span></div>
+    <div class="mb-stack">
+      <div class="mb-inline">
+        <span class="mb-small-note" style="flex:1;">Current route, targeting &amp; healing</span>
+        <button type="button" class="mb-small-button" id="minibia-bot-setup-export">Export</button>
+        <button type="button" class="mb-small-button" id="minibia-bot-setup-open">🗁 Import</button>
+        <input type="file" id="minibia-bot-setup-file" accept=".json,.txt" style="display:none;" />
+      </div>
+      <div id="minibia-bot-setup-options" style="display:none;">
+        <div class="mb-inline" style="flex-wrap:wrap;gap:10px;">
+          <label class="mb-toggle"><input type="checkbox" data-setup-part="waypoints" /><span>Waypoints</span></label>
+          <label class="mb-toggle"><input type="checkbox" data-setup-part="targeting" /><span>Targeting</span></label>
+          <label class="mb-toggle"><input type="checkbox" data-setup-part="healing" /><span>Healing</span></label>
+          <button type="button" class="mb-small-button" id="minibia-bot-setup-apply">Import Selected</button>
+          <button type="button" class="mb-small-button" id="minibia-bot-setup-cancel">Cancel</button>
         </div>
       </div>
-
-      <button type="button" class="mb-small-button" id="minibia-bot-profile-force-save" style="margin-top:6px;">💾 Force Save All Settings</button>
-      <button type="button" class="mb-small-button" id="minibia-bot-profile-delete-character" style="margin-top:6px;background:#5a2020;border-color:#883030;">🗑️ Delete Character Data</button>
-
+      <div class="mb-small-note" id="minibia-bot-setup-status" role="status">One file to share your setup. Choose what to import.</div>
     </div>
   </div>
 </div>
@@ -63547,51 +63628,57 @@ function upgradeSectionHeaders(panel) {
             }
         }
 
-        // ---- Export Waypoints (just a convenience, not strictly requested but nice to have) ----
-        const exportWaypointsBtn = panel.querySelector("#minibia-bot-profile-export-waypoints");
-        if (exportWaypointsBtn) {
-            exportWaypointsBtn.addEventListener("click", () => {
-                const name = profileSelect?.value;
-                if (!name) {
-                    if (profileStatus)
-                        profileStatus.textContent = "Select a profile to export waypoints from.";
-                    return;
+        // Combined setup files: preview first, apply only explicitly selected sections.
+        const setupStatus = panel.querySelector('#minibia-bot-setup-status');
+        const setupOptions = panel.querySelector('#minibia-bot-setup-options');
+        const setupFile = panel.querySelector('#minibia-bot-setup-file');
+        const setupChecks = Array.from(panel.querySelectorAll('[data-setup-part]'));
+        let pendingSetup = null;
+        panel.querySelector('#minibia-bot-setup-export')?.addEventListener('click', () => {
+            try {
+                const data = bot.profiles.exportSetup();
+                const url = URL.createObjectURL(new Blob([JSON.stringify(data,null,2)],{type:'application/json'}));
+                const a = document.createElement('a'); a.href=url;
+                a.download=(String(data.waypoints?.name || 'mb0t').replace(/[^a-z0-9_-]/gi,'_'))+'.setup.json';
+                document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(url),1000);
+                setupStatus.textContent='Setup exported.';
+            } catch(error) { setupStatus.textContent=error.message; }
+        });
+        panel.querySelector('#minibia-bot-setup-open')?.addEventListener('click',()=>setupFile.click());
+        setupFile?.addEventListener('change',async()=>{
+            const file=setupFile.files?.[0]; if(!file)return;
+            pendingSetup=null; setupOptions.style.display='none';
+            try {
+                if(file.size>10*1024*1024)throw new Error('Setup file is too large.');
+                pendingSetup=bot.profiles.validateSetup(JSON.parse(await file.text()));
+                for(const checkbox of setupChecks){const available=!!pendingSetup[checkbox.dataset.setupPart];checkbox.checked=available;checkbox.disabled=!available;}
+                setupOptions.style.display='block';
+                setupStatus.textContent=file.name+' — choose sections. Imported modules stay stopped.';
+            }catch(error){setupStatus.textContent='Import failed: '+error.message;}
+            setupFile.value='';
+        });
+        panel.querySelector('#minibia-bot-setup-cancel')?.addEventListener('click',()=>{pendingSetup=null;setupOptions.style.display='none';setupStatus.textContent='Import cancelled.';});
+        panel.querySelector('#minibia-bot-setup-apply')?.addEventListener('click',()=>{
+            if(!pendingSetup)return;
+            try{
+                const selected=Object.fromEntries(setupChecks.map(c=>[c.dataset.setupPart,c.checked&&!c.disabled]));
+                const result=bot.profiles.importSetup(pendingSetup,selected);
+                refreshCavePresetControls();
+                if (selected.healing) { refreshHealRules(); refreshAutoHealStatus(); bot.support?.refreshUi?.(); }
+                if (selected.targeting) {
+                    panel.querySelector('.mb-combat-rules')?.remove(); bot.combatRules?.mount?.(panel);
+                    refreshAutoAttackStatus(); refreshAutoAttackPreferredStatus({force:true}); refreshAutoAttackIgnoredStatus({force:true});
                 }
-                const profileData = bot.profiles.get(name);
-                if (!profileData) {
-                    if (profileStatus)
-                        profileStatus.textContent = `Profile "${name}" not found.`;
-                    return;
-                }
-                const presets = profileData["minibiaBot.cave.presets"];
-                if (!presets || !Array.isArray(presets) || presets.length === 0) {
-                    if (profileStatus)
-                        profileStatus.textContent = `No waypoints found in "${name}".`;
-                    return;
-                }
-                const data = JSON.stringify({
-                    "minibiaBot.cave.presets": presets
-                }, null, 2);
-                const blob = new Blob([data], {
-                    type: "application/json"
-                });
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement("a");
-                a.href = url;
-                a.download = `${name}_waypoints.json`;
-                document.body.appendChild(a);
-                a.click();
-                document.body.removeChild(a);
-                setTimeout(() => URL.revokeObjectURL(url), 1000);
-                if (profileStatus)
-                    profileStatus.textContent = `Waypoints exported from "${name}".`;
-            });
-        }
+                pendingSetup=null;setupOptions.style.display='none';
+                setupStatus.textContent='Imported '+result.parts.join(', ')+'. Imported modules are stopped.';
+            }catch(error){setupStatus.textContent='Import failed: '+error.message;}
+        });
 
         // ---- Import Waypoints ----
         const importWaypointsInput = panel.querySelector("#minibia-bot-profile-import-waypoints-input");
         const importWaypointsBtn = panel.querySelector("#minibia-bot-profile-import-waypoints");
 
+        const routeImportStatus = panel.querySelector("#minibia-bot-cave-status");
         if (importWaypointsBtn && importWaypointsInput) {
             importWaypointsBtn.addEventListener("click", () => {
                 importWaypointsInput.click();
@@ -63602,13 +63689,13 @@ function upgradeSectionHeaders(panel) {
                 if (!file)
                     return;
 
-                if (profileStatus)
-                    profileStatus.textContent = "Importing waypoints...";
+                if (routeImportStatus)
+                    routeImportStatus.textContent = "Importing waypoints...";
 
                 try {
                     const result = await bot.profiles.importWaypointsFromFile(file);
-                    if (profileStatus) {
-                        profileStatus.textContent = `Imported ${result.added} waypoint preset(s), skipped ${result.skipped} duplicate(s).`;
+                    if (routeImportStatus) {
+                        routeImportStatus.textContent = `Imported ${result.added} waypoint preset(s), skipped ${result.skipped} duplicate(s).`;
                     }
                     // Refresh cave UI to show new presets
                     if (typeof refreshCavePresetControls === "function") {
@@ -63617,8 +63704,8 @@ function upgradeSectionHeaders(panel) {
                     // Also refresh the profile list just in case (though we didn't add a profile)
                     refreshProfileList();
                 } catch (err) {
-                    if (profileStatus)
-                        profileStatus.textContent = `Import failed: ${err.message}`;
+                    if (routeImportStatus)
+                        routeImportStatus.textContent = `Import failed: ${err.message}`;
                     bot.log("Waypoint import error", err);
                 }
 
