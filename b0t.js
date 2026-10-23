@@ -4151,7 +4151,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.392",
+        version: "1.6.393",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -8271,10 +8271,15 @@ window.__minibiaBotBundle.installRuneModule = function installRuneModule(bot) {
         if(pendingCount){const r=trainingCount(pendingCount.id,now);if(r&&r.at>=pendingCount.at&&r.count>pendingCount.before)pendingCount=null;else if(now-pendingCount.at<6000)return null;else pendingCount=null;}
         const mana=bot.manaPercent(),absoluteMana=Number(bot.getPlayerState()?.mana)||0;
         for(let index=0;index<config.rules.length;index++){
-            const rule=config.rules[index];if(!rule.enabled||!rule.spellWords||mana<rule.minMana||mana>rule.maxMana)continue;
-            const spell=resolveTrainingSpell(rule.spellWords);if(absoluteMana<Number(spell.mana||0))continue;
+            const rule=config.rules[index];if(!rule.enabled||!rule.spellWords)continue;
             let count=null;
             if(rule.itemId){count=trainingCount(rule.itemId,now);if(!count)return null;if(count.count>=rule.itemCount)continue;}
+            // An unmet higher-priority supply rule reserves mana until it can
+            // cast. Otherwise a lower rule with a lower mana minimum starves it.
+            if(mana>rule.maxMana)continue;
+            if(mana<rule.minMana){if(rule.itemId)return null;continue;}
+            const spell=resolveTrainingSpell(rule.spellWords);
+            if(absoluteMana<Number(spell.mana||0)){if(rule.itemId)return null;continue;}
             return {rule,spell,index,count};
         }
         return null;
@@ -8497,7 +8502,7 @@ window.__minibiaBotBundle.installRuneModule = function installRuneModule(bot) {
     let trainerHost=null,editingRule=-1;
     function mount(panel){
         trainerHost=panel.querySelector('[data-mana-trainer-host]');if(!trainerHost)return;
-        trainerHost.innerHTML=`<div class="mb-section-title"><input type="checkbox" id="minibia-bot-rune-enabled" class="mb-title-toggle"><span class="mb-title-text">Mana Trainer</span><button type="button" class="mb-small-button" data-mt-new>+ Rule</button></div><div data-mt-rules></div><div class="mb-small-note">First matching rule casts. Move rules to change priority.</div><div class="mb-mt-editor" hidden><label class="mb-field"><span class="mb-field-label">Spell name / words</span><input data-mt-spell list="minibia-bot-training-spell-choices" autocomplete="off" placeholder="Spell name or words"><datalist id="minibia-bot-training-spell-choices"></datalist></label><div class="mb-mt-grid"><label class="mb-field"><span class="mb-field-label">Mana from %</span><input data-mt-min type="number" min="0" max="100" value="98"></label><label class="mb-field"><span class="mb-field-label">Mana to %</span><input data-mt-max type="number" min="0" max="100" value="100"></label><label class="mb-field"><span class="mb-field-label">Item condition</span><select data-mt-item></select></label><label class="mb-field"><span class="mb-field-label">Count below</span><input data-mt-count type="number" min="1" value="100"></label></div><div class="mb-mt-buttons"><button class="mb-small-button" data-mt-save>Add rule</button><button class="mb-small-button" data-mt-cancel hidden>Cancel</button></div></div>`;
+        trainerHost.innerHTML=`<div class="mb-section-title"><input type="checkbox" id="minibia-bot-rune-enabled" class="mb-title-toggle"><span class="mb-title-text">Mana Trainer</span><button type="button" class="mb-small-button" data-mt-new>+ Rule</button></div><div data-mt-rules></div><div class="mb-small-note">Rules run in order. Low item counts wait for their mana threshold.</div><div class="mb-mt-editor" hidden><label class="mb-field"><span class="mb-field-label">Spell name / words</span><input data-mt-spell list="minibia-bot-training-spell-choices" autocomplete="off" placeholder="Spell name or words"><datalist id="minibia-bot-training-spell-choices"></datalist></label><div class="mb-mt-grid"><label class="mb-field"><span class="mb-field-label">Mana from %</span><input data-mt-min type="number" min="0" max="100" value="98"></label><label class="mb-field"><span class="mb-field-label">Mana to %</span><input data-mt-max type="number" min="0" max="100" value="100"></label><label class="mb-field"><span class="mb-field-label">Item condition</span><select data-mt-item></select></label><label class="mb-field"><span class="mb-field-label">Count below</span><input data-mt-count type="number" min="1" value="100"></label></div><div class="mb-mt-buttons"><button class="mb-small-button" data-mt-save>Add rule</button><button class="mb-small-button" data-mt-cancel hidden>Cancel</button></div></div>`;
         const q=s=>trainerHost.querySelector(s),spell=q('[data-mt-spell]'),item=q('[data-mt-item]');
         function choices(){const current=item.value;const list=q('datalist');list.replaceChildren();item.replaceChildren();const always=document.createElement('option');always.value='0';always.textContent='No item limit';item.append(always);const seen=new Set();for(const s of trainingSpells()){const o=document.createElement('option');o.value=s.words;o.label=`${s.name} (${s.mana} MP)`;list.append(o);if(s.runeId&&!seen.has(s.runeId)){seen.add(s.runeId);const option=document.createElement('option');option.value=String(s.runeId);option.textContent=s.name.replace(/^Conjure /i,'');item.append(option);}}if([...item.options].some(o=>o.value===current))item.value=current;itemChanged();}
         function itemChanged(){q('[data-mt-count]').disabled=Number(item.value)===0;}
