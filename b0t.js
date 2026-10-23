@@ -4151,7 +4151,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.386",
+        version: "1.6.387",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -57279,6 +57279,8 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
     const savedSession = bot.storage.get(SESSION_KEY, null);
     let restored = false, revision = 0, priceRevision = 0;
     let overlayRow = null, overlayUpdatedAt = 0, overlayRevision = '';
+    let spellbook = null, craftJobs = [], craftGains = [], lastCraftAck = new Map();
+    let externalRuneGains = [], tradeOffers = new Map();
     const coinValues = { 2148: 1, 2152: 100, 2160: 10000 };
     const number = value => value != null && value !== '' && Number.isFinite(Number(value)) ? Number(value) : null;
     const whole = value => Math.max(0, Math.floor(number(value) || 0));
@@ -57299,7 +57301,7 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
     }
     function freshSession(owner) {
         return { schema: 1, owner, startedAt: Date.now(), recording: true, elapsedMs: 0, xp: 0,
-            kills: 0, monsters: {}, drops: {}, loot: {}, supplies: {}, unresolved: 0 };
+            kills: 0, monsters: {}, drops: {}, loot: {}, supplies: {}, crafted: {}, unresolved: 0 };
     }
     function persistConfig() { bot.storage.set(CONFIG_KEY, config); priceRevision++; }
     function save() {
@@ -57370,6 +57372,7 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
         const key = keyOf(item);
         if (!collection[key]) collection[key] = { ...item, count: 0 };
         collection[key].count += qty; revision++;
+        if (collection === session.loot && item.type === 'rune') externalRuneGains.push({ cid: item.cid, count: qty, at: Date.now() });
     }
     function active() { return !disposed && session?.recording && connected() && player === window.gameClient?.player && session.owner === ownerOf(player); }
     function readXp() {
@@ -57448,6 +57451,12 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
         const bytes = packet?.buffer; if (!(bytes instanceof Uint8Array)) return;
         const ops = typeof CONST !== 'undefined' ? CONST.PROTOCOL?.CLIENT || {} : {};
         const opcode = bytes[0], move = opcode === ops.THING_MOVE;
+        if (ops.BUY_OFFER != null && opcode === ops.BUY_OFFER && bytes.length >= 7) {
+            const vendor = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(1, true);
+            const offer = tradeOffers.get(vendor)?.[bytes[5]], item = identify({ id: offer?.id, sid: offer?.sid });
+            if (item?.type === 'rune' && offer?.type === 'sell') externalRuneGains.push({ cid: item.cid, count: whole(bytes[6]), at: Date.now() });
+            return;
+        }
         if (!move && ![ops.THING_USE, ops.THING_USE_WITH, ops.THING_USE_ON_CREATURE].filter(v => v != null).includes(opcode)) return;
         const from = locationAt(bytes, 1); if (!from || from.ground) return;
         const source = getContainer(from.containerId), item = identify(peek(source, from.slot));
@@ -57517,6 +57526,18 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
         if (!reading || !player || player !== window.gameClient?.player) return;
         const cid = whole(reading.itemId), fluid = whole(reading.fluidType), count = whole(reading.count), key = `${cid}:${fluid}`;
         const previous = countBaseline.get(key); countBaseline.set(key, count);
+        if (active() && fluid === 0 && previous != null && count > previous) {
+            const item = identify({ id: cid });
+            if (item?.type === 'rune' && item.sid !== 2260) {
+                pruneCrafts();
+                let madeCount = count - previous;
+                for (const incoming of externalRuneGains) {
+                    if (incoming.cid !== cid || !incoming.count) continue;
+                    const excluded = Math.min(madeCount, incoming.count); madeCount -= excluded; incoming.count -= excluded;
+                }
+                if (madeCount > 0) { craftGains.push({ cid, count: madeCount, at: Date.now(), player, session }); matchCrafts(); }
+            }
+        }
         const seedUntil = Number(window.gameClient?.networkManager?.__supplySeedExpect?.[key]) || 0;
         if (!active() || previous == null || count >= previous || Date.now() < seedUntil) return;
         const item = identify({ id: cid, fluidType: fluid });
@@ -57524,6 +57545,36 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
         // Only unsolicited server count decreases are consumption. Bag moves,
         // selling, dropping and refresh requests seed counts silently.
         addItem(session.supplies, item, previous - count);
+    }
+    function pruneCrafts() {
+        const now = Date.now();
+        craftJobs = craftJobs.filter(job => job.player === player && job.session === session && now - job.at < 6000).slice(-24);
+        craftGains = craftGains.filter(gain => gain.player === player && gain.session === session && now - gain.at < 6000).slice(-48);
+        externalRuneGains = externalRuneGains.filter(gain => gain.count > 0 && now - gain.at < 4000).slice(-80);
+        for (const [id, at] of lastCraftAck) if (now - at > 10000) lastCraftAck.delete(id);
+    }
+    function matchCrafts() {
+        if (!active()) return;
+        for (const job of [...craftJobs]) {
+            const gain = craftGains.find(g => g.cid === job.item.cid && g.at >= job.at - 500 && g.at <= job.at + 6000);
+            if (!gain) continue;
+            addItem(session.crafted, job.item, gain.count);
+            craftJobs.splice(craftJobs.indexOf(job), 1); craftGains.splice(craftGains.indexOf(gain), 1);
+        }
+    }
+    function onCraftAck(packet) {
+        if (!active()) return;
+        const id = whole(packet?.id), spell = window.gameClient?.interface?.SPELLS?.get?.(id);
+        const cid = whole(spell?.runeId); if (!cid) return;
+        const item = identify({ id: cid });
+        if (item?.type !== 'rune' || item.sid === 2260) return;
+        pruneCrafts();
+        // The server sends a separate global cooldown. Only this exact rune
+        // spell's successful cast is production; duplicate ACKs are ignored.
+        if (lastCraftAck.has(id) && Date.now() - lastCraftAck.get(id) < 1000) return;
+        lastCraftAck.set(id, Date.now());
+        craftJobs.push({ item, at: Date.now(), player, session }); matchCrafts();
+        if (craftJobs.some(job => job.item.cid === cid)) bot.requestItemCounts?.([{ id: cid, fluidType: 0 }]);
     }
     function seedSupplyCounts() {
         if (!active() || requestedCountsFor === player || !catalog.size) return;
@@ -57540,6 +57591,8 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
     function learnOffers(packet) {
         const offers = Array.isArray(packet?.offers) ? packet.offers : [];
         if (!offers.length) return;
+        tradeOffers.set(Number(packet.id), offers.map(offer => ({ ...offer })));
+        while (tradeOffers.size > 8) tradeOffers.delete(tradeOffers.keys().next().value);
         rebuildCatalog(); let changed = false;
         for (const offer of offers) {
             const props = window.gameClient?.itemDefinitionsByCid?.[Number(offer.id)]?.properties || {};
@@ -57556,6 +57609,13 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
     function priceFor(item, purpose) {
         const key = keyOf(item), override = number(config.overrides[key]?.[purpose]);
         if (override != null && override >= 0) return { value: override, source: 'Custom' };
+        if (purpose === 'craftCost') return { value: 0, source: 'No extra cost' };
+        if (purpose === 'made') {
+            const sale = priceFor(item, 'sell');
+            if (sale.value != null) return sale;
+            const purchase = priceFor(item, 'buy');
+            return { value: purchase.value, source: purchase.source === 'NPC' ? 'NPC purchase' : purchase.source };
+        }
         if (purpose === 'sell' && coinValues[item.sid]) return { value: coinValues[item.sid], source: 'Currency' };
         const offers = Object.entries(config.offers[key] || {}).filter(([vendor]) => vendor.endsWith(purpose === 'buy' ? ':sell' : ':buy')).map(([, gp]) => number(gp)).filter(gp => gp != null && gp >= 0);
         if (purpose === 'sell' && item.fluidType === 0) {
@@ -57575,23 +57635,27 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
     function status() {
         advanceClock();
         const loot = priced(session?.loot, 'sell'), supplies = priced(session?.supplies, 'buy'), drops = priced(session?.drops, 'sell');
+        const crafted = priced(session?.crafted, 'made'), craftCosts = priced(session?.crafted, 'craftCost');
+        const craftedTotal = totals(crafted), craftingCost = totals(craftCosts).value;
         const lootTotal = totals(loot), supplyTotal = totals(supplies), hours = (session?.elapsedMs || 0) / 3600000;
+        const profit = lootTotal.value + craftedTotal.value - supplyTotal.value - craftingCost;
         const xp = session?.xp || 0, xpPerHour = hours > 0 ? xp / hours : 0;
         const level = levelForXp(liveXp), remainingXp = level == null ? null : Math.max(0, expForLevel(level + 1) - liveXp);
         return { recording: !!session?.recording, connected: connected(), startedAt: session?.startedAt || null,
             owner: session?.owner || null, elapsedMs: session?.elapsedMs || 0, xp, xpPerHour, level, remainingXp,
             timeToLevelMs: xpPerHour > 0 && remainingXp != null ? remainingXp / xpPerHour * 3600000 : null,
             kills: session?.kills || 0, killsPerHour: hours > 0 ? session.kills / hours : 0,
-            loot, supplies, drops, monsters: { ...session?.monsters }, lootValue: lootTotal.value, supplyValue: supplyTotal.value,
-            lootUnknown: lootTotal.unknown, supplyUnknown: supplyTotal.unknown, balance: lootTotal.value - supplyTotal.value,
-            balancePerHour: hours > 0 ? (lootTotal.value - supplyTotal.value) / hours : 0,
-            profit: lootTotal.value - supplyTotal.value,
-            profitPerHour: hours > 0 ? (lootTotal.value - supplyTotal.value) / hours : 0,
-            profitState: lootTotal.unknown || supplyTotal.unknown ? 'partial' : lootTotal.value > supplyTotal.value ? 'profit' : lootTotal.value < supplyTotal.value ? 'waste' : 'break-even',
+            loot, supplies, drops, crafted, craftCosts, craftedCount: crafted.reduce((sum, row) => sum + row.count, 0),
+            craftedValue: craftedTotal.value, craftedUnknown: craftedTotal.unknown, craftingCost, craftPending: craftJobs.length,
+            monsters: { ...session?.monsters }, lootValue: lootTotal.value, supplyValue: supplyTotal.value,
+            lootUnknown: lootTotal.unknown, supplyUnknown: supplyTotal.unknown, balance: profit,
+            balancePerHour: hours > 0 ? profit / hours : 0,
+            profit, profitPerHour: hours > 0 ? profit / hours : 0,
+            profitState: lootTotal.unknown || supplyTotal.unknown || craftedTotal.unknown ? 'partial' : profit > 0 ? 'profit' : profit < 0 ? 'waste' : 'break-even',
             priceNote, revision, priceRevision };
     }
     function setPrice(key, purpose, value) {
-        if (!['buy', 'sell'].includes(purpose) || typeof key !== 'string' || !/^(?:\d+:\d+|n:.+)$/.test(key)) throw new Error('Choose an item first.');
+        if (!['buy', 'sell', 'made', 'craftCost'].includes(purpose) || typeof key !== 'string' || !/^(?:\d+:\d+|n:.+)$/.test(key)) throw new Error('Choose an item first.');
         if (value == null || String(value).trim() === '') {
             if (config.overrides[key]) { delete config.overrides[key][purpose]; if (!Object.keys(config.overrides[key]).length) delete config.overrides[key]; }
         } else {
@@ -57602,7 +57666,7 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
         persistConfig(); revision++; return priceFor(itemForKey(key), purpose);
     }
     function itemForKey(key) {
-        return catalog.get(key) || session?.loot?.[key] || session?.supplies?.[key] || session?.drops?.[key] ||
+        return catalog.get(key) || session?.loot?.[key] || session?.supplies?.[key] || session?.drops?.[key] || session?.crafted?.[key] ||
             { sid: whole(key.split(':')[0]), fluidType: whole(key.split(':')[1]), name: key };
     }
     async function refreshPrices() {
@@ -57648,9 +57712,11 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
     }
     function bind() {
         const gc = window.gameClient, p = gc?.player || null, ph = gc?.networkManager?.packetHandler;
-        if (gc === client && p === player && ph === handler) return;
+        const book = p?.spellbook;
+        if (gc === client && p === player && ph === handler && book === spellbook) return;
         advanceClock(); save(); unhook();
-        client = gc; player = p; handler = ph;
+        client = gc; player = p; handler = ph; spellbook = book;
+        craftJobs = []; craftGains = []; lastCraftAck.clear(); externalRuneGains = []; tradeOffers.clear();
         moves = []; ringRemovals = []; countBaseline.clear(); requestedCountsFor = null;
         liveXp = lastXp = null; lastClock = Date.now();
         rebuildCatalog();
@@ -57661,6 +57727,7 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
                 candidate.monsters && candidate.loot && candidate.supplies && candidate.drops ? candidate : freshSession(owner);
             revision++; save();
         }
+        if (session && (!session.crafted || typeof session.crafted !== 'object')) { session.crafted = {}; save(); }
         liveXp = lastXp = readXp();
         hook(ph, 'handlePropertyChange', args => {
             const packet = args[0];
@@ -57669,6 +57736,7 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
         });
         hook(ph, 'handleServerMessage', args => onMessage(args[0]));
         hook(ph, 'handleTradeOffer', args => learnOffers(args[0]));
+        hook(book, 'serverCastSpell', args => onCraftAck(args[0]));
         hook(ph, 'handleContainerItemRemove', (args, before) => onRemove(args[0], before), captureRemove);
         hook(ph, 'handleContainerAddItem', (args, before) => onAdd(args[0], before), captureAdd);
         // Record before sending: a synchronous test client may apply the ACK
@@ -57677,9 +57745,9 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
         const modal = gc?.interface?.modalManager?.get?.('offer-modal');
         if (modal?.__offers?.length) learnOffers({ id: modal.__id, offers: modal.__offers });
     }
-    function pause() { advanceClock(); if (session) session.recording = false; ringRemovals = []; lastXp = liveXp; save(); revision++; render(); }
+    function pause() { advanceClock(); if (session) session.recording = false; ringRemovals = []; craftJobs = []; craftGains = []; externalRuneGains = []; lastXp = liveXp; save(); revision++; render(); }
     function resume() { bind(); advanceClock(); if (session) session.recording = true; lastXp = liveXp; lastClock = Date.now(); countBaseline.clear(); requestedCountsFor = null; seedSupplyCounts(); save(); revision++; render(); }
-    function reset() { bind(); if (!player) return; session = freshSession(ownerOf(player)); moves = []; ringRemovals = []; lastXp = liveXp; lastClock = Date.now(); countBaseline.clear(); requestedCountsFor = null; seedSupplyCounts(); save(); revision++; render(); }
+    function reset() { bind(); if (!player) return; session = freshSession(ownerOf(player)); moves = []; ringRemovals = []; craftJobs = []; craftGains = []; externalRuneGains = []; lastCraftAck.clear(); lastXp = liveXp; lastClock = Date.now(); countBaseline.clear(); requestedCountsFor = null; seedSupplyCounts(); save(); revision++; render(); }
     const offCounts = bot.subscribeItemCounts?.(onCount);
 
     // ---- Hunt Analyzer panel ----
@@ -57721,13 +57789,17 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
         const signature = `${revision}:${priceRevision}`;
         if (snapshot || !overlayUpdatedAt || Date.now() - overlayUpdatedAt >= 1000 || signature !== overlayRevision) {
             const st = snapshot || status();
-            const values = [duration(st.elapsedMs) + (!st.recording ? ' (Paused)' : !st.connected ? ' (Offline)' : ''),
-                format(st.xpPerHour), format(st.xp), duration(st.timeToLevelMs),
-                format(st.lootValue) + ' gp' + (st.lootUnknown ? ' *' : ''),
-                format(st.supplyValue) + ' gp' + (st.supplyUnknown ? ' *' : ''), profitText(st)];
-            Array.from(overlayRow.children).forEach((line, i) => { line.textContent = line.dataset.huntOverlay + ': ' + values[i]; });
+            let madeLine = overlayRow.querySelector('[data-hunt-overlay="Runes Made"]');
+            if (st.craftedCount > 0 && !madeLine) { madeLine = document.createElement('div'); madeLine.dataset.huntOverlay = 'Runes Made'; overlayRow.insertBefore(madeLine, overlayRow.lastChild); }
+            if (!st.craftedCount) madeLine?.remove();
+            const values = { Session: duration(st.elapsedMs) + (!st.recording ? ' (Paused)' : !st.connected ? ' (Offline)' : ''),
+                'XP/H': format(st.xpPerHour), 'XP Total': format(st.xp), TTL: duration(st.timeToLevelMs),
+                Loot: format(st.lootValue) + ' gp' + (st.lootUnknown ? ' *' : ''),
+                Supplies: format(st.supplyValue) + ' gp' + (st.supplyUnknown ? ' *' : ''),
+                'Runes Made': format(st.craftedCount) + ' · ' + format(st.craftedValue) + ' gp' + (st.craftedUnknown ? ' *' : ''), Profit: profitText(st) };
+            Array.from(overlayRow.children).forEach(line => { line.textContent = line.dataset.huntOverlay + ': ' + values[line.dataset.huntOverlay]; });
             overlayRow.lastChild.style.color = profitColor(st);
-            overlayRow.title = st.profitState === 'partial' ? 'Partial totals: some item prices are unknown. Set their prices in Hunt.' : 'Profit = loot taken − supplies used';
+            overlayRow.title = st.profitState === 'partial' ? 'Partial totals: some item prices are unknown. Set their prices in Hunt.' : 'Profit = loot + crafted rune value − supplies − extra crafting costs';
             overlayUpdatedAt = Date.now(); overlayRevision = signature;
         }
         if (overlayRow.parentElement !== overlay) overlay.appendChild(overlayRow);
@@ -57757,18 +57829,20 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
           <div class="mb-hunt-actions"><button type="button" class="mb-small-button" data-hunt="toggle">Pause</button><button type="button" class="mb-small-button" data-hunt="reset">New session</button><span class="mb-small-note" data-hunt="state" role="status"></span></div>
           <label class="mb-toggle" style="margin:8px 0"><input type="checkbox" data-hunt="overlay"><span>Show in-game overlay</span></label>
           <div class="mb-hunt-grid" data-hunt="stats"></div>
+          <div class="mb-small-note" data-hunt="craft-summary"></div>
           <div class="mb-small-note" data-hunt="unknown" role="status"></div>
-          <div class="mb-hunt-actions"><select data-hunt="view" aria-label="Hunt breakdown"><option value="loot">Loot taken</option><option value="supplies">Supplies used</option><option value="monsters">Monsters killed</option><option value="drops">All drops</option></select></div>
+          <div class="mb-hunt-actions"><select data-hunt="view" aria-label="Hunt breakdown"><option value="loot">Loot taken</option><option value="supplies">Supplies used</option><option value="crafted">Runes made</option><option value="craftCosts">Extra crafting costs</option><option value="monsters">Monsters killed</option><option value="drops">All drops</option></select></div>
           <div class="mb-hunt-scroll" data-hunt="breakdown"></div>
           <details class="mb-hunt-fold" data-hunt="prices"><summary>Item prices</summary>
             <div class="mb-small-note" style="margin:7px 0">Loot uses the highest NPC resale price. Supplies use the lowest purchase price learned from NPC trades. Blank = NPC price; 0 = free. Changes revalue the whole session.</div>
             <label class="mb-field"><span class="mb-field-label">Item name / SID</span><input data-hunt="item" list="mb-hunt-item-choices" autocomplete="off" placeholder="Search an item…"></label><datalist id="mb-hunt-item-choices"></datalist>
             <div class="mb-small-note" data-hunt="npc-price"></div>
             <div class="mb-hunt-prices"><label class="mb-field"><span class="mb-field-label">Loot price / item (gp)</span><input data-hunt="sell" type="number" min="0" max="1000000000" step="any" placeholder="NPC price"></label><label class="mb-field"><span class="mb-field-label">Supply price / item (gp)</span><input data-hunt="buy" type="number" min="0" max="1000000000" step="any" placeholder="NPC price"></label></div>
+            <div data-hunt="craft-fields" hidden><div class="mb-hunt-prices"><label class="mb-field"><span class="mb-field-label">Made rune value / rune (gp)</span><input data-hunt="made" type="number" min="0" max="1000000000" step="any" placeholder="Rune sale / NPC price"></label><label class="mb-field"><span class="mb-field-label">Extra cost / rune (gp)</span><input data-hunt="craftCost" type="number" min="0" max="1000000000" step="any" placeholder="0"></label></div><div class="mb-small-note">Made rune value adds to profit. Extra cost is for materials or other costs not already tracked as supplies. Leave extra cost blank for 0; mana fluids are counted separately.</div></div>
             <div class="mb-hunt-actions"><button type="button" class="mb-small-button" data-hunt="save-price">Save prices</button><button type="button" class="mb-small-button" data-hunt="npc-default">Use NPC prices</button><button type="button" class="mb-small-button" data-hunt="refresh">Refresh NPC prices</button></div>
             <div class="mb-small-note" data-hunt="price-message" role="status" aria-live="polite"></div>
           </details>
-          <details class="mb-hunt-fold"><summary>Tracking details</summary><div class="mb-small-note" style="margin-top:7px">Starts automatically. Time runs while connected and recording; Pause and offline time are excluded. XP/h uses the entire recorded session, including idle time and XP losses. The session survives mb0t reloads on this character.<br><br>Kills and drops come from your server loot messages. Loot taken includes server auto-loot and confirmed moves from dead corpses into bags. Dropped items and items left in corpses are excluded from profit. Potions and runes use server consumption counts; rings count when they expire or use their last charge. Opening an NPC trade learns its purchase prices. Unknown prices are excluded from totals until priced.</div></details>
+          <details class="mb-hunt-fold"><summary>Tracking details</summary><div class="mb-small-note" style="margin-top:7px">Starts automatically. Time runs while connected and recording; Pause and offline time are excluded. XP/h uses the entire recorded session, including idle time and XP losses. The session survives mb0t reloads on this character.<br><br>Kills and drops come from your server loot messages. Loot taken includes server auto-loot and confirmed moves from dead corpses into bags. Dropped items and items left in corpses are excluded from profit. Potions and runes use server consumption counts; rings count when they expire or use their last charge. Opening an NPC trade learns its purchase prices. Unknown prices are excluded from totals until priced.<br><br>Runes made during this session need a successful rune spell and an increased server inventory count. Manual casts, Rune Crafter and Mana Trainer are tracked. Value defaults to the rune sale price, then known NPC purchase price; set your own value in Item prices. Profit includes the value of made runes, minus extra crafting costs and supplies used. Making runes adds value; using them later is still a supply expense.</div></details>
         </div>`;
         const q = name => host.querySelector(`[data-hunt="${name}"]`);
         ui = { host, q, selectedKey: null, choiceMap: new Map(), signature: '', choicesSignature: '', npcSignature: '' };
@@ -57788,14 +57862,15 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
             try {
                 if (!ui.selectedKey) throw new Error('Choose an item from the suggestions.');
                 // Validate both before mutating either price.
-                for (const purpose of ['buy', 'sell']) { const value = q(purpose).value; if (value !== '' && (number(value) == null || Number(value) < 0 || Number(value) > 1000000000)) throw new Error('Price must be 0–1,000,000,000 gp.'); }
-                for (const purpose of ['sell', 'buy']) setPrice(ui.selectedKey, purpose, q(purpose).value);
+                const purposes = ['sell', 'buy', ...(q('craft-fields').hidden ? [] : ['made', 'craftCost'])];
+                for (const purpose of purposes) { const value = q(purpose).value; if (value !== '' && (number(value) == null || Number(value) < 0 || Number(value) > 1000000000)) throw new Error('Price must be 0–1,000,000,000 gp.'); }
+                for (const purpose of purposes) setPrice(ui.selectedKey, purpose, q(purpose).value);
                 q('price-message').textContent = 'Prices saved. Session totals updated.'; render(); updatePriceHint();
             } catch (error) { q('price-message').textContent = error.message; }
         });
         q('npc-default').addEventListener('click', () => {
             if (!ui.selectedKey) return;
-            setPrice(ui.selectedKey, 'sell', null); setPrice(ui.selectedKey, 'buy', null); selectPrice(ui.selectedKey);
+            for (const purpose of ['sell', 'buy', 'made', 'craftCost']) setPrice(ui.selectedKey, purpose, null); selectPrice(ui.selectedKey);
             q('price-message').textContent = 'Using NPC prices.'; render();
         });
         render();
@@ -57806,7 +57881,7 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
         const signature = `${catalog.size}:${revision}:${priceRevision}`; if (ui.choicesSignature === signature) return;
         ui.choicesSignature = signature;
         const available = new Map();
-        for (const collection of [session?.loot, session?.supplies, session?.drops]) for (const [key, item] of Object.entries(collection || {})) available.set(key, item);
+        for (const collection of [session?.loot, session?.supplies, session?.drops, session?.crafted]) for (const [key, item] of Object.entries(collection || {})) available.set(key, item);
         for (const [key, item] of catalog) if (!ringBases.has(item.sid) && (window.gameClient?.npcTrades?.[item.sid] || config.offers[key] || config.overrides[key] || item.ring || item.type === 'rune' || item.fluidType)) available.set(key, item);
         const list = ui.host.querySelector('#mb-hunt-item-choices'); list.replaceChildren(); ui.choiceMap.clear();
         for (const [key, item] of [...available].sort((a, b) => a[1].name.localeCompare(b[1].name))) {
@@ -57817,7 +57892,8 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
         if (!ui) return;
         ui.selectedKey = key; ui.q('prices').open = true; refreshChoices();
         ui.q('item').value = choiceLabel(itemForKey(key));
-        for (const purpose of ['sell', 'buy']) ui.q(purpose).value = config.overrides[key]?.[purpose] ?? '';
+        for (const purpose of ['sell', 'buy', 'made', 'craftCost']) ui.q(purpose).value = config.overrides[key]?.[purpose] ?? '';
+        const item = itemForKey(key); ui.q('craft-fields').hidden = item.type !== 'rune' || item.sid === 2260;
         ui.q('price-message').textContent = ''; updatePriceHint();
     }
     function updatePriceHint() {
@@ -57833,11 +57909,12 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
         q('overlay').checked = config.overlayEnabled;
         q('toggle').textContent = st.recording ? 'Pause' : 'Resume';
         q('state').textContent = !st.owner ? 'Waiting for character' : !st.recording ? 'Paused' : !st.connected ? 'Offline' : 'Recording';
-        const partial = st.lootUnknown + st.supplyUnknown > 0;
+        const partial = st.lootUnknown + st.supplyUnknown + st.craftedUnknown > 0;
         const metrics = [['Session', duration(st.elapsedMs)], ['XP / hour', format(st.xpPerHour)], ['XP total', format(st.xp)],
             ['Time to level', duration(st.timeToLevelMs)], ['Kills', format(st.kills)], ['Kills / hour', format(st.killsPerHour)],
             ['Loot taken', format(st.lootValue) + ' gp' + (st.lootUnknown ? ' *' : '')], ['Supplies used', format(st.supplyValue) + ' gp' + (st.supplyUnknown ? ' *' : '')],
-            ['Profit', profitText(st)], ['Profit / hour', profitText(st, true)]];
+            ['Profit', profitText(st)], ['Profit / hour', profitText(st, true)],
+            ['Runes made', format(st.craftedCount)], ['Crafted value', format(st.craftedValue) + ' gp' + (st.craftedUnknown ? ' *' : '')]];
         const statHost = q('stats');
         if (!statHost.children.length) for (const [label] of metrics) {
             const card = document.createElement('div'); card.className = 'mb-hunt-card';
@@ -57846,9 +57923,10 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
         }
         metrics.forEach(([, value], i) => {
             statHost.children[i].lastChild.textContent = value;
-            if (i >= 8) { statHost.children[i].lastChild.style.color = profitColor(st); statHost.children[i].title = 'Profit = loot taken − supplies used'; }
+            if (i === 8 || i === 9) { statHost.children[i].lastChild.style.color = profitColor(st); statHost.children[i].title = 'Profit = loot + crafted rune value − supplies − extra crafting costs'; }
         });
-        q('unknown').textContent = partial ? `* Partial totals: ${st.lootUnknown} loot and ${st.supplyUnknown} supply item types need prices. Click an item to set its price.` : '';
+        q('craft-summary').textContent = st.craftedCount ? `Extra crafting costs: ${format(st.craftingCost)} gp · Made runes are included in profit.` : '';
+        q('unknown').textContent = partial ? `* Partial totals: ${st.lootUnknown} loot, ${st.supplyUnknown} supply and ${st.craftedUnknown} made rune item types need prices. Click an item to set its price.` : '';
         const view = q('view').value, signature = `${view}:${revision}:${priceRevision}:${Object.keys(window.gameClient?.npcTrades || {}).length}`;
         if (ui.signature !== signature) {
             ui.signature = signature; const parent = q('breakdown'); parent.replaceChildren();
@@ -57878,7 +57956,7 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
     function tick() {
         if (disposed) return;
         try {
-            bind(); advanceClock(); rebuildCatalog(); settleRings(); pruneMoves(); seedSupplyCounts();
+            bind(); advanceClock(); rebuildCatalog(); settleRings(); pruneMoves(); pruneCrafts(); seedSupplyCounts();
             // Only seed from the client model on binding. It can lag behind the
             // authoritative EXPERIENCE packet, so polling must never roll XP back.
             if (liveXp == null) liveXp = lastXp = readXp();
@@ -57896,6 +57974,7 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
         advanceClock(); settleRings(); save(); disposed = true; clearInterval(timer); fetchController?.abort(); offCounts?.(); unhook();
         overlayRow?.remove(); overlayRow = null; bot.uiTweaks?.applyTTL?.();
         window.removeEventListener('pagehide', onPageHide); ui?.host.remove(); ui = null; moves = []; ringRemovals = []; countBaseline.clear();
+        craftJobs = []; craftGains = []; lastCraftAck.clear(); externalRuneGains = []; tradeOffers.clear(); spellbook = null;
     });
 };
 
