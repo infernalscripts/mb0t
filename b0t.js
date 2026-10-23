@@ -4103,7 +4103,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.361",
+        version: "1.6.371",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -8461,7 +8461,6 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
         lastAttemptAt: {},
         pendingAttempt: {},
         manualCooldownUntil: {},
-        lastParalyzeAt: 0,
         hadPlayerSnapshot: false,
         playerRef: null,
         // Counters are bounded by configured rules and one pending action.
@@ -8484,10 +8483,6 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
         healRules: [],
         skipOnCooldown: true,
         debugCooldown: false,
-        paralyzeEnabled: false,
-        paralyzeSpellWords: "",
-        paralyzeMinHpPercent: 70,
-        paralyzeCooldownMs: 1500,
     }, bot.storage.get(configStorageKey, {}));
 
     // Immediate server events are primary; retain a slower fail-safe poll.
@@ -8533,6 +8528,8 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
             (!["hotbar", "spell", "item"].includes(rule.source) ? normalizeHotbarSlot(rule.slot) || 1 : null);
         return {
             enabled: rule.enabled !== false,
+            condition:rule.condition==='paralyzed'?'paralyzed':'always',
+            ...(Number.isFinite(Number(rule.cooldownMs))&&rule.cooldownMs!=null?{cooldownMs:Math.max(250,Number(rule.cooldownMs))}:{}),
             source: getRuleSource(rule),
             ...(legacyCooldownSlot ? { legacyCooldownSlot } : {}),
             slot: normalizeHotbarSlot(rule.slot) || 1,
@@ -8613,9 +8610,18 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
     delete config.minHp;
     delete config.minMana;
 
+    function isParalyzed(){const id=typeof ConditionManager!=='undefined'?ConditionManager.prototype.PARALYZE:16;return !!window.gameClient?.player?.hasCondition?.(id);}
+    function migrateParalyzeRule(){
+        if(!Object.hasOwn(config,'paralyzeEnabled')&&!Object.hasOwn(config,'paralyzeSpellWords'))return false;
+        const words=String(config.paralyzeSpellWords||'').trim();
+        if(words)config.healRules.push(normalizeRule({source:'spell',condition:'paralyzed',enabled:config.paralyzeEnabled===true,spellWords:words,manaCost:resolveHealSpell(words).mana||1,minHpPercent:Math.max(0,Math.min(100,Number(config.paralyzeMinHpPercent??70))),maxHpPercent:100,minManaPercent:0,maxManaPercent:100,cooldownMs:Number(config.paralyzeCooldownMs)||1500}));
+        for(const key of ['paralyzeEnabled','paralyzeSpellWords','paralyzeMinHpPercent','paralyzeCooldownMs'])delete config[key];
+        return true;
+    }
     const previousRules = JSON.stringify(config.healRules);
     config.healRules = normalizeRules(config.healRules);
-    if (JSON.stringify(config.healRules) !== previousRules) persistConfig();
+    const migratedParalyze=migrateParalyzeRule();
+    if (migratedParalyze||JSON.stringify(config.healRules) !== previousRules) persistConfig();
 
     function persistConfig() {
         bot.storage.set(configStorageKey, {
@@ -8627,10 +8633,6 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
             healRules: config.healRules,
             skipOnCooldown: config.skipOnCooldown,
             debugCooldown: config.debugCooldown,
-            paralyzeEnabled: config.paralyzeEnabled,
-            paralyzeSpellWords: config.paralyzeSpellWords,
-            paralyzeMinHpPercent: config.paralyzeMinHpPercent,
-            paralyzeCooldownMs: config.paralyzeCooldownMs,
         });
     }
 
@@ -8870,6 +8872,7 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
     }
 
     function expectedHealResource(rule) {
+        if(rule.condition==='paralyzed')return 'paralyze';
         if (getRuleSource(rule) === "item") return getSpecificItem(rule)?.resource || "either";
         // Healing rules express their purpose through HP/MP ranges, not a type
         // field. Only a restricted range is enough to infer one resource.
@@ -8883,6 +8886,7 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
 
     function didSucceed(stats, attempt) {
         if (!stats || !attempt) return false;
+        if(attempt.expectedResource==='paralyze')return !isParalyzed();
         const hpUp = !!stats.hp && stats.hp.current > attempt.hpBefore;
         const manaUp = !!stats.mana && stats.mana.current > attempt.manaBefore;
         if (attempt.expectedResource === 'hp') return hpUp;
@@ -8899,7 +8903,6 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
         state.lastUnconfirmedNoticeAt = {};
         state.lastNoSupplyNoticeAt = {};
         state.lastItemSupplyBySlot = {};
-        state.lastParalyzeAt = 0;
     }
 
     function resolvePending(stats, now) {
@@ -9027,6 +9030,7 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
 
     function canUseRule(rule, now, stats) {
         if (!rule || rule.enabled === false) return false;
+        if(rule.condition==='paralyzed'&&!isParalyzed())return false;
         const source = getRuleSource(rule);
         var slot = normalizeHotbarSlot(rule.slot);
         if (source === "hotbar" && !slot) return false;
@@ -9044,7 +9048,7 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
         //        }
 
         // Own per-slot cooldown
-        if (now - (state.lastHealAt[key] || 0) < config.healCooldownMs)
+        if (now - (state.lastHealAt[key] || 0) < (rule.cooldownMs??config.healCooldownMs))
             return false;
         if (now - (state.lastAttemptAt[key] || 0) < (config.healRetryMs || 200))
             return false;
@@ -9063,7 +9067,7 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
             return false;
 
         if (source === "spell") {
-            var cost = Math.max(1, Number(rule.manaCost) || 0);
+            var cost = Math.max(1, Number(rule.manaCost) || 0, Number(resolveHealSpell(rule.spellWords).mana)||0);
             if (stats.mana.current < cost)
                 return false;
         }
@@ -9148,33 +9152,6 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
         return clicked;
     }
 
-    function tryClearParalyze(stats, now) {
-        if (!config.paralyzeEnabled || !String(config.paralyzeSpellWords || "").trim())
-            return false;
-        const player = window.gameClient?.player;
-        const paralyzeId = typeof ConditionManager !== "undefined" ? ConditionManager.prototype.PARALYZE : 16;
-        if (!player?.hasCondition?.(paralyzeId))
-            return false;
-        const hp = getHpPercent(stats);
-        if (hp < Math.max(0, Math.min(100, Number(config.paralyzeMinHpPercent) || 0)))
-            return false;
-        if (now - (state.lastParalyzeAt || 0) < Math.max(250, Number(config.paralyzeCooldownMs) || 1500))
-            return false;
-        if (isPlayerExhausted())
-            return false;
-        const words = String(config.paralyzeSpellWords).trim();
-        if (config.skipOnCooldown && isSpellWordOnCooldown(words))
-            return false;
-        const sent = bot.actions.runShared('clear-paralyze',
-            bot.actions.priorities.DEFENSE, () => bot.sendChat(words));
-        if (sent) {
-            state.lastParalyzeAt = now;
-            if (config.debugCooldown)
-                bot.log(`[Heal] Cleared paralyze with ${words} at ${hp.toFixed(0)}% HP`);
-        }
-        return sent;
-    }
-
     function tryHeal() {
         if (!config.enabled)
             return false;
@@ -9198,8 +9175,7 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
         state.hadPlayerSnapshot = true;
         resolvePending(stats, now);
         pruneRuleState();
-        // Self-healing always gets first chance. Clearing paralyze must not
-        // spend an available action/cooldown ahead of a ready heal rule.
+        // All healing and condition rules use the same ordered priority list.
         if (hasPending()) return false;
         for (var i = 0; i < config.healRules.length; i++) {
             var rule = config.healRules[i];
@@ -9208,9 +9184,7 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
             if (triggerRule(rule, now, stats))
                 return true;
         }
-        // Defensive clearing runs only when no heal was dispatched. Preserve
-        // its configured HP floor and spell/exhaustion cooldown checks.
-        return tryClearParalyze(stats, now);
+        return false;
     }
 
     function scheduleNextTick() {
@@ -9295,10 +9269,6 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
                 healRules: config.healRules,
                 skipOnCooldown: config.skipOnCooldown,
                 debugCooldown: config.debugCooldown,
-                paralyzeEnabled: config.paralyzeEnabled,
-                paralyzeSpellWords: config.paralyzeSpellWords,
-                paralyzeMinHpPercent: config.paralyzeMinHpPercent,
-                paralyzeCooldownMs: config.paralyzeCooldownMs,
             },
             stats: stats,
             hpPercent: getHpPercent(stats),
@@ -9318,11 +9288,8 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
         if (Object.hasOwn(next, "healRules")) next.healRules = normalizeRules(next.healRules);
         for (var k in next)
             config[k] = next[k];
+        migrateParalyzeRule();
         pruneRuleState();
-        config.paralyzeEnabled = config.paralyzeEnabled === true;
-        config.paralyzeSpellWords = String(config.paralyzeSpellWords || "").trim();
-        config.paralyzeMinHpPercent = Math.max(0, Math.min(100, Number(config.paralyzeMinHpPercent) || 0));
-        config.paralyzeCooldownMs = Math.max(250, Number(config.paralyzeCooldownMs) || 1500);
         delete config.hpHotbarSlot;
         delete config.manaHotbarSlot;
         delete config.minHp;
@@ -53922,9 +53889,11 @@ window.__minibiaBotBundle.installFisherModule = function installFisherModule(bot
         tile: null, // {x, y, z}
         delayMs: 2000,
         fishThreshold: 10,
+        rodSid:2580,
     },
             bot.storage.get(configStorageKey, {}));
 
+    config.rodSid=Number(config.rodSid)===14050?14050:2580;
     function persistConfig() {
         bot.storage.set(configStorageKey, {
             ...config
@@ -53973,12 +53942,12 @@ window.__minibiaBotBundle.installFisherModule = function installFisherModule(bot
 
     // ---- Find fishing rod in equipment or containers ----
     function findFishingRod() {
-        if(typeof HotbarUsePacket==='function'&&window.gameClient?.send)return {server:true,item:{id:FISHING_ROD_ID}};
+
         const eq = getEquipment();
         if (eq) {
             for (let i = 0; i < eq.slots.length; i++) {
                 const item = eq.getSlotItem(i);
-                if (item && item.id === FISHING_ROD_ID) {
+                if (item && Number(item.id) === FISHING_ROD_ID && Number(item.sid)===config.rodSid) {
                     return {
                         container: eq,
                         slotIndex: i,
@@ -53992,7 +53961,7 @@ window.__minibiaBotBundle.installFisherModule = function installFisherModule(bot
                 continue;
             for (let i = 0; i < container.size; i++) {
                 const item = container.getSlotItem(i);
-                if (item && item.id === FISHING_ROD_ID) {
+                if (item && Number(item.id) === FISHING_ROD_ID && Number(item.sid)===config.rodSid) {
                     return {
                         container,
                         slotIndex: i,
@@ -54001,6 +53970,9 @@ window.__minibiaBotBundle.installFisherModule = function installFisherModule(bot
                 }
             }
         }
+        const now=Date.now(),selected=bot.sidInventory?.reading(config.rodSid),other=bot.sidInventory?.reading(config.rodSid===2580?14050:2580);
+        if(typeof HotbarUsePacket==='function'&&window.gameClient?.send&&selected&&other&&now-selected.at<=5000&&now-other.at<=5000&&selected.count>0&&other.count===0)return {server:true,item:{id:FISHING_ROD_ID,sid:config.rodSid}};
+        if(now-Number(state.lastRodCountRequestAt||0)>=1500){state.lastRodCountRequestAt=now;bot.sidInventory?.request([2580,14050]);}
         return null;
     }
 
@@ -54028,7 +54000,7 @@ window.__minibiaBotBundle.installFisherModule = function installFisherModule(bot
     function useFishingRod() {
         const rod = findFishingRod();
         if (!rod) {
-            bot.log("Fisher: No fishing rod found (ID 3483)");
+            if(Date.now()-Number(state.lastMissingRodLogAt||0)>30000){state.lastMissingRodLogAt=Date.now();bot.log('Fisher: selected rod unavailable — equip it or open its backpack',{sid:config.rodSid});}
             return false;
         }
 
@@ -54153,10 +54125,7 @@ window.__minibiaBotBundle.installFisherModule = function installFisherModule(bot
             bot.log("Fisher: No tile selected – cannot start");
             return false;
         }
-        if (!findFishingRod()) {
-            bot.log("Fisher: No fishing rod found – cannot start");
-            return false;
-        }
+        findFishingRod(); // Refresh exact rod counts; wait in tick if it is not available yet.
         state.running = true;
         state.unavailableTileKey = null;
         state.lastFishAt = 0;
@@ -54204,6 +54173,7 @@ window.__minibiaBotBundle.installFisherModule = function installFisherModule(bot
     }
 
     function updateConfig(next = {}) {
+        if(next.rodSid!==undefined){config.rodSid=Number(next.rodSid)===14050?14050:2580;state.lastRodCountRequestAt=0;state.lastMissingRodLogAt=0;}
         if (next.tile !== undefined) {
             // Ensure tile has x, y, z
             const t = next.tile;
@@ -56996,7 +56966,6 @@ function upgradeSectionHeaders(panel) {
     function refreshPaladinStatus() {
         const toggle = document.getElementById("minibia-bot-paladin-enabled");
         const statusLabel = document.getElementById("minibia-bot-paladin-status");
-        const ammoLabel = document.getElementById("minibia-bot-paladin-ammo");
         const handCountLabel = document.getElementById("minibia-bot-paladin-hand-count");
         const status = bot.paladin?.status?.();
 
@@ -57030,9 +56999,7 @@ function upgradeSectionHeaders(panel) {
             corpseDistanceInput.value =
                 status?.corpseMaxDistance ?? 12;
         }
-        if (ammoLabel) {
-            ammoLabel.textContent = status?.ammoCountKnown === false ? "?" : (status?.ammoCount ?? 0);
-        }
+
         if (handCountLabel) {
             // Get left hand count
             const eq = window.gameClient?.player?.equipment;
@@ -57215,7 +57182,7 @@ function upgradeSectionHeaders(panel) {
         const number = id => String(value(id)).trim() ? Number(value(id)) : NaN;
         const source = value("source") || "hotbar";
         return {
-            source,
+            source,condition:value("condition")==='paralyzed'?'paralyzed':'always',
             slot: number("slot"),
             spellWords: source === "spell" ? String(value("spell")).trim() : "",
             manaCost: source === "spell" ? number("manacost") : 0,
@@ -57228,6 +57195,7 @@ function upgradeSectionHeaders(panel) {
     function setHealRuleFormValues(rule) {
         const normalized = bot.heal.normalizeRule(rule);
         document.getElementById("minibia-bot-heal-source").value = normalized.source;
+        document.getElementById("minibia-bot-heal-condition").value = normalized.condition||"always";
         document.getElementById("minibia-bot-heal-slot").value = normalized.slot;
         document.getElementById("minibia-bot-heal-spell").value = normalized.spellWords;
         document.getElementById("minibia-bot-heal-manacost").value = normalized.manaCost;
@@ -57278,6 +57246,7 @@ function upgradeSectionHeaders(panel) {
                 const spell = bot.heal.resolveSpell(rule.spellWords);
                 label.textContent = `${spell.name ? spell.name + " · " : ""}${spell.words} (${rule.manaCost} MP)`;
             }
+            if(rule.condition==='paralyzed')label.textContent='🧊 Paralyzed · '+label.textContent;
             label.style.cssText = "font-weight:bold;color:#d4c48a;";
             info.appendChild(label);
             const hp = document.createElement("span");
@@ -57323,7 +57292,8 @@ function upgradeSectionHeaders(panel) {
         const old = healEditIndex == null ? null : rules[healEditIndex];
         const newRule = {
             enabled: old?.enabled !== false,
-            source: values.source,
+            source: values.source,condition:values.condition,
+            ...(old?.cooldownMs!=null?{cooldownMs:old.cooldownMs}:{}),
             ...(old?.legacyCooldownSlot && values.source === old.source ? { legacyCooldownSlot: old.legacyCooldownSlot } : {}),
             slot: values.source === "hotbar" ? values.slot : old?.slot || 1,
             spellWords: values.source === "spell" ? bot.heal.resolveSpell(values.spellWords).words : "",
@@ -58870,11 +58840,18 @@ function upgradeSectionHeaders(panel) {
 #minibia-bot-panel .mb-audio-test-row > label { flex:1; min-width:0; }
 #minibia-bot-panel button.mb-audio-test { flex:0 0 22px; width:22px; min-width:22px; height:22px; margin:0; padding:0; font-size:11px; line-height:20px; border-radius:4px; color:#d8c38b; }
 
-#minibia-bot-panel .mb-subtab-menu { display:flex; flex-wrap:wrap; gap:5px; padding:8px 8px 2px; }
-#minibia-bot-panel .mb-subtab-menu[hidden] { display:none; }
-#minibia-bot-panel .mb-subtab-button { width:auto; margin:0; padding:5px 9px; border:1px solid #444; border-radius:4px; background:#292929; color:#bdbdbd; font:inherit; font-size:11px; cursor:pointer; }
-#minibia-bot-panel .mb-subtab-button[data-active="true"] { color:#e1c57d !important; background:#38352d !important; border-color:#786b46 !important; }
-#minibia-bot-panel .mb-subtab-button:hover { color:#ead9ac; border-color:#82714c; }
+#minibia-bot-panel .mb-subtab-menu {display:flex;flex-wrap:wrap;gap:3px;padding:3px;margin:0 0 3px;background:rgba(0,0,0,.22);border:1px solid var(--mb-hub-edge,#383838);border-radius:5px;}
+#minibia-bot-panel .mb-subtab-menu[hidden] {display:none;}
+#minibia-bot-panel .mb-subtab-menu > .mb-subtab-button {
+  flex:1 1 auto;width:auto;min-width:0;min-height:28px;margin:0;padding:5px 10px;
+  border:0!important;border-bottom:2px solid transparent!important;border-radius:3px;
+  background:transparent!important;color:var(--mb-hub-muted,#aaa);font:inherit;font-size:11px;font-weight:600;line-height:1.2;
+  white-space:nowrap;text-align:center;cursor:pointer;transition:background .12s,color .12s,border-color .12s;
+}
+#minibia-bot-panel .mb-subtab-menu > .mb-subtab-button[data-active="true"] {color:#e1c57d!important;background:rgba(207,174,94,.10)!important;border-bottom-color:#c6a457!important;}
+#minibia-bot-panel .mb-subtab-menu > .mb-subtab-button:hover {color:#ead9ac;background:rgba(255,255,255,.045)!important;}
+#minibia-bot-panel .mb-subtab-menu > .mb-subtab-button:focus-visible {outline:1px solid #c6a457;outline-offset:-2px;}
+
 
 #minibia-bot-panel #minibia-bot-heal-new { margin-left:auto; order:2; flex-shrink:0; }
 #minibia-bot-panel #minibia-bot-heal-editor[hidden] { display:none; }
@@ -59274,6 +59251,62 @@ function upgradeSectionHeaders(panel) {
   display:flex;align-items:center;gap:6px;line-height:1.35;
 }
 #minibia-bot-panel [data-combo-slot-field][hidden] {display:none!important;}
+/* Primary headings share one rhythm, including CaveBot's inline controls. */
+#minibia-bot-panel .mb-tab-panel .mb-section > .mb-section-title:not(.mb-section-title--sub) {
+  min-height:24px!important;box-sizing:border-box;padding:0!important;margin:0 0 8px!important;gap:8px!important;
+}
+#minibia-bot-panel .mb-targeting-compact > .mb-section,
+#minibia-bot-panel .mb-looter-compact > .mb-section,
+#minibia-bot-panel .mb-cave-compact > .mb-section {padding:10px 12px!important;}
+#minibia-bot-panel .mb-cave-compact .mb-cave-top {margin-bottom:8px;align-items:center;}
+#minibia-bot-panel .mb-cave-compact .mb-cave-main-title {
+  display:flex;flex:1 1 auto;min-width:0;min-height:24px!important;margin:0!important;padding:0!important;gap:8px!important;
+}
+#minibia-bot-panel .mb-cave-compact .mb-cave-main-title::after {content:"";display:block;}
+#minibia-bot-panel .mb-equipment-panel > .mb-section {padding:10px 12px;}
+#minibia-bot-panel .mb-equipment-body {display:flex;flex-direction:column;gap:8px;min-width:0;}
+#minibia-bot-panel .mb-equipment-panel .mb-tools-count {font-size:10px;margin-left:auto;}
+#minibia-bot-panel .mb-equipment-panel .mb-ring-mode {justify-self:auto;font-size:11px;margin:0;}
+#minibia-bot-panel .mb-equipment-panel .mb-ring-row {display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;align-items:end;}
+#minibia-bot-panel .mb-equipment-panel .mb-ring-row:has(.mb-ring-threshold[hidden]) > .mb-equipment-item-field {grid-column:1/-1;}
+#minibia-bot-panel .mb-equipment-panel .mb-ring-threshold {display:block;white-space:normal;min-width:0;}
+#minibia-bot-panel .mb-equipment-panel .mb-ring-threshold input {width:100%;text-align:left;}
+#minibia-bot-panel .mb-equipment-picker {display:flex;gap:4px;align-items:center;min-width:0;}
+#minibia-bot-panel .mb-equipment-panel .mb-equipment-picker > input {flex:1;width:0;min-width:0;text-align:left;}
+#minibia-bot-panel .mb-equipment-picker > button {flex:0 0 auto;height:25px;padding:3px 6px;}
+#minibia-bot-panel .mb-equipment-panel .mb-tools-boots-values {display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;}
+#minibia-bot-panel .mb-equipment-panel .mb-tools-boot-value {display:block;min-width:0;}
+#minibia-bot-panel .mb-equipment-panel .mb-tools-options,#minibia-bot-panel .mb-equipment-options {margin:0;border-top:1px solid rgba(255,255,255,.08);padding-top:5px;font-size:11px;}
+#minibia-bot-panel .mb-equipment-panel summary {cursor:pointer;line-height:1.7;}
+#minibia-bot-panel .mb-equipment-options .mb-form-grid {margin-top:7px;}
+#minibia-bot-panel .mb-equipment-status {display:flex;gap:8px;font-size:10px;margin-top:6px;}
+#minibia-bot-panel .mb-equipment-panel #minibia-bot-paladin-equipper-status {font-size:10px;color:var(--mb-hub-muted);}
+#minibia-bot-panel .mb-general-compact > .mb-section {padding:10px 12px;}
+#minibia-bot-panel .mb-general-compact .mb-tools-toggle-grid {gap:7px 10px;margin:0 0 6px;}
+#minibia-bot-panel .mb-general-compact .mb-tools-control {grid-template-columns:90px minmax(0,1fr);padding:7px 0;}
+#minibia-bot-panel .mb-general-compact .mb-tools-control:first-child {border-top:0;padding-top:0;}
+#minibia-bot-panel .mb-general-compact .mb-form-grid {gap:8px 10px;}
+#minibia-bot-panel .mb-general-compact .mb-field {margin:0;min-width:0;}
+#minibia-bot-panel .mb-general-tile {display:flex;justify-content:space-between;align-items:center;gap:8px;margin:8px 0;}
+#minibia-bot-panel .mb-general-counter {display:flex;align-items:center;min-height:25px;font-size:11px;}
+#minibia-bot-panel .mb-general-options {border-top:1px solid rgba(255,255,255,.08);padding-top:5px;font-size:11px;}
+#minibia-bot-panel .mb-general-options summary {cursor:pointer;line-height:1.7;}
+#minibia-bot-panel .mb-general-options .mb-toggle {margin-top:6px;}
+#minibia-bot-panel .mb-general-compact[data-active="true"] {gap:6px;}
+#minibia-bot-panel .mb-general-compact > .mb-section {padding:7px 9px;}
+#minibia-bot-panel .mb-general-compact .mb-section > .mb-section-title:not(.mb-section-title--sub) {margin-bottom:5px!important;min-height:22px!important;}
+#minibia-bot-panel .mb-general-compact .mb-tools-toggle-grid {gap:5px 8px;margin-bottom:3px;}
+#minibia-bot-panel .mb-general-compact .mb-tools-control {padding:4px 0;}
+#minibia-bot-panel .mb-general-compact .mb-tools-more {margin-top:4px;padding-top:4px;}
+#minibia-bot-panel .mb-general-compact .mb-tools-more summary {font-size:11px;line-height:20px;}
+#minibia-bot-panel .mb-general-compact .mb-stack {gap:5px;}
+#minibia-bot-panel .mb-general-compact .mb-general-fish-fields {grid-template-columns:minmax(0,1.5fr) minmax(0,1fr) minmax(0,1fr)!important;gap:7px;}
+#minibia-bot-panel .mb-general-fish-count {margin-left:auto;display:inline-flex;gap:4px;align-items:center;font-size:10px;color:var(--mb-hub-muted);white-space:nowrap;}
+#minibia-bot-panel .mb-general-fish-count .mb-general-counter {min-height:0;display:inline;font-size:10px;}
+#minibia-bot-panel .mb-general-tile {margin:5px 0 0;gap:6px;flex-wrap:wrap;}
+#minibia-bot-panel .mb-general-tile #minibia-bot-fisher-status {flex:1;font-size:10px;}
+#minibia-bot-panel .mb-general-options {padding-top:3px;}
+#minibia-bot-panel .mb-general-outfit {border-top:1px solid rgba(255,255,255,.08);margin-top:5px;padding-top:5px;}
 #minibia-bot-panel .mb-title-status {flex-wrap:wrap;gap:3px;min-width:0;}
 #minibia-bot-panel .mb-expanded-module-button {cursor:pointer;padding:2px 4px;}
 #minibia-bot-panel[data-collapsed="true"] .mb-expanded-module-button {display:none!important;}
@@ -60484,6 +60517,7 @@ function upgradeSectionHeaders(panel) {
           <option value="item">Specific Item</option>
         </select>
       </label>
+      <label class="mb-field" style="margin-bottom:6px"><span class="mb-field-label">When</span><select id="minibia-bot-heal-condition"><option value="always">HP / MP ranges match</option><option value="paralyzed">Paralyzed + HP / MP ranges match</option></select></label>
       <div id="minibia-bot-heal-hotbar-fields" style="display:grid;grid-template-columns:1fr;gap:6px;margin-bottom:6px;">
         <label class="mb-field" for="minibia-bot-heal-slot"><span class="mb-field-label">Hotbar Slot</span><input type="number" id="minibia-bot-heal-slot" min="1" max="12" value="1" /></label>
       </div>
@@ -60508,16 +60542,6 @@ function upgradeSectionHeaders(panel) {
       </div>
       <div id="minibia-bot-heal-rule-error" class="mb-small-note" role="status" aria-live="polite" hidden style="color:#ffb0b0;margin-bottom:6px;"></div>
       <div style="display:flex;gap:6px;"><button type="button" id="minibia-bot-heal-save" style="flex:1;">Add Rule</button><button type="button" id="minibia-bot-heal-cancel" style="flex:0;width:auto;padding:8px 12px;">Cancel</button></div>
-    </div>
-    <div class="mb-section" style="margin-top:8px;padding:10px;background:rgba(255,255,255,0.03);">
-      <div class="mb-section-title mb-section-title--sub" style="margin-top:0;">
-        <input type="checkbox" id="minibia-bot-paralyze-enabled" class="mb-title-toggle" />
-        <span class="mb-title-text">🧊 Clear Paralyze</span>
-      </div>
-      <div style="display:grid;grid-template-columns:1fr 90px;gap:6px;margin-bottom:6px;">
-        <label class="mb-field"><span class="mb-field-label">Spell Words</span><input type="text" id="minibia-bot-paralyze-spell" placeholder="exura" /></label>
-        <label class="mb-field"><span class="mb-field-label">Above HP%</span><input type="number" id="minibia-bot-paralyze-minhp" min="0" max="100" value="70" /></label>
-      </div>
     </div>
     <div class="mb-small-note" style="margin-top:6px;">Rules are checked in order. First rule whose HP and MP ranges match will trigger. If spell words are given, mana cost must be set (and current mana must be ≥ that).</div>
   </div>
@@ -60756,24 +60780,16 @@ function upgradeSectionHeaders(panel) {
   </div>
 
   <!-- Fisher -->
-  <div class="mb-section">
-    <div class="mb-section-title">
-      <input type="checkbox" id="minibia-bot-fisher-enabled" class="mb-title-toggle" />
-      <span class="mb-title-text">🎣 Fisher</span>
+  <div class="mb-section mb-general-fisher">
+    <div class="mb-section-title"><input type="checkbox" id="minibia-bot-fisher-enabled" class="mb-title-toggle"><span class="mb-title-text">🎣 Fisher</span></div>
+    <div class="mb-form-grid">
+      <label class="mb-field"><span class="mb-field-label">Rod</span><select id="minibia-bot-fisher-rod" title="Uses the selected rod’s exact server ID. Equip it or open its backpack when carrying both rod types."><option value="2580">Fishing Rod</option><option value="14050">Old Rod</option></select></label>
+      <label class="mb-field"><span class="mb-field-label">Delay (s)</span><input type="number" id="minibia-bot-fisher-delay" min="0.5" step="0.5" value="2"></label>
+      <label class="mb-field"><span class="mb-field-label">Fish limit</span><input type="number" id="minibia-bot-fisher-threshold" min="1" value="10"></label>
+      <div class="mb-field"><span class="mb-field-label">Fish count</span><span class="mb-general-counter" id="minibia-bot-fisher-count">0</span></div>
     </div>
-    <div style="display:flex; align-items:center; gap:14px; flex-wrap:wrap;">
-      <button type="button" class="mb-small-button" id="minibia-bot-fisher-select-tile" style="padding:4px 14px;font-size:11px;">Set Tile</button>
-      <span style="font-size:11px; color:#cdbb8b; min-width:80px;" id="minibia-bot-fisher-tile-display">none</span>
-      <label class="mb-field" style="flex:0 0 72px;">
-        <span class="mb-field-label" style="font-size:10px;">Delay (s)</span>
-        <input type="number" id="minibia-bot-fisher-delay" min="0.5" step="0.5" value="2" style="padding:4px 4px;font-size:11px;text-align:center;" />
-      </label>
-      <label class="mb-field" style="flex:0 0 64px;">
-        <span class="mb-field-label" style="font-size:10px;">Fish Cap</span>
-        <input type="number" id="minibia-bot-fisher-threshold" min="1" value="10" style="padding:4px 4px;font-size:11px;text-align:center;" />
-      </label>
-      <span style="font-size:11px; color:#cdbb8b;">Fish: <span id="minibia-bot-fisher-count" style="font-weight:bold; color:#fff;">0</span></span>
-    </div>
+    <div class="mb-general-tile"><span class="mb-small-note" id="minibia-bot-fisher-tile-display">No tile selected</span><button type="button" class="mb-small-button" id="minibia-bot-fisher-select-tile">Set Tile</button></div>
+    <div class="mb-small-note" id="minibia-bot-fisher-status">Stopped</div>
   </div>
 
   <!-- Item Dropper -->
@@ -61184,9 +61200,7 @@ function upgradeSectionHeaders(panel) {
       </div>
 
       <div style="display:flex; gap:16px; flex-wrap:wrap; font-size:11px; color:#cdbb8b; margin-top:4px;">
-        <span id="minibia-bot-paladin-crafter-status">Crafter: idle</span>
         <span id="minibia-bot-paladin-equipper-status">Equipper: idle</span>
-        <span>Ammo count: <span id="minibia-bot-paladin-ammo">0</span></span>
       </div>
     </div>
   </div>
@@ -61850,14 +61864,43 @@ function upgradeSectionHeaders(panel) {
         for(const id of ['minibia-bot-slime-trainer-enabled','minibia-bot-monk-trainer-enabled']){
             const section=panel.querySelector('#'+id)?.closest('.mb-section');if(section)skillsPanel.appendChild(section);
         }
-        const equipmentSection=document.createElement('div');equipmentSection.className='mb-section mb-tools-section';
-        equipmentSection.innerHTML='<div class="mb-section-title"><span class="mb-title-text">Equipment</span></div><div class="mb-tools-control-list"></div>';
-        equipmentPanel.appendChild(equipmentSection);
-        for(const id of ['minibia-bot-equip-ring-enabled','minibia-bot-boots-swapper-enabled']){
-            const row=panel.querySelector('#'+id)?.closest('.mb-tools-control');if(row)equipmentSection.querySelector('.mb-tools-control-list').appendChild(row);
+        equipmentPanel.classList.add('mb-equipment-panel');
+        for(const [id,title] of [['minibia-bot-equip-ring-enabled','💍 Ring Equipper'],['minibia-bot-boots-swapper-enabled','🥾 Boot Swapper']]){
+            const toggle=panel.querySelector('#'+id),row=toggle?.closest('.mb-tools-control');if(!row)continue;
+            const section=document.createElement('div');section.className='mb-section';
+            const heading=document.createElement('div');heading.className='mb-section-title';
+            const text=document.createElement('span');text.className='mb-title-text';text.textContent=title;
+            const oldLabel=toggle.closest('label'),oldGroup=oldLabel.parentElement;
+            toggle.classList.add('mb-title-toggle');heading.append(toggle,text);oldLabel.remove();
+            const count=oldGroup.querySelector('.mb-tools-count');if(count)heading.appendChild(count);
+            if(oldGroup.classList.contains('mb-tools-control-label'))oldGroup.remove();
+            row.classList.remove('mb-tools-control');row.classList.add('mb-equipment-body');
+            section.append(heading,row);equipmentPanel.appendChild(section);
+        }
+        for(const row of equipmentPanel.querySelectorAll('.mb-ring-row')){
+            const label=row.querySelector(':scope > label'),input=row.querySelector(':scope > input'),pick=row.querySelector(':scope > button');
+            const field=document.createElement('div');field.className='mb-equipment-item-field';
+            label.classList.add('mb-field-label');const controls=document.createElement('div');controls.className='mb-equipment-picker';controls.append(input,pick);field.append(label,controls);row.prepend(field);
+            const threshold=row.querySelector('.mb-ring-threshold');
+            if(threshold){const value=threshold.querySelector('input'),caption=document.createElement('span');caption.className='mb-field-label';caption.textContent=value.id.endsWith('low')?'Switch below mana %':'Switch above mana %';threshold.replaceChildren(caption,value);}
+        }
+        for(const field of equipmentPanel.querySelectorAll('.mb-tools-boot-value')){
+            const label=field.querySelector('label'),input=field.querySelector('input'),button=field.querySelector('button');label.classList.add('mb-field-label');
+            const controls=document.createElement('div');controls.className='mb-equipment-picker';controls.append(input,button);field.replaceChildren(label,controls);
         }
         const weaponSection=panel.querySelector('#minibia-bot-paladin-equipper-enabled')?.closest('.mb-section');
-        if(weaponSection)equipmentPanel.appendChild(weaponSection);
+        if(weaponSection){
+            const title=weaponSection.querySelector('.mb-title-text');title.textContent='🗡️ Weapon Equipper';
+            const body=weaponSection.querySelector('.mb-stack');body.classList.add('mb-equipment-body');
+            const advanced=body.querySelector('.mb-form-grid'),details=document.createElement('details');details.className='mb-equipment-options';
+            const summary=document.createElement('summary');summary.textContent='More options';details.append(summary,advanced);
+            const weapon=panel.querySelector('#minibia-bot-paladin-weapon-id'),label=weapon.closest('label'),picker=panel.querySelector('#minibia-bot-paladin-capture-weapon'),equip=panel.querySelector('#minibia-bot-paladin-equip-now');
+            const oldRow=label.parentElement,controls=document.createElement('div');controls.className='mb-equipment-picker';
+            label.style.cssText='';weapon.remove();picker.style.cssText='';picker.textContent='🔍';picker.title='Pick weapon';picker.setAttribute('aria-label','Pick weapon');equip.style.cssText='';
+            controls.append(weapon,picker,equip);label.appendChild(controls);oldRow.replaceWith(label);body.append(details);
+            const status=panel.querySelector('#minibia-bot-paladin-equipper-status');if(status)body.appendChild(status);
+            equipmentPanel.appendChild(weaponSection);
+        }
         for(const id of ['minibia-bot-auto-pickup-enabled','minibia-bot-item-dropper-enabled']){
             const section=panel.querySelector('#'+id)?.closest('.mb-section');if(section)itemsPanel.appendChild(section);
         }
@@ -61931,18 +61974,44 @@ function upgradeSectionHeaders(panel) {
         }
         if(trackerSection)trackersPanel.appendChild(trackerSection);
         if(namesSection)namesPanel.appendChild(namesSection);
+        const followPanel=panel.querySelector('[data-tab-panel="utility"]');
+        const followSection=panel.querySelector('#minibia-bot-follow-enabled')?.closest('.mb-section');
+        if(followSection)followPanel.appendChild(followSection);
+        const followDebug=panel.querySelector('#minibia-bot-follow-debug');
+        if(followDebug){
+            const section=document.createElement('div');section.className='mb-section';
+            section.innerHTML='<div class="mb-section-title"><span class="mb-title-text">🧭 Follow Diagnostics</span></div>';
+            followDebug.textContent='Save Follow Debug';section.appendChild(followDebug);
+            panel.querySelector('[data-tab-panel="diagnostics"]').appendChild(section);
+        }
+        const generalPanel=panel.querySelector('[data-tab-panel="utility"]');generalPanel.classList.add('mb-general-compact');
+        const supportTools=generalPanel.querySelector('.mb-tools-section');
+        const utilityFold=supportTools?.querySelector('.mb-tools-more');
+        const outfit=generalPanel.querySelector('#minibia-bot-outfit-randomizer-enabled')?.closest('.mb-section');
+        if(outfit&&utilityFold){
+            const heading=outfit.querySelector('.mb-section-title'),toggle=heading.querySelector('input'),label=document.createElement('label');label.className='mb-toggle';
+            const name=document.createElement('span');name.textContent='Random Outfit';label.append(toggle,name);
+            const row=outfit.querySelector('div[style]');
+            const block=document.createElement('div');block.className='mb-general-outfit';block.appendChild(label);if(row)block.appendChild(row);utilityFold.appendChild(block);outfit.remove();
+        }
+        const fisher=generalPanel.querySelector('.mb-general-fisher');
+        if(fisher){
+            const count=panel.querySelector('#minibia-bot-fisher-count'),field=count.closest('.mb-field'),counter=document.createElement('span');counter.className='mb-general-fish-count';counter.append('Fish: ',count);fisher.querySelector('.mb-section-title').appendChild(counter);field.remove();
+            fisher.querySelector('.mb-form-grid').classList.add('mb-general-fish-fields');
+            const status=panel.querySelector('#minibia-bot-fisher-status');fisher.querySelector('.mb-general-tile').prepend(status);
+        }
+        const followBody=followSection?.querySelector('.mb-stack');
+        if(followBody){const options=document.createElement('details');options.className='mb-general-options';const summary=document.createElement('summary');summary.textContent='Follow options';options.appendChild(summary);for(const label of Array.from(followBody.querySelectorAll(':scope > .mb-toggle')))options.appendChild(label);const note=Array.from(followBody.querySelectorAll(':scope > .mb-small-note')).find(n=>!n.id);if(note)options.appendChild(note);followBody.appendChild(options);}
         const botTabGroups=[
-            {id:'cave',label:'Cave Bot',tabs:[['cave','Route'],['blacklist','Areas'],['resupply','Supplies'],['depot','Depot'],['bank','Bank']]},
+            {id:'cave',label:'Cave Bot',tabs:[['cave','Route'],['blacklist','Areas'],['resupply','Supplies'],['depot','Depot'],['bank','Bank'],['looter','Looter']]},
             {id:'targeting',label:'Targeting',tabs:[['targeting','Behavior'],['targetrules','Rules'],['targetlists','Lists']]},
             {id:'healing',label:'Healing',tabs:[['healing','Self'],['support','Friends']]},
-            {id:'looter',label:'Looter',tabs:[['looter','Looter']]},
+            {id:'training',label:'Training',tabs:[['training','Crafting'],['skilltraining','Skill Training']]},
             {id:'protection',label:'Protection',tabs:[['alert','Alerts'],['gmprotection','GM Protection'],['talk','Responder']]},
             {id:'professions',label:'Professions',tabs:[['professions','Woodcutting'],['mining','Mining'],['smithing','Smithing'],['cooking','Cooking']]},
-            {id:'utility',label:'Tools',tabs:[['utility','General'],['items','Items'],['ui','Interface'],['trackers','Trackers'],['namespoofer','Name Spoofer']]},
-            {id:'training',label:'Training',tabs:[['training','Crafting'],['skilltraining','Skill Training']]},
+            {id:'utility',label:'Tools',tabs:[['utility','General'],['items','Items'],['ui','Interface'],['trackers','Trackers'],['combo','PVP']]},
             {id:'equipment',label:'Equipment',tabs:[['equipment','Equipment']]},
-            {id:'combo',label:'PVP',tabs:[['combo','PVP']]},
-            {id:'settings',label:'Settings',tabs:[['xray','X-Ray'],['profiles','Profiles'],['diagnostics','Diagnostics'],['shortcuts','Shortcuts']]},
+            {id:'settings',label:'Settings',tabs:[['xray','X-Ray'],['profiles','Profiles'],['diagnostics','Diagnostics'],['shortcuts','Shortcuts'],['namespoofer','Name Spoofer']]},
         ];
         const tabContent=panel.querySelector('.mb-tab-content');
         const gmPanel=document.createElement('div');gmPanel.className='mb-tab-panel mb-alert-compact';gmPanel.dataset.tabPanel='gmprotection';
@@ -61954,6 +62023,7 @@ function upgradeSectionHeaders(panel) {
         for(const group of botTabGroups){const button=document.createElement('button');button.type='button';button.className='mb-tab-button';button.dataset.tabButton=group.id;button.textContent=group.label;menu.appendChild(button);}
         let lastSubtabs={};try{const saved=JSON.parse(localStorage.getItem('minibia-bot-active-subtabs')||'{}');if(saved&&typeof saved==='object'&&!Array.isArray(saved))lastSubtabs=saved;}catch{}
         function setActiveBotTab(tabId,selectGroup=false) {
+            if(tabId==='autofollow')tabId='utility';
             if(tabId==='status')tabId='diagnostics';
             if(tabId==='antibot')tabId='gmprotection';
             if(tabId==='paladin')tabId='training';
@@ -63093,6 +63163,8 @@ function upgradeSectionHeaders(panel) {
         const fisherSelectTile = panel.querySelector("#minibia-bot-fisher-select-tile");
         const fisherDelay = panel.querySelector("#minibia-bot-fisher-delay");
         const fisherThreshold = panel.querySelector("#minibia-bot-fisher-threshold");
+        const fisherRod=panel.querySelector('#minibia-bot-fisher-rod');
+        fisherRod?.addEventListener('change',()=>{bot.fisher?.updateConfig({rodSid:Number(fisherRod.value)});refreshFisherStatus();});
         const fisherStatus = panel.querySelector("#minibia-bot-fisher-status");
         const fisherCountDisplay = panel.querySelector("#minibia-bot-fisher-count");
 
@@ -63100,6 +63172,7 @@ function upgradeSectionHeaders(panel) {
             if (!bot.fisher)
                 return;
             const status = bot.fisher.status();
+            if(fisherRod&&document.activeElement!==fisherRod)fisherRod.value=String(status.config.rodSid||2580);
             if (fisherToggle && document.activeElement !== fisherToggle) {
                 fisherToggle.checked = status.running;
             }
@@ -63110,7 +63183,7 @@ function upgradeSectionHeaders(panel) {
                 fisherThreshold.value = status.config.fishThreshold;
             }
             if (fisherStatus) {
-                fisherStatus.textContent = status.pausedForCooking ? "Status: paused — food ready to cook" : status.running ? "Status: running" : "Status: idle";
+                fisherStatus.textContent = status.pausedForCooking ? "Status: paused — food ready to cook" : status.running ? (status.hasRod?"Running":"Waiting for selected rod — equip it or open its backpack") : "Stopped";
             }
             if (fisherCountDisplay) {
                 fisherCountDisplay.textContent = status.fishCountKnown ? status.fishCount : "?";
@@ -63926,9 +63999,7 @@ function upgradeSectionHeaders(panel) {
         const paladinWeaponId = document.getElementById("minibia-bot-paladin-weapon-id");
         const paladinCaptureBtn = document.getElementById("minibia-bot-paladin-capture-weapon");
         const paladinEquipNowBtn = document.getElementById("minibia-bot-paladin-equip-now");
-        const paladinCrafterStatus = document.getElementById("minibia-bot-paladin-crafter-status");
         const paladinEquipperStatus = document.getElementById("minibia-bot-paladin-equipper-status");
-        const paladinAmmoDisplay = document.getElementById("minibia-bot-paladin-ammo");
 
         function refreshPaladinStatus() {
             const status = bot.paladin?.status?.();
@@ -63944,15 +64015,11 @@ function upgradeSectionHeaders(panel) {
                 paladinEquipperToggle.checked = status.equipRunning;
             }
             // Status labels
-            if (paladinCrafterStatus) {
-                paladinCrafterStatus.textContent = status.running ? "Crafter: running" : "Crafter: idle";
-            }
+
             if (paladinEquipperStatus) {
                 paladinEquipperStatus.textContent = status.equipRunning ? "Equipper: running" : "Equipper: idle";
             }
-            if (paladinAmmoDisplay) {
-                paladinAmmoDisplay.textContent = status.ammoCountKnown === false ? "?" : (status.ammoCount ?? 0);
-            }
+
 
             // Input values (only if not focused)
             if (paladinAmmoId && document.activeElement !== paladinAmmoId)
@@ -64255,28 +64322,6 @@ function upgradeSectionHeaders(panel) {
                     bot.heal.stop();
                 refreshAutoHealStatus();
             });
-        }
-
-        const paralyzeEnabled = panel.querySelector("#minibia-bot-paralyze-enabled");
-        const paralyzeSpell = panel.querySelector("#minibia-bot-paralyze-spell");
-        const paralyzeMinHp = panel.querySelector("#minibia-bot-paralyze-minhp");
-        if (paralyzeEnabled && paralyzeSpell && paralyzeMinHp) {
-            const hc = bot.heal?.config || {};
-            paralyzeEnabled.checked = hc.paralyzeEnabled === true;
-            paralyzeSpell.value = hc.paralyzeSpellWords || "";
-            paralyzeMinHp.value = hc.paralyzeMinHpPercent ?? 70;
-            const saveParalyze = () => {
-                const hp = Math.max(0, Math.min(100, Number(paralyzeMinHp.value) || 0));
-                paralyzeMinHp.value = String(hp);
-                bot.heal.updateConfig({
-                    paralyzeEnabled: paralyzeEnabled.checked,
-                    paralyzeSpellWords: paralyzeSpell.value.trim(),
-                    paralyzeMinHpPercent: hp,
-                });
-            };
-            paralyzeEnabled.addEventListener("change", saveParalyze);
-            paralyzeSpell.addEventListener("change", saveParalyze);
-            paralyzeMinHp.addEventListener("change", saveParalyze);
         }
 
         // Rune Shooter
