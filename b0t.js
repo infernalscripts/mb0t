@@ -160,6 +160,53 @@ window.__minibiaBotBundle.createBot = function createBot() {
         }
     }
 
+    // One persisted volume for bot-owned HTML audio and synthesized alerts.
+    const audioVolumeStorageKey = "minibiaBot.audio.volume";
+    const audioOutputs = new Set();
+    const audioVolumeListeners = new Set();
+    let botAudioVolume = 1;
+    try {
+        const storedVolume = JSON.parse(window.localStorage.getItem(audioVolumeStorageKey));
+        if (typeof storedVolume === "number" && Number.isFinite(storedVolume))
+            botAudioVolume = Math.max(0, Math.min(1, storedVolume));
+    } catch (e) {}
+
+    function updateAudioVolume(value, specificAudio = null) {
+        const number = Number(value);
+        if (!Number.isFinite(number)) return botAudioVolume;
+        botAudioVolume = Math.max(0, Math.min(1, number));
+        try { window.localStorage.setItem(audioVolumeStorageKey, JSON.stringify(botAudioVolume)); } catch (e) {}
+        for (const audio of [alarmAudio, specificAudio]) {
+            try { if (audio) audio.volume = botAudioVolume; } catch (e) {}
+        }
+        for (const output of audioOutputs) {
+            try { output.gain.setValueAtTime(botAudioVolume, output.context.currentTime); } catch (e) {}
+        }
+        for (const listener of audioVolumeListeners) {
+            try { listener(botAudioVolume); } catch (e) {}
+        }
+        return botAudioVolume;
+    }
+
+    function createAudioOutput(context) {
+        const output = context.createGain();
+        output.gain.setValueAtTime(botAudioVolume, context.currentTime);
+        output.connect(context.destination);
+        audioOutputs.add(output);
+        return output;
+    }
+
+    function releaseAudioOutput(output) {
+        if (!output) return;
+        audioOutputs.delete(output);
+        try { output.disconnect(); } catch (e) {}
+    }
+
+    addCleanup(() => {
+        for (const output of audioOutputs) { try { output.disconnect(); } catch (e) {} }
+        audioOutputs.clear(); audioVolumeListeners.clear();
+    });
+
     // ---- ALARM AUDIO ----
     function getStoredAlarmAudioSrc() {
         try {
@@ -198,6 +245,7 @@ window.__minibiaBotBundle.createBot = function createBot() {
             alarmAudio = new Audio(src);
             alarmAudio.preload = "auto";
         }
+        alarmAudio.volume = botAudioVolume;
         return alarmAudio;
     }
 
@@ -4103,7 +4151,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.377",
+        version: "1.6.381",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -4406,6 +4454,17 @@ addCleanup(() => {
             return true;
         },
 
+        /** Shared volume for all bot alarms and alert tones (0 = muted). */
+        getAudioVolume() { return botAudioVolume; },
+        setAudioVolume(value) { return updateAudioVolume(value, this.__specificAlarmAudio); },
+        createAudioOutput,
+        releaseAudioOutput,
+        subscribeAudioVolume(listener) {
+            if (typeof listener !== "function") return () => {};
+            audioVolumeListeners.add(listener);
+            return () => audioVolumeListeners.delete(listener);
+        },
+
         /** Alarm audio management */
         getAlarmAudioSrc() {
             return getStoredAlarmAudioSrc();
@@ -4514,7 +4573,7 @@ addCleanup(() => {
                 }
 
                 audio.currentTime = 0;
-                audio.volume = 1;
+                audio.volume = this.getAudioVolume();
                 const playPromise = audio.play();
                 if (playPromise && typeof playPromise.catch === "function") {
                     playPromise.catch((error) => {
@@ -6484,6 +6543,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         lastPlayerAlertAt: 0,
         // ---- Audio alert state ----
         audioCtx: null,
+        audioOutput: null,
         lastTargetId: null,
         lowHealthBeepLast: 0,
         manaFullSince: null,
@@ -6546,10 +6606,14 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
     // ------------------------------------------------------------------
     // Audio alert helpers (self-contained, no external files needed)
     // ------------------------------------------------------------------
+    let alertAudioDestroyed = false;
+    const alertToneTimers = new Set();
     function getAlertAudioCtx() {
+        if (alertAudioDestroyed) return null;
         if (!state.audioCtx) {
             try {
                 state.audioCtx = new(window.AudioContext || window.webkitAudioContext)();
+                state.audioOutput = bot.createAudioOutput(state.audioCtx);
             } catch {
                 return null;
             }
@@ -6573,7 +6637,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
             gain.gain.setValueAtTime(volume, now);
             gain.gain.exponentialRampToValueAtTime(0.001, now + durationMs / 1000);
             osc.connect(gain);
-            gain.connect(ctx.destination);
+            gain.connect(state.audioOutput);
             osc.start(now);
             osc.stop(now + durationMs / 1000);
         } catch { /* ignore */
@@ -6581,10 +6645,23 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
     }
 
     function playToneSequence(notes) {
+        if (alertAudioDestroyed) return;
         for (const n of notes) {
-            setTimeout(() => playAlertTone(n.freq, n.dur, n.vol ?? 0.35), n.delay || 0);
+            const timer = setTimeout(() => {
+                alertToneTimers.delete(timer);
+                playAlertTone(n.freq, n.dur, n.vol ?? 0.35);
+            }, n.delay || 0);
+            alertToneTimers.add(timer);
         }
     }
+    bot.addCleanup(() => {
+        alertAudioDestroyed = true;
+        for (const timer of alertToneTimers) clearTimeout(timer);
+        alertToneTimers.clear();
+        bot.releaseAudioOutput(state.audioOutput); state.audioOutput = null;
+        const context = state.audioCtx; state.audioCtx = null;
+        if (context) { try { context.close().catch(() => {}); } catch (e) {} }
+    });
 
     // Audio Alerts also surface in the bot's top-right notification panel.
     // The notification module is installed later during bootstrap, so resolve
@@ -46920,6 +46997,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
 
     // Load config
     const stored = bot.storage.get(configStorageKey, {});
+    state.lootMode = stored.lootMode === "blacklist" ? "blacklist" : "whitelist";
     state.destinationId = stored.destinationId || null;
     state.destinationTitle = stored.destinationTitle || null;
 
@@ -46997,6 +47075,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         bot.storage.set(configStorageKey, {
             destinationId: state.destinationId,
             destinationTitle: state.destinationTitle,
+            lootMode: state.lootMode,
             trackedItems: Array.from(state.trackedItems.entries()),
             dropItemIds: Array.from(state.dropItemIds.values()),
             walkToCorpses: state.walkToCorpses,
@@ -47280,21 +47359,11 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
     }
 
     function isCorpseContainerItem(item) {
-        if (!item)
-            return false;
-
-        try {
-            if (
-                typeof item.isContainer === "function" &&
-                item.isContainer()
-            ) {
-                return true;
-            }
-        } catch (e) {}
-
-        const def =
+        if (!item) return false;
+        const def = window.gameClient?.itemDefinitionsBySid?.[item.sid] ||
             window.gameClient?.itemDefinitionsByCid?.[item.id];
-        return def?.properties?.type === "corpse";
+        const name = def?.properties?.name || item.name || "";
+        return /dead/i.test(String(name)) && isLootContainerItem(item);
     }
 
     function getCorpseTileInfo(pos) {
@@ -47333,7 +47402,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                 continue;
             }
 
-            if(destinationTree.includes(container))continue;
+            if(destinationTree.includes(container) || !isCorpseLootSource(container))continue;
 
             // Destination opening is not the corpse we are waiting for.
             if (
@@ -47348,10 +47417,74 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         return null;
     }
 
+    // Every move source must still be a live corpse window at send time.
+    // Server titles are authoritative; never infer a corpse from its slots.
+    function isCorpseLootSource(container) {
+        if (!container || getContainerById(container.__containerId) !== container ||
+            !/dead/i.test(String(container.__title || ""))) return false;
+        const player = window.gameClient?.player;
+        const seen = new Set();
+        let current = container;
+        for (let depth = 0; current && depth < 64; depth++) {
+            if (seen.has(current)) return false;
+            seen.add(current);
+            if (current === player?.equipment ||
+                (state.destinationId != null && Number(current.__containerId) === Number(state.destinationId))) return false;
+            const def = window.gameClient?.itemDefinitionsByCid?.[current.id] ||
+                window.gameClient?.itemDefinitionsBySid?.[current.sid];
+            const properties = def?.properties || {};
+            // A player can rename a backpack to contain "dead". Its item
+            // definition and parent chain still identify it as an inventory bag.
+            if (properties.slotType === "backpack" ||
+                (properties.type === "container" && properties.name && !/dead/i.test(properties.name))) return false;
+            if (current !== container && !/dead/i.test(String(current.__title || ""))) return false;
+            const linked = current.__openedFromParent || current.__replacedParent;
+            const parentId = Number(current.__parentCid);
+            const parent = linked || (parentId > 0 ? getContainerById(parentId) : null);
+            if (!parent && parentId > 0) return false;
+            current = parent;
+            if (!current) return true;
+        }
+        return false;
+    }
+
+    function isLootContainerItem(item) {
+        if (!item) return false;
+        try { if (item.isContainer?.() === true) return true; } catch (e) {}
+        const flag = typeof PropBitFlag !== "undefined" ? PropBitFlag.prototype.flags?.DatFlagContainer : undefined;
+        try { if (flag !== undefined && item.hasFlag?.(flag)) return true; } catch (e) {}
+        const defs = [window.gameClient?.itemDefinitionsBySid?.[item.sid],
+            window.gameClient?.itemDefinitionsByCid?.[item.id]].filter(Boolean);
+        for (const def of defs) {
+            const p = def.properties || {};
+            if (p.type === "container" || p.type === "corpse" || Number(p.containerSize) > 0 ||
+                p.slotType === "backpack" || (flag !== undefined && (Number(def.flags) & flag) !== 0)) return true;
+        }
+        const names = [item.name, ...defs.map(def => def.properties?.name)].filter(name => typeof name === "string");
+        return names.some(name => /\b(?:backpacks?|bags?|parcels?|baskets?|pouch(?:es)?|satchels?|sacks?|chests?|crates?|boxes|box|quivers?)\b/i.test(name));
+    }
+
+    function shouldLootItem(item) {
+        const key = exactItemKey(item);
+        if (!key || isLootContainerItem(item)) return false;
+        const listed = state.trackedItems.has(key) ||
+            (state.lootMode === "blacklist" && state.trackedItems.has(`legacy:${Number(item.id)}`));
+        if (isDropTrackedItem(key)) return true;
+        return state.lootMode === "blacklist" ? !listed : listed;
+    }
+
+    function isPendingLootMoveAllowed(pending) {
+        const source = getContainerById(pending.sourceId);
+        const item = source?.getSlotItem?.(pending.slot);
+        return isCorpseLootSource(source) && shouldLootItem(item) &&
+            (pending.kind === "drop" ? isDropTrackedItem(exactItemKey(item)) : !isDropTrackedItem(exactItemKey(item)));
+    }
+
     function isDropTrackedItem(itemId) {
-        return state.dropItemIds.has(
-            dropRuleKey(itemId)
-        );
+        const key = dropRuleKey(itemId);
+        if (state.dropItemIds.has(key)) return true;
+        return state.lootMode === "blacklist" && /^\d+:\d+:\d+$/.test(key) &&
+            state.dropItemIds.has(`legacy:${Number(key.split(':')[1])}`);
     }
 
     function setTrackedItemDrop(
@@ -47386,7 +47519,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
     function containerHasDestinationTrackedItems(
         container
     ) {
-        if (!container)
+        if (!isCorpseLootSource(container))
             return false;
 
         for (
@@ -47399,7 +47532,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
 
             if (
                 item &&
-                state.trackedItems.has(exactItemKey(item)) &&
+                shouldLootItem(item) &&
                 !isDropTrackedItem(exactItemKey(item))
             ) {
                 return true;
@@ -47449,9 +47582,8 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         now = Date.now()
     ) {
         if (
-            !container ||
-            !item ||
-            !state.trackedItems.has(exactItemKey(item)) ||
+            !isCorpseLootSource(container) ||
+            !shouldLootItem(item) ||
             !isDropTrackedItem(exactItemKey(item))
         ) {
             return false;
@@ -47466,6 +47598,8 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         }
 
         const sendDrop = () => {
+            if (!isCorpseLootSource(container) || !shouldLootItem(item) ||
+                !isDropTrackedItem(exactItemKey(item)) || container.getSlotItem?.(slot) !== item) return false;
             if (bot.isLiveItemSource && !bot.isLiveItemSource({which:container,index:slot},item)) return false;
             const from = {
                 which: container,
@@ -47562,14 +47696,14 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
     }
 
     function containerHasTrackedItems(container) {
-        if (!container)
+        if (!isCorpseLootSource(container))
             return false;
 
         for (let slot = 0; slot < container.size; slot++) {
             const item = container.getSlotItem?.(slot);
             if (
                 item &&
-                state.trackedItems.has(exactItemKey(item))
+                shouldLootItem(item)
             ) {
                 return true;
             }
@@ -49496,14 +49630,15 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             const distance=Math.max(Math.abs(pos.x-player.x),Math.abs(pos.y-player.y));
             return Number.isFinite(distance) && distance>1 && distance<=state.corpseMaxDistance;
         })) return true;
-        if (state.pendingMove && now-state.pendingMove.at<5000) return true;
+        if (state.pendingMove && now-state.pendingMove.at<5000 && isPendingLootMoveAllowed(state.pendingMove)) return true;
         const dest=getDestinationContainer();
         const overflow=dest?resolveLootDestination(dest,now):null;
         const canStore=overflow&&(overflow.dest||overflow.waiting||overflow.expandable);
         return getContainersArray().some(container=> {
+            if (!isCorpseLootSource(container)) return false;
             for (let slot=0;slot<container.size;slot++) {
                 const item=container.getSlotItem(slot),key=exactItemKey(item);
-                if (!state.trackedItems.has(key)) continue;
+                if (!shouldLootItem(item)) continue;
                 if (isDropTrackedItem(key) || (canStore && !overflow.tree.includes(container)))
                     return true;
             }
@@ -49522,6 +49657,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
 
         const now = Date.now();
 
+        if (state.pendingMove && !isPendingLootMoveAllowed(state.pendingMove)) state.pendingMove = null;
         if (state.pendingMove) {
             const pending =
                 state.pendingMove;
@@ -49630,9 +49766,10 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         const containers =
             getContainersArray();
 
-        // Pass 1: drop-marked items. Includes the selected destination bag so
-        // toggling Drop also clears matching stacks already stored there.
+        // Explicit Drop rules override blacklist exclusion, but sources still
+        // must be corpses and container items are always excluded.
         for (const container of containers) {
+            if (!isCorpseLootSource(container)) continue;
             for (
                 let slot = 0;
                 slot < container.size;
@@ -49642,8 +49779,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                     container.getSlotItem(slot);
 
                 if (
-                    !item ||
-                    !state.trackedItems.has(exactItemKey(item)) ||
+                    !shouldLootItem(item) ||
                     !isDropTrackedItem(exactItemKey(item))
                 ) {
                     continue;
@@ -49680,7 +49816,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
 
         for (const container of containers) {
             if (
-                overflow.tree.includes(container)
+                overflow.tree.includes(container) || !isCorpseLootSource(container)
             ) {
                 continue;
             }
@@ -49694,8 +49830,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                     container.getSlotItem(slot);
 
                 if (
-                    !item ||
-                    !state.trackedItems.has(exactItemKey(item)) ||
+                    !shouldLootItem(item) ||
                     isDropTrackedItem(exactItemKey(item))
                 ) {
                     continue;
@@ -49740,6 +49875,8 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                             which: dest,
                             index: targetSlot
                         };
+                        if (!isCorpseLootSource(container) || !shouldLootItem(item) ||
+                            isDropTrackedItem(exactItemKey(item)) || container.getSlotItem?.(slot) !== item) return false;
                         if (bot.isLiveItemSource && !bot.isLiveItemSource(from,item)) return false;
 
                         if (
@@ -50000,6 +50137,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             running: state.running,
             destinationId: state.destinationId,
             destinationTitle: state.destinationTitle,
+            lootMode: state.lootMode,
             trackedItems: Array.from(state.trackedItems.entries()),
             dropItemIds: Array.from(state.dropItemIds.values()),
             walkToCorpses: state.walkToCorpses,
@@ -50107,6 +50245,8 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
     }
 
     function updateConfig(next) {
+        if (next.lootMode !== undefined)
+            state.lootMode = next.lootMode === "blacklist" ? "blacklist" : "whitelist";
         let destinationChanged = false;
         if (next.destinationId !== undefined) {
             state.destinationId = next.destinationId;
@@ -50237,6 +50377,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         return {
             destinationId: state.destinationId,
             destinationTitle: state.destinationTitle,
+            lootMode: state.lootMode,
             trackedItems: Array.from(state.trackedItems.entries()),
             walkToCorpses: state.walkToCorpses,
             corpseMaxDistance: state.corpseMaxDistance,
@@ -52618,11 +52759,109 @@ window.__minibiaBotBundle.installClientExtras=function(bot){
  }
  function matches(rule){sync();const name=String(rule.name||'').trim().toLowerCase();if(!name)return false;const row=rows().find(r=>r.kind===rule.kind&&(r.name.toLowerCase()===name||r.legacyName?.toLowerCase()===name));if(!row)return false;return rule.condition==='count'?row.current!=null&&row.current>=Math.max(0,Number(rule.count)||0):row.completed;}
  function applyNative(values){const client=window.gameClient,settings=client?.interface?.settings;if(!settings?.__state||typeof AutoLootSettingsPacket!=='function'||!client.send)throw new Error('Native settings unavailable');const ids=['auto-loot-gold','auto-loot-food','auto-open-corpse','auto-refill-ammo','auto-eat-food','auto-convert-loot','reopen-containers'];const flags=ids.map(id=>!!values[id]);client.send(new AutoLootSettingsPacket(...flags));for(let i=0;i<ids.length;i++){settings.__state[ids[i]]=flags[i];const input=document.getElementById(ids[i]);if(input)input.checked=flags[i];}try{localStorage.setItem('settings',JSON.stringify(settings.__state));}catch(e){}return true;}
- function saveLoot(selected,enabled,routes){sync();if(!loot)throw new Error('Load server loot settings before saving');if(typeof LootListUpdatePacket!=='function'||!window.gameClient?.send)throw new Error('Server loot routing unavailable');const ids=[...new Set(selected.map(Number))];if(ids.length>500||ids.some(s=>!Number.isInteger(s)||s<=0||s>65535))throw new Error('Select up to 500 valid SIDs');const safe={};for(const sid of ids){const name=String(routes[sid]||'').trim();if(name.length>20)throw new Error('Backpack names must be 20 characters or fewer');if(name)safe[sid]=name;}window.gameClient.send(new LootListUpdatePacket(ids,!!enabled,safe));loot={...loot,selected:ids,enabled:!!enabled,routes:safe};return true;}
+ // Shared validation for imported files and the native server save action.
+ function normalizeLootRouting(data){
+  if(!data||typeof data!=='object'||Array.isArray(data))throw new Error('Invalid loot routing file.');
+  if(data.format!==undefined&&(data.format!=='mb0t-server-loot-routing'||data.version!==1))throw new Error('Unsupported loot routing file format or version.');
+  if(!Array.isArray(data.selected)||data.selected.length>500)throw new Error('A loot list must contain up to 500 item SIDs.');
+  if(typeof data.enabled!=='boolean')throw new Error('The loot list enabled setting must be true or false.');
+  if(!data.routes||typeof data.routes!=='object'||Array.isArray(data.routes))throw new Error('Invalid destination backpack routes.');
+  const ids=[],seen=new Set(),routes={};
+  for(const raw of data.selected){
+   if(typeof raw!=='number'&&!(typeof raw==='string'&&/^\d+$/.test(raw)))throw new Error('Every item SID must be an integer from 1 to 65535.');
+   const sid=Number(raw);
+   if(!Number.isInteger(sid)||sid<1||sid>65535)throw new Error('Every item SID must be an integer from 1 to 65535.');
+   const value=Object.prototype.hasOwnProperty.call(data.routes,sid)?data.routes[sid]:'';
+   if(typeof value!=='string')throw new Error('Destination backpack names must be text.');
+   const name=value.trim();
+   if(name.length>20)throw new Error('Backpack names must be 20 characters or fewer.');
+   if(!seen.has(sid)){seen.add(sid);ids.push(sid);if(name)routes[sid]=name;}
+  }
+  return {selected:ids,enabled:data.enabled,routes};
+ }
+ function saveLoot(selected,enabled,routes){
+  sync();
+  const client=window.gameClient;
+  if(typeof LootListUpdatePacket!=='function'||!client?.send||!client.player||client.networkManager?.isConnected?.()===false)throw new Error('Log in before saving server loot routing.');
+  const list=normalizeLootRouting({selected,enabled:!!enabled,routes});
+  client.send(new LootListUpdatePacket(list.selected,list.enabled,list.routes));
+  loot={...loot,...list};
+  return true;
+ }
  function mount(panel){if(!panel||panel.querySelector('[data-client-extras]'))return;const sections=[];const section=(tab,title)=>{const host=panel.querySelector(`[data-tab-panel="${tab}"]`);if(!host)return null;const el=document.createElement('div');el.className='mb-section';el.setAttribute('data-client-extras','');const h=document.createElement('div');h.className='mb-section-title';const heading=document.createElement('span');heading.className='mb-title-text';heading.textContent=title;h.append(heading);el.append(h);host.prepend(el);sections.push(el);return el;};const make=(tag,parent,content)=>{const el=document.createElement(tag);if(content!=null)el.textContent=content;parent.append(el);return el;};const button=(parent,label,fn)=>{const b=make('button',parent,label);b.type='button';b.className='mb-small-button';b.addEventListener('click',()=>{try{fn();}catch(e){bot.log(e.message);message.textContent=e.message;}});return b;};const field=(parent,label,type='text',value='')=>{const l=make('label',parent);l.className='mb-field';make('span',l,label).className='mb-field-label';const i=make('input',l);i.type=type;i.value=value;if(type==='number')i.min='0';return i;};const check=(parent,label,value)=>{const l=make('label',parent);l.style.cssText='display:flex;align-items:center;gap:6px;margin:6px 0';const i=make('input',l);i.type='checkbox';i.checked=!!value;i.style.cssText='width:13px;min-width:13px;margin:0';make('span',l,label);return i;};const select=(parent,label,options)=>{const l=make('label',parent);l.className='mb-field';make('span',l,label);const s=make('select',l);for(const [value,name]of options){const o=make('option',s,name);o.value=value;}return s;};
  const inv=section('resupply','Inventory Browser');const message=make('div',inv);message.className='mb-small-note';const actions=make('div',inv);button(actions,'Refresh inventory',requestInventory);const search=field(inv,'Filter by name / SID / CID');const inventoryList=make('div',inv);inventoryList.style.cssText='max-height:260px;overflow:auto';let invSignature='';
- const routing=section('diagnostics','Server Loot Routing');make('div',routing,'Loads and saves the game’s SID loot list. Fluid-specific rules stay in mb0t’s looter.').className='mb-small-note';const routeActions=make('div',routing);button(routeActions,'Load server settings',()=>textCommand('/lootlist'));const routeEnabled=check(routing,'Server loot list enabled',false);const routeList=make('div',routing);routeList.style.cssText='max-height:240px;overflow:auto';const routeSid=field(routing,'Item SID','number');const routeBag=field(routing,'Destination backpack name (blank = default)');let draft=null;button(routing,'Add / update route',()=>{if(!draft)throw new Error('Load server settings first');const sid=Number(routeSid.value);if(!Number.isInteger(sid)||sid<1||sid>65535)throw new Error('Invalid SID');if(!draft.selected.includes(sid))draft.selected.push(sid);draft.routes[sid]=routeBag.value.trim();renderRoutes();});button(routing,'Save to server',()=>{if(!draft)throw new Error('Load server settings first');saveLoot(draft.selected,routeEnabled.checked,draft.routes);message.textContent='Server loot settings sent.';});let lootRef=null;function renderRoutes(){routeList.replaceChildren();for(const sid of draft?.selected||[]){const line=make('div',routeList);line.style.cssText='display:flex;gap:6px;align-items:center;margin:4px 0';make('span',line,`${sid} → ${draft.routes[sid]||'default backpack'}`).style.flex='1';button(line,'Remove',()=>{draft.selected=draft.selected.filter(n=>n!==sid);delete draft.routes[sid];renderRoutes();});}}
- function render(){sync();if(!loot&&lootRef){lootRef=null;draft=null;routeList.replaceChildren();}if(loot&&loot!==lootRef){lootRef=loot;draft={selected:(loot.selected||[]).map(Number),routes:{...loot.routes}};routeEnabled.checked=loot.enabled!==false;renderRoutes();}if(!inv.getClientRects().length)return;const query=search.value.trim().toLowerCase(),signature=inventoryAt+':'+query;if(signature===invSignature)return;invSignature=signature;inventoryList.replaceChildren();for(const item of inventory){const def=window.gameClient?.itemDefinitionsBySid?.[item.sid];const itemName=def?.properties?.name||'Item';const desc=`${itemName} · SID ${item.sid} / CID ${item.cid} · Fluid ${item.fluidType} · Tint ${item.tintId}`;if(query&&!desc.toLowerCase().includes(query))continue;const row=make('div',inventoryList);row.style.cssText='padding:6px 0;border-bottom:1px solid #444';make('div',row,desc);button(row,'Cooking',()=>{if(item.fluidType)throw new Error('Fluid containers cannot be added as cooking food');const foods=bot.cooking.config.foods;if(!foods.some(f=>f.sid===item.sid&&f.cid===item.cid))bot.cooking.updateConfig({foods:[...foods,{sid:item.sid,cid:item.cid}]});message.textContent='Food added to Cooking.';});button(row,'Supply',()=>{const rule=bot.npcSupplyBuyer.addRule(itemName,100,10,itemName);if(rule)bot.npcSupplyBuyer.updateRule(rule.id,{sid:item.sid,cid:item.cid,fluidType:item.fluidType});message.textContent='Exact item supply rule added; edit amounts in Resupply.';});button(row,'Loot route',()=>{if(item.fluidType)throw new Error('Use mb0t looter capture for fluid-specific rules');routeSid.value=item.sid;message.textContent='SID copied to Server Loot Routing in Looter.';});}if(!inventory.length)make('div',inventoryList,'Refresh to list items in open and closed backpacks.');}
+ const routing=section('diagnostics','Server Loot Routing');
+ make('div',routing,'Save lists to a file or import them here. Save to server applies the list. Fluid-specific rules stay in mb0t’s looter.').className='mb-small-note';
+ const routeMessage=make('div',routing);routeMessage.className='mb-small-note';routeMessage.setAttribute('role','status');routeMessage.setAttribute('aria-live','polite');
+ const routeButton=(parent,label,fn)=>button(parent,label,()=>{try{fn();}catch(error){routeMessage.textContent=error.message;bot.log(error.message);}});
+ const routeActions=make('div',routing);routeActions.style.cssText='display:flex;gap:4px;flex-wrap:wrap;margin:6px 0';
+ const fileInput=make('input',routing);fileInput.type='file';fileInput.accept='.json,.txt,application/json';fileInput.hidden=true;
+ fileInput.setAttribute('aria-label','Import server loot routing list');
+ const downloadUrls=new Map();
+ let draft=null,draftDirty=false,lootRef=null,draftClient=window.gameClient,draftPlayer=window.gameClient?.player,importSerial=0;
+ routeButton(routeActions,'Load server settings',()=>{draftDirty=false;routeMessage.textContent='Loading server loot settings…';textCommand('/lootlist');});
+ routeButton(routeActions,'Save list to file',()=>{
+  render();if(!draft)throw new Error('Load server settings or import a list first.');
+  const list=normalizeLootRouting({...draft,enabled:routeEnabled.checked});
+  const data={format:'mb0t-server-loot-routing',version:1,...list};
+  const url=URL.createObjectURL(new Blob([JSON.stringify(data,null,2)],{type:'application/json'}));
+  const link=document.createElement('a');link.href=url;link.download='mb0t-server-loot-routing.json';
+  try{document.body.appendChild(link);link.click();}finally{link.remove();downloadUrls.set(url,setTimeout(()=>{URL.revokeObjectURL(url);downloadUrls.delete(url);},1000));}
+  routeMessage.textContent=`Saved ${list.selected.length} loot routes to file.`;
+ });
+ routeButton(routeActions,'Import list',()=>fileInput.click());
+ const routeEnabled=check(routing,'Server loot list enabled',false);
+ routeEnabled.disabled=true;
+ routeEnabled.addEventListener('change',()=>{if(draft)draftDirty=true;});
+ const routeList=make('div',routing);routeList.style.cssText='max-height:240px;overflow:auto';
+ const routeSid=field(routing,'Item SID','number');
+ const routeBag=field(routing,'Destination backpack name (blank = default)');
+ routeButton(routing,'Add / update route',()=>{
+  render();if(!draft)throw new Error('Load server settings or import a list first.');
+  const sid=Number(routeSid.value),name=routeBag.value.trim();
+  if(!Number.isInteger(sid)||sid<1||sid>65535)throw new Error('Invalid SID');
+  if(name.length>20)throw new Error('Backpack names must be 20 characters or fewer.');
+  if(!draft.selected.includes(sid)){if(draft.selected.length>=500)throw new Error('A loot list can contain up to 500 item SIDs.');draft.selected.push(sid);}
+  draft.routes[sid]=name;draftDirty=true;renderRoutes();routeMessage.textContent='Route updated. Save to server to apply, or save the list to file.';
+ });
+ routeButton(routing,'Save to server',()=>{
+  render();if(!draft)throw new Error('Load server settings or import a list first.');
+  saveLoot(draft.selected,routeEnabled.checked,draft.routes);draftDirty=false;render();routeMessage.textContent='Server loot settings sent.';
+ });
+ function renderRoutes(){
+  routeList.replaceChildren();
+  if(!draft||!draft.selected.length){make('div',routeList,draft?'This list has no items.':'Load server settings or import a list.').className='mb-small-note';return;}
+  for(const sid of draft.selected){
+   const line=make('div',routeList);line.style.cssText='display:flex;gap:6px;align-items:center;margin:4px 0';
+   make('span',line,`${sid} → ${draft.routes[sid]||'default backpack'}`).style.flex='1';
+   routeButton(line,'Remove',()=>{draft.selected=draft.selected.filter(n=>n!==sid);delete draft.routes[sid];draftDirty=true;renderRoutes();});
+  }
+ }
+ async function importLootFile(){
+  const file=fileInput.files?.[0],serial=++importSerial;
+  fileInput.value='';if(!file)return;
+  const expectedClient=window.gameClient,expectedPlayer=expectedClient?.player;
+  try{
+   if(file.size>256*1024)throw new Error('Loot routing files must be smaller than 256 KB.');
+   const text=await file.text();
+   if(disposed||serial!==importSerial||!routing.isConnected)return;
+   if(window.gameClient!==expectedClient||window.gameClient?.player!==expectedPlayer)throw new Error('Character changed. Import the list again.');
+   let data;try{data=JSON.parse(text.replace(/^\uFEFF/,''));}catch(error){throw new Error('Invalid JSON loot routing file.');}
+   const list=normalizeLootRouting(data);
+   render();draft={selected:list.selected,routes:list.routes};routeEnabled.checked=list.enabled;routeEnabled.disabled=false;draftDirty=true;
+   renderRoutes();routeMessage.textContent=`Imported ${list.selected.length} loot routes. Review the list, then Save to server to apply.`;
+  }catch(error){if(!disposed&&serial===importSerial&&routing.isConnected){routeMessage.textContent=error.message;bot.log(error.message);}}
+ }
+ fileInput.addEventListener('change',importLootFile);
+ cleanups.push(()=>{importSerial++;fileInput.removeEventListener('change',importLootFile);for(const[url,timer]of downloadUrls){clearTimeout(timer);URL.revokeObjectURL(url);}downloadUrls.clear();});
+ function render(){
+  sync();
+  if(draftClient!==window.gameClient||draftPlayer!==window.gameClient?.player){
+   draftClient=window.gameClient;draftPlayer=window.gameClient?.player;draft=null;draftDirty=false;lootRef=null;importSerial++;routeEnabled.disabled=true;routeMessage.textContent='';renderRoutes();
+  }
+  if(!loot&&lootRef){lootRef=null;if(!draftDirty){draft=null;renderRoutes();}}
+  if(loot&&loot!==lootRef){lootRef=loot;if(!draftDirty){draft={selected:(loot.selected||[]).map(Number),routes:{...loot.routes}};routeEnabled.checked=loot.enabled!==false;routeEnabled.disabled=false;renderRoutes();routeMessage.textContent=`Loaded ${draft.selected.length} loot routes.`;}}
+if(!inv.getClientRects().length)return;const query=search.value.trim().toLowerCase(),signature=inventoryAt+':'+query;if(signature===invSignature)return;invSignature=signature;inventoryList.replaceChildren();for(const item of inventory){const def=window.gameClient?.itemDefinitionsBySid?.[item.sid];const itemName=def?.properties?.name||'Item';const desc=`${itemName} · SID ${item.sid} / CID ${item.cid} · Fluid ${item.fluidType} · Tint ${item.tintId}`;if(query&&!desc.toLowerCase().includes(query))continue;const row=make('div',inventoryList);row.style.cssText='padding:6px 0;border-bottom:1px solid #444';make('div',row,desc);button(row,'Cooking',()=>{if(item.fluidType)throw new Error('Fluid containers cannot be added as cooking food');const foods=bot.cooking.config.foods;if(!foods.some(f=>f.sid===item.sid&&f.cid===item.cid))bot.cooking.updateConfig({foods:[...foods,{sid:item.sid,cid:item.cid}]});message.textContent='Food added to Cooking.';});button(row,'Supply',()=>{const rule=bot.npcSupplyBuyer.addRule(itemName,100,10,itemName);if(rule)bot.npcSupplyBuyer.updateRule(rule.id,{sid:item.sid,cid:item.cid,fluidType:item.fluidType});message.textContent='Exact item supply rule added; edit amounts in Resupply.';});button(row,'Loot route',()=>{if(item.fluidType)throw new Error('Use mb0t looter capture for fluid-specific rules');routeSid.value=item.sid;message.textContent='SID copied to Server Loot Routing in Looter.';});}if(!inventory.length)make('div',inventoryList,'Refresh to list items in open and closed backpacks.');}
  search.addEventListener('input',render);renderUi=render;render();const timer=setInterval(()=>{render();},1000);cleanups.push(()=>{clearInterval(timer);search.removeEventListener('input',render);sections.forEach(s=>s.remove());renderUi=()=>{};});
  }
  bot.clientExtras={config,mount,requestInventory,saveLoot,applyNative,status:()=>{sync();return {inventory:inventory.map(i=>({...i})),inventoryAt,loot};}};bot.progress={rows,matches,branch:(rule,label)=>matches(rule)?bot.goToLabel(label):false};bot.addCleanup(()=>{disposed=true;cleanups.reverse().forEach(f=>f());inventory=[];});
@@ -52665,12 +52904,12 @@ window.__minibiaBotBundle.installFollowingItemGuard = function(bot) {
     let running=config.enabled,disposed=false,chain=[],hold=null,timer=null,resumeTimer=null,message="Watching",muteUntil=0;
     const views=new Set(),corpses=new Map();
     // A distinct two-pulse rising chime, synthesized locally without audio files.
-    let soundContext=null,lastSoundAt=-Infinity;
+    let soundContext=null,soundOutput=null,lastSoundAt=-Infinity;
     const soundNodes=new Set();
     function primeSound() {
         if(disposed)return null;
         try {
-            if(!soundContext){const AudioCtx=window.AudioContext||window.webkitAudioContext;if(!AudioCtx)return null;soundContext=new AudioCtx();}
+            if(!soundContext){const AudioCtx=window.AudioContext||window.webkitAudioContext;if(!AudioCtx)return null;soundContext=new AudioCtx();soundOutput=bot.createAudioOutput(soundContext);}
             if(soundContext.state==="suspended")soundContext.resume().catch(()=>{});
             return soundContext;
         }catch{return null;}
@@ -52687,7 +52926,7 @@ window.__minibiaBotBundle.installFollowingItemGuard = function(bot) {
                 const osc=ctx.createOscillator(),gain=ctx.createGain(),begin=start+delay,end=begin+duration;
                 osc.type="triangle";osc.frequency.setValueAtTime(from,begin);osc.frequency.exponentialRampToValueAtTime(to,end);
                 gain.gain.setValueAtTime(.001,begin);gain.gain.exponentialRampToValueAtTime(.22,begin+.02);gain.gain.exponentialRampToValueAtTime(.001,end);
-                osc.connect(gain);gain.connect(ctx.destination);
+                osc.connect(gain);gain.connect(soundOutput);
                 const node={osc,gain};soundNodes.add(node);
                 osc.onended=()=>{osc.disconnect();gain.disconnect();soundNodes.delete(node);};
                 osc.start(begin);osc.stop(end+.01);
@@ -52702,7 +52941,7 @@ window.__minibiaBotBundle.installFollowingItemGuard = function(bot) {
     bot.addCleanup(()=>{
         document.removeEventListener("pointerdown",primeSound,true);document.removeEventListener("keydown",primeSound,true);
         for(const {osc,gain}of soundNodes){try{osc.stop();osc.disconnect();gain.disconnect();}catch{}}
-        soundNodes.clear();const ctx=soundContext;soundContext=null;if(ctx)ctx.close().catch(()=>{});
+        soundNodes.clear();bot.releaseAudioOutput(soundOutput);soundOutput=null;const ctx=soundContext;soundContext=null;if(ctx)ctx.close().catch(()=>{});
     });
 
     const pos=value=>{const p=value?.getPosition?.()||value;return p&&[p.x,p.y,p.z].every(Number.isFinite)?{x:p.x,y:p.y,z:p.z}:null;};
@@ -53221,16 +53460,18 @@ window.__minibiaBotBundle.installItemDropperModule = function installItemDropper
         return { id, enabled:raw.enabled !== false, identityMode:"sid",
             itemId:integer(definition?.id,1,65535) || oldCid,
             itemSid:sid, legacyCid,
+            destinationMode:raw.destinationMode === "self" ? "self" : "fixed",
             x:integer(raw.x,0,65535), y:integer(raw.y,0,65535), z:integer(raw.z,0,15) };
     }
     const saved = bot.storage.get(storageKey,{}) || {};
     const used = new Set();
-    const config = { schemaVersion:2, enabled:saved.enabled === true,
+    const config = { schemaVersion:3, enabled:saved.enabled === true,
         delayMs:Math.max(500,Math.min(60000,Number(saved.delayMs)||2000)),
         rules:(Array.isArray(saved.rules)?saved.rules:[]).slice(0,200).map(r=>normalizeRule(r,used)) };
     const persist = () => bot.storage.set(storageKey,{...config,rules:config.rules.map(r=>({...r}))});
     const changed = () => { state.revision++; persist(); };
-    const valid = rule => rule.itemSid != null && rule.x != null && rule.y != null && rule.z != null;
+    const valid = rule => rule.itemSid != null &&
+        (rule.destinationMode === "self" || (rule.x != null && rule.y != null && rule.z != null));
     function migratePendingCidRules() {
         let migrated=false;
         for (const rule of config.rules) {
@@ -53354,13 +53595,15 @@ window.__minibiaBotBundle.installItemDropperModule = function installItemDropper
         for (let n=0;n<length;n++) {
             const index=(state.cursor+n)%length, rule=rules[index];
             if (!rule.enabled) continue;
-            if (!valid(rule)) { reason=rule.legacyCid ? "Shared or unknown CID — select an exact SID" : "Complete item SID and X / Y / Z"; continue; }
+            if (!valid(rule)) { reason=rule.legacyCid ? "Shared or unknown CID — select an exact SID" : rule.destinationMode === "self" ? "Select an exact item SID" : "Complete item SID and X / Y / Z"; continue; }
             if ((state.blocked.get(rule.id)||0)>now) { reason="Waiting to retry a drop"; continue; }
+            // Self-target rules resolve the live player position on each drop.
+            const target = rule.destinationMode === "self" ? fromPosition : rule;
             // Dropping never asks Pathfinder to walk or interrupts a route.
-            if (!isDestinationOnScreen(rule,fromPosition)) {
+            if (!isDestinationOnScreen(target,fromPosition)) {
                 reason="Waiting for destination on screen"; continue;
             }
-            const tile=client.world?.getTileFromWorldPosition?.(new Position(rule.x,rule.y,rule.z));
+            const tile=client.world?.getTileFromWorldPosition?.(new Position(target.x,target.y,target.z));
             if (!tile || tile.id === 0 || tile.__isPlaceholder) { reason="Destination tile not loaded"; continue; }
             // Always address ground at these coordinates, even when the tile
             // already contains items. Never treat a pile as a completed rule.
@@ -53374,10 +53617,15 @@ window.__minibiaBotBundle.installItemDropperModule = function installItemDropper
                 // Resolve the live slot again inside the shared action lock.
                 if (!state.running || state.destroyed || !config.enabled || !config.rules.includes(rule) || !rule.enabled ||
                     !containers().includes(source.container) || source.container.getSlotItem(source.slot) !== source.item ||
-                    !matches(source.item,rule) || client !== window.gameClient || bot.actions?.isHalted?.()) return false;
+                    !matches(source.item,rule) || client !== window.gameClient || client.player !== player || bot.actions?.isHalted?.()) return false;
                 const current=position(client.player?.getPosition?.());
-                if (!isDestinationOnScreen(rule,current)) return false;
-                if (client.world.getTileFromWorldPosition(new Position(rule.x,rule.y,rule.z)) !== tile) return false;
+                const liveTarget=rule.destinationMode === "self" ? current : target;
+                if (!liveTarget || !isDestinationOnScreen(liveTarget,current)) return false;
+                const liveTile=client.world?.getTileFromWorldPosition?.(new Position(liveTarget.x,liveTarget.y,liveTarget.z));
+                if (!liveTile || liveTile.id === 0 || liveTile.__isPlaceholder ||
+                    (rule.destinationMode !== "self" && liveTile !== tile)) return false;
+                const liveTo={which:liveTile,index:0xFF};
+                if (client.mouse?.__moveTargetsDustbin?.(liveTo) === true) { state.reason="Dustbin needs manual confirmation"; return false; }
                 if (typeof ItemMovePacket !== "function") { state.reason="Item movement unavailable"; return false; }
                 const count=stackCount(source.item);
                 const pending={client,container:source.container,slot:source.slot,itemId:Number(source.item.id),itemSid:rule.itemSid,count,stackable:source.item.isStackable?.() === true,
@@ -53385,7 +53633,7 @@ window.__minibiaBotBundle.installItemDropperModule = function installItemDropper
                 const before=client.networkManager?.nPacketsSent;
                 state.pending=pending;
                 try {
-                    const result=client.send(new ItemMovePacket({which:source.container,index:source.slot},to,count));
+                    const result=client.send(new ItemMovePacket({which:source.container,index:source.slot},liveTo,count));
                     const after=client.networkManager?.nPacketsSent;
                     if (result === false || (Number.isFinite(before) && Number.isFinite(after) && after<=before)) {
                         state.pending=null; state.reason="Drop command not sent"; return false;
@@ -53396,7 +53644,7 @@ window.__minibiaBotBundle.installItemDropperModule = function installItemDropper
             };
             const sent=bot.actions?.runShared
                 ? bot.actions.runShared("item-dropper",bot.actions.priorities.UTILITY,send) : send();
-            if (!sent && !state.reason.startsWith("Drop") && state.reason!=="Item movement unavailable") state.reason="Waiting for shared actions";
+            if (!sent && !state.reason.startsWith("Drop") && state.reason!=="Item movement unavailable" && state.reason!=="Dustbin needs manual confirmation") state.reason="Waiting for shared actions";
             return !!sent;
         }
         state.reason=reason;
@@ -53443,6 +53691,7 @@ window.__minibiaBotBundle.installItemDropperModule = function installItemDropper
         const index=config.rules.findIndex(rule=>rule.id===id);
         if (index<0) return null;
         const current=config.rules[index],next={...current,...patch,id};
+        if (patch.destinationMode === "self" && state.capture?.id === id && state.capture.kind === "tile") cancelCapture();
         if (patch.itemSid !== undefined) {
             next.identityMode="sid"; next.legacyCid=null;
             next.itemId=integer(window.gameClient?.itemDefinitionsBySid?.[integer(patch.itemSid,1,65535)]?.id,1,65535);
@@ -53452,6 +53701,8 @@ window.__minibiaBotBundle.installItemDropperModule = function installItemDropper
             next.legacyCid=next.itemSid ? null : integer(patch.itemId,1,65535);
         }
         config.rules[index]=normalizeRule(next);
+        if (patch.destinationMode !== undefined) state.reason=config.rules[index].destinationMode === "self"
+            ? "Destination: your current position" : "Destination: fixed coordinates";
         state.blocked.delete(id); changed(); return {...config.rules[index]};
     }
     function removeRule(id) {
@@ -53512,6 +53763,7 @@ window.__minibiaBotBundle.installItemDropperModule = function installItemDropper
     }
     function startCapture(id,kind) {
         if (state.destroyed || !["item","tile"].includes(kind) || !config.rules.some(r=>r.id===id)) return false;
+        if (kind === "tile" && config.rules.find(r=>r.id===id)?.destinationMode === "self") return false;
         const same=state.capture?.id === id && state.capture?.kind === kind;
         cancelCapture(); if (same) return false;
         bot.equipRing?.clearCaptureMode?.(); bot.bootsSwapper?.clearCaptureMode?.();bot.helmetSwapper?.clearCaptureMode?.();
@@ -53553,7 +53805,7 @@ window.__minibiaBotBundle.installItemDropperModule = function installItemDropper
             pending:!!state.pending,selecting:state.capture?{...state.capture}:null,
             config:{...config,rules:config.rules.map(rule=>({...rule}))}})};
     bot.addCleanup(()=>{stop({persistEnabled:false});state.destroyed=true;state.pending=null;state.blocked.clear();});
-    if (saved.schemaVersion !== 2) persist();
+    if (saved.schemaVersion !== 3) persist();
     if (config.enabled) start();
 };
 
@@ -57124,6 +57376,7 @@ window.__minibiaBotBundle.installBankNpcModule = function installBankNpcModule(b
 
 window.__minibiaBotBundle.installPanel = function installPanel(bot) {
     let worldMapEditor = null;
+    let volumeControlCleanup = null;
     // Large-map waypoint editor. Terrain remains owned by the client; a separate
     // transparent canvas keeps route markers intact across asynchronous paints.
     function createWorldMapWaypointEditor(bot, selection) {
@@ -57563,6 +57816,7 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
 
     // ---- UTILITY FUNCTIONS ----
     function destroy() {
+        volumeControlCleanup?.(); volumeControlCleanup = null;
         worldMapEditor?.destroy();
         worldMapEditor = null;
         document.getElementById("minibia-bot-panel")?.remove();
@@ -57788,6 +58042,15 @@ function upgradeSectionHeaders(panel) {
             document.getElementById("minibia-bot-looter-corpse-distance");
 
         const status = bot.looter?.status?.();
+        const blacklistMode = status?.lootMode === "blacklist";
+        const modeInput = document.getElementById("minibia-bot-looter-mode");
+        if (modeInput && document.activeElement !== modeInput) modeInput.value = blacklistMode ? "blacklist" : "whitelist";
+        const listTitle = document.getElementById("minibia-bot-looter-list-title");
+        if (listTitle) listTitle.textContent = blacklistMode ? "Blacklisted Items — Leave or Drop" : "Tracked Items";
+        const modeNote = document.getElementById("minibia-bot-looter-mode-note");
+        if (modeNote) modeNote.textContent = blacklistMode
+            ? 'Loots unlisted items from “dead” containers only. Listed items stay in the corpse unless Drop is checked. Skips all container items and your own bags.'
+            : 'Loots listed items from “dead” containers only. Container items and your own bags are never loot sources.';
         if (toggle && document.activeElement !== toggle) {
             toggle.checked = !!status?.running;
         }
@@ -57806,7 +58069,7 @@ function upgradeSectionHeaders(panel) {
             if (!items.length) {
                 const empty = document.createElement("div");
                 empty.className = "mb-small-note";
-                empty.textContent = "No items tracked.";
+                empty.textContent = blacklistMode ? "Blacklist empty — all non-container items in corpses will be looted." : "No items tracked.";
                 listContainer.appendChild(empty);
             } else {
                 for (const [id, name] of items) {
@@ -57815,7 +58078,7 @@ function upgradeSectionHeaders(panel) {
                     row.style.cssText = "display:flex;justify-content:space-between;align-items:center;gap:8px;padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.05);";
 
                     const label = document.createElement("span");
-                    label.textContent = String(id).startsWith('legacy:') ? `${name} · re-track` : name;
+                    label.textContent = String(id).startsWith('legacy:') && !blacklistMode ? `${name} · re-track` : name;
                     label.title = String(id).startsWith('legacy:') ? 'Re-track this item to capture its exact SID.' : `SID ${String(id).split(':')[0]} · CID ${String(id).split(':')[1]} · Fluid ${String(id).split(':')[2]||0}`;
                     label.style.cssText = "flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
 
@@ -59623,6 +59886,10 @@ function upgradeSectionHeaders(panel) {
 #minibia-bot-panel .mb-audio-test-row > label { flex:1; min-width:0; }
 #minibia-bot-panel button.mb-audio-test { flex:0 0 22px; width:22px; min-width:22px; height:22px; margin:0; padding:0; font-size:11px; line-height:20px; border-radius:4px; color:#d8c38b; }
 
+#minibia-bot-panel .mb-audio-volume-row {display:flex;align-items:center;gap:8px;}
+#minibia-bot-panel .mb-audio-volume-row input[type="range"] {flex:1;min-width:60px;width:auto;height:22px;padding:0;margin:0;accent-color:#c7a76a;cursor:pointer;}
+#minibia-bot-panel .mb-audio-volume-row output {min-width:38px;text-align:right;color:#ddc991;font-size:11px;}
+#minibia-bot-panel .mb-audio-volume-row button {flex:0 0 auto;width:auto;margin:0;}
 #minibia-bot-panel .mb-subtab-menu {display:flex;flex-wrap:wrap;gap:3px;padding:3px;margin:0 0 3px;background:rgba(0,0,0,.22);border:1px solid var(--mb-hub-edge,#383838);border-radius:5px;}
 #minibia-bot-panel .mb-subtab-menu[hidden] {display:none;}
 #minibia-bot-panel .mb-subtab-menu > .mb-subtab-button {
@@ -60436,6 +60703,8 @@ function upgradeSectionHeaders(panel) {
 #minibia-bot-panel .mb-dropper-rule-head {display:flex;align-items:center;justify-content:space-between;gap:6px;margin-bottom:2px;min-height:16px;}
 #minibia-bot-panel .mb-dropper-rule-head .mb-toggle {min-width:0;flex:1;font-size:10px;gap:5px;margin:0;padding:0;line-height:14px;}
 #minibia-bot-panel .mb-dropper-rule-head input[type="checkbox"] {width:12px;height:12px;min-width:12px;margin:0;flex:0 0 12px;}
+#minibia-bot-panel .mb-dropper-self {display:flex;align-items:center;gap:4px;flex:0 0 auto;color:#cdbb8b;font-size:10px;white-space:nowrap;cursor:pointer;}
+#minibia-bot-panel .mb-dropper-values input:disabled {opacity:.45;}
 #minibia-bot-panel .mb-dropper-name {overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#cdbb8b;}
 #minibia-bot-panel .mb-dropper-remove {width:16px;height:16px;min-width:16px;flex:0 0 16px;padding:0;font-size:11px;line-height:14px;color:#de9993;}
 #minibia-bot-panel .mb-dropper-values,#minibia-bot-panel .mb-dropper-columns {display:grid;grid-template-columns:minmax(0,.9fr) 20px minmax(0,1fr) minmax(0,1fr) 25px 20px;align-items:center;gap:3px;}
@@ -61595,7 +61864,7 @@ function upgradeSectionHeaders(panel) {
   <!-- Item Dropper -->
   <div class="mb-section mb-dropper-section">
     <div class="mb-dropper-heading"><div class="mb-section-title"><input type="checkbox" id="minibia-bot-item-dropper-enabled" class="mb-title-toggle"><span class="mb-title-text">📤 Item Dropper</span></div><button type="button" class="mb-small-button" id="minibia-bot-item-dropper-add">+ Rule</button></div>
-    <div class="mb-dropper-toolbar"><label class="mb-dropper-delay">Delay (s)<input type="number" id="minibia-bot-item-dropper-delay" min="0.5" max="60" step="0.5" value="2"></label><span class="mb-small-note">Open backpacks · visible tiles</span></div>
+    <div class="mb-dropper-toolbar"><label class="mb-dropper-delay">Delay (s)<input type="number" id="minibia-bot-item-dropper-delay" min="0.5" max="60" step="0.5" value="2"></label><span class="mb-small-note">Open backpacks · fixed tile or My position</span></div>
     <div class="mb-dropper-columns" id="minibia-bot-item-dropper-columns" aria-hidden="true" hidden><span>SID</span><span></span><span>X</span><span>Y</span><span>Z</span><span></span></div>
     <div id="minibia-bot-item-dropper-rules" class="mb-dropper-rules"></div>
     <div id="minibia-bot-item-dropper-status" class="mb-small-note">Off · 0 dropped</div>
@@ -62020,11 +62289,13 @@ function upgradeSectionHeaders(panel) {
  <div class="mb-section">
   <div class="mb-section-title"><input type="checkbox" id="minibia-bot-looter-enabled" class="mb-title-toggle"><span class="mb-title-text">💰 Looter</span></div>
   <div class="mb-looter-destination"><span class="mb-small-note" id="minibia-bot-looter-dest-status">No destination selected</span><button type="button" class="mb-small-button" id="minibia-bot-looter-select-dest" title="Choose the main loot container. Full containers overflow into child bags automatically.">Set Destination</button></div>
-  <div class="mb-section-title mb-section-title--sub"><span class="mb-title-text">Tracked Items</span></div>
+  <label class="mb-field"><span class="mb-field-label">Loot mode</span><select id="minibia-bot-looter-mode"><option value="whitelist">Loot listed items</option><option value="blacklist">Blacklist — loot everything except listed items</option></select></label>
+  <div class="mb-small-note" id="minibia-bot-looter-mode-note">Loots only from containers whose names contain “dead”. Container items are always skipped.</div>
+  <div class="mb-section-title mb-section-title--sub"><span class="mb-title-text" id="minibia-bot-looter-list-title">Tracked Items</span></div>
   <div class="mb-looter-add"><input type="text" id="minibia-bot-looter-manual-input" placeholder="Item name" aria-label="Item name"><button type="button" class="mb-small-button" id="minibia-bot-looter-manual-add">Add</button><button type="button" class="mb-small-button" id="minibia-bot-looter-capture-item" title="Click an item to track its exact identity" aria-label="Pick item">🔍</button></div>
   <div id="minibia-bot-looter-item-list" class="mb-looter-items"></div>
   <details class="mb-looter-fold"><summary>Corpse Walking</summary><div class="mb-looter-options"><label class="mb-toggle"><input type="checkbox" id="minibia-bot-looter-walk-corpses"><span>Walk to distant corpses</span></label><label class="mb-field"><span class="mb-field-label">Max distance (tiles)</span><input type="number" id="minibia-bot-looter-corpse-distance" min="1" max="30" value="12"></label></div><div class="mb-small-note">Walks to corpses once combat is clear, briefly pausing CaveBot movement.</div></details>
-  <details class="mb-looter-fold"><summary>Item options</summary><div class="mb-small-note">Drop places that item on the ground instead of in the destination. Hover an item name to see its SID, CID, and fluid type. Use the magnifying glass to capture an exact item.</div></details>
+  <details class="mb-looter-fold"><summary>Item options</summary><div class="mb-small-note">Drop moves that item from a corpse to the ground in either mode. In Blacklist mode, listed items without Drop stay in the corpse. Container items and items in your own bags are always left untouched. Hover an item name to see its SID, CID, and fluid type. Use the magnifying glass to capture an exact item.</div></details>
   <div class="mb-small-note mb-looter-status" id="minibia-bot-looter-status">Status: idle</div>
  </div>
 </div>
@@ -62744,6 +63015,33 @@ function upgradeSectionHeaders(panel) {
             if(card)leaf.appendChild(card.parentElement===professionsPanel?card:card.parentElement);
         }
         const shortcutsPanel=makeLeaf('shortcuts');
+        const volumeSection=document.createElement('div');volumeSection.className='mb-section';
+        volumeSection.innerHTML=`<div class="mb-section-title"><span class="mb-title-text">Audio</span></div>
+<label class="mb-field" for="minibia-bot-audio-volume"><span class="mb-field-label">Volume</span></label>
+<div class="mb-audio-volume-row"><input type="range" id="minibia-bot-audio-volume" min="0" max="100" step="1" aria-label="Bot volume"><output id="minibia-bot-audio-volume-value" for="minibia-bot-audio-volume"></output><button type="button" class="mb-small-button" id="minibia-bot-audio-volume-test">Test sound</button></div>
+<div class="mb-small-note">Bot alarms and alert sounds. 0% mutes audio.</div>`;
+        shortcutsPanel.appendChild(volumeSection);
+        const volumeSlider=volumeSection.querySelector('#minibia-bot-audio-volume');
+        const volumeValue=volumeSection.querySelector('#minibia-bot-audio-volume-value');
+        const volumeTest=volumeSection.querySelector('#minibia-bot-audio-volume-test');
+        const refreshVolume=()=>{
+            const percent=Math.round(bot.getAudioVolume()*100);
+            volumeSlider.value=percent;
+            volumeValue.textContent=percent===0?'Muted':percent+'%';
+            volumeSlider.setAttribute('aria-valuetext',percent===0?'Muted':percent+' percent');
+        };
+        const changeVolume=()=>bot.setAudioVolume(Number(volumeSlider.value)/100);
+        const testVolume=()=>bot.panic?.playGenericBeepBloop?.();
+        volumeSlider.addEventListener('input',changeVolume);
+        volumeSlider.addEventListener('change',changeVolume);
+        volumeTest.addEventListener('click',testVolume);
+        const unsubscribeVolume=bot.subscribeAudioVolume(refreshVolume);
+        refreshVolume();
+        volumeControlCleanup=()=>{
+            unsubscribeVolume();volumeSlider.removeEventListener('input',changeVolume);
+            volumeSlider.removeEventListener('change',changeVolume);volumeTest.removeEventListener('click',testVolume);
+        };
+        bot.addCleanup(volumeControlCleanup);
         const shortcutSection=panel.querySelector('[data-pause-shortcut]');
         if(shortcutSection)shortcutsPanel.appendChild(shortcutSection);
         const targetingPanel=panel.querySelector('[data-tab-panel="targeting"]');
@@ -62837,7 +63135,7 @@ function upgradeSectionHeaders(panel) {
             {id:'professions',label:'Professions',tabs:[['professions','Woodcutting'],['mining','Mining'],['smithing','Smithing'],['cooking','Cooking']]},
             {id:'utility',label:'Tools',tabs:[['utility','General'],['items','Items'],['ui','Interface'],['trackers','Trackers'],['combo','PVP']]},
             {id:'equipment',label:'Equipment',tabs:[['equipment','Equipment']]},
-            {id:'settings',label:'Settings',tabs:[['xray','X-Ray'],['profiles','Profiles'],['diagnostics','Diagnostics'],['shortcuts','Shortcuts'],['namespoofer','Name Spoofer']]},
+            {id:'settings',label:'Settings',tabs:[['shortcuts','General'],['xray','X-Ray'],['profiles','Profiles'],['diagnostics','Diagnostics'],['namespoofer','Name Spoofer']]},
         ];
         const tabContent=panel.querySelector('.mb-tab-content');
         const gmPanel=document.createElement('div');gmPanel.className='mb-tab-panel mb-alert-compact';gmPanel.dataset.tabPanel='gmprotection';
@@ -64114,7 +64412,7 @@ function upgradeSectionHeaders(panel) {
                 dropperList.replaceChildren();
                 for (const [index,rule] of status.config.rules.entries()) {
                     const row=document.createElement("div"); row.className="mb-dropper-rule"; row.dataset.dropRule=rule.id;
-                    row.innerHTML=`<div class="mb-dropper-rule-head"><label class="mb-toggle"><input type="checkbox" data-drop-field="enabled"><span class="mb-dropper-name"></span></label><button type="button" class="mb-small-button mb-dropper-remove" data-drop-action="remove" title="Delete rule" aria-label="Delete drop rule">×</button></div>
+                    row.innerHTML=`<div class="mb-dropper-rule-head"><label class="mb-toggle"><input type="checkbox" data-drop-field="enabled"><span class="mb-dropper-name"></span></label><label class="mb-dropper-self" title="Drop this item at your current position each time, including after you move"><input type="checkbox" data-drop-field="destinationMode"><span>My position</span></label><button type="button" class="mb-small-button mb-dropper-remove" data-drop-action="remove" title="Delete rule" aria-label="Delete drop rule">×</button></div>
 <div class="mb-dropper-values"><input type="number" min="1" max="65535" step="1" data-drop-field="itemSid" placeholder="SID" aria-label="Server item ID (SID)" title="Server item ID (SID)"><button type="button" class="mb-small-button mb-dropper-picker" data-drop-action="item" title="Select exact item SID" aria-label="Select exact item SID" aria-pressed="false">🔍</button><input type="number" min="0" max="65535" step="1" data-drop-field="x" placeholder="X" aria-label="Destination X" title="Destination X"><input type="number" min="0" max="65535" step="1" data-drop-field="y" placeholder="Y" aria-label="Destination Y" title="Destination Y"><input type="number" min="0" max="15" step="1" data-drop-field="z" placeholder="Z" aria-label="Destination Z" title="Destination Z"><button type="button" class="mb-small-button mb-dropper-picker" data-drop-action="tile" title="Select destination tile" aria-label="Select destination tile" aria-pressed="false">🔍</button></div>`;
                     const def=window.gameClient?.itemDefinitionsBySid?.[rule.itemSid];
                     const name=row.querySelector(".mb-dropper-name");
@@ -64123,8 +64421,10 @@ function upgradeSectionHeaders(panel) {
                     for (const input of row.querySelectorAll("[data-drop-field]")) {
                         const field=input.dataset.dropField;
                         if (field==="enabled") input.checked=rule.enabled;
-                        else input.value=rule[field] ?? "";
+                        else if (field==="destinationMode") input.checked=rule.destinationMode === "self";
+                        else { input.value=rule[field] ?? ""; if (["x","y","z"].includes(field)) input.disabled=rule.destinationMode === "self"; }
                     }
+                    row.querySelector('[data-drop-action="tile"]').disabled=rule.destinationMode === "self";
                     dropperList.appendChild(row);
                 }
                 if (!status.config.rules.length) {
@@ -64150,7 +64450,7 @@ function upgradeSectionHeaders(panel) {
         dropperList?.addEventListener("change",event=>{
             const input=event.target.closest?.("[data-drop-field]"),row=input?.closest?.("[data-drop-rule]");
             if (!input || !row) return;
-            bot.itemDropper?.updateRule?.(row.dataset.dropRule,{[input.dataset.dropField]:input.type==="checkbox"?input.checked:input.value});
+            bot.itemDropper?.updateRule?.(row.dataset.dropRule,{[input.dataset.dropField]:input.dataset.dropField==="destinationMode"?(input.checked?"self":"fixed"):input.type==="checkbox"?input.checked:input.value});
             refreshItemDropperStatus();
         });
         dropperList?.addEventListener("click",event=>{
@@ -65008,6 +65308,14 @@ function upgradeSectionHeaders(panel) {
 
         // ---- Looter listeners ----
         const looterToggle = panel.querySelector("#minibia-bot-looter-enabled");
+        const lootModeInput = panel.querySelector("#minibia-bot-looter-mode");
+        if (lootModeInput) {
+            lootModeInput.value = bot.looter?.status?.().lootMode || "whitelist";
+            lootModeInput.addEventListener("change", () => {
+                bot.looter?.updateConfig?.({lootMode: lootModeInput.value});
+                refreshLooterStatus();
+            });
+        }
         const selectDestBtn = panel.querySelector("#minibia-bot-looter-select-dest");
         const captureItemBtn = panel.querySelector("#minibia-bot-looter-capture-item");
         const manualInput = panel.querySelector("#minibia-bot-looter-manual-input");
