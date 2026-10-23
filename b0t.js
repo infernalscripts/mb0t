@@ -4151,7 +4151,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.397",
+        version: "1.6.399",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -50983,7 +50983,8 @@ window.__minibiaBotBundle.installChancellorAlertModule = function installChancel
             if (!visible.has(id)) alert(creature.name||"Chancellor","nearby",now);
         }
         visible=nextVisible;
-        for(const node of chatNodes()){
+        const chat=chatNodes(),liveSignatures=new Set(chat.map(signature));
+        for(const node of chat){
             if (seenNodes.has(node)) continue;
             seenNodes.add(node);
             const name=String(node.getAttribute("name")||"").trim();
@@ -50992,9 +50993,11 @@ window.__minibiaBotBundle.installChancellorAlertModule = function installChancel
             if (!signatures.has(sig)) alert(name,"chat message",now);
             signatures.set(sig,now);
         }
-        for(const [sig,at]of signatures)if(now-at>60000)signatures.delete(sig);
+        // Chat can be rebuilt when switching channels or refreshing the UI.
+        // Keep every displayed message deduplicated for its whole lifetime.
         for(const [id,at]of alerts)if(now-at>60000)alerts.delete(id);
-        while(signatures.size>256)signatures.delete(signatures.keys().next().value);
+        let recent=0;
+        for(const sig of [...signatures.keys()].reverse())if(!liveSignatures.has(sig)&&++recent>4096)signatures.delete(sig);
         while(alerts.size>64)alerts.delete(alerts.keys().next().value);
     }
     function stop(){if(timer!==null)clearInterval(timer);timer=null;visible.clear();seenNodes=new WeakSet();signatures.clear();alerts.clear();}
@@ -51002,8 +51005,7 @@ window.__minibiaBotBundle.installChancellorAlertModule = function installChancel
         stop();
         if(!config.enabled)return;
         // Existing chat is history; a live nearby Chancellor still alerts.
-        for(const node of chatNodes()){seenNodes.add(node);signatures.set(signature(node),Date.now());}
-        while(signatures.size>256)signatures.delete(signatures.keys().next().value);
+        for(const node of chatNodes()){seenNodes.add(node);if(named(node.getAttribute("name")))signatures.set(signature(node),Date.now());}
         timer=setInterval(tick,250);
     }
     function updateConfig(next={}){if(next.enabled!==undefined)config.enabled=!!next.enabled;bot.storage.set(key,{...config});start();}
@@ -62602,6 +62604,10 @@ function upgradeSectionHeaders(panel) {
       <label class="mb-toggle"><input type="checkbox" id="minibia-bot-pink-skull-enabled" /><span>Pinkskull XLOG</span></label>
       <label class="mb-toggle" title="Close connection on a new Console message containing sent to temple. Disables Auto-Reconnect."><input type="checkbox" id="minibia-bot-temple-xlog-enabled" /><span>Temple XLOG</span></label>
     </div>
+    <details class="mb-alert-fold"><summary>GM responder greetings</summary><div class="mb-alert-fold-body">
+      <label class="mb-toggle"><input type="checkbox" id="minibia-bot-gm-random-greetings"><span>Random greeting</span></label>
+      <label class="mb-field"><span class="mb-field-label">Greetings · one per line</span><textarea id="minibia-bot-gm-greetings" rows="3" aria-label="GM greetings, one per line"></textarea></label>
+    </div></details>
     <details class="mb-alert-fold"><summary>Anti-bot check settings</summary><div class="mb-alert-fold-body"><label class="mb-toggle"><input type="checkbox" id="minibia-bot-antibot-close-window"><span>Close game window</span></label><div class="mb-small-note">Requires Anti-bot check. Turns off after triggering. Disconnects first; tab closing depends on browser permissions.</div><div class="mb-small-note" id="minibia-bot-antibot-last-xlog" hidden></div></div></details>
     <details class="mb-alert-fold">
       <summary>Game master names</summary>
@@ -64429,6 +64435,24 @@ function upgradeSectionHeaders(panel) {
                     bot.gmChatMonitor.start();
                 else
                     bot.gmChatMonitor.stop();
+            });
+        }
+
+        const gmRandomGreetings = panel.querySelector('#minibia-bot-gm-random-greetings');
+        const gmGreetings = panel.querySelector('#minibia-bot-gm-greetings');
+        if (gmRandomGreetings) {
+            gmRandomGreetings.checked = bot.gmChatMonitor?.config?.randomGreetings !== false;
+            gmRandomGreetings.addEventListener('change',()=>{
+                bot.gmChatMonitor?.updateConfig?.({randomGreetings:gmRandomGreetings.checked});
+                if(gmGreetings)gmGreetings.disabled=!gmRandomGreetings.checked;
+            });
+        }
+        if (gmGreetings) {
+            gmGreetings.value=(bot.gmChatMonitor?.config?.greetings || []).join('\n');
+            gmGreetings.disabled=gmRandomGreetings?.checked===false;
+            gmGreetings.addEventListener('change',()=>{
+                bot.gmChatMonitor?.updateConfig?.({greetings:gmGreetings.value});
+                gmGreetings.value=(bot.gmChatMonitor?.config?.greetings || []).join('\n');
             });
         }
 
@@ -69338,6 +69362,8 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
         firstReplyDelayMs: 1000,
         secondReplyDelayMs: 1000,
         firstReplyText: "Hey :D",
+        randomGreetings: true,
+        greetings: null,
         secondReplyText: "i am here",
 
         // One GM encounter gets one reply pair. New GM lines during this
@@ -69392,6 +69418,23 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
         Math.min(300000, Number(config.triggerCooldownMs) || 60000)
     );
 
+    function normalizeGreetings(value) {
+        const lines = Array.isArray(value) ? value : typeof value === 'string' ? value.split(/\r?\n/) : [];
+        const result = [...new Set(lines.map(line=>String(line||'').replace(/\s+/g,' ').trim().slice(0,120)).filter(Boolean))].slice(0,40);
+        return result.length ? result : [String(config.firstReplyText||'Hey :D'),'Hey!','Hi :)','Hello!','Hey there'];
+    }
+    config.randomGreetings = config.randomGreetings !== false;
+    config.greetings = normalizeGreetings(config.greetings);
+    let lastGreeting = null;
+    function pickGmGreeting() {
+        if (!config.randomGreetings) return String(config.firstReplyText || 'Hey :D');
+        const pool = config.greetings.filter(line=>line!==lastGreeting);
+        const choices = pool.length ? pool : config.greetings;
+        const greeting = choices[Math.floor(Math.random()*choices.length)] || String(config.firstReplyText || 'Hey :D');
+        lastGreeting = greeting;
+        return greeting;
+    }
+
     function persistConfig() {
         bot.storage.set(configStorageKey, {
             enabled: config.enabled,
@@ -69399,6 +69442,8 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
             firstReplyDelayMs: config.firstReplyDelayMs,
             secondReplyDelayMs: config.secondReplyDelayMs,
             firstReplyText: config.firstReplyText,
+            randomGreetings: config.randomGreetings,
+            greetings: config.greetings.slice(),
             secondReplyText: config.secondReplyText,
             triggerCooldownMs: config.triggerCooldownMs,
         });
@@ -69668,6 +69713,7 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
     function scheduleGmAutoReplies() {
         clearReplyTimers();
         state.replyPairsScheduled++;
+        const greeting = pickGmGreeting();
 
         const firstDelay = Math.max(
             250,
@@ -69696,10 +69742,7 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
                 );
 
             sendGmAutoReply(
-                String(
-                    config.firstReplyText ||
-                        "Hey :D"
-                ),
+                greeting,
                 "first"
             );
 
@@ -70127,6 +70170,8 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
         config.secondReplyText =
             String(config.secondReplyText || "i am here");
 
+        config.randomGreetings = config.randomGreetings !== false;
+        config.greetings = normalizeGreetings(config.greetings);
         persistConfig();
 
         if (
