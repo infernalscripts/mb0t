@@ -4151,7 +4151,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.382",
+        version: "1.6.386",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -47464,8 +47464,11 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             window.gameClient?.itemDefinitionsByCid?.[item.id]].filter(Boolean);
         for (const def of defs) {
             const p = def.properties || {};
+            // definitions.json uses server flags, a different layout from the
+            // live sprite DAT flags checked above. Weapons also set bit 16 in
+            // their server flags; that bit must not classify them as containers.
             if (p.type === "container" || p.type === "corpse" || Number(p.containerSize) > 0 ||
-                p.slotType === "backpack" || (flag !== undefined && (Number(def.flags) & flag) !== 0)) return true;
+                p.slotType === "backpack") return true;
         }
         const names = [item.name, ...defs.map(def => def.properties?.name)].filter(name => typeof name === "string");
         return names.some(name => /\b(?:backpacks?|bags?|parcels?|baskets?|pouch(?:es)?|satchels?|sacks?|chests?|crates?|boxes|box|quivers?)\b/i.test(name));
@@ -57262,6 +57265,641 @@ window.__minibiaBotBundle.installNpcSupplyBuyerModule = function installNpcSuppl
  *     acknowledgement between every line.
  * ==================================================================================
  */
+// Session totals are derived from applied server updates; outgoing actions are
+// observed only to distinguish moves from consumption, never treated as success.
+window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyzerModule(bot) {
+    const CONFIG_KEY = 'minibiaBot.huntAnalyzer.config', SESSION_KEY = 'minibiaBot.huntAnalyzer.session';
+    const raw = bot.storage.get(CONFIG_KEY, {}) || {};
+    const config = { overrides: raw.overrides && typeof raw.overrides === 'object' ? raw.overrides : {},
+        offers: raw.offers && typeof raw.offers === 'object' ? raw.offers : {}, overlayEnabled: raw.overlayEnabled === true };
+    let disposed = false, player = null, client = null, handler = null, hooks = [], lastClock = Date.now(), lastSave = 0;
+    let session = null, liveXp = null, lastXp = null, fetchController = null, priceNote = '', ui = null;
+    let definitions = null, names = new Map(), catalog = new Map(), ringBases = new Map();
+    let moves = [], ringRemovals = [], countBaseline = new Map(), requestedCountsFor = null;
+    const savedSession = bot.storage.get(SESSION_KEY, null);
+    let restored = false, revision = 0, priceRevision = 0;
+    let overlayRow = null, overlayUpdatedAt = 0, overlayRevision = '';
+    const coinValues = { 2148: 1, 2152: 100, 2160: 10000 };
+    const number = value => value != null && value !== '' && Number.isFinite(Number(value)) ? Number(value) : null;
+    const whole = value => Math.max(0, Math.floor(number(value) || 0));
+    const cleanName = value => String(value || '').replace(/<[^>]*>/g, '').replace(/\{\/?[a-z]+\}/gi, '').trim();
+    const nameKey = value => cleanName(value).toLowerCase().replace(/^(?:a|an|the)\s+/, '').replace(/\s+/g, ' ');
+    const keyOf = item => item.sid > 0 ? `${item.sid}:${item.fluidType || 0}` : `n:${nameKey(item.name)}`;
+    const equipmentId = () => typeof CONST !== 'undefined' ? CONST.CONTAINER?.EQUIPMENT ?? 0 : 0;
+    const ringSlot = () => typeof CONST !== 'undefined' ? CONST.EQUIPMENT?.RING ?? 8 : 8;
+    function connected() {
+        const gc = window.gameClient;
+        return !!gc?.player && gc.__spectatorMode !== true && gc.networkManager?.isConnected?.() !== false;
+    }
+    function ownerOf(p) {
+        const name = String(p?.name || p?.state?.name || '').trim().toLowerCase();
+        const world = String(window.__selectedWorld || new URLSearchParams(window.location?.search || '').get('world') ||
+            new URLSearchParams(window.location?.search || '').get('w') || 'main');
+        return name ? `${window.location?.host || ''}:${world}:${name}` : null;
+    }
+    function freshSession(owner) {
+        return { schema: 1, owner, startedAt: Date.now(), recording: true, elapsedMs: 0, xp: 0,
+            kills: 0, monsters: {}, drops: {}, loot: {}, supplies: {}, unresolved: 0 };
+    }
+    function persistConfig() { bot.storage.set(CONFIG_KEY, config); priceRevision++; }
+    function save() {
+        if (session) bot.storage.set(SESSION_KEY, session);
+        lastSave = Date.now();
+    }
+    function advanceClock() {
+        const now = Date.now();
+        if (session?.recording && connected() && window.gameClient?.player === player && ownerOf(player) === session.owner)
+            session.elapsedMs += Math.max(0, now - lastClock);
+        lastClock = now;
+    }
+    function countOf(item) {
+        try { return item ? Math.max(1, whole(item.getCount?.() ?? item.count)) : 0; } catch (_) { return 1; }
+    }
+    function getContainer(id) {
+        const p = window.gameClient?.player;
+        if (Number(id) === equipmentId()) return p?.equipment || null;
+        try { return p?.getContainer?.(Number(id)) || null; } catch (_) { return null; }
+    }
+    function peek(container, slot) {
+        try { return container?.peekItem?.(slot) || container?.getSlotItem?.(slot) || container?.slots?.[slot]?.item || null; } catch (_) { return null; }
+    }
+    function rebuildCatalog() {
+        const defs = window.gameClient?.itemDefinitionsBySid || window.gameClient?.itemDefinitions;
+        if (!defs || defs === definitions) return;
+        definitions = defs; names = new Map(); catalog = new Map(); ringBases = new Map();
+        const addName = (label, info) => {
+            const key = nameKey(label); if (!key) return;
+            if (!names.has(key)) names.set(key, []);
+            if (!names.get(key).some(row => keyOf(row) === keyOf(info))) names.get(key).push(info);
+        };
+        for (const [sid, def] of Object.entries(defs)) {
+            const props = def?.properties || {}, name = String(props.name || '').trim();
+            if (!name || !whole(sid)) continue;
+            const info = { sid: whole(sid), cid: whole(def.id), fluidType: 0, name, type: props.type || '', ring: props.slotType === 'ring' };
+            catalog.set(keyOf(info), info); addName(name, info);
+            addName(props.plural || name + 's', info);
+            if (name.endsWith('y')) addName(name.slice(0, -1) + 'ies', info);
+            if (info.ring && whole(props.transformEquipTo)) ringBases.set(whole(props.transformEquipTo), info.sid);
+        }
+        const fluidDef = defs[2006];
+        if (fluidDef) for (const [fluidType, name] of [[7, 'mana fluid'], [10, 'life fluid']]) {
+            const info = { sid: 2006, cid: whole(fluidDef.id), fluidType, name, type: 'fluidContainer', ring: false };
+            catalog.set(keyOf(info), info); addName(name, info); addName(name + 's', info);
+        }
+        for (const [sid, alias] of [[2148, 'gold coins'], [2152, 'platinum coins'], [2160, 'crystal coins']]) {
+            const info = catalog.get(`${sid}:0`); if (info) addName(alias, info);
+        }
+        revision++; priceRevision++;
+    }
+    function identify(item) {
+        if (!item) return null;
+        rebuildCatalog();
+        const gc = window.gameClient, cid = whole(item.id ?? item.itemId ?? item.cid);
+        let sid = whole(item.sid) || whole(gc?.sidByCid?.[cid]);
+        let def = definitions?.[sid] || gc?.itemDefinitionsByCid?.[cid];
+        let fluidType = whole(item.fluidType);
+        if (def?.properties?.slotType === 'ring' && ringBases.has(sid)) {
+            sid = ringBases.get(sid); def = definitions?.[sid] || def;
+        }
+        const base = catalog.get(`${sid}:${fluidType}`);
+        return { sid, cid, fluidType, name: base?.name || String(def?.properties?.name || item.name || `Item ${sid || cid}`),
+            type: def?.properties?.type || '', ring: def?.properties?.slotType === 'ring' };
+    }
+    function addItem(collection, item, count) {
+        const qty = whole(count); if (!item || !qty || !session) return;
+        const key = keyOf(item);
+        if (!collection[key]) collection[key] = { ...item, count: 0 };
+        collection[key].count += qty; revision++;
+    }
+    function active() { return !disposed && session?.recording && connected() && player === window.gameClient?.player && session.owner === ownerOf(player); }
+    function readXp() {
+        const p = window.gameClient?.player;
+        // Native EXPERIENCE updates only the Skills window, not player.state.
+        const el = document.querySelector('div[skill="experience"] .skill');
+        const dom = el ? number(el.textContent.replace(/[,\s]/g, '')) : null;
+        return dom ?? number(p?.skills?.__skills?.experience) ?? number(p?.state?.experience ?? p?.state?.exp);
+    }
+    function observeXp(value) {
+        const xp = number(value); if (xp == null || xp < 0) return;
+        advanceClock();
+        if (active() && lastXp != null) { session.xp += xp - lastXp; revision++; }
+        liveXp = lastXp = xp;
+    }
+    function expForLevel(level) { return Math.round((50 / 3) * (level ** 3 - 6 * level ** 2 + 17 * level - 12)); }
+    function levelForXp(xp) {
+        if (xp == null) return null;
+        let low = 1, high = 2;
+        while (expForLevel(high) <= xp && high < 131072) high *= 2;
+        while (low + 1 < high) { const mid = Math.floor((low + high) / 2); if (expForLevel(mid) <= xp) low = mid; else high = mid; }
+        return low;
+    }
+    function parseLootEntry(text) {
+        const label = nameKey(text).replace(/[.!]$/, '');
+        const match = /^(\d+)\s+(.+)$/.exec(label);
+        const count = match ? whole(match[1]) : 1, name = match ? match[2] : label;
+        if (!name || /^(nothing|nothing special|no loot)$/.test(name)) return null;
+        const choices = names.get(name) || [];
+        // Names do not carry a SID: ambiguous names remain explicitly unpriced.
+        const baseChoices = choices.filter(x => !ringBases.has(x.sid));
+        const unique = baseChoices.length === 1 ? baseChoices[0] : choices.length === 1 ? choices[0] : null;
+        return { item: unique || { sid: 0, cid: 0, fluidType: 0, name }, count };
+    }
+    function onMessage(text) {
+        if (!active()) return;
+        const match = /^Loot of (.+?):\s*([\s\S]*)$/i.exec(String(text || ''));
+        if (!match) return;
+        advanceClock(); rebuildCatalog();
+        session.kills++; const monster = cleanName(match[1]).replace(/^(?:a|an|the)\s+/i, '');
+        session.monsters[monster] = whole(session.monsters[monster]) + 1; revision++;
+        // Tags are preserved until after classification; only {auto} is taken.
+        for (const entry of match[2].replace(/[.!]\s*$/, '').split(/,\s*|\s+and\s+/i)) {
+            const parsed = parseLootEntry(entry); if (!parsed) continue;
+            addItem(session.drops, parsed.item, parsed.count);
+            if (/\{auto\}/i.test(entry)) addItem(session.loot, parsed.item, parsed.count);
+        }
+    }
+    function isCorpse(c) { return /dead/i.test(String(c?.__title || '')); }
+    function isInventory(c, id) {
+        if (Number(id) === equipmentId()) return true;
+        const seen = new Set();
+        while (c && !seen.has(c)) {
+            seen.add(c);
+            if (isCorpse(c) || /depot|locker/i.test(String(c.__title || '')) || [1, 3].includes(Number(c.__containerId))) return false;
+            const parentId = Number(c.__parentCid);
+            if (parentId > 0) { c = getContainer(parentId); continue; }
+            const def = window.gameClient?.itemDefinitionsByCid?.[Number(c.id)];
+            return !!def?.properties?.capacity || /backpack|bag|satchel/i.test(String(def?.properties?.name || ''));
+        }
+        return false;
+    }
+    function pruneMoves() { const cutoff = Date.now() - 4000; moves = moves.filter(m => m.at >= cutoff && m.player === player).slice(-80); }
+    function confirmLoot(move) {
+        if (!move || move.committed || !move.sourceCount || !move.destinationCount || !active()) return;
+        move.committed = true;
+        addItem(session.loot, move.item, Math.min(move.count, move.sourceCount, move.destinationCount));
+    }
+    function locationAt(bytes, offset) {
+        if (bytes.length < offset + 8) return null;
+        const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        return bytes[offset] === 0 ? { containerId: view.getUint32(offset + 3, true), slot: bytes[offset + 7] } : { ground: true };
+    }
+    function observeSend(packet) {
+        if (!active()) return;
+        const bytes = packet?.buffer; if (!(bytes instanceof Uint8Array)) return;
+        const ops = typeof CONST !== 'undefined' ? CONST.PROTOCOL?.CLIENT || {} : {};
+        const opcode = bytes[0], move = opcode === ops.THING_MOVE;
+        if (!move && ![ops.THING_USE, ops.THING_USE_WITH, ops.THING_USE_ON_CREATURE].filter(v => v != null).includes(opcode)) return;
+        const from = locationAt(bytes, 1); if (!from || from.ground) return;
+        const source = getContainer(from.containerId), item = identify(peek(source, from.slot));
+        if (!item) return;
+        pruneMoves();
+        moves.push({ at: Date.now(), player, from, to: move ? locationAt(bytes, 9) : null,
+            count: move ? whole(bytes[17]) : 1, item, move, corpse: isCorpse(source) });
+    }
+    function captureRemove(packet) {
+        const container = getContainer(packet?.containerIndex), item = peek(container, Number(packet?.slotIndex));
+        return { container, item: identify(item), beforeCount: countOf(item), slot: Number(packet?.slotIndex),
+            id: Number(packet?.containerIndex), at: Date.now(), player };
+    }
+    function onRemove(packet, before) {
+        if (!active() || !before?.item || before.player !== player) return;
+        const count = Math.min(before.beforeCount, whole(packet.count) || before.beforeCount);
+        pruneMoves();
+        const matched = moves.find(m => m.move && !m.used && m.from.containerId === before.id && m.from.slot === before.slot && keyOf(m.item) === keyOf(before.item));
+        if (matched) {
+            matched.used = true;
+            if (matched.corpse && matched.to && !matched.to.ground && isInventory(getContainer(matched.to.containerId), matched.to.containerId)) {
+                matched.sourceCount = count; confirmLoot(matched);
+            }
+            return;
+        }
+        if (before.id === equipmentId() && before.slot === ringSlot() && before.item.ring) {
+            // Use/equip/unequip transforms are not spent rings. The expiry has
+            // no client move/use operation and is confirmed by the server REMOVE.
+            const equipAction = moves.some(m => !m.move && m.item.ring && before.at - m.at < 1200);
+            if (!equipAction) ringRemovals.push({ ...before, count: 1, session });
+        }
+    }
+    function captureAdd(packet) {
+        const item = peek(getContainer(packet?.containerId), Number(packet?.slot));
+        return { item: identify(item), count: countOf(item) };
+    }
+    function onAdd(packet, before) {
+        if (!active()) return;
+        const item = identify({ id: packet.itemId, sid: packet.sid, fluidType: packet.fluidType });
+        if (item) {
+            pruneMoves();
+            const move = moves.find(m => m.move && m.corpse && !m.committed && !m.destinationCount && m.to && !m.to.ground &&
+                m.to.containerId === Number(packet.containerId) && keyOf(m.item) === keyOf(item));
+            if (move && isInventory(getContainer(packet.containerId), packet.containerId)) {
+                const oldCount = before?.item && keyOf(before.item) === keyOf(item) ? before.count : 0;
+                move.destinationCount = Math.max(0, (whole(packet.count) || 1) - oldCount); confirmLoot(move);
+            }
+        }
+        if (!item?.ring) return;
+        for (const pending of ringRemovals) {
+            if (pending.cancelled || keyOf(pending.item) !== keyOf(item) || Date.now() - pending.at > 800) continue;
+            // An unequipped ring appearing in a bag, or base->active transform,
+            // proves transfer. Replacing an expired ring with another identical
+            // active ring still counts the expired one.
+            if (Number(packet.containerId) !== equipmentId() || Number(packet.itemId) !== pending.item.cid) pending.cancelled = true;
+        }
+    }
+    function settleRings() {
+        const now = Date.now();
+        ringRemovals = ringRemovals.filter(pending => {
+            if (now - pending.at < 850) return true;
+            if (!pending.cancelled && pending.session === session && active()) addItem(session.supplies, pending.item, pending.count);
+            return false;
+        });
+    }
+    function onCount(reading) {
+        if (!reading || !player || player !== window.gameClient?.player) return;
+        const cid = whole(reading.itemId), fluid = whole(reading.fluidType), count = whole(reading.count), key = `${cid}:${fluid}`;
+        const previous = countBaseline.get(key); countBaseline.set(key, count);
+        const seedUntil = Number(window.gameClient?.networkManager?.__supplySeedExpect?.[key]) || 0;
+        if (!active() || previous == null || count >= previous || Date.now() < seedUntil) return;
+        const item = identify({ id: cid, fluidType: fluid });
+        if (!item || item.ring || !(item.type === 'rune' || fluid === 7 || fluid === 10 || /potion/i.test(item.name))) return;
+        // Only unsolicited server count decreases are consumption. Bag moves,
+        // selling, dropping and refresh requests seed counts silently.
+        addItem(session.supplies, item, previous - count);
+    }
+    function seedSupplyCounts() {
+        if (!active() || requestedCountsFor === player || !catalog.size) return;
+        const requests = [], seen = new Set();
+        for (const item of catalog.values()) {
+            if (item.ring || !(item.type === 'rune' || [7, 10].includes(item.fluidType) || /potion/i.test(item.name))) continue;
+            const key = `${item.cid}:${item.fluidType}`; if (seen.has(key)) continue; seen.add(key);
+            const reading = bot.getItemCountReading?.(item.cid, item.fluidType);
+            if (reading && number(reading.count) != null) countBaseline.set(key, whole(reading.count));
+            requests.push({ id: item.cid, fluidType: item.fluidType });
+        }
+        if (requests.length && bot.requestItemCounts?.(requests)) requestedCountsFor = player;
+    }
+    function learnOffers(packet) {
+        const offers = Array.isArray(packet?.offers) ? packet.offers : [];
+        if (!offers.length) return;
+        rebuildCatalog(); let changed = false;
+        for (const offer of offers) {
+            const props = window.gameClient?.itemDefinitionsByCid?.[Number(offer.id)]?.properties || {};
+            const fluidType = /mana fluid/i.test(offer.name) ? 7 : /life fluid/i.test(offer.name) ? 10 :
+                ['fluidContainer', 'fluid'].includes(props.type) ? whole(offer.count) : 0;
+            const item = identify({ id: offer.id, sid: offer.sid, fluidType, name: offer.name });
+            const price = number(offer.price); if (!item?.sid || price == null || price < 0 || !['buy', 'sell'].includes(offer.type)) continue;
+            const key = keyOf(item), vendor = `${packet.id || 'npc'}:${offer.type}`;
+            if (!config.offers[key]) config.offers[key] = {};
+            if (config.offers[key][vendor] !== price) { config.offers[key][vendor] = price; changed = true; }
+        }
+        if (changed) persistConfig();
+    }
+    function priceFor(item, purpose) {
+        const key = keyOf(item), override = number(config.overrides[key]?.[purpose]);
+        if (override != null && override >= 0) return { value: override, source: 'Custom' };
+        if (purpose === 'sell' && coinValues[item.sid]) return { value: coinValues[item.sid], source: 'Currency' };
+        const offers = Object.entries(config.offers[key] || {}).filter(([vendor]) => vendor.endsWith(purpose === 'buy' ? ':sell' : ':buy')).map(([, gp]) => number(gp)).filter(gp => gp != null && gp >= 0);
+        if (purpose === 'sell' && item.fluidType === 0) {
+            const rows = window.gameClient?.npcTrades?.[item.sid];
+            if (Array.isArray(rows)) for (const row of rows) { const gp = number(row?.price); if (gp != null && gp >= 0) offers.push(gp); }
+        }
+        if (!offers.length) return { value: null, source: 'Unknown' };
+        return { value: purpose === 'buy' ? Math.min(...offers) : Math.max(...offers), source: 'NPC' };
+    }
+    function priced(collection, purpose) {
+        return Object.entries(collection || {}).map(([key, item]) => {
+            const price = priceFor(item, purpose); return { ...item, key, price: price.value, source: price.source,
+                value: price.value == null ? null : price.value * item.count };
+        }).sort((a, b) => (b.value || 0) - (a.value || 0) || a.name.localeCompare(b.name));
+    }
+    function totals(rows) { return { value: rows.reduce((sum, r) => sum + (r.value || 0), 0), unknown: rows.filter(r => r.price == null).length }; }
+    function status() {
+        advanceClock();
+        const loot = priced(session?.loot, 'sell'), supplies = priced(session?.supplies, 'buy'), drops = priced(session?.drops, 'sell');
+        const lootTotal = totals(loot), supplyTotal = totals(supplies), hours = (session?.elapsedMs || 0) / 3600000;
+        const xp = session?.xp || 0, xpPerHour = hours > 0 ? xp / hours : 0;
+        const level = levelForXp(liveXp), remainingXp = level == null ? null : Math.max(0, expForLevel(level + 1) - liveXp);
+        return { recording: !!session?.recording, connected: connected(), startedAt: session?.startedAt || null,
+            owner: session?.owner || null, elapsedMs: session?.elapsedMs || 0, xp, xpPerHour, level, remainingXp,
+            timeToLevelMs: xpPerHour > 0 && remainingXp != null ? remainingXp / xpPerHour * 3600000 : null,
+            kills: session?.kills || 0, killsPerHour: hours > 0 ? session.kills / hours : 0,
+            loot, supplies, drops, monsters: { ...session?.monsters }, lootValue: lootTotal.value, supplyValue: supplyTotal.value,
+            lootUnknown: lootTotal.unknown, supplyUnknown: supplyTotal.unknown, balance: lootTotal.value - supplyTotal.value,
+            balancePerHour: hours > 0 ? (lootTotal.value - supplyTotal.value) / hours : 0,
+            profit: lootTotal.value - supplyTotal.value,
+            profitPerHour: hours > 0 ? (lootTotal.value - supplyTotal.value) / hours : 0,
+            profitState: lootTotal.unknown || supplyTotal.unknown ? 'partial' : lootTotal.value > supplyTotal.value ? 'profit' : lootTotal.value < supplyTotal.value ? 'waste' : 'break-even',
+            priceNote, revision, priceRevision };
+    }
+    function setPrice(key, purpose, value) {
+        if (!['buy', 'sell'].includes(purpose) || typeof key !== 'string' || !/^(?:\d+:\d+|n:.+)$/.test(key)) throw new Error('Choose an item first.');
+        if (value == null || String(value).trim() === '') {
+            if (config.overrides[key]) { delete config.overrides[key][purpose]; if (!Object.keys(config.overrides[key]).length) delete config.overrides[key]; }
+        } else {
+            const gp = number(value); if (gp == null || gp < 0 || gp > 1000000000) throw new Error('Price must be 0–1,000,000,000 gp.');
+            if (!config.overrides[key]) config.overrides[key] = {};
+            config.overrides[key][purpose] = gp;
+        }
+        persistConfig(); revision++; return priceFor(itemForKey(key), purpose);
+    }
+    function itemForKey(key) {
+        return catalog.get(key) || session?.loot?.[key] || session?.supplies?.[key] || session?.drops?.[key] ||
+            { sid: whole(key.split(':')[0]), fluidType: whole(key.split(':')[1]), name: key };
+    }
+    async function refreshPrices() {
+        if (disposed || fetchController) return false;
+        fetchController = new AbortController(); const controller = fetchController;
+        const timeout = setTimeout(() => controller.abort(), 10000);
+        priceNote = 'Loading NPC resale prices…';
+        try {
+            const response = await fetch('/play/npc-trades.json?v=' + Date.now(), { signal: controller.signal });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const data = await response.json();
+            if (!data || Array.isArray(data) || typeof data !== 'object') throw new Error('Invalid NPC price list');
+            if (disposed || controller.signal.aborted) return false;
+            window.gameClient.npcTrades = data; priceRevision++; revision++;
+            priceNote = `NPC resale prices loaded (${Object.keys(data).length} items).`;
+            return true;
+        } catch (_) { if (!disposed) priceNote = 'Could not refresh NPC prices. Existing prices kept.'; return false; }
+        finally { clearTimeout(timeout); if (fetchController === controller) fetchController = null; }
+    }
+    function unhook() {
+        for (const record of hooks.splice(0)) {
+            record.active = false;
+            if (record.owner[record.name] === record.wrapper) {
+                if (record.own) record.owner[record.name] = record.original; else delete record.owner[record.name];
+            }
+        }
+    }
+    function hook(owner, name, after, before) {
+        const original = owner?.[name]; if (typeof original !== 'function') return;
+        const record = { owner, name, original, own: Object.hasOwn(owner, name), active: true, wrapper: null };
+        record.wrapper = function(...args) {
+            let captured;
+            if (record.active && !disposed && window.gameClient === client) {
+                try { captured = before?.(...args); } catch (error) { bot.log?.('[Hunt Analyzer] capture', error.message); }
+            }
+            const result = original.apply(this, args);
+            if (record.active && !disposed && window.gameClient === client) {
+                try { after?.(args, captured); } catch (error) { bot.log?.('[Hunt Analyzer]', error.message); }
+            }
+            return result;
+        };
+        owner[name] = record.wrapper; hooks.push(record);
+    }
+    function bind() {
+        const gc = window.gameClient, p = gc?.player || null, ph = gc?.networkManager?.packetHandler;
+        if (gc === client && p === player && ph === handler) return;
+        advanceClock(); save(); unhook();
+        client = gc; player = p; handler = ph;
+        moves = []; ringRemovals = []; countBaseline.clear(); requestedCountsFor = null;
+        liveXp = lastXp = null; lastClock = Date.now();
+        rebuildCatalog();
+        const owner = ownerOf(p);
+        if (owner && (!session || session.owner !== owner)) {
+            const candidate = !restored ? savedSession : null; restored = true;
+            session = candidate?.schema === 1 && candidate.owner === owner && Number.isFinite(candidate.elapsedMs) &&
+                candidate.monsters && candidate.loot && candidate.supplies && candidate.drops ? candidate : freshSession(owner);
+            revision++; save();
+        }
+        liveXp = lastXp = readXp();
+        hook(ph, 'handlePropertyChange', args => {
+            const packet = args[0];
+            const exp = typeof CONST !== 'undefined' ? CONST.PROPERTIES?.EXPERIENCE : null;
+            if (exp != null && Number(packet?.guid) === Number(player?.id) && packet.property === exp) observeXp(packet.value);
+        });
+        hook(ph, 'handleServerMessage', args => onMessage(args[0]));
+        hook(ph, 'handleTradeOffer', args => learnOffers(args[0]));
+        hook(ph, 'handleContainerItemRemove', (args, before) => onRemove(args[0], before), captureRemove);
+        hook(ph, 'handleContainerAddItem', (args, before) => onAdd(args[0], before), captureAdd);
+        // Record before sending: a synchronous test client may apply the ACK
+        // inside send(). The original packet, return value and exceptions pass on.
+        hook(gc, 'send', null, observeSend);
+        const modal = gc?.interface?.modalManager?.get?.('offer-modal');
+        if (modal?.__offers?.length) learnOffers({ id: modal.__id, offers: modal.__offers });
+    }
+    function pause() { advanceClock(); if (session) session.recording = false; ringRemovals = []; lastXp = liveXp; save(); revision++; render(); }
+    function resume() { bind(); advanceClock(); if (session) session.recording = true; lastXp = liveXp; lastClock = Date.now(); countBaseline.clear(); requestedCountsFor = null; seedSupplyCounts(); save(); revision++; render(); }
+    function reset() { bind(); if (!player) return; session = freshSession(ownerOf(player)); moves = []; ringRemovals = []; lastXp = liveXp; lastClock = Date.now(); countBaseline.clear(); requestedCountsFor = null; seedSupplyCounts(); save(); revision++; render(); }
+    const offCounts = bot.subscribeItemCounts?.(onCount);
+
+    // ---- Hunt Analyzer panel ----
+    const format = value => Math.round(value || 0).toLocaleString();
+    function duration(ms) {
+        if (ms == null || !Number.isFinite(ms)) return '—';
+        const seconds = Math.max(0, Math.floor(ms / 1000)), hours = Math.floor(seconds / 3600);
+        return `${String(hours).padStart(2, '0')}:${String(Math.floor(seconds / 60) % 60).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
+    }
+    function profitText(st, perHour = false) {
+        const value = perHour ? st.profitPerHour : st.profit;
+        const label = { profit: 'Profit', waste: 'Waste', 'break-even': 'Break-even', partial: 'Partial' }[st.profitState];
+        return `${value > 0 ? '+' : ''}${format(value)} gp${st.profitState === 'partial' ? ' *' : ''} (${label})`;
+    }
+    function profitColor(st) {
+        return { profit: '#9f9', waste: '#ff9999', 'break-even': '#ddd', partial: '#e5c46a' }[st.profitState];
+    }
+    function overlayEnabled() { return !disposed && config.overlayEnabled; }
+    function setOverlayEnabled(enabled) {
+        config.overlayEnabled = enabled === true; persistConfig(); overlayUpdatedAt = 0;
+        if (!config.overlayEnabled) { overlayRow?.remove(); overlayRow = null; }
+        bot.uiTweaks?.applyTTL?.(); render();
+    }
+    function renderOverlay(snapshot = null) {
+        if (!overlayEnabled()) { overlayRow?.remove(); overlayRow = null; return; }
+        const overlay = document.getElementById('debug-statistics') || document.getElementById('debugger-statistics')
+            || document.getElementById('debug-overlay') || document.getElementById('performance-overlay');
+        if (!overlay) return;
+        if (!overlayRow) {
+            overlayRow = document.createElement('div'); overlayRow.id = 'mb-hunt-analyzer-inline-row';
+            Object.assign(overlayRow.style, { color: '#ddd', fontWeight: 'bold', marginTop: '4px', pointerEvents: 'none', fontVariantNumeric: 'tabular-nums' });
+            for (const label of ['Session', 'XP/H', 'XP Total', 'TTL', 'Loot', 'Supplies', 'Profit']) {
+                const line = document.createElement('div'); line.dataset.huntOverlay = label; overlayRow.appendChild(line);
+            }
+            overlayUpdatedAt = 0;
+        }
+        // renderStatistics runs every frame; reattach after native innerHTML
+        // refreshes, while computing totals only once per second or on edits.
+        const signature = `${revision}:${priceRevision}`;
+        if (snapshot || !overlayUpdatedAt || Date.now() - overlayUpdatedAt >= 1000 || signature !== overlayRevision) {
+            const st = snapshot || status();
+            const values = [duration(st.elapsedMs) + (!st.recording ? ' (Paused)' : !st.connected ? ' (Offline)' : ''),
+                format(st.xpPerHour), format(st.xp), duration(st.timeToLevelMs),
+                format(st.lootValue) + ' gp' + (st.lootUnknown ? ' *' : ''),
+                format(st.supplyValue) + ' gp' + (st.supplyUnknown ? ' *' : ''), profitText(st)];
+            Array.from(overlayRow.children).forEach((line, i) => { line.textContent = line.dataset.huntOverlay + ': ' + values[i]; });
+            overlayRow.lastChild.style.color = profitColor(st);
+            overlayRow.title = st.profitState === 'partial' ? 'Partial totals: some item prices are unknown. Set their prices in Hunt.' : 'Profit = loot taken − supplies used';
+            overlayUpdatedAt = Date.now(); overlayRevision = signature;
+        }
+        if (overlayRow.parentElement !== overlay) overlay.appendChild(overlayRow);
+    }
+    function mount(panel) {
+        if (!panel || panel.querySelector('[data-tab-panel="hunt"]')) return;
+        const host = document.createElement('div'); host.className = 'mb-tab-panel mb-hunt'; host.dataset.tabPanel = 'hunt';
+        panel.querySelector('.mb-tab-content')?.appendChild(host);
+        host.innerHTML = `<style>
+          #minibia-bot-panel .mb-hunt-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin:8px 0}
+          #minibia-bot-panel .mb-hunt-card{background:#222;border:1px solid #444;padding:7px;min-width:0}
+          #minibia-bot-panel .mb-hunt-label{font-size:10px;color:#aaa;display:block;margin-bottom:3px}
+          #minibia-bot-panel .mb-hunt-value{font-size:15px;font-weight:bold;color:#e0d6ba;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+          #minibia-bot-panel .mb-hunt-actions{display:flex;gap:5px;align-items:center;flex-wrap:wrap;margin:7px 0}
+          #minibia-bot-panel .mb-hunt-actions button{width:auto;margin:0}
+          #minibia-bot-panel .mb-hunt-scroll{max-height:260px;overflow:auto;margin-top:7px}
+          #minibia-bot-panel .mb-hunt-table{border-collapse:collapse;width:100%;font-size:11px}
+          #minibia-bot-panel .mb-hunt-table td,#minibia-bot-panel .mb-hunt-table th{padding:5px 3px;border-bottom:1px solid #444;text-align:right}
+          #minibia-bot-panel .mb-hunt-table td:first-child,#minibia-bot-panel .mb-hunt-table th:first-child{text-align:left;overflow-wrap:anywhere}
+          #minibia-bot-panel .mb-hunt-table button{font-size:11px;text-align:left;width:auto;padding:0;background:none;border:0;color:#d5c28f}
+          #minibia-bot-panel .mb-hunt-fold{margin-top:10px;border-top:1px solid #444;padding-top:7px}
+          #minibia-bot-panel .mb-hunt-fold summary{cursor:pointer;color:#d4c48a}
+          #minibia-bot-panel .mb-hunt-prices{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin:8px 0}
+          #minibia-bot-panel .mb-hunt input{box-sizing:border-box;max-width:100%;min-width:0}
+        </style>
+        <div class="mb-section"><div class="mb-section-title"><span class="mb-title-text">Hunt Analyzer</span></div>
+          <div class="mb-hunt-actions"><button type="button" class="mb-small-button" data-hunt="toggle">Pause</button><button type="button" class="mb-small-button" data-hunt="reset">New session</button><span class="mb-small-note" data-hunt="state" role="status"></span></div>
+          <label class="mb-toggle" style="margin:8px 0"><input type="checkbox" data-hunt="overlay"><span>Show in-game overlay</span></label>
+          <div class="mb-hunt-grid" data-hunt="stats"></div>
+          <div class="mb-small-note" data-hunt="unknown" role="status"></div>
+          <div class="mb-hunt-actions"><select data-hunt="view" aria-label="Hunt breakdown"><option value="loot">Loot taken</option><option value="supplies">Supplies used</option><option value="monsters">Monsters killed</option><option value="drops">All drops</option></select></div>
+          <div class="mb-hunt-scroll" data-hunt="breakdown"></div>
+          <details class="mb-hunt-fold" data-hunt="prices"><summary>Item prices</summary>
+            <div class="mb-small-note" style="margin:7px 0">Loot uses the highest NPC resale price. Supplies use the lowest purchase price learned from NPC trades. Blank = NPC price; 0 = free. Changes revalue the whole session.</div>
+            <label class="mb-field"><span class="mb-field-label">Item name / SID</span><input data-hunt="item" list="mb-hunt-item-choices" autocomplete="off" placeholder="Search an item…"></label><datalist id="mb-hunt-item-choices"></datalist>
+            <div class="mb-small-note" data-hunt="npc-price"></div>
+            <div class="mb-hunt-prices"><label class="mb-field"><span class="mb-field-label">Loot price / item (gp)</span><input data-hunt="sell" type="number" min="0" max="1000000000" step="any" placeholder="NPC price"></label><label class="mb-field"><span class="mb-field-label">Supply price / item (gp)</span><input data-hunt="buy" type="number" min="0" max="1000000000" step="any" placeholder="NPC price"></label></div>
+            <div class="mb-hunt-actions"><button type="button" class="mb-small-button" data-hunt="save-price">Save prices</button><button type="button" class="mb-small-button" data-hunt="npc-default">Use NPC prices</button><button type="button" class="mb-small-button" data-hunt="refresh">Refresh NPC prices</button></div>
+            <div class="mb-small-note" data-hunt="price-message" role="status" aria-live="polite"></div>
+          </details>
+          <details class="mb-hunt-fold"><summary>Tracking details</summary><div class="mb-small-note" style="margin-top:7px">Starts automatically. Time runs while connected and recording; Pause and offline time are excluded. XP/h uses the entire recorded session, including idle time and XP losses. The session survives mb0t reloads on this character.<br><br>Kills and drops come from your server loot messages. Loot taken includes server auto-loot and confirmed moves from dead corpses into bags. Dropped items and items left in corpses are excluded from profit. Potions and runes use server consumption counts; rings count when they expire or use their last charge. Opening an NPC trade learns its purchase prices. Unknown prices are excluded from totals until priced.</div></details>
+        </div>`;
+        const q = name => host.querySelector(`[data-hunt="${name}"]`);
+        ui = { host, q, selectedKey: null, choiceMap: new Map(), signature: '', choicesSignature: '', npcSignature: '' };
+        q('toggle').addEventListener('click', () => session?.recording ? pause() : resume());
+        q('overlay').addEventListener('change', () => setOverlayEnabled(q('overlay').checked));
+        q('reset').addEventListener('click', reset);
+        q('view').addEventListener('change', () => { ui.signature = ''; render(); });
+        q('refresh').addEventListener('click', () => { refreshPrices().then(() => render()); });
+        q('prices').addEventListener('toggle', () => { if (q('prices').open) refreshChoices(); });
+        q('item').addEventListener('change', () => {
+            const enteredSid = whole(q('item').value), baseSid = ringBases.get(enteredSid) || enteredSid;
+            const key = ui.choiceMap.get(q('item').value) || (baseSid && catalog.has(baseSid + ':0') ? baseSid + ':0' : null);
+            if (key) selectPrice(key); else { ui.selectedKey = null; q('price-message').textContent = 'Choose an item from the suggestions.'; }
+        });
+        q('item').addEventListener('input', () => { ui.selectedKey = null; });
+        q('save-price').addEventListener('click', () => {
+            try {
+                if (!ui.selectedKey) throw new Error('Choose an item from the suggestions.');
+                // Validate both before mutating either price.
+                for (const purpose of ['buy', 'sell']) { const value = q(purpose).value; if (value !== '' && (number(value) == null || Number(value) < 0 || Number(value) > 1000000000)) throw new Error('Price must be 0–1,000,000,000 gp.'); }
+                for (const purpose of ['sell', 'buy']) setPrice(ui.selectedKey, purpose, q(purpose).value);
+                q('price-message').textContent = 'Prices saved. Session totals updated.'; render(); updatePriceHint();
+            } catch (error) { q('price-message').textContent = error.message; }
+        });
+        q('npc-default').addEventListener('click', () => {
+            if (!ui.selectedKey) return;
+            setPrice(ui.selectedKey, 'sell', null); setPrice(ui.selectedKey, 'buy', null); selectPrice(ui.selectedKey);
+            q('price-message').textContent = 'Using NPC prices.'; render();
+        });
+        render();
+    }
+    function choiceLabel(item) { return `${item.name} · ${item.sid ? 'SID ' + item.sid : 'name only'}${item.fluidType ? ' · fluid ' + item.fluidType : ''}`; }
+    function refreshChoices() {
+        if (!ui) return;
+        const signature = `${catalog.size}:${revision}:${priceRevision}`; if (ui.choicesSignature === signature) return;
+        ui.choicesSignature = signature;
+        const available = new Map();
+        for (const collection of [session?.loot, session?.supplies, session?.drops]) for (const [key, item] of Object.entries(collection || {})) available.set(key, item);
+        for (const [key, item] of catalog) if (!ringBases.has(item.sid) && (window.gameClient?.npcTrades?.[item.sid] || config.offers[key] || config.overrides[key] || item.ring || item.type === 'rune' || item.fluidType)) available.set(key, item);
+        const list = ui.host.querySelector('#mb-hunt-item-choices'); list.replaceChildren(); ui.choiceMap.clear();
+        for (const [key, item] of [...available].sort((a, b) => a[1].name.localeCompare(b[1].name))) {
+            const option = document.createElement('option'); option.value = choiceLabel(item); list.appendChild(option); ui.choiceMap.set(option.value, key);
+        }
+    }
+    function selectPrice(key) {
+        if (!ui) return;
+        ui.selectedKey = key; ui.q('prices').open = true; refreshChoices();
+        ui.q('item').value = choiceLabel(itemForKey(key));
+        for (const purpose of ['sell', 'buy']) ui.q(purpose).value = config.overrides[key]?.[purpose] ?? '';
+        ui.q('price-message').textContent = ''; updatePriceHint();
+    }
+    function updatePriceHint() {
+        if (!ui?.selectedKey) return;
+        const item = itemForKey(ui.selectedKey), sell = priceFor(item, 'sell'), buy = priceFor(item, 'buy');
+        ui.q('npc-price').textContent = `Loot: ${sell.value == null ? '?' : format(sell.value) + ' gp'} (${sell.source}) · Supply: ${buy.value == null ? '?' : format(buy.value) + ' gp'} (${buy.source})`;
+    }
+    function render() {
+        if (disposed) return;
+        const st = status(); renderOverlay(st);
+        if (!ui || !ui.host.isConnected) return;
+        const q = ui.q;
+        q('overlay').checked = config.overlayEnabled;
+        q('toggle').textContent = st.recording ? 'Pause' : 'Resume';
+        q('state').textContent = !st.owner ? 'Waiting for character' : !st.recording ? 'Paused' : !st.connected ? 'Offline' : 'Recording';
+        const partial = st.lootUnknown + st.supplyUnknown > 0;
+        const metrics = [['Session', duration(st.elapsedMs)], ['XP / hour', format(st.xpPerHour)], ['XP total', format(st.xp)],
+            ['Time to level', duration(st.timeToLevelMs)], ['Kills', format(st.kills)], ['Kills / hour', format(st.killsPerHour)],
+            ['Loot taken', format(st.lootValue) + ' gp' + (st.lootUnknown ? ' *' : '')], ['Supplies used', format(st.supplyValue) + ' gp' + (st.supplyUnknown ? ' *' : '')],
+            ['Profit', profitText(st)], ['Profit / hour', profitText(st, true)]];
+        const statHost = q('stats');
+        if (!statHost.children.length) for (const [label] of metrics) {
+            const card = document.createElement('div'); card.className = 'mb-hunt-card';
+            const title = document.createElement('span'); title.className = 'mb-hunt-label'; title.textContent = label;
+            const value = document.createElement('span'); value.className = 'mb-hunt-value'; card.append(title, value); statHost.appendChild(card);
+        }
+        metrics.forEach(([, value], i) => {
+            statHost.children[i].lastChild.textContent = value;
+            if (i >= 8) { statHost.children[i].lastChild.style.color = profitColor(st); statHost.children[i].title = 'Profit = loot taken − supplies used'; }
+        });
+        q('unknown').textContent = partial ? `* Partial totals: ${st.lootUnknown} loot and ${st.supplyUnknown} supply item types need prices. Click an item to set its price.` : '';
+        const view = q('view').value, signature = `${view}:${revision}:${priceRevision}:${Object.keys(window.gameClient?.npcTrades || {}).length}`;
+        if (ui.signature !== signature) {
+            ui.signature = signature; const parent = q('breakdown'); parent.replaceChildren();
+            const table = document.createElement('table'); table.className = 'mb-hunt-table';
+            const header = document.createElement('tr');
+            for (const label of view === 'monsters' ? ['Monster', 'Kills'] : ['Item', 'Qty', 'GP / item', 'Total GP']) { const th = document.createElement('th'); th.textContent = label; header.appendChild(th); }
+            const thead = document.createElement('thead'); thead.appendChild(header); table.appendChild(thead);
+            const body = document.createElement('tbody'); table.appendChild(body);
+            const rows = view === 'monsters' ? Object.entries(st.monsters).sort((a,b) => b[1]-a[1]) : st[view];
+            for (const row of rows) {
+                const tr = document.createElement('tr');
+                const values = view === 'monsters' ? [row[0], format(row[1])] : [row.name, format(row.count), row.price == null ? '?' : format(row.price), row.value == null ? '?' : format(row.value)];
+                values.forEach((value, i) => {
+                    const td = document.createElement('td');
+                    if (i === 0 && view !== 'monsters') { const button = document.createElement('button'); button.type = 'button'; button.textContent = value; button.title = 'Edit item prices'; button.addEventListener('click', () => selectPrice(row.key)); td.appendChild(button); }
+                    else td.textContent = value;
+                    if (i === 2 && view !== 'monsters') td.title = row.source;
+                    tr.appendChild(td);
+                }); body.appendChild(tr);
+            }
+            if (!rows.length) { const empty = document.createElement('div'); empty.className = 'mb-small-note'; empty.textContent = 'Nothing recorded yet.'; parent.appendChild(empty); }
+            else parent.appendChild(table);
+        }
+        if (q('prices').open) refreshChoices();
+        if (priceNote && ui.npcSignature !== priceNote) { ui.npcSignature = priceNote; q('price-message').textContent = priceNote; }
+    }
+    function tick() {
+        if (disposed) return;
+        try {
+            bind(); advanceClock(); rebuildCatalog(); settleRings(); pruneMoves(); seedSupplyCounts();
+            // Only seed from the client model on binding. It can lag behind the
+            // authoritative EXPERIENCE packet, so polling must never roll XP back.
+            if (liveXp == null) liveXp = lastXp = readXp();
+            if (Date.now() - lastSave >= 5000) save(); render();
+        } catch (error) { bot.log?.('[Hunt Analyzer]', error.message); }
+    }
+    bot.huntAnalyzer = { status, pause, resume, reset, setPrice, priceFor, refreshPrices, mount, config, overlayEnabled, setOverlayEnabled, renderOverlay };
+    bind(); seedSupplyCounts();
+    if (config.overlayEnabled) bot.uiTweaks?.applyTTL?.();
+    if (!Object.keys(window.gameClient?.npcTrades || {}).length && window.gameClient) refreshPrices();
+    const timer = setInterval(tick, 1000);
+    const onPageHide = () => { advanceClock(); save(); };
+    window.addEventListener('pagehide', onPageHide);
+    bot.addCleanup(() => {
+        advanceClock(); settleRings(); save(); disposed = true; clearInterval(timer); fetchController?.abort(); offCounts?.(); unhook();
+        overlayRow?.remove(); overlayRow = null; bot.uiTweaks?.applyTTL?.();
+        window.removeEventListener('pagehide', onPageHide); ui?.host.remove(); ui = null; moves = []; ringRemovals = []; countBaseline.clear();
+    });
+};
+
+
 window.__minibiaBotBundle.installBankNpcModule = function installBankNpcModule(bot) {
     const key="minibiaBot.bankNpc.config";
     const config=Object.assign({npcName:"",greeting:"hi",npcDelayMs:250,actionTimeoutMs:5000,customLines:""},bot.storage.get(key,{}));
@@ -62554,16 +63192,10 @@ function upgradeSectionHeaders(panel) {
       <div class="mb-small-note">Blocks "Loot of …" notifications from the centre of the screen. Loot still goes to the server log.</div>
 
       <label class="mb-toggle" style="margin-top:8px;">
-        <input type="checkbox" id="minibia-bot-ui-ttl-enabled" />
-        <span>Show Time-To-Level (TTL)</span>
-      </label>
-      <div class="mb-small-note">Shows time until the next level beside the other counters, even with Performance switched off.</div>
-
-      <label class="mb-toggle" style="margin-top:8px;">
         <input type="checkbox" id="minibia-bot-ui-soul-enabled" />
         <span>Show Soul Points</span>
       </label>
-      <div class="mb-small-note">Shows current soul points beside TTL and task counters, even with Performance switched off.</div>
+      <div class="mb-small-note">Shows current soul points in the in-game overlay, even with Performance switched off.</div>
 
       <label class="mb-toggle" style="margin-top:8px;">
         <input type="checkbox" id="minibia-bot-ui-show-item-ids" />
@@ -62592,7 +63224,7 @@ function upgradeSectionHeaders(panel) {
         <span class="mb-small-note">Updates every 15s while enabled.</span>
       </div>
       <div class="mb-small-note" id="minibia-bot-task-tracker-status"></div>
-      <div class="mb-small-note">Shows each tracked counter beside TTL, even when the Performance overlay is off.</div>
+      <div class="mb-small-note">Shows each tracked counter in the in-game overlay, even when the Performance overlay is off.</div>
     </div>
   </div>
 
@@ -62630,6 +63262,7 @@ function upgradeSectionHeaders(panel) {
         bot.pauseHotkey?.mount?.(panel);
         bot.haste?.mount?.(panel);
         bot.curePoison?.mount?.(panel);
+        bot.huntAnalyzer?.mount?.(panel);
         organizePanelSections(panel);
 
         // v1.6.75: Special Areas bind immediately after the panel exists.
@@ -63106,7 +63739,7 @@ function upgradeSectionHeaders(panel) {
         const overlaySection=document.createElement('div');overlaySection.className='mb-section';
         overlaySection.innerHTML='<div class="mb-section-title"><span class="mb-title-text">📊 Overlays</span></div><div class="mb-stack"></div>';
         trackersPanel.appendChild(overlaySection);
-        for(const id of ['minibia-bot-ui-ttl-enabled','minibia-bot-ui-soul-enabled']){
+        for(const id of ['minibia-bot-ui-soul-enabled']){
             const row=interfacePanel?.querySelector('#'+id)?.closest('label');if(!row)continue;
             const note=row.nextElementSibling?.classList.contains('mb-small-note')?row.nextElementSibling:null;
             row.style.marginTop='0';overlaySection.querySelector('.mb-stack').appendChild(row);
@@ -63150,6 +63783,7 @@ function upgradeSectionHeaders(panel) {
             {id:'protection',label:'Protection',tabs:[['alert','Alerts'],['gmprotection','GM Protection'],['talk','Responder']]},
             {id:'professions',label:'Professions',tabs:[['professions','Woodcutting'],['mining','Mining'],['smithing','Smithing'],['cooking','Cooking']]},
             {id:'utility',label:'Tools',tabs:[['utility','General'],['items','Items'],['ui','Interface'],['trackers','Trackers'],['combo','PVP']]},
+            {id:'hunt',label:'Hunt',tabs:[['hunt','Hunt Analyzer']]},
             {id:'equipment',label:'Equipment',tabs:[['equipment','Equipment']]},
             {id:'settings',label:'Settings',tabs:[['shortcuts','General'],['xray','X-Ray'],['profiles','Profiles'],['diagnostics','Diagnostics'],['namespoofer','Name Spoofer']]},
         ];
@@ -67179,10 +67813,12 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
         nameSpooferEnabled: false,
         spoofedName: "",
         hideFloatingPopups: false,
-        ttlEnabled: false,
         soulEnabled: false,
         hideLootMessages: false,
     }, bot.storage.get(configStorageKey, {}));
+    // The Hunt Analyzer owns TTL now; retire the old saved overlay preference.
+    delete config.ttlEnabled;
+    document.getElementById("ttl-inline-row")?.remove();
 
     function persistConfig() {
         bot.storage.set(configStorageKey, config);
@@ -67195,87 +67831,13 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
     let floatingTextRetryTimer = null;
     let nameplateRefreshTimer = null;
 
-    // ---- TTL state ----
+    // ---- Shared overlay state ----
     const ttlState = {
         installed: false,
         originalRenderStatistics: null,
         debuggerInstance: null,
         intervalId: null,
     };
-
-    // ---- TTL helper functions ----
-    function getExpForLevel(level) {
-        return Math.floor((50 / 3) * Math.pow(level, 3) - 100 * Math.pow(level, 2) + (850 / 3) * level - 200);
-    }
-
-    function calculateTTL() {
-        try {
-            let expEl = document.querySelector('div[skill="experience"] .skill');
-            let lvlEl = document.querySelector('div[skill="level"] .skill');
-            let currentExp = expEl ? parseInt(expEl.textContent.replace(/,/g, ''), 10) : null;
-            let level = lvlEl ? parseInt(lvlEl.textContent.replace(/,/g, ''), 10) : null;
-
-            if (currentExp == null || isNaN(currentExp) || level == null || isNaN(level)) {
-                let player = gameClient?.player?.state;
-                if (player) {
-                    currentExp = player.experience;
-                    level = player.level;
-                }
-            }
-
-            if (currentExp == null || level == null || isNaN(currentExp) || isNaN(level)) {
-                return "Open Skills";
-            }
-
-            let neededExp = getExpForLevel(level + 1);
-            let remaining = neededExp - currentExp;
-            if (remaining <= 0) {
-                return "LEVEL UP!";
-            }
-
-            let xphEl = document.querySelector('div[skill="xph"] .skill');
-            let xph = 0;
-            if (xphEl) {
-                let raw = xphEl.textContent.replace(/,/g, '').trim();
-                if (raw.includes('/h'))
-                    raw = raw.replace('/h', '').trim();
-                xph = parseFloat(raw);
-            }
-            if (!xph || xph <= 0) {
-                let win = gameClient?.interface?.windows?.skill;
-                if (win && win.__xphStartExp != null) {
-                    let elapsed = (Date.now() - win.__xphStartTime) / 3600000;
-                    if (elapsed > 0.005) {
-                        xph = (win.__xphLastExp - win.__xphStartExp) / elapsed;
-                    }
-                }
-            }
-            if (!xph || xph <= 0 || !isFinite(xph)) {
-                return "Gain XP";
-            }
-
-            let hours = remaining / xph;
-            let seconds = Math.round(hours * 3600);
-            if (seconds < 0)
-                seconds = 0;
-            if (seconds > 31536000) {
-                return "> 1y";
-            }
-
-            let h = Math.floor(seconds / 3600);
-            let m = Math.floor((seconds % 3600) / 60);
-            let s = seconds % 60;
-            let formatted = "";
-            if (h > 0)
-                formatted += h + "h ";
-            if (m > 0 || h > 0)
-                formatted += m + "m ";
-            formatted += s + "s";
-            return formatted;
-        } catch (e) {
-            return "?";
-        }
-    }
 
     // ---- Loot message filter ----
     const lootFilterState = {
@@ -67355,8 +67917,6 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
         else uninstallLootFilter();
     }
 
-    let ttlLastUpdateAt = 0;
-    let ttlRow = null;
     let soulRow = null;
     function updateSoulRow(overlay) {
         if (uiTweaksDestroyed || !config.soulEnabled) return;
@@ -67378,32 +67938,22 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
     function updateTTLRow() {
         if (uiTweaksDestroyed) return;
         bot.taskTracker?.renderOverlay?.();
-        if (!config.ttlEnabled && !config.soulEnabled) return;
+        bot.huntAnalyzer?.renderOverlay?.();
+        if (!config.soulEnabled) return;
         const overlay = document.getElementById("debug-statistics")
             || document.getElementById("debugger-statistics")
             || document.getElementById("debug-overlay")
             || document.getElementById("performance-overlay");
         if (!overlay) return;
         updateSoulRow(overlay);
-        if (!config.ttlEnabled) return;
-        if (!ttlRow) {
-            ttlRow = document.getElementById("ttl-inline-row") || document.createElement("div");
-            ttlRow.id = "ttl-inline-row";
-            Object.assign(ttlRow.style, {color:"#9f9",fontWeight:"bold",marginTop:"2px",pointerEvents:"none"});
-        }
-        const now = Date.now();
-        if (!ttlLastUpdateAt || now - ttlLastUpdateAt >= 1000) {
-            ttlLastUpdateAt = now;
-            ttlRow.textContent = "⏳ TTL: " + calculateTTL();
-        }
-        if (ttlRow.parentElement !== overlay) overlay.appendChild(ttlRow);
+
     }
 
-    // ---- TTL install / uninstall ----
+    // ---- Shared overlay install / uninstall ----
     let ttlInstallTimer = null;
 
     function installTTL() {
-        if (uiTweaksDestroyed || (!config.ttlEnabled && !config.soulEnabled && !bot.taskTracker?.enabled?.())) return;
+        if (uiTweaksDestroyed || (!config.soulEnabled && !bot.taskTracker?.enabled?.() && !bot.huntAnalyzer?.overlayEnabled?.())) return;
         const instance = window.gameClient?.renderer?.debugger;
         if (ttlState.installed && ttlState.debuggerInstance === instance) return;
         if (ttlState.installed) uninstallTTL();
@@ -67428,15 +67978,14 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
         ttlState.installed = true;
         updateTTLRow();
         ttlState.intervalId = setInterval(() => {
-            if (uiTweaksDestroyed || (!config.ttlEnabled && !config.soulEnabled && !bot.taskTracker?.enabled?.())) return;
+            if (uiTweaksDestroyed || (!config.soulEnabled && !bot.taskTracker?.enabled?.() && !bot.huntAnalyzer?.overlayEnabled?.())) return;
             installTTL(); // Rebind if reconnect replaces the debugger instance.
             updateTTLRow();
         }, 1000);
-        bot.log("[TTL] Hook installed.");
+        bot.log("[Overlay] Hook installed.");
     }
 
     function uninstallTTL() {
-        ttlLastUpdateAt = 0;
         if (ttlInstallTimer) clearTimeout(ttlInstallTimer);
         ttlInstallTimer = null;
         if (ttlState.intervalId) clearInterval(ttlState.intervalId);
@@ -67449,19 +67998,16 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
         ttlState.originalRenderStatistics = null;
         ttlState.debuggerInstance = null;
         ttlState.wrapper = null;
-        ttlRow?.remove();
-        ttlRow = null;
         document.getElementById("ttl-inline-row")?.remove();
         soulRow?.remove(); soulRow = null;
         document.getElementById("soul-inline-row")?.remove();
         ttlState.installed = false;
-        bot.log("[TTL] Hook uninstalled.");
+        bot.log("[Overlay] Hook uninstalled.");
     }
 
     function applyTTL() {
-        if (!config.ttlEnabled) { ttlRow?.remove(); ttlRow=null; ttlLastUpdateAt=0; }
         if (!config.soulEnabled) { soulRow?.remove(); soulRow=null; }
-        if (config.ttlEnabled || config.soulEnabled || bot.taskTracker?.enabled?.()) {
+        if (config.soulEnabled || bot.taskTracker?.enabled?.() || bot.huntAnalyzer?.overlayEnabled?.()) {
             installTTL();
             updateTTLRow();
         } else {
@@ -67803,7 +68349,6 @@ function bindControls(panel) {
     const spoofNameInput = panel.querySelector("#minibia-bot-ui-spoofed-name");
     const applySpooferBtn = panel.querySelector("#minibia-bot-ui-apply-spoofer");
     const hidePopupsCheck = panel.querySelector("#minibia-bot-ui-hide-popups");
-    const ttlCheck       = panel.querySelector("#minibia-bot-ui-ttl-enabled");
     const soulCheck      = panel.querySelector("#minibia-bot-ui-soul-enabled");
     const hideLootCheck  = panel.querySelector("#minibia-bot-ui-hide-loot-messages");
 
@@ -67813,7 +68358,6 @@ function bindControls(panel) {
         if (nameSpoofCheck) nameSpoofCheck.checked = config.nameSpooferEnabled;
         if (spoofNameInput) spoofNameInput.value   = config.spoofedName || "";
         if (hidePopupsCheck) hidePopupsCheck.checked = config.hideFloatingPopups;
-        if (ttlCheck)       ttlCheck.checked       = config.ttlEnabled;
         if (soulCheck)      soulCheck.checked      = config.soulEnabled;
     }
 
@@ -67858,13 +68402,6 @@ function bindControls(panel) {
         hidePopupsCheck.addEventListener("change", function () {
             config.hideFloatingPopups = this.checked;
             applyAll();
-        });
-    }
-    if (ttlCheck) {
-        ttlCheck.addEventListener("change", function () {
-            config.ttlEnabled = this.checked;
-            persistConfig();
-            applyTTL();
         });
     }
     if (soulCheck) {
@@ -71070,6 +71607,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         currentBundle.installDepositerModule(bot);
         currentBundle.installNpcSupplyBuyerModule(bot);
         currentBundle.installBankNpcModule(bot);
+        currentBundle.installHuntAnalyzerModule(bot);
 
         bot.combatRules.armActions();
         currentBundle.installPanel(bot);
@@ -71113,6 +71651,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
             depositer: bot.depositer?.status?.(),
             npcSupplyBuyer: bot.npcSupplyBuyer?.status?.(),
             bankNpc: bot.bankNpc?.status?.(),
+            huntAnalyzer: bot.huntAnalyzer?.status?.(),
         });
 
         window.minibiaBot = bot;
