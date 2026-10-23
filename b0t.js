@@ -4103,7 +4103,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.373",
+        version: "1.6.377",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -4160,6 +4160,7 @@ addCleanup(() => {
                     persistEnabled: false
                 });
             this.bootsSwapper?.stop?.({ persistEnabled: false });
+            this.helmetSwapper?.stop?.({ persistEnabled: false });
             this.itemDropper?.stop?.({ persistEnabled: false });
             if (this.eat?.stop)
                 this.eat.stop({
@@ -6394,7 +6395,7 @@ window.__minibiaBotBundle.installItemAlertItems = function(bot) {
         bind(pick,"click",()=>{
             if(capturing){cancelCapture();message("Selection cancelled.");return;}
             cancelActiveCapture();
-            bot.itemDropper?.cancelCapture?.();bot.looter?.clearCaptureMode?.();bot.equipRing?.clearCaptureMode?.();bot.bootsSwapper?.clearCaptureMode?.();
+            bot.itemDropper?.cancelCapture?.();bot.looter?.clearCaptureMode?.();bot.equipRing?.clearCaptureMode?.();bot.bootsSwapper?.clearCaptureMode?.();bot.helmetSwapper?.clearCaptureMode?.();
             capturing=true;cancelActiveCapture=cancelCapture;pick.setAttribute("aria-pressed","true");
             message("Click an item in a backpack, equipment slot or on the ground. Escape cancels.");
             document.addEventListener("click",captureClick,true);document.addEventListener("keydown",captureKey,true);
@@ -6833,6 +6834,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
             caveRunning: !!bot.cave?.status?.().running,
             equipRingRunning: !!bot.equipRing?.status?.().running,
             bootsSwapperRunning: !!bot.bootsSwapper?.status?.().running,
+            helmetSwapperRunning: !!bot.helmetSwapper?.status?.().running,
             itemDropperRunning: !!bot.itemDropper?.status?.().running,
         };
     }
@@ -6864,6 +6866,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
             bot.ui?.refreshEquipRingStatus?.();
         }
         if (state.pendingReturnModules?.bootsSwapperRunning) bot.bootsSwapper?.start?.();
+        if (state.pendingReturnModules?.helmetSwapperRunning) bot.helmetSwapper?.start?.();
         if (state.pendingReturnModules?.itemDropperRunning) bot.itemDropper?.start?.();
     }
 
@@ -6974,6 +6977,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
                 cave: getSharedGmModuleSnapshot(bot.cave),
                 equipRing: getSharedGmModuleSnapshot(bot.equipRing),
                 bootsSwapper: getSharedGmModuleSnapshot(bot.bootsSwapper),
+                helmetSwapper: getSharedGmModuleSnapshot(bot.helmetSwapper),
                 itemDropper: getSharedGmModuleSnapshot(bot.itemDropper),
                 slimeTrainer: getSharedGmModuleSnapshot(bot.slimeTrainer),
                 paladin:
@@ -7004,7 +7008,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         try { bot.attack?.stop?.({ persistEnabled: false }); } catch (e) {}
         try { bot.cave?.stop?.({ persistEnabled: false }); } catch (e) {}
         try { bot.equipRing?.stop?.({ persistEnabled: false }); } catch (e) {}
-        try { bot.bootsSwapper?.stop?.({ persistEnabled: false }); bot.itemDropper?.stop?.({ persistEnabled: false }); } catch (e) {}
+        try { bot.bootsSwapper?.stop?.({ persistEnabled: false }); bot.helmetSwapper?.stop?.({ persistEnabled: false }); bot.itemDropper?.stop?.({ persistEnabled: false }); } catch (e) {}
         try { bot.slimeTrainer?.stop?.({ persistEnabled: false }); } catch (e) {}
         try { bot.paladin?.stop?.({ persistEnabled: false }); } catch (e) {}
 
@@ -7113,6 +7117,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         restoreSharedGmModule("CaveBot", bot.cave, modules.cave);
         restoreSharedGmModule("Equip Ring", bot.equipRing, modules.equipRing);
         restoreSharedGmModule("Boots Swapper", bot.bootsSwapper, modules.bootsSwapper);
+        restoreSharedGmModule("Helmet Swapper", bot.helmetSwapper, modules.helmetSwapper);
         restoreSharedGmModule("Item Dropper", bot.itemDropper, modules.itemDropper);
         restoreSharedGmModule("Slime Trainer", bot.slimeTrainer, modules.slimeTrainer);
 
@@ -7326,7 +7331,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
             });
             bot.ui?.refreshEquipRingStatus?.();
         }
-        bot.bootsSwapper?.stop?.({ persistEnabled: false }); bot.itemDropper?.stop?.({ persistEnabled: false });
+        bot.bootsSwapper?.stop?.({ persistEnabled: false }); bot.helmetSwapper?.stop?.({ persistEnabled: false }); bot.itemDropper?.stop?.({ persistEnabled: false });
         return !!bot.pz?.goToHomePz?.();
     }
 
@@ -40041,6 +40046,21 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             }));
     }
 
+    // Coordinate-only editing for movement waypoints. Script entries are never
+    // repositioned or inspected for floor, distance or reachability here.
+    function moveWaypointPosition(index, position) {
+        if (!Number.isInteger(index) || index < 0 || index >= route.length || route[index].script)
+            return null;
+        if (!position || ![position.x, position.y, position.z].every(Number.isInteger) ||
+            position.x < 0 || position.x > 65535 || position.y < 0 || position.y > 65535 ||
+            position.z < 0 || position.z > 15) return null;
+        Object.assign(route[index], {x: position.x, y: position.y, z: position.z});
+        resetRecoveryContext("waypoint position edited");
+        persistRoute();
+        bot.log("Waypoint position edited", {index, ...position});
+        return cloneValue(route[index]);
+    }
+
     function updateWaypoint(index, updates) {
         if (!route.length || index < 0 || index >= route.length) {
             bot.log("Invalid waypoint index.");
@@ -40152,6 +40172,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         getRecoveryHistory,
         getMovementSummary,
         clearRouteHealth,
+        moveWaypointPosition,
         updateWaypoint,
         mergePresets: mergePresets,
         renamePreset: renamePreset,
@@ -41113,6 +41134,7 @@ window.__minibiaBotBundle.installBootsSwapperModule = function installBootsSwapp
         clearCaptureMode();
         if (cancel) return false;
         bot.equipRing?.clearCaptureMode?.();
+        bot.helmetSwapper?.clearCaptureMode?.();
         state.captureMode = mode;
         state.reason = "Click boots in an open backpack or equipment slot";
         state.captureHandler = event => {
@@ -41196,6 +41218,289 @@ window.__minibiaBotBundle.installBootsSwapperModule = function installBootsSwapp
             cooldownRemainingMs: state.lastActionAt == null ? 0 : Math.max(0, SWAP_COOLDOWN_MS - (Date.now() - state.lastActionAt)) };
     }
     bot.bootsSwapper = { start, stop, status, config, updateConfig, startCaptureBoots, clearCaptureMode, trySwap };
+    bot.addCleanup(() => { stop({ persistEnabled: false }); state.destroyed = true; state.player = state.equipment = state.pending = null; });
+    if (config.enabled) start();
+};
+
+
+/** Helmet Swapper: current target selects combat helmet; otherwise idle helmet. */
+window.__minibiaBotBundle.installHelmetSwapperModule = function installHelmetSwapperModule(bot) {
+    const storageKey = "minibiaBot.helmetSwapper.config";
+    const SWAP_COOLDOWN_MS = 2000;
+    const IDLE_GRACE_MS = 2000;
+    const state = {
+        running: false, destroyed: false, timerId: null, player: null, equipment: null,
+        mode: null, noTargetSince: null, lastActionAt: null, pending: null,
+        retryAfter: 0, lastCountId: 0, lastCountAt: 0,
+        captureMode: null, captureHandler: null, captureKeyHandler: null, captureTimer: null,
+        reason: "Stopped"
+    };
+    const config = Object.assign({ enabled: false, idleId: 0, combatId: 0, idleSid: 0, combatSid: 0 },
+        bot.storage.get(storageKey, {}));
+    const validId = value => Number.isSafeInteger(Number(value)) && Number(value) > 0 && Number(value) <= 65535 ? Number(value) : 0;
+    function normalizeConfig() {
+        for (const field of ["idleId", "combatId", "idleSid", "combatSid"]) config[field] = validId(config[field]);
+        config.enabled = config.enabled === true;
+    }
+    normalizeConfig();
+    function persist() { bot.storage.set(storageKey, { ...config }); }
+    function refreshUi() { bot.ui?.refreshHelmetSwapperStatus?.(); }
+    function getHelmetSlot() {
+        const slot = window.CONST?.EQUIPMENT?.HELMET;
+        return Number.isInteger(slot) && slot >= 0 ? slot : 0;
+    }
+    function getEquippedHelmet() { return window.gameClient?.player?.equipment?.getSlotItem?.(getHelmetSlot()) || null; }
+    function getDefinition(item) {
+        const client = window.gameClient;
+        return (item?.sid && client?.itemDefinitionsBySid?.[item.sid]) || client?.itemDefinitionsByCid?.[item?.id] || null;
+    }
+    function isHelmet(item) {
+        const properties = getDefinition(item)?.properties || {};
+        const slot = String(properties.slotType || properties.slot || "").toLowerCase();
+        return slot === "helmet" || slot === "head" || /\bhelm(?:et)?s?\b/i.test(properties.name || item?.name || "");
+    }
+    function getInventoryIdentity(item) {
+        if (!item) return { id: 0, sid: 0 };
+        const client = window.gameClient;
+        const dormantSid = validId(getDefinition(item)?.properties?.transformDeEquipTo);
+        const dormant = dormantSid ? client?.itemDefinitionsBySid?.[dormantSid] : null;
+        if (dormant && validId(dormant.id)) return { id: validId(dormant.id), sid: dormantSid };
+        return { id: validId(item.id), sid: validId(item.sid) };
+    }
+    function matchesHelmet(item, id, sid = 0) {
+        if (!item || !id) return false;
+        const identity = getInventoryIdentity(item);
+        return (Number(item.id) === id || identity.id === id) &&
+            (!sid || Number(item.sid) === sid || identity.sid === sid);
+    }
+    function hasLiveTarget() {
+        const player = window.gameClient?.player;
+        const target = player?.getTarget?.() || player?.__target || null;
+        if (!target) return false;
+        const health = target.state?.health ?? target.health;
+        return health == null || !Number.isFinite(Number(health)) || Number(health) > 0;
+    }
+    function updateMode(now) {
+        if (hasLiveTarget()) {
+            state.noTargetSince = null;
+            state.mode = "combat";
+        } else {
+            if (state.noTargetSince == null) state.noTargetSince = now;
+            if (state.mode !== "combat" || now - state.noTargetSince >= IDLE_GRACE_MS)
+                state.mode = "idle";
+        }
+        return state.mode;
+    }
+    function syncSession() {
+        const player = window.gameClient?.player || null;
+        const equipment = player?.equipment || null;
+        if (state.player !== player || state.equipment !== equipment) {
+            state.player = player;
+            state.equipment = equipment;
+            state.mode = null;
+            state.noTargetSince = null;
+            state.lastActionAt = null;
+            state.pending = null;
+            state.retryAfter = 0;
+            state.lastCountId = 0;
+            state.lastCountAt = 0;
+        }
+        return !!player && !!equipment;
+    }
+    function trySwap(now = Date.now()) {
+        if (!state.running || state.destroyed) return false;
+        if (!syncSession() || window.gameClient?.networkManager?.isConnected?.() === false) {
+            state.reason = "Waiting for character";
+            return false;
+        }
+        const mode = updateMode(now);
+        const id = config[`${mode}Id`], sid = config[`${mode}Sid`];
+        const worn = getEquippedHelmet();
+        if (state.pending) {
+            if (matchesHelmet(worn, state.pending.id, state.pending.sid)) {
+                state.pending = null;
+            } else if (now - state.pending.at < 3500) {
+                state.reason = "Waiting for helmet swap";
+                return false;
+            } else {
+                state.pending = null;
+                state.retryAfter = now + 5000;
+            }
+        }
+        if (!id) {
+            state.reason = `Set ${mode === "combat" ? "targeting" : "no-target"} helmet ID`;
+            return false;
+        }
+        if (matchesHelmet(worn, id, sid)) {
+            state.reason = `${mode === "combat" ? "Targeting" : "No-target"} helmet equipped`;
+            return false;
+        }
+        if (state.lastActionAt != null && now - state.lastActionAt < SWAP_COOLDOWN_MS) {
+            state.reason = "Swap cooldown";
+            return false;
+        }
+        if (now < state.retryAfter) { state.reason = "Waiting to retry helmet swap"; return false; }
+        if (state.lastCountId !== id || now - state.lastCountAt >= 5000) {
+            state.lastCountId = id;
+            state.lastCountAt = now;
+            bot.requestItemCounts?.([{ id, fluidType: 0 }]);
+        }
+        const reading = bot.getItemCountReading?.(id, 0);
+        const visible = bot.items?.find?.({ cid: id, sid: sid || null });
+        if (!visible && reading && Number(reading.count) === 0 &&
+            now - Number(reading.at || 0) <= 12000) {
+            state.reason = "Selected helmet are missing";
+            return false;
+        }
+        const hm = window.gameClient?.interface?.hotbarManager;
+        if (typeof hm?.__handleItemUseWithMode !== "function") {
+            state.reason = "Helmet equip function unavailable";
+            return false;
+        }
+        const resolvedSid = sid || validId(window.gameClient?.sidByCid?.[id]) ||
+            validId(window.gameClient?.itemDefinitionsByCid?.[id]?.sid);
+        const sent = bot.actions.runShared("helmet-swap", bot.actions.priorities.UTILITY, () => {
+            // Recheck the helmet slot inside the shared inventory-action lock.
+            if (matchesHelmet(getEquippedHelmet(), id, sid)) return false;
+            const nativeDebounceMs = Number(typeof HotbarManager !== "undefined"
+                ? HotbarManager.prototype.EQUIP_MOVE_DEBOUNCE_MS : 300) || 300;
+            if (hm.__lastEquipMoveAt && now - hm.__lastEquipMoveAt < nativeDebounceMs)
+                return false; // Native equipment debounce would silently discard it.
+            hm.__handleItemUseWithMode({ id, sid: resolvedSid, fluidType: 0 }, "helmet");
+            return true;
+        }, 120);
+        if (!sent) { state.reason = "Waiting for other action"; return false; }
+        state.lastActionAt = now;
+        state.pending = { id, sid, at: now };
+        state.reason = `Switching to ${mode === "combat" ? "targeting" : "no-target"} helmet`;
+        return true;
+    }
+    let offHelmetEvents = null;
+    function attachHelmetEvents() {
+        if (offHelmetEvents) return;
+        offHelmetEvents = bot.clientEvents?.subscribe(["target", "equipment", "inventory", "supplies", "session"], () => {
+            if (!state.running) return;
+            bot.clientEvents.queue("helmet", () => {
+                if (!state.running || state.destroyed) return;
+                if (state.timerId != null) window.clearTimeout(state.timerId);
+                state.timerId = null;
+                tick();
+            });
+        });
+    }
+    function detachHelmetEvents() {
+        offHelmetEvents?.(); offHelmetEvents = null;
+        bot.clientEvents?.cancel("helmet");
+    }
+
+    function tick() {
+        state.timerId = null;
+        if (!state.running || state.destroyed) return;
+        try { trySwap(); }
+        catch (error) { state.reason = "Helmet swap failed"; state.retryAfter = Date.now() + 5000; bot.log("Helmet Swapper:", error?.message || String(error)); }
+        finally {
+            if (state.running && !state.destroyed) state.timerId = window.setTimeout(tick, 1000);
+        }
+    }
+    function clearCaptureMode() {
+        if (state.captureHandler) document.removeEventListener("click", state.captureHandler, true);
+        if (state.captureKeyHandler) document.removeEventListener("keydown", state.captureKeyHandler, true);
+        if (state.captureTimer != null) window.clearTimeout(state.captureTimer);
+        state.captureHandler = state.captureKeyHandler = state.captureTimer = null;
+        state.captureMode = null;
+        refreshUi();
+    }
+    function startCaptureHelmet(mode) {
+        bot.itemDropper?.cancelCapture?.();
+        if (state.destroyed || !["idle", "combat"].includes(mode)) return false;
+        const cancel = state.captureMode === mode;
+        clearCaptureMode();
+        if (cancel) return false;
+        bot.equipRing?.clearCaptureMode?.();
+        bot.bootsSwapper?.clearCaptureMode?.();
+        state.captureMode = mode;
+        state.reason = "Click helmet in an open backpack or equipment slot";
+        state.captureHandler = event => {
+            const slot = event?.target?.closest?.(".slot[slotindex]");
+            if (!slot) return;
+            event.preventDefault(); event.stopPropagation(); event.stopImmediatePropagation?.();
+            let item = null, equipmentHelmetSlot = false;
+            const containerEl = slot.closest?.("[containerindex]") || slot.closest?.("[containerIndex]");
+            if (containerEl) {
+                const containerId = Number(containerEl.getAttribute("containerindex") || containerEl.getAttribute("containerIndex"));
+                const index = Number(slot.getAttribute("slotindex"));
+                if (Number.isSafeInteger(index) && index >= 0) {
+                    for (const container of window.gameClient?.player?.__openedContainers || []) {
+                        if (Number(container?.__containerId) === containerId) { item = container.getSlotItem?.(index); break; }
+                    }
+                }
+            } else {
+                const eq = window.gameClient?.player?.equipment;
+                for (let index = 0; index < (eq?.slots?.length || 0); index++) {
+                    const el = eq.slots[index]?.element;
+                    if (el && (el === slot || el.contains?.(slot))) {
+                        item = eq.getSlotItem?.(index);
+                        equipmentHelmetSlot = index === getHelmetSlot();
+                        break;
+                    }
+                }
+            }
+            if (!item || (!equipmentHelmetSlot && !isHelmet(item))) {
+                state.reason = "Select a helmet item";
+                refreshUi();
+                return;
+            }
+            const identity = getInventoryIdentity(item);
+            if (!identity.id) { state.reason = "Could not read helmet ID"; refreshUi(); return; }
+            updateConfig({ [`${mode}Id`]: identity.id, [`${mode}Sid`]: identity.sid });
+            state.reason = `${mode === "combat" ? "Targeting" : "No-target"} helmet ID selected`;
+            clearCaptureMode();
+        };
+        state.captureKeyHandler = event => { if (event.key === "Escape") { state.reason = "Helmet selection cancelled"; clearCaptureMode(); } };
+        document.addEventListener("click", state.captureHandler, true);
+        document.addEventListener("keydown", state.captureKeyHandler, true);
+        state.captureTimer = window.setTimeout(() => { state.reason = "Helmet selection expired"; clearCaptureMode(); }, 30000);
+        refreshUi();
+        return true;
+    }
+    function updateConfig(next = {}) {
+        for (const mode of ["idle", "combat"]) {
+            if (Object.hasOwn(next, `${mode}Id`)) {
+                config[`${mode}Id`] = validId(next[`${mode}Id`]);
+                config[`${mode}Sid`] = validId(next[`${mode}Sid`]);
+            }
+        }
+        normalizeConfig();
+        persist();
+        refreshUi();
+        return { ...config };
+    }
+    function start() {
+        if (state.destroyed || state.running) return false;
+        state.running = true; config.enabled = true; persist();
+        bot.clientEvents?.ensureBound(); attachHelmetEvents();
+        tick(); refreshUi();
+        return true;
+    }
+    function stop(options = {}) {
+        const wasRunning = state.running;
+        state.running = false;
+        detachHelmetEvents();
+        if (state.timerId != null) window.clearTimeout(state.timerId);
+        state.timerId = null;
+        // Keep lastActionAt/pending across a quick stop/start: an accepted
+        // inventory move still needs confirmation and the two-second cooldown.
+        clearCaptureMode();
+        if (options.persistEnabled !== false) { config.enabled = false; persist(); }
+        state.reason = "Stopped"; refreshUi();
+        return wasRunning;
+    }
+    function status() {
+        return { running: state.running, mode: state.mode, reason: state.reason,
+            selecting: state.captureMode, lastActionAt: state.lastActionAt,
+            cooldownRemainingMs: state.lastActionAt == null ? 0 : Math.max(0, SWAP_COOLDOWN_MS - (Date.now() - state.lastActionAt)) };
+    }
+    bot.helmetSwapper = { start, stop, status, config, updateConfig, startCaptureHelmet, clearCaptureMode, trySwap };
     bot.addCleanup(() => { stop({ persistEnabled: false }); state.destroyed = true; state.player = state.equipment = state.pending = null; });
     if (config.enabled) start();
 };
@@ -41427,7 +41732,7 @@ window.__minibiaBotBundle.installAutoEatModule = function installAutoEatModule(b
         if (capturing) { cancelCapture(); render(); return false; }
         bot.itemAlertItems?.cancelCapture?.(); bot.itemDropper?.cancelCapture?.();
         bot.autoPickup?.cancelCapture?.(); bot.looter?.clearCaptureMode?.();
-        bot.equipRing?.clearCaptureMode?.(); bot.bootsSwapper?.clearCaptureMode?.();
+        bot.equipRing?.clearCaptureMode?.(); bot.bootsSwapper?.clearCaptureMode?.();bot.helmetSwapper?.clearCaptureMode?.();
         capturing = true; controls.error = false;
         controls.status.textContent = "Click food in a bag or equipment slot. Esc cancels.";
         document.addEventListener("click", captureClick, true);
@@ -42864,7 +43169,7 @@ window.__minibiaBotBundle.installAntiBotMonitorModule = function installAntiBotM
         safely("reconnect disable", () => bot.reconnect?.disable?.());
         safely("restart cancellation", () => bot.gmKillSwitch?.cancel?.("Anti-Bot window close"));
         for (const name of ["followingItemGuard", "gmChatMonitor", "autoPickup", "looter", "cave", "attack",
-                            "runeShooter", "rune", "heal", "invisible", "haste", "magicShield", "equipRing", "bootsSwapper",
+                            "runeShooter", "rune", "heal", "invisible", "haste", "magicShield", "equipRing", "bootsSwapper", "helmetSwapper",
                             "itemDropper", "eat", "conjureFood", "paladin", "slimeTrainer", "monkTrainer", "talk",
                             "antiAfk", "fisher", "woodcutting", "mining", "smithing", "cooking", "comboBot", "holdTarget"]) {
             safely(`stop ${name}`, () => bot[name]?.stop?.({ persistEnabled: false }));
@@ -46204,7 +46509,7 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
         if (cancel) return false;
         bot.itemDropper?.cancelCapture?.();
         bot.equipRing?.clearCaptureMode?.();
-        bot.bootsSwapper?.clearCaptureMode?.();
+        bot.bootsSwapper?.clearCaptureMode?.();bot.helmetSwapper?.clearCaptureMode?.();
         const client=window.gameClient, player=client?.player;
         if (!player) return false;
         state.captureMode=mode;
@@ -50312,7 +50617,7 @@ window.__minibiaBotBundle.installTempleXlogModule = function installTempleXlogMo
         try { bot.reconnect?.disable?.(); } catch (e) { bot.log("Temple XLOG: reconnect disable failed", e); }
         try { bot.gmKillSwitch?.cancel?.("Temple XLOG"); } catch (e) { bot.log("Temple XLOG: restart cancellation failed", e); }
         for (const name of ["followingItemGuard", "gmChatMonitor", "autoPickup", "looter", "cave", "attack",
-                            "runeShooter", "rune", "heal", "invisible", "haste", "magicShield", "equipRing", "bootsSwapper",
+                            "runeShooter", "rune", "heal", "invisible", "haste", "magicShield", "equipRing", "bootsSwapper", "helmetSwapper",
                             "itemDropper", "eat", "conjureFood", "paladin", "slimeTrainer", "monkTrainer", "talk",
                             "antiAfk", "fisher", "woodcutting", "mining", "smithing", "cooking", "comboBot", "holdTarget"]) {
             try { bot[name]?.stop?.({ persistEnabled: false }); }
@@ -50526,7 +50831,7 @@ window.__minibiaBotBundle.installPinkSkullDetectorModule = function installPinkS
         // Module errors must never prevent the disconnect. Preserve enabled
         // preferences so that a deliberate reload does not silently erase them.
         for (const name of ["autoPickup", "cave", "attack", "runeShooter", "rune", "heal", "invisible", "haste", "magicShield",
-                            "equipRing", "bootsSwapper", "itemDropper", "eat", "conjureFood", "paladin", "looter"]) {
+                            "equipRing", "bootsSwapper", "helmetSwapper", "itemDropper", "eat", "conjureFood", "paladin", "looter"]) {
             try { bot[name]?.stop?.({ persistEnabled: false }); }
             catch (e) { bot.log(`Pink Skull: failed to stop ${name}:`, e); }
         }
@@ -50624,6 +50929,7 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
         "minibiaBot.cave.presets",
         "minibiaBot.equipRing.config",
         "minibiaBot.bootsSwapper.config",
+        "minibiaBot.helmetSwapper.config",
         "minibiaBot.eat.config",
         "minibiaBot.conjureFood.config",
         "minibiaBot.talk.config",
@@ -51043,7 +51349,7 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
         const route = [];
         const stepTransitions = new Set(['floor-down', 'floor-up', 'stairs-up', 'stairs-down']);
         const directions = {here:[0,0], n:[0,-1], ne:[1,-1], e:[1,0], se:[1,1], s:[0,1], sw:[-1,1], w:[-1,0], nw:[-1,-1]};
-        const types = new Set(['walk', 'stand', 'rope', 'shovel', 'ladder', 'ladder-up', 'ladder-down', 'use', 'script', ...stepTransitions]);
+        const types = new Set(['walk', 'wait', 'stand', 'rope', 'shovel', 'ladder', 'ladder-up', 'ladder-down', 'use', 'script', ...stepTransitions]);
         let previousStepTransitionKey = null;
         let previousStepStart = -1;
         let previousStepSource = null;
@@ -51116,7 +51422,8 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
                 ...(valid ? {x:targetPos.x, y:targetPos.y, z:targetPos.z} : {}),
                 label: String(wp.label || '').trim() || undefined,
                 ...(type === 'script' ? {script} : {}),
-                stand:type === 'stand', rope:type === 'rope', shovel:type === 'shovel', ladder:isLadder
+                stand:type === 'stand', rope:type === 'rope', shovel:type === 'shovel', ladder:isLadder,
+                ...(type === 'wait' ? {knightBox:true} : {})
             });
         }
         if (!route.length) throw new Error('No enabled waypoints to import.');
@@ -53207,7 +53514,7 @@ window.__minibiaBotBundle.installItemDropperModule = function installItemDropper
         if (state.destroyed || !["item","tile"].includes(kind) || !config.rules.some(r=>r.id===id)) return false;
         const same=state.capture?.id === id && state.capture?.kind === kind;
         cancelCapture(); if (same) return false;
-        bot.equipRing?.clearCaptureMode?.(); bot.bootsSwapper?.clearCaptureMode?.();
+        bot.equipRing?.clearCaptureMode?.(); bot.bootsSwapper?.clearCaptureMode?.();bot.helmetSwapper?.clearCaptureMode?.();
         bot.looter?.clearCaptureMode?.(); bot.fisher?.cancelTileCapture?.();
         state.capture={id,kind};
         state.reason=kind === "item" ? "Click an item to select its ID" : "Click a destination tile";
@@ -56816,6 +57123,396 @@ window.__minibiaBotBundle.installBankNpcModule = function installBankNpcModule(b
 };
 
 window.__minibiaBotBundle.installPanel = function installPanel(bot) {
+    let worldMapEditor = null;
+    // Large-map waypoint editor. Terrain remains owned by the client; a separate
+    // transparent canvas keeps route markers intact across asynchronous paints.
+    function createWorldMapWaypointEditor(bot, selection) {
+        const types = {stand: 'Stand', walk: 'Walk', rope: 'Rope', shovel: 'Shovel'};
+        const colors = {stand: '#f4d078', walk: '#75c7f0', rope: '#cba5fb', shovel: '#e9aa73'};
+        let disposed = false, mount = null, mode = 'view', kind = 'stand';
+        let insertAfter = true, gesture = null, frame = null, timer = null;
+        let route = [], routeKey = null, presetName = null, lastPaint = null;
+        let notice = '', noticeUntil = 0;
+        const bindings = [];
+        const on = (el, type, fn, options = false) => {
+            el.addEventListener(type, fn, options);
+            bindings.push(() => el.removeEventListener(type, fn, options));
+        };
+        const consume = event => { event.preventDefault(); event.stopImmediatePropagation(); };
+        const position = wp => wp && !wp.script && [wp.x, wp.y, wp.z].every(Number.isInteger) &&
+            wp.z >= 0 && wp.z <= 15;
+        const selected = () => {
+            const i = selection.getSelected();
+            return Number.isInteger(i) && i >= 0 && i < route.length ? i : null;
+        };
+        const waypointType = wp => wp.script ? 'Script' : wp.rope ? 'Rope' : wp.shovel ? 'Shovel' :
+            wp.ladder ? 'Ladder' : wp.knightBox ? 'Box' : wp.stand ? 'Stand' : 'Walk';
+        const say = text => { notice = text; noticeUntil = Date.now() + 4000; refresh(); };
+        function readRoute(force = false) {
+            const name = bot.cave?.getActivePresetName?.() || '';
+            const revision = bot.cave?.getWaypointListMeta?.().revision;
+            const key = `${name}|${revision}`;
+            if (name !== presetName) {
+                if (presetName !== null) selection.setSelected(null);
+                presetName = name; gesture = null;
+                if (mode === 'move') mode = 'select';
+            }
+            if (force || revision === undefined || key !== routeKey) {
+                route = bot.cave?.getRoute?.() || [];
+                routeKey = key; lastPaint = null;
+                if (selection.getSelected() !== null && selected() === null) selection.setSelected(null);
+                if (mode === 'move' && !position(route[selected()])) mode = 'select';
+            }
+        }
+        function setMode(next) {
+            selection.endMinimapPick?.();
+            mode = next; gesture = null; noticeUntil = 0;
+            if (mount) {
+                mount.modal.__targetPosition = null;
+                mount.canvas.removeEventListener('mousemove', mount.modal.__boundMoveCallback);
+                mount.modal.__isDragging = false;
+            }
+            refresh();
+        }
+        function surface() {
+            if (!mount) return null;
+            const rect = mount.canvas.getBoundingClientRect();
+            const css = getComputedStyle(mount.canvas);
+            const num = name => parseFloat(css[name]) || 0;
+            const left = num('borderLeftWidth') + num('paddingLeft');
+            const right = num('borderRightWidth') + num('paddingRight');
+            const top = num('borderTopWidth') + num('paddingTop');
+            const bottom = num('borderBottomWidth') + num('paddingBottom');
+            const width = rect.width - left - right, height = rect.height - top - bottom;
+            if (width <= 0 || height <= 0) return null;
+            return {left: rect.left + left, top: rect.top + top, width, height};
+        }
+        function view() {
+            const center = mount?.modal.__center;
+            const zoom = Number(mount?.modal.__zoomLevel);
+            if (!center || ![center.x, center.y, center.z].every(Number.isFinite) ||
+                !Number.isInteger(zoom) || zoom < 0 || zoom > 4) return null;
+            // Native terrain doubles once per zoom step. Its click handler uses
+            // zoom+1, which diverges at zoom 2–4; use the actual rendered scale.
+            return {x: center.x, y: center.y, z: center.z, scale: 2 ** zoom};
+        }
+        function worldPoint(clientX, clientY) {
+            const rect = surface(), v = view();
+            if (!rect || !v || clientX < rect.left || clientX >= rect.left + rect.width ||
+                clientY < rect.top || clientY >= rect.top + rect.height) return null;
+            const x = Math.floor(v.x + ((clientX - rect.left) / rect.width * 256 - 128) / v.scale);
+            const y = Math.floor(v.y + ((clientY - rect.top) / rect.height * 256 - 128) / v.scale);
+            return x >= 0 && y >= 0 && x <= 65535 && y <= 65535 ? {x, y, z: v.z} : null;
+        }
+        function choose(index) {
+            selection.setSelected(index);
+            noticeUntil = 0; lastPaint = null; refresh();
+        }
+        function hit(clientX, clientY) {
+            const rect = surface(), v = view();
+            if (!rect || !v) return null;
+            let best = null, distance = 13 * 13;
+            route.forEach((wp, i) => {
+                if (!position(wp) || wp.z !== v.z) return;
+                const px = rect.left + (128 + (wp.x - v.x + 0.5) * v.scale) * rect.width / 256;
+                const py = rect.top + (128 + (wp.y - v.y + 0.5) * v.scale) * rect.height / 256;
+                const d = (clientX - px) ** 2 + (clientY - py) ** 2;
+                if (d < distance) { distance = d; best = i; }
+            });
+            return best;
+        }
+        function editAt(clientX, clientY) {
+            readRoute();
+            const point = worldPoint(clientX, clientY);
+            if (!point) return;
+            if (mode === 'select') {
+                const i = hit(clientX, clientY);
+                if (i === null) say('No waypoint here. Choose one from the list or click its number.');
+                else choose(i);
+                return;
+            }
+            const i = selected();
+            if (mode === 'move') {
+                if (i === null || !position(route[i])) { setMode('select'); return; }
+                if (bot.cave.moveWaypointPosition(i, point)) {
+                    readRoute(true); selection.setSelected(i); setMode('select');
+                    say(`Moved #${i + 1} to ${point.x}, ${point.y}, ${point.z}.`);
+                }
+                return;
+            }
+            if (mode !== 'add') return;
+            const index = insertAfter && i !== null ? i + 1 : route.length;
+            const wp = {...point};
+            if (kind !== 'walk') { wp[kind] = true; wp.label = types[kind]; }
+            if (!bot.cave.addWaypoint(wp, index)) return;
+            // Selection is an editing cursor, never CaveBot's movement index.
+            readRoute(true); selection.setSelected(index);
+            say(`Added ${types[kind]} #${index + 1} at ${point.x}, ${point.y}, ${point.z}.`);
+        }
+        function copyCenter(center) {
+            return typeof center.copy === 'function' ? center.copy() :
+                Object.assign(Object.create(Object.getPrototypeOf(center)), center);
+        }
+        function pointOf(event, end = false) {
+            if (gesture?.touchId !== undefined) {
+                const list = end ? event.changedTouches : event.touches;
+                return Array.from(list || []).find(t => t.identifier === gesture.touchId) || null;
+            }
+            return event;
+        }
+        function down(event) {
+            if (!mount || mode === 'view' || event.target !== mount.canvas) return;
+            if (event.type === 'touchstart' && event.touches.length !== 1) {
+                consume(event); gesture = null; return;
+            }
+            if (event.button !== undefined && event.button !== 0) return;
+            consume(event);
+            const p = event.touches ? event.touches[0] : event;
+            const v = view(), rect = surface();
+            if (!v || !rect) return;
+            gesture = {x: p.clientX, y: p.clientY, dragged: false, v, rect,
+                center: copyCenter(mount.modal.__center),
+                ...(event.touches ? {touchId: p.identifier} : {})};
+        }
+        function move(event) {
+            if (!gesture || !mount || mode === 'view') return;
+            if (event.touches && event.touches.length !== 1) { consume(event); gesture = null; return; }
+            const p = pointOf(event);
+            if (!p) return;
+            consume(event);
+            const dx = p.clientX - gesture.x, dy = p.clientY - gesture.y;
+            if (Math.hypot(dx, dy) > 4) gesture.dragged = true;
+            if (!gesture.dragged) return;
+            const center = copyCenter(gesture.center);
+            center.x -= Math.round(dx * 256 / gesture.rect.width / gesture.v.scale);
+            center.y -= Math.round(dy * 256 / gesture.rect.height / gesture.v.scale);
+            mount.modal.__center = center;
+            mount.modal.draw();
+            refresh();
+        }
+        function up(event) {
+            if (!gesture || !mount) return;
+            if (gesture.touchId === undefined && event.button !== undefined && event.button !== 0) return;
+            const p = pointOf(event, true);
+            if (!p) return;
+            consume(event);
+            const dragged = gesture.dragged || Math.hypot(p.clientX - gesture.x, p.clientY - gesture.y) > 4;
+            gesture = null;
+            if (!dragged) editAt(p.clientX, p.clientY);
+        }
+        function cancel() { gesture = null; }
+        function guard(event) {
+            if (mode === 'view' || !mount) return;
+            if (event.target === mount.canvas || event.target.closest?.('#map-walk-btn')) consume(event);
+        }
+        function key(event) {
+            if (!mount || !mount.root.getClientRects().length) return;
+            if (event.key === 'Escape' && mode !== 'view') { consume(event); setMode('view'); }
+            else if (mount.toolbar.contains(event.target)) event.stopImmediatePropagation();
+        }
+        function paint(v, rect) {
+            const canvas = mount.overlay, ctx = canvas.getContext('2d');
+            const wrapperRect = mount.wrapper.getBoundingClientRect();
+            const sx = mount.wrapper.offsetWidth ? wrapperRect.width / mount.wrapper.offsetWidth : 1;
+            const sy = mount.wrapper.offsetHeight ? wrapperRect.height / mount.wrapper.offsetHeight : 1;
+            canvas.style.left = `${(rect.left - wrapperRect.left) / sx - mount.wrapper.clientLeft + mount.wrapper.scrollLeft}px`;
+            canvas.style.top = `${(rect.top - wrapperRect.top) / sy - mount.wrapper.clientTop + mount.wrapper.scrollTop}px`;
+            canvas.style.width = `${rect.width / sx}px`; canvas.style.height = `${rect.height / sy}px`;
+            const chosen = selected();
+            const signature = `${routeKey}|${chosen}|${v.x},${v.y},${v.z},${v.scale}|${rect.width},${rect.height}`;
+            if (signature === lastPaint) return;
+            lastPaint = signature;
+            ctx.clearRect(0, 0, 256, 256);
+            const unit = 256 / rect.width;
+            const project = wp => ({x: 128 + (wp.x - v.x + 0.5) * v.scale,
+                y: 128 + (wp.y - v.y + 0.5) * v.scale});
+            let previous = null;
+            ctx.save(); ctx.lineWidth = 1.5 * unit; ctx.strokeStyle = 'rgba(255,216,120,.75)';
+            route.forEach(wp => {
+                if (!position(wp) || wp.z !== v.z) { previous = null; return; }
+                const p = project(wp);
+                if (previous) { ctx.beginPath(); ctx.moveTo(previous.x, previous.y); ctx.lineTo(p.x, p.y); ctx.stroke(); }
+                previous = p;
+            });
+            const drawPoint = (wp, i) => {
+                if (!position(wp) || wp.z !== v.z) return;
+                const p = project(wp);
+                if (p.x < -15 * unit || p.y < -15 * unit || p.x > 256 + 15 * unit || p.y > 256 + 15 * unit) return;
+                const color = colors[waypointType(wp).toLowerCase()] || '#e0c687';
+                ctx.beginPath(); ctx.arc(p.x, p.y, (i === chosen ? 9 : 7) * unit, 0, Math.PI * 2);
+                ctx.fillStyle = i === chosen ? '#fff1bd' : '#202020'; ctx.fill();
+                ctx.strokeStyle = i === chosen ? '#ffffff' : color; ctx.lineWidth = (i === chosen ? 2 : 1.5) * unit; ctx.stroke();
+                ctx.font = `bold ${10 * unit}px sans-serif`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+                ctx.fillStyle = i === chosen ? '#171717' : color; ctx.fillText(String(i + 1), p.x, p.y + 0.5 * unit);
+            };
+            route.forEach((wp, i) => { if (i !== chosen) drawPoint(wp, i); });
+            if (chosen !== null) drawPoint(route[chosen], chosen);
+            ctx.restore();
+        }
+        function updateControls() {
+            const m = mount, i = selected(), wp = route[i];
+            const labelKey = `${routeKey}|${route.length}`;
+            if (labelKey !== m.listKey) {
+                m.listKey = labelKey;
+                m.list.replaceChildren(new Option('Choose waypoint…', ''));
+                route.forEach((point, index) => m.list.add(new Option(
+                    `#${index + 1} ${waypointType(point)}${point.label ? ' · ' + point.label : ''}` +
+                    (position(point) ? ` (${point.x}, ${point.y}, ${point.z})` : ''), String(index))));
+            }
+            m.list.value = i === null ? '' : String(i);
+            m.toggle.textContent = mode === 'view' ? 'Edit waypoints' : 'Done';
+            m.toggle.setAttribute('aria-pressed', String(mode !== 'view'));
+            for (const [type, button] of Object.entries(m.typeButtons))
+                button.setAttribute('aria-pressed', String(mode === 'add' && type === kind));
+            m.select.setAttribute('aria-pressed', String(mode === 'select'));
+            m.move.setAttribute('aria-pressed', String(mode === 'move'));
+            m.move.disabled = !position(wp); m.find.disabled = !position(wp); m.remove.disabled = i === null;
+            m.canvas.style.cursor = mode === 'view' ? m.cursor : gesture?.dragged ? 'grabbing' : 'crosshair';
+            if (m.walkButton) m.walkButton.disabled = mode === 'view' ? m.walkDisabled : true;
+            const count = `${route.length} waypoints`;
+            const instructions = mode === 'view' ? 'Choose a type to place waypoints.' : mode === 'add' ?
+                `Click to add ${types[kind]} · Drag to pan · Esc to finish.` : mode === 'move' ?
+                `Click a new tile for #${i + 1} · Drag to pan · Esc to finish.` :
+                'Click a waypoint number to select · Drag to pan · Esc to finish.';
+            const target = i !== null ? `Selected #${i + 1} · ` : '';
+            const statusText = Date.now() < noticeUntil ? notice : `${target}${count} · ${instructions}`;
+            if (m.status.textContent !== statusText) m.status.textContent = statusText;
+            m.afterText.textContent = insertAfter && i !== null ? `Insert after #${i + 1}` : 'Insert after selected';
+        }
+        function unmount() {
+            if (!mount) return;
+            const m = mount;
+            if (m.modal.draw === m.drawWrapper) {
+                if (m.drawDescriptor) Object.defineProperty(m.modal, 'draw', m.drawDescriptor);
+                else delete m.modal.draw;
+            }
+            if (m.modal.__handleClick === m.clickWrapper) {
+                if (m.clickDescriptor) Object.defineProperty(m.modal, '__handleClick', m.clickDescriptor);
+                else delete m.modal.__handleClick;
+            }
+            m.canvas.style.cursor = m.cursor;
+            if (m.walkButton) m.walkButton.disabled = m.walkDisabled;
+            if (m.wrapper.style.position === 'relative' && m.changedPosition) m.wrapper.style.position = m.position;
+            m.toolbar.remove(); m.overlay.remove();
+            mount = null; gesture = null; mode = 'view'; lastPaint = null;
+        }
+        function attach(modal, root, canvas) {
+            unmount();
+            const wrapper = canvas.closest('.map-modal-wrapper') || canvas.parentElement;
+            const toolbar = document.createElement('section'); toolbar.className = 'mb-map-waypoints';
+            toolbar.setAttribute('aria-label', 'mb0t map waypoint editor');
+            toolbar.innerHTML = `<div class="mb-map-row"><strong>mb0t waypoints</strong><button type="button" data-map-edit aria-pressed="false">Edit waypoints</button></div>
+<div class="mb-map-row" data-map-types></div>
+<div class="mb-map-row"><select data-map-list aria-label="Selected waypoint"></select><button type="button" data-map-find title="Center the map on the selected waypoint">Find</button><button type="button" data-map-select aria-pressed="false">Select</button><button type="button" data-map-move aria-pressed="false">Move</button><button type="button" data-map-delete>Delete</button></div>
+<label class="mb-map-after"><input type="checkbox" data-map-after checked><span>Insert after selected</span></label>
+<div class="mb-map-status" data-map-status role="status" aria-live="polite"></div>`;
+            const overlay = document.createElement('canvas'); overlay.width = overlay.height = 256;
+            overlay.className = 'mb-map-route-overlay'; overlay.setAttribute('aria-hidden', 'true');
+            const positionStyle = wrapper.style.position;
+            const changedPosition = getComputedStyle(wrapper).position === 'static';
+            if (changedPosition) wrapper.style.position = 'relative';
+            wrapper.appendChild(overlay);
+            const host = root.querySelector('.modal-body') || root;
+            host.insertBefore(toolbar, host.firstChild);
+            const get = name => toolbar.querySelector(`[data-map-${name}]`);
+            const draw = modal.draw, click = modal.__handleClick;
+            const drawWrapper = function(...args) { const result = draw.apply(this, args); schedule(); return result; };
+            const clickWrapper = function(...args) { if (!disposed && mount?.modal === this && mode !== 'view') return; return click?.apply(this, args); };
+            mount = {modal, root, canvas, wrapper, toolbar, overlay, position: positionStyle, changedPosition,
+                cursor: canvas.style.cursor, walkButton: root.querySelector('#map-walk-btn'),
+                walkDisabled: root.querySelector('#map-walk-btn')?.disabled || false,
+                drawDescriptor: Object.getOwnPropertyDescriptor(modal, 'draw'),
+                clickDescriptor: Object.getOwnPropertyDescriptor(modal, '__handleClick'), drawWrapper, clickWrapper,
+                toggle: get('edit'), list: get('list'), find: get('find'), select: get('select'), move: get('move'),
+                remove: get('delete'), after: get('after'), afterText: get('after').nextElementSibling,
+                status: get('status'), typeButtons: {}, listKey: null};
+            modal.draw = drawWrapper; modal.__handleClick = clickWrapper;
+            const m = mount;
+            for (const [type, label] of Object.entries(types)) {
+                const button = document.createElement('button'); button.type = 'button'; button.textContent = label;
+                button.dataset.mapType = type; button.setAttribute('aria-pressed', 'false');
+                m.typeButtons[type] = button; get('types').appendChild(button);
+                button.addEventListener('click', () => { kind = type; setMode('add'); });
+            }
+            m.toggle.addEventListener('click', () => setMode(mode === 'view' ? 'add' : 'view'));
+            m.select.addEventListener('click', () => setMode('select'));
+            m.move.addEventListener('click', () => { if (position(route[selected()])) setMode('move'); });
+            m.after.checked = insertAfter;
+            m.after.addEventListener('change', () => { insertAfter = m.after.checked; refresh(); });
+            m.list.addEventListener('change', () => { choose(m.list.value === '' ? null : Number(m.list.value)); if (mode === 'move') setMode('select'); });
+            m.find.addEventListener('click', () => {
+                const wp = route[selected()]; if (!position(wp)) return;
+                const center = copyCenter(modal.__center); center.x = wp.x; center.y = wp.y; center.z = wp.z;
+                modal.__center = center; modal.__targetPosition = null; modal.draw(); refresh();
+            });
+            m.remove.addEventListener('click', () => {
+                readRoute(); const i = selected();
+                if (i === null || !bot.cave.deleteWaypoint(i)) return;
+                readRoute(true); selection.setSelected(route.length ? Math.min(i, route.length - 1) : null);
+                if (mode === 'move') mode = 'select';
+                say(`Deleted waypoint #${i + 1}.`);
+            });
+            // Modal buttons without action attributes must remain local controls.
+            for (const type of ['mousedown', 'mouseup', 'click', 'dblclick', 'touchstart', 'touchend', 'keydown', 'keyup'])
+                toolbar.addEventListener(type, event => event.stopPropagation());
+        }
+        function refresh() {
+            if (disposed) return;
+            const modal = window.gameClient?.interface?.modalManager?.get?.('map-modal');
+            const root = document.getElementById('map-modal');
+            const canvas = modal?.canvas?.canvas;
+            if (!modal || !root || !canvas || !root.contains(canvas) || typeof modal.draw !== 'function') { unmount(); return; }
+            if (!mount || mount.modal !== modal || mount.canvas !== canvas || !mount.toolbar.isConnected) attach(modal, root, canvas);
+            if (!root.getClientRects().length || getComputedStyle(root).visibility === 'hidden') {
+                if (mode !== 'view') setMode('view');
+                return;
+            }
+            readRoute(); updateControls();
+            const v = view(), rect = surface();
+            if (v && rect) paint(v, rect);
+        }
+        function schedule() {
+            if (disposed || frame !== null) return;
+            frame = window.requestAnimationFrame(() => { frame = null; refresh(); });
+        }
+        const style = document.createElement('style');
+        style.textContent = `
+#map-modal .mb-map-waypoints{box-sizing:border-box;padding:7px;margin:0 0 8px;border:1px solid #454039;border-radius:5px;background:#272624;color:#d7d2c7;font:11px/1.4 sans-serif;text-align:left;}
+#map-modal .mb-map-row{display:flex;gap:4px;align-items:center;flex-wrap:wrap;margin-bottom:5px;}
+#map-modal .mb-map-row strong{flex:1;color:#e5d4a5;font-size:11px;}
+#map-modal .mb-map-waypoints button{width:auto;min-width:0;min-height:24px;flex:0 0 auto;margin:0;padding:3px 8px;border:1px solid #57514a;border-radius:4px;background:#373532;color:#e2ddd2;font:11px/1.3 sans-serif;cursor:pointer;}
+#map-modal .mb-map-waypoints button:hover{background:#48443d;}
+#map-modal .mb-map-waypoints button[aria-pressed="true"]{border-color:#c7a76a;background:#514635;color:#fff0c7;}
+#map-modal .mb-map-waypoints button:disabled{opacity:.4;cursor:default;}
+#map-modal .mb-map-waypoints select{flex:1 1 150px;min-width:0;width:150px;max-width:100%;height:25px;padding:2px 4px;border:1px solid #57514a;border-radius:4px;background:#222;color:#ded9cd;font:11px sans-serif;}
+#map-modal .mb-map-after{display:flex;align-items:center;gap:5px;font-size:11px;cursor:pointer;}
+#map-modal .mb-map-after input{width:auto;margin:0;accent-color:#c7a76a;}
+#map-modal .mb-map-status{margin-top:4px;min-height:15px;color:#bfb7a5;font-size:10px;overflow-wrap:anywhere;}
+#map-modal canvas.mb-map-route-overlay{position:absolute;pointer-events:none!important;z-index:5;border:0!important;padding:0!important;margin:0!important;background:transparent!important;box-shadow:none!important;border-radius:0!important;}
+`;
+        document.head.appendChild(style);
+        on(window, 'mousedown', down, {capture: true, passive: false});
+        on(window, 'mousemove', move, {capture: true, passive: false});
+        on(window, 'mouseup', up, {capture: true, passive: false});
+        on(window, 'touchstart', down, {capture: true, passive: false});
+        on(window, 'touchmove', move, {capture: true, passive: false});
+        on(window, 'touchend', up, {capture: true, passive: false});
+        on(window, 'touchcancel', cancel, true);
+        on(window, 'blur', cancel);
+        on(window, 'keydown', key, true);
+        for (const type of ['click', 'dblclick', 'contextmenu']) on(window, type, guard, {capture: true, passive: false});
+        const api = {refresh, isEditing: () => mode !== 'view', destroy() {
+            if (disposed) return;
+            disposed = true; window.clearInterval(timer);
+            if (frame !== null) window.cancelAnimationFrame(frame);
+            frame = null; bindings.splice(0).forEach(off => off()); unmount(); style.remove(); route = [];
+            if (bot.mapWaypointEditor === api) delete bot.mapWaypointEditor;
+        }};
+        timer = window.setInterval(refresh, 250);
+        refresh();
+        return api;
+    }
+
     function organizePanelSections(panel){
         const tab=name=>panel.querySelector(`[data-tab-panel="${name}"]`);
         const header=(section,title)=>{const h=Array.from(section?.querySelectorAll('.mb-section-title')||[]).find(h=>h.textContent.trim()===title);return h;};
@@ -56866,6 +57563,8 @@ window.__minibiaBotBundle.installPanel = function installPanel(bot) {
 
     // ---- UTILITY FUNCTIONS ----
     function destroy() {
+        worldMapEditor?.destroy();
+        worldMapEditor = null;
         document.getElementById("minibia-bot-panel")?.remove();
         document.getElementById("minibia-bot-style")?.remove();
     }
@@ -57934,6 +58633,28 @@ function upgradeSectionHeaders(panel) {
         if (label) {
             label.textContent = status?.reason || "";
             label.hidden = !status?.selecting && (!status?.running || /boots equipped$|^(Swap cooldown|Waiting for boots swap|Waiting for other action)$|^Switching to/.test(status?.reason || ""));
+        }
+    }
+
+    function refreshHelmetSwapperStatus() {
+        const status = bot.helmetSwapper?.status?.();
+        const toggle = document.getElementById("minibia-bot-helmet-swapper-enabled");
+        if (toggle && document.activeElement !== toggle) toggle.checked = !!status?.running;
+        for (const mode of ["idle", "combat"]) {
+            const input = document.getElementById(`minibia-bot-helmet-${mode}-id`);
+            if (input && document.activeElement !== input) input.value = bot.helmetSwapper?.config?.[`${mode}Id`] || "";
+            const button = document.getElementById(`minibia-bot-helmet-${mode}-select`);
+            if (button) {
+                const selecting = status?.selecting === mode;
+                button.setAttribute("aria-pressed", selecting ? "true" : "false");
+                button.title = selecting ? "Click helmet in a backpack/equipment slot. Click 🔍 again or press Esc to cancel."
+                    : `Click, then click your ${mode === "idle" ? "no-target" : "targeting"} helmet in a backpack or equipment slot`;
+            }
+        }
+        const label = document.getElementById("minibia-bot-helmet-swapper-status");
+        if (label) {
+            label.textContent = status?.reason || "";
+            label.hidden = !status?.selecting && (!status?.running || /helmet equipped$|^(Swap cooldown|Waiting for helmet swap|Waiting for other action)$|^Switching to/.test(status?.reason || ""));
         }
     }
 
@@ -60778,6 +61499,23 @@ function upgradeSectionHeaders(panel) {
         </div>
         <span class="mb-tools-inline-status mb-tools-status" id="minibia-bot-boots-swapper-status" aria-live="polite" hidden></span>
       </div>
+
+      <div class="mb-tools-control">
+        <label class="mb-toggle" title="Swap helmets for idle and combat, with a 2-second cooldown."><input type="checkbox" id="minibia-bot-helmet-swapper-enabled" /><span>Helmet</span></label>
+        <div class="mb-tools-boots-values">
+          <div class="mb-tools-boot-value">
+            <label for="minibia-bot-helmet-idle-id">Idle</label>
+            <input type="number" id="minibia-bot-helmet-idle-id" min="1" max="65535" step="1" placeholder="ID" title="Helmet to wear without a target" />
+            <button type="button" class="mb-small-button mb-tools-picker" id="minibia-bot-helmet-idle-select" title="Pick idle helmet from a backpack or equipment slot" aria-label="Select idle helmet ID" aria-pressed="false">🔍</button>
+          </div>
+          <div class="mb-tools-boot-value">
+            <label for="minibia-bot-helmet-combat-id">Combat</label>
+            <input type="number" id="minibia-bot-helmet-combat-id" min="1" max="65535" step="1" placeholder="ID" title="Helmet to wear with a selected target" />
+            <button type="button" class="mb-small-button mb-tools-picker" id="minibia-bot-helmet-combat-select" title="Pick combat helmet from a backpack or equipment slot" aria-label="Select combat helmet ID" aria-pressed="false">🔍</button>
+          </div>
+        </div>
+        <span class="mb-tools-inline-status mb-tools-status" id="minibia-bot-helmet-swapper-status" aria-live="polite" hidden></span>
+      </div>
     </div>
 
     <details class="mb-tools-more">
@@ -60981,6 +61719,13 @@ function upgradeSectionHeaders(panel) {
       <button type="button" class="mb-small-button" id="minibia-bot-cave-move-down" title="Move selected waypoint down" aria-label="Move selected waypoint down">▼</button>
       <button type="button" class="mb-small-button" id="minibia-bot-cave-delete-selected" title="Delete selected waypoint" aria-label="Delete selected waypoint" style="background:#5a2020;border-color:#883030;">✕</button>
     </div>
+    <div class="mb-cave-field-row" style="margin-top:5px;">
+      <button type="button" class="mb-small-button" id="minibia-bot-cave-map-pick" aria-pressed="false" title="Click the minimap to place waypoints. Escape to finish.">⌖ Pick on minimap</button>
+      <select id="minibia-bot-cave-map-type" aria-label="Minimap waypoint type" style="flex:1;">
+        <option value="walk">Walk</option><option value="stand">Stand</option><option value="knightbox">Box</option><option value="rope">Rope</option><option value="shovel">Shovel</option><option value="ladder">Ladder</option>
+      </select>
+    </div>
+    <div id="minibia-bot-cave-map-status" class="mb-cave-note" role="status" hidden></div>
     <div id="minibia-bot-cave-waypoint-list"></div>
 
     <details class="mb-cave-compact-fold" id="minibia-bot-cave-waypoint-editor">
@@ -61946,7 +62691,7 @@ function upgradeSectionHeaders(panel) {
             const section=panel.querySelector('#'+id)?.closest('.mb-section');if(section)skillsPanel.appendChild(section);
         }
         equipmentPanel.classList.add('mb-equipment-panel');
-        for(const [id,title] of [['minibia-bot-equip-ring-enabled','💍 Ring Equipper'],['minibia-bot-boots-swapper-enabled','🥾 Boot Swapper']]){
+        for(const [id,title] of [['minibia-bot-equip-ring-enabled','💍 Ring Equipper'],['minibia-bot-boots-swapper-enabled','🥾 Boot Swapper'],['minibia-bot-helmet-swapper-enabled','🪖 Helmet Swapper']]){
             const toggle=panel.querySelector('#'+id),row=toggle?.closest('.mb-tools-control');if(!row)continue;
             const section=document.createElement('div');section.className='mb-section';
             const heading=document.createElement('div');heading.className='mb-section-title';
@@ -62159,6 +62904,7 @@ function upgradeSectionHeaders(panel) {
                 try { refreshFisherStatus?.(); } catch {}
                 try { refreshEquipRingStatus?.(); } catch {}
                 try { refreshBootsSwapperStatus?.(); } catch {}
+                try { refreshHelmetSwapperStatus?.(); } catch {}
                 try { refreshAutoEatStatus?.(); } catch {}
                 try { refreshAutoInvisibleStatus?.(); } catch {}
                 try { refreshAutoMagicShieldStatus?.(); } catch {}
@@ -62235,6 +62981,26 @@ function upgradeSectionHeaders(panel) {
             if (button) button.addEventListener("click", () => {
                 bot.bootsSwapper?.startCaptureBoots?.(mode);
                 refreshBootsSwapperStatus();
+            });
+        }
+
+        // ---- Helmet Swapper ----
+        const helmetToggle = panel.querySelector("#minibia-bot-helmet-swapper-enabled");
+        if (helmetToggle) helmetToggle.addEventListener("change", function () {
+            if (this.checked) bot.helmetSwapper?.start?.();
+            else bot.helmetSwapper?.stop?.();
+            refreshHelmetSwapperStatus();
+        });
+        for (const mode of ["idle", "combat"]) {
+            const input = panel.querySelector(`#minibia-bot-helmet-${mode}-id`);
+            if (input) input.addEventListener("change", function () {
+                bot.helmetSwapper?.updateConfig?.({ [`${mode}Id`]: Number(this.value) });
+                refreshHelmetSwapperStatus();
+            });
+            const button = panel.querySelector(`#minibia-bot-helmet-${mode}-select`);
+            if (button) button.addEventListener("click", () => {
+                bot.helmetSwapper?.startCaptureHelmet?.(mode);
+                refreshHelmetSwapperStatus();
             });
         }
 
@@ -64993,8 +65759,8 @@ function upgradeSectionHeaders(panel) {
         // v1.6.26: waypoint type is selected directly by the button instead of
         // persistent Stand/Rope/Shovel/Ladder checkboxes. All five movement
         // buttons share the same Direction selector and insertion behavior.
-        function addDirectionalCaveWaypoint(type = "walk") {
-            const pos = bot.getPlayerPosition();
+        function addDirectionalCaveWaypoint(type = "walk", mapPosition = null) {
+            const pos = mapPosition || bot.getPlayerPosition();
             if (!pos) {
                 bot.log("Cannot get player position.");
                 return;
@@ -65002,7 +65768,7 @@ function upgradeSectionHeaders(panel) {
 
             const dirSelect = document.getElementById("minibia-bot-cave-direction");
             const dir = dirSelect ? dirSelect.value : "C";
-            const offset = getDirectionOffset(dir);
+            const offset = mapPosition ? {dx:0,dy:0} : getDirectionOffset(dir);
             const x = Number(pos.x) + Number(offset.dx || 0);
             const y = Number(pos.y) + Number(offset.dy || 0);
             const z = Number(pos.z);
@@ -65039,6 +65805,82 @@ function upgradeSectionHeaders(panel) {
             scrollToWaypointIndex(insertIndex, true);
             bot.log(`${labels[kind] || "Walk"} waypoint added at #${insertIndex + 1} (${x}, ${y}, ${z}).`);
         }
+
+        // Minimap route editor. Resolve the live renderer on every event (reconnect-safe).
+        const mapPickButton = panel.querySelector('#minibia-bot-cave-map-pick');
+        const mapPickType = panel.querySelector('#minibia-bot-cave-map-type');
+        const mapPickStatus = panel.querySelector('#minibia-bot-cave-map-status');
+        let mapPicking = false;
+        let pickedCanvas = null;
+        let oldMapCursor = '';
+        function endMinimapPick() {
+            mapPicking = false;
+            if (pickedCanvas) pickedCanvas.style.cursor = oldMapCursor;
+            pickedCanvas = null;
+            mapPickButton?.setAttribute('aria-pressed','false');
+            if (mapPickButton) mapPickButton.textContent = '⌖ Pick on minimap';
+            if (mapPickStatus) mapPickStatus.hidden = true;
+        }
+        function minimapPickPosition(minimap, event) {
+            if (typeof minimap?.__getCanvasCoordinates !== 'function' || typeof minimap?.__coordsToWorldPosition !== 'function') throw new Error('Minimap coordinates unavailable.');
+            const coords = minimap.__getCanvasCoordinates(event);
+            const pos = minimap.__coordsToWorldPosition(coords);
+            // Native walking clamps Z to the player's floor; editing uses the floor being viewed.
+            const z = Number.isInteger(minimap.__renderLayer) ? minimap.__renderLayer : pos?.z;
+            if (!pos || ![pos.x,pos.y,z].every(Number.isInteger) || z < 0 || z > 15) throw new Error('Invalid minimap position.');
+            return {x:pos.x,y:pos.y,z};
+        }
+        function captureMinimapPick(event) {
+            if (!mapPicking) return;
+            const minimap = window.gameClient?.renderer?.minimap;
+            const canvas = minimap?.minimap?.canvas;
+            if (!canvas || event.target !== canvas) return;
+            // Suppress the native autowalk/drag handlers only on the minimap while editing.
+            event.preventDefault(); event.stopImmediatePropagation();
+            if (event.type !== 'click' || event.button !== 0) return;
+            try {
+                const pos = minimapPickPosition(minimap,event);
+                addDirectionalCaveWaypoint(mapPickType?.value || 'walk',pos);
+                mapPickStatus.textContent = `Added at ${pos.x}, ${pos.y}, ${pos.z}. Click more tiles · Esc to finish.`;
+            } catch (error) { mapPickStatus.textContent = error.message; }
+        }
+        function minimapPickKey(event) {
+            if (!mapPicking || event.key !== 'Escape') return;
+            event.preventDefault(); event.stopImmediatePropagation(); endMinimapPick();
+        }
+        mapPickButton?.addEventListener('click',()=>{
+            if (mapPicking) { endMinimapPick(); return; }
+            const minimap = window.gameClient?.renderer?.minimap;
+            const canvas = minimap?.minimap?.canvas;
+            if (!canvas || typeof minimap.__coordsToWorldPosition !== 'function' || typeof minimap.__getCanvasCoordinates !== 'function') {
+                mapPickStatus.hidden = false; mapPickStatus.textContent = 'Minimap unavailable. Log in first.'; return;
+            }
+            mapPicking = true; pickedCanvas = canvas; oldMapCursor = canvas.style.cursor; canvas.style.cursor = 'crosshair';
+            mapPickButton.setAttribute('aria-pressed','true'); mapPickButton.textContent = '■ Finish picking';
+            mapPickStatus.hidden = false; mapPickStatus.textContent = 'Click minimap tiles to add waypoints · Esc to finish.';
+        });
+        const mapPickEvents = ['pointerdown','pointerup','mousedown','mouseup','dblclick','click','touchstart','touchmove','touchend'];
+        for (const type of mapPickEvents) window.addEventListener(type,captureMinimapPick,{capture:true,passive:false});
+        window.addEventListener('keydown',minimapPickKey,true);
+        bot.addCleanup(()=>{
+            endMinimapPick();
+            for (const type of mapPickEvents) window.removeEventListener(type,captureMinimapPick,true);
+            window.removeEventListener('keydown',minimapPickKey,true);
+        });
+
+        worldMapEditor = createWorldMapWaypointEditor(bot, {
+            getSelected: () => selectedWaypointIndex,
+            setSelected: index => {
+                selectedWaypointIndex = index;
+                lastWaypointListKey = null;
+                refreshCaveWaypointList();
+                refreshCaveStatus();
+                refreshCavePresetControls();
+            },
+            endMinimapPick,
+        });
+        bot.mapWaypointEditor = worldMapEditor;
+        bot.addCleanup(worldMapEditor.destroy);
 
         panel.querySelector("#minibia-bot-cave-add-knight-box")?.addEventListener("click", () => addDirectionalCaveWaypoint("knightbox"));
         addBtn?.addEventListener("click", () => addDirectionalCaveWaypoint("walk"));
@@ -65876,6 +66718,7 @@ function upgradeSectionHeaders(panel) {
             refreshCaveStatus();
             refreshEquipRingStatus();
             refreshBootsSwapperStatus();
+            refreshHelmetSwapperStatus();
             refreshTalkStatus();
             refreshVisibleCreatures();
             refreshCavePresetControls();
@@ -65988,6 +66831,7 @@ function upgradeSectionHeaders(panel) {
         refreshCavePresetControls,
         refreshEquipRingStatus,
         refreshBootsSwapperStatus,
+        refreshHelmetSwapperStatus,
         refreshTalkStatus,
         refreshVisibleCreatures,
         refreshCaveClosestStatus,
@@ -69336,7 +70180,7 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
             if (capturing) { cancelCapture(); message("Selection cancelled."); return; }
             cancelPickupCapture();cancelPickupCapture=cancelCapture;
             bot.itemAlertItems?.cancelCapture?.(); bot.itemDropper?.cancelCapture?.();
-            bot.looter?.clearCaptureMode?.(); bot.equipRing?.clearCaptureMode?.(); bot.bootsSwapper?.clearCaptureMode?.();
+            bot.looter?.clearCaptureMode?.(); bot.equipRing?.clearCaptureMode?.(); bot.bootsSwapper?.clearCaptureMode?.();bot.helmetSwapper?.clearCaptureMode?.();
             capturing = true; pick.setAttribute("aria-pressed", "true");
             message(`Click an item to ${allowed?"collect":"ignore"}. Escape cancels.`);
             document.addEventListener("click", captureClick, true);
@@ -69394,7 +70238,7 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
         bind(input,'keydown',event=>{if(event.key==='Enter'){event.preventDefault();saveTyped();}});
         bind(pick,'click',()=>{
             if(capturing){cancelCapture();message('Selection cancelled.');return;}
-            cancelPickupCapture();bot.itemAlertItems?.cancelCapture?.();bot.itemDropper?.cancelCapture?.();bot.looter?.clearCaptureMode?.();bot.equipRing?.clearCaptureMode?.();bot.bootsSwapper?.clearCaptureMode?.();
+            cancelPickupCapture();bot.itemAlertItems?.cancelCapture?.();bot.itemDropper?.cancelCapture?.();bot.looter?.clearCaptureMode?.();bot.equipRing?.clearCaptureMode?.();bot.bootsSwapper?.clearCaptureMode?.();bot.helmetSwapper?.clearCaptureMode?.();
             capturing=true;cancelPickupCapture=cancelCapture;pick.setAttribute('aria-pressed','true');message('Click the item to prioritize. Escape cancels.');
             document.addEventListener('click',captureClick,true);document.addEventListener('keydown',captureKey,true);
             timer=setTimeout(()=>{cancelCapture();message('Item selection timed out.');},20000);
@@ -69600,6 +70444,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         ["cave", "minibiaBot.cave.config"],
         ["equipRing", "minibiaBot.equipRing.config"],
         ["bootsSwapper", "minibiaBot.bootsSwapper.config"],
+        ["helmetSwapper", "minibiaBot.helmetSwapper.config"],
         ["eat", "minibiaBot.eat.config"],
         ["conjureFood", "minibiaBot.conjureFood.config"],
         ["talk", "minibiaBot.talk.config"],
@@ -69852,6 +70697,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         currentBundle.installSpecialAreasModule(bot);
         currentBundle.installEquipRingModule(bot);
         currentBundle.installBootsSwapperModule(bot);
+        currentBundle.installHelmetSwapperModule(bot);
         currentBundle.installAutoEatModule(bot);
         currentBundle.installConjureFoodModule(bot);
         currentBundle.installTalkModule(bot);
@@ -69934,6 +70780,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
             specialAreas: bot.specialAreas?.status?.(),
             equipRing: bot.equipRing.status(),
             bootsSwapper: bot.bootsSwapper.status(),
+            helmetSwapper: bot.helmetSwapper.status(),
             eat: bot.eat.status(),
             conjureFood: bot.conjureFood.status(),
             talk: bot.talk.status(),
@@ -69963,6 +70810,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
                 ["runeShooter", "minibiaBot.runeShooter.config"],
                 ["equipRing", "minibiaBot.equipRing.config"],
         ["bootsSwapper", "minibiaBot.bootsSwapper.config"],
+        ["helmetSwapper", "minibiaBot.helmetSwapper.config"],
                 ["eat", "minibiaBot.eat.config"],
                 ["conjureFood", "minibiaBot.conjureFood.config"],
                 ["talk", "minibiaBot.talk.config"],
@@ -70154,7 +71002,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
             version: bot.version,
             character: characterName || "(global)",
             modules: ["pz", "xray", "panic", "rune", "heal", "invisible", "haste", "magicShield",
-                "attack", "cave", "equipRing", "bootsSwapper", "eat", "talk", "ui"]
+                "attack", "cave", "equipRing", "bootsSwapper", "helmetSwapper", "eat", "talk", "ui"]
         });
         console.log("minibiaBot.reload()");
         return bot;
