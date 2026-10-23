@@ -4151,7 +4151,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.395",
+        version: "1.6.397",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -16164,6 +16164,44 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
     const OFFSCREEN_HUNT_PAUSE_REASON = "offscreen-hunt";
 
+    let knightBoxReach = null;
+    function filterKnightBoxMonsters(monsters, now=Date.now()) {
+        const from=normalizePosition(bot.getPlayerPosition());
+        if(!from)return [];
+        const key=`${from.x},${from.y},${from.z}:${bot.specialAreas?.getRevision?.() || 0}`;
+        let reachable=null;
+        function connected(pos) {
+            if(!reachable){
+                if(knightBoxReach?.key===key && knightBoxReach.expires>now)reachable=knightBoxReach.tiles;
+                else {
+                    const tiles=new Set([`${from.x},${from.y}`]),queue=[from];
+                    const offsets=[[0,-1],[1,0],[0,1],[-1,0],[-1,-1],[1,-1],[-1,1],[1,1]];
+                    for(let i=0;i<queue.length&&i<1200;i++){
+                        const p=queue[i];
+                        for(const [dx,dy] of offsets){
+                            const next={x:p.x+dx,y:p.y+dy,z:from.z},k=`${next.x},${next.y}`;
+                            if(tiles.has(k)||Math.max(Math.abs(next.x-from.x),Math.abs(next.y-from.y))>14)continue;
+                            if(!isSafeTargetApproachTile(next.x,next.y,next.z,true)||isFloorChangeTile(getTileAtPosition(next))||!isTargetingStepPolicyAllowed(p,next))continue;
+                            // Do not find a fake route through two touching wall corners.
+                            if(dx&&dy&&(!isSafeTargetApproachTile(p.x+dx,p.y,p.z,true)||!isSafeTargetApproachTile(p.x,p.y+dy,p.z,true)))continue;
+                            tiles.add(k);queue.push(next);
+                        }
+                    }
+                    knightBoxReach={key,tiles,expires:now+500};reachable=tiles;
+                }
+            }
+            return reachable.has(`${pos.x},${pos.y}`);
+        }
+        return monsters.filter(creature=>{
+            const pos=normalizePosition(creature?.getPosition?.()||creature?.__position);
+            if(!pos||pos.z!==from.z)return false;
+            if(getTargetLineOfSightInfo(creature).clear===true)return true;
+            // Ignore creatures for geometry: a monster blocked by its own pack
+            // still belongs to this fight. Walls and floor changes do not.
+            return connected(pos);
+        });
+    }
+
     function isKnightBoxFinishing() {
         const policy=bot.cave?.getKnightBoxPolicy?.();
         return policy?.active===true&&policy.phase==='fight'&&policy.targeting===true;
@@ -26077,11 +26115,11 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         probeKnightBoxBlocker: from => probeIgnoredTrapEscape(from,true),
         getKnightBoxMonsters: () => {
             const visible=Object.values(window.gameClient?.world?.activeCreatures||{}).filter(c=>isNativeVisibleMonster(c,true)&&!isConfiguredIgnoredCreature(c));
-            if(!isKnightBoxFinishing())return visible;
+            if(!isKnightBoxFinishing())return filterKnightBoxMonsters(visible);
             const runners=getOffscreenHuntCandidates().filter(isKnightBoxRunner);
             const active=getActiveOffscreenHuntTarget();
             const hunting=active&&isKnownMonsterForOffscreenHunt(active)&&isKnightBoxRunner(active)&&!isIgnoredTargetCreature(active)&&!isOffscreenHuntTargetSkipped(active,Date.now())?[active]:[];
-            return [...new Map([...visible,...runners,...hunting].map(c=>[c.id,c])).values()];
+            return filterKnightBoxMonsters([...new Map([...visible,...runners,...hunting].map(c=>[c.id,c])).values()]);
         },
         getCurrentTarget,
         getCurrentFollowTarget,
@@ -36211,7 +36249,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             knightBoxState.targeting=true;publishKnightBox();
             if(!bot.attack?.isRunning?.())bot.attack?.start?.();
             const monsters=bot.attack?.getKnightBoxMonsters?.()||[];
-            if(monsters.length||bot.attack?.isCombatActive?.())knightBoxState.quietAt=null;
+            if(monsters.length)knightBoxState.quietAt=null;
             else if(knightBoxState.quietAt===null)knightBoxState.quietAt=now;
             if(knightBoxState.quietAt!==null&&now-knightBoxState.quietAt>=1000){
                 const completed=state.currentIndex;advanceWaypoint();knightBoxState.index=state.currentIndex;
@@ -52707,7 +52745,14 @@ window.__minibiaBotBundle.installClientEvents = function installClientEvents(bot
         hook(handler, "handlePropertyChange", "stats", args => {
             const packet = args[0], p = window.gameClient?.player;
             const props = typeof CONST !== "undefined" ? CONST.PROPERTIES || {} : {};
-            if (!p || Number(packet?.guid) !== Number(p.id)) return null;
+            if (!p) return null;
+            if (Number(packet?.guid) !== Number(p.id)) {
+                const creature = window.gameClient?.world?.getCreature?.(packet?.guid);
+                if (typeof CONST !== 'undefined' && creature?.type === CONST.TYPES?.PLAYER && bot.support?.status?.().running &&
+                    [props.HEALTH,props.HEALTH_MAX,props.MANA,props.MANA_MAX].filter(v=>v!=null).includes(packet.property))
+                    emit('friend-stats',{id:packet.guid,property:packet.property});
+                return null;
+            }
             const selected = [props.HEALTH, props.HEALTH_MAX, props.MANA, props.MANA_MAX].filter(v => v != null);
             return selected.includes(packet.property) ? { property: packet.property } : null;
         });
@@ -55601,7 +55646,7 @@ window.__minibiaBotBundle.installSupportModule = function installSupportModule(b
         const name=String(current.name||'').trim();if(!name||(rule.target&&normalizeName(rule.target)!==normalizeName(name)))return false;
         const percent=resourcePercent(current,rule.resource);if(percent==null||percent>=rule.threshold)return false;
         const item=resolvedItem(rule),last=state.lastByRule.get(rule.id),kindLast=state.lastByKind.get(item.kind);
-        if((last!=null&&now-last<rule.cooldownMs)||(kindLast&&now-kindLast.at<kindLast.cooldownMs)||onCooldown(item.kind))return false;
+        if((last!=null&&now-last<rule.cooldownMs)||(kindLast&&now-kindLast.at<250)||onCooldown(item.kind))return false;
         const source=item.kind==='spell'?null:findSource(item);if(item.kind!=='spell'&&!source)return false;
         state.actionInProgress=true;
         try{
@@ -55662,15 +55707,33 @@ window.__minibiaBotBundle.installSupportModule = function installSupportModule(b
     function scheduleNextTick() {
         if (!state.running) return;
         if (state.timerId) clearTimeout(state.timerId);
-        state.timerId = setTimeout(tick, 500);
+        state.timerId = setTimeout(tick, 100);
     }
 
+    let offSupportEvents = null;
+    function attachSupportEvents() {
+        if (offSupportEvents || !bot.clientEvents?.subscribe) return;
+        offSupportEvents = bot.clientEvents.subscribe(['friend-stats','stats','cooldown','supplies','creatures','session'],()=>{
+            if (!state.running) return;
+            bot.clientEvents.queue('support-heal',()=>{
+                if (!state.running) return;
+                if (state.timerId != null) clearTimeout(state.timerId);
+                state.timerId = null;
+                tick();
+            });
+        });
+    }
+    function detachSupportEvents() {
+        offSupportEvents?.(); offSupportEvents = null;
+        bot.clientEvents?.cancel?.('support-heal');
+    }
     function start() {
         if (state.running) return false;
         config.enabled = true;
         persistConfig();
         state.running = true;
         logImportant('Started');
+        attachSupportEvents();
         tick();
         return true;
     }
@@ -55678,6 +55741,7 @@ window.__minibiaBotBundle.installSupportModule = function installSupportModule(b
     function stop(options = {}) {
         const persist = options.persistEnabled !== false;
         state.running = false;
+        detachSupportEvents();
         state.actionInProgress = false;
         if (state.timerId) {
             clearTimeout(state.timerId);
