@@ -4151,7 +4151,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.389",
+        version: "1.6.390",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -57287,6 +57287,7 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
     let disposed = false, player = null, client = null, handler = null, hooks = [], lastClock = Date.now(), lastSave = 0;
     let session = null, liveXp = null, lastXp = null, fetchController = null, priceNote = '', ui = null;
     let definitions = null, names = new Map(), catalog = new Map(), ringBases = new Map();
+    let ringTimer = null, ringTimerSource = null;
     let moves = [], ringRemovals = [], countBaseline = new Map(), requestedCountsFor = null;
     const savedSession = bot.storage.get(SESSION_KEY, null);
     let restored = false, revision = 0, priceRevision = 0;
@@ -57484,9 +57485,49 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
         moves.push({ at: Date.now(), player, from, to: move ? locationAt(bytes, 9) : null,
             count: move ? whole(bytes[17]) : 1, item, move, corpse: isCorpse(source) });
     }
+    // Use the same monotonic clock as Equipment.setTimers / its timer overlay.
+    const ringClock = () => typeof performance !== 'undefined' && typeof performance.now === 'function' ? performance.now() : Date.now();
+    function countTimedRing(cycle = ringTimer) {
+        if (!cycle || cycle.counted || cycle.cancelled || cycle.session !== session || !active()) return;
+        if (ringClock() < cycle.deadline) return;
+        addItem(session.supplies, cycle.item, 1); cycle.counted = true;
+    }
+    function observeRingTimer() {
+        const eq = window.gameClient?.player?.equipment, worn = peek(eq, ringSlot());
+        const timer = eq?.__timers?.[ringSlot()];
+        if (ringTimer && ringTimer.worn === worn) countTimedRing();
+        if (!worn || !active()) { ringTimer = null; ringTimerSource = timer || null; return; }
+        if (timer === ringTimerSource) {
+            if (ringTimer?.worn !== worn) ringTimer = null;
+            return; // Never apply an old slot timer to a newly equipped ring.
+        }
+        ringTimerSource = timer || null;
+        if (!timer || !(Number(timer.seconds) > 0) || !Number.isFinite(Number(timer.ts))) return;
+        const item = identify(worn); if (!item) return;
+        // The ring equipment slot is authoritative even for incomplete item metadata.
+        item.ring = true;
+        const previous = ringTimer;
+        const deadline = Number(timer.ts) + Number(timer.seconds) * 1000;
+        // Regular server resyncs update one ring cycle. A replacement creates
+        // a new equipped Item even when its CID/SID match the previous ring.
+        if (previous?.worn === worn && !previous.cancelled && !previous.counted) {
+            previous.deadline = deadline; previous.item = item; return;
+        }
+        if (previous?.worn === worn && previous.counted) return;
+        ringTimer = {worn,item,deadline,session,counted:false,cancelled:false};
+        countTimedRing();
+    }
+    function captureRingChange() {
+        observeRingTimer();
+        const worn = peek(window.gameClient?.player?.equipment, ringSlot());
+        return ringTimer?.worn === worn ? ringTimer : null;
+    }
     function captureRemove(packet) {
+        const cycle = captureRingChange();
         const container = getContainer(packet?.containerIndex), item = peek(container, Number(packet?.slotIndex));
-        return { container, item: identify(item), beforeCount: countOf(item), slot: Number(packet?.slotIndex),
+        const identity = identify(item);
+        if (identity && Number(packet?.containerIndex) === equipmentId() && Number(packet?.slotIndex) === ringSlot()) identity.ring = true;
+        return { container, cycle, item: identity, beforeCount: countOf(item), slot: Number(packet?.slotIndex),
             id: Number(packet?.containerIndex), at: Date.now(), player };
     }
     function onRemove(packet, before) {
@@ -57496,6 +57537,7 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
         const matched = moves.find(m => m.move && !m.used && m.from.containerId === before.id && m.from.slot === before.slot && keyOf(m.item) === keyOf(before.item));
         if (matched) {
             matched.used = true;
+            if (before.cycle) before.cycle.cancelled = true;
             if (matched.corpse && matched.to && !matched.to.ground && isInventory(getContainer(matched.to.containerId), matched.to.containerId)) {
                 matched.sourceCount = count; confirmLoot(matched);
             }
@@ -57510,8 +57552,9 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
         }
     }
     function captureAdd(packet) {
+        const cycle = captureRingChange();
         const item = peek(getContainer(packet?.containerId), Number(packet?.slot));
-        return { item: identify(item), count: countOf(item) };
+        return { item: identify(item), count: countOf(item), cycle };
     }
     function onAdd(packet, before) {
         if (!active()) return;
@@ -57531,14 +57574,17 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
             // An unequipped ring appearing in a bag, or base->active transform,
             // proves transfer. Replacing an expired ring with another identical
             // active ring still counts the expired one.
-            if (Number(packet.containerId) !== equipmentId() || Number(packet.itemId) !== pending.item.cid) pending.cancelled = true;
+            if (Number(packet.containerId) !== equipmentId() || Number(packet.itemId) !== pending.item.cid) { pending.cancelled = true; if (pending.cycle) pending.cycle.cancelled = true; }
         }
     }
     function settleRings() {
         const now = Date.now();
         ringRemovals = ringRemovals.filter(pending => {
             if (now - pending.at < 850) return true;
-            if (!pending.cancelled && pending.session === session && active()) addItem(session.supplies, pending.item, pending.count);
+            if (!pending.cancelled && !pending.cycle?.counted && pending.session === session && active()) {
+                addItem(session.supplies, pending.item, pending.count);
+                if (pending.cycle) pending.cycle.counted = true;
+            }
             return false;
         });
     }
@@ -57737,7 +57783,7 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
         advanceClock(); save(); unhook();
         client = gc; player = p; handler = ph; spellbook = book;
         craftJobs = []; craftGains = []; lastCraftAck.clear(); externalRuneGains = []; tradeOffers.clear();
-        moves = []; ringRemovals = []; countBaseline.clear(); requestedCountsFor = null;
+        moves = []; ringRemovals = []; ringTimer = null; ringTimerSource = null; countBaseline.clear(); requestedCountsFor = null;
         liveXp = lastXp = null; lastClock = Date.now();
         rebuildCatalog();
         const owner = ownerOf(p);
@@ -57757,6 +57803,7 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
         hook(ph, 'handleServerMessage', args => onMessage(args[0]));
         hook(ph, 'handleTradeOffer', args => learnOffers(args[0]));
         hook(book, 'serverCastSpell', args => onCraftAck(args[0]));
+        hook(ph, 'handleEquipmentTimers', () => observeRingTimer(), captureRingChange);
         hook(ph, 'handleContainerItemRemove', (args, before) => onRemove(args[0], before), captureRemove);
         hook(ph, 'handleContainerAddItem', (args, before) => onAdd(args[0], before), captureAdd);
         // Record before sending: a synchronous test client may apply the ACK
@@ -57765,9 +57812,9 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
         const modal = gc?.interface?.modalManager?.get?.('offer-modal');
         if (modal?.__offers?.length) learnOffers({ id: modal.__id, offers: modal.__offers });
     }
-    function pause() { advanceClock(); if (session) session.recording = false; ringRemovals = []; craftJobs = []; craftGains = []; externalRuneGains = []; lastXp = liveXp; save(); revision++; render(); }
+    function pause() { advanceClock(); if (session) session.recording = false; ringRemovals = []; ringTimer = null; ringTimerSource = null; craftJobs = []; craftGains = []; externalRuneGains = []; lastXp = liveXp; save(); revision++; render(); }
     function resume() { bind(); advanceClock(); if (session) session.recording = true; lastXp = liveXp; lastClock = Date.now(); countBaseline.clear(); requestedCountsFor = null; seedSupplyCounts(); save(); revision++; render(); }
-    function reset() { bind(); if (!player) return; session = freshSession(ownerOf(player)); moves = []; ringRemovals = []; craftJobs = []; craftGains = []; externalRuneGains = []; lastCraftAck.clear(); lastXp = liveXp; lastClock = Date.now(); countBaseline.clear(); requestedCountsFor = null; seedSupplyCounts(); save(); revision++; render(); }
+    function reset() { bind(); if (!player) return; session = freshSession(ownerOf(player)); moves = []; ringRemovals = []; ringTimer = null; ringTimerSource = null; craftJobs = []; craftGains = []; externalRuneGains = []; lastCraftAck.clear(); lastXp = liveXp; lastClock = Date.now(); countBaseline.clear(); requestedCountsFor = null; seedSupplyCounts(); save(); revision++; render(); }
     const offCounts = bot.subscribeItemCounts?.(onCount);
 
     // ---- Hunt Analyzer panel ----
@@ -57976,7 +58023,7 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
     function tick() {
         if (disposed) return;
         try {
-            bind(); advanceClock(); rebuildCatalog(); settleRings(); pruneMoves(); pruneCrafts(); seedSupplyCounts();
+            bind(); advanceClock(); rebuildCatalog(); observeRingTimer(); settleRings(); pruneMoves(); pruneCrafts(); seedSupplyCounts();
             // Only seed from the client model on binding. It can lag behind the
             // authoritative EXPERIENCE packet, so polling must never roll XP back.
             if (liveXp == null) liveXp = lastXp = readXp();
@@ -57984,7 +58031,7 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
         } catch (error) { bot.log?.('[Hunt Analyzer]', error.message); }
     }
     bot.huntAnalyzer = { status, pause, resume, reset, setPrice, priceFor, refreshPrices, mount, config, overlayEnabled, setOverlayEnabled, renderOverlay };
-    bind(); seedSupplyCounts();
+    bind(); seedSupplyCounts(); observeRingTimer();
     if (config.overlayEnabled) bot.uiTweaks?.applyTTL?.();
     if (!Object.keys(window.gameClient?.npcTrades || {}).length && window.gameClient) refreshPrices();
     const timer = setInterval(tick, 1000);
