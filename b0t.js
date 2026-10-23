@@ -4151,7 +4151,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.381",
+        version: "1.6.382",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -8611,6 +8611,7 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
         return {
             enabled: rule.enabled !== false,
             condition:rule.condition==='paralyzed'?'paralyzed':'always',
+            skipWhileTargeting: rule.skipWhileTargeting === true,
             ...(Number.isFinite(Number(rule.cooldownMs))&&rule.cooldownMs!=null?{cooldownMs:Math.max(250,Number(rule.cooldownMs))}:{}),
             source: getRuleSource(rule),
             ...(legacyCooldownSlot ? { legacyCooldownSlot } : {}),
@@ -8693,6 +8694,12 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
     delete config.minMana;
 
     function isParalyzed(){const id=typeof ConditionManager!=='undefined'?ConditionManager.prototype.PARALYZE:16;return !!window.gameClient?.player?.hasCondition?.(id);}
+    function matchesRuleCondition(rule) {
+        if (rule.condition !== "paralyzed") return true;
+        if (!isParalyzed()) return false;
+        const player = window.gameClient?.player;
+        return !rule.skipWhileTargeting || !(player?.getTarget?.() || player?.__target);
+    }
     function migrateParalyzeRule(){
         if(!Object.hasOwn(config,'paralyzeEnabled')&&!Object.hasOwn(config,'paralyzeSpellWords'))return false;
         const words=String(config.paralyzeSpellWords||'').trim();
@@ -9112,7 +9119,7 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
 
     function canUseRule(rule, now, stats) {
         if (!rule || rule.enabled === false) return false;
-        if(rule.condition==='paralyzed'&&!isParalyzed())return false;
+        if (!matchesRuleCondition(rule)) return false;
         const source = getRuleSource(rule);
         var slot = normalizeHotbarSlot(rule.slot);
         if (source === "hotbar" && !slot) return false;
@@ -9199,7 +9206,7 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
 
         if (source === "spell") {
             var sent = bot.actions.runShared('self-heal-spell',
-                bot.actions.priorities.HEAL, () => bot.sendChat(resolveHealSpell(rule.spellWords).words));
+                bot.actions.priorities.HEAL, () => matchesRuleCondition(rule) && bot.sendChat(resolveHealSpell(rule.spellWords).words));
             if (sent) {
                 state.manualCooldownUntil[key] = now + config.healCooldownMs;
                 state.lastAttemptAt[key] = now;
@@ -9217,7 +9224,7 @@ window.__minibiaBotBundle.installHealModule = function installHealModule(bot) {
         }
 
         var clicked = bot.actions.runShared(source === "item" ? 'self-heal-item' : 'self-heal-hotbar',
-            bot.actions.priorities.HEAL, () => source === "item" ? useSpecificItem(rule) : bot.clickHotbar(slot - 1));
+            bot.actions.priorities.HEAL, () => matchesRuleCondition(rule) && (source === "item" ? useSpecificItem(rule) : bot.clickHotbar(slot - 1)));
         if (clicked) {
             state.manualCooldownUntil[key] = now + config.healCooldownMs;
             state.lastAttemptAt[key] = now;
@@ -58183,6 +58190,8 @@ function upgradeSectionHeaders(panel) {
             const group = document.getElementById(`minibia-bot-heal-${mode}-fields`);
             if (group) { group.hidden = source !== mode; group.style.display = source === mode ? "grid" : "none"; }
         }
+        const paralyzeOptions = document.getElementById("minibia-bot-heal-paralyze-options");
+        if (paralyzeOptions) paralyzeOptions.hidden = document.getElementById("minibia-bot-heal-condition")?.value !== "paralyzed";
         setHealRuleError();
     }
 
@@ -58207,6 +58216,7 @@ function upgradeSectionHeaders(panel) {
         const source = value("source") || "hotbar";
         return {
             source,condition:value("condition")==='paralyzed'?'paralyzed':'always',
+            skipWhileTargeting: value("condition") === "paralyzed" && document.getElementById("minibia-bot-heal-skip-target")?.checked === true,
             slot: number("slot"),
             spellWords: source === "spell" ? String(value("spell")).trim() : "",
             manaCost: source === "spell" ? number("manacost") : 0,
@@ -58220,6 +58230,7 @@ function upgradeSectionHeaders(panel) {
         const normalized = bot.heal.normalizeRule(rule);
         document.getElementById("minibia-bot-heal-source").value = normalized.source;
         document.getElementById("minibia-bot-heal-condition").value = normalized.condition||"always";
+        document.getElementById("minibia-bot-heal-skip-target").checked = normalized.skipWhileTargeting;
         document.getElementById("minibia-bot-heal-slot").value = normalized.slot;
         document.getElementById("minibia-bot-heal-spell").value = normalized.spellWords;
         document.getElementById("minibia-bot-heal-manacost").value = normalized.manaCost;
@@ -58270,7 +58281,7 @@ function upgradeSectionHeaders(panel) {
                 const spell = bot.heal.resolveSpell(rule.spellWords);
                 label.textContent = `${spell.name ? spell.name + " · " : ""}${spell.words} (${rule.manaCost} MP)`;
             }
-            if(rule.condition==='paralyzed')label.textContent='🧊 Paralyzed · '+label.textContent;
+            if(rule.condition==='paralyzed')label.textContent='🧊 Paralyzed · '+(rule.skipWhileTargeting?'No target · ':'')+label.textContent;
             label.style.cssText = "font-weight:bold;color:#d4c48a;";
             info.appendChild(label);
             const hp = document.createElement("span");
@@ -58317,6 +58328,7 @@ function upgradeSectionHeaders(panel) {
         const newRule = {
             enabled: old?.enabled !== false,
             source: values.source,condition:values.condition,
+            skipWhileTargeting: values.skipWhileTargeting,
             ...(old?.cooldownMs!=null?{cooldownMs:old.cooldownMs}:{}),
             ...(old?.legacyCooldownSlot && values.source === old.source ? { legacyCooldownSlot: old.legacyCooldownSlot } : {}),
             slot: values.source === "hotbar" ? values.slot : old?.slot || 1,
@@ -61570,6 +61582,10 @@ function upgradeSectionHeaders(panel) {
         </select>
       </label>
       <label class="mb-field" style="margin-bottom:6px"><span class="mb-field-label">When</span><select id="minibia-bot-heal-condition"><option value="always">HP / MP ranges match</option><option value="paralyzed">Paralyzed + HP / MP ranges match</option></select></label>
+      <div id="minibia-bot-heal-paralyze-options" hidden style="margin-bottom:8px;">
+        <label class="mb-toggle"><input type="checkbox" id="minibia-bot-heal-skip-target"><span>Don't cure paralyze while targeting</span></label>
+        <div class="mb-small-note">Skip this rule while you have a target. Other healing rules still run.</div>
+      </div>
       <div id="minibia-bot-heal-hotbar-fields" style="display:grid;grid-template-columns:1fr;gap:6px;margin-bottom:6px;">
         <label class="mb-field" for="minibia-bot-heal-slot"><span class="mb-field-label">Hotbar Slot</span><input type="number" id="minibia-bot-heal-slot" min="1" max="12" value="1" /></label>
       </div>
@@ -65454,6 +65470,7 @@ function upgradeSectionHeaders(panel) {
         // Heal UI
         const healSource = panel.querySelector("#minibia-bot-heal-source");
         healSource?.addEventListener("change", refreshHealRuleFields);
+        panel.querySelector("#minibia-bot-heal-condition")?.addEventListener("change", refreshHealRuleFields);
         const healSpell = panel.querySelector("#minibia-bot-heal-spell");
         healSpell?.addEventListener("change", () => {
             const spell = bot.heal.resolveSpell(healSpell.value);
