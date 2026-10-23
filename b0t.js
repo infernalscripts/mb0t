@@ -4151,7 +4151,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.390",
+        version: "1.6.392",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -7634,11 +7634,11 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
             const requestInterval = Math.max(2000, Number(config.itemAlertsRefreshMs) || 5000);
             if (now - lastRequest >= requestInterval) {
                 state.itemCountRequestAt = now;
-                bot.itemAlertItems.request(config.itemAlerts);
+                bot.itemAlertItems.request(config.itemAlerts.filter(a => a && a.enabled !== false));
             }
 
             for (const a of config.itemAlerts) {
-                if (!a || !Number.isFinite(a.id) || !a.threshold) continue;
+                if (!a || a.enabled === false || !Number.isFinite(a.id) || !a.threshold) continue;
 
                 // v1.6.35: built-in alerts always use the shared server count.
                 // Ordinary items are the exact (CID, 0) pair; fluid alerts keep
@@ -7727,7 +7727,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
             config.noTargetBeep ||
             config.lowCapBeep ||
             config.alphaMonsterBeep ||
-            (config.itemAlerts && config.itemAlerts.length > 0));
+            (config.itemAlerts && config.itemAlerts.some(a => a && a.enabled !== false)));
     }
 
     function start() {
@@ -7839,6 +7839,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
             next.itemAlerts = next.itemAlerts
                 .map(a => ({
                         id: Number(a?.id),
+                        enabled: a?.enabled !== false,
                         ...(Number.isInteger(Number(a?.sid)) && Number(a.sid)>0 && Number(a.sid)<=65535 ? {sid:Number(a.sid)} : {}),
                         fluidType: Math.max(0, Math.trunc(Number(a?.fluidType) || 0)),
                         name: String(a?.name || "").trim() || `Item ${a?.id}`,
@@ -57288,6 +57289,7 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
     let session = null, liveXp = null, lastXp = null, fetchController = null, priceNote = '', ui = null;
     let definitions = null, names = new Map(), catalog = new Map(), ringBases = new Map();
     let ringTimer = null, ringTimerSource = null;
+    let supplyUses = [];
     let moves = [], ringRemovals = [], countBaseline = new Map(), requestedCountsFor = null;
     const savedSession = bot.storage.get(SESSION_KEY, null);
     let restored = false, revision = 0, priceRevision = 0;
@@ -57466,6 +57468,17 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
         const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
         return bytes[offset] === 0 ? { containerId: view.getUint32(offset + 3, true), slot: bytes[offset + 7] } : { ground: true };
     }
+    function recordFluidUse(item) {
+        if (!item || ![7,10].includes(item.fluidType)) return;
+        supplyUses = supplyUses.filter(use => use.player === player && use.session === session && Date.now()-use.at < 4000).slice(-31);
+        const key = `${item.cid}:${item.fluidType}`;
+        // Preserve a known pre-use total even when this analyzer has just started.
+        if (!countBaseline.has(key)) {
+            const reading = bot.getItemCountReading?.(item.cid,item.fluidType);
+            if (reading && number(reading.count) != null) countBaseline.set(key,whole(reading.count));
+        }
+        supplyUses.push({item,at:Date.now(),player,session});
+    }
     function observeSend(packet) {
         if (!active()) return;
         const bytes = packet?.buffer; if (!(bytes instanceof Uint8Array)) return;
@@ -57477,10 +57490,15 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
             if (item?.type === 'rune' && offer?.type === 'sell') externalRuneGains.push({ cid: item.cid, count: whole(bytes[6]), at: Date.now() });
             return;
         }
+        if (ops.HOTBAR_USE != null && opcode === ops.HOTBAR_USE && bytes.length >= 9) {
+            if (bytes[1] <= 3) recordFluidUse(identify({id:new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength).getUint16(2,true),fluidType:bytes[4]}));
+            return;
+        }
         if (!move && ![ops.THING_USE, ops.THING_USE_WITH, ops.THING_USE_ON_CREATURE].filter(v => v != null).includes(opcode)) return;
         const from = locationAt(bytes, 1); if (!from || from.ground) return;
         const source = getContainer(from.containerId), item = identify(peek(source, from.slot));
         if (!item) return;
+        if (!move) recordFluidUse(item);
         pruneMoves();
         moves.push({ at: Date.now(), player, from, to: move ? locationAt(bytes, 9) : null,
             count: move ? whole(bytes[17]) : 1, item, move, corpse: isCorpse(source) });
@@ -57605,12 +57623,25 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
             }
         }
         const seedUntil = Number(window.gameClient?.networkManager?.__supplySeedExpect?.[key]) || 0;
-        if (!active() || previous == null || count >= previous || Date.now() < seedUntil) return;
+        if (!active() || previous == null || count >= previous) return;
+        supplyUses = supplyUses.filter(use => use.player === player && use.session === session && Date.now()-use.at < 4000);
+        const uses = supplyUses.filter(use => use.item.cid === cid && use.item.fluidType === fluid);
+        const matchingMove = moves.some(move => move.move && move.player === player && keyOf(move.item) === keyOf(uses[0]?.item || {}) && Date.now()-move.at < 4000);
+        const confirmedFluidUses = [7,10].includes(fluid) && !matchingMove ? Math.min(previous-count,uses.length) : 0;
+        // Container refreshes mark counts as solicited, even when caused by
+        // drinking a fluid. A matching use + authoritative decrease confirms it.
+        if (Date.now() < seedUntil && !confirmedFluidUses) return;
         const item = identify({ id: cid, fluidType: fluid });
         if (!item || item.ring || !(item.type === 'rune' || fluid === 7 || fluid === 10 || /potion/i.test(item.name))) return;
         // Only unsolicited server count decreases are consumption. Bag moves,
         // selling, dropping and refresh requests seed counts silently.
-        addItem(session.supplies, item, previous - count);
+        const spent = Date.now() < seedUntil ? confirmedFluidUses : previous-count;
+        addItem(session.supplies, item, spent);
+        let remaining = spent;
+        supplyUses = supplyUses.filter(use => {
+            if (remaining > 0 && use.item.cid === cid && use.item.fluidType === fluid) { remaining--; return false; }
+            return true;
+        });
     }
     function pruneCrafts() {
         const now = Date.now();
@@ -57783,7 +57814,7 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
         advanceClock(); save(); unhook();
         client = gc; player = p; handler = ph; spellbook = book;
         craftJobs = []; craftGains = []; lastCraftAck.clear(); externalRuneGains = []; tradeOffers.clear();
-        moves = []; ringRemovals = []; ringTimer = null; ringTimerSource = null; countBaseline.clear(); requestedCountsFor = null;
+        moves = []; supplyUses = []; ringRemovals = []; ringTimer = null; ringTimerSource = null; countBaseline.clear(); requestedCountsFor = null;
         liveXp = lastXp = null; lastClock = Date.now();
         rebuildCatalog();
         const owner = ownerOf(p);
@@ -57812,9 +57843,9 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
         const modal = gc?.interface?.modalManager?.get?.('offer-modal');
         if (modal?.__offers?.length) learnOffers({ id: modal.__id, offers: modal.__offers });
     }
-    function pause() { advanceClock(); if (session) session.recording = false; ringRemovals = []; ringTimer = null; ringTimerSource = null; craftJobs = []; craftGains = []; externalRuneGains = []; lastXp = liveXp; save(); revision++; render(); }
+    function pause() { advanceClock(); if (session) session.recording = false; supplyUses = []; ringRemovals = []; ringTimer = null; ringTimerSource = null; craftJobs = []; craftGains = []; externalRuneGains = []; lastXp = liveXp; save(); revision++; render(); }
     function resume() { bind(); advanceClock(); if (session) session.recording = true; lastXp = liveXp; lastClock = Date.now(); countBaseline.clear(); requestedCountsFor = null; seedSupplyCounts(); save(); revision++; render(); }
-    function reset() { bind(); if (!player) return; session = freshSession(ownerOf(player)); moves = []; ringRemovals = []; ringTimer = null; ringTimerSource = null; craftJobs = []; craftGains = []; externalRuneGains = []; lastCraftAck.clear(); lastXp = liveXp; lastClock = Date.now(); countBaseline.clear(); requestedCountsFor = null; seedSupplyCounts(); save(); revision++; render(); }
+    function reset() { bind(); if (!player) return; session = freshSession(ownerOf(player)); moves = []; supplyUses = []; ringRemovals = []; ringTimer = null; ringTimerSource = null; craftJobs = []; craftGains = []; externalRuneGains = []; lastCraftAck.clear(); lastXp = liveXp; lastClock = Date.now(); countBaseline.clear(); requestedCountsFor = null; seedSupplyCounts(); save(); revision++; render(); }
     const offCounts = bot.subscribeItemCounts?.(onCount);
 
     // ---- Hunt Analyzer panel ----
@@ -58040,7 +58071,7 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
     bot.addCleanup(() => {
         advanceClock(); settleRings(); save(); disposed = true; clearInterval(timer); fetchController?.abort(); offCounts?.(); unhook();
         overlayRow?.remove(); overlayRow = null; bot.uiTweaks?.applyTTL?.();
-        window.removeEventListener('pagehide', onPageHide); ui?.host.remove(); ui = null; moves = []; ringRemovals = []; countBaseline.clear();
+        window.removeEventListener('pagehide', onPageHide); ui?.host.remove(); ui = null; moves = []; supplyUses = []; ringRemovals = []; countBaseline.clear();
         craftJobs = []; craftGains = []; lastCraftAck.clear(); externalRuneGains = []; tradeOffers.clear(); spellbook = null;
     });
 };
@@ -67600,6 +67631,20 @@ function upgradeSectionHeaders(panel) {
                 const row = document.createElement("div");
                 row.className = "mb-list-row";
                 row.style.cssText = "display:flex;justify-content:space-between;align-items:center;padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.05);";
+                const enabled = document.createElement("input");
+                enabled.type = "checkbox";
+                enabled.checked = a.enabled !== false;
+                enabled.setAttribute("aria-label", `Enable ${a.name || "item count"} alert`);
+                enabled.title = "Enable this alert";
+                enabled.style.cssText = "flex:0 0 auto;margin:0;";
+                enabled.addEventListener("change", () => {
+                    const current = (bot.panic.config.itemAlerts || []).slice();
+                    const index = current.findIndex(item => bot.itemAlertItems.key(item) === bot.itemAlertItems.key(a));
+                    if (index < 0) return;
+                    current[index] = { ...current[index], enabled: enabled.checked };
+                    bot.panic.updateConfig({ itemAlerts: current });
+                    refreshPanicItemAlertsList();
+                });
                 const label = document.createElement("span");
                 const fluidSuffix = Number(a.fluidType) > 0 ? ` fluid ${a.fluidType}` : "";
                 label.textContent = `${a.name} (${a.sid?`SID ${a.sid}`:a.id}${fluidSuffix}) — alert below ${a.threshold}`;
@@ -67628,6 +67673,7 @@ function upgradeSectionHeaders(panel) {
                 actions.appendChild(makeAudioTestButton(a.name || "item count",()=>bot.panic?.testAudio?.("itemLow",{message:`Sound test: ${a.name || "item count"}`,type:`audio-item-${idx}`})));
                 actions.appendChild(editBtn);
                 actions.appendChild(removeBtn);
+                row.appendChild(enabled);
                 row.appendChild(label);
                 row.style.gap = "8px";
                 row.appendChild(actions);
