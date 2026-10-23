@@ -4151,7 +4151,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.393",
+        version: "1.6.395",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -12465,7 +12465,48 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         return isHoleTile(tile) || tileHasNamedThing(tile, "rope spot");
     }
 
+    let kiteStepInFlight = null;
+    const rejectedKiteTiles = new Map();
+    const kiteTileKey = pos => pos ? `${Number(pos.x)},${Number(pos.y)},${Number(pos.z)}` : '';
+    function kiteTileRejected(pos, now = Date.now()) {
+        const key = kiteTileKey(pos), until = rejectedKiteTiles.get(key) || 0;
+        if (until > now) return true;
+        rejectedKiteTiles.delete(key); return false;
+    }
+    function rejectKiteTile(pos, now = Date.now()) {
+        if (!pos) return;
+        rejectedKiteTiles.set(kiteTileKey(pos),now+4000);
+        while (rejectedKiteTiles.size>32) rejectedKiteTiles.delete(rejectedKiteTiles.keys().next().value);
+    }
+    function waitForKiteStep(now=Date.now()) {
+        const step=kiteStepInFlight;
+        if (!step) return false;
+        const pos=normalizePosition(bot.getPlayerPosition());
+        if (kiteTileKey(pos)!==kiteTileKey(step.from)) {kiteStepInFlight=null;return false;}
+        if (now-step.at<1200) return true;
+        // No server progress on an unpredicted player-through-player step.
+        rejectKiteTile(step.to,now); kiteStepInFlight=null;
+        stopKiteAutoWalk('Kite step did not advance'); return false;
+    }
+    const offKiteMovement = bot.clientEvents?.subscribe(['movement-cancel','session'],event=>{
+        if(event.type==='session'){kiteStepInFlight=null;rejectedKiteTiles.clear();return;}
+        if(!state.running || !config.kiteMode)return;
+        const from=normalizePosition(event.position || bot.getPlayerPosition());
+        let next=kiteStepInFlight?.to;
+        const path=state.manualPursuitAutoWalkPathPositions || [];
+        if(!next && (['kite','pull'].includes(window.gameClient?.__mbTargetingAutoWalkOwner) || /kite|lure-pull/.test(state.movementOwner || ''))) {
+            const index=path.findIndex(p=>kiteTileKey(p)===kiteTileKey(from));
+            const candidate=path[index+1];
+            if(candidate && getChebyshevDistance(from,candidate)===1)next=candidate;
+        }
+        if(!next)return;
+        rejectKiteTile(next);kiteStepInFlight=null;
+        stopKiteAutoWalk('Kite step rejected by server');
+    });
+    bot.addCleanup(()=>{offKiteMovement?.();kiteStepInFlight=null;rejectedKiteTiles.clear();});
+
     function isSafeTileForKite(pos) {
+        if (kiteTileRejected(pos)) return false;
         if (!pos)
             return false;
         const tile = getTileAtPosition(pos);
@@ -12869,7 +12910,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         return Math.max(dx,dy)>0 ? Math.min(dx,dy)/Math.max(dx,dy) : 0;
     }
     function isDiagonalKiteStepPending() {
-        if (!isDiagonalKiteEnabled() && !config.kiteLureMode) return false;
+        if (waitForKiteStep()) return true;
         const player=window.gameClient?.player;
         player?.prunePreWalks?.();
         return !!player?.isMoving?.() || (Array.isArray(player?.__preWalks) && player.__preWalks.length>0);
@@ -13393,6 +13434,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         options = {}
     ) {
         if (bot.autoPickup?.ownsMovement?.()) return false;
+        if (waitForKiteStep(now)) return true;
         if (
             !candidate ||
             candidate.direction === null ||
@@ -13434,6 +13476,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 : options.mode === "position" ? "position" : "away";
 
         let moved = false;
+        const firstStep = playerPos ? {x:playerPos.x+Number(candidate.dx || 0),y:playerPos.y+Number(candidate.dy || 0),z:playerPos.z} : null;
+        if (firstStep && kiteTileRejected(firstStep,now)) return false;
+        const occupants = firstStep ? getTileAtPosition(firstStep)?.monsters : null;
+        const playerStep = firstStep && [...(occupants?.values?.() || [])].some(c=>c && c!==window.gameClient?.player && c.type===CONST.TYPES.PLAYER);
         let finalDistance =
             candidate.nextTargetDist;
 
@@ -13557,6 +13603,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         if (!moved)
             return false;
 
+        if (playerStep && !kiteTileRejected(firstStep,now)) kiteStepInFlight={from:{...playerPos},to:firstStep,at:now};
         state.lastKiteMoveAt = now;
         state.lastKiteMoveReason =
             reason || "kite";
@@ -14091,6 +14138,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function syncKite(now) {
+        if (waitForKiteStep(now)) return true;
         if (bot.autoPickup?.ownsMovement?.()) return false;
         if (!config.kiteMode)
             return false;
@@ -24772,6 +24820,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function stop(options = {}) {
+        kiteStepInFlight=null;rejectedKiteTiles.clear();
         clearIgnoredTrapEscape("Targeting stopped");
         clearCombatRuleMode();
         const shouldPersist = options.persistEnabled !== false;
@@ -57473,8 +57522,8 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
         const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
         return bytes[offset] === 0 ? { containerId: view.getUint32(offset + 3, true), slot: bytes[offset + 7] } : { ground: true };
     }
-    function recordFluidUse(item) {
-        if (!item || ![7,10].includes(item.fluidType)) return;
+    function recordSupplyUse(item) {
+        if (!item || !(item.type === 'rune' || [7,10].includes(item.fluidType) || /potion/i.test(item.name))) return;
         supplyUses = supplyUses.filter(use => use.player === player && use.session === session && Date.now()-use.at < 4000).slice(-31);
         const key = `${item.cid}:${item.fluidType}`;
         // Preserve a known pre-use total even when this analyzer has just started.
@@ -57496,14 +57545,14 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
             return;
         }
         if (ops.HOTBAR_USE != null && opcode === ops.HOTBAR_USE && bytes.length >= 9) {
-            if (bytes[1] <= 3) recordFluidUse(identify({id:new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength).getUint16(2,true),fluidType:bytes[4]}));
+            if (bytes[1] <= 3) recordSupplyUse(identify({id:new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength).getUint16(2,true),fluidType:bytes[4]}));
             return;
         }
         if (!move && ![ops.THING_USE, ops.THING_USE_WITH, ops.THING_USE_ON_CREATURE].filter(v => v != null).includes(opcode)) return;
         const from = locationAt(bytes, 1); if (!from || from.ground) return;
         const source = getContainer(from.containerId), item = identify(peek(source, from.slot));
         if (!item) return;
-        if (!move) recordFluidUse(item);
+        if (!move) recordSupplyUse(item);
         pruneMoves();
         moves.push({ at: Date.now(), player, from, to: move ? locationAt(bytes, 9) : null,
             count: move ? whole(bytes[17]) : 1, item, move, corpse: isCorpse(source) });
@@ -57632,15 +57681,15 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
         supplyUses = supplyUses.filter(use => use.player === player && use.session === session && Date.now()-use.at < 4000);
         const uses = supplyUses.filter(use => use.item.cid === cid && use.item.fluidType === fluid);
         const matchingMove = moves.some(move => move.move && move.player === player && keyOf(move.item) === keyOf(uses[0]?.item || {}) && Date.now()-move.at < 4000);
-        const confirmedFluidUses = [7,10].includes(fluid) && !matchingMove ? Math.min(previous-count,uses.length) : 0;
+        const confirmedSupplyUses = !matchingMove ? Math.min(previous-count,uses.length) : 0;
         // Container refreshes mark counts as solicited, even when caused by
-        // drinking a fluid. A matching use + authoritative decrease confirms it.
-        if (Date.now() < seedUntil && !confirmedFluidUses) return;
+        // drinking a fluid or using a rune. Match the use to the server decrease.
+        if (Date.now() < seedUntil && !confirmedSupplyUses) return;
         const item = identify({ id: cid, fluidType: fluid });
         if (!item || item.ring || !(item.type === 'rune' || fluid === 7 || fluid === 10 || /potion/i.test(item.name))) return;
         // Only unsolicited server count decreases are consumption. Bag moves,
         // selling, dropping and refresh requests seed counts silently.
-        const spent = Date.now() < seedUntil ? confirmedFluidUses : previous-count;
+        const spent = Date.now() < seedUntil ? confirmedSupplyUses : previous-count;
         addItem(session.supplies, item, spent);
         let remaining = spent;
         supplyUses = supplyUses.filter(use => {
