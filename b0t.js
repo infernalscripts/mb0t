@@ -4151,7 +4151,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.387",
+        version: "1.6.389",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -4218,6 +4218,7 @@ addCleanup(() => {
                 this.talk.stop({
                     persistEnabled: false
                 });
+            this.corpseLooter?.stop?.({ persistEnabled: false });
             if (this.looter?.stop)
                 this.looter.stop();
             if (this.depositer?.stop)
@@ -7065,6 +7066,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
                         equipShouldRestore: !!bot.paladin?.status?.().equipRunning,
                     },
                 looter: getSharedGmModuleSnapshot(bot.looter),
+                corpseLooter: getSharedGmModuleSnapshot(bot.corpseLooter),
             },
         };
     }
@@ -7074,6 +7076,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         // AutoPickup first so its movement-pause ownership is released before
         // CaveBot itself is stopped.
         try { bot.autoPickup?.stop?.({ persistEnabled: false }); } catch (e) {}
+        try { bot.corpseLooter?.stop?.({ persistEnabled: false }); } catch (e) {}
         try { bot.looter?.stop?.({ persistEnabled: false }); } catch (e) {}
         try { bot.runeShooter?.stop?.({ persistEnabled: false }); } catch (e) {}
         try { bot.rune?.stop?.({ persistEnabled: false }); } catch (e) {}
@@ -7227,6 +7230,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         }
 
         restoreSharedGmModule("Looter", bot.looter, modules.looter);
+        restoreSharedGmModule("Loot distant corpses", bot.corpseLooter, modules.corpseLooter);
         restoreSharedGmModule("AutoPickup", bot.autoPickup, modules.autoPickup);
 
         if (snapshot.panicRunning) {
@@ -43252,7 +43256,7 @@ window.__minibiaBotBundle.installAntiBotMonitorModule = function installAntiBotM
         safely("action halt", () => bot.actions?.halt?.());
         safely("reconnect disable", () => bot.reconnect?.disable?.());
         safely("restart cancellation", () => bot.gmKillSwitch?.cancel?.("Anti-Bot window close"));
-        for (const name of ["followingItemGuard", "gmChatMonitor", "autoPickup", "looter", "cave", "attack",
+        for (const name of ["followingItemGuard", "gmChatMonitor", "autoPickup", "corpseLooter", "looter", "cave", "attack",
                             "runeShooter", "rune", "heal", "invisible", "haste", "magicShield", "equipRing", "bootsSwapper", "helmetSwapper",
                             "itemDropper", "eat", "conjureFood", "paladin", "slimeTrainer", "monkTrainer", "talk",
                             "antiAfk", "fisher", "woodcutting", "mining", "smithing", "cooking", "comboBot", "holdTarget"]) {
@@ -46918,6 +46922,8 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
 
     const state = {
         running: false,
+        runtimeRunning: false,
+        disposed: false,
         timerId: null,
         destinationId: null,
         destinationTitle: null,
@@ -46949,9 +46955,8 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         corpseApproachLastReason: null,
         corpseAdjacentSkips: 0,
 
-        // v1.5.66: if normal movement naturally brings us beside a queued
-        // corpse, native auto-open already gets its chance. Remove that corpse
-        // immediately so distant-loot logic never backtracks to it later.
+        // Nearby queued corpses still need an acknowledged open and loot pass.
+        // Retain legacy counters in diagnostics for saved integrations.
         corpsePassedAdjacentConsumes: 0,
         corpsePassedAdjacentLastKey: null,
         corpsePassedAdjacentLastAt: 0,
@@ -47001,6 +47006,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
     };
 
     const looterContainerCache = new Map();
+    const corpseOpenClaims = new Map();
 
     // Load config
     const stored = bot.storage.get(configStorageKey, {});
@@ -47216,6 +47222,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
 
     const unsubscribeLooterContainerAcks = bot.containerAcks?.subscribe?.(event => {
         if (!event || event.ok === false) return;
+        observeCorpseContainerAck(event);
         const id = Number(event.containerId);
         if (!Number.isFinite(id)) return;
         for (const [key, entry] of Array.from(looterContainerCache.entries())) {
@@ -47375,17 +47382,17 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
 
     function getCorpseTileInfo(pos) {
         const tile = getTileAtPosition(pos);
-        if (!tile)
+        if (!tile) return null;
+        // Use the actual stack index, including a corpse below a loose item.
+        if (Array.isArray(tile.items)) {
+            for (let index = tile.items.length - 1; index >= 0; index--) {
+                const item = tile.items[index];
+                if (isCorpseContainerItem(item)) return { tile, item, index };
+            }
             return null;
-
-        const topItem = getTopTileItem(tile);
-        if (!isCorpseContainerItem(topItem))
-            return null;
-
-        return {
-            tile,
-            item: topItem
-        };
+        }
+        const item = getTopTileItem(tile);
+        return isCorpseContainerItem(item) ? { tile, item, index: 0xFF } : null;
     }
 
     function getOpenContainerIds() {
@@ -48350,8 +48357,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                 Number.isFinite(distance) &&
                 distance <= 1
             ) {
-                state.corpseAdjacentSkips++;
-                return false;
+                return true;
             }
         }
 
@@ -48419,7 +48425,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
 
         bot.log(
             success
-                ? "Looter: corpse looting finished"
+                ? (job.nativeHandoff ? "Corpse walking: handed off to native auto-loot" : "Looter: corpse looting finished")
                 : "Looter: corpse approach ended",
             {
                 reason,
@@ -48558,7 +48564,8 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         now = Date.now()
     ) {
         if (
-            !state.running ||
+            !state.runtimeRunning ||
+            corpseActionsBlocked() ||
             !creature
         ) {
             return false;
@@ -48587,15 +48594,6 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             state.nearbyCorpseReadyUntil=Math.max(state.nearbyCorpseReadyUntil,now+750);
         if (!state.walkToCorpses)
             return false;
-
-        // v1.5.49: if the monster dies on an adjacent tile, do not create a
-        // movement-ownership job at all. The game's normal corpse auto-open
-        // and existing Looter container scan can handle it without pausing
-        // CaveBot or Targeting.
-        if (Number.isFinite(distance) && distance <= 1) {
-            state.corpseAdjacentSkips++;
-            return false;
-        }
 
         if (
             !Number.isFinite(distance) ||
@@ -48632,12 +48630,6 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         while (state.corpseQueue.length >= 64)
             state.corpseQueue.shift();
 
-        // Final invariant: corpse walking NEVER queues adjacent corpses.
-        if (distance <= 1) {
-            state.corpseAdjacentSkips++;
-            return false;
-        }
-
         state.corpseQueue.push({
             key,
             monsterId: creature.id,
@@ -48648,6 +48640,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                 z: Number(pos.z)
             },
             deathAt: now,
+            baselineAckSeq: Number(bot.containerAcks?.snapshot?.()) || 0,
             notBefore:
                 now + state.corpseOpenDelayMs,
             expiresAt:
@@ -48661,7 +48654,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         state.corpseDeathsQueued++;
 
         bot.log(
-            `Looter v${bot.version}: queued distant corpse`,
+            `Looter v${bot.version}: queued ${distance <= 1 ? "nearby" : "distant"} corpse`,
             {
                 id: creature.id,
                 name:
@@ -48810,7 +48803,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
     }
 
     function ensureDeathHookOwnership() {
-        if (!state.running)
+        if (!state.runtimeRunning)
             return false;
 
         const handler =
@@ -48861,13 +48854,13 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             typeof handler.handlePropertyChange !== "function"
         ) {
             if (
-                state.running &&
+                state.runtimeRunning &&
                 state.deathHookRetryTimer == null
             ) {
                 state.deathHookRetryTimer =
                     window.setTimeout(() => {
                         state.deathHookRetryTimer = null;
-                        if (state.running)
+                        if (state.runtimeRunning)
                             installDeathHook();
                     }, 500);
             }
@@ -48886,7 +48879,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
 
             try {
                 if (
-                    state.running &&
+                    state.runtimeRunning &&
                     packet?.property ===
                         CONST.PROPERTIES.HEALTH &&
                     Number(packet?.value) === 0
@@ -49155,98 +49148,110 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         return true;
     }
 
-    function consumeNaturallyAdjacentQueuedCorpses(
-        now = Date.now()
-    ) {
-        if (
-            !state.walkToCorpses ||
-            !state.corpseQueue.length
-        ) {
-            return 0;
+    function prioritizeNearbyQueuedCorpses(now = Date.now()) {
+        if (!state.walkToCorpses || !state.corpseQueue.length) return;
+        const pos = bot.getPlayerPosition(); if (!pos) return;
+        // Passing a corpse is not evidence of opening it. Service nearby jobs
+        // first, without sending a walk or pausing Targeting.
+        const index = state.corpseQueue.findIndex(candidate => candidate?.position &&
+            Number(candidate.position.z) === Number(pos.z) && now <= candidate.expiresAt &&
+            Math.max(Math.abs(candidate.position.x-pos.x), Math.abs(candidate.position.y-pos.y)) <= 1);
+        if (index > 0) state.corpseQueue.unshift(state.corpseQueue.splice(index, 1)[0]);
+    }
+
+    function corpseHasWantedItems(container) {
+        if (!container) return false;
+        for (let slot=0; slot<container.size; slot++) if (shouldLootItem(container.getSlotItem?.(slot))) return true;
+        return false;
+    }
+
+    function observeCorpseContainerAck(event) {
+        const job = state.corpseJob;
+        if (!job || event.source !== 'server' || event.ok === false) return;
+        const pos = bot.getPlayerPosition();
+        const beside = pos && Number(pos.z) === Number(job.position.z) &&
+            Math.max(Math.abs(pos.x-job.position.x),Math.abs(pos.y-job.position.y)) <= 1;
+        if (beside && event.kind === 'open' && Number(event.seq) > Number(job.baselineAckSeq || 0) &&
+            Number(event.cid || event.container?.id) === Number(job.corpseCid) &&
+            event.container && getContainerById(event.containerId) === event.container && isCorpseLootSource(event.container)) {
+            const claim = corpseOpenClaims.get(event.seq);
+            if (claim && claim !== job.key) return;
+            corpseOpenClaims.set(event.seq, job.key);
+            while (corpseOpenClaims.size > 128) corpseOpenClaims.delete(corpseOpenClaims.keys().next().value);
+            job.openedContainerId = Number(event.containerId);
+            job.openedContainer = event.container;
+            job.openAckSeq = Number(event.seq);
+            job.lootStartedAt = job.lootStartedAt || Date.now();
+            job.lootDeadlineAt = job.lootDeadlineAt || Date.now() + state.corpseLootHoldMs;
+            job.lastContainerActivityAt = Date.now();
         }
-
-        const playerPos =
-            bot.getPlayerPosition();
-
-        if (!playerPos)
-            return 0;
-
-        const playerX =
-            Number(playerPos.x);
-        const playerY =
-            Number(playerPos.y);
-        const playerZ =
-            Number(playerPos.z);
-
-        if (
-            !Number.isFinite(playerX) ||
-            !Number.isFinite(playerY) ||
-            !Number.isFinite(playerZ)
-        ) {
-            return 0;
+        if (job.openedContainerId != null && Number(event.containerId) === Number(job.openedContainerId) &&
+            (!event.container || event.container === job.openedContainer)) {
+            if (['open','remove','add','transform'].includes(event.kind)) job.lastContainerActivityAt = Date.now();
+            if (['open','remove','add'].includes(event.kind) && event.container)
+                job.emptySince = corpseHasWantedItems(event.container) ? 0 : job.emptySince || Date.now();
         }
+    }
 
-        let removed = 0;
-
-        state.corpseQueue =
-            state.corpseQueue.filter(
-                candidate => {
-                    const pos =
-                        candidate?.position;
-
-                    if (
-                        !pos ||
-                        Number(pos.z) !==
-                            playerZ
-                    ) {
-                        return true;
-                    }
-
-                    const distance =
-                        Math.max(
-                            Math.abs(
-                                Number(pos.x) -
-                                playerX
-                            ),
-                            Math.abs(
-                                Number(pos.y) -
-                                playerY
-                            )
-                        );
-
-                    if (
-                        !Number.isFinite(distance) ||
-                        distance > 1
-                    ) {
-                        return true;
-                    }
-
-                    removed++;
-                    state.nearbyCorpseReadyUntil=Math.max(state.nearbyCorpseReadyUntil,now+750);
-                    state.corpseAdjacentSkips++;
-                    state.corpsePassedAdjacentConsumes++;
-                    state.corpsePassedAdjacentLastKey =
-                        candidate.key || null;
-                    state.corpsePassedAdjacentLastAt =
-                        now;
-
-                    bot.log(
-                        "Looter: passed queued corpse – removed from approach queue",
-                        {
-                            monster:
-                                candidate.monsterName ||
-                                "Monster",
-                            position:
-                                candidate.position,
-                            distance
-                        }
-                    );
-
+    function updateAdjacentCorpse(job, corpseInfo, now) {
+        if (!job.arrivedAdjacentAt) {
+            job.arrivedAdjacentAt = now;
+            job.openDeadlineAt = now + Math.max(4000, Math.min(8000, state.corpseLootHoldMs));
+            clearCorpseApproachMovement(job);
+            bot.log('Looter: beside corpse; waiting for confirmed open', {monster:job.monsterName,position:job.position});
+        }
+        if (corpseInfo && job.openedContainerId == null) job.corpseCid = Number(corpseInfo.item.id);
+        // Native auto-open may already have replied, even when the protocol
+        // container id was reused. An old unrelated corpse window is not proof.
+        if (job.openedContainerId == null) {
+            for (const event of bot.containerAcks?.recent?.(64) || []) observeCorpseContainerAck(event);
+        }
+        if (job.openedContainerId != null) {
+            const container = getContainerById(job.openedContainerId);
+            if (container !== job.openedContainer || !isCorpseLootSource(container)) {
+                const nativeHandoff = !state.running && !!job.openAckSeq;
+                job.nativeHandoff = nativeHandoff;
+                finishCorpseJob(nativeHandoff || !!job.emptySince, nativeHandoff ? 'corpse opened for native auto-loot' : job.emptySince ? 'corpse loot confirmed' : 'corpse window closed before loot finished');
+                return false;
+            }
+            if (!state.running) {
+                // The server owns premium loot selection, destinations and moves.
+                // An acknowledged open is the handoff, not proof that every item
+                // was collected. Leave a short quiet window for native updates.
+                job.nativeHandoff = true;
+                if (now - job.lootStartedAt >= 750 && now - job.lastContainerActivityAt >= 500) {
+                    finishCorpseJob(true, 'corpse opened for native auto-loot');
                     return false;
                 }
-            );
-
-        return removed;
+                if (now > job.lootDeadlineAt) { finishCorpseJob(true, 'corpse opened for native auto-loot'); return false; }
+                return true;
+            }
+            job.nativeHandoff = false;
+            moveItems(container);
+            const pending = state.pendingMove && Number(state.pendingMove.sourceId) === Number(container.__containerId);
+            if (!corpseHasWantedItems(container) && !pending) {
+                job.emptySince = job.emptySince || now;
+                if (now - job.emptySince >= 250) { finishCorpseJob(true, 'corpse loot confirmed'); return false; }
+            } else job.emptySince = 0;
+            if (now > job.lootDeadlineAt) { finishCorpseJob(false, 'corpse loot timeout; eligible items remain or move unconfirmed'); return false; }
+            return true;
+        }
+        if (now > job.openDeadlineAt) { finishCorpseJob(false, 'corpse open not confirmed'); return false; }
+        if (!corpseInfo || job.openAttempts >= 3 || (job.lastOpenAt && now-job.lastOpenAt < 1800)) return true;
+        const open = () => {
+            const pos = bot.getPlayerPosition(), current = getCorpseTileInfo(job.position);
+            if (!state.runtimeRunning || state.corpseJob !== job || corpseActionsBlocked() || !pos ||
+                Number(pos.z) !== Number(job.position.z) || Math.max(Math.abs(pos.x-job.position.x),Math.abs(pos.y-job.position.y)) > 1 ||
+                !current || current.item !== corpseInfo.item || typeof ItemUsePacket !== 'function' || !window.gameClient?.send ||
+                window.gameClient.networkManager?.isConnected?.() === false) return false;
+            job.corpseCid = Number(current.item.id);
+            job.lastOpenAt = Date.now(); job.openAttempts++;
+            window.gameClient.send(new ItemUsePacket({which:current.tile,index:current.index}));
+            return true;
+        };
+        const sent = bot.actions?.runShared ? bot.actions.runShared('looter-open-corpse',bot.actions.priorities.UTILITY,open) : open();
+        if (sent) bot.log('Looter: opening corpse', {monster:job.monsterName,position:job.position,attempt:job.openAttempts});
+        return true;
     }
 
     function startNextCorpseJob(
@@ -49256,20 +49261,10 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             state.corpseJob ||
             !state.walkToCorpses ||
             !state.corpseQueue.length ||
-            bot.actions?.isHalted?.()
+            corpseActionsBlocked()
         ) {
             return false;
         }
-
-        // Never pause CaveBot/Targeting while combat is still happening.
-        const combatGate =
-            getCorpseCombatGate(
-                now,
-                true
-            );
-
-        if (!combatGate.clear)
-            return false;
 
         // Drop stale/dead candidates until we find a real corpse tile.
         while (state.corpseQueue.length) {
@@ -49319,24 +49314,9 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                 )
             );
 
-            // Re-check right before ownership. The corpse may have been distant
-            // when queued but the player can naturally reach it during the
-            // short death->corpse delay. In that case normal looting should
-            // continue with ZERO CaveBot/Targeting pause.
-            if (distance <= 1) {
-                state.corpseQueue.shift();
-                state.corpseAdjacentSkips++;
-                bot.log(
-                    "Looter: corpse already adjacent – no approach needed",
-                    {
-                        monster:
-                            candidate.monsterName,
-                        position:
-                            candidate.position
-                    }
-                );
-                continue;
-            }
+            // Walking is between fights. A nearby corpse only needs an open
+            // and loot pass, so it can be serviced while Targeting continues.
+            if (distance > 1 && !getCorpseCombatGate(now,true).clear) return false;
 
             if (distance > state.corpseMaxDistance) {
                 state.corpseQueue.shift();
@@ -49348,8 +49328,10 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                 getCorpseTileInfo(candidate.position);
 
             // Corpse item-add may arrive a little after HEALTH=0.
-            if (!corpseInfo)
-                return false;
+            if (!corpseInfo) {
+                if (now-candidate.deathAt < 2000) return false;
+                state.corpseQueue.shift(); state.corpseJobsFailed++; continue;
+            }
 
             state.corpseQueue.shift();
 
@@ -49395,7 +49377,11 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                 lastWalkReason: null,
                 baselineContainerIds:
                     getOpenContainerIds(),
+                corpseCid: Number(corpseInfo.item.id),
                 openedContainerId: null,
+                openedContainer: null,
+                openAttempts: 0,
+                lastOpenAt: 0,
                 caveWasRunning: false,
                 attackWasRunning: false,
                 cavePausedByLooter: false,
@@ -49410,7 +49396,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                     false
                 );
 
-            if (!ownershipCombatGate.clear) {
+            if (distance > 1 && !ownershipCombatGate.clear) {
                 state.corpseQueue.unshift(
                     candidate
                 );
@@ -49427,7 +49413,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             state.corpseJobsStarted++;
 
             bot.log(
-                "Looter: walking to distant corpse",
+                distance > 1 ? "Looter: walking to distant corpse" : "Looter: servicing nearby corpse",
                 {
                     monster:
                         job.monsterName,
@@ -49437,6 +49423,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                 }
             );
 
+            if (distance <= 1) { updateAdjacentCorpse(job, corpseInfo, now); return true; }
             if (!walkAdjacentToCorpse(job, now)) {
                 finishCorpseJob(
                     false,
@@ -49459,9 +49446,9 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             return false;
 
         if (
-            !state.running ||
+            !state.runtimeRunning ||
             !state.walkToCorpses ||
-            bot.actions?.isHalted?.()
+            corpseActionsBlocked()
         ) {
             finishCorpseJob(
                 false,
@@ -49501,13 +49488,11 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             return false;
         }
 
-        const combatGate =
-            getCorpseCombatGate(
-                now,
-                false
-            );
+        const adjacent = livePlayerPos && Number(livePlayerPos.z) === Number(job.position.z) &&
+            Math.max(Math.abs(livePlayerPos.x-job.position.x),Math.abs(livePlayerPos.y-job.position.y)) <= 1;
+        const combatGate = getCorpseCombatGate(now,false);
 
-        if (!combatGate.clear) {
+        if (!adjacent && !combatGate.clear) {
             deferCorpseJobForCombat(
                 job,
                 combatGate,
@@ -49517,7 +49502,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         }
 
         if (
-            now >
+            !job.arrivedAdjacentAt && now >
             Number(
                 job.approachDeadlineAt ||
                 (
@@ -49537,6 +49522,9 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             getCorpseTileInfo(
                 job.position
             );
+
+        if (adjacent) return updateAdjacentCorpse(job, corpseInfo, now);
+        if (job.arrivedAdjacentAt) { finishCorpseJob(false,'moved away from corpse before loot finished'); return false; }
 
         if (!corpseInfo) {
             // Give the death/item update a brief moment before deciding the
@@ -49560,33 +49548,6 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
 
         if (!playerPos)
             return true;
-
-        const dx = Math.abs(
-            Number(job.position.x) -
-            Number(playerPos.x)
-        );
-        const dy = Math.abs(
-            Number(job.position.y) -
-            Number(playerPos.y)
-        );
-
-        const adjacent =
-            dx <= 1 &&
-            dy <= 1 &&
-            Number(playerPos.z) ===
-                Number(job.position.z);
-
-        if (adjacent) {
-            // v1.5.58: walking beside the corpse is the ENTIRE job.
-            // No container wait, no loot hold, no corpse ownership after
-            // arrival. Native auto-open and the normal Looter loop continue
-            // independently after CaveBot movement is released.
-            finishCorpseJob(
-                true,
-                "arrived beside corpse"
-            );
-            return false;
-        }
 
         noteCorpseApproachProgress(
             job,
@@ -49630,7 +49591,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
     // re-sending every slot before acknowledgement can duplicate requests and
     // repeatedly target the same empty destination slot.
     function hasPendingLoot(now = Date.now()) {
-        if (!state.running || bot.actions?.isHalted?.()) return false;
+        if (!state.runtimeRunning || corpseActionsBlocked()) return false;
         if (state.corpseJob || now<state.nearbyCorpseReadyUntil) return true;
         const player=bot.getPlayerPosition();
         if (state.walkToCorpses && player && state.corpseQueue.some(entry=> {
@@ -49638,9 +49599,10 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             if (!pos || now>entry.expiresAt || Number(pos.z)!==Number(player.z) ||
                 isCorpseCombatAbandoned(entry.key,now)) return false;
             const distance=Math.max(Math.abs(pos.x-player.x),Math.abs(pos.y-player.y));
-            return Number.isFinite(distance) && distance>1 && distance<=state.corpseMaxDistance;
+            return Number.isFinite(distance) && distance<=state.corpseMaxDistance;
         })) return true;
         if (state.pendingMove && now-state.pendingMove.at<5000 && isPendingLootMoveAllowed(state.pendingMove)) return true;
+        if (!state.running) return false;
         const dest=getDestinationContainer();
         const overflow=dest?resolveLootDestination(dest,now):null;
         const canStore=overflow&&(overflow.dest||overflow.waiting||overflow.expandable);
@@ -49656,10 +49618,10 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         });
     }
 
-    function moveItems() {
+    function moveItems(onlyContainer = null) {
         if (
             !state.running ||
-            bot.actions?.isHalted?.() ||
+            corpseActionsBlocked() ||
             bot.autoPickup?.isBusy?.()
         ) {
             return false;
@@ -49779,6 +49741,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         // Explicit Drop rules override blacklist exclusion, but sources still
         // must be corpses and container items are always excluded.
         for (const container of containers) {
+            if (onlyContainer && container !== onlyContainer) continue;
             if (!isCorpseLootSource(container)) continue;
             for (
                 let slot = 0;
@@ -49825,6 +49788,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         }
 
         for (const container of containers) {
+            if (onlyContainer && container !== onlyContainer) continue;
             if (
                 overflow.tree.includes(container) || !isCorpseLootSource(container)
             ) {
@@ -49989,19 +49953,27 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         return false;
     }
 
+    function corpseActionsBlocked() {
+        return state.disposed || bot.actions?.isHalted?.() || bot.gmKillSwitch?.isActive?.() || bot.pauseHotkey?.isPaused?.();
+    }
+
     function tick() {
-        if (!state.running)
+        if (!state.runtimeRunning)
             return;
         try {
             const now = Date.now();
 
+            if (corpseActionsBlocked()) {
+                state.corpseQueue = [];
+                state.nearbyCorpseReadyUntil = 0;
+                if (state.corpseJob) finishCorpseJob(false, 'corpse actions paused');
+                return;
+            }
             if (bot.followingItemGuard?.isHolding?.()) return;
             ensureDeathHookOwnership();
 
-            // This runs even during combat. If CaveBot/Targeting naturally
-            // walks us beside any queued corpse, native auto-open has already
-            // had its opportunity, so that corpse must never cause backtracking.
-            consumeNaturallyAdjacentQueuedCorpses(
+            // Nearby corpses are prioritized, never discarded just for passing.
+            prioritizeNearbyQueuedCorpses(
                 now
             );
 
@@ -50021,13 +49993,13 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
     }
 
     function scheduleNextTick(delayOverride = null) {
-        if (!state.running)
+        if (!state.runtimeRunning)
             return;
 
         if (state.timerId !== null)
             window.clearTimeout(state.timerId);
 
-        const delay = Number.isFinite(
+        const delay = delayOverride != null && Number.isFinite(
             Number(delayOverride)
         )
             ? Math.max(
@@ -50047,15 +50019,15 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         }, delay);
     }
 
-    function start() {
-        if (state.running)
-            return false;
-        state.running = true;
+    function startRuntime() {
+        if (state.runtimeRunning || state.disposed) return false;
+        state.runtimeRunning = true;
         state.pendingMove = null;
         state.nearbyCorpseReadyUntil = 0;
         resetLooterContainerCache();
         state.corpseQueue = [];
         state.corpseJob = null;
+        corpseOpenClaims.clear();
         state.corpseApproachStalls = 0;
         state.corpseApproachSideSwitches = 0;
         state.corpseApproachNoRoute = 0;
@@ -50084,7 +50056,6 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         state.corpseCombatLastAbandonedKey = null;
         state.corpseCombatLastAbandonedAt = 0;
         installDeathHook();
-        bot.log("Looter started");
         tick();
         return true;
     }
@@ -50097,9 +50068,9 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         state.captureMode = false;
     }
 
-    function stop() {
+    function stopRuntime() {
         resetOverflow();
-        state.running = false;
+        state.runtimeRunning = false;
         state.pendingMove = null;
         state.nearbyCorpseReadyUntil = 0;
         looterContainerCache.clear();
@@ -50138,13 +50109,50 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             window.clearTimeout(state.timerId);
             state.timerId = null;
         }
+        return true;
+    }
+
+    function start() {
+        if (state.disposed || state.running) return false;
+        state.running = true;
+        state.pendingMove = null;
+        resetLooterContainerCache();
+        if (!startRuntime()) tick();
+        bot.log("Looter started");
+        return true;
+    }
+
+    function stop() {
+        state.running = false;
+        state.pendingMove = null;
+        resetOverflow();
+        looterContainerCache.clear();
+        clearCaptureMode();
+        if (!state.walkToCorpses) stopRuntime();
         bot.log("Looter stopped");
         return true;
+    }
+
+    function setCorpseEnabled(enabled, options = {}) {
+        if (state.disposed) return false;
+        state.walkToCorpses = enabled === true;
+        if (!state.walkToCorpses) {
+            state.corpseQueue = [];
+            state.nearbyCorpseReadyUntil = 0;
+            if (state.corpseJob) finishCorpseJob(false, 'loot distant corpses disabled');
+        }
+        if (state.walkToCorpses || state.running) {
+            if (!startRuntime()) scheduleNextTick(50);
+        } else stopRuntime();
+        if (options.persistEnabled !== false) persistConfig();
+        return state.walkToCorpses;
     }
 
     function status() {
         return {
             running: state.running,
+            corpseRuntimeRunning: state.runtimeRunning,
+            corpseLootHandler: state.running ? "mb0t Looter" : "Native auto-loot",
             destinationId: state.destinationId,
             destinationTitle: state.destinationTitle,
             lootMode: state.lootMode,
@@ -50225,6 +50233,8 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                 state.corpseQueue.length,
             corpseJobActive:
                 !!state.corpseJob,
+            corpseJobPhase: state.corpseJob ? (state.corpseJob.openedContainerId != null ? 'looting' : state.corpseJob.arrivedAdjacentAt ? 'opening' : 'walking') : null,
+            corpseJobOpenedContainerId: state.corpseJob?.openedContainerId ?? null,
             corpseJobMonster:
                 state.corpseJob?.monsterName ||
                 null,
@@ -50304,20 +50314,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                 );
         }
 
-        if (next.walkToCorpses !== undefined) {
-            state.walkToCorpses =
-                !!next.walkToCorpses;
-
-            if (!state.walkToCorpses) {
-                state.corpseQueue = [];
-                if (state.corpseJob) {
-                    finishCorpseJob(
-                        false,
-                        "walk-to-corpses disabled"
-                    );
-                }
-            }
-        }
+        if (next.walkToCorpses !== undefined) setCorpseEnabled(!!next.walkToCorpses);
         if (next.corpseMaxDistance !== undefined) {
             state.corpseMaxDistance =
                 Math.max(
@@ -50376,7 +50373,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         }
 
         if (
-            state.running &&
+            state.runtimeRunning &&
             !state.deathHookWrapper
         ) {
             installDeathHook();
@@ -50522,7 +50519,12 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
     }
 
     // Covers UI capture listeners even if Looter was never started.
-    bot.addCleanup(() => stop());
+    bot.addCleanup(() => {
+        state.disposed = true;
+        state.running = false;
+        state.walkToCorpses = false;
+        stopRuntime();
+    });
 
     // ---- Public API ----
     bot.addCleanup(() => unsubscribeLooterContainerAcks());
@@ -50558,6 +50560,16 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                 }
             })),
     };
+
+    bot.corpseLooter = {
+        start: () => setCorpseEnabled(true),
+        stop: (options = {}) => { setCorpseEnabled(false, options); return true; },
+        updateConfig: (next = {}) => updateConfig({ ...next,
+            ...(next.enabled !== undefined ? { walkToCorpses: next.enabled === true } : {}) }),
+        status: () => ({ ...status(), running: state.walkToCorpses,
+            config: { enabled: state.walkToCorpses }, itemLooterRunning: state.running }),
+    };
+    if (state.walkToCorpses) startRuntime();
 };
 
 // -- CAVEBOT / TARGETING PAUSE SHORTCUT
@@ -50767,7 +50779,7 @@ window.__minibiaBotBundle.installTempleXlogModule = function installTempleXlogMo
         try { bot.actions?.halt?.(); } catch (e) { bot.log("Temple XLOG: action halt failed", e); }
         try { bot.reconnect?.disable?.(); } catch (e) { bot.log("Temple XLOG: reconnect disable failed", e); }
         try { bot.gmKillSwitch?.cancel?.("Temple XLOG"); } catch (e) { bot.log("Temple XLOG: restart cancellation failed", e); }
-        for (const name of ["followingItemGuard", "gmChatMonitor", "autoPickup", "looter", "cave", "attack",
+        for (const name of ["followingItemGuard", "gmChatMonitor", "autoPickup", "corpseLooter", "looter", "cave", "attack",
                             "runeShooter", "rune", "heal", "invisible", "haste", "magicShield", "equipRing", "bootsSwapper", "helmetSwapper",
                             "itemDropper", "eat", "conjureFood", "paladin", "slimeTrainer", "monkTrainer", "talk",
                             "antiAfk", "fisher", "woodcutting", "mining", "smithing", "cooking", "comboBot", "holdTarget"]) {
@@ -50982,7 +50994,7 @@ window.__minibiaBotBundle.installPinkSkullDetectorModule = function installPinkS
         // Module errors must never prevent the disconnect. Preserve enabled
         // preferences so that a deliberate reload does not silently erase them.
         for (const name of ["autoPickup", "cave", "attack", "runeShooter", "rune", "heal", "invisible", "haste", "magicShield",
-                            "equipRing", "bootsSwapper", "helmetSwapper", "itemDropper", "eat", "conjureFood", "paladin", "looter"]) {
+                            "equipRing", "bootsSwapper", "helmetSwapper", "itemDropper", "eat", "conjureFood", "paladin", "corpseLooter", "looter"]) {
             try { bot[name]?.stop?.({ persistEnabled: false }); }
             catch (e) { bot.log(`Pink Skull: failed to stop ${name}:`, e); }
         }
@@ -57337,11 +57349,18 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
         for (const [sid, def] of Object.entries(defs)) {
             const props = def?.properties || {}, name = String(props.name || '').trim();
             if (!name || !whole(sid)) continue;
-            const info = { sid: whole(sid), cid: whole(def.id), fluidType: 0, name, type: props.type || '', ring: props.slotType === 'ring' };
+            const info = { sid: whole(sid), cid: whole(def.id), fluidType: 0, name, type: props.type || '', ring: String(props.slotType || props.slot || '').toLowerCase() === 'ring' || /\bring\b/i.test(name) };
             catalog.set(keyOf(info), info); addName(name, info);
             addName(props.plural || name + 's', info);
             if (name.endsWith('y')) addName(name.slice(0, -1) + 'ies', info);
             if (info.ring && whole(props.transformEquipTo)) ringBases.set(whole(props.transformEquipTo), info.sid);
+        }
+        // Active ring definitions can omit slotType. Their de-equip SID is
+        // authoritative even when the dormant definition has no forward link.
+        for (const [sid, def] of Object.entries(defs)) {
+            const baseSid = whole(def?.properties?.transformDeEquipTo);
+            if (baseSid && baseSid !== whole(sid) && catalog.get(`${baseSid}:0`)?.ring)
+                ringBases.set(whole(sid), baseSid);
         }
         const fluidDef = defs[2006];
         if (fluidDef) for (const [fluidType, name] of [[7, 'mana fluid'], [10, 'life fluid']]) {
@@ -57360,12 +57379,12 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
         let sid = whole(item.sid) || whole(gc?.sidByCid?.[cid]);
         let def = definitions?.[sid] || gc?.itemDefinitionsByCid?.[cid];
         let fluidType = whole(item.fluidType);
-        if (def?.properties?.slotType === 'ring' && ringBases.has(sid)) {
+        if (ringBases.has(sid)) {
             sid = ringBases.get(sid); def = definitions?.[sid] || def;
         }
         const base = catalog.get(`${sid}:${fluidType}`);
         return { sid, cid, fluidType, name: base?.name || String(def?.properties?.name || item.name || `Item ${sid || cid}`),
-            type: def?.properties?.type || '', ring: def?.properties?.slotType === 'ring' };
+            type: def?.properties?.type || '', ring: base?.ring === true || String(def?.properties?.slotType || def?.properties?.slot || '').toLowerCase() === 'ring' || /\bring\b/i.test(def?.properties?.name || item.name || '') };
     }
     function addItem(collection, item, count) {
         const qty = whole(count); if (!item || !qty || !session) return;
@@ -57483,10 +57502,11 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
             return;
         }
         if (before.id === equipmentId() && before.slot === ringSlot() && before.item.ring) {
-            // Use/equip/unequip transforms are not spent rings. The expiry has
-            // no client move/use operation and is confirmed by the server REMOVE.
-            const equipAction = moves.some(m => !m.move && m.item.ring && before.at - m.at < 1200);
-            if (!equipAction) ringRemovals.push({ ...before, count: 1, session });
+            // A fresh ring use can be the equipper replacing this expired ring,
+            // even synchronously inside the removal handler. It is not evidence
+            // that the old ring survived. A confirmed bag return/transform below
+            // cancels this candidate; an outgoing move of this slot matched above.
+            ringRemovals.push({ ...before, count: 1, session });
         }
     }
     function captureAdd(packet) {
@@ -58723,22 +58743,6 @@ function upgradeSectionHeaders(panel) {
             }
         }
 
-        if (
-            walkCorpseToggle &&
-            document.activeElement !== walkCorpseToggle
-        ) {
-            walkCorpseToggle.checked =
-                !!status?.walkToCorpses;
-        }
-
-        if (
-            corpseDistanceInput &&
-            document.activeElement !== corpseDistanceInput
-        ) {
-            corpseDistanceInput.value =
-                status?.corpseMaxDistance ?? 12;
-        }
-
         if (handCountLabel) {
             // Get left hand count
             const eq = window.gameClient?.player?.equipment;
@@ -58784,6 +58788,32 @@ function upgradeSectionHeaders(panel) {
         if (destLabel) {
             const destId = bot.looter?.getDestinationId?.();
             destLabel.textContent = destId ? `Destination: container ${destId}` : "No destination selected";
+        }
+
+        if (
+            walkCorpseToggle &&
+            document.activeElement !== walkCorpseToggle
+        ) {
+            walkCorpseToggle.checked =
+                !!status?.walkToCorpses;
+        }
+
+        if (
+            corpseDistanceInput &&
+            document.activeElement !== corpseDistanceInput
+        ) {
+            corpseDistanceInput.value =
+                status?.corpseMaxDistance ?? 12;
+        }
+
+        const corpseStatus = document.getElementById("minibia-bot-corpse-looter-status");
+        if (corpseStatus) {
+            const phase = status?.corpseJobPhase;
+            const detail = status?.corpseJobActive
+                ? `${phase === "walking" ? "Walking to" : phase === "opening" ? "Opening" : status.running ? "Looting" : "Native auto-loot:"} ${status.corpseJobMonster || "corpse"}`
+                : status?.corpseQueueLength ? `Queued: ${status.corpseQueueLength} · waiting for combat to clear` : "Ready";
+            corpseStatus.textContent = status?.walkToCorpses
+                ? `${detail} · ${status.corpseLootHandler}` : "Status: off";
         }
 
         // Render tracked items
@@ -63019,6 +63049,12 @@ function upgradeSectionHeaders(panel) {
 
 <!-- Looter Tab -->
 <div class="mb-tab-panel mb-looter-compact" data-tab-panel="looter">
+<div class="mb-section" data-corpse-looter>
+  <div class="mb-section-title"><input type="checkbox" id="minibia-bot-looter-walk-corpses" class="mb-title-toggle"><label class="mb-title-text" for="minibia-bot-looter-walk-corpses">Loot distant corpses</label></div>
+  <label class="mb-field"><span class="mb-field-label">Max distance (tiles)</span><input type="number" id="minibia-bot-looter-corpse-distance" min="1" max="30" value="12"></label>
+  <div class="mb-small-note">Works independently of mb0t Looter. With Looter off, opens corpses for native premium auto-loot. Walking starts after combat clears.</div>
+  <div class="mb-small-note mb-looter-status" id="minibia-bot-corpse-looter-status">Status: off</div>
+</div>
  <div class="mb-section">
   <div class="mb-section-title"><input type="checkbox" id="minibia-bot-looter-enabled" class="mb-title-toggle"><span class="mb-title-text">💰 Looter</span></div>
   <div class="mb-looter-destination"><span class="mb-small-note" id="minibia-bot-looter-dest-status">No destination selected</span><button type="button" class="mb-small-button" id="minibia-bot-looter-select-dest" title="Choose the main loot container. Full containers overflow into child bags automatically.">Set Destination</button></div>
@@ -63027,7 +63063,6 @@ function upgradeSectionHeaders(panel) {
   <div class="mb-section-title mb-section-title--sub"><span class="mb-title-text" id="minibia-bot-looter-list-title">Tracked Items</span></div>
   <div class="mb-looter-add"><input type="text" id="minibia-bot-looter-manual-input" placeholder="Item name" aria-label="Item name"><button type="button" class="mb-small-button" id="minibia-bot-looter-manual-add">Add</button><button type="button" class="mb-small-button" id="minibia-bot-looter-capture-item" title="Click an item to track its exact identity" aria-label="Pick item">🔍</button></div>
   <div id="minibia-bot-looter-item-list" class="mb-looter-items"></div>
-  <details class="mb-looter-fold"><summary>Corpse Walking</summary><div class="mb-looter-options"><label class="mb-toggle"><input type="checkbox" id="minibia-bot-looter-walk-corpses"><span>Walk to distant corpses</span></label><label class="mb-field"><span class="mb-field-label">Max distance (tiles)</span><input type="number" id="minibia-bot-looter-corpse-distance" min="1" max="30" value="12"></label></div><div class="mb-small-note">Walks to corpses once combat is clear, briefly pausing CaveBot movement.</div></details>
   <details class="mb-looter-fold"><summary>Item options</summary><div class="mb-small-note">Drop moves that item from a corpse to the ground in either mode. In Blacklist mode, listed items without Drop stay in the corpse. Container items and items in your own bags are always left untouched. Hover an item name to see its SID, CID, and fluid type. Use the magnifying glass to capture an exact item.</div></details>
   <div class="mb-small-note mb-looter-status" id="minibia-bot-looter-status">Status: idle</div>
  </div>
@@ -66075,8 +66110,8 @@ function upgradeSectionHeaders(panel) {
             walkCorpseToggle.addEventListener(
                 "change",
                 () => {
-                    bot.looter?.updateConfig?.({
-                        walkToCorpses:
+                    bot.corpseLooter?.updateConfig?.({
+                        enabled:
                             walkCorpseToggle.checked
                     });
                     refreshLooterStatus();
