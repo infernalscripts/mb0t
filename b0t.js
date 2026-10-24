@@ -3168,7 +3168,7 @@ addCleanup(() => {
         mode,
         now = Date.now()
     ) {
-        if (window.minibiaBot?.autoPickup?.isFollowPaused?.()) return false;
+        if (window.minibiaBot?.autoPickup?.isFollowPaused?.() || window.minibiaBot?.panic?.ownsMovement?.()) return false;
         const client =
             window.gameClient;
         const player =
@@ -3655,7 +3655,7 @@ addCleanup(() => {
         // Keep Follow enabled while Auto Pickup owns a priority-item excursion.
         // Its ordinary timer continues, so it resumes on the first tick after
         // the native game confirms the ground item is gone.
-        if (window.minibiaBot?.autoPickup?.isFollowPaused?.()) {
+        if (window.minibiaBot?.autoPickup?.isFollowPaused?.() || window.minibiaBot?.panic?.ownsMovement?.()) {
             setCustomFollowWait("waiting for priority item pickup",now);return true;
         }
         clearLegacyNativeFollow();
@@ -4151,7 +4151,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.413",
+        version: "1.6.414",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -5399,29 +5399,20 @@ window.__minibiaBotBundle.installPzModule = function installPzModule(bot) {
     }
 
     function goToTile(tile) {
-        if (!tile?.__position)
-            return false;
-        const from = bot.getPlayerPosition();
-        if (!from)
-            return false;
-        const p = tile.__position;
-        const to = new Position(p.x, p.y, p.z);
+        const p = tile?.__position;
+        const client = window.gameClient, from = client?.player?.__position;
+        if (!p || !from || ![p.x,p.y,p.z].every(Number.isFinite) || p.z !== from.z) return false;
+        if (p.x === from.x && p.y === from.y) return true;
+        const pf = client.world?.pathfinder;
+        if (typeof pf?.findPath !== "function") return false;
         try {
-            window.gameClient?.world?.pathfinder?.findPath?.(from, to);
-            bot.log("pathing to", {
-                x: p.x,
-                y: p.y,
-                z: p.z,
-                flags: tile.flags
-            });
-            return true;
+            // Position is not necessarily exposed as a browser global.
+            const to = Object.assign(Object.create(Object.getPrototypeOf(from)), from, {x:p.x,y:p.y,z:p.z});
+            pf.findPath(from, to);
+            const destination = pf.__finalDestination;
+            return !!destination && destination.x === p.x && destination.y === p.y && destination.z === p.z;
         } catch (error) {
-            bot.log("pathing failed", {
-                x: p.x,
-                y: p.y,
-                z: p.z,
-                error: error?.message
-            });
+            bot.log("Panic pathing failed", {position:p,error:error?.message});
             return false;
         }
     }
@@ -5494,13 +5485,8 @@ window.__minibiaBotBundle.installPzModule = function installPzModule(bot) {
             bot.log("No home PZ set");
             return false;
         }
-        const candidate = getNearestPzTo(home.x, home.y, home.z);
-        if (!candidate) {
-            bot.log("No loaded PZ found near saved home", home);
-            return false;
-        }
-        bot.log("home candidate", candidate);
-        return goToTile(candidate.tile);
+        // Home is an exact saved destination; it may be outside the loaded screen.
+        return goToTile({__position:home});
     }
 
     function printPzCandidates(limit = 10) {
@@ -6542,6 +6528,10 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         lastThreatAt: 0,
         lastReturnAttemptAt: 0,
         lastPlayerAlertAt: 0,
+        escapeDestination: null,
+        positionAttemptAt: 0,
+        positionRequesting: false,
+        positionPauseHeld: false,
         // ---- Audio alert state ----
         audioCtx: null,
         audioOutput: null,
@@ -6562,6 +6552,8 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         tickMs: 200,
         triggerCooldownMs: 4000,
         returnToOriginEnabled: false,
+        holdPositionEnabled: false,
+        holdPosition: null,
         returnDelayMs: 300000, // 5 minutes
         returnDelayJitterMs: 30000, // ±30 seconds
         returnRetryCooldownMs: 2000,
@@ -6907,6 +6899,51 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         return messages[0] || null;
     }
 
+    function ownsPosition() {
+        return !!(state.escapeDestination || state.pendingReturnOrigin ||
+            (config.holdPositionEnabled && normalizePosition(config.holdPosition)));
+    }
+
+    function positionMovementAllowed() {
+        const client = window.gameClient;
+        return !!client?.player && !client.player.isDead &&
+            (client.networkManager?.isConnected?.() === true || client.isConnected?.() === true) &&
+            !bot.actions?.isHalted?.() && !bot.gmKillSwitch?.isActive?.() && !bot.pauseHotkey?.isPaused?.();
+    }
+
+    function moveToPosition(position) {
+        state.positionRequesting = true;
+        try { return !!bot.pz?.goToTile?.({__position:position}); }
+        finally { state.positionRequesting = false; }
+    }
+
+    function syncPosition(now) {
+        const enabled = ownsPosition() && positionMovementAllowed();
+        if (!enabled) {
+            if (state.positionPauseHeld) bot.cave?.resumeMovement?.("panic-position");
+            state.positionPauseHeld = false;
+            return;
+        }
+        if (!state.positionPauseHeld) state.positionPauseHeld = bot.cave?.pauseMovement?.("panic-position") === true;
+        const selector=window.gameClient?.interface?.fightModeSelector;
+        if (Number(selector?.currentChaseMode) === 2) selector.setChaseMode?.(0);
+        const current = normalizePosition(bot.getPlayerPosition());
+        let target = state.escapeDestination || (!state.pendingReturnOrigin && config.holdPositionEnabled ? normalizePosition(config.holdPosition) : null);
+        if (!target || !current) return;
+        if (isSamePosition(current,target)) {
+            state.escapeDestination = null;
+            return;
+        }
+        // Never guess a floor transition or restart an in-flight step every tick.
+        if (current.z !== target.z || now-state.positionAttemptAt < 800) return;
+        const player=window.gameClient.player, pf=window.gameClient.world?.pathfinder;
+        const dest=pf?.__finalDestination;
+        if ((player.isMoving?.() || player.__preWalks?.length || pf?.__isAutoWalking) &&
+            dest && isSamePosition(normalizePosition(dest),target)) return;
+        state.positionAttemptAt=now;
+        moveToPosition(target);
+    }
+
     // ---- RETURN TO ORIGIN LOGIC ----
     function getReturnDelayMs() {
         const base = normalizeDelayMs(config.returnDelayMs, 0);
@@ -6967,13 +7004,11 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
     }
 
     function tryReturnToOrigin(now = Date.now()) {
-        if (!config.returnToOriginEnabled || !state.pendingReturnOrigin || !state.returnNotBeforeAt)
+        if (state.escapeDestination || !config.returnToOriginEnabled || !state.pendingReturnOrigin || !state.returnNotBeforeAt)
             return false;
         if (now < state.returnNotBeforeAt)
             return false;
         if (!isReturnCoastClear())
-            return false;
-        if (now - state.lastReturnAttemptAt < normalizeDelayMs(config.returnRetryCooldownMs, 2000))
             return false;
 
         const currentPos = normalizePosition(bot.getPlayerPosition());
@@ -6986,11 +7021,11 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
             clearPendingReturn();
             return true;
         }
+        if (now - state.lastReturnAttemptAt < normalizeDelayMs(config.returnRetryCooldownMs, 2000))
+            return false;
         state.lastReturnAttemptAt = now;
-        const moved = !!bot.cave?.goToPosition?.(state.pendingReturnOrigin) ||
-            !!bot.pz?.goToTile?.({
-                __position: state.pendingReturnOrigin
-            });
+        if (!positionMovementAllowed()) return false;
+        const moved = moveToPosition(state.pendingReturnOrigin);
         if (moved) {
             bot.log("panic returning to origin", {
                 origin: state.pendingReturnOrigin,
@@ -7411,6 +7446,16 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
     // ---- TRIGGER FUNCTIONS ----
     function triggerPanic(reason, details = {}) {
         const now = Date.now();
+        const home = normalizePosition(bot.pz?.getHomePz?.());
+        if (!home) {
+            if (now-state.lastTriggerAt >= config.triggerCooldownMs) {
+                state.lastTriggerAt=now;
+                bot.log("Panic Runner: set Home before enabling escape triggers");
+                bot.showPanelNotification?.("PANIC RUNNER", "Set Home to choose an escape position.", "panic-no-home", 15000);
+            }
+            return false;
+        }
+        state.escapeDestination = home;
         armPendingReturn(now);
         if (now - state.lastTriggerAt < config.triggerCooldownMs)
             return false;
@@ -7431,7 +7476,9 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
             bot.ui?.refreshEquipRingStatus?.();
         }
         bot.bootsSwapper?.stop?.({ persistEnabled: false }); bot.helmetSwapper?.stop?.({ persistEnabled: false }); bot.itemDropper?.stop?.({ persistEnabled: false });
-        return !!bot.pz?.goToHomePz?.();
+        state.positionAttemptAt=0;
+        syncPosition(now);
+        return true;
     }
 
     function triggerGameMasterKillSwitch(players) {
@@ -7701,8 +7748,9 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         const now = Date.now();
         try {
             const triggered = checkGameMasters() || checkUnknownPlayers() || checkHealthLoss();
-            if (!triggered)
+            if (!triggered && positionMovementAllowed())
                 tryReturnToOrigin(now);
+            syncPosition(now);
 
             // ---- Player on‑screen alert (sound only, does NOT stop any module) ----
             if (config.playerAlertEnabled) {
@@ -7737,6 +7785,8 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
     function shouldRun() {
         return !!(
             getGameMasterNames().length ||
+            config.holdPositionEnabled ||
+            state.escapeDestination || state.pendingReturnOrigin ||
             config.unknownPlayerEnabled ||
             config.healthLossEnabled ||
             config.playerAlertEnabled ||
@@ -7780,6 +7830,9 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
             window.clearTimeout(state.timerId);
             state.timerId = null;
         }
+        state.escapeDestination = null;
+        if (state.positionPauseHeld) bot.cave?.resumeMovement?.("panic-position");
+        state.positionPauseHeld = false;
         state.lastHealth = null;
         state.lastDamageEventKey = null;
         state.alphaMonsterBeepLast = null;
@@ -7872,6 +7925,14 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
             next.itemAlertsRefreshMs = Math.max(2000, Number(next.itemAlertsRefreshMs) || 5000);
         }
 
+        if (next.holdPosition !== undefined) next.holdPosition=normalizePosition(next.holdPosition);
+        if (next.holdPositionEnabled !== undefined) {
+            next.holdPositionEnabled=next.holdPositionEnabled === true;
+            if (next.holdPositionEnabled && !normalizePosition(next.holdPosition || config.holdPosition)) {
+                next.holdPosition=normalizePosition(bot.getPlayerPosition());
+                if (!next.holdPosition) next.holdPositionEnabled=false;
+            }
+        }
         Object.assign(config, next);
         if (!config.returnToOriginEnabled)
             clearPendingReturn();
@@ -7936,6 +7997,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         };
     }
 
+    bot.addCleanup(stop);
     if (shouldRun())
         start();
 
@@ -7944,6 +8006,8 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         stop,
         status,
         updateConfig,
+        ownsMovement: () => ownsPosition() && positionMovementAllowed(),
+        isRequestingMovement: () => state.positionRequesting,
         getVisiblePlayers,
         getUnknownVisiblePlayers,
         getTrustedVisiblePlayers,
@@ -11822,7 +11886,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         if (config.attackIgnoredWhenTrapped !== true || !state.running || !config.enabled || !player ||
             !(player.state?.health > 0) || !(client.networkManager?.isConnected?.() === true || client.isConnected?.() === true) ||
             isProtectionZoneBlocked(now) || bot.pauseHotkey?.isPaused?.() || bot.actions?.isHalted?.() || bot.gmKillSwitch?.isActive?.() ||
-            bot.autoPickup?.ownsMovement?.() || (current && state.autoTargetId !== current.id)) {
+            (bot.autoPickup?.ownsMovement?.() || bot.panic?.ownsMovement?.()) || (current && state.autoTargetId !== current.id)) {
             if (state.ignoredTrap) clearIgnoredTrapEscape("inactive");
             return false;
         }
@@ -12003,7 +12067,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     // ---- Helper ----
 
     function setClientChaseMode(enabled) {
-        if (bot.autoPickup?.ownsMovement?.()) enabled = false;
+        if ((bot.autoPickup?.ownsMovement?.() || bot.panic?.ownsMovement?.())) enabled = false;
         try {
             const fms = window.gameClient?.interface?.fightModeSelector;
             if (!fms) {
@@ -13453,7 +13517,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         now = Date.now(),
         options = {}
     ) {
-        if (bot.autoPickup?.ownsMovement?.()) return false;
+        if ((bot.autoPickup?.ownsMovement?.() || bot.panic?.ownsMovement?.())) return false;
         if (waitForKiteStep(now)) return true;
         if (
             !candidate ||
@@ -13656,7 +13720,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
     // ---- Chase: move toward target only when outside kite hysteresis ----
     function syncChase(now) {
-        if (bot.autoPickup?.ownsMovement?.()) return false;
+        if ((bot.autoPickup?.ownsMovement?.() || bot.panic?.ownsMovement?.())) return false;
         if (!config.kiteMode)
             return false;
 
@@ -14159,7 +14223,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
     function syncKite(now) {
         if (waitForKiteStep(now)) return true;
-        if (bot.autoPickup?.ownsMovement?.()) return false;
+        if ((bot.autoPickup?.ownsMovement?.() || bot.panic?.ownsMovement?.())) return false;
         if (!config.kiteMode)
             return false;
         const target = config.kiteLureMode ? getKiteLureRetreatTarget() || getEngagedTarget() : getEngagedTarget();
@@ -16025,7 +16089,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function syncKiteLineOfSight(now = Date.now()) {
-        if (bot.autoPickup?.ownsMovement?.()) return false;
+        if ((bot.autoPickup?.ownsMovement?.() || bot.panic?.ownsMovement?.())) return false;
         const target=getCurrentTarget();
         if (!config.kiteMode || !target) {clearKiteLosRecovery();return false;}
         const info=getTargetLineOfSightInfo(target);
@@ -16540,7 +16604,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function syncOffscreenHunt(now = Date.now()) {
-        if (bot.autoPickup?.ownsMovement?.()) return false;
+        if ((bot.autoPickup?.ownsMovement?.() || bot.panic?.ownsMovement?.())) return false;
         if (
             !state.running ||
             !config.enabled ||
@@ -17070,7 +17134,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     // Gathering is optional; escaping pack pressure is not constrained by
     // shooting radius, diagonal preference, or a perfect four-tile corridor.
     function tryKiteLureEmergencyEscape(now=Date.now(), force=false) {
-        if (!config.kiteLureMode || bot.autoPickup?.ownsMovement?.()) return false;
+        if (!config.kiteLureMode || (bot.autoPickup?.ownsMovement?.() || bot.panic?.ownsMovement?.())) return false;
         const from=normalizePosition(bot.getPlayerPosition());
         if (!from) return false;
         const threats=getKiteRetreatThreats().filter(t=>t.z===from.z);
@@ -17171,7 +17235,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         }
         const player = window.gameClient?.player;
         if (!player || isProtectionZoneBlocked(now) || bot.actions?.isHalted?.() || bot.gmKillSwitch?.isActive?.() ||
-            bot.pauseHotkey?.isPaused?.() || bot.autoPickup?.ownsMovement?.() || bot.followingItemGuard?.isHolding?.()) {
+            bot.pauseHotkey?.isPaused?.() || (bot.autoPickup?.ownsMovement?.() || bot.panic?.ownsMovement?.()) || bot.followingItemGuard?.isHolding?.()) {
             clearLureOffscreenPull("Kite Lure suspended",{quiet:true}); return false;
         }
         const from = normalizePosition(bot.getPlayerPosition());
@@ -17508,7 +17572,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function syncLureOffscreenPull(context, now = Date.now()) {
-        if (bot.autoPickup?.ownsMovement?.()) return false;
+        if ((bot.autoPickup?.ownsMovement?.() || bot.panic?.ownsMovement?.())) return false;
         const eligible =
             state.running &&
             config.enabled &&
@@ -23602,7 +23666,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         now = Date.now(),
         options = {}
     ) {
-        if (bot.autoPickup?.ownsMovement?.()) return false;
+        if ((bot.autoPickup?.ownsMovement?.() || bot.panic?.ownsMovement?.())) return false;
         const client =
             window.gameClient;
         const pf =
@@ -24094,7 +24158,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function sendManualTargetPursuitStep(playerPos, stepPos, target, reason, now = Date.now()) {
-        if (bot.autoPickup?.ownsMovement?.()) return false;
+        if ((bot.autoPickup?.ownsMovement?.() || bot.panic?.ownsMovement?.())) return false;
         if (!playerPos || !stepPos || !target) return false;
         if (now - state.lastManualPursuitAt < 140) return false;
 
@@ -24164,7 +24228,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function syncManualTargetPursuit(now = Date.now()) {
-        if (bot.autoPickup?.ownsMovement?.()) return false;
+        if ((bot.autoPickup?.ownsMovement?.() || bot.panic?.ownsMovement?.())) return false;
         // Melee is the ONLY option that authorizes Targeting movement toward
         // a monster. With Melee OFF, Targeting must stand still.
         if (
@@ -24309,7 +24373,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function syncMeleeChase(now = Date.now()) {
-        if (bot.autoPickup?.ownsMovement?.()) return false;
+        if ((bot.autoPickup?.ownsMovement?.() || bot.panic?.ownsMovement?.())) return false;
         if (bot.pauseHotkey?.isPaused?.()) return false;
         // v1.6.47: Melee is the ONLY permission for ordinary target pursuit.
         // Client Chase is an engine selector, not an independent permission.
@@ -24574,7 +24638,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
     // ---- Helper: standard away movement (fallback) ----
     function kiteAwayOnly(target, playerPos, targetPos, dist) {
-        if (bot.autoPickup?.ownsMovement?.()) return false;
+        if ((bot.autoPickup?.ownsMovement?.() || bot.panic?.ownsMovement?.())) return false;
         const offsets = [
             [0, -1], [1, 0], [0, 1], [-1, 0],
             [-1, -1], [1, -1], [-1, 1], [1, 1]
@@ -24648,7 +24712,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
     // Fallback function to move away from enemy
     function syncKiteFallback(now) {
-        if (bot.autoPickup?.ownsMovement?.()) return false;
+        if ((bot.autoPickup?.ownsMovement?.() || bot.panic?.ownsMovement?.())) return false;
         const target = getEngagedTarget();
         if (!target)
             return false;
@@ -45654,7 +45718,7 @@ window.__minibiaBotBundle.installMovementPatch = function installMovementPatch(b
                         if (
                             !sameTargetingPursuit &&
                             !followOwnsMovement &&
-                            !bot.autoPickup?.ownsMovement?.()
+                            !bot.autoPickup?.ownsMovement?.() && !bot.panic?.ownsMovement?.()
                         ) {
                             stopMovement(client);
                         }
@@ -45720,7 +45784,7 @@ window.__minibiaBotBundle.installMovementPatch = function installMovementPatch(b
                 // Auto Pickup may send a route during combat only inside its
                 // own synchronous path request. Unrelated movement stays blocked.
                 if ((packetName === "AutoWalkPacket" || packetName === "WalkToDestinationPacket") &&
-                    bot.autoPickup?.isRequestingMovement?.() === true) {
+                    (bot.autoPickup?.isRequestingMovement?.() === true || bot.panic?.isRequestingMovement?.() === true)) {
                     return original.call(this, packet);
                 }
 
@@ -60048,6 +60112,11 @@ function upgradeSectionHeaders(panel) {
         const status = bot.panic?.status?.();
         const unknown = document.getElementById("minibia-bot-panic-unknown");
         const health = document.getElementById("minibia-bot-panic-health");
+        const hold = document.getElementById("minibia-bot-panic-hold");
+        const holdLabel = document.getElementById("minibia-bot-panic-hold-position");
+        if (hold) hold.checked = !!status?.config?.holdPositionEnabled;
+        const holdPos = status?.config?.holdPosition;
+        if (holdLabel) holdLabel.textContent = holdPos ? `${holdPos.x}, ${holdPos.y}, ${holdPos.z}` : "Not set";
         const ret = document.getElementById("minibia-bot-panic-return");
         const alertToggle = document.getElementById("minibia-bot-panic-player-alert");
         const cooldownInput = document.getElementById("minibia-bot-panic-player-cooldown");
@@ -62998,7 +63067,7 @@ function upgradeSectionHeaders(panel) {
     </details>
     <button type="button" id="minibia-bot-panic-cancel-restart" style="display:none;" class="mb-small-button">Cancel Restart</button>
   </div>
-<details class="mb-section mb-alert-trusted"><summary class="mb-section-title"><span class="mb-title-text">Trusted Names</span></summary><div class="mb-alert-fold-body"><div class="mb-alert-pick"><input type="text" id="minibia-bot-panic-trusted-input" placeholder="Trusted name"><button type="button" class="mb-small-button" id="minibia-bot-panic-trusted-add">Add</button></div><div class="mb-list" id="minibia-bot-panic-trusted-list"></div></div></details><div class="mb-section"><div class="mb-section-title"><span class="mb-title-text">Panic Runner</span></div><div class="mb-alert-toggle-grid"><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-unknown"><span>Unknown player</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-health"><span>Health loss</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-return"><span>Auto return to position</span></label></div><div class="mb-alert-home"><span class="mb-small-note" id="minibia-bot-home">Panic Runner Home: not set</span><button type="button" class="mb-small-button" id="minibia-bot-set-home">Set Home</button></div></div>
+<details class="mb-section mb-alert-trusted"><summary class="mb-section-title"><span class="mb-title-text">Trusted Names</span></summary><div class="mb-alert-fold-body"><div class="mb-alert-pick"><input type="text" id="minibia-bot-panic-trusted-input" placeholder="Trusted name"><button type="button" class="mb-small-button" id="minibia-bot-panic-trusted-add">Add</button></div><div class="mb-list" id="minibia-bot-panic-trusted-list"></div></div></details><div class="mb-section"><div class="mb-section-title"><span class="mb-title-text">Panic Runner</span></div><div class="mb-alert-toggle-grid"><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-unknown"><span>Unknown player</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-health"><span>Health loss</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-return"><span>Auto return to position</span></label></div><div class="mb-alert-home"><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-hold"><span>Hold position</span></label><span class="mb-small-note" id="minibia-bot-panic-hold-position">Not set</span><button type="button" class="mb-small-button" id="minibia-bot-panic-hold-set">Set here</button></div><div class="mb-alert-home"><span class="mb-small-note" id="minibia-bot-home">Panic Runner Home: not set</span><button type="button" class="mb-small-button" id="minibia-bot-set-home">Set Home</button></div></div>
 </div>
 
 
@@ -68093,6 +68162,16 @@ function upgradeSectionHeaders(panel) {
             });
         }
 
+        panel.querySelector("#minibia-bot-panic-hold")?.addEventListener("change", event => {
+            bot.panic.updateConfig({holdPositionEnabled:event.target.checked});
+            refreshPanicStatus();
+        });
+        panel.querySelector("#minibia-bot-panic-hold-set")?.addEventListener("click", () => {
+            const position=bot.getPlayerPosition();
+            if (position) bot.panic.updateConfig({holdPosition:{x:position.x,y:position.y,z:position.z}});
+            refreshPanicStatus();
+        });
+
         // ---- Panic toggles: Unknown Player, Healthloss, Auto Return ----
         const unknownToggle = panel.querySelector("#minibia-bot-panic-unknown");
         const healthToggle = panel.querySelector("#minibia-bot-panic-health");
@@ -71167,11 +71246,11 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
         const p=state.priority;
         return !!(state.running&&config.enabled&&config.priorityEnabled&&p&&state.pickupInProgress&&
             p.client===window.gameClient&&p.player===window.gameClient?.player&&
-            bot.getPlayerPosition()?.z===p.position.z&&!bot.actions?.isHalted?.()&&!bot.followingItemGuard?.isHolding?.());
+            bot.getPlayerPosition()?.z===p.position.z&&!bot.actions?.isHalted?.()&&!(bot.followingItemGuard?.isHolding?.() || bot.panic?.ownsMovement?.()));
     }
     function scanPriorityGround() {
         if (!state.running||!config.enabled||!config.priorityEnabled||!config.priorityItem||
-            bot.actions?.isHalted?.()||bot.followingItemGuard?.isHolding?.()) return false;
+            bot.actions?.isHalted?.()||(bot.followingItemGuard?.isHolding?.() || bot.panic?.ownsMovement?.())) return false;
         if (state.priority) return true;
         const player=bot.getPlayerPosition(),client=window.gameClient;
         if (!player||!client?.world?.getTileFromWorldPosition) return false;
@@ -71197,7 +71276,7 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
     // than running a full radius scan on every drop, splash and field update.
     function tryPriorityAt(position) {
         if (!state.running || !config.enabled || !config.priorityEnabled || !config.priorityItem ||
-            state.priority || bot.actions?.isHalted?.() || bot.followingItemGuard?.isHolding?.()) return false;
+            state.priority || bot.actions?.isHalted?.() || (bot.followingItemGuard?.isHolding?.() || bot.panic?.ownsMovement?.())) return false;
         const player=bot.getPlayerPosition();
         const distance=player && player.z===position.z ? Math.max(Math.abs(player.x-position.x),Math.abs(player.y-position.y)) : Infinity;
         if (distance>Math.min(10,Math.max(1,Number(config.radius)||5))) return false;
@@ -71320,7 +71399,7 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
 
     // ---- Core pickup logic with walk and pause ----
     function __doPickup(pos, itemId, callback, selection = null) {
-        if (bot.followingItemGuard?.isHolding?.()) { callback?.(false); return false; }
+        if ((bot.followingItemGuard?.isHolding?.() || bot.panic?.ownsMovement?.())) { callback?.(false); return false; }
         const tile = gameClient.world.getTileFromWorldPosition(pos);
         if (!tile) {
             if (callback)
@@ -71405,7 +71484,7 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
         // Running Targeting restores its current mode on its next tick. Restore
         // manual chase only when Targeting did not own that setting.
         if (sameSession && state.running && !bot.actions?.isHalted?.() &&
-            !bot.followingItemGuard?.isHolding?.() && !bot.pauseHotkey?.isPaused?.() &&
+            !(bot.followingItemGuard?.isHolding?.() || bot.panic?.ownsMovement?.()) && !bot.pauseHotkey?.isPaused?.() &&
             !bot.attack?.isRunning?.() && previousChaseMode === 2) {
             const selector = client?.interface?.fightModeSelector;
             if (Number(selector?.currentChaseMode) === 0) {
@@ -71439,7 +71518,7 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
     }
 
     function __walkAndPickup(pos, itemId, selection=null) {
-        if (state.pickupInProgress || bot.followingItemGuard?.isHolding?.() || bot.actions?.isHalted?.())
+        if (state.pickupInProgress || (bot.followingItemGuard?.isHolding?.() || bot.panic?.ownsMovement?.()) || bot.actions?.isHalted?.())
             return;
         const playerPos = bot.getPlayerPosition();
         if (!playerPos || playerPos.z !== pos.z ||
@@ -71455,7 +71534,7 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
                 const inReach = current && current.z === pos.z &&
                     Math.max(Math.abs(pos.x - current.x), Math.abs(pos.y - current.y)) <= 1;
                 if (inReach && (!state.ownedPathfinder || ownsMovement()) &&
-                    !bot.actions?.isHalted?.() && !bot.followingItemGuard?.isHolding?.()) {
+                    !bot.actions?.isHalted?.() && !(bot.followingItemGuard?.isHolding?.() || bot.panic?.ownsMovement?.())) {
                     __doPickup(pos, itemId, null, selection);
                 }
             } finally {
@@ -71498,7 +71577,7 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
         state.walkInterval = setInterval(() => {
             if (token !== state.attemptToken || !state.pickupInProgress) return;
             const current = bot.getPlayerPosition();
-            if (skipsOrdinaryFollowWalk(pos) || !ownsMovement() || bot.followingItemGuard?.isHolding?.() || bot.actions?.isHalted?.() ||
+            if (skipsOrdinaryFollowWalk(pos) || !ownsMovement() || (bot.followingItemGuard?.isHolding?.() || bot.panic?.ownsMovement?.()) || bot.actions?.isHalted?.() ||
                 !current || current.z !== pos.z ||
                 replacedPickupRoute()) {
                 __resumeModules();
@@ -71579,7 +71658,7 @@ window.__minibiaBotBundle.installAutoPickupModule = function installAutoPickupMo
                     abandon();tryPriorityAt(pickupPos);return;
                 }
                 if (skipsOrdinaryFollowWalk(pickupPos)) { abandon();return; }
-                if (state.pickupInProgress || bot.followingItemGuard?.isHolding?.()) {
+                if (state.pickupInProgress || (bot.followingItemGuard?.isHolding?.() || bot.panic?.ownsMovement?.())) {
                     if (attempt < 30) schedulePickup(attempt + 1);
                     else abandon();
                     return;
