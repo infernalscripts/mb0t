@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.424",
+        version: "1.6.436",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -5426,7 +5426,16 @@ window.__minibiaBotBundle.installTabTitleModule = function installTabTitleModule
             lastWritten=null;return;
         }
         const name=clean(window.__minibiaBotCurrentCharacter || window.gameClient?.player?.name);
-        const base=name ? `${name} | mb0t` : "mb0t";
+        const cave=bot.cave?.getUiStatus?.();
+        const caveOn=cave?.running===true;
+        const targetingOn=bot.attack?.isRunning?.()===true;
+        const total=Number(cave?.routeLength)||0;
+        const index=total ? Math.max(1,Math.min(total,(Number(cave?.currentIndex)||0)+1)) : 0;
+        const activity=cave?.movement?.safetyStopped ? "safety stopped" : cave?.learnMode ? "recording" :
+            caveOn ? clean(cave?.movement?.mode || "Walking").toLowerCase() : "idle";
+        const progress=total ? ` (${index}/${total})` : "";
+        const base=[name,`CaveBot: ${caveOn ? 'ON' : 'OFF'}`,
+            `Targeting: ${targetingOn ? 'ON' : 'OFF'}`,`Status: ${activity}${progress}`].filter(Boolean).join(' | ');
         const title=config.alerts && Date.now()<alertUntil ? `⚠ ${alertLabel || "ALERT"} | ${base}` : base;
         if(document.title!==title)document.title=title;
         lastWritten=title;
@@ -5449,7 +5458,7 @@ window.__minibiaBotBundle.installTabTitleModule = function installTabTitleModule
     function mount(parent){
         if(!parent || parent.querySelector('[data-tab-title]'))return;
         const section=document.createElement('div');section.className='mb-section';section.setAttribute('data-tab-title','');
-        section.innerHTML='<div class="mb-section-title"><span class="mb-title-text">🌐 Browser title</span></div><div class="mb-alert-toggle-grid"><label class="mb-toggle"><input type="checkbox" data-title-enabled><span>Character name in title</span></label><label class="mb-toggle"><input type="checkbox" data-title-alerts><span>Show alerts in title</span></label></div>';
+        section.innerHTML='<div class="mb-section-title"><span class="mb-title-text">🌐 Browser title</span></div><div class="mb-alert-toggle-grid"><label class="mb-toggle"><input type="checkbox" data-title-enabled><span>Character &amp; bot status in title</span></label><label class="mb-toggle"><input type="checkbox" data-title-alerts><span>Show alerts in title</span></label></div>';
         const enabled=section.querySelector('[data-title-enabled]'),alerts=section.querySelector('[data-title-alerts]');
         const refresh=()=>{enabled.checked=config.enabled;alerts.checked=config.alerts;alerts.disabled=!config.enabled;};
         enabled.addEventListener('change',()=>{updateConfig({enabled:enabled.checked});refresh();});
@@ -5630,6 +5639,123 @@ window.__minibiaBotBundle.installPzModule = function installPzModule(bot) {
     bot.getHomePz = getHomePz;
     bot.clearHomePz = clearHomePz;
     bot.goToHomePz = goToHomePz;
+};
+
+window.__minibiaBotBundle.installStaffMarkersModule = function installStaffMarkersModule(bot) {
+    const key="minibiaBot.staffMarkers.config",saved=bot.storage.get(key,{}),config={enabled:saved.enabled!==false,sound:saved.sound!==false};
+    let root=null,timer=null,disposed=false;
+    const markers=new Map(),announced=new Map(),audioNodes=new Set();
+    let audio=null,output=null;
+    function primeAudio(force=false){
+        if(disposed || (!config.sound && force!==true))return null;
+        try{
+            if(!audio){const Ctx=window.AudioContext||window.webkitAudioContext;if(!Ctx)return null;
+                audio=new Ctx();output=bot.createAudioOutput(audio);}
+            if(audio.state==='suspended')audio.resume().catch(()=>{});
+            return audio;
+        }catch{return null;}
+    }
+    function playSound(names='Staff detected',testing=false){
+        bot.tabTitle?.alert?.('STAFF DETECTED');
+        bot.showPanelNotification?.('STAFF DETECTED',String(names),'staff-detected',15000);
+        const ctx=primeAudio(testing);if(!ctx)return false;
+        const play=()=>{
+            if(disposed || (!config.sound && !testing) || ctx.state!=='running')return false;
+            const start=ctx.currentTime+.015;
+            for(const [delay,freq,duration] of [[0,1046,.14],[.19,698,.20],[.48,1046,.14],[.67,698,.20],[1,1568,.18],[1.23,523,.34]]){
+                const osc=ctx.createOscillator(),gain=ctx.createGain(),at=start+delay,end=at+duration;
+                osc.type='triangle';osc.frequency.setValueAtTime(freq,at);
+                gain.gain.setValueAtTime(.001,at);gain.gain.exponentialRampToValueAtTime(.28,at+.015);gain.gain.exponentialRampToValueAtTime(.001,end);
+                osc.connect(gain);gain.connect(output);const node={osc,gain};audioNodes.add(node);
+                osc.onended=()=>{osc.disconnect();gain.disconnect();audioNodes.delete(node);};osc.start(at);osc.stop(end+.01);
+            }
+            return true;
+        };
+        if(ctx.state==='running')return play();
+        ctx.resume().then(play).catch(()=>{});return true;
+    }
+    document.addEventListener('pointerdown',primeAudio,true);
+    document.addEventListener('keydown',primeAudio,true);
+    function clear(){markers.clear();root?.remove();root=null;}
+    function candidates(){
+        const client=window.gameClient,player=client?.player,position=player?.__position;
+        if(!player || !position || client.networkManager?.isConnected?.()===false)return [];
+        const source=client.world?.activeCreatures || {};
+        const all=source instanceof Map ? [...source.values()] : Object.values(source);
+        const names=new Set((bot.panic?.getGameMasterNames?.()||[]).map(n=>String(n).trim().toLowerCase()));
+        return all.filter(c=>{
+            const p=c?.__position;
+            if(!c || c===player || c.id===player.id || Number(c.type)!==0 || !p ||
+                ![p.x,p.y,p.z].every(v=>Number.isFinite(Number(v))) || Number(p.z)!==Number(position.z))return false;
+            return c.outfit?.verifiedGhost===true || /^(?:god|gm|gamemaster|chancellor)\s+\S/i.test(String(c.name||'').trim()) ||
+                names.has(String(c.name||'').trim().toLowerCase());
+        });
+    }
+    function render(){
+        if(disposed || !config.enabled){clear();return;}
+        const client=window.gameClient,renderer=client?.renderer,canvas=renderer?.screen?.canvas;
+        const creatures=candidates();
+        if(!creatures.length || !canvas?.getBoundingClientRect){clear();return;}
+        const rect=canvas.getBoundingClientRect();
+        const upper=document.querySelector('.main .upper')?.getBoundingClientRect?.();
+        const left=Math.max(rect.left,upper?.left ?? rect.left),top=Math.max(rect.top,upper?.top ?? rect.top);
+        const right=Math.min(rect.right,upper?.right ?? rect.right),bottom=Math.min(rect.bottom,upper?.bottom ?? rect.bottom);
+        if(right<=left || bottom<=top || rect.width<=0 || rect.height<=0){clear();return;}
+        if(!root){root=document.createElement('div');root.id='minibia-bot-staff-markers';root.setAttribute('aria-hidden','true');
+            Object.assign(root.style,{position:'fixed',pointerEvents:'none',overflow:'hidden',zIndex:'999997'});document.body.appendChild(root);}
+        Object.assign(root.style,{left:left+'px',top:top+'px',width:(right-left)+'px',height:(bottom-top)+'px'});
+        const sx=Number(canvas.width)>0 ? 32*rect.width/Number(canvas.width) : rect.width/15;
+        const sy=Number(canvas.height)>0 ? 32*rect.height/Number(canvas.height) : rect.height/11;
+        const live=new Set(),appeared=[],now=Date.now();
+        for(const c of creatures){
+            let p;
+            try{p=renderer.getCreatureScreenPosition(c);}catch{continue;}
+            if(!p || !Number.isFinite(p.x) || !Number.isFinite(p.y))continue;
+            const x=rect.left+p.x*sx-left,y=rect.top+p.y*sy-top;
+            if(x+sx<0 || y+sy<0 || x>right-left || y>bottom-top)continue;
+            const id=String(c.id);live.add(id);
+            if(!announced.has(id) || now-announced.get(id)>3000)appeared.push(String(c.name||'Invisible staff'));
+            announced.set(id,now);
+            let entry=markers.get(id);
+            if(!entry){
+                const box=document.createElement('div'),label=document.createElement('span');
+                Object.assign(box.style,{position:'absolute',boxSizing:'border-box',border:'2px solid #ff5656',background:'rgba(255,35,35,.10)',pointerEvents:'none'});
+                Object.assign(label.style,{position:'absolute',left:'50%',bottom:'100%',transform:'translateX(-50%)',padding:'2px 4px',background:'rgba(25,0,0,.85)',color:'#ffaaaa',font:'bold 11px Verdana,sans-serif',whiteSpace:'nowrap',pointerEvents:'none'});
+                box.appendChild(label);root.appendChild(box);entry={box,label};markers.set(id,entry);
+            }
+            Object.assign(entry.box.style,{left:x+'px',top:y+'px',width:sx+'px',height:sy+'px'});
+            entry.label.textContent=String(c.name||'Invisible staff')+(c.outfit?.verifiedGhost ? ' · ghost' : '');
+        }
+        for(const [id,entry] of markers)if(!live.has(id)){entry.box.remove();markers.delete(id);}
+        for(const [id,at] of announced)if(now-at>30000)announced.delete(id);
+        while(announced.size>128)announced.delete(announced.keys().next().value);
+        if(appeared.length && config.sound)playSound(appeared.join(', '));
+    }
+    function setEnabled(value){
+        config.enabled=value===true;if(!config.enabled)announced.clear();bot.storage.set(key,{...config});
+        if(timer!==null){clearInterval(timer);timer=null;}
+        if(config.enabled){timer=setInterval(render,100);render();}else clear();
+    }
+    function mount(parent){
+        if(!parent || parent.querySelector('[data-staff-markers]'))return;
+        const section=document.createElement('div');section.className='mb-section';section.setAttribute('data-staff-markers','');
+        section.innerHTML='<div class="mb-section-title"><span class="mb-title-text">👁 Staff markers</span></div><label class="mb-toggle"><input type="checkbox" data-staff-enabled><span>Mark GMs and ghosts on screen</span></label><div style="display:flex;align-items:center;gap:6px"><label class="mb-toggle"><input type="checkbox" data-staff-sound><span>Sound when staff appears</span></label><button type="button" class="mb-small-button" data-staff-test title="Test staff alert sound" aria-label="Test staff alert sound">►</button></div>';
+        const toggle=section.querySelector('[data-staff-enabled]');toggle.checked=config.enabled;toggle.addEventListener('change',()=>setEnabled(toggle.checked));
+        const sound=section.querySelector('[data-staff-sound]');sound.checked=config.sound;
+        sound.addEventListener('change',()=>{config.sound=sound.checked;bot.storage.set(key,{...config});});
+        section.querySelector('[data-staff-test]').addEventListener('click',()=>{
+            playSound('Sound test',true);
+        });
+        parent.appendChild(section);
+    }
+    bot.staffMarkers={config,setEnabled,mount,candidates,playSound};
+    if(config.enabled)timer=setInterval(render,100);
+    bot.addCleanup(()=>{
+        disposed=true;if(timer!==null)clearInterval(timer);timer=null;clear();announced.clear();
+        document.removeEventListener('pointerdown',primeAudio,true);document.removeEventListener('keydown',primeAudio,true);
+        for(const node of audioNodes){try{node.osc.stop();node.osc.disconnect();node.gain.disconnect();}catch{}}audioNodes.clear();
+        try{output?.disconnect();}catch{}if(audio){try{audio.close().catch(()=>{});}catch{}}audio=null;output=null;
+    });
 };
 
 window.__minibiaBotBundle.installXrayModule = function installXrayModule(bot) {
@@ -6654,6 +6780,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         lowCapBeepLast: 0,
         outOfSoulBeepLast: null,
         alphaMonsterBeepLast: null,
+        rareMonsterAlertLast: {alpha:null,ancient:null},
     };
 
     const config = Object.assign({
@@ -6829,16 +6956,21 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
                 }
             ]);
     }
-    function playAlphaMonsterBeep() {
-        bot.tabTitle?.alert?.("ALPHA / ANCIENT");
-        // Distinct rising double call, synthesized by the shared alert audio engine.
-        playToneSequence([
-            { freq: 620, dur: 110, vol: 0.4 },
-            { freq: 930, dur: 110, delay: 140, vol: 0.4 },
-            { freq: 1240, dur: 200, delay: 280, vol: 0.4 },
-            { freq: 930, dur: 110, delay: 620, vol: 0.4 },
-            { freq: 1240, dur: 240, delay: 760, vol: 0.4 },
-        ]);
+    function monsterAlertKind(creature) {
+        return /^ancient\s+\S/i.test(String(creature?.name||'').trim()) ? 'ancient' : 'alpha';
+    }
+    function playAlphaMonsterBeep(kind='alpha',offset=0) {
+        const ancient=kind==='ancient';
+        bot.tabTitle?.alert?.(ancient?'ANCIENT MONSTER':'ALPHA MONSTER');
+        const notes=ancient ? [
+            {freq:880,dur:180,vol:.4},{freq:660,dur:180,delay:220,vol:.4},
+            {freq:440,dur:300,delay:440,vol:.4},
+        ] : [
+            {freq:620,dur:110,vol:.4},{freq:930,dur:110,delay:140,vol:.4},
+            {freq:1240,dur:200,delay:280,vol:.4},{freq:930,dur:110,delay:620,vol:.4},
+            {freq:1240,dur:240,delay:760,vol:.4},
+        ];
+        playToneSequence(notes.map(note=>({...note,delay:(note.delay||0)+offset})));
     }
 
     function getVisibleAlphaMonsters() {
@@ -7694,19 +7826,25 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         checkOutOfSoulAlert(now,player);
         if (!player) {
             state.alphaMonsterBeepLast = null;
+            state.rareMonsterAlertLast={alpha:null,ancient:null};
             return;
         }
 
         if (config.alphaMonsterBeep) {
-            const alphas = getVisibleAlphaMonsters();
-            if (!alphas.length) state.alphaMonsterBeepLast = null;
-            else if (state.alphaMonsterBeepLast === null || now - state.alphaMonsterBeepLast >= 2000) {
-                const first = state.alphaMonsterBeepLast === null;
-                state.alphaMonsterBeepLast = now;
-                playAlphaMonsterBeep();
-                if (first) showAudioAlertNotification("ALPHA / ANCIENT MONSTER", alphas.map(c => c.name || "Alpha monster").join(", "), "audio-alpha-monster");
+            const monsters=getVisibleAlphaMonsters();
+            const groups={alpha:monsters.filter(c=>monsterAlertKind(c)==='alpha'),ancient:monsters.filter(c=>monsterAlertKind(c)==='ancient')};
+            for(const kind of ['alpha','ancient']){
+                const creatures=groups[kind];
+                if(!creatures.length){state.rareMonsterAlertLast[kind]=null;continue;}
+                const first=state.rareMonsterAlertLast[kind]===null;
+                if(first || now-state.rareMonsterAlertLast[kind]>=2000){
+                    state.rareMonsterAlertLast[kind]=now;
+                    playAlphaMonsterBeep(kind,kind==='ancient'&&groups.alpha.length?1100:0);
+                    if(first)showAudioAlertNotification(kind==='ancient'?'ANCIENT MONSTER':'ALPHA MONSTER',
+                        creatures.map(c=>c.name||'Monster').join(', '),`audio-${kind}-monster`);
+                }
             }
-        } else state.alphaMonsterBeepLast = null;
+        } else state.rareMonsterAlertLast={alpha:null,ancient:null};
 
         const st = player.state || {};
         const health = Number(st.health || 0);
@@ -7953,6 +8091,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         state.lastHealth = null;
         state.lastDamageEventKey = null;
         state.alphaMonsterBeepLast = null;
+        state.rareMonsterAlertLast={alpha:null,ancient:null};
         clearPendingReturn();
         bot.log("panic runner stopped");
         return true;
@@ -8020,7 +8159,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         }
         if (next.alphaMonsterBeep !== undefined) {
             next.alphaMonsterBeep = !!next.alphaMonsterBeep;
-            if (next.alphaMonsterBeep !== config.alphaMonsterBeep) state.alphaMonsterBeepLast = null;
+            if (next.alphaMonsterBeep !== config.alphaMonsterBeep) {state.alphaMonsterBeepLast = null;state.rareMonsterAlertLast={alpha:null,ancient:null};}
         }
         if (next.lowCapBeep !== undefined) {
             next.lowCapBeep = !!next.lowCapBeep;
@@ -8134,7 +8273,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         playGenericBeepBloop,
         testAudio: (name, notification = null) => {
             const sounds={targetDeath:playTargetDeathBeep,lowHealth:playLowHealthBeep,manaFull:playManaFullBeep,
-                outOfSoul:playOutOfSoulBeep,noTarget:playNoTargetBeep,itemLow:playItemLowBeep,lowCap:playItemLowBeep,alpha:playAlphaMonsterBeep,generic:playGenericBeepBloop,
+                outOfSoul:playOutOfSoulBeep,noTarget:playNoTargetBeep,itemLow:playItemLowBeep,lowCap:playItemLowBeep,alpha:()=>{playAlphaMonsterBeep("alpha");playAlphaMonsterBeep("ancient",1100);},generic:playGenericBeepBloop,
                 player:()=>bot.playPlayerAlarm?.(),playerAttack:()=>bot.playPlayerAttackAlarm?.(),message:()=>bot.playMessageAlarm?.(),
                 gm:()=>bot.playGMAlarm?.(),antibot:()=>bot.playAntiBotAlarm?.(),alarm:()=>bot.playAlarm?.()};
             const play=sounds[name];if(typeof play!=='function')return false;play();
@@ -47380,6 +47519,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         timerId: null,
         destinationId: null,
         destinationTitle: null,
+        autoMain: {item:null,player:null,container:null,pending:null,lastAttempt:0},
         trackedItems: new Map(),
         dropItemIds: new Set(),
         captureMode: false,
@@ -47467,6 +47607,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
     state.lootMode = stored.lootMode === "blacklist" ? "blacklist" : "whitelist";
     state.destinationId = stored.destinationId || null;
     state.destinationTitle = stored.destinationTitle || null;
+    state.destinationMode = stored.destinationMode === "auto" || (!stored.destinationMode && !state.destinationId && !state.destinationTitle) ? "auto" : "manual";
 
     // Optional corpse walking is OFF by default.
     state.walkToCorpses = stored.walkToCorpses === true;
@@ -47540,6 +47681,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
 
     function persistConfig() {
         bot.storage.set(configStorageKey, {
+            destinationMode: state.destinationMode,
             destinationId: state.destinationId,
             destinationTitle: state.destinationTitle,
             lootMode: state.lootMode,
@@ -47677,6 +47819,12 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
     const unsubscribeLooterContainerAcks = bot.containerAcks?.subscribe?.(event => {
         if (!event || event.ok === false) return;
         observeCorpseContainerAck(event);
+        const auto=state.autoMain;
+        if (auto.pending && event.source==='server' && event.kind==='open' &&
+            Number(event.seq)>auto.pending.seq && Number(event.cid)===Number(auto.item?.id) &&
+            !Number(event.parentContainerId) && event.container && !isCorpseLootSource(event.container)) {
+            auto.container=event.container;auto.pending=null;
+        }
         const pending=state.pendingMove;
         if (pending && event.source==='server' && event.kind==='remove' &&
             Number(event.containerId)===Number(pending.sourceId) &&
@@ -47709,8 +47857,47 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         }
     }) || (() => {});
 
+    function getAutomaticBackpack() {
+        const player=window.gameClient?.player,eq=player?.equipment;
+        const slot=typeof CONST!=='undefined' ? Number(CONST.EQUIPMENT?.BACKPACK ?? 6) : 6;
+        const item=eq?.getSlotItem?.(slot) || eq?.peekItem?.(slot);
+        const auto=state.autoMain,now=Date.now();
+        if(auto.player!==player || auto.item!==item){
+            auto.player=player;auto.item=item;auto.container=null;auto.pending=null;auto.lastAttempt=0;resetOverflow();
+        }
+        if(!item || !(Number(item.id)>0))return null;
+        const all=getContainersArray();
+        if(auto.container && all.includes(auto.container) && Number(auto.container.id)===Number(item.id))return auto.container;
+        auto.container=null;
+        // Match the equipped bag, excluding nested bags and corpse windows.
+        // Do not pick an arbitrary bag when several top-level copies match.
+        const candidates=all.filter(b=>Number(b.id)===Number(item.id) &&
+            !(Number(b.__parentCid)>0) && !b.__openedFromParent && !b.__replacedParent && !isCorpseLootSource(b));
+        const named=candidates.filter(b=>String(b.__title||'').trim().toLowerCase()==='main backpack');
+        if(named.length===1){auto.container=named[0];auto.pending=null;return auto.container;}
+        if(candidates.length===1){auto.container=candidates[0];auto.pending=null;return auto.container;}
+        if(candidates.length>1)return null;
+        if(auto.pending && now-auto.pending.at<3000)return null;
+        auto.pending=null;
+        if(!state.running || corpseActionsBlocked() || now-auto.lastAttempt<3000 ||
+            window.gameClient?.networkManager?.isConnected?.()===false ||
+            typeof ItemUsePacket!=='function' || typeof window.gameClient?.send!=='function')return null;
+        const action=()=>{
+            if((eq.getSlotItem?.(slot)||eq.peekItem?.(slot))!==item)return false;
+            auto.pending={at:now,seq:Number(bot.containerAcks?.snapshot?.())||0};
+            auto.lastAttempt=now;
+            window.gameClient.send(new ItemUsePacket({which:eq,index:slot}));return true;
+        };
+        try {
+            const sent=bot.actions?.runShared ? bot.actions.runShared('looter-open-main',bot.actions.priorities.UTILITY,action,0) : action();
+            if(!sent)auto.pending=null;
+        }catch(error){auto.pending=null;bot.log('Looter: could not open equipped backpack',error?.message||error);}
+        return auto.container;
+    }
+
     // ---- Get destination container (stable per-run binding + fallback lookup) ----
     function getDestinationContainer() {
+        if(state.destinationMode=== "auto")return getAutomaticBackpack();
         let dest = getLooterContainer("destination", {
             expectedTitle: state.destinationTitle || ""
         });
@@ -50552,6 +50739,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             running: state.running,
             corpseRuntimeRunning: state.runtimeRunning,
             corpseLootHandler: state.running ? "mb0t Looter" : "Native auto-loot",
+            destinationMode: state.destinationMode,
             destinationId: state.destinationId,
             destinationTitle: state.destinationTitle,
             lootMode: state.lootMode,
@@ -50667,6 +50855,11 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         if (next.lootMode !== undefined)
             state.lootMode = next.lootMode === "blacklist" ? "blacklist" : "whitelist";
         let destinationChanged = false;
+        if(next.destinationMode!==undefined){
+            state.destinationMode=next.destinationMode==='auto'?'auto':'manual';
+            state.autoMain.container=null;state.autoMain.pending=null;
+            resetOverflow();destinationChanged=true;
+        }
         if (next.destinationId !== undefined) {
             state.destinationId = next.destinationId;
             destinationChanged = true;
@@ -50781,6 +50974,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         state.pendingMove = null;
         persistConfig();
         return {
+            destinationMode: state.destinationMode,
             destinationId: state.destinationId,
             destinationTitle: state.destinationTitle,
             lootMode: state.lootMode,
@@ -50887,6 +51081,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             }
 
             resetOverflow();
+            state.destinationMode = "manual";
             state.destinationId = containerId;
             state.destinationTitle = container.__title || null;
             persistConfig();
@@ -51258,7 +51453,9 @@ window.__minibiaBotBundle.installTempleXlogModule = function installTempleXlogMo
 
 window.__minibiaBotBundle.installChancellorAlertModule = function installChancellorAlertModule(bot) {
     const key="minibiaBot.chancellorAlert.config";
-    const config={enabled:false,...bot.storage.get(key,{})};
+    const config={enabled:false,pauseSeconds:30,...bot.storage.get(key,{})};
+    const normalizePause=value=>Math.max(5,Math.min(60,Math.round(Number(value)||30)));
+    config.pauseSeconds=normalizePause(config.pauseSeconds);
     let timer=null,seenNodes=new WeakSet(),visible=new Set();
     const signatures=new Map(),alerts=new Map();
     const named=name=>/^chancellor\s+\S/i.test(String(name||"").trim());
@@ -51271,8 +51468,8 @@ window.__minibiaBotBundle.installChancellorAlertModule = function installChancel
         const notice={title:"🛡️ CHANCELLOR",message:`${name} — ${source}`,type:"gm"};
         if (bot.playGMAlarm) bot.playGMAlarm(notice);
         else bot.showPanelNotification?.(notice.title,notice.message,notice.type);
-        bot.gmKillSwitch?.trigger?.({source:"chancellor-alert",delayMs:15000,details:{name,source}});
-        bot.log("Chancellor detected; pausing for 15 seconds",{name,source});
+        bot.gmKillSwitch?.trigger?.({source:"chancellor-alert",delayMs:config.pauseSeconds*1000,details:{name,source}});
+        bot.log(`Chancellor detected; pausing for ${config.pauseSeconds} seconds`,{name,source});
     }
     function tick(){
         if (!config.enabled) return;
@@ -51314,7 +51511,12 @@ window.__minibiaBotBundle.installChancellorAlertModule = function installChancel
         for(const node of chatNodes()){seenNodes.add(node);if(named(node.getAttribute("name")))signatures.set(signature(node),Date.now());}
         timer=setInterval(tick,250);
     }
-    function updateConfig(next={}){if(next.enabled!==undefined)config.enabled=!!next.enabled;bot.storage.set(key,{...config});start();}
+    function updateConfig(next={}){
+        const changed=next.enabled!==undefined && config.enabled!==!!next.enabled;
+        if(next.enabled!==undefined)config.enabled=!!next.enabled;
+        if(next.pauseSeconds!==undefined)config.pauseSeconds=normalizePause(next.pauseSeconds);
+        bot.storage.set(key,{...config});if(changed)start();
+    }
     bot.chancellorAlert={config,updateConfig,status:()=>({running:timer!==null})};
     bot.addCleanup(stop);
     start();
@@ -51479,6 +51681,8 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
     const GZIP_PREFIX = "GZ1:"; // marker for gzipped payloads
 
     const CONFIG_KEYS = [
+        "minibiaBot.itemMover.config",
+        "minibiaBot.staffMarkers.config",
         "minibiaBot.tabTitle.config",
         "minibiaBot.rune.config",
         "minibiaBot.heal.config",
@@ -56387,6 +56591,135 @@ window.__minibiaBotBundle.installSupportModule = function installSupportModule(b
  *     The old captured-BP transfer remains available as "manual" workflow.
  * ==================================================================================
  */
+window.__minibiaBotBundle.installItemMoverModule = function installItemMoverModule(bot){
+    const key='minibiaBot.itemMover.config',saved=bot.storage.get(key,{}),config={enabled:saved.enabled===true,items:Array.isArray(saved.items)?saved.items.filter(r=>r && Number(r.id)>0).slice(0,128).map(r=>({...r,enabled:r.enabled!==false})):[]};
+    let disposed=false,timer=null,queued=false,player=null,equipped=null,destination=null,opening=null,pending=null,lastOpen=0,retryAt=0,view=null,reason='Off';
+    const bags=()=>{const all=window.gameClient?.player?.__openedContainers;return all instanceof Map?[...all.values()]:all instanceof Set?[...all]:Array.isArray(all)?all:Object.values(all||{});};
+    const peek=(c,i)=>c?.getSlotItem?.(i)||c?.peekItem?.(i)||null;
+    const size=c=>c?.slots?.length ?? c?.size ?? 0;
+    const matches=(it,rule)=>!!it && Number(it.id)===Number(rule.id) &&
+        (!Number(rule.sid) || Number(it.sid)===Number(rule.sid)) && Number(it.fluidType||0)===Number(rule.fluidType||0);
+    const ruleFor=it=>config.items.find(rule=>rule.enabled!==false&&matches(it,rule));
+    const stackable=it=>{try{return it?.isStackable?.()===true;}catch{return false;}};
+    const count=it=>stackable(it)?Math.max(1,Number(it?.count)||1):1;
+    const setReason=text=>{reason=text;if(view)view.textContent=text;};
+    function blocked(){return bot.actions?.isHalted?.() || bot.gmKillSwitch?.isActive?.() || bot.pauseHotkey?.isPaused?.() || bot.depositer?.status?.().running;}
+    function tree(root,all){const found=new Set([root]);for(let changed=true;changed;){changed=false;for(const c of all)if(!found.has(c)&&[...found].some(p=>c.__openedFromParent===p||c.__replacedParent===p||(Number(c.__parentCid)>0&&Number(c.__parentCid)===Number(p.__containerId)))){found.add(c);changed=true;}}return found;}
+    function tick(){
+        if(disposed || !config.enabled)return;
+        try{
+            const client=window.gameClient,p=client?.player,eq=p?.equipment,now=Date.now();
+            if(!p || client.networkManager?.isConnected?.()===false){setReason('Waiting for character');return;}
+            if(blocked()){setReason('Paused');return;}
+            const slot=typeof CONST!=='undefined'?Number(CONST.EQUIPMENT?.QUIVER ?? 9):9,item=peek(eq,slot);
+            if(player!==p || equipped!==item){player=p;equipped=item;destination=null;opening=null;pending=null;lastOpen=0;retryAt=0;}
+            let isBag=false;try{isBag=item?.isContainer?.()===true || client.itemDefinitionsBySid?.[item?.sid]?.properties?.type==='container' || client.itemDefinitionsByCid?.[item?.id]?.properties?.type==='container';}catch{}
+            if(!isBag){setReason('Equip a bag in the arrow slot');return;}
+            const all=bags();
+            if(destination && !all.includes(destination))destination=null;
+            if(!destination){
+                // A confirmed use of the equipped arrow-slot bag identifies it
+                // even when several backpacks have the same sprite and name.
+                if(opening && now-opening.at<3000){setReason('Opening arrow-slot bag');return;}
+                opening=null;
+                if(now-lastOpen<3000)return;
+                if(typeof ItemUsePacket!=='function'||typeof client.send!=='function'){setReason('Item use unavailable');return;}
+                const open=()=>{if(peek(eq,slot)!==item)return false;opening={at:now,seq:Number(bot.containerAcks?.snapshot?.())||0};lastOpen=now;client.send(new ItemUsePacket({which:eq,index:slot}));return true;};
+                const sent=bot.actions?.runShared?bot.actions.runShared('item-mover-open',bot.actions.priorities.UTILITY,open,0):open();
+                if(!sent)opening=null;setReason('Opening arrow-slot bag');return;
+            }
+            if(pending){
+                const current=peek(pending.source,pending.slot);
+                if(!all.includes(pending.source)||current!==pending.item||count(current)!==pending.before||pending.ack)pending=null;
+                else if(now-pending.at<3000)return;
+                else{pending=null;retryAt=now+3000;setReason('Move unconfirmed; waiting');return;}
+            }
+            if(now<retryAt)return;
+            if(!config.items.length){setReason('Add items to move');return;}
+            const excluded=tree(destination,all);
+            let full=false;
+            for(const source of all){
+                if(source===eq||excluded.has(source))continue;
+                const def=client.itemDefinitionsBySid?.[source.sid]||client.itemDefinitionsByCid?.[source.id];
+                if(def?.properties?.type==='corpse'||/\b(?:dead|slain)\b/i.test(String(source.__title||'')))continue;
+                for(let i=0;i<size(source);i++){
+                    const it=peek(source,i),rule=ruleFor(it);if(!rule)continue;
+                    try{if(it.isContainer?.())continue;}catch{continue;}
+                    let targetSlot=-1,capacity=stackable(it)?100:1;
+                    for(let j=0;j<size(destination);j++){
+                        const other=peek(destination,j);
+                        if(stackable(it)&&matches(other,rule)&&count(other)<100){targetSlot=j;capacity=100-count(other);break;}
+                        if(!other&&targetSlot<0)targetSlot=j;
+                    }
+                    if(targetSlot<0){full=true;continue;}
+                    const amount=Math.min(capacity,count(it));
+                    const move=()=>{
+                        if(rule.enabled===false || !config.items.includes(rule) || peek(source,i)!==it || !bags().includes(destination)||peek(eq,slot)!==equipped)return false;
+                        if(typeof ItemMovePacket!=='function'||typeof client.send!=='function')return false;
+                        pending={source,slot:i,item:it,before:count(it),at:now,ack:false};
+                        try{client.send(new ItemMovePacket({which:source,index:i},{which:destination,index:targetSlot},amount));}catch(e){pending=null;throw e;}
+                        return true;
+                    };
+                    const sent=bot.actions?.runShared?bot.actions.runShared('item-mover',bot.actions.priorities.UTILITY,move,0):move();
+                    setReason(sent?'Moving '+(rule.name||'item'):'Waiting for action');return;
+                }
+            }
+            setReason(full?'Arrow-slot bag full':'Watching open bags');
+        }catch(error){setReason('Waiting: '+String(error?.message||error));}
+    }
+    function wake(){if(disposed||!config.enabled||queued)return;queued=true;Promise.resolve().then(()=>{queued=false;tick();});}
+    const unsubscribe=bot.containerAcks?.subscribe?.(event=>{
+        if(event?.source!=='server'||event.ok===false)return;
+        if(opening && event.kind==='open' && Number(event.seq)>opening.seq &&
+            Number(event.cid)===Number(equipped?.id) && !Number(event.parentContainerId) && event.container){destination=event.container;opening=null;}
+        if(pending && event.kind==='remove' && Number(event.containerId)===Number(pending.source.__containerId)&&Number(event.slot)===pending.slot)pending.ack=true;
+        if(['open','close','add','remove','transform'].includes(event.kind))wake();
+    }) || (()=>{});
+    function setEnabled(value){config.enabled=value===true;bot.storage.set(key,{...config});pending=null;opening=null;
+        if(timer!==null)clearInterval(timer);timer=null;if(config.enabled){timer=setInterval(tick,200);tick();}else setReason('Off');}
+    let capture=null,captureTimer=null;
+    function cancelCapture(){if(capture)document.removeEventListener('click',capture,true);capture=null;if(captureTimer!==null)clearTimeout(captureTimer);captureTimer=null;}
+    function mount(parent){if(!parent||parent.querySelector('[data-item-mover]'))return;
+        const section=document.createElement('div');section.className='mb-section';section.setAttribute('data-item-mover','');
+        section.innerHTML='<div class="mb-dropper-heading"><div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-mover-enabled aria-label="Enable item mover"><span class="mb-title-text">📦 Item mover</span></div><button type="button" class="mb-small-button" data-mover-new>+ Rule</button></div><div class="mb-small-note">Selected items → arrow-slot bag</div><div data-mover-editor hidden><div class="mb-alert-pick"><input type="text" data-mover-name list="mb-item-mover-suggestions" placeholder="Item name or SID"><button type="button" class="mb-small-button" data-mover-pick title="Pick item" aria-label="Pick item">🔍</button><button type="button" class="mb-small-button" data-mover-add>Add rule</button><button type="button" class="mb-small-button" data-mover-cancel>Cancel</button></div><datalist id="mb-item-mover-suggestions"></datalist></div><div class="mb-list" data-mover-list></div><div class="mb-small-note" data-mover-status></div>';
+        const q=selector=>section.querySelector(selector),input=q('[data-mover-name]'),list=q('[data-mover-list]');
+        const persist=()=>bot.storage.set(key,{...config,items:config.items.map(r=>({...r}))});
+        const editor=q('[data-mover-editor]');
+        const closeEditor=()=>{cancelCapture();editor.hidden=true;input.value='';};
+        q('[data-mover-new]').addEventListener('click',()=>{editor.hidden=false;input.focus();});
+        q('[data-mover-cancel]').addEventListener('click',closeEditor);
+        const renderList=()=>{list.replaceChildren();for(const rule of config.items){
+            const row=document.createElement('div');row.className='mb-list-row';row.style.cssText='display:flex;align-items:center;justify-content:space-between;gap:6px';
+            const enabled=document.createElement('input');enabled.type='checkbox';enabled.checked=rule.enabled!==false;
+            enabled.setAttribute('aria-label','Enable '+(rule.name||'item rule'));
+            enabled.addEventListener('change',()=>{rule.enabled=enabled.checked;persist();wake();});
+            const label=document.createElement('label');label.className='mb-toggle';label.style.cssText='flex:1;min-width:0';
+            const name=document.createElement('span');name.textContent=rule.name||`Item ${rule.sid||rule.id}`;name.title=`SID ${rule.sid||'?'} · CID ${rule.id}`;
+            const remove=document.createElement('button');remove.type='button';remove.className='mb-small-button';remove.textContent='✕';remove.title='Remove item';remove.addEventListener('click',()=>{config.items=config.items.filter(r=>r!==rule);persist();renderList();});label.append(enabled,name);row.append(label,remove);list.appendChild(row);
+        }};
+        const add=item=>{if(!item || !Number(item.id)){setReason('Choose an item from the suggestions');return;}
+            const rule={enabled:true,id:Number(item.id),sid:Number(item.sid)||0,fluidType:Number(item.fluidType)||0,name:String(item.name||'Item '+item.id)};
+            if(!config.items.some(r=>Number(r.sid)===rule.sid&&Number(r.id)===rule.id&&Number(r.fluidType||0)===rule.fluidType))config.items.push(rule);
+            persist();renderList();closeEditor();setReason(config.enabled?'Watching open bags':'Off');wake();
+        };
+        const toggle=q('[data-mover-enabled]');toggle.checked=config.enabled;toggle.addEventListener('change',()=>setEnabled(toggle.checked));
+        input.addEventListener('input',()=>{const choices=(bot.itemAlertItems?.catalog?.()||[]).filter(r=>r.name.toLowerCase().includes(input.value.trim().toLowerCase())).slice(0,40);const dl=q('datalist');dl.replaceChildren();for(const r of choices){const option=document.createElement('option');option.value=r.choice;dl.appendChild(option);}});
+        const addInput=()=>{const value=input.value.trim();if(/^\d+$/.test(value)){add((bot.itemAlertItems?.catalog?.()||[]).find(r=>r.sid===Number(value)));return;}const resolved=bot.itemAlertItems?.resolve?.(value);if(resolved?.item)add(resolved.item);else setReason(resolved?.error||'Choose an item');};
+        q('[data-mover-add]').addEventListener('click',addInput);input.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();addInput();}});
+        q('[data-mover-pick]').addEventListener('click',()=>{
+            cancelCapture();setReason('Click an item in a bag or equipment slot');
+            capture=event=>{const raw=bot.itemAlertItems?.captureItem?.(event);if(!raw)return;
+                event.preventDefault();event.stopPropagation();event.stopImmediatePropagation?.();
+                const item=bot.itemAlertItems?.fromItem?.(raw);cancelCapture();add(item);
+            };document.addEventListener('click',capture,true);captureTimer=setTimeout(()=>{cancelCapture();setReason('Item picker expired');},20000);
+        });
+        view=q('[data-mover-status]');view.textContent=reason;renderList();parent.appendChild(section);
+    }
+    bot.itemMover={config,setEnabled,mount,status:()=>({running:config.enabled,reason})};
+    if(config.enabled)timer=setInterval(tick,200);
+    bot.addCleanup(()=>{disposed=true;cancelCapture();unsubscribe();if(timer!==null)clearInterval(timer);pending=null;opening=null;destination=null;player=null;equipped=null;view=null;});
+};
+
 window.__minibiaBotBundle.installDepositerModule = function installDepositerModule(bot) {
     const configStorageKey = "minibiaBot.depositer.config";
     const DEFAULT_BAGS = {
@@ -56466,7 +56799,7 @@ window.__minibiaBotBundle.installDepositerModule = function installDepositerModu
     };
 
     function normalizeConfig() {
-        config.workflow = config.workflow === "manual" ? "manual" : "depot-room";
+        config.workflow = ["manual","all-bags"].includes(config.workflow) ? config.workflow : "depot-room";
         config.mode = ["npc", "split", "all"].includes(config.mode) ? config.mode : "npc";
         config.sourceTitle = String(config.sourceTitle || "Loot").trim() || "Loot";
         config.manualSourceId = Number.isFinite(Number(config.manualSourceId)) ? Number(config.manualSourceId) : null;
@@ -57493,29 +57826,61 @@ window.__minibiaBotBundle.installDepositerModule = function installDepositerModu
         throw new Error("No reachable depot locker found within the configured wait time");
     }
 
-    async function runManual() {
-        const source = findOpenContainer(config.manualSourceId, config.manualSourceTitle);
+    function destinationContainers(root){
+        const tree=new Set([root]),all=openedContainers();
+        for(let changed=true;changed;){
+            changed=false;
+            for(const c of all){
+                if(tree.has(c))continue;
+                if([...tree].some(parent=>c.__openedFromParent===parent || c.__replacedParent===parent ||
+                    (Number(c.__parentCid)>0 && Number(c.__parentCid)===Number(parent.__containerId)))){
+                    tree.add(c);changed=true;
+                }
+            }
+        }
+        return tree;
+    }
+    async function runManual(allBags=false) {
+        const source = allBags ? null : findOpenContainer(config.manualSourceId, config.manualSourceTitle);
         const destination = findOpenContainer(config.destinationId, config.destinationTitle);
-        if (!source) throw new Error("Manual source backpack is not open/captured");
-        if (!destination) throw new Error("Manual destination backpack is not open/captured");
+        if (!allBags && !source) throw new Error("Manual source backpack is not open/captured");
+        if (!destination) throw new Error("Destination backpack is not open/captured");
         if (source === destination) throw new Error("Source and destination cannot be the same backpack");
         const keep = new Set(config.keepItemIds.map(Number));
+        // Fixed source membership: destination overflow bags opened during the
+        // transfer must never become new sources and move their loot back out.
+        const sources=allBags ? openedContainers().filter(c=>{
+            const type=String(itemDef(c.id)?.properties?.type||'').toLowerCase();
+            return c!==window.gameClient?.player?.equipment && type!=='corpse' &&
+                !/\b(?:dead|slain)\b/i.test(containerTitle(c)) && !isDepotContainer(c);
+        }) : null;
         while (true) {
             stopCheck();
+            const excluded=destinationContainers(destination);
+            const live=openedContainers();
+            if(!live.includes(destination))throw new Error("Destination backpack was closed; transfer stopped");
             let row = null;
-            for (const c of openedContainers().filter(x => x===source || x.__openedFromParent===source || x.__replacedParent===source || Number(x.__parentCid)===Number(source.__containerId))) {
+            const containers=allBags ? sources.filter(c=>live.includes(c)) : live.filter(x => x===source || x.__openedFromParent===source || x.__replacedParent===source || Number(x.__parentCid)===Number(source.__containerId));
+            for (const c of containers) {
+                if(excluded.has(c))continue;
                 for (let slot=0;slot<slots(c);slot++) {
-                    const it=peek(c,slot); if(!it || (config.skipContainers&&isBag(it)) || keep.has(Number(it.id))) continue;
+                    const it=peek(c,slot); if(!it || ((allBags||config.skipContainers)&&isBag(it)) || keep.has(Number(it.id))) continue;
                     row={c,slot,it}; break;
                 }
                 if(row)break;
             }
             if(!row)break;
+            statusMessage("transfer",`Moving items · ${state.movedItems} moved`);
             const id=identify(row.it);
             const target=await findTargetSlot(async()=>destination,[],id,"manual-destination");
-            if(!target)throw new Error("Manual destination tree is full");
+            if(!target)throw new Error("Destination backpack and child bags are full");
+            // Opening a destination child can replace windows. Revalidate the
+            // source slot before sending a packet with an obsolete slot index.
+            if(!openedContainers().includes(row.c) || peek(row.c,row.slot)!==row.it)
+                throw new Error("Source changed while preparing transfer; run again with the bags open");
             await moveConfirmed(row,target,Math.min(target.capacity,count(row.it)));
         }
+        statusMessage("complete",`Transfer complete · ${state.movedItems} items moved`);
     }
 
     async function runDepotRoom() {
@@ -57579,7 +57944,8 @@ window.__minibiaBotBundle.installDepositerModule = function installDepositerModu
         resetRunContainerCache();
         bot.cave?.pauseMovement?.("depositer");
         try {
-            if (config.workflow === "manual") await runManual();
+            if (config.workflow === "all-bags") await runManual(true);
+            else if (config.workflow === "manual") await runManual();
             else await runDepotRoom();
             bot.log("[Depositer] Complete", {moved:state.movedItems,groups:state.groups});
             if(typeof bot.showPanelNotification==="function")bot.showPanelNotification("📦 DEPOT COMPLETE",`${state.movedItems} items moved`,"depositer",8000);else bot.sendServerMessage?.(`Depot complete: ${state.movedItems} items moved`);
@@ -59530,7 +59896,9 @@ function upgradeSectionHeaders(panel) {
         }
         if (destLabel) {
             const destId = bot.looter?.getDestinationId?.();
-            destLabel.textContent = destId ? `Destination: container ${destId}` : "No destination selected";
+            destLabel.textContent = status?.destinationMode==='auto' ? "Equipped backpack · child bags when full" : destId ? `Destination: container ${destId}` : "No destination selected";
+            const mode=document.getElementById("minibia-bot-looter-destination-mode");
+            if(mode && document.activeElement!==mode)mode.value=status?.destinationMode || 'manual';
         }
 
         if (
@@ -61446,6 +61814,7 @@ function upgradeSectionHeaders(panel) {
 #minibia-bot-panel .mb-rm-add > label { min-width:0; margin:0; }
 #minibia-bot-panel .mb-rm-add[hidden] { display:none; }
 #minibia-bot-panel [data-rm-new] { margin-left:auto; order:2; flex-shrink:0; }
+
 #minibia-bot-panel .mb-rm-actions { display:flex; gap:4px; }
 #minibia-bot-panel .mb-rm-actions button { padding:3px 6px; }
 #minibia-bot-panel .mb-rm-target { text-align:center; }
@@ -63165,11 +63534,12 @@ function upgradeSectionHeaders(panel) {
     <div class="mb-alert-toggle-grid">
       <label class="mb-toggle"><input type="checkbox" id="minibia-bot-antibot-enabled"><span>Anti-bot check</span></label>
       <label class="mb-toggle"><input type="checkbox" id="minibia-bot-gm-chat-monitor"><span>GM Auto Respond</span></label>
-      <label class="mb-toggle" title="GM alarm and 15-second pause for a nearby Chancellor or a new Chancellor chat message. No auto-reply."><input type="checkbox" id="minibia-bot-chancellor-alert"><span>Chancellor alert</span></label>
+      <label class="mb-toggle" title="GM alarm and configured pause for a nearby Chancellor or a new Chancellor chat message. No auto-reply."><input type="checkbox" id="minibia-bot-chancellor-alert"><span>Chancellor alert</span></label>
       <label class="mb-toggle"><input type="checkbox" id="minibia-bot-antibot-creature-enabled"><span>Anti-bot creature</span></label>
       <label class="mb-toggle"><input type="checkbox" id="minibia-bot-pink-skull-enabled" /><span>Pinkskull XLOG</span></label>
       <label class="mb-toggle" title="Close connection on a new Console message containing sent to temple. Disables Auto-Reconnect."><input type="checkbox" id="minibia-bot-temple-xlog-enabled" /><span>Temple XLOG</span></label>
     </div>
+    <label class="mb-field"><span class="mb-field-label">Chancellor pause (seconds)</span><input type="number" id="minibia-bot-chancellor-pause" min="5" max="60" step="1" value="30" style="max-width:80px"></label>
     <details class="mb-alert-fold"><summary>GM responder replies</summary><div class="mb-alert-fold-body">
       <label class="mb-toggle"><input type="checkbox" id="minibia-bot-gm-random-greetings"><span>Randomize both replies</span></label>
       <label class="mb-field"><span class="mb-field-label">First reply · short, lowercase · one per line</span><textarea id="minibia-bot-gm-greetings" rows="3" aria-label="GM greetings, one per line"></textarea></label>
@@ -63421,7 +63791,7 @@ function upgradeSectionHeaders(panel) {
 </div>
 
 <!-- Resupply Tab -->
-<div class="mb-tab-panel mb-resupply-compact" data-tab-panel="resupply"><div class="mb-section mb-resupply-section"><div class="mb-section-title"><span class="mb-title-text">📦 Depositer / Depot Room</span></div><div class="mb-resupply-grid"><label class="mb-field"><span class="mb-field-label">Workflow</span><select id="minibia-bot-depositer-workflow"><option value="depot-room">Depot Room (auto)</option><option value="manual">Open BP → BP</option></select></label><label class="mb-field"><span class="mb-field-label">Sorting</span><select id="minibia-bot-depositer-mode"><option value="npc">Stackables + NPC</option><option value="split">Stackables / Unstackables</option><option value="all">All together</option></select></label><label class="mb-field"><span class="mb-field-label">Loot BP name</span><input id="minibia-bot-depositer-source" placeholder="Loot"></label></div><div class="mb-resupply-actions"><button type="button" class="mb-small-button" id="minibia-bot-depositer-run" title="Run Depositer">Run Depositer</button><button type="button" class="mb-small-button" id="minibia-bot-depositer-stop" title="Stop">Stop</button><button type="button" class="mb-small-button" id="minibia-bot-depositer-add-wp" title="+ Cave WP">+ Cave WP</button></div><div class="mb-resupply-status"><span class="mb-small-note" id="minibia-bot-depositer-status">Idle</span></div><details class="mb-resupply-fold" data-resupply-workflow="depot-room"><summary>Destination backpacks</summary><div class="mb-resupply-fold-body"><div id="minibia-bot-depositer-bags" class="mb-resupply-grid"></div></div></details><details class="mb-resupply-fold" ><summary>Item rules</summary><div class="mb-resupply-fold-body"><div class="mb-small-note">Keep an amount or choose a destination group. Auto follows the sorting mode.</div><div id="minibia-bot-depositer-rules" class="mb-resupply-rule-list"></div><div class="mb-resupply-grid"><label class="mb-field"><span class="mb-field-label">Item SID</span><input type="number" id="minibia-bot-depositer-new-sid" placeholder="SID" min="1"></label><label class="mb-field"><span class="mb-field-label">Keep amount</span><input type="number" id="minibia-bot-depositer-new-keep" placeholder="Keep" min="0" value="0"></label><label class="mb-field"><span class="mb-field-label">Destination group</span><select id="minibia-bot-depositer-new-group"><option value="auto">Auto</option><option value="all">All loot</option><option value="stackables">Stackables</option><option value="unstackables">Unstackables</option><option value="green">Green Djinn</option><option value="blue">Blue Djinn</option><option value="rashid">Rashid</option><option value="other">Other</option><option value="unsorted">Unsorted</option></select></label></div><div class="mb-resupply-actions"><button type="button" class="mb-small-button" id="minibia-bot-depositer-add-rule" title="Add rule">Add rule</button></div></div></details><div class="mb-resupply-manual" data-resupply-workflow="manual" hidden><div class="mb-resupply-grid"><label class="mb-field"><span class="mb-field-label">Manual source BP</span><div class="mb-resupply-pick"><input id="minibia-bot-depositer-manual-source"><button type="button" class="mb-small-button" id="minibia-bot-depositer-source-pick">Pick</button></div></label><label class="mb-field"><span class="mb-field-label">Manual destination BP</span><div class="mb-resupply-pick"><input id="minibia-bot-depositer-destination"><button type="button" class="mb-small-button" id="minibia-bot-depositer-destination-pick">Pick</button></div></label></div></div><details class="mb-resupply-fold" ><summary>Advanced settings</summary><div class="mb-resupply-fold-body"><div class="mb-resupply-grid"><label class="mb-field"><span class="mb-field-label">Move delay ms</span><input type="number" id="minibia-bot-depositer-delay" min="80" max="2000" step="20" value="220"></label><label class="mb-field"><span class="mb-field-label">Locker radius</span><input type="number" id="minibia-bot-depositer-radius" min="3" max="30" value="14"></label><label class="mb-field"><span class="mb-field-label">Explore steps</span><input type="number" id="minibia-bot-depositer-explore" min="0" max="30" value="8"></label><label class="mb-field"><span class="mb-field-label">Locker wait sec</span><input type="number" id="minibia-bot-depositer-wait" min="5" max="300" value="60"></label><label class="mb-field"><span class="mb-field-label">ACK timeout ms</span><input type="number" id="minibia-bot-depositer-ack" min="1500" max="15000" step="250" value="4000"></label><label class="mb-field"><span class="mb-field-label">Legacy keep CIDs</span><input id="minibia-bot-depositer-keep" placeholder="3031, 3492"></label></div></div></details><details class="mb-resupply-fold" ><summary>How depositing works</summary><div class="mb-resupply-fold-body"><div class="mb-small-note">Depot Room finds the named loot backpack, a reachable locker and the configured destination backpacks. It continues into child bags when full and waits for each move to be confirmed. Manual mode transfers between the selected open backpacks.</div></div></details></div><div class="mb-section mb-resupply-section"><div class="mb-section-title"><input type="checkbox" id="minibia-bot-npc-supply-enabled" class="mb-title-toggle"><span class="mb-title-text">🛒 NPC Supply / Trade</span></div><div class="mb-resupply-grid"><label class="mb-field"><span class="mb-field-label">NPC name</span><input id="minibia-bot-npc-supply-name" placeholder="Sandra"></label></div><div class="mb-resupply-actions"><button type="button" class="mb-small-button" id="minibia-bot-npc-supply-run" title="Refill Now">Refill Now</button><button type="button" class="mb-small-button" id="minibia-bot-npc-supply-check" title="Check Supplies">Check Supplies</button><button type="button" class="mb-small-button" id="minibia-bot-npc-supply-stop" title="Stop">Stop</button></div><div class="mb-resupply-status"><span class="mb-small-note" id="minibia-bot-npc-supply-status">Idle</span></div><div id="minibia-bot-npc-supply-rules" class="mb-resupply-rule-list"></div><details class="mb-resupply-fold" ><summary>Add supply rule</summary><div class="mb-resupply-fold-body"><div class="mb-resupply-grid"><label class="mb-field"><span class="mb-field-label">Item name</span><input id="minibia-bot-npc-supply-new-name" placeholder="Item name"></label><label class="mb-field"><span class="mb-field-label">NPC offer (optional)</span><input id="minibia-bot-npc-supply-new-trade" placeholder="NPC offer name (optional)"></label><label class="mb-field"><span class="mb-field-label">LOW below</span><input type="number" id="minibia-bot-npc-supply-new-min" min="0" value="10" title="LOW below"></label><label class="mb-field"><span class="mb-field-label">Refill to</span><input type="number" id="minibia-bot-npc-supply-new-target" min="0" value="100" title="Refill target"></label></div><div class="mb-resupply-actions"><button type="button" class="mb-small-button" id="minibia-bot-npc-supply-add" title="Add">Add</button></div></div></details><details class="mb-resupply-fold" ><summary>Cavebot waypoints</summary><div class="mb-resupply-fold-body"><label class="mb-field"><span class="mb-field-label">Supplies OK → waypoint label</span><input id="minibia-bot-npc-supply-check-ok-label" value="start"></label><div class="mb-resupply-actions"><button type="button" class="mb-small-button" id="minibia-bot-npc-supply-add-wp" title="+ Resupply WPT">+ Resupply WPT</button><button type="button" class="mb-small-button" id="minibia-bot-npc-supply-add-check-wp" title="+ Supply Check WPT">+ Supply Check WPT</button></div><div class="mb-small-note">LOW continues to the next waypoint. OK jumps to the configured label.</div></div></details><details class="mb-resupply-fold" ><summary>One-off buy / sell</summary><div class="mb-resupply-fold-body"><div class="mb-resupply-grid"><label class="mb-field"><span class="mb-field-label">Item name</span><input id="minibia-bot-npc-oneoff-name" placeholder="Item name"></label><label class="mb-field"><span class="mb-field-label">Amount / total / keep</span><input type="number" id="minibia-bot-npc-oneoff-value" min="0" value="100"></label><label class="mb-field"><span class="mb-field-label">Buy mode</span><select id="minibia-bot-npc-oneoff-buy-mode"><option value="fill">Buy to total</option><option value="fixed">Buy fixed</option></select></label><label class="mb-field"><span class="mb-field-label">Sell mode</span><select id="minibia-bot-npc-oneoff-sell-mode"><option value="all">Sell all</option><option value="amount">Sell amount</option><option value="keep">Sell, keep X</option></select></label></div><div class="mb-resupply-actions"><button type="button" class="mb-small-button" id="minibia-bot-npc-oneoff-buy" title="Buy">Buy</button><button type="button" class="mb-small-button" id="minibia-bot-npc-oneoff-sell" title="Sell">Sell</button></div></div></details><details class="mb-resupply-fold" ><summary>Advanced settings</summary><div class="mb-resupply-fold-body"><div class="mb-resupply-grid"><label class="mb-field"><span class="mb-field-label">Greeting</span><input id="minibia-bot-npc-supply-greeting" value="hi"></label><label class="mb-field"><span class="mb-field-label">Trade word</span><input id="minibia-bot-npc-supply-trade" value="trade"></label><label class="mb-field"><span class="mb-field-label">Delay ms</span><input type="number" id="minibia-bot-npc-supply-delay" min="140" max="3000" step="20" value="250"></label><label class="mb-field"><span class="mb-field-label">Count timeout ms</span><input type="number" id="minibia-bot-npc-supply-timeout" min="1200" max="15000" step="250" value="5000"></label></div><label class="mb-toggle"><input type="checkbox" id="minibia-bot-npc-supply-close" checked><span>Close trade after</span></label></div></details><details class="mb-resupply-fold" ><summary>How resupplying works</summary><div class="mb-resupply-fold-body"><div class="mb-small-note">Refill to is the total inventory count to buy up to. LOW below is used by supply checks. Trades use the normal NPC conversation and exact inventory counts, with confirmation after each purchase.</div></div></details></div><div class="mb-section mb-resupply-section"><div class="mb-section-title"><span class="mb-title-text">🏦 Bank NPC</span></div><div class="mb-resupply-grid"><label class="mb-field"><span class="mb-field-label">NPC name</span><input id="minibia-bot-bank-name" placeholder="Banker name (blank = nearest NPC)"></label><label class="mb-field"><span class="mb-field-label">Preset</span><select id="minibia-bot-bank-preset"><option value="deposit-all">Deposit all</option><option value="withdraw">Withdraw amount</option><option value="custom">Custom dialogue</option></select></label></div><div data-resupply-bank="withdraw" hidden><div class="mb-resupply-grid"><label class="mb-field"><span class="mb-field-label">Amount</span><input type="number" id="minibia-bot-bank-amount" min="1" value="1000"></label></div></div><div data-resupply-bank="custom" hidden><label class="mb-field"><span class="mb-field-label">Custom lines (one per line)</span><textarea id="minibia-bot-bank-custom" rows="2"></textarea></label></div><div class="mb-resupply-actions"><button type="button" class="mb-small-button" id="minibia-bot-bank-run" title="Run Bank Action">Run Bank Action</button><button type="button" class="mb-small-button" id="minibia-bot-bank-stop" title="Stop">Stop</button><button type="button" class="mb-small-button" id="minibia-bot-bank-add-wp" title="+ Cave WP">+ Cave WP</button></div><div class="mb-resupply-status"><span class="mb-small-note" id="minibia-bot-bank-status">Idle</span></div><details class="mb-resupply-fold" ><summary>Advanced settings</summary><div class="mb-resupply-fold-body"><div class="mb-resupply-grid"><label class="mb-field"><span class="mb-field-label">Greeting</span><input id="minibia-bot-bank-greeting" value="hi"></label><label class="mb-field"><span class="mb-field-label">Fallback delay ms</span><input type="number" id="minibia-bot-bank-delay" min="0" max="3000" value="250"></label><label class="mb-field"><span class="mb-field-label">Reply timeout ms</span><input type="number" id="minibia-bot-bank-timeout" min="350" max="30000" value="5000"></label></div></div></details><details class="mb-resupply-fold" ><summary>How bank actions work</summary><div class="mb-resupply-fold-body"><div class="mb-small-note">Deposit all: deposit → all → yes. Withdraw: withdraw → amount → yes. Custom dialogue sends one line at a time. Each line waits for the NPC reply.</div></div></details></div></div>
+<div class="mb-tab-panel mb-resupply-compact" data-tab-panel="resupply"><div class="mb-section mb-resupply-section"><div class="mb-section-title"><span class="mb-title-text">📦 Depositer / Depot Room</span></div><div class="mb-resupply-grid"><label class="mb-field"><span class="mb-field-label">Workflow</span><select id="minibia-bot-depositer-workflow"><option value="depot-room">Depot Room (auto)</option><option value="manual">Open BP → BP</option><option value="all-bags">All open bags → Selected bag</option></select></label><label class="mb-field"><span class="mb-field-label">Sorting</span><select id="minibia-bot-depositer-mode"><option value="npc">Stackables + NPC</option><option value="split">Stackables / Unstackables</option><option value="all">All together</option></select></label><label class="mb-field"><span class="mb-field-label">Loot BP name</span><input id="minibia-bot-depositer-source" placeholder="Loot"></label></div><div class="mb-resupply-actions"><button type="button" class="mb-small-button" id="minibia-bot-depositer-run" title="Run Depositer">Run Depositer</button><button type="button" class="mb-small-button" id="minibia-bot-depositer-stop" title="Stop">Stop</button><button type="button" class="mb-small-button" id="minibia-bot-depositer-add-wp" title="+ Cave WP">+ Cave WP</button></div><div class="mb-resupply-status"><span class="mb-small-note" id="minibia-bot-depositer-status">Idle</span></div><details class="mb-resupply-fold" data-resupply-workflow="depot-room"><summary>Destination backpacks</summary><div class="mb-resupply-fold-body"><div id="minibia-bot-depositer-bags" class="mb-resupply-grid"></div></div></details><details class="mb-resupply-fold" ><summary>Item rules</summary><div class="mb-resupply-fold-body"><div class="mb-small-note">Keep an amount or choose a destination group. Auto follows the sorting mode.</div><div id="minibia-bot-depositer-rules" class="mb-resupply-rule-list"></div><div class="mb-resupply-grid"><label class="mb-field"><span class="mb-field-label">Item SID</span><input type="number" id="minibia-bot-depositer-new-sid" placeholder="SID" min="1"></label><label class="mb-field"><span class="mb-field-label">Keep amount</span><input type="number" id="minibia-bot-depositer-new-keep" placeholder="Keep" min="0" value="0"></label><label class="mb-field"><span class="mb-field-label">Destination group</span><select id="minibia-bot-depositer-new-group"><option value="auto">Auto</option><option value="all">All loot</option><option value="stackables">Stackables</option><option value="unstackables">Unstackables</option><option value="green">Green Djinn</option><option value="blue">Blue Djinn</option><option value="rashid">Rashid</option><option value="other">Other</option><option value="unsorted">Unsorted</option></select></label></div><div class="mb-resupply-actions"><button type="button" class="mb-small-button" id="minibia-bot-depositer-add-rule" title="Add rule">Add rule</button></div></div></details><div class="mb-resupply-manual" data-resupply-workflow="manual all-bags" hidden><div class="mb-resupply-grid"><label class="mb-field" data-resupply-workflow="manual"><span class="mb-field-label">Manual source BP</span><div class="mb-resupply-pick"><input id="minibia-bot-depositer-manual-source"><button type="button" class="mb-small-button" id="minibia-bot-depositer-source-pick">Pick</button></div></label><label class="mb-field"><span class="mb-field-label">Destination bag</span><div class="mb-resupply-pick"><input id="minibia-bot-depositer-destination"><button type="button" class="mb-small-button" id="minibia-bot-depositer-destination-pick">Pick</button></div></label></div></div><details class="mb-resupply-fold" ><summary>Advanced settings</summary><div class="mb-resupply-fold-body"><div class="mb-resupply-grid"><label class="mb-field"><span class="mb-field-label">Move delay ms</span><input type="number" id="minibia-bot-depositer-delay" min="80" max="2000" step="20" value="220"></label><label class="mb-field"><span class="mb-field-label">Locker radius</span><input type="number" id="minibia-bot-depositer-radius" min="3" max="30" value="14"></label><label class="mb-field"><span class="mb-field-label">Explore steps</span><input type="number" id="minibia-bot-depositer-explore" min="0" max="30" value="8"></label><label class="mb-field"><span class="mb-field-label">Locker wait sec</span><input type="number" id="minibia-bot-depositer-wait" min="5" max="300" value="60"></label><label class="mb-field"><span class="mb-field-label">ACK timeout ms</span><input type="number" id="minibia-bot-depositer-ack" min="1500" max="15000" step="250" value="4000"></label><label class="mb-field"><span class="mb-field-label">Legacy keep CIDs</span><input id="minibia-bot-depositer-keep" placeholder="3031, 3492"></label></div></div></details><details class="mb-resupply-fold" ><summary>How depositing works</summary><div class="mb-resupply-fold-body"><div class="mb-small-note">Depot Room finds the named loot backpack, a reachable locker and the configured destination backpacks. It continues into child bags when full and waits for each move to be confirmed. Manual mode transfers between the selected open backpacks.</div></div></details></div><div class="mb-section mb-resupply-section"><div class="mb-section-title"><input type="checkbox" id="minibia-bot-npc-supply-enabled" class="mb-title-toggle"><span class="mb-title-text">🛒 NPC Supply / Trade</span></div><div class="mb-resupply-grid"><label class="mb-field"><span class="mb-field-label">NPC name</span><input id="minibia-bot-npc-supply-name" placeholder="Sandra"></label></div><div class="mb-resupply-actions"><button type="button" class="mb-small-button" id="minibia-bot-npc-supply-run" title="Refill Now">Refill Now</button><button type="button" class="mb-small-button" id="minibia-bot-npc-supply-check" title="Check Supplies">Check Supplies</button><button type="button" class="mb-small-button" id="minibia-bot-npc-supply-stop" title="Stop">Stop</button></div><div class="mb-resupply-status"><span class="mb-small-note" id="minibia-bot-npc-supply-status">Idle</span></div><div id="minibia-bot-npc-supply-rules" class="mb-resupply-rule-list"></div><details class="mb-resupply-fold" ><summary>Add supply rule</summary><div class="mb-resupply-fold-body"><div class="mb-resupply-grid"><label class="mb-field"><span class="mb-field-label">Item name</span><input id="minibia-bot-npc-supply-new-name" placeholder="Item name"></label><label class="mb-field"><span class="mb-field-label">NPC offer (optional)</span><input id="minibia-bot-npc-supply-new-trade" placeholder="NPC offer name (optional)"></label><label class="mb-field"><span class="mb-field-label">LOW below</span><input type="number" id="minibia-bot-npc-supply-new-min" min="0" value="10" title="LOW below"></label><label class="mb-field"><span class="mb-field-label">Refill to</span><input type="number" id="minibia-bot-npc-supply-new-target" min="0" value="100" title="Refill target"></label></div><div class="mb-resupply-actions"><button type="button" class="mb-small-button" id="minibia-bot-npc-supply-add" title="Add">Add</button></div></div></details><details class="mb-resupply-fold" ><summary>Cavebot waypoints</summary><div class="mb-resupply-fold-body"><label class="mb-field"><span class="mb-field-label">Supplies OK → waypoint label</span><input id="minibia-bot-npc-supply-check-ok-label" value="start"></label><div class="mb-resupply-actions"><button type="button" class="mb-small-button" id="minibia-bot-npc-supply-add-wp" title="+ Resupply WPT">+ Resupply WPT</button><button type="button" class="mb-small-button" id="minibia-bot-npc-supply-add-check-wp" title="+ Supply Check WPT">+ Supply Check WPT</button></div><div class="mb-small-note">LOW continues to the next waypoint. OK jumps to the configured label.</div></div></details><details class="mb-resupply-fold" ><summary>One-off buy / sell</summary><div class="mb-resupply-fold-body"><div class="mb-resupply-grid"><label class="mb-field"><span class="mb-field-label">Item name</span><input id="minibia-bot-npc-oneoff-name" placeholder="Item name"></label><label class="mb-field"><span class="mb-field-label">Amount / total / keep</span><input type="number" id="minibia-bot-npc-oneoff-value" min="0" value="100"></label><label class="mb-field"><span class="mb-field-label">Buy mode</span><select id="minibia-bot-npc-oneoff-buy-mode"><option value="fill">Buy to total</option><option value="fixed">Buy fixed</option></select></label><label class="mb-field"><span class="mb-field-label">Sell mode</span><select id="minibia-bot-npc-oneoff-sell-mode"><option value="all">Sell all</option><option value="amount">Sell amount</option><option value="keep">Sell, keep X</option></select></label></div><div class="mb-resupply-actions"><button type="button" class="mb-small-button" id="minibia-bot-npc-oneoff-buy" title="Buy">Buy</button><button type="button" class="mb-small-button" id="minibia-bot-npc-oneoff-sell" title="Sell">Sell</button></div></div></details><details class="mb-resupply-fold" ><summary>Advanced settings</summary><div class="mb-resupply-fold-body"><div class="mb-resupply-grid"><label class="mb-field"><span class="mb-field-label">Greeting</span><input id="minibia-bot-npc-supply-greeting" value="hi"></label><label class="mb-field"><span class="mb-field-label">Trade word</span><input id="minibia-bot-npc-supply-trade" value="trade"></label><label class="mb-field"><span class="mb-field-label">Delay ms</span><input type="number" id="minibia-bot-npc-supply-delay" min="140" max="3000" step="20" value="250"></label><label class="mb-field"><span class="mb-field-label">Count timeout ms</span><input type="number" id="minibia-bot-npc-supply-timeout" min="1200" max="15000" step="250" value="5000"></label></div><label class="mb-toggle"><input type="checkbox" id="minibia-bot-npc-supply-close" checked><span>Close trade after</span></label></div></details><details class="mb-resupply-fold" ><summary>How resupplying works</summary><div class="mb-resupply-fold-body"><div class="mb-small-note">Refill to is the total inventory count to buy up to. LOW below is used by supply checks. Trades use the normal NPC conversation and exact inventory counts, with confirmation after each purchase.</div></div></details></div><div class="mb-section mb-resupply-section"><div class="mb-section-title"><span class="mb-title-text">🏦 Bank NPC</span></div><div class="mb-resupply-grid"><label class="mb-field"><span class="mb-field-label">NPC name</span><input id="minibia-bot-bank-name" placeholder="Banker name (blank = nearest NPC)"></label><label class="mb-field"><span class="mb-field-label">Preset</span><select id="minibia-bot-bank-preset"><option value="deposit-all">Deposit all</option><option value="withdraw">Withdraw amount</option><option value="custom">Custom dialogue</option></select></label></div><div data-resupply-bank="withdraw" hidden><div class="mb-resupply-grid"><label class="mb-field"><span class="mb-field-label">Amount</span><input type="number" id="minibia-bot-bank-amount" min="1" value="1000"></label></div></div><div data-resupply-bank="custom" hidden><label class="mb-field"><span class="mb-field-label">Custom lines (one per line)</span><textarea id="minibia-bot-bank-custom" rows="2"></textarea></label></div><div class="mb-resupply-actions"><button type="button" class="mb-small-button" id="minibia-bot-bank-run" title="Run Bank Action">Run Bank Action</button><button type="button" class="mb-small-button" id="minibia-bot-bank-stop" title="Stop">Stop</button><button type="button" class="mb-small-button" id="minibia-bot-bank-add-wp" title="+ Cave WP">+ Cave WP</button></div><div class="mb-resupply-status"><span class="mb-small-note" id="minibia-bot-bank-status">Idle</span></div><details class="mb-resupply-fold" ><summary>Advanced settings</summary><div class="mb-resupply-fold-body"><div class="mb-resupply-grid"><label class="mb-field"><span class="mb-field-label">Greeting</span><input id="minibia-bot-bank-greeting" value="hi"></label><label class="mb-field"><span class="mb-field-label">Fallback delay ms</span><input type="number" id="minibia-bot-bank-delay" min="0" max="3000" value="250"></label><label class="mb-field"><span class="mb-field-label">Reply timeout ms</span><input type="number" id="minibia-bot-bank-timeout" min="350" max="30000" value="5000"></label></div></div></details><details class="mb-resupply-fold" ><summary>How bank actions work</summary><div class="mb-resupply-fold-body"><div class="mb-small-note">Deposit all: deposit → all → yes. Withdraw: withdraw → amount → yes. Custom dialogue sends one line at a time. Each line waits for the NPC reply.</div></div></details></div></div>
 
 <!-- Cave Tab -->
 <div class="mb-tab-panel mb-cave-compact" data-tab-panel="cave">
@@ -63826,7 +64196,7 @@ function upgradeSectionHeaders(panel) {
 </div>
  <div class="mb-section">
   <div class="mb-section-title"><input type="checkbox" id="minibia-bot-looter-enabled" class="mb-title-toggle"><span class="mb-title-text">💰 Looter</span></div>
-  <div class="mb-looter-destination"><span class="mb-small-note" id="minibia-bot-looter-dest-status">No destination selected</span><button type="button" class="mb-small-button" id="minibia-bot-looter-select-dest" title="Choose the main loot container. Full containers overflow into child bags automatically.">Set Destination</button></div>
+  <label class="mb-field"><span class="mb-field-label">Loot destination</span><select id="minibia-bot-looter-destination-mode"><option value="auto">Equipped backpack (auto)</option><option value="manual">Selected container</option></select></label><div class="mb-looter-destination"><span class="mb-small-note" id="minibia-bot-looter-dest-status">No destination selected</span><button type="button" class="mb-small-button" id="minibia-bot-looter-select-dest" title="Choose the main loot container. Full containers overflow into child bags automatically.">Set Destination</button></div>
   <label class="mb-field"><span class="mb-field-label">Loot mode</span><select id="minibia-bot-looter-mode"><option value="whitelist">Loot listed items</option><option value="blacklist">Blacklist — loot everything except listed items</option></select></label>
   <div class="mb-small-note" id="minibia-bot-looter-mode-note">Loots only from containers whose names contain “dead”. Container items are always skipped.</div>
   <div class="mb-section-title mb-section-title--sub"><span class="mb-title-text" id="minibia-bot-looter-list-title">Tracked Items</span></div>
@@ -64488,6 +64858,7 @@ function upgradeSectionHeaders(panel) {
         const contentHost=panel.querySelector('.mb-tab-content');
         const makeLeaf=id=>{const el=document.createElement('div');el.className='mb-tab-panel';el.dataset.tabPanel=id;contentHost.appendChild(el);return el;};
         const skillsPanel=makeLeaf('skilltraining'),equipmentPanel=makeLeaf('equipment'),itemsPanel=makeLeaf('items');
+        bot.itemMover?.mount?.(itemsPanel);
         const trainingPanel=panel.querySelector('[data-tab-panel="training"]');
         const ammoHost=panel.querySelector('[data-ammo-crafter-host]');
         if(ammoHost)trainingPanel.querySelector('[data-runemaker-host]').after(ammoHost);
@@ -64677,6 +65048,7 @@ function upgradeSectionHeaders(panel) {
         const gmSection=panel.querySelector('.mb-alert-antibot');
         if(gmSection)gmPanel.appendChild(gmSection);
         tabContent.appendChild(gmPanel);
+        bot.staffMarkers?.mount?.(gmPanel);
         const subtabBar=document.createElement('div');subtabBar.className='mb-subtab-menu';subtabBar.setAttribute('role','tablist');subtabBar.setAttribute('aria-label','Section');tabContent.prepend(subtabBar);
         const menu=panel.querySelector('.mb-tab-menu');menu.replaceChildren();
         for(const group of botTabGroups){const button=document.createElement('button');button.type='button';button.className='mb-tab-button';button.dataset.tabButton=group.id;button.textContent=group.label;menu.appendChild(button);}
@@ -66662,6 +67034,14 @@ function upgradeSectionHeaders(panel) {
             });
         }
 
+        const chancellorPause=panel.querySelector("#minibia-bot-chancellor-pause");
+        if(chancellorPause){
+            chancellorPause.value=bot.chancellorAlert?.config?.pauseSeconds || 30;
+            chancellorPause.addEventListener("change",()=>{
+                bot.chancellorAlert?.updateConfig?.({pauseSeconds:chancellorPause.value});
+                chancellorPause.value=bot.chancellorAlert?.config?.pauseSeconds || 30;
+            });
+        }
         const chancellorToggle=panel.querySelector("#minibia-bot-chancellor-alert");
         if(chancellorToggle){
             chancellorToggle.checked=bot.chancellorAlert?.config?.enabled===true;
@@ -66895,6 +67275,10 @@ function upgradeSectionHeaders(panel) {
                 refreshLooterStatus();
             });
         }
+        panel.querySelector("#minibia-bot-looter-destination-mode")?.addEventListener("change",event=>{
+            bot.looter.updateConfig({destinationMode:event.target.value});
+            refreshLooterStatus();
+        });
         const selectDestBtn = panel.querySelector("#minibia-bot-looter-select-dest");
         const captureItemBtn = panel.querySelector("#minibia-bot-looter-capture-item");
         const manualInput = panel.querySelector("#minibia-bot-looter-manual-input");
@@ -67510,7 +67894,7 @@ function upgradeSectionHeaders(panel) {
         }
 
         function refreshResupplyFormVisibility(){
-            panel.querySelectorAll('[data-resupply-workflow]').forEach(el=>{el.hidden=el.dataset.resupplyWorkflow!==(depositerWorkflow?.value||'depot-room');});
+            panel.querySelectorAll('[data-resupply-workflow]').forEach(el=>{el.hidden=!el.dataset.resupplyWorkflow.split(' ').includes(depositerWorkflow?.value||'depot-room');});
             const preset=panel.querySelector('#minibia-bot-bank-preset')?.value||'deposit-all';
             panel.querySelectorAll('[data-resupply-bank]').forEach(el=>{el.hidden=el.dataset.resupplyBank!==preset;});
         }
@@ -69968,7 +70352,7 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
         enabled: false,
         restartDelayMs: 15000,
         firstReplyDelayMs: 1000,
-        secondReplyDelayMs: 1000,
+        secondReplyDelayMs: 3000,
         firstReplyText: "Hey :D",
         randomGreetings: true,
         greetings: null,
@@ -69984,7 +70368,7 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
         Math.min(60000, Number(config.restartDelayMs) || 15000)
     );
     // v1.5.43: use a human-paced sequential reply:
-    // wait ~1s -> "Hey :D" -> wait ~1s -> "i am here".
+    // First reply after ~1s; second reply at least 3s later.
     // Migrate both previous default pairs to the new timing.
     const storedFirstReplyDelay =
         Number(config.firstReplyDelayMs);
@@ -70015,10 +70399,10 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
 
     // This value is the gap AFTER the first reply has actually been sent.
     config.secondReplyDelayMs = Math.max(
-        250,
+        3000,
         Math.min(
             5000,
-            Number(config.secondReplyDelayMs) || 1000
+            Number(config.secondReplyDelayMs) || 3000
         )
     );
     config.triggerCooldownMs = Math.max(
@@ -70354,15 +70738,15 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
         );
 
         const secondGap = Math.max(
-            250,
+            3000,
             Math.min(
                 5000,
                 Number(config.secondReplyDelayMs) ||
-                    1000
+                    3000
             )
         );
 
-        // Wait ~1 second, send the first line, THEN begin the next ~1 second
+        // Wait ~1 second, send the first line, THEN begin the next ~3 second
         // wait so timer throttling cannot collapse the gap between messages.
         const firstId = setTimeout(() => {
             state.replyTimerIds =
@@ -72594,6 +72978,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         currentBundle.installTabTitleModule(bot);
         currentBundle.installPzModule(bot);
         currentBundle.installXrayModule(bot);
+        currentBundle.installStaffMarkersModule(bot);
         currentBundle.installPanicModule(bot);
         currentBundle.installRuneModule(bot);
         currentBundle.installHealModule(bot);
@@ -72655,6 +73040,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         currentBundle.installUiTweaksModule(bot);
         currentBundle.installProgressTracker(bot);
         currentBundle.installDepositerModule(bot);
+        currentBundle.installItemMoverModule(bot);
         currentBundle.installNpcSupplyBuyerModule(bot);
         currentBundle.installBankNpcModule(bot);
         currentBundle.installHuntAnalyzerModule(bot);
