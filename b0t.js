@@ -470,9 +470,12 @@ window.__minibiaBotBundle.createBot = function createBot() {
 
     // ---- TILE HELPERS ----
     function getTileAtPosition(pos) {
-        if (!pos)
-            return null;
-        return window.gameClient?.world?.getTileFromWorldPosition?.(new Position(pos.x, pos.y, pos.z)) || null;
+        if (!pos) return null;
+        const client=window.gameClient;
+        const position = typeof Position === "function" ? new Position(pos.x,pos.y,pos.z)
+            : Object.assign(Object.create(Object.getPrototypeOf(client?.player?.__position || {})),
+                {x:pos.x,y:pos.y,z:pos.z});
+        return client?.world?.getTileFromWorldPosition?.(position) || null;
     }
 
     function getChebyshevDistance(from, to) {
@@ -4151,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.414",
+        version: "1.6.416",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -4648,24 +4651,75 @@ addCleanup(() => {
             return useItemFromSource(source);
         },
 
-        // ---- USE ITEM ON TILE ----
-        useItemOnPosition(itemId, x, y, z) {
-            const pos = {
-                x,
-                y,
-                z
-            };
+        // ---- USE INVENTORY ITEM WITH A TILE ----
+        useItemWithPosition(itemId, x, y, z) {
+            const pos = typeof x === "object" && x !== null
+                ? {x:Number(x.x),y:Number(x.y),z:Number(x.z)}
+                : {x:Number(x),y:Number(y),z:Number(z)};
+            const requested = Number(itemId?.sid ?? itemId?.id ?? itemId);
+            const explicitSid = itemId && typeof itemId === "object" && itemId.sid != null;
+            if (!Number.isInteger(requested) || requested <= 0 || !Object.values(pos).every(Number.isInteger)) {
+                this.log("useItemWithPosition requires an item ID and valid x, y, z coordinates.");
+                return false;
+            }
             const tile = getTileAtPosition(pos);
             if (!tile) {
-                this.log(`Tile at ${x},${y},${z} is not loaded.`);
+                this.log(`Tile at ${pos.x},${pos.y},${pos.z} is not loaded.`);
                 return false;
             }
-            const source = findItemById(itemId);
-            if (!source) {
-                this.log(`Item ${itemId} not found.`);
+            const client=window.gameClient;
+            // Numeric IDs prefer CID; {sid: ...} selects an exact server variant.
+            let source = explicitSid ? null : findItemById(requested);
+            const serverDef=client?.itemDefinitionsBySid?.[requested];
+            if (!source && serverDef) {
+                const cid=Number(serverDef.cid ?? serverDef.id);
+                if (Number.isInteger(cid) && cid>0) source=findItemById(cid,requested);
+            }
+            if (source) return useItemOnTile(source, tile);
+
+            this.log(`Item ${requested} not found in equipment or open containers.`);
+            return false;
+        },
+
+        // ---- USE ITEM ON TILE ----
+        useItemOnPosition(itemId, x, y, z) {
+            const pos = typeof x === "object" && x !== null
+                ? {x:Number(x.x),y:Number(x.y),z:Number(x.z)}
+                : {x:Number(x),y:Number(y),z:Number(z)};
+            const requested = Number(itemId?.sid ?? itemId?.id ?? itemId);
+            const explicitSid = itemId && typeof itemId === "object" && itemId.sid != null;
+            if (!Number.isInteger(requested) || requested <= 0 || !Object.values(pos).every(Number.isInteger)) {
+                this.log("useItemOnPosition requires an item ID and valid x, y, z coordinates.");
                 return false;
             }
-            return useItemOnTile(source, tile);
+            const tile = getTileAtPosition(pos);
+            if (!tile) {
+                this.log(`Tile at ${pos.x},${pos.y},${pos.z} is not loaded.`);
+                return false;
+            }
+            const client=window.gameClient;
+            // A lever, door, etc. already at these coordinates is a use action,
+            // not a tool that must first be found in the backpack.
+            const items=Array.isArray(tile.items) ? tile.items : [];
+            const matches=(item,bySid)=>item && Number(bySid ? item.sid : item.id)===requested;
+            let index=-1;
+            if (!explicitSid) for(let i=items.length-1;i>=0;i--) if(matches(items[i],false)){index=i;break;}
+            if(index<0) for(let i=items.length-1;i>=0;i--) if(matches(items[i],true)){index=i;break;}
+            const groundMatches=matches(tile,explicitSid) || matches(tile,true);
+            if(index<0 && !groundMatches) {
+                this.log(`Item ${requested} not found on tile ${pos.x},${pos.y},${pos.z}.`);
+                return false;
+            }
+            try {
+                if (typeof client?.mouse?.use !== "function") {
+                    this.log("useItemOnPosition: client item-use handler is unavailable.");
+                    return false;
+                }
+                return client.mouse.use({which:tile,index:index<0 ? 0xFF : index}) !== false;
+            } catch(error) {
+                this.log("useItemOnPosition failed",error?.message || error);
+                return false;
+            }
         },
 
         // ---- USE POSITION (right-click on tile) ----
