@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.423",
+        version: "1.6.424",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -47844,7 +47844,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         const def = window.gameClient?.itemDefinitionsBySid?.[item.sid] ||
             window.gameClient?.itemDefinitionsByCid?.[item.id];
         const name = def?.properties?.name || item.name || "";
-        return /dead/i.test(String(name)) && isLootContainerItem(item);
+        return /(?:dead|slain)/i.test(String(name)) && isLootContainerItem(item);
     }
 
     function getCorpseTileInfo(pos) {
@@ -47902,7 +47902,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
     // Server titles are authoritative; never infer a corpse from its slots.
     function isCorpseLootSource(container) {
         if (!container || getContainerById(container.__containerId) !== container ||
-            !/dead/i.test(String(container.__title || ""))) return false;
+            !/(?:dead|slain)/i.test(String(container.__title || ""))) return false;
         const player = window.gameClient?.player;
         const seen = new Set();
         let current = container;
@@ -47914,11 +47914,11 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             const def = window.gameClient?.itemDefinitionsByCid?.[current.id] ||
                 window.gameClient?.itemDefinitionsBySid?.[current.sid];
             const properties = def?.properties || {};
-            // A player can rename a backpack to contain "dead". Its item
+            // A player can rename a backpack to contain "dead" or "slain". Its item
             // definition and parent chain still identify it as an inventory bag.
             if (properties.slotType === "backpack" ||
-                (properties.type === "container" && properties.name && !/dead/i.test(properties.name))) return false;
-            if (current !== container && !/dead/i.test(String(current.__title || ""))) return false;
+                (properties.type === "container" && properties.name && !/(?:dead|slain)/i.test(properties.name))) return false;
+            if (current !== container && !/(?:dead|slain)/i.test(String(current.__title || ""))) return false;
             const linked = current.__openedFromParent || current.__replacedParent;
             const parentId = Number(current.__parentCid);
             const parent = linked || (parentId > 0 ? getContainerById(parentId) : null);
