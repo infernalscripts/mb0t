@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.416",
+        version: "1.6.420",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -4514,6 +4514,7 @@ addCleanup(() => {
 
         /** Play the alarm sound */
         playAlarm() {
+            this.tabTitle?.alert?.("ALARM");
             try {
                 const audio = getAlarmAudio();
                 if (!audio)
@@ -4559,6 +4560,7 @@ addCleanup(() => {
 
         /** Internal helper for specific alarms */
         _playSpecificAlarm(src, label) {
+            this.tabTitle?.alert?.(({playerAlarm:"PLAYER NEARBY",gmAlarm:"GM ALERT",antiBotAlarm:"ANTIBOT CHECK",playerAttackAlarm:"PLAYER ATTACK",messageAlarm:"MESSAGE"})[label] || "ALERT");
             try {
                 // Create a shared audio element if it doesn't exist
                 if (!this.__specificAlarmAudio) {
@@ -5411,6 +5413,58 @@ addCleanup(() => {
  *    Finds, paths to, and remembers PZ tiles. Also allows setting a "home" PZ.
  * ==================================================================================
  */
+window.__minibiaBotBundle.installTabTitleModule = function installTabTitleModule(bot) {
+    const key="minibiaBot.tabTitle.config",saved=bot.storage.get(key,{});
+    const config={enabled:saved.enabled===true,alerts:saved.alerts!==false};
+    let original=document.title,lastWritten=null,timer=null,disposed=false,alertUntil=0,alertLabel="";
+    const clean=value=>String(value||"").replace(/[\r\n\t]+/g," ").trim().slice(0,80);
+    function render(){
+        if(disposed)return;
+        if(lastWritten!==null && document.title!==lastWritten) original=document.title;
+        if(!config.enabled){
+            if(lastWritten!==null && document.title===lastWritten)document.title=original;
+            lastWritten=null;return;
+        }
+        const name=clean(window.__minibiaBotCurrentCharacter || window.gameClient?.player?.name);
+        const base=name ? `${name} | mb0t` : "mb0t";
+        const title=config.alerts && Date.now()<alertUntil ? `⚠ ${alertLabel || "ALERT"} | ${base}` : base;
+        if(document.title!==title)document.title=title;
+        lastWritten=title;
+    }
+    function alert(label="ALERT",durationMs=15000){
+        if(disposed || !config.enabled || !config.alerts)return;
+        alertLabel=clean(label)||"ALERT";
+        alertUntil=Math.max(alertUntil,Date.now()+Math.max(15000,Number(durationMs)||0));
+        render();
+    }
+    function updateConfig(next={}){
+        if(next.enabled!==undefined)config.enabled=next.enabled===true;
+        if(next.alerts!==undefined)config.alerts=next.alerts===true;
+        if(!config.enabled || !config.alerts){alertUntil=0;alertLabel="";}
+        bot.storage.set(key,{...config});
+        if(config.enabled && timer===null){original=document.title;timer=setInterval(render,500);}
+        if(!config.enabled && timer!==null){clearInterval(timer);timer=null;}
+        render();return {...config};
+    }
+    function mount(parent){
+        if(!parent || parent.querySelector('[data-tab-title]'))return;
+        const section=document.createElement('div');section.className='mb-section';section.setAttribute('data-tab-title','');
+        section.innerHTML='<div class="mb-section-title"><span class="mb-title-text">🌐 Browser title</span></div><div class="mb-alert-toggle-grid"><label class="mb-toggle"><input type="checkbox" data-title-enabled><span>Character name in title</span></label><label class="mb-toggle"><input type="checkbox" data-title-alerts><span>Show alerts in title</span></label></div>';
+        const enabled=section.querySelector('[data-title-enabled]'),alerts=section.querySelector('[data-title-alerts]');
+        const refresh=()=>{enabled.checked=config.enabled;alerts.checked=config.alerts;alerts.disabled=!config.enabled;};
+        enabled.addEventListener('change',()=>{updateConfig({enabled:enabled.checked});refresh();});
+        alerts.addEventListener('change',()=>{updateConfig({alerts:alerts.checked});refresh();});
+        refresh();parent.appendChild(section);
+    }
+    bot.tabTitle={config,updateConfig,alert,mount};
+    if(config.enabled){timer=setInterval(render,500);render();}
+    bot.addCleanup(()=>{
+        if(timer!==null)clearInterval(timer);timer=null;
+        if(lastWritten!==null && document.title===lastWritten)document.title=original;
+        lastWritten=null;disposed=true;
+    });
+};
+
 window.__minibiaBotBundle.installPzModule = function installPzModule(bot) {
     const homeStorageKey = "minibiaBot.pz.home";
 
@@ -6716,6 +6770,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
     // The notification module is installed later during bootstrap, so resolve
     // this dynamically at alert time rather than capturing it during install.
     function showAudioAlertNotification(title, message, type = "audio") {
+        bot.tabTitle?.alert?.(title);
         try {
             return bot.showPanelNotification?.(
                 String(title || "🔔 AUDIO ALERT"),
@@ -6733,6 +6788,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
     // creating a second audio engine or invoking one of the spoken alarm files.
     // Callers may optionally supply panel notification details.
     function playGenericBeepBloop(notification = null) {
+        bot.tabTitle?.alert?.("ALERT");
         playToneSequence([
             { freq: 760, dur: 120, vol: 0.30 },
             { freq: 420, dur: 180, delay: 145, vol: 0.30 },
@@ -6748,6 +6804,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
     }
 
     function playTargetDeathBeep() {
+        bot.tabTitle?.alert?.("TARGET DEATH");
         playToneSequence([{
                     freq: 800,
                     dur: 150
@@ -6759,6 +6816,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
             ]);
     }
     function playLowHealthBeep() {
+        bot.tabTitle?.alert?.("LOW HEALTH");
         playToneSequence([{
                     freq: 880,
                     dur: 150,
@@ -6772,6 +6830,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
             ]);
     }
     function playAlphaMonsterBeep() {
+        bot.tabTitle?.alert?.("ALPHA / ANCIENT");
         // Distinct rising double call, synthesized by the shared alert audio engine.
         playToneSequence([
             { freq: 620, dur: 110, vol: 0.4 },
@@ -6794,6 +6853,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
     }
 
     function playManaFullBeep() {
+        bot.tabTitle?.alert?.("FULL MANA");
         playToneSequence([{
                     freq: 1200,
                     dur: 100,
@@ -6812,6 +6872,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
             ]);
     }
     function playOutOfSoulBeep() {
+        bot.tabTitle?.alert?.("OUT OF SOUL");
         playToneSequence([{freq:880,dur:140,vol:0.3},{freq:660,dur:140,delay:180,vol:0.3},{freq:440,dur:220,delay:360,vol:0.3}]);
     }
     function checkOutOfSoulAlert(now, player) {
@@ -6824,6 +6885,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         showAudioAlertNotification('OUT OF SOUL','You have 0 soul points.','audio-out-of-soul');
     }
     function playNoTargetBeep() {
+        bot.tabTitle?.alert?.("NO TARGET");
         playToneSequence([{
                     freq: 300,
                     dur: 400,
@@ -6837,6 +6899,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
             ]);
     }
     function playItemLowBeep() {
+        bot.tabTitle?.alert?.("LOW ITEMS");
         playToneSequence([{
                     freq: 500,
                     dur: 200,
@@ -27077,18 +27140,38 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
  * ==================================================================================
  */
 window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
-    // Read only the client's current NPC conversation, never general chat history.
+    // Some NPC replies appear in Default chat without updating the popup.
+    // Read only typed NPC messages, never player text or console announcements.
     function npcDialogText() {
-        const dialog=window.gameClient?.interface?.npcDialog;
-        if(!dialog)return '';
-        const turn=dialog.__turn;
-        const lines=turn ? (Array.isArray(turn.lines)?turn.lines:[]) : [dialog.__lastState?.message || ''];
-        const keywords=turn ? (Array.isArray(turn.keywords)?turn.keywords:[]) : (dialog.__lastState?.keywords || []);
+        const client=window.gameClient,dialog=client?.interface?.npcDialog;
+        const turn=dialog?.__turn;
         const clean=value=>{
             let text=String(value||'').replace(/<[^>]*>/g,'');
-            try{if(typeof dialog.__decodeHTML==='function')text=dialog.__decodeHTML(text);}catch(_){}
+            try{if(typeof dialog?.__decodeHTML==='function')text=dialog.__decodeHTML(text);}catch(_){}
             return text.replace(/[{}]/g,'').replace(/\s+/g,' ').trim();
         };
+        const channels=client?.interface?.channelManager?.channels || [];
+        const npcType=typeof CONST!=='undefined' ? (CONST.TYPES?.NPC ?? 2) : 2;
+        const now=Date.now(),recent=[];
+        for(const channel of channels) {
+            if (!(channel?.name==='Default' || channel?.id===0 || channel?.__id===0)) continue;
+            for(const entry of channel.__contents || []) {
+                const at=Number(new Date(entry?.__time));
+                if (Number(entry?.type)!==npcType || !entry?.name || !Number.isFinite(at) ||
+                    at>now+1000 || now-at>60000) continue;
+                recent.push({entry,at});
+            }
+        }
+        recent.sort((a,b)=>b.at-a.at);
+        const latest=recent[0];
+        // Prefer a newer chat reply over an old popup conversation. Keep the
+        // short burst from that NPC together, as the native dialog does.
+        if(latest && (!turn?.lines?.length || latest.at>Number(turn.at || 0))) {
+            return recent.filter(r=>r.entry.name===latest.entry.name && latest.at-r.at<=3000)
+                .reverse().slice(-8).map(r=>clean(r.entry.message)).filter(Boolean).join(' ');
+        }
+        const lines=turn ? (Array.isArray(turn.lines)?turn.lines:[]) : [dialog?.__lastState?.message || ''];
+        const keywords=turn ? (Array.isArray(turn.keywords)?turn.keywords:[]) : (dialog?.__lastState?.keywords || []);
         return [...lines,...keywords].map(clean).filter(Boolean).join(' ');
     }
     bot.npc=Object.freeze({
@@ -31403,19 +31486,22 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         return a && b && a.x === b.x && a.y === b.y && a.z === b.z;
     }
 
-    function findClosestWaypointIndex(position) {
-        if (!position || !route.length)
-            return 0;
-        let bestIdx = 0,
-        bestDist = Infinity;
-        route.forEach((wp, i) => {
-            const d = getDistanceToWaypoint(position, wp);
-            if (Number.isFinite(d) && d < bestDist) {
-                bestDist = d;
-                bestIdx = i;
-            }
-        });
-        return bestIdx;
+    function findStartingWaypointIndex(position) {
+        if (!position || !route.length) return 0;
+        let closestIndex=0,closestDistance=Infinity;
+        // Prefer route order within the local starting area. This selection
+        // runs only on start; normal progression and recovery stay unchanged.
+        for(let i=0;i<route.length;i++) {
+            const wp=route[i];
+            if (!wp || wp.script || wp.x==null || wp.y==null || wp.z==null ||
+                ![wp.x,wp.y,wp.z].every(v=>Number.isFinite(Number(v))) ||
+                Number(wp.z)!==Number(position.z)) continue;
+            const distance=Math.max(Math.abs(Number(wp.x)-Number(position.x)),
+                Math.abs(Number(wp.y)-Number(position.y)));
+            if (distance<=5) return i;
+            if (distance<closestDistance){closestDistance=distance;closestIndex=i;}
+        }
+        return closestIndex;
     }
 
     // ---- TILE / ITEM HELPERS ----
@@ -39499,7 +39585,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         state.teleportRecoveryLastIndex = -1;
         state.teleportRecoveryLastReason = null;
         state.teleportRecoveryLastDistance = null;
-        state.currentIndex = findClosestWaypointIndex(pos);
+        state.currentIndex = findStartingWaypointIndex(pos);
         state.direction = state.currentIndex >= route.length - 1 ? -1 : 1;
         if (route.length <= 1)
             state.direction = 1;
@@ -39646,7 +39732,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         resetOffscreenFrontierTracking();
         if (state.recoveryFenceActive)
             clearRecoveryFence("CaveBot started");
-        state.currentIndex = findClosestWaypointIndex(pos);
+        state.currentIndex = findStartingWaypointIndex(pos);
         if (config.loopMode) {
             state.direction = 1; // always forward when looping
         } else {
@@ -51432,6 +51518,7 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
     const GZIP_PREFIX = "GZ1:"; // marker for gzipped payloads
 
     const CONFIG_KEYS = [
+        "minibiaBot.tabTitle.config",
         "minibiaBot.rune.config",
         "minibiaBot.heal.config",
         "minibiaBot.invisible.config",
@@ -53299,6 +53386,7 @@ window.__minibiaBotBundle.installFollowingItemGuard = function(bot) {
         }catch{return null;}
     }
     function playAlertSound() {
+        bot.tabTitle?.alert?.("FOLLOWING ITEM");
         const ctx=primeSound(),at=Date.now();
         if(!ctx||disposed||at-lastSoundAt<2500)return false;
         lastSoundAt=at;
@@ -60748,6 +60836,8 @@ function upgradeSectionHeaders(panel) {
     }
 
     function scrollToWaypointIndex(index, force = false) {
+        const editor=document.getElementById("minibia-bot-cave-waypoint-editor");
+        if (!force && editor?.contains(document.activeElement)) return;
         const container = document.getElementById("minibia-bot-cave-waypoint-list");
         if (!container)
             return;
@@ -60783,10 +60873,14 @@ function upgradeSectionHeaders(panel) {
 
         const rows = container.querySelectorAll("[data-index]");
         if (targetIndex >= 0 && targetIndex < rows.length) {
-            rows[targetIndex].scrollIntoView({
-                block: "nearest",
-                behavior: "smooth"
-            });
+            // Scroll only the waypoint list, never the surrounding editor or
+            // page. scrollIntoView also moves scrollable ancestor panels.
+            const rowRect=rows[targetIndex].getBoundingClientRect();
+            const listRect=container.getBoundingClientRect();
+            const top=listRect.top+container.clientTop;
+            const bottom=top+container.clientHeight;
+            if (rowRect.top<top) container.scrollTop+=rowRect.top-top;
+            else if (rowRect.bottom>bottom) container.scrollTop+=rowRect.bottom-bottom;
         }
     }
 
@@ -61591,6 +61685,15 @@ function upgradeSectionHeaders(panel) {
   flex-direction: column;
   overflow: hidden;
 }
+
+/* Text controls override the panel's non-selectable chrome. */
+#minibia-bot-panel input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+#minibia-bot-panel textarea {
+  -webkit-user-select: text;
+  user-select: text;
+  cursor: text;
+}
+#minibia-bot-cave-waypoint-script { touch-action: auto; }
 
 /* ── Header ── */
 #minibia-bot-panel .mb-titlebar {
@@ -64484,6 +64587,7 @@ function upgradeSectionHeaders(panel) {
             if(card)leaf.appendChild(card.parentElement===professionsPanel?card:card.parentElement);
         }
         const shortcutsPanel=makeLeaf('shortcuts');
+        bot.tabTitle?.mount?.(shortcutsPanel);
         const volumeSection=document.createElement('div');volumeSection.className='mb-section';
         volumeSection.innerHTML=`<div class="mb-section-title"><span class="mb-title-text">Audio</span></div>
 <label class="mb-field" for="minibia-bot-audio-volume"><span class="mb-field-label">Volume</span></label>
@@ -65585,6 +65689,17 @@ function upgradeSectionHeaders(panel) {
                     bot.log("Failed to add script waypoint.");
                 }
             });
+        }
+
+        // Leave native focus, selection, clipboard and textarea resizing intact,
+        // while keeping editing gestures out of the game's body listeners.
+        const waypointEditor=panel.querySelector("#minibia-bot-cave-waypoint-editor");
+        if (waypointEditor) {
+            for (const type of ["pointerdown","pointerup","mousedown","mouseup","mousemove","click","dblclick","contextmenu","keydown","keyup","keypress","selectstart","dragstart"]) {
+                waypointEditor.addEventListener(type,event=>{
+                    if (event.target?.matches?.("input,textarea")) event.stopPropagation();
+                });
+            }
         }
 
         const saveWpBtn = panel.querySelector("#minibia-bot-cave-waypoint-save");
@@ -72515,6 +72630,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         currentBundle.installGroundSpawnLogger(bot);
         currentBundle.installFollowingItemGuard(bot);
         currentBundle.installCurePoisonModule(bot);
+        currentBundle.installTabTitleModule(bot);
         currentBundle.installPzModule(bot);
         currentBundle.installXrayModule(bot);
         currentBundle.installPanicModule(bot);
