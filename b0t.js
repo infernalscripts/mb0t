@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.436",
+        version: "1.6.437",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -56602,9 +56602,53 @@ window.__minibiaBotBundle.installItemMoverModule = function installItemMoverModu
     const ruleFor=it=>config.items.find(rule=>rule.enabled!==false&&matches(it,rule));
     const stackable=it=>{try{return it?.isStackable?.()===true;}catch{return false;}};
     const count=it=>stackable(it)?Math.max(1,Number(it?.count)||1):1;
+    let childOpening=null;
+    const childSlots=new Map();
+    const isBagItem=item=>{try{return item?.isContainer?.()===true;}catch{return false;}};
+    function resetChildren(){childOpening=null;childSlots.clear();}
     const setReason=text=>{reason=text;if(view)view.textContent=text;};
     function blocked(){return bot.actions?.isHalted?.() || bot.gmKillSwitch?.isActive?.() || bot.pauseHotkey?.isPaused?.() || bot.depositer?.status?.().running;}
-    function tree(root,all){const found=new Set([root]);for(let changed=true;changed;){changed=false;for(const c of all)if(!found.has(c)&&[...found].some(p=>c.__openedFromParent===p||c.__replacedParent===p||(Number(c.__parentCid)>0&&Number(c.__parentCid)===Number(p.__containerId)))){found.add(c);changed=true;}}return found;}
+    function linked(child,parent){return child.__openedFromParent===parent || child.__replacedParent===parent ||
+        (Number(child.__parentCid)>0&&Number(child.__parentCid)===Number(parent.__containerId));}
+    function tree(root,all){
+        const found=new Set([root]),queue=[root];
+        for(let i=0;i<queue.length&&found.size<64;i++){
+            const parent=queue[i],slots=childSlots.get(parent);
+            if(slots)for(const [index,entry] of slots)if(peek(parent,index)!==entry.item)slots.delete(index);
+            for(const child of all)if(!found.has(child) &&
+                (linked(child,parent) || (slots&&[...slots.values()].some(e=>e.child===child)))){
+                found.add(child);queue.push(child);if(found.size>=64)break;
+            }
+        }
+        for(const parent of childSlots.keys())if(!found.has(parent))childSlots.delete(parent);
+        return found;
+    }
+    function expandDestination(containers,all,now,client){
+        if(childOpening){if(now-childOpening.at<3000)return true;childOpening=null;}
+        if(containers.size>=64 || typeof ItemUsePacket!=='function')return false;
+        for(const parent of containers){
+            let slots=childSlots.get(parent);if(!slots){slots=new Map();childSlots.set(parent,slots);}
+            for(let index=0;index<size(parent);index++){
+                const item=peek(parent,index);if(!isBagItem(item))continue;
+                const entry=slots.get(index);
+                if(entry && entry.item===item && ((entry.child&&all.includes(entry.child))||now-entry.at<5000))continue;
+                // Use already linked child bags first. Avoid toggling an open
+                // same-type child whose original slot was not captured.
+                if(all.some(b=>linked(b,parent)&&Number(b.id)===Number(item.id)&&
+                    ![...slots.values()].some(e=>e.child===b)))continue;
+                const open=()=>{
+                    if(peek(parent,index)!==item || !bags().includes(parent))return false;
+                    const record={item,at:now,child:null};slots.set(index,record);
+                    childOpening={parent,index,record,at:now,seq:Number(bot.containerAcks?.snapshot?.())||0};
+                    try{client.send(new ItemUsePacket({which:parent,index}));}catch(e){childOpening=null;slots.delete(index);throw e;}
+                    return true;
+                };
+                const sent=bot.actions?.runShared?bot.actions.runShared('item-mover-open-child',bot.actions.priorities.UTILITY,open,0):open();
+                setReason(sent?'Opening destination child bag':'Waiting for action');return true;
+            }
+        }
+        return false;
+    }
     function tick(){
         if(disposed || !config.enabled)return;
         try{
@@ -56612,11 +56656,11 @@ window.__minibiaBotBundle.installItemMoverModule = function installItemMoverModu
             if(!p || client.networkManager?.isConnected?.()===false){setReason('Waiting for character');return;}
             if(blocked()){setReason('Paused');return;}
             const slot=typeof CONST!=='undefined'?Number(CONST.EQUIPMENT?.QUIVER ?? 9):9,item=peek(eq,slot);
-            if(player!==p || equipped!==item){player=p;equipped=item;destination=null;opening=null;pending=null;lastOpen=0;retryAt=0;}
+            if(player!==p || equipped!==item){player=p;equipped=item;destination=null;opening=null;pending=null;lastOpen=0;retryAt=0;resetChildren();}
             let isBag=false;try{isBag=item?.isContainer?.()===true || client.itemDefinitionsBySid?.[item?.sid]?.properties?.type==='container' || client.itemDefinitionsByCid?.[item?.id]?.properties?.type==='container';}catch{}
             if(!isBag){setReason('Equip a bag in the arrow slot');return;}
             const all=bags();
-            if(destination && !all.includes(destination))destination=null;
+            if(destination && !all.includes(destination)){destination=null;resetChildren();}
             if(!destination){
                 // A confirmed use of the equipped arrow-slot bag identifies it
                 // even when several backpacks have the same sprite and name.
@@ -56645,26 +56689,34 @@ window.__minibiaBotBundle.installItemMoverModule = function installItemMoverModu
                 for(let i=0;i<size(source);i++){
                     const it=peek(source,i),rule=ruleFor(it);if(!rule)continue;
                     try{if(it.isContainer?.())continue;}catch{continue;}
-                    let targetSlot=-1,capacity=stackable(it)?100:1;
-                    for(let j=0;j<size(destination);j++){
-                        const other=peek(destination,j);
-                        if(stackable(it)&&matches(other,rule)&&count(other)<100){targetSlot=j;capacity=100-count(other);break;}
-                        if(!other&&targetSlot<0)targetSlot=j;
+                    let target=null,targetSlot=-1,capacity=stackable(it)?100:1;
+                    for(const candidate of excluded){
+                        let empty=-1;
+                        for(let j=0;j<size(candidate);j++){
+                            const other=peek(candidate,j);
+                            if(stackable(it)&&matches(other,rule)&&count(other)<100){target=candidate;targetSlot=j;capacity=100-count(other);break;}
+                            if(!other&&empty<0)empty=j;
+                        }
+                        if(target)break;
+                        if(empty>=0){target=candidate;targetSlot=empty;break;}
                     }
-                    if(targetSlot<0){full=true;continue;}
+                    if(targetSlot<0){
+                        if(expandDestination(excluded,all,now,client))return;
+                        full=true;continue;
+                    }
                     const amount=Math.min(capacity,count(it));
                     const move=()=>{
-                        if(rule.enabled===false || !config.items.includes(rule) || peek(source,i)!==it || !bags().includes(destination)||peek(eq,slot)!==equipped)return false;
+                        if(rule.enabled===false || !config.items.includes(rule) || peek(source,i)!==it || !bags().includes(target)||!bags().includes(destination)||peek(eq,slot)!==equipped)return false;
                         if(typeof ItemMovePacket!=='function'||typeof client.send!=='function')return false;
                         pending={source,slot:i,item:it,before:count(it),at:now,ack:false};
-                        try{client.send(new ItemMovePacket({which:source,index:i},{which:destination,index:targetSlot},amount));}catch(e){pending=null;throw e;}
+                        try{client.send(new ItemMovePacket({which:source,index:i},{which:target,index:targetSlot},amount));}catch(e){pending=null;throw e;}
                         return true;
                     };
                     const sent=bot.actions?.runShared?bot.actions.runShared('item-mover',bot.actions.priorities.UTILITY,move,0):move();
                     setReason(sent?'Moving '+(rule.name||'item'):'Waiting for action');return;
                 }
             }
-            setReason(full?'Arrow-slot bag full':'Watching open bags');
+            setReason(full?'Arrow-slot bag and child bags full':'Watching open bags');
         }catch(error){setReason('Waiting: '+String(error?.message||error));}
     }
     function wake(){if(disposed||!config.enabled||queued)return;queued=true;Promise.resolve().then(()=>{queued=false;tick();});}
@@ -56672,16 +56724,22 @@ window.__minibiaBotBundle.installItemMoverModule = function installItemMoverModu
         if(event?.source!=='server'||event.ok===false)return;
         if(opening && event.kind==='open' && Number(event.seq)>opening.seq &&
             Number(event.cid)===Number(equipped?.id) && !Number(event.parentContainerId) && event.container){destination=event.container;opening=null;}
+        if(childOpening && event.kind==='open' && Number(event.seq)>childOpening.seq &&
+            Number(event.cid)===Number(childOpening.record.item.id) && event.container &&
+            (!Number(event.parentContainerId)||Number(event.parentContainerId)===Number(childOpening.parent.__containerId)) &&
+            event.container!==destination){
+            childOpening.record.child=event.container;childOpening=null;
+        }
         if(pending && event.kind==='remove' && Number(event.containerId)===Number(pending.source.__containerId)&&Number(event.slot)===pending.slot)pending.ack=true;
         if(['open','close','add','remove','transform'].includes(event.kind))wake();
     }) || (()=>{});
-    function setEnabled(value){config.enabled=value===true;bot.storage.set(key,{...config});pending=null;opening=null;
+    function setEnabled(value){config.enabled=value===true;bot.storage.set(key,{...config});pending=null;opening=null;childOpening=null;
         if(timer!==null)clearInterval(timer);timer=null;if(config.enabled){timer=setInterval(tick,200);tick();}else setReason('Off');}
     let capture=null,captureTimer=null;
     function cancelCapture(){if(capture)document.removeEventListener('click',capture,true);capture=null;if(captureTimer!==null)clearTimeout(captureTimer);captureTimer=null;}
     function mount(parent){if(!parent||parent.querySelector('[data-item-mover]'))return;
         const section=document.createElement('div');section.className='mb-section';section.setAttribute('data-item-mover','');
-        section.innerHTML='<div class="mb-dropper-heading"><div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-mover-enabled aria-label="Enable item mover"><span class="mb-title-text">📦 Item mover</span></div><button type="button" class="mb-small-button" data-mover-new>+ Rule</button></div><div class="mb-small-note">Selected items → arrow-slot bag</div><div data-mover-editor hidden><div class="mb-alert-pick"><input type="text" data-mover-name list="mb-item-mover-suggestions" placeholder="Item name or SID"><button type="button" class="mb-small-button" data-mover-pick title="Pick item" aria-label="Pick item">🔍</button><button type="button" class="mb-small-button" data-mover-add>Add rule</button><button type="button" class="mb-small-button" data-mover-cancel>Cancel</button></div><datalist id="mb-item-mover-suggestions"></datalist></div><div class="mb-list" data-mover-list></div><div class="mb-small-note" data-mover-status></div>';
+        section.innerHTML='<div class="mb-dropper-heading"><div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-mover-enabled aria-label="Enable item mover"><span class="mb-title-text">📦 Item mover</span></div><button type="button" class="mb-small-button" data-mover-new>+ Rule</button></div><div class="mb-small-note">Selected items → arrow-slot bag + child bags</div><div data-mover-editor hidden><div class="mb-alert-pick"><input type="text" data-mover-name list="mb-item-mover-suggestions" placeholder="Item name or SID"><button type="button" class="mb-small-button" data-mover-pick title="Pick item" aria-label="Pick item">🔍</button><button type="button" class="mb-small-button" data-mover-add>Add rule</button><button type="button" class="mb-small-button" data-mover-cancel>Cancel</button></div><datalist id="mb-item-mover-suggestions"></datalist></div><div class="mb-list" data-mover-list></div><div class="mb-small-note" data-mover-status></div>';
         const q=selector=>section.querySelector(selector),input=q('[data-mover-name]'),list=q('[data-mover-list]');
         const persist=()=>bot.storage.set(key,{...config,items:config.items.map(r=>({...r}))});
         const editor=q('[data-mover-editor]');
@@ -56717,7 +56775,7 @@ window.__minibiaBotBundle.installItemMoverModule = function installItemMoverModu
     }
     bot.itemMover={config,setEnabled,mount,status:()=>({running:config.enabled,reason})};
     if(config.enabled)timer=setInterval(tick,200);
-    bot.addCleanup(()=>{disposed=true;cancelCapture();unsubscribe();if(timer!==null)clearInterval(timer);pending=null;opening=null;destination=null;player=null;equipped=null;view=null;});
+    bot.addCleanup(()=>{disposed=true;resetChildren();cancelCapture();unsubscribe();if(timer!==null)clearInterval(timer);pending=null;opening=null;destination=null;player=null;equipped=null;view=null;});
 };
 
 window.__minibiaBotBundle.installDepositerModule = function installDepositerModule(bot) {
