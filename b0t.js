@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.437",
+        version: "1.6.438",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -5413,6 +5413,106 @@ addCleanup(() => {
  *    Finds, paths to, and remembers PZ tiles. Also allows setting a "home" PZ.
  * ==================================================================================
  */
+window.__minibiaBotBundle.installExtraSidebarsModule = function installExtraSidebarsModule(bot){
+    const key='minibiaBot.extraSidebars.config',saved=bot.storage.get(key,{});
+    const limit=v=>Math.max(0,Math.min(2,Math.trunc(Number(v)||0)));
+    const config={left:limit(saved.left),right:limit(saved.right)};
+    let disposed=false,binding=null;
+    const extras=[];
+    function resize(){window.dispatchEvent(new Event('resize'));}
+    function removeExtras(){
+        for(const entry of extras.splice(0)){
+            const target=entry.side==='left'?binding?.left:binding?.right;
+            if(target)while(entry.column.firstChild)target.appendChild(entry.column.firstChild);
+            entry.wrap.remove();
+        }
+    }
+    function detach(){
+        if(!binding)return;
+        removeExtras();const b=binding;
+        if(b.wm.getStack===b.getStack)b.wm.getStack=b.originalStack;
+        if(b.wm.getFreeStack===b.getFree)b.wm.getFreeStack=b.originalFree;
+        if(b.wm.saveLayout===b.save)b.wm.saveLayout=b.originalSave;
+        binding=null;
+    }
+    function sync(){
+        if(disposed)return;
+        const client=window.gameClient,wm=client?.interface?.windowManager;
+        if(!wm || client.touch?.isMobileMode){if(binding){detach();resize();}return;}
+        if(binding?.wm===wm)return;
+        detach();
+        // Keep native column identity stable: wm.stacks is a live collection,
+        // so inserting more .column elements must not change left/right lookup.
+        const columns=Array.from(document.querySelectorAll('.column')).filter(c=>!c.hasAttribute('data-mb-extra-column'));
+        const left=columns[0],right=columns[1],host=left?.parentElement?.parentElement;
+        if(!left || !right || !host || right.parentElement?.parentElement!==host)return;
+        const b={wm,left,right,host,originalStack:wm.getStack,originalFree:wm.getFreeStack,originalSave:wm.saveLayout};
+        if(typeof b.originalStack!=='function'||typeof b.originalFree!=='function')return;
+        b.getStack=function(side){if(side==='left')return left;if(side==='right')return right;return b.originalStack.apply(this,arguments);};
+        b.getFree=function(height,preferred){
+            const original=b.originalFree.apply(this,arguments);
+            if(!extras.length)return original;
+            const free=stack=>{try{return Number(this.__columnFreeSpace(stack))||0;}catch{return 0;}};
+            if(original && free(original)>=Number(height||0))return original;
+            return extras.reduce((best,e)=>free(e.column)>free(best)?e.column:best,original||right);
+        };
+        b.save=function(){
+            const result=b.originalSave?.apply(this,arguments);
+            // Preserve native fixed-window open state even when its DOM element
+            // lives in an extra column the native layout writer doesn't scan.
+            if(this.LAYOUT_KEY && extras.length)try{
+                const layout=JSON.parse(localStorage.getItem(this.LAYOUT_KEY)||'null');
+                if(layout?.columns && Array.isArray(layout.open)){
+                    for(const entry of extras)for(const el of Array.from(entry.column.children)){
+                        const gameWindow=el.id&&this.windows?.[el.id];if(!gameWindow)continue;
+                        const list=layout.columns[entry.side] || (layout.columns[entry.side]=[]);
+                        if(!list.includes(el.id))list.push(el.id);
+                        if(!gameWindow.isHidden?.()&&!layout.open.includes(el.id))layout.open.push(el.id);
+                    }
+                    localStorage.setItem(this.LAYOUT_KEY,JSON.stringify(layout));
+                }
+            }catch{}
+            return result;
+        };
+        binding=b;wm.getStack=b.getStack;wm.getFreeStack=b.getFree;if(typeof b.originalSave==='function')wm.saveLayout=b.save;
+        build();
+    }
+    function build(){
+        if(!binding)return;
+        const placements=extras.map(e=>({side:e.side,index:e.index,windows:Array.from(e.column.children)}));
+        removeExtras();const b=binding;
+        for(const side of ['left','right'])for(let index=0;index<config[side];index++){
+            const native=side==='left'?b.left:b.right,originalWrap=native.parentElement;
+            const wrap=document.createElement('div');wrap.className=originalWrap.className;wrap.setAttribute('data-mb-extra-sidebar',side);
+            const width=Math.round(originalWrap.getBoundingClientRect().width)||216;
+            Object.assign(wrap.style,{width:width+'px',minWidth:width+'px',flex:'0 0 '+width+'px',boxSizing:'border-box'});
+            const column=document.createElement('div');column.className='column';column.setAttribute('data-mb-extra-column',side+'-'+index);
+            // Native window drop handling checks className === "column".
+            Object.assign(column.style,{height:'100%',minHeight:'80px',overflowY:'auto'});
+            wrap.appendChild(column);
+            if(side==='left')b.host.insertBefore(wrap,b.left.parentElement);
+            else b.host.insertBefore(wrap,b.right.parentElement.nextSibling);
+            column.addEventListener('dragover',event=>b.wm.__handleWindowDrop?.(event));
+            extras.push({side,index,wrap,column});
+            const prior=placements.find(e=>e.side===side&&e.index===index);
+            if(prior)for(const el of prior.windows)column.appendChild(el);
+        }
+        resize();
+    }
+    function updateConfig(next){
+        config.left=limit(next.left??config.left);config.right=limit(next.right??config.right);
+        bot.storage.set(key,{...config});if(binding)build();else sync();return {...config};
+    }
+    function mount(parent){if(!parent || parent.querySelector('[data-extra-sidebars]'))return;
+        const section=document.createElement('div');section.className='mb-section';section.setAttribute('data-extra-sidebars','');
+        section.innerHTML='<div class="mb-section-title"><span class="mb-title-text">▥ Extra sidebars</span></div><div class="mb-alert-grid"><label class="mb-field"><span class="mb-field-label">Extra left columns</span><select data-side="left"><option value="0">None</option><option value="1">1</option><option value="2">2</option></select></label><label class="mb-field"><span class="mb-field-label">Extra right columns</span><select data-side="right"><option value="0">None</option><option value="1">1</option><option value="2">2</option></select></label></div>';
+        for(const side of ['left','right']){const select=section.querySelector(`[data-side="${side}"]`);select.value=String(config[side]);select.addEventListener('change',()=>updateConfig({[side]:select.value}));}
+        parent.appendChild(section);
+    }
+    bot.extraSidebars={config,updateConfig,mount};sync();const timer=setInterval(sync,1000);
+    bot.addCleanup(()=>{disposed=true;clearInterval(timer);detach();resize();});
+};
+
 window.__minibiaBotBundle.installTabTitleModule = function installTabTitleModule(bot) {
     const key="minibiaBot.tabTitle.config",saved=bot.storage.get(key,{});
     const config={enabled:saved.enabled===true,alerts:saved.alerts!==false};
@@ -51681,6 +51781,7 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
     const GZIP_PREFIX = "GZ1:"; // marker for gzipped payloads
 
     const CONFIG_KEYS = [
+        "minibiaBot.extraSidebars.config",
         "minibiaBot.itemMover.config",
         "minibiaBot.staffMarkers.config",
         "minibiaBot.tabTitle.config",
@@ -64977,6 +65078,7 @@ function upgradeSectionHeaders(panel) {
             if(card)leaf.appendChild(card.parentElement===professionsPanel?card:card.parentElement);
         }
         const shortcutsPanel=makeLeaf('shortcuts');
+        bot.extraSidebars?.mount?.(shortcutsPanel);
         bot.tabTitle?.mount?.(shortcutsPanel);
         const volumeSection=document.createElement('div');volumeSection.className='mb-section';
         volumeSection.innerHTML=`<div class="mb-section-title"><span class="mb-title-text">Audio</span></div>
@@ -73033,6 +73135,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         currentBundle.installGroundSpawnLogger(bot);
         currentBundle.installFollowingItemGuard(bot);
         currentBundle.installCurePoisonModule(bot);
+        currentBundle.installExtraSidebarsModule(bot);
         currentBundle.installTabTitleModule(bot);
         currentBundle.installPzModule(bot);
         currentBundle.installXrayModule(bot);
