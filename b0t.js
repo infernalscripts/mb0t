@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.421",
+        version: "1.6.423",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -47385,6 +47385,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         captureMode: false,
         captureHandler: null,
         pendingMove: null,
+        lootWakeQueued: false,
         nearbyCorpseReadyUntil: 0,
         lastFullLogAt: 0,
 
@@ -47676,6 +47677,19 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
     const unsubscribeLooterContainerAcks = bot.containerAcks?.subscribe?.(event => {
         if (!event || event.ok === false) return;
         observeCorpseContainerAck(event);
+        const pending=state.pendingMove;
+        if (pending && event.source==='server' && event.kind==='remove' &&
+            Number(event.containerId)===Number(pending.sourceId) &&
+            Number(event.slot)===Number(pending.slot) &&
+            (!event.container || event.container===pending.sourceContainer)) {
+            pending.sourceAcknowledged=true;
+            const job=state.corpseJob;
+            if(job && Number(job.openedContainerId)===Number(pending.sourceId))
+                job.lootDeadlineAt=Math.min(job.lootStartedAt+30000,
+                    Math.max(job.lootDeadlineAt||0,Date.now()+state.corpseLootHoldMs));
+        }
+        if(state.runtimeRunning && event.source==='server' &&
+            ['open','remove','add','transform'].includes(event.kind)) wakeLooterNow();
         const id = Number(event.containerId);
         if (!Number.isFinite(id)) return;
         for (const [key, entry] of Array.from(looterContainerCache.entries())) {
@@ -48118,7 +48132,8 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                         "looter-drop",
                         bot.actions.priorities
                             .UTILITY,
-                        sendDrop
+                        sendDrop,
+                        0
                     )
                     : sendDrop();
         } catch (e) {
@@ -48142,6 +48157,8 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         });
         state.pendingMove = {
             kind: "drop",
+            sourceItem: item,
+            sourceContainer: container,
             sourceId:
                 container.__containerId,
             sourceCacheKey,
@@ -50082,109 +50099,23 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
 
         const now = Date.now();
 
-        if (state.pendingMove && !isPendingLootMoveAllowed(state.pendingMove)) state.pendingMove = null;
         if (state.pendingMove) {
-            const pending =
-                state.pendingMove;
-            const source =
-                (
-                    pending.sourceCacheKey
-                        ? getLooterContainer(
-                            pending.sourceCacheKey,
-                            {
-                                expectedId:
-                                    pending.sourceId,
-                                expectedTitle:
-                                    pending.sourceTitle ||
-                                    ""
-                            }
-                        )
-                        : null
-                ) ||
-                getContainerById(
-                    pending.sourceId
-                );
-            const item =
-                source?.getSlotItem?.(
-                    pending.slot
-                );
-
-            if (!source) {
-                state.pendingMove = null;
-                return false;
-            }
-
-            // A changed/empty source slot means the server acknowledged it.
-            if (
-                !item ||
-                item.id !== pending.itemId ||
+            const pending=state.pendingMove,source=getContainerById(pending.sourceId);
+            const item=source?.getSlotItem?.(pending.slot);
+            const changed=!source || (pending.sourceContainer && source!==pending.sourceContainer) ||
+                !item || (pending.sourceItem && item!==pending.sourceItem) ||
+                Number(item.id)!==Number(pending.itemId) ||
                 Number(item.sid||0)!==Number(pending.itemSid||0) ||
                 Number(item.fluidType||0)!==Number(pending.itemFluidType||0) ||
-                item.count !== pending.count
-            ) {
-                state.pendingMove = null;
+                item.count!==pending.count;
+            if (changed || pending.sourceAcknowledged || !isPendingLootMoveAllowed(pending)) {
+                state.pendingMove=null;
+                // Continue this pass using fresh slots, including identical items
+                // that shifted into the just-removed slot. Never reuse old indices.
+            } else if (now-pending.at<3000) {
                 return false;
-            }
-
-            if (
-                pending.kind === "drop"
-            ) {
-                if (
-                    now - pending.at <
-                    3000
-                ) {
-                    return false;
-                }
-
-                state.pendingMove = null;
             } else {
-                const destination =
-                    (
-                        pending.destCacheKey
-                            ? getLooterContainer(
-                                pending.destCacheKey,
-                                {
-                                    expectedId:
-                                        pending.destId,
-                                    expectedTitle:
-                                        pending.destTitle ||
-                                        ""
-                                }
-                            )
-                            : null
-                    ) ||
-                    getContainerById(
-                        pending.destId
-                    );
-                const targetItem =
-                    destination?.getSlotItem?.(
-                        pending.targetSlot
-                    );
-
-                if (
-                    !destination ||
-                    source.__containerId ===
-                        destination.__containerId
-                ) {
-                    state.pendingMove = null;
-                    return false;
-                }
-
-                if (
-                    targetItem &&
-                    now - pending.at < 5000
-                ) {
-                    return false;
-                }
-
-                if (
-                    now - pending.at <
-                    3000
-                ) {
-                    return false;
-                }
-
-                state.pendingMove = null;
+                state.pendingMove=null;
             }
         }
 
@@ -50337,7 +50268,8 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                                 bot.actions
                                     .priorities
                                     .UTILITY,
-                                sendMove
+                                sendMove,
+                                0
                             )
                             : sendMove();
                 } catch (e) {
@@ -50377,6 +50309,8 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
 
                 state.pendingMove = {
                     kind: "move",
+                    sourceItem: item,
+                    sourceContainer: container,
                     sourceId:
                         container
                             .__containerId,
@@ -50408,6 +50342,19 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
 
     function corpseActionsBlocked() {
         return state.disposed || bot.actions?.isHalted?.() || bot.gmKillSwitch?.isActive?.() || bot.pauseHotkey?.isPaused?.();
+    }
+
+    function wakeLooterNow() {
+        if (!state.runtimeRunning || state.disposed || state.lootWakeQueued) return;
+        state.lootWakeQueued=true;
+        // Run after the current server packet has finished updating every slot.
+        // Coalesce packet bursts, with no polling delay or recursive sends.
+        Promise.resolve().then(()=>{
+            state.lootWakeQueued=false;
+            if (!state.runtimeRunning || state.disposed) return;
+            if(state.timerId!==null){window.clearTimeout(state.timerId);state.timerId=null;}
+            tick();
+        }).catch(error=>bot.log("Looter immediate scan failed",error?.message || error));
     }
 
     function tick() {
@@ -50460,10 +50407,9 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                 Number(delayOverride)
             )
             : (
-                state.corpseJob ||
-                state.corpseQueue.length
-                    ? 200
-                    : 1000
+                state.pendingMove || state.running
+                    ? 50
+                    : (state.corpseJob || state.corpseQueue.length ? 200 : 1000)
             );
 
         state.timerId = window.setTimeout(() => {
