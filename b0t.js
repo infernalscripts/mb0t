@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.420",
+        version: "1.6.421",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -31484,6 +31484,21 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
     function isSameTile(a, b) {
         return a && b && a.x === b.x && a.y === b.y && a.z === b.z;
+    }
+
+    function findClosestWaypointIndex(position) {
+        if (!position || !route.length)
+            return 0;
+        let bestIdx = 0,
+        bestDist = Infinity;
+        route.forEach((wp, i) => {
+            const d = getDistanceToWaypoint(position, wp);
+            if (Number.isFinite(d) && d < bestDist) {
+                bestDist = d;
+                bestIdx = i;
+            }
+        });
+        return bestIdx;
     }
 
     function findStartingWaypointIndex(position) {
