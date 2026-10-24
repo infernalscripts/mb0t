@@ -4151,7 +4151,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.399",
+        version: "1.6.413",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -6554,6 +6554,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         itemCountRequestAt: 0,
         itemAlertLast: {}, // itemId -> timestamp
         lowCapBeepLast: 0,
+        outOfSoulBeepLast: null,
         alphaMonsterBeepLast: null,
     };
 
@@ -6580,6 +6581,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         noTargetDelayMs: 10000,
         noTargetRepeatMs: 30000,
         lowCapBeep: false,
+        outOfSoulBeep: false,
         alphaMonsterBeep: false,
         lowCapThreshold: 100,
         lowCapRepeatMs: 30000,
@@ -6737,8 +6739,12 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
     function getVisibleAlphaMonsters() {
         if (!window.gameClient?.player || window.gameClient?.networkManager?.isConnected?.() === false) return [];
         // This native visibility filter remains available while Targeting is off.
-        return (bot.attack?.getVisibleCombatMonsters?.() || []).filter(creature =>
-            Math.abs(Number(creature.__scale) - 1.3) < 0.01 || /^alpha\b/i.test(String(creature.name || '').trim()));
+        return (bot.attack?.getVisibleCombatMonsters?.() || []).filter(creature => {
+            const name = String(creature.name || '').trim().replace(/\s+/g,' ');
+            // Ancient Scarab is an ordinary species, not an Ancient variant.
+            if (/^ancient scarabs?$/i.test(name)) return false;
+            return Math.abs(Number(creature.__scale) - 1.3) < 0.01 || /^alpha\b/i.test(name) || /^ancient\s+\S/i.test(name);
+        });
     }
 
     function playManaFullBeep() {
@@ -6758,6 +6764,18 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
                     vol: 0.3
                 },
             ]);
+    }
+    function playOutOfSoulBeep() {
+        playToneSequence([{freq:880,dur:140,vol:0.3},{freq:660,dur:140,delay:180,vol:0.3},{freq:440,dur:220,delay:360,vol:0.3}]);
+    }
+    function checkOutOfSoulAlert(now, player) {
+        const value=player?.state?.soul;
+        const known=value!=null&&value!==''&&Number.isFinite(Number(value));
+        if (!config.outOfSoulBeep || !known || Number(value)!==0) {state.outOfSoulBeepLast=null;return;}
+        if (state.outOfSoulBeepLast!==null && now-state.outOfSoulBeepLast<30000) return;
+        state.outOfSoulBeepLast=now;
+        playOutOfSoulBeep();
+        showAudioAlertNotification('OUT OF SOUL','You have 0 soul points.','audio-out-of-soul');
     }
     function playNoTargetBeep() {
         playToneSequence([{
@@ -7509,6 +7527,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
 
     function checkAudioAlerts(now) {
         const player = window.gameClient?.player;
+        checkOutOfSoulAlert(now,player);
         if (!player) {
             state.alphaMonsterBeepLast = null;
             return;
@@ -7521,7 +7540,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
                 const first = state.alphaMonsterBeepLast === null;
                 state.alphaMonsterBeepLast = now;
                 playAlphaMonsterBeep();
-                if (first) showAudioAlertNotification("ALPHA MONSTER", alphas.map(c => c.name || "Alpha monster").join(", "), "audio-alpha-monster");
+                if (first) showAudioAlertNotification("ALPHA / ANCIENT MONSTER", alphas.map(c => c.name || "Alpha monster").join(", "), "audio-alpha-monster");
             }
         } else state.alphaMonsterBeepLast = null;
 
@@ -7726,6 +7745,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
             config.manaFullBeep ||
             config.noTargetBeep ||
             config.lowCapBeep ||
+            config.outOfSoulBeep ||
             config.alphaMonsterBeep ||
             (config.itemAlerts && config.itemAlerts.some(a => a && a.enabled !== false)));
     }
@@ -7933,15 +7953,15 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
         playGenericBeepBloop,
         testAudio: (name, notification = null) => {
             const sounds={targetDeath:playTargetDeathBeep,lowHealth:playLowHealthBeep,manaFull:playManaFullBeep,
-                noTarget:playNoTargetBeep,itemLow:playItemLowBeep,lowCap:playItemLowBeep,alpha:playAlphaMonsterBeep,generic:playGenericBeepBloop,
+                outOfSoul:playOutOfSoulBeep,noTarget:playNoTargetBeep,itemLow:playItemLowBeep,lowCap:playItemLowBeep,alpha:playAlphaMonsterBeep,generic:playGenericBeepBloop,
                 player:()=>bot.playPlayerAlarm?.(),playerAttack:()=>bot.playPlayerAttackAlarm?.(),message:()=>bot.playMessageAlarm?.(),
                 gm:()=>bot.playGMAlarm?.(),antibot:()=>bot.playAntiBotAlarm?.(),alarm:()=>bot.playAlarm?.()};
             const play=sounds[name];if(typeof play!=='function')return false;play();
             const notices={
                 targetDeath:["TARGET DEATH","audio-target-death"],lowHealth:["LOW HEALTH","audio-low-health"],
                 manaFull:["MANA FULL","audio-mana-full"],noTarget:["NO TARGET","audio-no-target"],
-                lowCap:["LOW CAPACITY","audio-low-capacity"],itemLow:["ITEM COUNT ALERT","audio-item-test"],
-                alpha:["ALPHA MONSTER","audio-alpha-monster"],generic:["ANTI-BOT CREATURE","audio-creature"],
+                outOfSoul:["OUT OF SOUL","audio-out-of-soul"],lowCap:["LOW CAPACITY","audio-low-capacity"],itemLow:["ITEM COUNT ALERT","audio-item-test"],
+                alpha:["ALPHA / ANCIENT MONSTER","audio-alpha-monster"],generic:["ANTI-BOT CREATURE","audio-creature"],
             };
             const notice=notices[name];
             if(notice)showAudioAlertNotification(notification?.title||notice[0],notification?.message||"Sound test",notification?.type||notice[1]);
@@ -26939,11 +26959,30 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
  * ==================================================================================
  */
 window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
+    // Read only the client's current NPC conversation, never general chat history.
+    function npcDialogText() {
+        const dialog=window.gameClient?.interface?.npcDialog;
+        if(!dialog)return '';
+        const turn=dialog.__turn;
+        const lines=turn ? (Array.isArray(turn.lines)?turn.lines:[]) : [dialog.__lastState?.message || ''];
+        const keywords=turn ? (Array.isArray(turn.keywords)?turn.keywords:[]) : (dialog.__lastState?.keywords || []);
+        const clean=value=>{
+            let text=String(value||'').replace(/<[^>]*>/g,'');
+            try{if(typeof dialog.__decodeHTML==='function')text=dialog.__decodeHTML(text);}catch(_){}
+            return text.replace(/[{}]/g,'').replace(/\s+/g,' ').trim();
+        };
+        return [...lines,...keywords].map(clean).filter(Boolean).join(' ');
+    }
+    bot.npc=Object.freeze({
+        dialog:keyword=>typeof keyword==='string'&&!!keyword.trim()&&npcDialogText().toLowerCase().includes(keyword.trim().replace(/\s+/g,' ').toLowerCase()),
+        text:npcDialogText,
+    });
+
     const failedRecoveryTiles=new Map();
     const configStorageKey = "minibiaBot.cave.config";
     const routeStorageKey = "minibiaBot.cave.route";
     const transitionStorageKey = "minibiaBot.cave.transitions";
-    const presetStorageKey = "minibiaBot.cave.presets";
+    const presetStorageKey = "minibiaBot.char.__shared__.cave.presets";
     const defaultPresetName = "Default";
     const minimapOverlayRootId = "minibia-bot-cave-minimap-overlay";
     const minimapOverlayStyleId = "minibia-bot-cave-minimap-overlay-style";
@@ -27912,6 +27951,49 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     let route = normalizeRoute(bot.storage.get(routeStorageKey, []));
     let transitions = normalizeTransitions(bot.storage.get(transitionStorageKey, []));
     let presets = normalizePresets(bot.storage.get(presetStorageKey, []));
+    const presetContent=p=>JSON.stringify([p.route,p.transitions,p.areas]);
+    function migrateSharedPresets() {
+        const store=window.localStorage,current=String(window.__minibiaBotCurrentCharacter||'').replace(/[^A-Za-z0-9_.-]/g,'_');
+        const migrationKey='minibiaBot.char.__shared__.cave.migrated';
+        let migratedSources;try{migratedSources=JSON.parse(store[migrationKey]||'null');}catch(_){}
+        const existingShared=typeof store[presetStorageKey]==='string';
+        const alreadyShared=existingShared && !migratedSources;
+        if(!migratedSources||typeof migratedSources!=='object'||Array.isArray(migratedSources))migratedSources={};
+        const sources=[];
+        for(let i=0;i<store.length;i++){const key=store.key(i);if(key!==presetStorageKey&&(key==='minibiaBot.cave.presets'||/^minibiaBot\.char\..+\.cave\.presets$/.test(key)))sources.push(key);}
+        sources.sort((a,b)=>Number(b===`minibiaBot.char.${current}.cave.presets`)-Number(a===`minibiaBot.char.${current}.cave.presets`));
+        // Older shared versions already imported every legacy catalog. Do not
+        // resurrect routes deliberately removed from that shared library.
+        if(alreadyShared){for(const key of sources)migratedSources[key]=true;bot.storage.set(migrationKey,migratedSources);return;}
+        const migrated=[];
+        for(const key of sources){
+            if(migratedSources[key])continue;
+            let data;try{data=JSON.parse(store[key]||'null');}catch{continue;}if(!Array.isArray(data))continue;
+            const entries=normalizePresets(data);if(!entries.length&&data.length)continue;
+            const owner=key.startsWith('minibiaBot.char.')?key.slice('minibiaBot.char.'.length,-'.cave.presets'.length):'legacy';
+            for(const p of entries){
+                let chosen=presets.find(x=>x.name.toLowerCase()===p.name.toLowerCase());
+                if(chosen&&presetContent(chosen)!==presetContent(p)){
+                    chosen=presets.find(x=>x.name.toLowerCase().startsWith((p.name+' (').toLowerCase())&&presetContent(x)===presetContent(p));
+                    if(!chosen){let name=p.name+' ('+owner+')',n=2;while(presets.some(x=>x.name.toLowerCase()===name.toLowerCase()))name=p.name+' ('+owner+' '+(n++)+')';chosen={...p,name};presets.push(chosen);}
+                }else if(!chosen){chosen=p;presets.push(p);}
+                if(owner===current&&String(config.activePresetName||'').toLowerCase()===p.name.toLowerCase())config.activePresetName=chosen.name;
+            }
+            migrated.push(key);migratedSources[key]=true;
+        }
+        if(migrated.length){
+            const payload=JSON.stringify(presets);bot.storage.set(presetStorageKey,presets);
+            // Only retire old character copies after the complete shared library
+            // is durably saved. Quota failures retain every original copy.
+            if(store[presetStorageKey]===payload){
+                bot.storage.set(migrationKey,migratedSources);
+                for(const key of migrated){delete store[key];window.__minibiaBotUnsavedStorage?.delete(key);}
+            }
+        }
+    }
+    migrateSharedPresets();
+    let presetBaseline=cloneValue(presets),sharedUpdatePending=false;
+    let sharedDurableRaw=window.localStorage[presetStorageKey] ?? null,sharedWaitAt=0;
     if (!presets.length && (route.length || transitions.length)) {
         presets = [{
                 name: defaultPresetName,
@@ -27921,6 +28003,50 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             }
         ];
     }
+
+    function applySharedPresetUpdate() {
+        // Storage events may be delayed/missed in background clients. Also
+        // compare the actual durable value, bypassing a stale unsaved overlay.
+        const durableRaw=window.localStorage[presetStorageKey] ?? null;
+        if(durableRaw!==sharedDurableRaw){
+            sharedDurableRaw=durableRaw;sharedUpdatePending=true;sharedWaitAt=Date.now();
+            window.__minibiaBotUnsavedStorage?.delete(presetStorageKey);
+            if(state.running)stopCaveMovementNow();
+        }
+        if(!sharedUpdatePending)return false;
+        const player=window.gameClient?.player;
+        if(state.running&&isWaypointScriptActive())return false;
+        if(state.running&&(player?.isMoving?.()||player?.__preWalks?.length)&&Date.now()-sharedWaitAt<2000)return false;
+        const name=String(config.activePresetName||getActivePresetName()),old=presets.find(p=>p.name.toLowerCase()===name.toLowerCase());
+        let stored;try{stored=JSON.parse(durableRaw||'[]');}catch(_){return false;}
+        const next=normalizePresets(stored);
+        let active=next.find(p=>p.name.toLowerCase()===name.toLowerCase());
+        if(!active&&old)active=next.find(p=>presetContent(p)===presetContent(old));
+        sharedUpdatePending=false;presets=next;presetBaseline=cloneValue(next);
+        if(!active){
+            if(state.running)stop();
+            if(next.length)loadPresetState(next[0].name);else{route=[];transitions=[];state.currentIndex=0;}
+            bot.log('Cave: active shared preset removed; CaveBot stopped');return true;
+        }
+        if(active.name===name&&old&&presetContent(active)===presetContent(old))return true;
+        const previous=route[state.currentIndex],index=state.currentIndex;
+        route=normalizeRoute(active.route);transitions=normalizeTransitions(active.transitions);
+        const matching=[];if(previous)route.forEach((wp,i)=>{if(JSON.stringify(wp)===JSON.stringify(previous))matching.push(i);});
+        state.currentIndex=matching.length?matching.sort((a,b)=>Math.abs(a-index)-Math.abs(b-index))[0]:Math.max(0,Math.min(index,route.length-1));
+        state.pendingTransitionSource=null;state._shovelOpened={};state._shovelOpenedAt={};state.routeRevision++;setActivePresetName(active.name);
+        resetRecoveryContext('shared preset updated');clearLureStaticRouteCache('shared preset updated');
+        bot.specialAreas?.refreshPresetAreas?.();state.lastPathAt=0;
+        bot.log('Cave: shared preset updated',{name:active.name,waypoint:state.currentIndex+1});return true;
+    }
+    function sharedPresetChanged(event) {
+        if(event.key!==presetStorageKey)return;
+        sharedUpdatePending=true;sharedWaitAt=Date.now();
+        if(state.running)stopCaveMovementNow();
+        applySharedPresetUpdate();
+    }
+    window.addEventListener('storage',sharedPresetChanged);
+    const sharedPresetTimer=setInterval(applySharedPresetUpdate,250);
+    bot.addCleanup(()=>{window.removeEventListener('storage',sharedPresetChanged);clearInterval(sharedPresetTimer);});
 
     function getPresetNames() {
         return presets.map(p => p.name);
@@ -27942,21 +28068,30 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     }
 
     function persistPresets() {
-        bot.storage.set(presetStorageKey, presets.map(p => ({
-                    name: p.name,
-                    route: p.route.map(w => ({
-                            ...w
-                        })),
-                    transitions: p.transitions.map(t => cloneValue(t)),
-                    areas: normalizePresetAreas(p.areas),
-                })));
+        // Apply local deltas to the latest shared library, retaining edits to
+        // unrelated presets made in another tab since our last read.
+        const latest=normalizePresets(bot.storage.get(presetStorageKey,[]));
+        const merged=new Map(latest.map(p=>[p.name.toLowerCase(),p]));
+        const local=new Map(presets.map(p=>[p.name.toLowerCase(),p]));
+        const baseline=new Map(presetBaseline.map(p=>[p.name.toLowerCase(),p]));
+        for(const [key]of baseline)if(!local.has(key))merged.delete(key);
+        for(const [key,p]of local)if(!baseline.has(key)||JSON.stringify(baseline.get(key))!==JSON.stringify(p))merged.set(key,p);
+        presets=[...merged.values()];presetBaseline=cloneValue(presets);
+        bot.storage.set(presetStorageKey,presets);
+        sharedDurableRaw=window.localStorage[presetStorageKey] ?? null;
     }
 
     function persistLegacyActivePreset() {
-        bot.storage.set(routeStorageKey, route.map(w => ({
-                    ...w
-                })));
-        bot.storage.set(transitionStorageKey, transitions.map(t => cloneValue(t)));
+        const saved = bot.storage.get(presetStorageKey, []);
+        const active = Array.isArray(saved) ? saved.find(p => String(p.name).toLowerCase() === String(getActivePresetName()).toLowerCase()) : null;
+        const mirror = (key, value, canonical) => {
+            if (Array.isArray(canonical) && JSON.stringify(value) === JSON.stringify(canonical)) {
+                bot.storage.remove(key); return;
+            }
+            bot.storage.set(key,value);
+        };
+        mirror(routeStorageKey,route.map(w=>({...w})),active?.route);
+        mirror(transitionStorageKey,transitions.map(t=>cloneValue(t)),active?.transitions);
     }
 
     function setActivePresetName(name) {
@@ -30983,9 +31118,10 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             });
             return false;
         }
+        const deletingActive = preset.name.toLowerCase() === String(config.activePresetName || getActivePresetName()).toLowerCase();
         presets = presets.filter(p => p.name.toLowerCase() !== preset.name.toLowerCase());
         persistPresets();
-        if (preset.name.toLowerCase() === getActivePresetName().toLowerCase()) {
+        if (deletingActive) {
             const fallback = presets[0] || null;
             if (state.running)
                 stop();
@@ -31054,9 +31190,10 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
      * @param {boolean} skipExisting – If true, presets with matching names are skipped.
      * @returns {{ added: number, skipped: number }}
      */
-    function mergePresets(newPresets, skipExisting = true) {
+    function mergePresets(newPresets, skipExisting = true, options = {}) {
         let added = 0;
         let skipped = 0;
+        const importedNames = [];
 
         if (!Array.isArray(newPresets)) {
             bot.log("mergePresets: invalid input, expected array");
@@ -31067,7 +31204,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         }
 
         for (const p of newPresets) {
-            const norm = normalizePreset(p);
+            let norm = normalizePreset(p);
             if (!norm) {
                 bot.log("mergePresets: skipping invalid preset", p);
                 continue;
@@ -31075,20 +31212,24 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
             const existing = getPresetByName(norm.name);
             if (existing && skipExisting) {
-                skipped++;
-                continue;
+                if (options.renameConflicts && presetContent(existing)!==presetContent(norm)) {
+                    const base=norm.name;let name=base+' (imported)',suffix=2;
+                    while(getPresetByName(name))name=base+' (imported '+(suffix++)+')';
+                    norm={...norm,name};
+                } else {skipped++;importedNames.push(existing.name);continue;}
             }
 
             // Add or replace (replace shouldn't happen because we skip existing)
             upsertPreset(norm.name, norm.route, norm.transitions, norm.areas);
-            added++;
+            added++;importedNames.push(norm.name);
         }
 
         persistPresets();
         bot.log(`mergePresets: added ${added}, skipped ${skipped}`);
         return {
             added,
-            skipped
+            skipped,
+            importedNames
         };
     }
 
@@ -36125,12 +36266,12 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                     ? `${waypoint.x},${waypoint.y},${waypoint.z}`
                     : "unnamed");
             bot.log(`Executing script for waypoint ${label}`);
-            const scriptFn = new Function('bot', 'state', waypoint.script);
+            const scriptFn = new Function('bot', 'state', 'npc', waypoint.script);
             const bankTaskBefore = bot.bankNpc?.getPendingTask?.();
             let result;
             scriptExecutionDepth++;
             try {
-                result = scriptFn(bot, state);
+                result = scriptFn(bot, state, bot.npc);
             } finally {
                 scriptExecutionDepth--;
             }
@@ -51701,7 +51842,7 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
                         : convertExternalWaypointRoute(data, file.name);
                     if (!Array.isArray(presetsData) || presetsData.length === 0)
                         return reject(new Error("Cave presets array is empty or invalid."));
-                    const result = bot.cave.mergePresets(presetsData, true);
+                    const result = bot.cave.mergePresets(presetsData, true, {renameConflicts:true});
                     resolve(result);
                 } catch (err) {
                     reject(new Error(`Import failed: ${err.message}`));
@@ -51815,6 +51956,7 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
         delete : deleteProfile,
         get: getProfile,
         getAllConfigs,
+        configKeys: () => CONFIG_KEYS.slice(),
         setAllConfigs,
         export: exportProfileToFile,
         import: importProfileFromFile,
@@ -52420,7 +52562,7 @@ window.__minibiaBotBundle.installSpecialAreasModule = function installSpecialAre
         }
     }
 
-    bot.specialAreas={status,config,updateConfig,getRevision:()=>areaRevision,getAreaTypeDefinitions:()=>areaTypeDefinitions.map(cloneValue),getAreas,addArea,addAreaCurrentTile,updateArea,removeArea,clearAreas,normalizeArea,normalizeAreas,getPositionPolicy,isPositionAllowed,getPositionCost,hasAreaTypeAt,hasActiveAreasForFloor,hasHardAreasForFloor,hasPolicySafeApproach,searchPolicyPath,findPolicyPath,walkTo,sendPolicyPath,beginAreaCapture,beginTestPathCapture,cancelCapture,clearTestPath,renderOverlay,destroy:destroySpecialAreasRuntime};
+    bot.specialAreas={status,config,updateConfig,refreshPresetAreas:()=>{areaCache.clear();areaRevision++;clearPolicyCaches();renderOverlay();},getRevision:()=>areaRevision,getAreaTypeDefinitions:()=>areaTypeDefinitions.map(cloneValue),getAreas,addArea,addAreaCurrentTile,updateArea,removeArea,clearAreas,normalizeArea,normalizeAreas,getPositionPolicy,isPositionAllowed,getPositionCost,hasAreaTypeAt,hasActiveAreasForFloor,hasHardAreasForFloor,hasPolicySafeApproach,searchPolicyPath,findPolicyPath,walkTo,sendPolicyPath,beginAreaCapture,beginTestPathCapture,cancelCapture,clearTestPath,renderOverlay,destroy:destroySpecialAreasRuntime};
     window[runtimeKey]={token:runtimeToken,destroy:destroySpecialAreasRuntime};
 
     // Compatibility facade for old mb0t code paths that still ask "blacklist?".
@@ -53445,6 +53587,144 @@ window.__minibiaBotBundle.installGroundSpawnLogger = function(bot) {
 };
 
 
+/** Storage Manager: inspect/export mb0t data; never clear the site's storage. */
+window.__minibiaBotBundle.installStorageManagerModule = function(bot) {
+    const prefix='minibiaBot.',charPrefix=prefix+'char.',profilePrefix=prefix+'profiles.';
+    const safeName=name=>String(name||'').replace(/[^A-Za-z0-9_.-]/g,'_');
+    const activeName=()=>safeName(window.__minibiaBotCurrentCharacter || window.gameClient?.player?.name || '');
+    const bytes=(key,value)=>(key.length+String(value).length)*2;
+    function entries() {
+        const data=new Map(),store=window.localStorage;
+        for(let i=0;i<store.length;i++){
+            const key=store.key(i);if(typeof key!=='string')continue;
+            // Named property reads bypass the character-remapping getItem hook.
+            const value=store[key];if(typeof value==='string')data.set(key,value);
+        }
+        return data;
+    }
+    function snapshot() {
+        const data=entries(),pending=window.__minibiaBotUnsavedStorage || new Map();
+        const keys=[...new Set([...data.keys(),...pending.keys()])];
+        const suffixes=(bot.profiles?.configKeys?.() || []).filter(k=>k.startsWith(prefix)).map(k=>'.'+k.slice(prefix.length)).sort((a,b)=>b.length-a.length);
+        const groups=new Map();let totalBytes=0,otherBytes=0;
+        for(const [key,value]of data){totalBytes+=bytes(key,value);if(!key.startsWith(prefix))otherBytes+=bytes(key,value);}
+        for(const key of keys){
+            if(!key.startsWith(prefix))continue;
+            let id='shared',label='Shared settings',kind='shared',current=false;
+            if(key.startsWith('minibiaBot.char.__shared__.')){id='shared-routes';label='Shared Cave presets';kind='shared';}
+            else if(key.startsWith(charPrefix)){
+                const suffix=suffixes.find(end=>key.endsWith(end));
+                const name=suffix?key.slice(charPrefix.length,-suffix.length):key.slice(charPrefix.length).split('.')[0];
+                id='char:'+name;label=name;kind='character';current=name===activeName() || (!!activeName() && key.startsWith(charPrefix+activeName()+'.'));
+            }else if(key.startsWith(profilePrefix)){
+                const name=key.slice(profilePrefix.length);id='profile:'+name;label=name;kind='profile';
+            }
+            if(!groups.has(id))groups.set(id,{id,label,kind,current,keys:[],bytes:0,pending:0,deletable:kind==='profile'||kind==='character'&&!current});
+            const group=groups.get(id);group.keys.push(key);
+            if(data.has(key))group.bytes+=bytes(key,data.get(key));
+            if(pending.has(key))group.pending++;
+        }
+        return {totalBytes,otherBytes,pending:pending.size,groups:[...groups.values()].sort((a,b)=>b.bytes-a.bytes)};
+    }
+    function backup(ids) {
+        const selected=snapshot().groups.filter(g=>ids.includes(g.id));
+        const data=entries(),pending=window.__minibiaBotUnsavedStorage || new Map(),result={};
+        for(const group of selected)for(const key of group.keys)result[key]=pending.has(key)?pending.get(key):data.get(key);
+        return {format:'mb0t-storage-backup',version:1,createdAt:new Date().toISOString(),entries:result};
+    }
+    function removeGroups(ids) {
+        const groups=snapshot().groups.filter(g=>ids.includes(g.id));
+        if(!groups.length || groups.some(g=>!g.deletable))throw new Error('Only saved profiles and inactive characters can be deleted.');
+        const keys=groups.flatMap(g=>g.keys),profiles=new Set(groups.filter(g=>g.kind==='profile').map(g=>g.label));
+        // This list is generated from a fresh inventory, never from imported data.
+        for(const key of keys){delete window.localStorage[key];window.__minibiaBotUnsavedStorage?.delete(key);}
+        if(profiles.size){
+            const names=bot.profiles?.list?.() || [];
+            const next=names.filter(name=>!profiles.has(safeName(name)));
+            window.localStorage.setItem('minibiaBot.profileIndex',JSON.stringify(next));
+        }
+        return keys.length;
+    }
+    function duplicateCopies() {
+        const data=entries(),duplicates=[];
+        for(const [key,value]of data){
+            if(!key.startsWith(prefix)||!key.endsWith('.cave.presets'))continue;
+            try{
+                const presets=JSON.parse(value);if(!Array.isArray(presets))continue;
+                const base=key.slice(0,-'presets'.length);
+                for(const [suffix,field]of [['route','route'],['transitions','transitions']]){
+                    const mirrorKey=base+suffix,raw=data.get(mirrorKey);if(raw==null)continue;
+                    const mirror=JSON.parse(raw);
+                    if(Array.isArray(mirror)&&presets.some(p=>Array.isArray(p?.[field])&&JSON.stringify(p[field])===JSON.stringify(mirror)))duplicates.push({key:mirrorKey,bytes:bytes(mirrorKey,raw)});
+                }
+            }catch(_){}
+        }
+        return duplicates;
+    }
+    function cleanDuplicates() {
+        const list=duplicateCopies();
+        for(const row of list){delete window.localStorage[row.key];}
+        return list.reduce((sum,row)=>sum+row.bytes,0);
+    }
+    const format=value=>value>=1048576?(value/1048576).toFixed(2)+' MB':value>=1024?(value/1024).toFixed(1)+' KB':value+' B';
+    function mount(panel) {
+        const host=panel.querySelector('[data-tab-panel="storage"]');if(!host||host.dataset.storageBound)return;host.dataset.storageBound='true';
+        host.innerHTML=`<div class="mb-section"><div class="mb-section-title"><span class="mb-title-text">🗄️ Storage Manager</span></div>
+        <div class="mb-stack"><div class="mb-small-note" data-storage-summary></div>
+        <div style="display:flex;flex-wrap:wrap;gap:5px"><button class="mb-small-button" data-storage-refresh>Refresh</button><button class="mb-small-button" data-storage-export>Export selected</button><button class="mb-small-button" data-storage-delete>Delete selected</button></div>
+        <div data-storage-list></div><div class="mb-small-note" data-storage-status role="status">Select a character or profile to export. Only inactive characters and saved profiles can be deleted.</div>
+        <details class="mb-alert-fold"><summary>Duplicate route copies</summary><div class="mb-alert-fold-body"><div class="mb-small-note" data-storage-duplicates></div><button class="mb-small-button" data-storage-clean>Clean duplicates</button></div></details>
+        <details class="mb-alert-fold"><summary>Restore an exported backup</summary><div class="mb-alert-fold-body"><input type="file" data-storage-file accept=".json"><button class="mb-small-button" data-storage-restore>Restore backup</button><div class="mb-small-note">Restores inactive characters and saved profiles only. Existing keys are preserved.</div></div></details>
+        </div></div>`;
+        const q=selector=>host.querySelector(selector),selection=new Set();let deletePlan=null;
+        const message=text=>{q('[data-storage-status]').textContent=text;};
+        function cancelPlan(){deletePlan=null;q('[data-storage-delete]').textContent='Delete selected';}
+        function render(){
+            cancelPlan();const data=snapshot();
+            q('[data-storage-summary]').textContent=`Local storage: ${format(data.totalBytes)} · game / other data: ${format(data.otherBytes)}${data.pending?' · '+data.pending+' unsaved changes':''}`;
+            const list=q('[data-storage-list]');list.replaceChildren();
+            for(const group of data.groups){
+                const row=document.createElement('label');row.style.cssText='display:grid;grid-template-columns:14px minmax(0,1fr) auto;gap:8px;align-items:center;padding:7px 0;border-bottom:1px solid rgba(224,200,148,.12)';
+                const check=document.createElement('input');check.type='checkbox';check.checked=selection.has(group.id);check.setAttribute('aria-label','Select '+group.label);
+                const name=document.createElement('span');name.style.cssText='min-width:0;overflow-wrap:anywhere;font-size:11px';name.textContent=(group.kind==='profile'?'Profile · ':group.kind==='character'?'Character · ':'')+group.label+(group.current?' (current)':'')+(group.pending?' · unsaved':'');
+                const size=document.createElement('span');size.className='mb-small-note';size.textContent=format(group.bytes);
+                check.addEventListener('change',()=>{cancelPlan();if(check.checked)selection.add(group.id);else selection.delete(group.id);});row.append(check,name,size);list.append(row);
+            }
+            const copies=duplicateCopies();q('[data-storage-duplicates]').textContent=`${copies.length} redundant copies · ${format(copies.reduce((n,row)=>n+row.bytes,0))}. Only copies identical to saved presets are removed.`;q('[data-storage-clean]').disabled=!copies.length;
+        }
+        function download(data){const url=URL.createObjectURL(new Blob([JSON.stringify(data,null,2)],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download='mb0t-storage-backup.json';document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);}
+        q('[data-storage-refresh]').addEventListener('click',render);
+        q('[data-storage-export]').addEventListener('click',()=>{if(!selection.size){message('Select at least one row.');return;}download(backup([...selection]));message('Backup exported, including selected unsaved changes.');});
+        q('[data-storage-delete]').addEventListener('click',()=>{
+            if(deletePlan){try{const count=removeGroups(deletePlan);selection.clear();render();message(`Deleted ${count} mb0t setting(s).`);}catch(error){message(error.message);cancelPlan();}return;}
+            const groups=snapshot().groups.filter(g=>selection.has(g.id));
+            if(!groups.length){message('Select an inactive character or saved profile.');return;}
+            if(groups.some(g=>!g.deletable)){message('Current character and shared settings are protected. Switch characters before deleting that character.');return;}
+            deletePlan=groups.map(g=>g.id);q('[data-storage-delete]').textContent='Confirm delete';message('Delete '+groups.map(g=>g.label).join(', ')+'? Export first if you want a backup. Click Confirm delete to remove these groups.');
+        });
+        q('[data-storage-clean]').addEventListener('click',()=>{const saved=cleanDuplicates();render();message('Removed '+format(saved)+' of duplicate data. Saved presets are intact.');});
+        q('[data-storage-restore]').addEventListener('click',async()=>{
+            const file=q('[data-storage-file]').files?.[0];if(!file){message('Choose a storage backup first.');return;}
+            try{if(file.size>20*1024*1024)throw new Error('Backup is too large.');const count=restore(JSON.parse(await file.text()));render();message(`Restored ${count} setting(s). Existing settings were preserved.`);}catch(error){message(error.message);}
+        });
+        render();
+    }
+    function restore(data) {
+        if(data?.format!=='mb0t-storage-backup'||data.version!==1||!data.entries||typeof data.entries!=='object'||Array.isArray(data.entries))throw new Error('Invalid storage backup.');
+        const rows=Object.entries(data.entries),currentPrefix=charPrefix+activeName()+'.';
+        // Validate the whole file before applying any change. No site/game keys.
+        if(rows.some(([key,value])=>typeof value!=='string'||!(key.startsWith(charPrefix)||key.startsWith(profilePrefix))||key.startsWith(currentPrefix)||key.startsWith('minibiaBot.char.__shared__.')||key==='__proto__'))throw new Error('Backup must contain only inactive characters or saved profiles. Current/shared settings cannot be restored here.');
+        const existing=entries();let count=0;
+        for(const [key,value]of rows)if(!existing.has(key)&&!window.__minibiaBotUnsavedStorage?.has(key)){window.localStorage.setItem(key,value);count++;}
+        // Rebuild the profile index so restored compressed profiles are selectable.
+        const names=new Set(bot.profiles?.list?.() || []);
+        for(const [key]of rows)if(key.startsWith(profilePrefix))names.add(key.slice(profilePrefix.length));
+        if(names.size)window.localStorage.setItem('minibiaBot.profileIndex',JSON.stringify([...names]));
+        return count;
+    }
+    bot.storageManager={snapshot,backup,removeGroups,duplicateCopies,cleanDuplicates,restore,mount};
+};
+
 window.__minibiaBotBundle.installObservability = function(bot) {
     let player=null,lastTick=0,disposed=false;
     const skills=new Map(),views=[],liveSkills=new Map();
@@ -53503,8 +53783,106 @@ window.__minibiaBotBundle.installObservability = function(bot) {
         }
         const spell=bot.combatRules?.status?.();if(spell?.blockedReason&&spell.blockedReason!=='inactive')rows.push(['Spell rules',spell.blockedReason]);
         if(bot.cave?.isRunning?.()){const s=bot.cave.getUiStatus?.();rows.push(['Cavebot',s?`Waypoint #${s.currentIndex+1} · ${s.movement?.mode||'Running'}`:'Running']);}
+        if(window.__minibiaBotUnsavedStorage?.size)rows.unshift(['Storage',`${window.__minibiaBotUnsavedStorage.size} unsaved setting(s) — export before refreshing`]);
         if(bot.actions?.isHalted?.())rows.unshift(['Actions','Halted']);
         return rows;
+    }
+    function tileMapSnapshot(radius=16) {
+        const raw=bot.getPlayerPosition?.(),gc=window.gameClient;
+        if(!raw || ![raw.x,raw.y,raw.z].every(v=>Number.isFinite(Number(v))))return null;
+        const center={x:Number(raw.x),y:Number(raw.y),z:Number(raw.z)};
+        const r=Math.max(2,Math.min(20,Math.trunc(Number(radius)||16))),tiles=[];
+        for(let dy=-r;dy<=r;dy++)for(let dx=-r;dx<=r;dx++){
+            const position={x:center.x+dx,y:center.y+dy,z:center.z},cell={...position,dx,dy,kind:'unknown',creatures:[]};
+            const tile=typeof Position==='function'?gc?.world?.getTileFromWorldPosition?.(new Position(position.x,position.y,position.z)):null;
+            if(tile && tile.id!==0 && !tile.__isPlaceholder){
+                try{
+                    const ground=tile.isWalkable?.()===true || tile.__hasWalkableGroundItem?.()===true;
+                    const obstacle=bot.hasNavigationObstacle?.(tile)===true;
+                    const itemBlocked=tile.isItemBlocked?.()===true;
+                    cell.kind=obstacle||!ground||itemBlocked?'blocked':'walkable';
+                    cell.reason=obstacle?'Server obstacle':!ground?'Ground not walkable':itemBlocked?'Blocking item':'Walkable';
+                    if(cell.kind==='walkable' && bot.cave?.isFloorChangeTile?.(tile)){cell.kind='transition';cell.reason='Floor change';}
+                    const creatures=Array.from(tile.monsters?.values?.() || []);
+                    cell.creatures=creatures.filter(c=>c && c!==gc.player && c.id!==gc.player?.id && Number(c.state?.health ?? c.health ?? 1)>0).map(c=>String(c.name||'Creature'));
+                    const definition=gc.itemDefinitionsBySid?.[tile.sid] || gc.itemDefinitionsByCid?.[tile.id];
+                    cell.ground=definition?.properties?.name || '';
+                }catch{cell.kind='unknown';cell.reason='Tile data unavailable';}
+            }
+            tiles.push(cell);
+        }
+        const route=bot.cave?.getRoute?.() || [],currentIndex=bot.cave?.getUiStatus?.()?.currentIndex;
+        const waypoints=[];
+        route.forEach((wp,index)=>{
+            if(!wp || String(wp.script||'').trim() || ![wp.x,wp.y,wp.z].every(v=>v!=null&&v!==''&&Number.isFinite(Number(v))))return;
+            const x=Number(wp.x),y=Number(wp.y),z=Number(wp.z),dx=x-center.x,dy=y-center.y;
+            if(z!==center.z || Math.abs(dx)>r || Math.abs(dy)>r)return;
+            const type=wp.knightBox?'Box':wp.rope?'Rope':wp.shovel?'Shovel':wp.ladder?'Ladder':wp.stand?'Stand':'Walk';
+            const marker={index,number:index+1,x,y,z,dx,dy,type,label:String(wp.label||''),current:index===currentIndex};
+            waypoints.push(marker);
+            const tile=tiles[(dy+r)*(r*2+1)+dx+r];
+            if(tile){if(!tile.waypoints)tile.waypoints=[];tile.waypoints.push(marker);}
+        });
+        return {center,radius:r,size:r*2+1,tiles,waypoints};
+    }
+    function mountTileMap(host) {
+        const section=document.createElement('details');section.className='mb-section mb-tile-map';
+        const heading=document.createElement('summary');heading.className='mb-section-title';heading.style.cursor='pointer';
+        const title=document.createElement('span');title.className='mb-title-text';title.textContent='🗺️ Local Tile Map';heading.append(title);section.append(heading);
+        const controls=document.createElement('div');controls.className='mb-tile-map-toolbar';
+        const caption=document.createElement('span');caption.className='mb-small-note';caption.classList.add('mb-tile-map-caption');caption.textContent='Waiting for character…';
+        const range=document.createElement('select');range.className='mb-tile-map-size';range.setAttribute('aria-label','Tile map size');
+        for(const [value,label]of [[7,'15 × 15'],[12,'25 × 25'],[16,'33 × 33']]){const option=document.createElement('option');option.value=value;option.textContent=label;range.append(option);}range.value='16';controls.append(caption,range);section.append(controls);
+        const canvas=document.createElement('canvas');canvas.width=396;canvas.height=396;canvas.setAttribute('aria-label','Live map of nearby loaded tiles');canvas.style.cssText='display:block;width:100%;max-width:396px;aspect-ratio:1;image-rendering:pixelated;border:1px solid #504937;border-radius:4px;box-sizing:border-box;';section.append(canvas);
+        const legend=document.createElement('div');legend.className='mb-small-note';legend.classList.add('mb-tile-map-legend');
+        for(const [color,label]of [['#706b55','Walkable'],['#151515','Blocked'],['#293440','Unloaded'],['#e0bd4b','Creature'],['#6b9ed0','Floor change'],['#ffffff','You'],['#b894f4','Waypoint'],['#62dbc0','Current']]){
+            const chip=document.createElement('span');chip.style.cssText='display:inline-flex;align-items:center;gap:5px;white-space:nowrap;min-width:0;';
+            const dot=document.createElement('span');dot.style.cssText=`width:8px;height:8px;display:inline-block;background:${color};border:1px solid #777;`;chip.append(dot,document.createTextNode(label));legend.append(chip);
+        }
+        section.append(legend);
+        const mapStyle=document.createElement('style');mapStyle.textContent=`
+        #minibia-bot-panel .mb-tile-map .mb-tile-map-toolbar{display:grid!important;grid-template-columns:minmax(0,1fr) 88px;align-items:center;gap:8px;margin:2px 0 8px;}
+        #minibia-bot-panel .mb-tile-map .mb-tile-map-caption{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-variant-numeric:tabular-nums;}
+        #minibia-bot-panel .mb-tile-map select.mb-tile-map-size{width:88px!important;min-width:88px!important;max-width:88px!important;margin:0!important;}
+        #minibia-bot-panel .mb-tile-map canvas{margin:0 auto;}
+        #minibia-bot-panel .mb-tile-map .mb-tile-map-legend{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:5px 8px;margin:8px 0 6px;font-size:10px;line-height:1.3;}
+        #minibia-bot-panel .mb-tile-map .mb-tile-map-info{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:18px;height:18px;padding-top:4px;border-top:1px solid rgba(224,200,148,.12);font-variant-numeric:tabular-nums;}
+        `;section.append(mapStyle);
+        const info=document.createElement('div');info.className='mb-small-note';info.classList.add('mb-tile-map-info');info.textContent='Hover a tile for coordinates and details.';section.append(info);host.append(section);
+        const colors={walkable:'#706b55',blocked:'#151515',unknown:'#293440',transition:'#6b9ed0'};
+        let snapshot=null;
+        function renderMap(){
+            if(!section.open||!section.getClientRects().length)return;
+            snapshot=tileMapSnapshot(Number(range.value));const ctx=canvas.getContext('2d');if(!ctx)return;
+            ctx.fillStyle=colors.unknown;ctx.fillRect(0,0,396,396);
+            if(!snapshot){info.textContent='Waiting for character and map data.';return;}
+            const cell=396/snapshot.size;
+            for(const tile of snapshot.tiles){const x=(tile.dx+snapshot.radius)*cell,y=(tile.dy+snapshot.radius)*cell;
+                ctx.fillStyle=colors[tile.kind];ctx.fillRect(Math.floor(x),Math.floor(y),Math.ceil(cell),Math.ceil(cell));
+                if(tile.creatures.length){ctx.fillStyle='#e0bd4b';ctx.fillRect(x+cell*.25,y+cell*.25,cell*.5,cell*.5);}
+            }
+            for(const tile of snapshot.tiles){
+                if(!tile.waypoints?.length)continue;
+                const marker=tile.waypoints.find(w=>w.current)||tile.waypoints[0];
+                const label=String(marker.number)+(tile.waypoints.length>1?'+':'');
+                const x=(tile.dx+snapshot.radius)*cell,y=(tile.dy+snapshot.radius)*cell;
+                ctx.fillStyle=marker.current?'#62dbc0':'#b894f4';ctx.fillRect(x+1,y+1,cell-2,cell-2);
+                ctx.font=`bold ${Math.max(6,Math.min(11,(cell-2)/label.length*1.5))}px sans-serif`;ctx.textAlign='center';ctx.textBaseline='middle';
+                ctx.fillStyle='#16121e';ctx.fillText(label,x+cell/2,y+cell/2,cell-2);
+            }
+            const centerCell=snapshot.tiles[snapshot.radius*snapshot.size+snapshot.radius];
+            if(centerCell.waypoints?.length){ctx.strokeStyle='#fff';ctx.lineWidth=2;ctx.strokeRect(snapshot.radius*cell+1,snapshot.radius*cell+1,cell-2,cell-2);}
+            else {ctx.fillStyle='#fff';ctx.fillRect((snapshot.radius+.2)*cell,(snapshot.radius+.2)*cell,cell*.6,cell*.6);}
+            caption.textContent=`${snapshot.center.x}, ${snapshot.center.y}, ${snapshot.center.z}`;
+        }
+        canvas.addEventListener('mousemove',event=>{
+            if(!snapshot)return;const rect=canvas.getBoundingClientRect();
+            const x=Math.floor((event.clientX-rect.left)/rect.width*snapshot.size),y=Math.floor((event.clientY-rect.top)/rect.height*snapshot.size);
+            if(x<0||y<0||x>=snapshot.size||y>=snapshot.size)return;const tile=snapshot.tiles[y*snapshot.size+x];
+            info.textContent=`${tile.x}, ${tile.y}, ${tile.z} · ${tile.reason||'Unloaded'}${tile.ground?' · '+tile.ground:''}${tile.creatures.length?' · '+tile.creatures.join(', '):''}${tile.waypoints?.length?' · '+tile.waypoints.map(w=>`#${w.number} ${w.type}${w.label?' ('+w.label+')':''}${w.current?' [current]':''}`).join(', '):''}`;
+            info.title=info.textContent;
+        });
+        section.addEventListener('toggle',renderMap);range.addEventListener('change',renderMap);views.push(renderMap);
     }
     function mount(panel){
         if(!panel||panel.querySelector('[data-observability]'))return;
@@ -53533,11 +53911,12 @@ window.__minibiaBotBundle.installObservability = function(bot) {
                 const values=[`Gained: ${s?.gained.toLocaleString()||0}`,`Points/h: ${Math.round(s?.rate||0).toLocaleString()}`,`To level: ${duration(s?.seconds)}`,`Remaining: ${s?.remaining.toLocaleString()||'—'}`];cells.forEach((c,i)=>{if(c.textContent!==values[i])c.textContent=values[i];});});
         }
         const host=panel.querySelector('[data-tab-panel="diagnostics"]');if(!host)return;
+        mountTileMap(host);
         const diag=section(host,'Action Diagnostics'),details=make('details',diag);make('summary',details,'Show current actions');const rows=make('div',details);let signature='';
         views.push(()=>{if(!details.open||!diag.getClientRects().length)return;const data=diagnostics(),next=JSON.stringify(data);if(next===signature)return;signature=next;rows.replaceChildren();if(!data.length)make('div',rows,'No active modules').className='mb-small-note';for(const [label,text]of data){const row=make('div',rows);row.className='mb-observe-row';make('span',row,label);make('span',row,text);}});
         tick();
     }
-    bot.observability={mount,skillSnapshot,diagnostics,tick,reset:()=>{skills.clear();}};
+    bot.observability={mount,tileMapSnapshot,skillSnapshot,diagnostics,tick,reset:()=>{skills.clear();}};
     observeSkills();sync();const timer=setInterval(tick,1000);bot.addCleanup(()=>{disposed=true;clearInterval(timer);detachSkills();views.length=0;skills.clear();liveSkills.clear();});
 };
 
@@ -57742,20 +58121,19 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
                 if (madeCount > 0) { craftGains.push({ cid, count: madeCount, at: Date.now(), player, session }); matchCrafts(); }
             }
         }
-        const seedUntil = Number(window.gameClient?.networkManager?.__supplySeedExpect?.[key]) || 0;
         if (!active() || previous == null || count >= previous) return;
         supplyUses = supplyUses.filter(use => use.player === player && use.session === session && Date.now()-use.at < 4000);
         const uses = supplyUses.filter(use => use.item.cid === cid && use.item.fluidType === fluid);
         const matchingMove = moves.some(move => move.move && move.player === player && keyOf(move.item) === keyOf(uses[0]?.item || {}) && Date.now()-move.at < 4000);
         const confirmedSupplyUses = !matchingMove ? Math.min(previous-count,uses.length) : 0;
-        // Container refreshes mark counts as solicited, even when caused by
-        // drinking a fluid or using a rune. Match the use to the server decrease.
-        if (Date.now() < seedUntil && !confirmedSupplyUses) return;
+        // A decrease alone is not consumption: crafting followed by dropping,
+        // depot transfers and selling all change the same server total.
+        // Require a matching use even when no solicited-refresh flag remains.
+        if (!confirmedSupplyUses) return;
         const item = identify({ id: cid, fluidType: fluid });
         if (!item || item.ring || !(item.type === 'rune' || fluid === 7 || fluid === 10 || /potion/i.test(item.name))) return;
-        // Only unsolicited server count decreases are consumption. Bag moves,
-        // selling, dropping and refresh requests seed counts silently.
-        const spent = Date.now() < seedUntil ? confirmedSupplyUses : previous-count;
+        // Count at most the number of observed uses, never an entire moved stack.
+        const spent = confirmedSupplyUses;
         addItem(session.supplies, item, spent);
         let remaining = spent;
         supplyUses = supplyUses.filter(use => {
@@ -62502,6 +62880,7 @@ function upgradeSectionHeaders(panel) {
 <div class="mb-tab-panel" data-tab-panel="professions"></div>
 
 <div class="mb-tab-panel" data-tab-panel="diagnostics"></div>
+<div class="mb-tab-panel" data-tab-panel="storage"></div>
 
 <!-- Healing Tab -->
 <div class="mb-tab-panel" data-tab-panel="healing">
@@ -62561,7 +62940,7 @@ function upgradeSectionHeaders(panel) {
 </div>
 
 <!-- Alert Tab -->
-<div class="mb-tab-panel mb-alert-compact" data-tab-panel="alert"><div class="mb-section"><div class="mb-section-title"><span class="mb-title-text">⚠️ Alerts</span></div><div class="mb-alert-toggle-grid"><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-player-alert"><span>Player on screen</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-player-attack-alert"><span>Player attack</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-message-alert"><span>Message</span></label><label class="mb-toggle" title="Plays a descending tone when your target dies"><input type="checkbox" id="minibia-bot-panic-target-death-beep"><span>Target death</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-low-health-beep"><span>Low health</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-mana-full-beep"><span>Mana full</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-no-target-beep"><span>No target</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-low-cap-beep"><span>Low capacity</span></label><label class="mb-toggle" title="Repeats every 2 seconds while an alpha monster is on screen"><input type="checkbox" id="minibia-bot-panic-alpha-monster-beep"><span>Alpha monster</span></label></div><details class="mb-alert-fold"><summary>Player alert settings</summary><div class="mb-alert-fold-body"><label class="mb-field"><span class="mb-field-label">Player alert cooldown (s)</span><input type="number" id="minibia-bot-panic-player-cooldown" min="10" value="10"></label></div></details><details class="mb-alert-fold"><summary>Thresholds &amp; repeat timing</summary><div class="mb-alert-fold-body"><div class="mb-alert-setting-group"><div class="mb-alert-setting-title">Low health</div><div class="mb-alert-grid"><label class="mb-field">
+<div class="mb-tab-panel mb-alert-compact" data-tab-panel="alert"><div class="mb-section"><div class="mb-section-title"><span class="mb-title-text">⚠️ Alerts</span></div><div class="mb-alert-toggle-grid"><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-player-alert"><span>Player on screen</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-player-attack-alert"><span>Player attack</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-message-alert"><span>Message</span></label><label class="mb-toggle" title="Plays a descending tone when your target dies"><input type="checkbox" id="minibia-bot-panic-target-death-beep"><span>Target death</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-low-health-beep"><span>Low health</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-mana-full-beep"><span>Mana full</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-no-target-beep"><span>No target</span></label><label class="mb-toggle" title="Alerts at 0 soul points; repeats every 30 seconds until soul recovers."><input type="checkbox" id="minibia-bot-panic-out-of-soul-beep"><span>Out of soul</span></label><label class="mb-toggle"><input type="checkbox" id="minibia-bot-panic-low-cap-beep"><span>Low capacity</span></label><label class="mb-toggle" title="Repeats every 2 seconds for Alpha or Ancient monsters. Ancient Scarab is excluded."><input type="checkbox" id="minibia-bot-panic-alpha-monster-beep"><span>Alpha / Ancient monster</span></label></div><details class="mb-alert-fold"><summary>Player alert settings</summary><div class="mb-alert-fold-body"><label class="mb-field"><span class="mb-field-label">Player alert cooldown (s)</span><input type="number" id="minibia-bot-panic-player-cooldown" min="10" value="10"></label></div></details><details class="mb-alert-fold"><summary>Thresholds &amp; repeat timing</summary><div class="mb-alert-fold-body"><div class="mb-alert-setting-group"><div class="mb-alert-setting-title">Low health</div><div class="mb-alert-grid"><label class="mb-field">
               <span class="mb-field-label">Threshold %</span>
               <input type="number" id="minibia-bot-panic-low-health-threshold" min="1" max="99" value="50">
             </label><label class="mb-field">
@@ -62604,9 +62983,10 @@ function upgradeSectionHeaders(panel) {
       <label class="mb-toggle"><input type="checkbox" id="minibia-bot-pink-skull-enabled" /><span>Pinkskull XLOG</span></label>
       <label class="mb-toggle" title="Close connection on a new Console message containing sent to temple. Disables Auto-Reconnect."><input type="checkbox" id="minibia-bot-temple-xlog-enabled" /><span>Temple XLOG</span></label>
     </div>
-    <details class="mb-alert-fold"><summary>GM responder greetings</summary><div class="mb-alert-fold-body">
-      <label class="mb-toggle"><input type="checkbox" id="minibia-bot-gm-random-greetings"><span>Random greeting</span></label>
-      <label class="mb-field"><span class="mb-field-label">Greetings · one per line</span><textarea id="minibia-bot-gm-greetings" rows="3" aria-label="GM greetings, one per line"></textarea></label>
+    <details class="mb-alert-fold"><summary>GM responder replies</summary><div class="mb-alert-fold-body">
+      <label class="mb-toggle"><input type="checkbox" id="minibia-bot-gm-random-greetings"><span>Randomize both replies</span></label>
+      <label class="mb-field"><span class="mb-field-label">First reply · short, lowercase · one per line</span><textarea id="minibia-bot-gm-greetings" rows="3" aria-label="GM greetings, one per line"></textarea></label>
+      <label class="mb-field"><span class="mb-field-label">Second reply · short, lowercase · one per line</span><textarea id="minibia-bot-gm-second-replies" rows="3" aria-label="GM second replies, one per line"></textarea></label>
     </div></details>
     <details class="mb-alert-fold"><summary>Anti-bot check settings</summary><div class="mb-alert-fold-body"><label class="mb-toggle"><input type="checkbox" id="minibia-bot-antibot-close-window"><span>Close game window</span></label><div class="mb-small-note">Requires Anti-bot check. Turns off after triggering. Disconnects first; tab closing depends on browser permissions.</div><div class="mb-small-note" id="minibia-bot-antibot-last-xlog" hidden></div></div></details>
     <details class="mb-alert-fold">
@@ -62919,7 +63299,7 @@ function upgradeSectionHeaders(panel) {
     <div class="mb-cave-preset-row">
       <div class="mb-cave-preset-picker">
         <button type="button" class="mb-small-button mb-mobile-preset-arrow" id="minibia-bot-cave-preset-prev" title="Previous preset" aria-label="Previous cave preset">◀</button>
-        <select id="minibia-bot-cave-preset-select" aria-label="Cave preset"></select>
+        <select id="minibia-bot-cave-preset-select" aria-label="Shared Cave preset" title="Shared across all characters; edits update other open tabs"></select>
         <button type="button" class="mb-small-button mb-mobile-preset-arrow" id="minibia-bot-cave-preset-next" title="Next preset" aria-label="Next cave preset">▶</button>
       </div>
       <div class="mb-cave-preset-actions" role="group" aria-label="Preset tools">
@@ -63573,6 +63953,7 @@ function upgradeSectionHeaders(panel) {
         bot.smithing?.mount?.(panel);
         bot.cooking?.mount?.(panel);
         bot.observability?.mount?.(panel);
+        bot.storageManager?.mount?.(panel);
         bot.groundSpawnLogger?.mount?.(panel);
         bot.followingItemGuard?.mount?.(panel);
         bot.pauseHotkey?.mount?.(panel);
@@ -64049,7 +64430,7 @@ function upgradeSectionHeaders(panel) {
         const targetRulesHost=targetingPanel?.querySelector('[data-targeting-rules-host]');
         if(targetRulesHost&&!targetRulesHost.children.length)targetRulesHost.style.display='none';
         const interfacePanel=panel.querySelector('[data-tab-panel="ui"]');
-        const trackersPanel=makeLeaf('trackers'),namesPanel=makeLeaf('namespoofer');
+        const trackersPanel=makeLeaf('trackers');
         const trackerSection=interfacePanel?.querySelector('#minibia-bot-task-tracker-enabled')?.closest('.mb-section');
         const namesSection=interfacePanel?.querySelector('#minibia-bot-ui-name-spoofer-enabled')?.closest('.mb-section');
         const overlaySection=document.createElement('div');overlaySection.className='mb-section';
@@ -64062,7 +64443,7 @@ function upgradeSectionHeaders(panel) {
             if(note)overlaySection.querySelector('.mb-stack').appendChild(note);
         }
         if(trackerSection)trackersPanel.appendChild(trackerSection);
-        if(namesSection)namesPanel.appendChild(namesSection);
+        if(namesSection)shortcutsPanel.appendChild(namesSection);
         const followPanel=panel.querySelector('[data-tab-panel="utility"]');
         const followSection=panel.querySelector('#minibia-bot-follow-enabled')?.closest('.mb-section');
         if(followSection)followPanel.appendChild(followSection);
@@ -64101,7 +64482,7 @@ function upgradeSectionHeaders(panel) {
             {id:'utility',label:'Tools',tabs:[['utility','General'],['items','Items'],['ui','Interface'],['trackers','Trackers'],['combo','PVP']]},
             {id:'hunt',label:'Hunt',tabs:[['hunt','Hunt Analyzer']]},
             {id:'equipment',label:'Equipment',tabs:[['equipment','Equipment']]},
-            {id:'settings',label:'Settings',tabs:[['shortcuts','General'],['xray','X-Ray'],['profiles','Profiles'],['diagnostics','Diagnostics'],['namespoofer','Name Spoofer']]},
+            {id:'settings',label:'Settings',tabs:[['shortcuts','General'],['xray','X-Ray'],['profiles','Profiles'],['storage','Storage'],['diagnostics','Diagnostics']]},
         ];
         const tabContent=panel.querySelector('.mb-tab-content');
         const gmPanel=document.createElement('div');gmPanel.className='mb-tab-panel mb-alert-compact';gmPanel.dataset.tabPanel='gmprotection';
@@ -64115,6 +64496,7 @@ function upgradeSectionHeaders(panel) {
         function setActiveBotTab(tabId,selectGroup=false) {
             if(tabId==='autofollow')tabId='utility';
             if(tabId==='status')tabId='diagnostics';
+            if(tabId==='namespoofer')tabId='shortcuts';
             if(tabId==='antibot')tabId='gmprotection';
             if(tabId==='paladin')tabId='training';
             const leafGroup=botTabGroups.find(g=>g.tabs.some(([id])=>id===tabId));
@@ -64440,11 +64822,13 @@ function upgradeSectionHeaders(panel) {
 
         const gmRandomGreetings = panel.querySelector('#minibia-bot-gm-random-greetings');
         const gmGreetings = panel.querySelector('#minibia-bot-gm-greetings');
+        const gmSecondReplies = panel.querySelector('#minibia-bot-gm-second-replies');
         if (gmRandomGreetings) {
             gmRandomGreetings.checked = bot.gmChatMonitor?.config?.randomGreetings !== false;
             gmRandomGreetings.addEventListener('change',()=>{
                 bot.gmChatMonitor?.updateConfig?.({randomGreetings:gmRandomGreetings.checked});
                 if(gmGreetings)gmGreetings.disabled=!gmRandomGreetings.checked;
+                if(gmSecondReplies)gmSecondReplies.disabled=!gmRandomGreetings.checked;
             });
         }
         if (gmGreetings) {
@@ -64453,6 +64837,15 @@ function upgradeSectionHeaders(panel) {
             gmGreetings.addEventListener('change',()=>{
                 bot.gmChatMonitor?.updateConfig?.({greetings:gmGreetings.value});
                 gmGreetings.value=(bot.gmChatMonitor?.config?.greetings || []).join('\n');
+            });
+        }
+
+        if (gmSecondReplies) {
+            gmSecondReplies.value=(bot.gmChatMonitor?.config?.secondReplies || []).join('\n');
+            gmSecondReplies.disabled=gmRandomGreetings?.checked===false;
+            gmSecondReplies.addEventListener('change',()=>{
+                bot.gmChatMonitor?.updateConfig?.({secondReplies:gmSecondReplies.value});
+                gmSecondReplies.value=(bot.gmChatMonitor?.config?.secondReplies || []).join('\n');
             });
         }
 
@@ -65744,8 +66137,11 @@ function upgradeSectionHeaders(panel) {
 
                 try {
                     const result = await bot.profiles.importWaypointsFromFile(file);
+                    const importedName=result.importedNames?.[0];
+                    if(importedName)bot.cave.loadPreset(importedName);
+                    refreshCaveWaypointList();refreshCaveStatus();
                     if (routeImportStatus) {
-                        routeImportStatus.textContent = `Imported ${result.added} waypoint preset(s), skipped ${result.skipped} duplicate(s).`;
+                        routeImportStatus.textContent = `Imported ${result.added} preset(s)${importedName?' — opened '+importedName:''}${result.skipped?' · '+result.skipped+' already present':''}.`;
                     }
                     // Refresh cave UI to show new presets
                     if (typeof refreshCavePresetControls === "function") {
@@ -67745,6 +68141,7 @@ function upgradeSectionHeaders(panel) {
             noTargetDelay: panel.querySelector("#minibia-bot-panic-no-target-delay"),
             noTargetRepeat: panel.querySelector("#minibia-bot-panic-no-target-repeat"),
             lowCap: panel.querySelector("#minibia-bot-panic-low-cap-beep"),
+            outOfSoul: panel.querySelector("#minibia-bot-panic-out-of-soul-beep"),
             alphaMonster: panel.querySelector("#minibia-bot-panic-alpha-monster-beep"),
             lowCapThresh: panel.querySelector("#minibia-bot-panic-low-cap-threshold"),
             lowCapRepeat: panel.querySelector("#minibia-bot-panic-low-cap-repeat"),
@@ -67849,6 +68246,7 @@ function upgradeSectionHeaders(panel) {
                 audioIds.noTargetRepeat.value = Math.round((c.noTargetRepeatMs ?? 30000) / 1000);
             if (audioIds.alphaMonster && document.activeElement !== audioIds.alphaMonster)
                 audioIds.alphaMonster.checked = !!c.alphaMonsterBeep;
+            if (audioIds.outOfSoul && document.activeElement !== audioIds.outOfSoul) audioIds.outOfSoul.checked = !!c.outOfSoulBeep;
             if (audioIds.lowCap && document.activeElement !== audioIds.lowCap)
                 audioIds.lowCap.checked = !!c.lowCapBeep;
             if (audioIds.lowCapThresh && document.activeElement !== audioIds.lowCapThresh)
@@ -67864,6 +68262,7 @@ function upgradeSectionHeaders(panel) {
             ["manaFull", "manaFullBeep"],
             ["noTarget", "noTargetBeep"],
             ["lowCap", "lowCapBeep"],
+            ["outOfSoul", "outOfSoulBeep"],
             ["alphaMonster", "alphaMonsterBeep"],
         ];
         for (const [uiKey, cfgKey] of boolToggles) {
@@ -67914,7 +68313,7 @@ function upgradeSectionHeaders(panel) {
         for(const [id,sound]of [
             ['minibia-bot-panic-player-alert','player'],['minibia-bot-player-attack-alert','playerAttack'],['minibia-bot-message-alert','message'],
             ['minibia-bot-panic-target-death-beep','targetDeath'],['minibia-bot-panic-low-health-beep','lowHealth'],['minibia-bot-panic-mana-full-beep','manaFull'],
-            ['minibia-bot-panic-no-target-beep','noTarget'],['minibia-bot-panic-low-cap-beep','lowCap'],['minibia-bot-panic-alpha-monster-beep','alpha'],
+            ['minibia-bot-panic-out-of-soul-beep','outOfSoul'],['minibia-bot-panic-no-target-beep','noTarget'],['minibia-bot-panic-low-cap-beep','lowCap'],['minibia-bot-panic-alpha-monster-beep','alpha'],
             ['minibia-bot-antibot-enabled','antibot'],['minibia-bot-gm-chat-monitor','gm'],['minibia-bot-chancellor-alert','gm'],
             ['minibia-bot-antibot-creature-enabled','generic'],['minibia-bot-pink-skull-enabled','alarm'],
             ['minibia-bot-panic-unknown','alarm'],['minibia-bot-panic-health','alarm'],
@@ -69418,19 +69817,37 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
         Math.min(300000, Number(config.triggerCooldownMs) || 60000)
     );
 
-    function normalizeGreetings(value) {
-        const lines = Array.isArray(value) ? value : typeof value === 'string' ? value.split(/\r?\n/) : [];
-        const result = [...new Set(lines.map(line=>String(line||'').replace(/\s+/g,' ').trim().slice(0,120)).filter(Boolean))].slice(0,40);
-        return result.length ? result : [String(config.firstReplyText||'Hey :D'),'Hey!','Hi :)','Hello!','Hey there'];
+    const shortGreetings = ['hey :d','hey!','hi :)','hello!','hey','yo','hi','hey :)','hey :p','hey ^^','hey there','heya','hiya','hello','hello :)','hello :d','hi!','hi :d','hi ^^','yo!','yo :)','yo :d','sup','sup?','heyy','heyyy','hey hey','hiya :)','heya!','hello there'];
+    const shortSecondReplies = ['im here',':d','here :)','whats up?','sup','sup?','xd','here','yep','yup','yeah','yea','yep :)','yup :)','yeah :)','im here :)','here :d','im here :d',':)',':p',';)',';d','^^','^^?','xd?','xdd','hehe','haha','all good','all good :)','whats up','whats up :)','whatsup','whatsup?','yo?','hey?','yes?','yeah?','yep?','hm?','hmm?','oh hey','oh hi','oh :)','o/','hi :)'];
+    const shortReply = value => String(value||'').replace(/\s+/g,' ').trim().toLowerCase().slice(0,24).trim();
+    // Replace the earlier verbose defaults once, then retain edited lists.
+    if (config.shortReplyListsVersion !== 1) {
+        config.greetings = shortGreetings.slice(); config.secondReplies = shortSecondReplies.slice();
+        config.firstReplyText='hey :d';config.secondReplyText='im here';config.shortReplyListsVersion=1;
     }
+    function normalizeGreetings(value, second = false) {
+        const lines = Array.isArray(value) ? value : typeof value === 'string' ? value.split(/\r?\n/) : [];
+        const result = [...new Set(lines.map(shortReply).filter(Boolean))].slice(0,80);
+        return result.length ? result : (second ? shortSecondReplies : shortGreetings).slice();
+    }
+    config.firstReplyText=shortReply(config.firstReplyText)||'hey :d';
+    config.secondReplyText=shortReply(config.secondReplyText)||'im here';
     config.randomGreetings = config.randomGreetings !== false;
     config.greetings = normalizeGreetings(config.greetings);
-    let lastGreeting = null;
+    config.secondReplies = normalizeGreetings(config.secondReplies, true);
+    let lastGreeting = null, lastSecondReply = null;
+    function pickGmSecondReply(greeting) {
+        if (!config.randomGreetings) return shortReply(config.secondReplyText) || 'im here';
+        const pool = config.secondReplies.filter(line=>line!==lastSecondReply && line!==greeting);
+        const choices = pool.length ? pool : config.secondReplies;
+        const reply = choices[Math.floor(Math.random()*choices.length)] || shortReply(config.secondReplyText) || 'im here';
+        lastSecondReply = reply; return reply;
+    }
     function pickGmGreeting() {
-        if (!config.randomGreetings) return String(config.firstReplyText || 'Hey :D');
+        if (!config.randomGreetings) return shortReply(config.firstReplyText) || 'hey :d';
         const pool = config.greetings.filter(line=>line!==lastGreeting);
         const choices = pool.length ? pool : config.greetings;
-        const greeting = choices[Math.floor(Math.random()*choices.length)] || String(config.firstReplyText || 'Hey :D');
+        const greeting = choices[Math.floor(Math.random()*choices.length)] || shortReply(config.firstReplyText) || 'hey :d';
         lastGreeting = greeting;
         return greeting;
     }
@@ -69443,7 +69860,9 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
             secondReplyDelayMs: config.secondReplyDelayMs,
             firstReplyText: config.firstReplyText,
             randomGreetings: config.randomGreetings,
+            shortReplyListsVersion: config.shortReplyListsVersion,
             greetings: config.greetings.slice(),
+            secondReplies: config.secondReplies.slice(),
             secondReplyText: config.secondReplyText,
             triggerCooldownMs: config.triggerCooldownMs,
         });
@@ -69714,6 +70133,7 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
         clearReplyTimers();
         state.replyPairsScheduled++;
         const greeting = pickGmGreeting();
+        const secondReply = pickGmSecondReply(greeting);
 
         const firstDelay = Math.max(
             250,
@@ -69753,10 +70173,7 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
                     );
 
                 sendGmAutoReply(
-                    String(
-                        config.secondReplyText ||
-                            "i am here"
-                    ),
+                    secondReply,
                     "second"
                 );
             }, secondGap);
@@ -70166,12 +70583,13 @@ window.__minibiaBotBundle.installGmChatMonitorModule = function installGmChatMon
             )
         );
         config.firstReplyText =
-            String(config.firstReplyText || "Hey :D");
+            shortReply(config.firstReplyText) || "hey :d";
         config.secondReplyText =
-            String(config.secondReplyText || "i am here");
+            shortReply(config.secondReplyText) || "im here";
 
         config.randomGreetings = config.randomGreetings !== false;
         config.greetings = normalizeGreetings(config.greetings);
+        config.secondReplies = normalizeGreetings(config.secondReplies, true);
         persistConfig();
 
         if (
@@ -71721,6 +72139,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
             return key;
         if (!key.startsWith(BASE_PREFIX))
             return key;
+        if (key === 'minibiaBot.cave.presets') return 'minibiaBot.char.__shared__.cave.presets';
         if (GLOBAL_KEYS.has(key))
             return key;
         if (key.startsWith(CHAR_PREFIX))
@@ -71738,30 +72157,80 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
             window.__minibiaBotCurrentCharacter = characterName;
         }
 
-        if (window.__minibiaBotStoragePatched)
+        if (window.__minibiaBotStoragePatched && window.__minibiaBotStorageVersion === 409)
             return;
 
         const origGet = Storage.prototype.getItem;
         const origSet = Storage.prototype.setItem;
         const origRemove = Storage.prototype.removeItem;
-
+        // Preserve unsaved settings across mb0t reinjection (not a page refresh).
+        const pending = window.__minibiaBotUnsavedStorage || (window.__minibiaBotUnsavedStorage = new Map());
+        let retryAt=0,lastWarning=null;
+        const quotaError=error=>error?.name==='QuotaExceededError'||error?.name==='NS_ERROR_DOM_QUOTA_REACHED'||error?.code===22||error?.code===1014;
+        function reclaimDuplicateRoute(key) {
+            if(!String(key).endsWith('.cave.presets'))return;
+            const prefix=String(key).slice(0,-'presets'.length);
+            try {
+                const presets=JSON.parse(origGet.call(window.localStorage,key)||'null');
+                if(!Array.isArray(presets)||!presets.length)return;
+                for(const [suffix,field]of [['route','route'],['transitions','transitions']]){
+                    const mirrorKey=prefix+suffix,raw=origGet.call(window.localStorage,mirrorKey);
+                    if(raw==null)continue;
+                    const data=JSON.parse(raw);
+                    if(Array.isArray(data)&&presets.some(p=>Array.isArray(p?.[field])&&JSON.stringify(p[field])===JSON.stringify(data)))
+                        origRemove.call(window.localStorage,mirrorKey);
+                }
+            }catch(_){}
+        }
+        function warnStorageFull() {
+            const now=Date.now();if(lastWarning!==null&&now-lastWarning<60000)return;lastWarning=now;
+            const message='Browser storage is full. Unsaved changes are kept in memory. Export your route/settings before refreshing; remove unused profiles to free space.';
+            console.warn('[mbot]',message);
+            window.minibiaBot?.showPanelNotification?.('STORAGE FULL',message,'storage-full',15000);
+        }
+        function scheduleStorageRetry() {
+            if(window.__minibiaBotStorageRetryTimer!=null || !pending.size)return;
+            window.__minibiaBotStorageRetryTimer=setTimeout(()=>{
+                window.__minibiaBotStorageRetryTimer=null;
+                for(const [key,value]of pending){
+                    try{reclaimDuplicateRoute(key);origSet.call(window.localStorage,key,value);pending.delete(key);}
+                    catch(error){if(quotaError(error)){retryAt=Date.now()+30000;break;}console.warn('[mbot] Storage retry failed',error?.message);break;}
+                }
+                if(pending.size)scheduleStorageRetry();
+            },30000);
+        }
         Storage.prototype.getItem = function (key) {
-            if (this === window.localStorage)
+            if (this === window.localStorage) {
                 key = scopedKey(key);
+                if(pending.has(key))return pending.get(key);
+            }
             return origGet.call(this, key);
         };
         Storage.prototype.setItem = function (key, value) {
-            if (this === window.localStorage)
-                key = scopedKey(key);
-            return origSet.call(this, key, value);
+            if (this !== window.localStorage) return origSet.call(this,key,value);
+            key=scopedKey(key);value=String(value);
+            if(!String(key).startsWith(BASE_PREFIX))return origSet.call(this,key,value);
+            if(pending.size && Date.now()<retryAt){pending.set(key,value);warnStorageFull();scheduleStorageRetry();return;}
+            try {
+                if(origGet.call(this,key)!==value)origSet.call(this,key,value);
+                pending.delete(key);
+            } catch(error) {
+                if(!quotaError(error))throw error;
+                reclaimDuplicateRoute(key);
+                try {origSet.call(this,key,value);pending.delete(key);}
+                catch(retryError){
+                    if(!quotaError(retryError))throw retryError;
+                    pending.set(key,value);retryAt=Date.now()+30000;warnStorageFull();scheduleStorageRetry();
+                }
+            }
         };
         Storage.prototype.removeItem = function (key) {
-            if (this === window.localStorage)
-                key = scopedKey(key);
+            if (this === window.localStorage) {key=scopedKey(key);pending.delete(key);}
             return origRemove.call(this, key);
         };
 
         window.__minibiaBotStoragePatched = true;
+        window.__minibiaBotStorageVersion = 409;
         console.log("[minibia-bot] Character-scoped storage installed for:", characterName || "(global)");
     }
 
@@ -71955,6 +72424,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         currentBundle.installPinkSkullDetectorModule(bot);
         currentBundle.installChancellorAlertModule(bot);
         currentBundle.installProfileModule(bot);
+        currentBundle.installStorageManagerModule(bot);
         currentBundle.installAntiAfkModule(bot);
         currentBundle.installFisherModule(bot);
         currentBundle.installItemDropperModule(bot);
