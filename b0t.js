@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.494",
+        version: "1.6.495",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -6440,13 +6440,34 @@ window.__minibiaBotBundle.installSidebarDropGuardModule = function installSideba
         const manager=window.gameClient?.interface?.windowManager;
         if(!active()||!manager?.state?.currentDragElement)return;
         const el=event.target?.nodeType===1?event.target:event.target?.parentElement;
+        // A wide map crosses two DOM stacks. Resolve the bag's destination
+        // by the pointer's column, rather than the map/spacer under it.
+        const map=document.querySelector('.mb-hud-window[data-mb-hud="minimap"]');
+        const mapRect=map?.getBoundingClientRect(),mapWrap=map?.closest('.oogwrap');
+        const wrapRect=mapWrap?.getBoundingClientRect();
+        if(mapRect&&wrapRect&&mapRect.width>wrapRect.width*1.5&&event.clientY>=mapRect.bottom-2){
+            const side=bot.sidebarPanels?.config.minimap?.startsWith('left')?'left':'right';
+            const panel=(bot.extraSidebars?.getPanels?.()||[]).find(p=>{
+                if(!p.id.startsWith(side))return false;const rect=p.column.closest('.oogwrap')?.getBoundingClientRect();
+                return rect&&event.clientX>=rect.left&&event.clientX<rect.right&&event.clientY<=rect.bottom;
+            });
+            if(panel){
+                event.preventDefault();event.stopImmediatePropagation();const moving=manager.state.currentDragElement;
+                if(moving===map)return;
+                const before=Array.from(panel.column.children).find(node=>node!==moving&&node!==map&&!node.hasAttribute('data-mb-map-spacer')&&event.clientY<node.getBoundingClientRect().top+node.getBoundingClientRect().height/2);
+                if(moving.parentElement!==panel.column||moving.nextElementSibling!==(before||null)){
+                    panel.column.insertBefore(moving,before||null);manager.saveLayout?.();manager.saveContainerGeometry?.();
+                }
+                return;
+            }
+        }
         const wrap=el?.closest?.('.oogwrap');if(!wrap)return;
         const column=el.closest('.column')||Array.from(wrap.children).find(e=>e.className==='column');
         // Always stop native bubbling here: without a column ancestor its
         // swap loop can reach the outer sidebar and move it into the game row.
         event.preventDefault();event.stopImmediatePropagation();
         if(!column)return;
-        const target=el.closest('.column')?el:column;
+        const target=el.closest('[data-mb-map-spacer]')?column:el.closest('.column')?el:column;
         manager.__handleWindowDrop?.({target});
     }
     function repair(){
