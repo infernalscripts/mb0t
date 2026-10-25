@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.509",
+        version: "1.6.513",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -6475,21 +6475,25 @@ window.__minibiaBotBundle.installBotSidebarModule = function installBotSidebarMo
 
 window.__minibiaBotBundle.installBackpackSizingModule = function installBackpackSizingModule(bot){
     let disposed=false;const owned=new Map();
-    const active=()=>document.body.classList.contains('mb-six-slot-rows')&&!window.gameClient?.touch?.isMobileMode;
+    const active=()=>document.body.classList.contains('mb-custom-sidebar-width')&&bot.interfaceLayout?.config.enabled!==false&&!window.gameClient?.touch?.isMobileMode;
     function restore(){for(const [body,original] of owned){for(const [p,v] of original)if(v)body.style.setProperty(p,v);else body.style.removeProperty(p);}owned.clear();}
     function size(container,event){
         const body=container?.window?.getElement?.('.body');if(!body||window.getComputedStyle(body).display==='none')return;
         const count=Number(container.size);if(!(count>0))return;
-        if(!owned.has(body))owned.set(body,['min-height','max-height'].map(p=>[p,body.style.getPropertyValue(p)]));
+        if(!owned.has(body))owned.set(body,['height','min-height','max-height'].map(p=>[p,body.style.getPropertyValue(p)]));
         // Border-box body: 34px slot, 2px between rows, 2px padding each end.
-        const fullRows=Math.max(1,Math.ceil(count/6));
-        const rowsHeight=rows=>rows*36+2;
-        const available=Math.max(38,Math.min(Math.floor(window.innerHeight*.33),window.innerHeight-body.getBoundingClientRect().top-20));
-        const maxRows=Math.max(1,Math.min(fullRows,Math.floor((available-2)/36)));
-        body.style.setProperty('min-height','38px');body.style.setProperty('max-height',rowsHeight(maxRows)+'px');
+        const columns=document.body.classList.contains('mb-six-slot-rows')?6:5;
+        const fullRows=Math.max(1,Math.ceil(count/columns));
+        const css=window.getComputedStyle(body);
+        const border=(parseFloat(css.borderTopWidth)||0)+(parseFloat(css.borderBottomWidth)||0);
+        const extra=2+border;
+        const rowsHeight=rows=>rows*36+extra;
+        const available=Math.max(rowsHeight(1),window.innerHeight-body.getBoundingClientRect().top-20);
+        const maxRows=Math.max(1,Math.min(fullRows,Math.floor((available-extra)/36)));
+        body.style.setProperty('min-height',rowsHeight(1)+'px');body.style.setProperty('max-height',rowsHeight(maxRows)+'px');
         const current=Number.parseFloat(body.style.height)||body.getBoundingClientRect().height;
         const desired=event?event.clientY-body.getBoundingClientRect().top-12:current;
-        const rows=Math.max(1,Math.min(maxRows,Math.round((desired-2)/36)));
+        const rows=Math.max(1,Math.min(maxRows,Math.round((desired-extra)/36)));
         body.style.height=rowsHeight(rows)+'px';
     }
     function sync(event){
@@ -70477,6 +70481,12 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
         hideLootMessages: false,
     }, bot.storage.get(configStorageKey, {}));
     const bagStyle=document.createElement('style');bagStyle.textContent=`
+body.mb-custom-sidebar-width:not(.mb-six-slot-rows):not(.force-mobile) #game-wrapper .oogwrap:not([data-mb-empty-sidebar]){width:var(--mb-sidebar-width,216px)!important;min-width:var(--mb-sidebar-width,216px)!important;max-width:var(--mb-sidebar-width,216px)!important;flex:0 0 var(--mb-sidebar-width,216px)!important;box-sizing:border-box;}
+body.mb-custom-sidebar-width:not(.force-mobile) #game-wrapper .column{min-width:0;max-width:100%;box-sizing:border-box;}
+body.mb-custom-sidebar-width:not(.mb-six-slot-rows):not(.force-mobile) .column .window[containerIndex]>.body:not([style*="display: none"]):not([style*="display:none"]){display:grid!important;grid-template-columns:repeat(5,minmax(0,34px))!important;gap:2px!important;justify-content:center!important;align-content:start!important;padding:2px!important;box-sizing:border-box!important;overflow-x:hidden!important;scrollbar-width:thin;}
+
+
+body.mb-custom-sidebar-width:not(.mb-six-slot-rows):not(.force-mobile) .column .window[containerIndex]>.body>.slot{width:100%!important;max-width:34px!important;height:34px!important;min-width:0!important;padding:0!important;margin:0!important;box-sizing:border-box!important;}
 body.mb-six-slot-rows:not(.force-mobile) #game-wrapper .oogwrap:not([data-mb-empty-sidebar]){width:228px!important;min-width:228px!important;max-width:228px!important;flex:0 0 228px!important;box-sizing:border-box;}
 body.mb-six-slot-rows:not(.force-mobile) #game-wrapper .column{width:100%!important;box-sizing:border-box;}
 body.mb-six-slot-rows:not(.force-mobile) .column .window[containerIndex]>.body:not([style*="display: none"]):not([style*="display:none"]){display:grid!important;grid-template-columns:repeat(6,minmax(0,34px))!important;gap:2px!important;overflow-x:hidden!important;scrollbar-width:thin;justify-content:start;padding:2px!important;box-sizing:border-box;}
@@ -70958,6 +70968,10 @@ body.mb-full-width-minimap:not(.force-mobile) #minimap-container .crosshair{
     }
 
     function applyStyles() {
+        const customDesktop=bot.interfaceLayout?.config.enabled!==false&&!window.gameClient?.touch?.isMobileMode;
+        document.body.classList.toggle('mb-custom-sidebar-width',customDesktop);
+        if(customDesktop)document.body.style.setProperty('--mb-sidebar-width',config.wideColumns?'224px':'216px');
+        else document.body.style.removeProperty('--mb-sidebar-width');
         document.body.classList.toggle("mb-six-slot-rows",config.sixSlotRows!==false&&bot.interfaceLayout?.config.enabled!==false&&!window.gameClient?.touch?.isMobileMode);
         document.body.classList.toggle("mb-full-width-minimap",config.fullWidthMinimap===true&&bot.interfaceLayout?.config.enabled!==false&&!window.gameClient?.touch?.isMobileMode);
         const columns = document.querySelectorAll("#game-wrapper .column");
@@ -70966,6 +70980,7 @@ body.mb-full-width-minimap:not(.force-mobile) #minimap-container .crosshair{
             if(bot.interfaceLayout?.config.enabled===false)col.style.removeProperty('width');else col.style.width = newWidth;
         });
 
+        bot.sidebarPanels?.sync?.();
         applyNameSpoof();
         applyFloatingTextPatch();
         applyTTL();
@@ -71112,7 +71127,7 @@ function bindControls(panel) {
     // ---- Cleanup on bot destroy ----
     bot.addCleanup(() => {
         uiTweaksDestroyed = true;
-        bagStyle.remove();document.body.classList.remove("mb-six-slot-rows");
+        bagStyle.remove();document.body.classList.remove("mb-six-slot-rows","mb-custom-sidebar-width");document.body.style.removeProperty('--mb-sidebar-width');
         minimapStyle.remove();document.body.classList.remove("mb-full-width-minimap");
         for (const timer of [nameSpoofRetryTimer, floatingTextRetryTimer, nameplateRefreshTimer]) {
             if (timer != null) clearTimeout(timer);
