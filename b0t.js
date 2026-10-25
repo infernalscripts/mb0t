@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.486",
+        version: "1.6.488",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -6010,7 +6010,13 @@ window.__minibiaBotBundle.installSidebarPanelsModule = function installSidebarPa
     // Native .window/.header/.title/.body styles supply the same visual
     // treatment as backpacks and Battle; only size constraints are local.
     const style=document.createElement('style');style.textContent=`
-.window.mb-hud-window{display:flex;flex:0 0 auto;min-width:0;max-width:100%;width:100%;box-sizing:border-box;}
+.window.mb-hud-window{display:flex;flex:0 0 auto;min-width:0!important;max-width:100%!important;width:100%!important;align-self:stretch;box-sizing:border-box!important;}
+#game-wrapper .oogwrap2:has(.mb-hud-window){width:100%!important;min-width:0!important;max-width:100%!important;box-sizing:border-box!important;}
+#game-wrapper .oogwrap2>.equipment-options-wrapper:has(>.mb-hud-window){
+ display:flex!important;flex-direction:column!important;align-items:stretch!important;
+ width:100%!important;min-width:0!important;max-width:100%!important;
+ margin:0!important;padding:0!important;box-sizing:border-box!important;
+}
 .window.mb-hud-window>.header>.title{pointer-events:none;}
 .window.mb-hud-window.mb-hud-minimized>.body{display:none!important;}
 .window.mb-hud-window>.mb-hud-body{min-width:0;max-width:100%;box-sizing:border-box;}
@@ -6356,6 +6362,40 @@ window.__minibiaBotBundle.installBotSidebarModule = function installBotSidebarMo
     function poll(){const panel=document.getElementById('minibia-bot-panel');if(observer?.panel!==panel){observer?.disconnect();observer=null;if(panel){observer=new MutationObserver(sync);observer.panel=panel;observer.observe(panel,{attributes:true,attributeFilter:['data-collapsed','style']});}}sync();}
     bot.botSidebar={config,mount,sync,restore};const timer=setInterval(poll,500);poll();
     bot.addCleanup(()=>{disposed=true;clearInterval(timer);observer?.disconnect();restore();style.remove();});
+};
+
+window.__minibiaBotBundle.installBackpackSizingModule = function installBackpackSizingModule(bot){
+    let disposed=false;const owned=new Map();
+    const active=()=>document.body.classList.contains('mb-six-slot-rows')&&!window.gameClient?.touch?.isMobileMode;
+    function restore(){for(const [body,original] of owned){for(const [p,v] of original)if(v)body.style.setProperty(p,v);else body.style.removeProperty(p);}owned.clear();}
+    function size(container,event){
+        const body=container?.window?.getElement?.('.body');if(!body||window.getComputedStyle(body).display==='none')return;
+        const count=Number(container.size);if(!(count>0))return;
+        if(!owned.has(body))owned.set(body,['min-height','max-height'].map(p=>[p,body.style.getPropertyValue(p)]));
+        // Border-box body: 34px slot, 2px between rows, 2px padding each end.
+        const fullRows=Math.max(1,Math.ceil(count/6));
+        const rowsHeight=rows=>rows*36+2;
+        const available=Math.max(38,Math.min(Math.floor(window.innerHeight*.33),window.innerHeight-body.getBoundingClientRect().top-20));
+        const maxRows=Math.max(1,Math.min(fullRows,Math.floor((available-2)/36)));
+        body.style.setProperty('min-height','38px');body.style.setProperty('max-height',rowsHeight(maxRows)+'px');
+        const current=Number.parseFloat(body.style.height)||body.getBoundingClientRect().height;
+        const desired=event?event.clientY-body.getBoundingClientRect().top-12:current;
+        const rows=Math.max(1,Math.min(maxRows,Math.round((desired-2)/36)));
+        body.style.height=rowsHeight(rows)+'px';
+    }
+    function sync(event){
+        if(disposed)return;
+        if(!active()){if(owned.size)restore();return;}
+        const client=window.gameClient,containers=client?.player?.__openedContainers||[];
+        const resizing=client?.interface?.windowManager?.state?.currentMouseElement;
+        for(const c of containers)size(c,event&&resizing===c.window?event:null);
+        for(const body of owned.keys())if(!body.isConnected)owned.delete(body);
+    }
+    // Registered after the game's mouse listener: correct its legacy row clamp
+    // before paint and before mouseup snapshots the container height.
+    const onMove=e=>{if(window.gameClient?.interface?.windowManager?.state?.currentMouseElement)sync(e);};
+    document.addEventListener('mousemove',onMove);const timer=setInterval(sync,500);
+    bot.addCleanup(()=>{disposed=true;clearInterval(timer);document.removeEventListener('mousemove',onMove);restore();});
 };
 
 window.__minibiaBotBundle.installTabTitleModule = function installTabTitleModule(bot) {
@@ -73989,6 +74029,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         currentBundle.installHotbarDockModule(bot);
         currentBundle.installExtraHotbarsModule(bot);
         currentBundle.installBotSidebarModule(bot);
+        currentBundle.installBackpackSizingModule(bot);
         currentBundle.installTabTitleModule(bot);
         currentBundle.installPzModule(bot);
         currentBundle.installXrayModule(bot);
