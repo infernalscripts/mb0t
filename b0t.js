@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.505",
+        version: "1.6.506",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -6023,6 +6023,8 @@ window.__minibiaBotBundle.installSidebarPanelsModule = function installSidebarPa
 .mb-map-span-overflow{overflow:visible!important;}
 .window.mb-hud-window{display:flex;flex:0 0 auto;min-width:0!important;max-width:100%!important;width:100%!important;align-self:stretch;box-sizing:border-box!important;}
 #game-wrapper .oogwrap2:has(.mb-hud-window){width:100%!important;min-width:0!important;max-width:100%!important;box-sizing:border-box!important;}
+#game-wrapper .oogwrap2:has(.mb-hud-window){height:auto!important;min-height:0!important;flex:0 0 auto!important;margin:0!important;padding:0!important;gap:0!important;}
+#game-wrapper .oogwrap2>.equipment-options-wrapper[data-mb-empty-equipment-home]{display:none!important;}
 #game-wrapper .oogwrap2>.equipment-options-wrapper:has(>.mb-hud-window){
  display:flex!important;flex-direction:column!important;align-items:stretch!important;
  width:100%!important;min-width:0!important;max-width:100%!important;
@@ -6171,6 +6173,7 @@ window.__minibiaBotBundle.installSidebarPanelsModule = function installSidebarPa
     function restore(){
         clearMapSpan();
         for(const wrap of collapsed){wrap.removeAttribute("data-mb-empty-sidebar");wrap.removeAttribute("data-mb-empty-top");}collapsed.clear();
+        document.querySelectorAll('[data-mb-empty-equipment-home]').forEach(el=>el.removeAttribute('data-mb-empty-equipment-home'));
         for(const r of owned.values()){
             if(r.keyHome?.parentNode)r.keyHome.parentNode.insertBefore(r.keyButton,r.keyHome);
             r.keyWrapper?.removeAttribute('data-mb-key-placeholder');r.soulBox?.remove();
@@ -6247,6 +6250,9 @@ window.__minibiaBotBundle.installSidebarPanelsModule = function installSidebarPa
         }
         const mr=owned.get('minimap');if(mr){applyMapSpan(mr,available);updateMapSize(mr);}
         collapseEmptyRight(available);
+        // Empty home sections can move the neighbouring stack's top edge.
+        // Measure spanning-map reservation again after that layout change.
+        if(mr)updateMapSize(mr);
         for(const render of views)render(available);
     }
     function collapseEmptyRight(available){
@@ -6272,6 +6278,12 @@ window.__minibiaBotBundle.installSidebarPanelsModule = function installSidebarPa
                 }
                 return true;
             });
+            for(const home of Array.from(top.children).filter(el=>el.classList.contains('equipment-options-wrapper'))){
+                const used=candidates.some(el=>home.contains(el));
+                const wasEmpty=home.hasAttribute('data-mb-empty-equipment-home');
+                home.toggleAttribute('data-mb-empty-equipment-home',!used);
+                if(wasEmpty===used)topChanged=true;
+            }
             const wasHidden=top.hasAttribute('data-mb-empty-top');
             if(occupied){top.removeAttribute('data-mb-empty-top');collapsed.delete(top);}
             else{top.setAttribute('data-mb-empty-top','');collapsed.add(top);}
@@ -6351,16 +6363,40 @@ window.__minibiaBotBundle.installSidebarPanelsModule = function installSidebarPa
             const tile={canvas:scratch,context,clear(){context.clearRect(0,0,160,160);}};
             b.render=function(chunks,skipMarker){
                 const originalCanvas=this.minimap,center=this.center,zoom=1<<this.__zoomLevel,H=canvas.height,W=canvas.width;
+                const partyDraw=this.__drawPartyMembers,hadOwnParty=Object.prototype.hasOwnProperty.call(this,'__drawPartyMembers');
                 context.imageSmoothingEnabled=false;
                 originalCanvas.context.save();originalCanvas.context.imageSmoothingEnabled=false;originalCanvas.context.globalCompositeOperation="source-over";originalCanvas.context.clearRect(0,0,canvas.width,H);
                 try{
                     this.minimap=tile;
+                    this.__drawPartyMembers=()=>{};
                     for(let top=0;top<H;top+=160)for(let left=0;left<W;left+=160){
                         this.center=Object.assign(Object.create(Object.getPrototypeOf(center)),center,{x:center.x+(left+80-W/2)/zoom,y:center.y+(top+80-H/2)/zoom});
                         b.original.render.call(this,chunks,skipMarker);
                         const rows=Math.min(160,H-top),cols=Math.min(160,W-left);originalCanvas.context.drawImage(scratch,0,0,cols,rows,left,top,cols,rows);
                     }
-                }finally{this.minimap=originalCanvas;this.center=center;originalCanvas.context.restore();}
+                }finally{
+                    this.minimap=originalCanvas;this.center=center;
+                    if(hadOwnParty)this.__drawPartyMembers=partyDraw;else delete this.__drawPartyMembers;
+                    originalCanvas.context.restore();
+                }
+                // Native party dots clamp to a 160px square. Draw once using
+                // the full viewport instead of repeating at every strip edge.
+                const client=window.gameClient,positions=client?.__partyPositions,p=client?.player?.getPosition?.();
+                if(!p||!positions?.length||(client.__partyPositionsAt&&Date.now()-client.__partyPositionsAt>6000))return;
+                const ctx=originalCanvas.context;ctx.save();
+                try{
+                    ctx.globalCompositeOperation='source-over';
+                    for(const m of positions){
+                        const x=W/2+(m.x-p.x-center.x)*zoom,y=H/2+(m.y-p.y-center.y)*zoom;
+                        const cx=Math.max(6,Math.min(W-6,x)),cy=Math.max(6,Math.min(H-6,y)),edged=cx!==x||cy!==y,same=m.z===this.__renderLayer;
+                        ctx.beginPath();ctx.arc(cx,cy,3.5,0,2*Math.PI);
+                        ctx.fillStyle=same?'#33ccff':'rgba(51,204,255,0.35)';ctx.fill();
+                        ctx.lineWidth=1;ctx.strokeStyle=edged?'#ffffff':'#0a3a4a';ctx.stroke();
+                        if(!same){ctx.fillStyle='#ffffff';ctx.font='8px sans-serif';ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillText(m.z<this.__renderLayer?'▲':'▼',cx,cy);}
+                        const name=String(m.name||'').split(' ')[0].slice(0,10);
+                        if(typeof Minimap!=='undefined'&&typeof Minimap.drawMapLabel==='function')Minimap.drawMapLabel(ctx,name,cx,cy-12,{font:'bold 9px sans-serif',align:'center',color:'#cdeeff'});
+                    }
+                }finally{ctx.restore();}
             };
             b.cache=function(){
                 const client=window.gameClient,p=client?.player?.getPosition?.();if(!p)return;
