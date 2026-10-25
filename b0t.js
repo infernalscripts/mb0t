@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.496",
+        version: "1.6.498",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -6029,9 +6029,9 @@ window.__minibiaBotBundle.installSidebarPanelsModule = function installSidebarPa
  margin:0!important;padding:0!important;box-sizing:border-box!important;
 }
 .window.mb-hud-window>.header>.title{pointer-events:none;}
-#game-wrapper .window.mb-hud-window.mb-hud-minimized>.body{display:none!important;}
+.window.mb-hud-window.mb-hud-minimized>.body{display:none!important;}
 .window.mb-hud-window>.mb-hud-body{min-width:0;max-width:100%;box-sizing:border-box;}
-.window.mb-hud-window[data-mb-hud="equipment"]>.body.equipment-options-wrapper{
+.window.mb-hud-window[data-mb-hud="equipment"]:not(.mb-hud-minimized)>.body.equipment-options-wrapper{
  display:flex!important;flex-direction:row!important;flex-wrap:nowrap!important;align-items:flex-start!important;
  justify-content:center!important;gap:8px!important;width:100%!important;min-width:0!important;
  margin:0!important;padding:3px 6px 6px!important;flex:0 0 auto!important;overflow:visible!important;
@@ -6153,7 +6153,7 @@ window.__minibiaBotBundle.installSidebarPanelsModule = function installSidebarPa
         const shell=document.createElement('div');shell.className='window mb-hud-window';shell.setAttribute('data-mb-hud',name);shell.draggable=true;
         const header=document.createElement('div');header.className='header';header.title='Drag to a sidebar or between backpacks';
         const minimize=document.createElement('button');minimize.type='button';minimize.className='symbol-button small';minimize.textContent='−';minimize.title='Minimize';minimize.draggable=false;
-        const title=document.createElement('span');title.className='title';title.textContent=name==='minimap'?'Minimap':name==='vitals'?'Health & mana':'Equipment';header.append(minimize,title);
+        const title=document.createElement('span');title.className='title';title.textContent=name==='minimap'?'Minimap':name==='vitals'?'Health & Mana':'Equipment';header.append(minimize,title);
         const body=document.createElement('div');body.className='body mb-hud-body'+(name==='equipment'?' equipment-options-wrapper':'');shell.append(header,body);
         minimize.addEventListener('click',event=>{event.stopPropagation();const hidden=body.style.display==='none';body.style.display=hidden?'':'none';shell.classList.toggle('mb-hud-minimized',!hidden);minimize.textContent=hidden?'−':'+';});
         const nodes=elements.map(el=>{const home=document.createComment('mb0t '+name+' home');el.parentNode.insertBefore(home,el);return {el,home};});
@@ -6260,7 +6260,7 @@ window.__minibiaBotBundle.installSidebarPanelsModule = function installSidebarPa
     function updateConfig(next){for(const name of ['vitals','equipment','minimap'])if(name in next){config[name]=valid(next[name]);delete config.orders[name];}persist();sync();window.dispatchEvent(new Event('resize'));}
     function mount(parent){if(!parent||parent.querySelector('[data-sidebar-panels]'))return;
         const section=document.createElement('div');section.className='mb-section';section.setAttribute('data-sidebar-panels','');
-        section.innerHTML='<div class="mb-section-title"><span class="mb-title-text">▥ Side panels</span></div><div class="mb-alert-grid"><label class="mb-field"><span class="mb-field-label">Health &amp; mana</span><select data-panel="vitals"></select></label><label class="mb-field"><span class="mb-field-label">Equipment</span><select data-panel="equipment"></select></label><label class="mb-field"><span class="mb-field-label">Minimap</span><select data-panel="minimap"></select></label></div>';
+        section.innerHTML='<div class="mb-section-title"><span class="mb-title-text">▥ Side panels</span></div><div class="mb-alert-grid"><label class="mb-field"><span class="mb-field-label">Health &amp; Mana</span><select data-panel="vitals"></select></label><label class="mb-field"><span class="mb-field-label">Equipment</span><select data-panel="equipment"></select></label><label class="mb-field"><span class="mb-field-label">Minimap</span><select data-panel="minimap"></select></label></div>';
         for(const name of ['vitals','equipment','minimap']){
             const select=section.querySelector('[data-panel="'+name+'"]');let signature='';
             views.add(panels=>{
