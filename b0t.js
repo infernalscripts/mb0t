@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.490",
+        version: "1.6.491",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -6397,6 +6397,34 @@ window.__minibiaBotBundle.installBackpackSizingModule = function installBackpack
     const onMove=e=>{if(window.gameClient?.interface?.windowManager?.state?.currentMouseElement)sync(e);};
     document.addEventListener('mousemove',onMove);const timer=setInterval(sync,500);
     bot.addCleanup(()=>{disposed=true;clearInterval(timer);document.removeEventListener('mousemove',onMove);restore();});
+};
+
+window.__minibiaBotBundle.installSidebarDropGuardModule = function installSidebarDropGuardModule(bot){
+    const active=()=>bot.interfaceLayout?.config.enabled!==false&&!window.gameClient?.touch?.isMobileMode;
+    function dragover(event){
+        const manager=window.gameClient?.interface?.windowManager;
+        if(!active()||!manager?.state?.currentDragElement)return;
+        const el=event.target?.nodeType===1?event.target:event.target?.parentElement;
+        const wrap=el?.closest?.('.oogwrap');if(!wrap)return;
+        const column=el.closest('.column')||Array.from(wrap.children).find(e=>e.className==='column');
+        // Always stop native bubbling here: without a column ancestor its
+        // swap loop can reach the outer sidebar and move it into the game row.
+        event.preventDefault();event.stopImmediatePropagation();
+        if(!column)return;
+        const target=el.closest('.column')?el:column;
+        manager.__handleWindowDrop?.({target});
+    }
+    function repair(){
+        if(!active())return;const client=window.gameClient,panels=bot.extraSidebars?.getPanels?.()||[];
+        for(const c of client?.player?.__openedContainers||[]){
+            const el=c?.window?.__element;if(!el?.isConnected||el.parentElement?.className==='column')continue;
+            const parentWrap=el.closest('.oogwrap');
+            const target=panels.find(p=>p.column.parentElement===parentWrap)||panels.find(p=>p.id==='right');
+            if(target)target.column.appendChild(el);
+        }
+    }
+    document.addEventListener('dragover',dragover,true);const timer=setInterval(repair,500);repair();
+    bot.addCleanup(()=>{clearInterval(timer);document.removeEventListener('dragover',dragover,true);});
 };
 
 window.__minibiaBotBundle.installTabTitleModule = function installTabTitleModule(bot) {
@@ -70228,8 +70256,9 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
     const bagStyle=document.createElement('style');bagStyle.textContent=`
 body.mb-six-slot-rows:not(.force-mobile) #game-wrapper .oogwrap:not([data-mb-empty-sidebar]){width:228px!important;min-width:228px!important;max-width:228px!important;flex:0 0 228px!important;box-sizing:border-box;}
 body.mb-six-slot-rows:not(.force-mobile) #game-wrapper .column{width:100%!important;box-sizing:border-box;}
-body.mb-six-slot-rows:not(.force-mobile) .column .window[containerIndex]>.body:not([style*="display: none"]):not([style*="display:none"]){display:grid!important;grid-template-columns:repeat(6,34px)!important;gap:2px!important;justify-content:start;padding:2px!important;box-sizing:border-box;}
-body.mb-six-slot-rows:not(.force-mobile) .column .window[containerIndex]>.body>.slot{width:34px!important;height:34px!important;min-width:0!important;padding:0!important;margin:0!important;box-sizing:border-box!important;}
+body.mb-six-slot-rows:not(.force-mobile) .column .window[containerIndex]>.body:not([style*="display: none"]):not([style*="display:none"]){display:grid!important;grid-template-columns:repeat(6,minmax(0,34px))!important;gap:2px!important;overflow-x:hidden!important;scrollbar-width:thin;justify-content:start;padding:2px!important;box-sizing:border-box;}
+body.mb-six-slot-rows:not(.force-mobile) .column .window[containerIndex]>.body>.slot{width:100%!important;max-width:34px!important;height:34px!important;min-width:0!important;padding:0!important;margin:0!important;box-sizing:border-box!important;}
+body.mb-six-slot-rows:not(.force-mobile) .column .window[containerIndex]>.body::-webkit-scrollbar{width:8px;height:0;}
 `;document.head.appendChild(bagStyle);
     const minimapStyle=document.createElement('style');
     minimapStyle.textContent=`
@@ -74031,6 +74060,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         currentBundle.installExtraHotbarsModule(bot);
         currentBundle.installBotSidebarModule(bot);
         currentBundle.installBackpackSizingModule(bot);
+        currentBundle.installSidebarDropGuardModule(bot);
         currentBundle.installTabTitleModule(bot);
         currentBundle.installPzModule(bot);
         currentBundle.installXrayModule(bot);
