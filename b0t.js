@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.513",
+        version: "1.6.520",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -9628,7 +9628,7 @@ window.__minibiaBotBundle.installRunemakerModule = function installRunemakerModu
     const state={running:false,timer:null,lastCastAt:0,lastRequestAt:0,pending:null,player:null,sessionAt:0,retryAt:0,reason:"Off"};
     let editingSpellId=null;
     let disposed=false,host=null,rows=new Map(),select=null,quantity=null,enabled=null,statusLabel=null;
-    function normalize(){config.enabled=config.enabled===true;config.rules=(Array.isArray(config.rules)?config.rules:[]).filter(r=>Number.isSafeInteger(Number(r.spellId))&&Number(r.spellId)>0).map(r=>({spellId:Number(r.spellId),enabled:r.enabled!==false,count:Math.max(1,Math.min(100000,Math.trunc(Number(r.count)||100)))})).filter((r,i,list)=>list.findIndex(x=>x.spellId===r.spellId)===i).slice(0,40);}
+    function normalize(){config.enabled=config.enabled===true;config.rules=(Array.isArray(config.rules)?config.rules:[]).filter(r=>Number.isSafeInteger(Number(r.spellId))&&Number(r.spellId)>0).map(r=>({spellId:Number(r.spellId),enabled:r.enabled!==false,count:Math.max(0,Math.min(100000,Math.trunc(Number(r.count)||0)))})).filter((r,i,list)=>list.findIndex(x=>x.spellId===r.spellId)===i).slice(0,40);}
     normalize();
     function persist(){bot.storage.set(key,{...config,rules:config.rules.map(r=>({...r}))});}
     function catalogue(){
@@ -9638,14 +9638,14 @@ window.__minibiaBotBundle.installRunemakerModule = function installRunemakerModu
     }
     function syncSession(now){const player=window.gameClient?.player;if(state.player!==player){state.player=player;state.sessionAt=now;state.pending=null;state.lastRequestAt=0;state.retryAt=0;state.lastCastAt=0;}return player;}
     function reading(spell,now){const r=bot.getItemCountReading?.(spell.itemId,0);return r&&Number.isFinite(Number(r.count))&&Number(r.at)>=state.sessionAt&&now-Number(r.at)<=12000?{count:Math.max(0,Number(r.count)),at:Number(r.at)}:null;}
-    function deficits(now=Date.now()) {syncSession(now);const spells=catalogue();return config.rules.filter(r=>r.enabled).map(rule=>{const spell=spells.find(s=>s.sid===rule.spellId);return {rule,spell,count:spell?reading(spell,now):null};}).filter(row=>row.spell&&(!row.count||row.count.count<row.rule.count));}
+    function deficits(now=Date.now()) {syncSession(now);const spells=catalogue();return config.rules.filter(r=>r.enabled).map(rule=>{const spell=spells.find(s=>s.sid===rule.spellId);return {rule,spell,count:spell?reading(spell,now):null};}).filter(row=>row.spell&&(!row.count||row.rule.count===0||row.count.count<row.rule.count));}
     function needsMana(){return state.running&&config.enabled&&deficits().length>0;}
     function refreshCounts(now,force=false){if(!force&&now-state.lastRequestAt<2000)return;state.lastRequestAt=now;const all=catalogue();const items=config.rules.filter(r=>r.enabled).map(r=>all.find(s=>s.sid===r.spellId)).filter(Boolean).map(s=>({id:s.itemId,fluidType:0}));if(items.length)bot.requestItemCounts?.(items);}
     function permitted(row,now){
         const client=window.gameClient,player=client?.player,book=player?.spellbook;
         if(!state.running||!config.enabled||!player||player!==state.player||!(client.isConnected?.()===true||client.networkManager?.isConnected?.()===true))return false;
         if(bot.actions?.isHalted?.()||bot.gmKillSwitch?.isActive?.()||bot.pauseHotkey?.isPaused?.())return false;
-        if(!row.count||row.count.count>=row.rule.count||!config.rules.some(r=>r.spellId===row.rule.spellId&&r.enabled))return false;
+        if(!row.count||(row.rule.count>0&&row.count.count>=row.rule.count)||!config.rules.some(r=>r.spellId===row.rule.spellId&&r.enabled))return false;
         if(!book?.spells?.has(row.spell.sid))return false;
         if(!(Number(player.state?.health)>0)||!Number.isFinite(Number(player.state?.mana))||Number(player.state.mana)<row.spell.mana)return false;
         const soulCost=Number(client.interface?.SOUL_COST?.[row.spell.sid]??client.interface?.DEFAULT_SOUL_COST??1);
@@ -9696,7 +9696,7 @@ window.__minibiaBotBundle.installRunemakerModule = function installRunemakerModu
             const on=document.createElement('input');on.type='checkbox';on.checked=rule.enabled;on.setAttribute('aria-label',`Enable ${spell?.name||'rune'}`);on.addEventListener('change',()=>updateConfig({rules:config.rules.map(r=>r.spellId===rule.spellId?{...r,enabled:on.checked}:r)}));
             const name=document.createElement('span');name.textContent=spell?.name||`Rune spell ${rule.spellId}`;name.title=[spell?.name,spell?.words].filter(Boolean).join(' · ');
             const count=document.createElement('span');count.className='mb-tools-count';rows.set(rule.spellId,count);
-            const target=document.createElement('span');target.textContent=String(rule.count);target.className='mb-rm-target';
+            const target=document.createElement('span');target.textContent=rule.count===0?"Unlimited":String(rule.count);target.className='mb-rm-target';
             const actions=document.createElement('div');actions.className='mb-rm-actions';
             const edit=document.createElement('button');edit.type='button';edit.className='mb-small-button';edit.textContent='Edit';edit.title='Edit rule';edit.addEventListener('click',()=>{editingSpellId=rule.spellId;fillSelect();select.value=String(rule.spellId);quantity.value=String(rule.count);host.querySelector('.mb-rm-add').hidden=false;host.querySelector('[data-rm-add]').textContent='Save';select.focus();});
             const remove=document.createElement('button');remove.type='button';remove.className='mb-small-button';remove.textContent='×';remove.title='Remove rule';remove.addEventListener('click',()=>{if(editingSpellId===rule.spellId)closeEditor();updateConfig({rules:config.rules.filter(r=>r.spellId!==rule.spellId)});});
@@ -9706,13 +9706,13 @@ window.__minibiaBotBundle.installRunemakerModule = function installRunemakerModu
     }
     function closeEditor(){editingSpellId=null;if(host)host.querySelector('.mb-rm-add').hidden=true;}
     function mount(panel){host=panel.querySelector(options.host||'[data-runemaker-host]');if(!host)return;
-        host.innerHTML=`<div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-rm-enabled><span class="mb-title-text">Rune Crafter</span><button type="button" class="mb-small-button" data-rm-new>+ Rule</button></div><div class="mb-rm-row mb-rm-columns" aria-hidden="true"><span></span><span>Rune</span><span>Current</span><span>Target</span><span></span></div><div data-stock-runes></div><div class="mb-rm-add" hidden><label class="mb-field"><span class="mb-field-label">Rune</span><select aria-label="Rune type" data-rm-type></select></label><label class="mb-field"><span class="mb-field-label">Target count</span><input type="number" min="1" max="100000" value="100" aria-label="Rune target count" data-rm-count></label><div class="mb-rm-editor-actions"><button type="button" class="mb-small-button" data-rm-add>Add rule</button><button type="button" class="mb-small-button" data-rm-cancel>Cancel</button></div></div><div class="mb-small-note" data-rm-status></div>`;
+        host.innerHTML=`<div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-rm-enabled><span class="mb-title-text">Rune Crafter</span><button type="button" class="mb-small-button" data-rm-new>+ Rule</button></div><div class="mb-rm-row mb-rm-columns" aria-hidden="true"><span></span><span>Rune</span><span>Current</span><span>Target</span><span></span></div><div data-stock-runes></div><div class="mb-rm-add" hidden><label class="mb-field"><span class="mb-field-label">Rune</span><select aria-label="Rune type" data-rm-type></select></label><label class="mb-field"><span class="mb-field-label">Target count (0 = unlimited)</span><input type="number" min="0" max="100000" value="0" aria-label="Rune target count" data-rm-count></label><div class="mb-rm-editor-actions"><button type="button" class="mb-small-button" data-rm-add>Add rule</button><button type="button" class="mb-small-button" data-rm-cancel>Cancel</button></div></div><div class="mb-small-note" data-rm-status></div>`;
         host.querySelector('.mb-title-text').textContent=options.title||'Rune Crafter';
         if(options.itemLabel){host.querySelector('.mb-rm-columns > span:nth-child(2)').textContent=options.itemLabel;host.querySelector('.mb-rm-add .mb-field-label').textContent=options.itemLabel;host.querySelector('[data-rm-type]').setAttribute('aria-label',options.itemLabel+' spell');}
         if(options.enabledId)host.querySelector('[data-rm-enabled]').id=options.enabledId;
         enabled=host.querySelector('[data-rm-enabled]');select=host.querySelector('[data-rm-type]');quantity=host.querySelector('[data-rm-count]');statusLabel=host.querySelector('[data-rm-status]');
         enabled.addEventListener('change',()=>enabled.checked?start():stop());select.addEventListener('focus',fillSelect);
-        host.querySelector('[data-rm-new]').addEventListener('click',()=>{editingSpellId=null;fillSelect();quantity.value='100';host.querySelector('[data-rm-add]').textContent='Add rule';host.querySelector('.mb-rm-add').hidden=false;select.focus();});
+        host.querySelector('[data-rm-new]').addEventListener('click',()=>{editingSpellId=null;fillSelect();quantity.value='0';host.querySelector('[data-rm-add]').textContent='Add rule';host.querySelector('.mb-rm-add').hidden=false;select.focus();});
         host.querySelector('[data-rm-cancel]').addEventListener('click',closeEditor);
         host.querySelector('[data-rm-add]').addEventListener('click',()=>{const id=Number(select.value);if(!catalogue().some(s=>s.sid===id))return;const previous=config.rules.find(r=>r.spellId===editingSpellId);const rule={spellId:id,count:Number(quantity.value),enabled:previous?.enabled!==false};let rules=[...config.rules];if(editingSpellId!==null){const index=rules.findIndex(r=>r.spellId===editingSpellId);rules=rules.filter(r=>r.spellId!==id||r.spellId===editingSpellId);const at=rules.findIndex(r=>r.spellId===editingSpellId);if(at>=0)rules[at]=rule;else rules.splice(Math.max(0,index),0,rule);}else{rules=rules.filter(r=>r.spellId!==id);rules.push(rule);}closeEditor();updateConfig({rules});});render();
     }
@@ -9745,7 +9745,7 @@ window.__minibiaBotBundle.installRuneModule = function installRuneModule(bot) {
 
     let countRequestAt=0,countPlayer=null,countSessionAt=0,pendingCount=null;
     function normalizeRules() {
-        if (!Array.isArray(config.rules)) config.rules=[{spellWords:config.runeSpellWords,minMana:config.runeManaCost,maxMana:100,itemId:0,itemCount:100,enabled:true}];
+        if (!Array.isArray(config.rules)) config.rules=[];
         config.rules=config.rules.slice(0,40).map(r=>{const min=Math.max(0,Math.min(100,Number(r.minMana)||0));return {spellWords:String(r.spellWords||'').trim(),minMana:min,maxMana:Math.max(min,Math.min(100,Number(r.maxMana??100)||0)),itemId:Math.max(0,Math.trunc(Number(r.itemId)||0)),itemCount:Math.max(1,Math.trunc(Number(r.itemCount)||100)),enabled:r.enabled!==false};});
     }
     normalizeRules();
@@ -9826,7 +9826,7 @@ window.__minibiaBotBundle.installRuneModule = function installRuneModule(bot) {
         const hpPercent = hp.max > 0 ? (hp.current / hp.max) * 100 : 0;
         const enoughHp = hpPercent >= config.minHpPercent;
         const enoughMana = !!selectTrainingRule(now);
-        const enoughFood = food?.seconds == null || food.seconds >= config.minFoodSeconds;
+        const enoughFood = true; // Mana training does not require food or sated status.
         const cooldownElapsed = now - state.lastRuneAt;
         const cooldownRemaining = Math.max(0, config.runeCooldownMs - cooldownElapsed);
         const cooldownReady = cooldownRemaining === 0;
@@ -9837,7 +9837,7 @@ window.__minibiaBotBundle.installRuneModule = function installRuneModule(bot) {
             enoughFood,
             cooldownReady,
             cooldownRemainingMs: cooldownRemaining,
-            canMakeRune: enoughHp && enoughMana && enoughFood && cooldownReady,
+            canMakeRune: enoughHp && enoughMana && cooldownReady,
         };
     }
 
@@ -9999,7 +9999,7 @@ window.__minibiaBotBundle.installRuneModule = function installRuneModule(bot) {
             ['↑','Move up',()=>move(index,-1),index===0],['↓','Move down',()=>move(index,1),index===config.rules.length-1],['Edit','Edit rule',()=>edit(index),false],['×','Remove rule',()=>{updateConfig({rules:config.rules.filter((_,i)=>i!==index)});reset();draw();},false]]){const button=document.createElement('button');button.type='button';button.className='mb-small-button';button.textContent=text;button.title=label;button.setAttribute('aria-label',label);button.disabled=disabled;button.addEventListener('click',action);buttons.append(button);}top.append(buttons);const summary=document.createElement('div');summary.className='mb-small-note';const itemSpell=trainingSpells().find(s=>Number(s.runeId)===rule.itemId);summary.textContent=`Mana ${rule.minMana}–${rule.maxMana}% · ${rule.itemId?`${itemSpell?.name.replace(/^Conjure /i,'')||'Item '+rule.itemId} below ${rule.itemCount}`:'Always cast'}`;row.append(top,summary);if(!rule.enabled)row.classList.add('mb-mt-disabled');list.append(row);});}
         function move(index,delta){const rules=[...config.rules];[rules[index],rules[index+delta]]=[rules[index+delta],rules[index]];updateConfig({rules});reset();draw();}
         q('#minibia-bot-rune-enabled').checked=state.running;q('#minibia-bot-rune-enabled').addEventListener('change',e=>e.target.checked?start():stop());
-        spell.addEventListener('focus',choices);spell.addEventListener('change',()=>{const s=resolveTrainingSpell(spell.value.trim());spell.value=s.words;const native=trainingSpells().find(x=>x.words===s.words);item.value=String(native?.runeId||0);itemChanged();});item.addEventListener('change',itemChanged);
+        spell.addEventListener('focus',choices);spell.addEventListener('change',()=>{const s=resolveTrainingSpell(spell.value.trim());spell.value=s.words;itemChanged();});item.addEventListener('change',itemChanged);
         q('[data-mt-new]').addEventListener('click',()=>{reset();choices();q('.mb-mt-editor').hidden=false;q('[data-mt-cancel]').hidden=false;spell.focus();});
         q('[data-mt-save]').addEventListener('click',()=>{if(!spell.value.trim())return;const resolved=resolveTrainingSpell(spell.value.trim()),rule={spellWords:resolved.words,minMana:Number(q('[data-mt-min]').value),maxMana:Number(q('[data-mt-max]').value),itemId:Number(item.value),itemCount:Number(q('[data-mt-count]').value),enabled:editingRule>=0?config.rules[editingRule]?.enabled!==false:true};const rules=[...config.rules];if(editingRule>=0)rules[editingRule]=rule;else rules.push(rule);updateConfig({rules});reset();draw();});q('[data-mt-cancel]').addEventListener('click',reset);choices();draw();
     }
@@ -57827,7 +57827,7 @@ window.__minibiaBotBundle.installSupportModule = function installSupportModule(b
  * ==================================================================================
  */
 window.__minibiaBotBundle.installItemMoverModule = function installItemMoverModule(bot){
-    const key='minibiaBot.itemMover.config',saved=bot.storage.get(key,{}),config={enabled:saved.enabled===true,items:Array.isArray(saved.items)?saved.items.filter(r=>r && Number(r.id)>0).slice(0,128).map(r=>({...r,enabled:r.enabled!==false})):[]};
+    const key='minibiaBot.itemMover.config',saved=bot.storage.get(key,{}),config={enabled:saved.enabled===true,items:Array.isArray(saved.items)?saved.items.filter(r=>r && Number(r.id)>0).slice(0,128).map(r=>({...r,enabled:r.enabled!==false,targetCount:Math.max(0,Math.min(1000000,Math.trunc(Number(r.targetCount)||0)))})):[]};
     let disposed=false,timer=null,queued=false,player=null,equipped=null,destination=null,opening=null,pending=null,lastOpen=0,retryAt=0,view=null,reason='Off';
     const bags=()=>{const all=window.gameClient?.player?.__openedContainers;return all instanceof Map?[...all.values()]:all instanceof Set?[...all]:Array.isArray(all)?all:Object.values(all||{});};
     const peek=(c,i)=>c?.getSlotItem?.(i)||c?.peekItem?.(i)||null;
@@ -57837,6 +57837,14 @@ window.__minibiaBotBundle.installItemMoverModule = function installItemMoverModu
     const ruleFor=it=>config.items.find(rule=>rule.enabled!==false&&matches(it,rule));
     const stackable=it=>{try{return it?.isStackable?.()===true;}catch{return false;}};
     const count=it=>stackable(it)?Math.max(1,Number(it?.count)||1):1;
+    const targetLimit=rule=>Math.max(0,Math.min(1000000,Math.trunc(Number(rule.targetCount)||0)));
+    function destinationCount(rule,containers){
+        let total=0;
+        for(const bag of containers)for(let i=0;i<size(bag);i++){
+            const item=peek(bag,i);if(matches(item,rule))total+=count(item);
+        }
+        return total;
+    }
     let childOpening=null;
     const childSlots=new Map();
     const isBagItem=item=>{try{return item?.isContainer?.()===true;}catch{return false;}};
@@ -57909,7 +57917,10 @@ window.__minibiaBotBundle.installItemMoverModule = function installItemMoverModu
             }
             if(pending){
                 const current=peek(pending.source,pending.slot);
-                if(!all.includes(pending.source)||current!==pending.item||count(current)!==pending.before||pending.ack)pending=null;
+                const sourceChanged=!all.includes(pending.source)||current!==pending.item||count(current)!==pending.before||pending.ack;
+                const destinationConfirmed=!pending.rule||destinationCount(pending.rule,tree(destination,all))>=pending.destinationBefore+pending.amount;
+                if(sourceChanged&&destinationConfirmed)pending=null;
+                else if(pending.rule&&now-pending.at>=3000){setReason('Waiting for destination count confirmation');return;}
                 else if(now-pending.at<3000)return;
                 else{pending=null;retryAt=now+3000;setReason('Move unconfirmed; waiting');return;}
             }
@@ -57924,6 +57935,11 @@ window.__minibiaBotBundle.installItemMoverModule = function installItemMoverModu
                 for(let i=0;i<size(source);i++){
                     const it=peek(source,i),rule=ruleFor(it);if(!rule)continue;
                     try{if(it.isContainer?.())continue;}catch{continue;}
+                    const limit=targetLimit(rule);
+                    // Inspect child bags before counting a capped destination.
+                    if(limit&&expandDestination(excluded,all,now,client))return;
+                    const remaining=limit?Math.max(0,limit-destinationCount(rule,excluded)):Infinity;
+                    if(remaining<=0)continue;
                     let target=null,targetSlot=-1,capacity=stackable(it)?100:1;
                     for(const candidate of excluded){
                         let empty=-1;
@@ -57939,12 +57955,16 @@ window.__minibiaBotBundle.installItemMoverModule = function installItemMoverModu
                         if(expandDestination(excluded,all,now,client))return;
                         full=true;continue;
                     }
-                    const amount=Math.min(capacity,count(it));
+                    const amount=Math.min(capacity,count(it),remaining);
                     const move=()=>{
                         if(rule.enabled===false || !config.items.includes(rule) || peek(source,i)!==it || !bags().includes(target)||!bags().includes(destination)||peek(eq,slot)!==equipped)return false;
                         if(typeof ItemMovePacket!=='function'||typeof client.send!=='function')return false;
-                        pending={source,slot:i,item:it,before:count(it),at:now,ack:false};
-                        try{client.send(new ItemMovePacket({which:source,index:i},{which:target,index:targetSlot},amount));}catch(e){pending=null;throw e;}
+                        const destinationBefore=destinationCount(rule,tree(destination,bags()));
+                        const currentLimit=targetLimit(rule);
+                        const moveAmount=Math.min(amount,count(it),currentLimit?Math.max(0,currentLimit-destinationBefore):Infinity);
+                        if(moveAmount<=0)return false;
+                        pending={source,slot:i,item:it,before:count(it),at:now,ack:false,rule:currentLimit?rule:null,destinationBefore,amount:moveAmount};
+                        try{client.send(new ItemMovePacket({which:source,index:i},{which:target,index:targetSlot},moveAmount));}catch(e){pending=null;throw e;}
                         return true;
                     };
                     const sent=bot.actions?.runShared?bot.actions.runShared('item-mover',bot.actions.priorities.UTILITY,move,0):move();
@@ -57974,12 +57994,13 @@ window.__minibiaBotBundle.installItemMoverModule = function installItemMoverModu
     function cancelCapture(){if(capture)document.removeEventListener('click',capture,true);capture=null;if(captureTimer!==null)clearTimeout(captureTimer);captureTimer=null;}
     function mount(parent){if(!parent||parent.querySelector('[data-item-mover]'))return;
         const section=document.createElement('div');section.className='mb-section';section.setAttribute('data-item-mover','');
-        section.innerHTML='<div class="mb-dropper-heading"><div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-mover-enabled aria-label="Enable item mover"><span class="mb-title-text">📦 Item mover</span></div><button type="button" class="mb-small-button" data-mover-new>+ Rule</button></div><div class="mb-small-note">Selected items → arrow-slot bag + child bags</div><div data-mover-editor hidden><div class="mb-alert-pick"><input type="text" data-mover-name list="mb-item-mover-suggestions" placeholder="Item name or SID"><button type="button" class="mb-small-button" data-mover-pick title="Pick item" aria-label="Pick item">🔍</button><button type="button" class="mb-small-button" data-mover-add>Add rule</button><button type="button" class="mb-small-button" data-mover-cancel>Cancel</button></div><datalist id="mb-item-mover-suggestions"></datalist></div><div class="mb-list" data-mover-list></div><div class="mb-small-note" data-mover-status></div>';
+        section.innerHTML='<div class="mb-dropper-heading"><div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-mover-enabled aria-label="Enable item mover"><span class="mb-title-text">📦 Item mover</span></div><button type="button" class="mb-small-button" data-mover-new>+ Rule</button></div><div class="mb-small-note">Selected items → arrow-slot bag + child bags. Move up to: destination total; 0 = unlimited.</div><div data-mover-editor hidden><div class="mb-alert-pick"><input type="text" data-mover-name list="mb-item-mover-suggestions" placeholder="Item name or SID"><button type="button" class="mb-small-button" data-mover-pick title="Pick item" aria-label="Pick item">🔍</button><button type="button" class="mb-small-button" data-mover-add>Add rule</button><button type="button" class="mb-small-button" data-mover-cancel>Cancel</button></div><label class="mb-field"><span class="mb-field-label">Move up to (0 = unlimited)</span><input type="number" data-mover-limit min="0" max="1000000" step="1" value="0"></label><datalist id="mb-item-mover-suggestions"></datalist></div><div class="mb-mover-columns" aria-hidden="true"><span>Item</span><span>Move up to</span><span></span><span></span></div><div class="mb-list" data-mover-list></div><div class="mb-small-note" data-mover-status></div>';
         const q=selector=>section.querySelector(selector),input=q('[data-mover-name]'),list=q('[data-mover-list]');
         const persist=()=>bot.storage.set(key,{...config,items:config.items.map(r=>({...r}))});
-        const editor=q('[data-mover-editor]');
-        const closeEditor=()=>{cancelCapture();editor.hidden=true;input.value='';};
-        q('[data-mover-new]').addEventListener('click',()=>{editor.hidden=false;input.focus();});
+        const editor=q('[data-mover-editor]'),limitInput=q('[data-mover-limit]'),saveButton=q('[data-mover-add]');
+        let editing=null,originalInput='';
+        const closeEditor=()=>{cancelCapture();editing=null;originalInput='';editor.hidden=true;input.value='';limitInput.value='0';saveButton.textContent='Add rule';};
+        q('[data-mover-new]').addEventListener('click',()=>{closeEditor();editor.hidden=false;input.focus();});
         q('[data-mover-cancel]').addEventListener('click',closeEditor);
         const renderList=()=>{list.replaceChildren();for(const rule of config.items){
             const row=document.createElement('div');row.className='mb-list-row';row.style.cssText='display:flex;align-items:center;justify-content:space-between;gap:6px';
@@ -57988,16 +58009,24 @@ window.__minibiaBotBundle.installItemMoverModule = function installItemMoverModu
             enabled.addEventListener('change',()=>{rule.enabled=enabled.checked;persist();wake();});
             const label=document.createElement('label');label.className='mb-toggle';label.style.cssText='flex:1;min-width:0';
             const name=document.createElement('span');name.textContent=rule.name||`Item ${rule.sid||rule.id}`;name.title=`SID ${rule.sid||'?'} · CID ${rule.id}`;
-            const remove=document.createElement('button');remove.type='button';remove.className='mb-small-button';remove.textContent='✕';remove.title='Remove item';remove.addEventListener('click',()=>{config.items=config.items.filter(r=>r!==rule);persist();renderList();});label.append(enabled,name);row.append(label,remove);list.appendChild(row);
+            const remove=document.createElement('button');remove.type='button';remove.className='mb-small-button';remove.textContent='✕';remove.title='Remove item';remove.addEventListener('click',()=>{if(editing===rule)closeEditor();config.items=config.items.filter(r=>r!==rule);persist();renderList();});label.append(enabled,name);
+            const capLabel=document.createElement('label');capLabel.className='mb-field';capLabel.style.cssText='flex:0 0 82px';
+            const cap=document.createElement('input');cap.type='number';cap.min='0';cap.max='1000000';cap.step='1';cap.value=String(targetLimit(rule));cap.style.width='76px';cap.title='Total to keep in the arrow-slot bag and child bags. 0 = unlimited.';cap.setAttribute('aria-label','Destination count for '+(rule.name||'item'));
+            cap.addEventListener('change',()=>{rule.targetCount=Math.max(0,Math.min(1000000,Math.trunc(Number(cap.value)||0)));cap.value=String(rule.targetCount);persist();wake();});
+            const edit=document.createElement('button');edit.type='button';edit.className='mb-small-button';edit.textContent='Edit';edit.title='Edit rule';
+            edit.addEventListener('click',()=>{closeEditor();editing=rule;originalInput=rule.name||String(rule.sid||rule.id);input.value=originalInput;limitInput.value=String(targetLimit(rule));saveButton.textContent='Save';editor.hidden=false;input.focus();});
+            capLabel.append(cap);row.append(label,capLabel,edit,remove);list.appendChild(row);
         }};
         const add=item=>{if(!item || !Number(item.id)){setReason('Choose an item from the suggestions');return;}
-            const rule={enabled:true,id:Number(item.id),sid:Number(item.sid)||0,fluidType:Number(item.fluidType)||0,name:String(item.name||'Item '+item.id)};
-            if(!config.items.some(r=>Number(r.sid)===rule.sid&&Number(r.id)===rule.id&&Number(r.fluidType||0)===rule.fluidType))config.items.push(rule);
+            const rule={enabled:editing?editing.enabled!==false:true,id:Number(item.id),sid:Number(item.sid)||0,fluidType:Number(item.fluidType)||0,name:String(item.name||'Item '+item.id),targetCount:Math.max(0,Math.min(1000000,Math.trunc(Number(limitInput.value)||0)))};
+            if(config.items.some(r=>r!==editing&&Number(r.sid)===rule.sid&&Number(r.id)===rule.id&&Number(r.fluidType||0)===rule.fluidType)){setReason('A rule for this item already exists');return;}
+            if(editing){const index=config.items.indexOf(editing);if(index<0){closeEditor();return;}config.items[index]=rule;}
+            else config.items.push(rule);
             persist();renderList();closeEditor();setReason(config.enabled?'Watching open bags':'Off');wake();
         };
         const toggle=q('[data-mover-enabled]');toggle.checked=config.enabled;toggle.addEventListener('change',()=>setEnabled(toggle.checked));
         input.addEventListener('input',()=>{const choices=(bot.itemAlertItems?.catalog?.()||[]).filter(r=>r.name.toLowerCase().includes(input.value.trim().toLowerCase())).slice(0,40);const dl=q('datalist');dl.replaceChildren();for(const r of choices){const option=document.createElement('option');option.value=r.choice;dl.appendChild(option);}});
-        const addInput=()=>{const value=input.value.trim();if(/^\d+$/.test(value)){add((bot.itemAlertItems?.catalog?.()||[]).find(r=>r.sid===Number(value)));return;}const resolved=bot.itemAlertItems?.resolve?.(value);if(resolved?.item)add(resolved.item);else setReason(resolved?.error||'Choose an item');};
+        const addInput=()=>{const value=input.value.trim();if(editing&&value===originalInput){add(editing);return;}if(/^\d+$/.test(value)){add((bot.itemAlertItems?.catalog?.()||[]).find(r=>r.sid===Number(value)));return;}const resolved=bot.itemAlertItems?.resolve?.(value);if(resolved?.item)add(resolved.item);else setReason(resolved?.error||'Choose an item');};
         q('[data-mover-add]').addEventListener('click',addInput);input.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();addInput();}});
         q('[data-mover-pick]').addEventListener('click',()=>{
             cancelCapture();setReason('Click an item in a bag or equipment slot');
@@ -64003,6 +64032,31 @@ function upgradeSectionHeaders(panel) {
   font-size: 10px;
 }
 
+/* Compact Item Mover: one heading, single-line rule controls. */
+#minibia-bot-panel [data-item-mover] .mb-mover-columns,
+#minibia-bot-panel [data-item-mover] [data-mover-list] > .mb-list-row {
+  display:grid !important;
+  grid-template-columns:minmax(0,1fr) 76px 38px 24px;
+  align-items:center;
+  gap:6px;
+  padding:3px 6px;
+}
+#minibia-bot-panel [data-item-mover] .mb-mover-columns {
+  margin-top:5px;padding-right:10px;color:#bdbdbd;font-size:10px;line-height:14px;
+}
+#minibia-bot-panel [data-item-mover] [data-mover-list] {gap:0;margin-top:0;}
+#minibia-bot-panel [data-item-mover] [data-mover-list] .mb-toggle,
+#minibia-bot-panel [data-item-mover] [data-mover-list] .mb-field {
+  margin:0;padding:0;min-width:0;line-height:18px;
+}
+#minibia-bot-panel [data-item-mover] [data-mover-list] .mb-toggle > span {
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+#minibia-bot-panel [data-item-mover] [data-mover-list] input[type="number"],
+#minibia-bot-panel [data-item-mover] [data-mover-list] .mb-small-button {
+  width:100%;min-width:0;min-height:0;height:22px;margin:0;padding:1px 4px;line-height:18px;box-sizing:border-box;
+}
+
 /* ── Creature rows ── */
 #minibia-bot-panel .mb-creature-row {
   padding: 4px 8px;
@@ -65161,6 +65215,7 @@ function upgradeSectionHeaders(panel) {
         <button type="button" class="mb-small-button" id="minibia-bot-cave-preset-delete" title="Delete preset" aria-label="Delete preset">❌</button>
       </div>
     </div>
+    <div class="mb-inline" style="margin-top:4px;"><button type="button" class="mb-small-button" id="minibia-bot-cave-import-clipboard" title="Import waypoint JSON from your clipboard">Import from clipboard</button><span class="mb-small-note">or Ctrl+V here</span></div>
     <div id="minibia-bot-cave-status" class="mb-cave-status" role="status">Status: no waypoints</div>
     <div class="mb-cave-toolbar">
       <span class="mb-cave-subtitle" style="margin:0;">Waypoints</span>
@@ -68050,6 +68105,84 @@ function upgradeSectionHeaders(panel) {
 
                 // Reset file input so the same file can be re-selected
                 importWaypointsInput.value = "";
+            });
+        }
+
+        // Native paste fallback plus direct clipboard reading during Ctrl+V user activation.
+        const cavePastePanel = panel.querySelector('[data-tab-panel="cave"]');
+        let cavePasteBusy = false;
+        if (cavePastePanel) {
+            cavePastePanel.tabIndex = -1;
+            const isPasteEditor = node => node instanceof Element &&
+                (node.closest('input,textarea,select') || node.isContentEditable);
+            cavePastePanel.addEventListener('pointerdown', event => {
+                if (event.target instanceof Element && !event.target.closest('input,textarea,select,button,a,summary,[contenteditable]'))
+                    cavePastePanel.focus({preventScroll:true});
+            });
+            const clipboardImportButton = panel.querySelector('#minibia-bot-cave-import-clipboard');
+            const importPastedWaypoints = async rawText => {
+                const text = String(rawText || '').trim().replace(/^\uFEFF/, '');
+                if (!text) {
+                    if (routeImportStatus) routeImportStatus.textContent = 'Clipboard is empty. Copy waypoint JSON first.';
+                    return;
+                }
+                if (cavePasteBusy) return;
+                cavePasteBusy = true;
+                if (routeImportStatus) routeImportStatus.textContent = 'Importing pasted waypoints...';
+                try {
+                    const file = new File([text], 'Pasted route.json', {type:'application/json'});
+                    const result = await bot.profiles.importWaypointsFromFile(file);
+                    const importedName = result.importedNames?.[0];
+                    if (importedName) bot.cave.loadPreset(importedName);
+                    refreshCaveWaypointList();refreshCaveStatus();
+                    refreshCavePresetControls();refreshProfileList();
+                    if (routeImportStatus) routeImportStatus.textContent = `Imported ${result.added} preset(s)${importedName ? ' — opened '+importedName : ''}${result.skipped ? ' · '+result.skipped+' already present' : ''}.`;
+                } catch (error) {
+                    if (routeImportStatus) routeImportStatus.textContent = 'Import failed: '+error.message;
+                    bot.log('Waypoint JSON import error', error);
+                } finally {
+                    cavePasteBusy = false;
+                }
+            };
+            const pasteWaypoints = event => {
+                if (event.defaultPrevented || !cavePastePanel.getClientRects().length ||
+                    isPasteEditor(event.target) || isPasteEditor(document.activeElement)) return;
+                if (!cavePastePanel.contains(event.target) && !cavePastePanel.matches(':hover')) return;
+                const text = (event.clipboardData?.getData('text/plain') || '').trim().replace(/^\uFEFF/, '');
+                if (!text || !/^[{\[]/.test(text)) return;
+                event.preventDefault();event.stopPropagation();
+                void importPastedWaypoints(text);
+            };
+            const importClipboardWaypoints = async () => {
+                if (clipboardImportButton.disabled || cavePasteBusy) return;
+                clipboardImportButton.disabled = true;
+                try {
+                    if (!navigator.clipboard?.readText) throw new Error('Clipboard reading unavailable');
+                    const text = await navigator.clipboard.readText();
+                    await importPastedWaypoints(text);
+                } catch (error) {
+                    if (routeImportStatus) routeImportStatus.textContent = 'Clipboard access blocked. Allow clipboard access in your browser, then try again.';
+                } finally {
+                    clipboardImportButton.disabled = false;
+                }
+            };
+            clipboardImportButton?.addEventListener('click', importClipboardWaypoints);
+            const pasteShortcut = event => {
+                if (!(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey ||
+                    String(event.key).toLowerCase() !== 'v') return;
+                if (!cavePastePanel.getClientRects().length ||
+                    isPasteEditor(event.target) || isPasteEditor(document.activeElement)) return;
+                if (!cavePastePanel.contains(event.target) && !cavePastePanel.matches(':hover')) return;
+                if (!navigator.clipboard?.readText) return; // Let native paste supply clipboardData.
+                event.preventDefault();
+                event.stopImmediatePropagation();
+                if (!event.repeat) void importClipboardWaypoints();
+            };
+            window.addEventListener('keydown', pasteShortcut, true);
+            document.addEventListener('paste', pasteWaypoints, true);
+            bot.addCleanup(() => {
+                window.removeEventListener('keydown', pasteShortcut, true);
+                document.removeEventListener('paste', pasteWaypoints, true);
             });
         }
 
