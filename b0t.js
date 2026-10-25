@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.507",
+        version: "1.6.509",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -65048,7 +65048,7 @@ function upgradeSectionHeaders(panel) {
       <label class="mb-field"><span class="mb-field-label">Fish limit</span><input type="number" id="minibia-bot-fisher-threshold" min="1" value="10"></label>
       <div class="mb-field"><span class="mb-field-label">Fish count</span><span class="mb-general-counter" id="minibia-bot-fisher-count">0</span></div>
     </div>
-    <div class="mb-general-tile"><span class="mb-small-note" id="minibia-bot-fisher-tile-display">No tile selected</span><button type="button" class="mb-small-button" id="minibia-bot-fisher-select-tile">Set Tile</button></div>
+    <div class="mb-general-tile"><span class="mb-small-note" id="minibia-bot-fisher-tile-display">No tile selected</span><button type="button" class="mb-small-button" id="minibia-bot-fisher-select-tile"><span aria-hidden="true">🔍</span> Set Tile</button></div>
     <div class="mb-small-note" id="minibia-bot-fisher-status">Stopped</div>
   </div>
 
