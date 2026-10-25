@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.491",
+        version: "1.6.494",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -5657,9 +5657,17 @@ window.__minibiaBotBundle.installNativeHotbarSkinModule = function installNative
         for(const [text,action,title] of [
             ['▴',()=>list.scrollBy({top:-102,left:-102,behavior:'smooth'}),'Scroll hotbar back'],
             ['▾',()=>list.scrollBy({top:102,left:102,behavior:'smooth'}),'Scroll hotbar forward'],
-            ['⚙',()=>{controls.style.display=controls.style.display==='none'?'':'none';},'Hotbar presets and bank']]){
+            ['⚙',button=>{const opening=controls.style.display==='none';controls.style.display=opening?'':'none';if(opening){
+                // The bottom footer is display:contents and has no layout box.
+                // Anchor to the actual button, then measure the opened menu.
+                const rect=button.getBoundingClientRect();Object.assign(controls.style,{position:'fixed',left:'0px',top:'0px',right:'auto',bottom:'auto',zIndex:'10000',maxWidth:'180px'});
+                const menu=controls.getBoundingClientRect(),gap=4;
+                controls.style.left=Math.max(gap,Math.min(window.innerWidth-menu.width-gap,rect.right-menu.width))+'px';
+                const above=rect.top-menu.height-gap;
+                controls.style.top=Math.max(gap,Math.min(window.innerHeight-menu.height-gap,above>=gap?above:rect.bottom+gap))+'px';
+            }},'Hotbar presets and bank']]){
             const button=document.createElement('button');button.type='button';button.textContent=text;button.title=title;
-            button.addEventListener('click',event=>{event.stopPropagation();action();});footer.appendChild(button);
+            button.addEventListener('click',event=>{event.stopPropagation();action(event.currentTarget);});footer.appendChild(button);
         }
         for(const node of original)(slots.includes(node)?list:controls).appendChild(node);
         bar.classList.add('mb-native-hotbar');bar.appendChild(list);bar.appendChild(controls);bar.appendChild(footer);
@@ -5717,8 +5725,10 @@ window.__minibiaBotBundle.installHotbarDockModule = function installHotbarDockMo
 .main .mb-bottom-hotkey-tray>.hotbar.mb-native-hotbar>.mb-extra-hotbar-scroll{display:contents!important;}
 .main .mb-bottom-hotkey-tray>.hotbar.mb-native-hotbar>.mb-extra-hotbar-scroll>button{width:34px;height:34px;box-sizing:border-box;margin:0;padding:0;background:#383838;border:1px solid #666;color:#ddd;order:100;}
 .main .mb-bottom-hotkey-tray>.hotbar.mb-native-hotbar>.mb-extra-hotbar-scroll>button:not(:last-child){display:none!important;}
-.main .mb-bottom-hotkey-tray>.hotbar.mb-native-hotbar>.mb-native-hotbar-controls{position:absolute;right:3px;bottom:38px;z-index:5;padding:4px;border:1px solid #666;background:#222;}
-.main .mb-bottom-hotkey-tray>.hotbar.mb-native-hotbar>.mb-native-hotbar-controls .hotbar-bank-toggle{display:none!important;}
+.main .mb-bottom-hotkey-tray>.hotbar.mb-native-hotbar>.mb-native-hotbar-controls{position:fixed;right:3px;bottom:38px;z-index:5;padding:4px;border:1px solid #666;background:#222;}
+.main .mb-bottom-hotkey-tray>.hotbar.mb-native-hotbar>.mb-native-hotbar-controls .hotbar-bank-toggle{display:inline-block!important;}
+.main .mb-bottom-hotkey-tray.mb-hotbar-compact>.hotbar.mb-native-hotbar.show-bank2 .hotbar-item.hotbar-bank2{display:block!important;}
+.main .mb-bottom-hotkey-tray.mb-hotbar-compact>.hotbar.mb-native-hotbar.show-bank2 .hotbar-item:not(.hotbar-bank2){display:none!important;}
 
 /* Slot feedback is paint-only. Native success/reject animations must never
    change a docked slot's geometry or create a second scroll container. */
@@ -6005,11 +6015,12 @@ window.__minibiaBotBundle.installExtraSidebarsModule = function installExtraSide
 window.__minibiaBotBundle.installSidebarPanelsModule = function installSidebarPanelsModule(bot){
     const key='minibiaBot.sidebarPanels.config',saved=bot.storage.get(key,{});
     const valid=v=>/^(original|left|right|left-[01]|right-[01])$/.test(v)?v:'original';
-    const config={vitals:valid(saved.vitals),equipment:valid(saved.equipment),minimap:valid(saved.minimap),mapHeight:Number(saved.mapHeight)>0?Math.min(1000,Number(saved.mapHeight)):null,orders:{...saved.orders}};
+    const config={vitals:valid(saved.vitals),equipment:valid(saved.equipment),minimap:valid(saved.minimap),mapSpan:saved.mapSpan===2?2:1,mapHeight:Number(saved.mapHeight)>0?Math.min(1000,Number(saved.mapHeight)):null,orders:{...saved.orders}};
     const owned=new Map(),views=new Set(),collapsed=new Set();let disposed=false,mapDrag=null,mapBinding=null;
     // Native .window/.header/.title/.body styles supply the same visual
     // treatment as backpacks and Battle; only size constraints are local.
     const style=document.createElement('style');style.textContent=`
+.mb-map-span-overflow{overflow:visible!important;}
 .window.mb-hud-window{display:flex;flex:0 0 auto;min-width:0!important;max-width:100%!important;width:100%!important;align-self:stretch;box-sizing:border-box!important;}
 #game-wrapper .oogwrap2:has(.mb-hud-window){width:100%!important;min-width:0!important;max-width:100%!important;box-sizing:border-box!important;}
 #game-wrapper .oogwrap2>.equipment-options-wrapper:has(>.mb-hud-window){
@@ -6126,6 +6137,7 @@ window.__minibiaBotBundle.installSidebarPanelsModule = function installSidebarPa
         persist();wm()?.saveLayout?.();wm()?.saveContainerGeometry?.();
     }
     function restore(){
+        clearMapSpan();
         for(const wrap of collapsed){wrap.removeAttribute("data-mb-empty-sidebar");wrap.removeAttribute("data-mb-empty-top");}collapsed.clear();
         for(const r of owned.values()){
             if(r.keyHome?.parentNode)r.keyHome.parentNode.insertBefore(r.keyButton,r.keyHome);
@@ -6156,7 +6168,10 @@ window.__minibiaBotBundle.installSidebarPanelsModule = function installSidebarPa
         if(name==='minimap'){
             const footer=document.createElement('div');footer.className='footer';footer.title='Drag to resize map · double-click to fill panel';shell.appendChild(footer);
             footer.addEventListener('pointerdown',event=>{if(event.button!==0)return;event.preventDefault();event.stopPropagation();mapDrag={r,y:event.clientY,size:body.getBoundingClientRect().height};footer.setPointerCapture?.(event.pointerId);});
-            footer.addEventListener('dblclick',()=>{config.mapHeight=null;persist();sync();});
+            footer.addEventListener('dblclick',()=>{config.mapHeight=null;config.mapSpan=1;persist();sync();});
+            for(const side of ['left','right']){const grip=document.createElement('div');grip.title='Drag to span one or two sidebars';Object.assign(grip.style,{position:'absolute',top:'22px',bottom:'8px',width:'5px',cursor:'ew-resize',zIndex:'4',[side]:'0'});shell.appendChild(grip);grip.draggable=false;
+                grip.addEventListener('pointerdown',event=>{if(event.button!==0)return;event.preventDefault();event.stopPropagation();mapDrag={r,horizontal:true,x:event.clientX,side,start:config.mapSpan};grip.setPointerCapture?.(event.pointerId);});}
+            shell.style.position='relative';
         }
         shell.addEventListener('mousedown',event=>{const manager=wm();if(manager?.state)manager.state.mouseDownTarget=event.target;});
         shell.addEventListener('dragstart',event=>{
@@ -6186,7 +6201,7 @@ window.__minibiaBotBundle.installSidebarPanelsModule = function installSidebarPa
                 const value=r.soulBox.querySelector('span'),soul=window.gameClient?.player?.state?.soul;
                 if(value)value.textContent=Number.isFinite(Number(soul))&&soul!=null?String(soul):'—';
             }
-            if(name==='minimap')updateMapSize(r);
+            
             const p=available.find(p=>p.id===config[name]);
             if(!p||config[name]==='original'){
                 const home=r.nodes[0].home;
@@ -6198,6 +6213,7 @@ window.__minibiaBotBundle.installSidebarPanelsModule = function installSidebarPa
             }
             r.placed=true;
         }
+        const mr=owned.get('minimap');if(mr){applyMapSpan(mr,available);updateMapSize(mr);}
         collapseEmptyRight(available);
         for(const render of views)render(available);
     }
@@ -6205,7 +6221,7 @@ window.__minibiaBotBundle.installSidebarPanelsModule = function installSidebarPa
         const wrap=available.find(p=>p.id==='right')?.column?.parentNode;if(!wrap)return;
         // Ignore empty structural wrappers. Inspect actual game panels instead,
         // and ignore our own collapse state so a newly opened bag restores it.
-        const candidates=Array.from(wrap.querySelectorAll('[data-mb-bot-window]'));
+        const candidates=Array.from(wrap.querySelectorAll('[data-mb-bot-window],[data-mb-map-spacer]'));
         for(const r of owned.values())if(wrap.contains(r.shell))candidates.push(r.shell);
         const manager=wm();
         for(const gameWindow of Object.values(manager?.windows||{})){
@@ -6265,10 +6281,29 @@ window.__minibiaBotBundle.installSidebarPanelsModule = function installSidebarPa
         b.canvas.width=b.width;b.canvas.height=b.height;mapBinding=null;
         try{b.map.cache();}catch{}
     }
+    let spanState=null;
+    function clearMapSpan(){
+        if(!spanState)return;const b=spanState;spanState=null;b.spacer.remove();
+        for(const el of b.ancestors)el.classList.remove('mb-map-span-overflow');
+        for(const key of ['width','max-width','left','z-index'])b.r.shell.style.removeProperty(key);
+    }
+    function applyMapSpan(r,available){
+        clearMapSpan();if(config.mapSpan!==2||r.shell.classList.contains('mb-hud-minimized'))return;
+        const wrap=r.shell.closest('.oogwrap');if(!wrap)return;
+        const box=wrap.getBoundingClientRect(),side=config.minimap.startsWith('left')?'left':'right';
+        const others=available.filter(p=>p.id.startsWith(side)&&p.column.closest('.oogwrap')!==wrap).map(p=>({p,box:p.column.closest('.oogwrap').getBoundingClientRect()})).filter(e=>e.box.width>0&&Math.abs(e.box.top-box.top)<40);
+        others.sort((a,b)=>Math.abs(a.box.left-box.left)-Math.abs(b.box.left-box.left));const next=others[0];if(!next)return;
+        const left=Math.min(box.left,next.box.left),right=Math.max(box.right,next.box.right);if(right-left>box.width*2+24)return;
+        const spacer=document.createElement('div');spacer.setAttribute('data-mb-map-spacer','');spacer.style.flex='0 0 auto';spacer.style.pointerEvents='none';next.p.column.insertBefore(spacer,next.p.column.firstChild);
+        const ancestors=[];for(let el=r.shell.parentElement;el&&el.id!=='game-wrapper';el=el.parentElement){el.classList.add('mb-map-span-overflow');ancestors.push(el);}
+        r.shell.style.setProperty('width',(right-left)+'px','important');r.shell.style.setProperty('max-width',(right-left)+'px','important');r.shell.style.left=(left-r.shell.parentElement.getBoundingClientRect().left)+'px';r.shell.style.zIndex='3';
+        spanState={r,spacer,ancestors};
+    }
     function updateMapSize(r){
         const width=r.body.parentNode?.getBoundingClientRect().width||216;
-        const height=Math.max(width,Math.min(1000,config.mapHeight||width));
-        r.body.style.width='100%';r.body.style.height=Math.round(height)+'px';
+        const singleWidth=r.shell.closest('.oogwrap')?.getBoundingClientRect().width||width;
+        const height=Math.max(singleWidth,Math.min(1000,config.mapHeight||singleWidth));
+        r.body.style.width='100%';r.body.style.height=Math.round(height)+'px';if(spanState?.r===r)spanState.spacer.style.height=(height+r.header.getBoundingClientRect().height+10)+'px';
         const map=window.gameClient?.renderer?.minimap;
         if(!map?.minimap?.canvas||typeof map.render!=='function')return;
         if(mapBinding?.map!==map){
@@ -6278,15 +6313,15 @@ window.__minibiaBotBundle.installSidebarPanelsModule = function installSidebarPa
             const b={map,canvas,width:canvas.width,height:canvas.height,original:{render:map.render,cache:map.cache,__coordsToWorldPosition:map.__coordsToWorldPosition}};
             const tile={canvas:scratch,context,clear(){context.clearRect(0,0,160,160);}};
             b.render=function(chunks,skipMarker){
-                const originalCanvas=this.minimap,center=this.center,zoom=1<<this.__zoomLevel,H=canvas.height;
+                const originalCanvas=this.minimap,center=this.center,zoom=1<<this.__zoomLevel,H=canvas.height,W=canvas.width;
                 context.imageSmoothingEnabled=false;
                 originalCanvas.context.save();originalCanvas.context.imageSmoothingEnabled=false;originalCanvas.context.globalCompositeOperation="source-over";originalCanvas.context.clearRect(0,0,canvas.width,H);
                 try{
                     this.minimap=tile;
-                    for(let top=0;top<H;top+=160){
-                        this.center=Object.assign(Object.create(Object.getPrototypeOf(center)),center,{y:center.y+(top+80-H/2)/zoom});
+                    for(let top=0;top<H;top+=160)for(let left=0;left<W;left+=160){
+                        this.center=Object.assign(Object.create(Object.getPrototypeOf(center)),center,{x:center.x+(left+80-W/2)/zoom,y:center.y+(top+80-H/2)/zoom});
                         b.original.render.call(this,chunks,skipMarker);
-                        const rows=Math.min(160,H-top);originalCanvas.context.drawImage(scratch,0,0,160,rows,0,top,160,rows);
+                        const rows=Math.min(160,H-top),cols=Math.min(160,W-left);originalCanvas.context.drawImage(scratch,0,0,cols,rows,left,top,cols,rows);
                     }
                 }finally{this.minimap=originalCanvas;this.center=center;originalCanvas.context.restore();}
             };
@@ -6296,20 +6331,20 @@ window.__minibiaBotBundle.installSidebarPanelsModule = function installSidebarPa
                 // Load every chunk crossed by the taller view, including gaps
                 // between its top and bottom. Native cache only covers a square.
                 for(let y=Math.floor((cy-canvas.height/2)/128)*128;y<=cy+canvas.height/2;y+=128)
-                    for(let x=Math.floor((cx-80)/128)*128;x<=cx+80;x+=128)
+                    for(let x=Math.floor((cx-canvas.width/2)/128)*128;x<=cx+canvas.width/2;x+=128)
                         points.push(Object.assign(Object.create(Object.getPrototypeOf(p)),p,{x,y,z:this.__renderLayer}));
                 client.database.preloadCallback(points,this.chunkUpdate.bind(this));
             };
-            b.__coordsToWorldPosition=function(coords){return b.original.__coordsToWorldPosition.call(this,{x:coords.x,y:coords.y-(canvas.height/2-80)});};
+            b.__coordsToWorldPosition=function(coords){return b.original.__coordsToWorldPosition.call(this,{x:coords.x-(canvas.width/2-80),y:coords.y-(canvas.height/2-80)});};
             mapBinding=b;for(const name of ['render','cache','__coordsToWorldPosition'])map[name]=b[name];
         }
         const b=mapBinding;
         // Fixed horizontal tile scale, additional vertical pixels = more terrain.
         // Multiples of 32 keep every native zoom level aligned at strip seams.
-        const internalHeight=Math.max(160,Math.round(160*height/width/32)*32);
-        if(b.canvas.height!==internalHeight||b.canvas.width!==160){b.canvas.width=160;b.canvas.height=internalHeight;map.cache();}
+        const internalWidth=config.mapSpan===2&&spanState?320:160,internalHeight=Math.max(160,Math.round(internalWidth*height/width/32)*32);
+        if(b.canvas.height!==internalHeight||b.canvas.width!==internalWidth){b.canvas.width=internalWidth;b.canvas.height=internalHeight;map.cache();}
     }
-    function resizeMap(event){if(!mapDrag)return;const {r,y,size}=mapDrag;const width=r.shell.getBoundingClientRect().width;config.mapHeight=Math.round(Math.max(width,Math.min(1000,size+event.clientY-y)));updateMapSize(r);}
+    function resizeMap(event){if(!mapDrag)return;if(mapDrag.horizontal){const delta=(event.clientX-mapDrag.x)*(mapDrag.side==='left'?-1:1);config.mapSpan=delta>35?2:delta< -35?1:mapDrag.start;sync();return;}const {r,y,size}=mapDrag;const width=r.shell.closest('.oogwrap')?.getBoundingClientRect().width||r.shell.getBoundingClientRect().width/(spanState?2:1);config.mapHeight=Math.round(Math.max(width,Math.min(1000,size+event.clientY-y)));updateMapSize(r);}
     function finishMap(){if(mapDrag){mapDrag=null;persist();}}
     document.addEventListener('pointermove',resizeMap);document.addEventListener('pointerup',finishMap);document.addEventListener('pointercancel',finishMap);
     bot.sidebarPanels={config,mount,updateConfig,restore,sync};sync();const timer=setInterval(sync,500);
