@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.495",
+        version: "1.6.496",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -6029,7 +6029,7 @@ window.__minibiaBotBundle.installSidebarPanelsModule = function installSidebarPa
  margin:0!important;padding:0!important;box-sizing:border-box!important;
 }
 .window.mb-hud-window>.header>.title{pointer-events:none;}
-.window.mb-hud-window.mb-hud-minimized>.body{display:none!important;}
+#game-wrapper .window.mb-hud-window.mb-hud-minimized>.body{display:none!important;}
 .window.mb-hud-window>.mb-hud-body{min-width:0;max-width:100%;box-sizing:border-box;}
 .window.mb-hud-window[data-mb-hud="equipment"]>.body.equipment-options-wrapper{
  display:flex!important;flex-direction:row!important;flex-wrap:nowrap!important;align-items:flex-start!important;
