@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.488",
+        version: "1.6.489",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -5672,7 +5672,7 @@ window.__minibiaBotBundle.installNativeHotbarSkinModule = function installNative
 window.__minibiaBotBundle.installHotbarDockModule = function installHotbarDockModule(bot){
     const key='minibiaBot.hotbarDock.config',saved=bot.storage.get(key,{});
     const normalize=value=>['left','right'].includes(value)?value:'bottom';
-    const config={position:normalize(saved.position)};
+    const config={position:normalize(saved.position),showSecondBank:saved.showSecondBank!==false};
     let disposed=false,binding=null,extraBars=[];
     const style=document.createElement('style');style.id='minibia-bot-hotbar-dock-style';
     style.textContent=`
@@ -5819,7 +5819,7 @@ window.__minibiaBotBundle.installHotbarDockModule = function installHotbarDockMo
         // 24 slots + settings + one spare cell for the adaptive tray. Hide
         // bank two only visually; Shift hotkeys and assignments stay intact.
         const bottomWidth=b.bottom.clientWidth;
-        b.bottom.classList.toggle('mb-hotbar-compact',bottomWidth>0&&bottomWidth<938);
+        b.bottom.classList.toggle('mb-hotbar-compact',!config.showSecondBank||(bottomWidth>0&&bottomWidth<938));
         const height=b.upper.getBoundingClientRect().height;
         if(height>0){
             b.left.style.maxHeight=b.right.style.maxHeight=Math.round(height)+'px';
@@ -5838,13 +5838,13 @@ window.__minibiaBotBundle.installHotbarDockModule = function installHotbarDockMo
         const signature=config.position+'|'+active.map(e=>e.id+':'+e.position).join(',');
         if(signature!==b.signature){b.signature=signature;window.dispatchEvent(new Event('resize'));}
     }
-    function updateConfig(next){config.position=normalize(next.position);bot.storage.set(key,{...config});apply();return {...config};}
+    function updateConfig(next){if('position' in next)config.position=normalize(next.position);if('showSecondBank' in next)config.showSecondBank=next.showSecondBank!==false;bot.storage.set(key,{...config});apply();window.dispatchEvent(new Event('resize'));return {...config};}
     function mount(parent){if(!parent||parent.querySelector('[data-hotbar-dock]'))return;
         const section=document.createElement('div');section.className='mb-section';section.setAttribute('data-hotbar-dock','');
-        section.innerHTML='<div class="mb-section-title"><span class="mb-title-text">⌨ Hotbar</span></div><label class="mb-field"><span class="mb-field-label">Position</span><select><option value="bottom">Bottom</option><option value="left">Left of canvas (vertical)</option><option value="right">Right of canvas (vertical)</option></select></label>';
-        const select=section.querySelector('select');select.value=config.position;select.addEventListener('change',()=>updateConfig({position:select.value}));parent.appendChild(section);
+        section.innerHTML='<div class="mb-section-title"><span class="mb-title-text">⌨ Hotbar</span></div><label class="mb-field"><span class="mb-field-label">Position</span><select><option value="bottom">Bottom</option><option value="left">Left of canvas (vertical)</option><option value="right">Right of canvas (vertical)</option></select></label><label class="mb-toggle"><input type="checkbox" data-second-bank><span>Show second hotbar bank</span></label><div class="mb-small-note">Bottom layout: hide bank two to fill the space with custom slots. Ctrl+click a custom slot to bind a hotkey.</div>';
+        const select=section.querySelector('select');select.value=config.position;select.addEventListener('change',()=>updateConfig({position:select.value}));const bank=section.querySelector('[data-second-bank]');bank.checked=config.showSecondBank;bank.addEventListener('change',()=>updateConfig({showSecondBank:bank.checked}));parent.appendChild(section);
     }
-    bot.hotbarDock={config,updateConfig,mount,sync:apply,getSideHeight:()=>Number(binding?.upper?.getBoundingClientRect?.()?.height)||0,getBottomWidth:()=>binding?.bottom?.clientWidth||0,getNativeBottomCells:()=>{const width=binding?.bottom?.clientWidth||0;return width>0&&width<938?13:25;},setExtraBars:entries=>{extraBars=entries;apply();}};
+    bot.hotbarDock={config,updateConfig,mount,sync:apply,getSideHeight:()=>Number(binding?.upper?.getBoundingClientRect?.()?.height)||0,getBottomWidth:()=>binding?.bottom?.clientWidth||0,getNativeBottomCells:()=>{const width=binding?.bottom?.clientWidth||0;return !config.showSecondBank||(width>0&&width<938)?13:25;},setExtraBars:entries=>{extraBars=entries;apply();}};
     apply();const timer=setInterval(apply,500);
     bot.addCleanup(()=>{disposed=true;clearInterval(timer);restore();style.remove();window.dispatchEvent(new Event('resize'));});
 };
