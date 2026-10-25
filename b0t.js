@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.520",
+        version: "1.6.527",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -5507,7 +5507,7 @@ window.__minibiaBotBundle.installExtraHotbarsModule = function installExtraHotba
     }
     window.addEventListener('keydown',keydown,true);
     function position(){
-        bot.hotbarDock?.setExtraBars?.(nodes.map(e=>({id:e.bar.id,root:e.root,position:e.bar.position,enabled:e.bar.enabled})));
+        bot.hotbarDock?.setExtraBars?.(nodes.map(e=>({id:e.bar.id,root:e.root,position:e.bar.autoFill?(bot.hotbarDock?.config.position||'bottom'):e.bar.position,enabled:e.bar.enabled,autoFill:e.bar.autoFill})));
     }
     function removeNodes(){rebinding=null;bot.hotbarDock?.setExtraBars?.([]);for(const n of nodes.splice(0))n.root.remove();drag=null;}
     function rebuild(){
@@ -5556,8 +5556,12 @@ window.__minibiaBotBundle.installExtraHotbarsModule = function installExtraHotba
             desired.set(bar,count);
         }
         const bar=config.bars.find(b=>b.autoFill);
+        const position=bot.hotbarDock?.config.position||'bottom';
+        if(bar)bar.position=position;
         const width=Number(bot.hotbarDock?.getBottomWidth?.() || document.querySelector('.main')?.clientWidth || 0);
-        if(bar?.enabled && width>=70){
+        if(bar?.enabled && position!=='bottom' && height>0){
+            desired.set(bar,bot.hotbarDock.getSideTrayFillCells());
+        }else if(bar?.enabled && width>=70){
             const native=bot.hotbarDock?.config?.position==='bottom'?(bot.hotbarDock?.getNativeBottomCells?.()||25):0;
             const others=config.bars.filter(b=>b!==bar&&b.enabled&&b.position==='bottom').reduce((n,b)=>n+(desired.get(b)||b.count),0);
             desired.set(bar,Math.max(1,Math.min(48,Math.floor((width-2)/36)-native-others)));
@@ -5588,15 +5592,16 @@ window.__minibiaBotBundle.installExtraHotbarsModule = function installExtraHotba
     function setSlotCount(id,value){const bar=config.bars.find(b=>b.id===id);if(!bar)return false;capture();bar.count=slotCount(value);bar.manualCount=bar.count;update();return true;}
     function mount(parent){if(!parent||parent.querySelector('[data-extra-hotbars]'))return;
         const section=document.createElement('div');section.className='mb-section';section.setAttribute('data-extra-hotbars','');
-        section.innerHTML='<div class="mb-dropper-heading"><div class="mb-section-title"><span class="mb-title-text">⌨ Extra hotbars</span></div><button type="button" class="mb-small-button" data-bar-add>+ Hotbar</button></div><label class="mb-toggle"><input type="checkbox" data-auto-fit-sides><span>Auto-fit side hotbars to canvas height</span></label><div data-bar-list></div><div class="mb-small-note">The bottom tray fills spare width automatically. Extra bars: 1–48 slots each. Right-click to edit. Ctrl+click to bind a hotkey; Esc cancels, Backspace clears.</div>';
+        section.innerHTML='<div class="mb-dropper-heading"><div class="mb-section-title"><span class="mb-title-text">⌨ Extra hotbars</span></div><button type="button" class="mb-small-button" data-bar-add>+ Hotbar</button></div><label class="mb-toggle"><input type="checkbox" data-auto-fit-sides><span>Auto-fit side hotbars to canvas height</span></label><div data-bar-list></div><div class="mb-small-note">The automatic tray follows the native hotbar and fills spare space. Extra bars: 1–48 slots each. Right-click to edit. Ctrl+click to bind a hotkey; Esc cancels, Backspace clears.</div>';
         const list=section.querySelector('[data-bar-list]'),button=section.querySelector('[data-bar-add]');button.addEventListener('click',add);
         const autoFit=section.querySelector('[data-auto-fit-sides]');autoFit.checked=config.autoFitSides;
         autoFit.addEventListener('change',()=>{config.autoFitSides=autoFit.checked;persist();fitBottom();for(const render of views)render();});
         const render=()=>{list.replaceChildren();button.disabled=config.bars.filter(b=>!b.autoFill).length>=maxBars;
             config.bars.forEach((bar,i)=>{const row=document.createElement('div');row.style.cssText='display:flex;align-items:center;gap:6px;margin:5px 0';
-                const label=document.createElement('label');label.className='mb-toggle';label.style.cssText='flex:1;margin:0';const check=document.createElement('input');check.type='checkbox';check.checked=bar.enabled;label.append(check,document.createTextNode(bar.autoFill?'Bottom tray (auto)':'Hotbar '+(i+1)));
+                const label=document.createElement('label');label.className='mb-toggle';label.style.cssText='flex:1;margin:0';const check=document.createElement('input');check.type='checkbox';check.checked=bar.enabled;label.append(check,document.createTextNode(bar.autoFill?'Hotbar tray (auto)':'Hotbar '+(i+1)));
                 check.addEventListener('change',()=>{bar.enabled=check.checked;persist();position();});
                 const select=document.createElement('select');select.style.cssText='width:auto;max-width:110px';for(const [v,t] of [['left','Left'],['right','Right'],['bottom','Bottom']]){const o=document.createElement('option');o.value=v;o.textContent=t;select.appendChild(o);}select.value=bar.position;select.disabled=bar.autoFill===true;
+                select.title=bar.autoFill?'Follows the native hotbar position':'';
                 select.addEventListener('change',()=>{bar.position=select.value;bar.x=null;bar.y=null;persist();position();});
                 const count=document.createElement('input');count.type='number';count.min='1';count.max='48';count.step='1';count.value=String(bar.count);count.disabled=bar.autoFill===true||(config.autoFitSides&&bar.position!=="bottom");count.title='Number of slots (1–48)';count.setAttribute('aria-label','Slots in hotbar '+(i+1));count.style.cssText='width:58px;text-align:center';
                 count.addEventListener('change',()=>setSlotCount(bar.id,count.value));
@@ -5681,11 +5686,17 @@ window.__minibiaBotBundle.installHotbarDockModule = function installHotbarDockMo
     const key='minibiaBot.hotbarDock.config',saved=bot.storage.get(key,{});
     const normalize=value=>['left','right'].includes(value)?value:'bottom';
     const config={position:normalize(saved.position),showSecondBank:saved.showSecondBank!==false};
-    let disposed=false,binding=null,extraBars=[];
+    let disposed=false,binding=null,extraBars=[],scaleBinding=null,resizeFrame=null;
     const style=document.createElement('style');style.id='minibia-bot-hotbar-dock-style';
     style.textContent=`
-.mb-hotbar-dock-row{display:flex;align-items:stretch;flex:1 1 auto;min-width:0;min-height:0;overflow:hidden;}
-.mb-hotbar-dock-row>.upper{flex:1 1 0!important;min-width:0!important;width:auto!important;}
+/* The native .middle spacers grow independently of the canvas. Remove
+   empty spacer boxes and allocate canvas height without its intrinsic size,
+   so resizing the transformed canvas cannot shrink its own parent. */
+#game-wrapper .main.mb-hotbar-docked>.middle:empty{display:none!important;}
+.main.mb-hotbar-docked>.mb-hotbar-dock-row{flex:1 1 0!important;min-height:0!important;}
+.main.mb-hotbar-docked>.mb-hotbar-dock-row>.upper>.canvas-wrapper{min-width:0!important;min-height:0!important;flex:0 0 auto;}
+.mb-hotbar-dock-row{display:flex;align-items:stretch;flex:1 1 0;min-width:0;min-height:0;overflow:hidden;}
+.mb-hotbar-dock-row>.upper{display:flex!important;align-items:center!important;justify-content:center!important;position:relative!important;overflow:hidden!important;flex:1 1 0!important;min-width:0!important;min-height:0!important;width:auto!important;height:auto!important;align-self:stretch!important;}
 .mb-hotbar-dock-side>.hotbar{display:flex!important;flex-direction:column!important;flex-wrap:nowrap!important;align-items:center!important;justify-content:flex-start!important;width:42px!important;min-width:42px!important;flex:0 0 42px!important;height:auto!important;min-height:0!important;overflow-x:hidden!important;overflow-y:auto!important;gap:3px!important;margin:0!important;padding:4px 2px!important;box-sizing:border-box!important;position:relative!important;inset:auto!important;transform:none!important;}
 .mb-hotbar-dock-side>.hotbar>.hotbar-item{flex:0 0 34px!important;width:34px!important;height:34px!important;min-height:34px!important;box-sizing:border-box!important;margin:0!important;}
 .mb-hotbar-dock-side>.hotbar>.hotbar-presets{display:flex!important;flex-wrap:wrap!important;justify-content:center!important;flex:0 0 auto!important;width:36px!important;margin:0 0 2px!important;gap:1px!important;}
@@ -5788,9 +5799,95 @@ window.__minibiaBotBundle.installHotbarDockModule = function installHotbarDockMo
 
 
 `;
+    style.textContent += `
+/* Remove the native grey texture from the canvas surround and spacers. */
+#game-wrapper .main.mb-hotbar-docked,
+#game-wrapper .main.mb-hotbar-docked>.middle,
+#game-wrapper .main.mb-hotbar-docked>.mb-hotbar-dock-row,
+#game-wrapper .main.mb-hotbar-docked>.mb-hotbar-dock-row>.upper,
+#game-wrapper .main.mb-hotbar-docked>.mb-hotbar-dock-row>.upper>.canvas-wrapper{
+ background-color:#141414!important;
+ background-image:none!important;
+}
+/* Native side tray uses the same rack and slot grid as custom side hotbars. */
+.main .mb-hotbar-dock-side>.mb-side-hotkey-tray{
+ display:grid;grid-auto-flow:column;grid-template-columns:repeat(var(--mb-side-columns,1),34px);
+ grid-template-rows:repeat(var(--mb-side-rows,1),34px);gap:2px;
+ flex:0 0 auto;align-content:start;justify-content:start;align-self:stretch;
+ box-sizing:border-box;padding:2px;background:#141414;overflow:hidden;
+}
+.main .mb-side-hotkey-tray>.hotbar.mb-native-hotbar,
+.main .mb-side-hotkey-tray>.hotbar.mb-native-hotbar>.mb-extra-hotbar-slots,
+.main .mb-side-hotkey-tray>.mb-extra-hotbar,
+.main .mb-side-hotkey-tray>.mb-extra-hotbar>.mb-extra-hotbar-slots{display:contents!important;}
+.main .mb-side-hotkey-tray>.hotbar.mb-native-hotbar .hotbar-item{display:block!important;}
+.main .mb-side-hotkey-tray.mb-hotbar-compact>.hotbar.mb-native-hotbar .hotbar-item.hotbar-bank2{display:none!important;}
+.main .mb-side-hotkey-tray.mb-hotbar-compact>.hotbar.mb-native-hotbar.show-bank2 .hotbar-item.hotbar-bank2{display:block!important;}
+.main .mb-side-hotkey-tray.mb-hotbar-compact>.hotbar.mb-native-hotbar.show-bank2 .hotbar-item:not(.hotbar-bank2){display:none!important;}
+.main .mb-side-hotkey-tray>.mb-extra-hotbar>.mb-extra-hotbar-scroll{display:none!important;}
+.main .mb-side-hotkey-tray>.hotbar.mb-native-hotbar>.mb-extra-hotbar-scroll{display:contents!important;}
+.main .mb-side-hotkey-tray>.hotbar.mb-native-hotbar>.mb-extra-hotbar-scroll>button{width:34px;height:34px;box-sizing:border-box;margin:0;padding:0;order:100;}
+.main .mb-side-hotkey-tray>.hotbar.mb-native-hotbar>.mb-extra-hotbar-scroll>button:not(:last-child){display:none!important;}
+.main .mb-side-hotkey-tray>.hotbar.mb-native-hotbar>.mb-native-hotbar-controls{position:fixed;z-index:10000;padding:4px;border:1px solid #666;background:#222;}
+.main .mb-side-hotkey-tray .hotbar-bank-toggle{display:inline-block!important;}
+/* Border on the sized wrapper stays exactly one CSS pixel at every zoom. */
+#game-wrapper .main.mb-hotbar-docked>.mb-hotbar-dock-row>.upper>.canvas-wrapper{
+ outline:1px solid #000!important;
+ outline-offset:0;
+}
+/* Use the game's bg2 texture for the hotbar frames and canvas surround. */
+#game-wrapper .main.mb-hotbar-docked,
+#game-wrapper .main.mb-hotbar-docked>.middle,
+#game-wrapper .main.mb-hotbar-docked>.mb-hotbar-dock-row,
+#game-wrapper .main.mb-hotbar-docked>.mb-hotbar-dock-row>.upper,
+#game-wrapper .main.mb-hotbar-docked>.mb-hotbar-dock-row>.upper>.canvas-wrapper,
+#game-wrapper .main.mb-hotbar-docked .mb-hotbar-dock-side,
+#game-wrapper .main.mb-hotbar-docked .mb-bottom-hotkey-tray,
+#game-wrapper .main.mb-hotbar-docked .mb-side-hotkey-tray,
+#game-wrapper .main.mb-hotbar-docked .hotbar.mb-native-hotbar,
+#game-wrapper .main.mb-hotbar-docked .mb-extra-hotbar{
+ background-color:#191919!important;
+ background-image:url("https://minibia.com/png/bg2.png")!important;
+ background-repeat:repeat!important;
+}
+
+`;
     document.head.appendChild(style);
+    function restoreScale(){
+        if(scaleBinding && scaleBinding.ui.getResolutionScale===scaleBinding.wrapper)
+            scaleBinding.ui.getResolutionScale=scaleBinding.original;
+        scaleBinding=null;
+    }
+    function syncScale(){
+        const ui=window.gameClient?.interface;
+        if(scaleBinding?.ui===ui)return;
+        restoreScale();
+        if(typeof ui?.getResolutionScale!=='function')return;
+        const original=ui.getResolutionScale;
+        const wrapper=function(){
+            const requested=original.apply(this,arguments);
+            if(!binding||disposed||bot.interfaceLayout?.config.enabled===false||window.gameClient?.touch?.isMobileMode)return requested;
+            const rect=binding.upper.getBoundingClientRect();
+            const width=Number(this.SCREEN_WIDTH_MIN)||480,height=Number(this.SCREEN_HEIGHT_MIN)||352;
+            if(rect.width<=0||rect.height<=0)return requested;
+            // Fill the actual canvas area. The native scale reserves space
+            // for the default bottom hotbar and sidebars even after docking;
+            // using it as an upper limit leaves unused borders around the view.
+            return Math.min(Math.max(1,rect.width-2)/width,Math.max(1,rect.height-2)/height);
+        };
+        scaleBinding={ui,original,wrapper};ui.getResolutionScale=wrapper;
+    }
+    function queueCanvasResize(){
+        if(disposed||resizeFrame!==null)return;
+        resizeFrame=window.requestAnimationFrame(()=>{
+            resizeFrame=null;
+            if(binding&&!disposed)window.gameClient?.interface?.handleResize?.(new Event('resize'));
+        });
+    }
     function restore(){
-        const b=binding;if(!b)return;
+        const b=binding;if(!b){restoreScale();return;}
+        b.observer?.disconnect();restoreScale();
+        if(!b.hadDockClass)b.main.classList.remove('mb-hotbar-docked');
         for(const e of extraBars)if(e.root.parentNode && e.root.parentNode!==document.body)document.body.appendChild(e.root);
         if(b.barHome.isConnected)b.barHome.parentNode.insertBefore(b.bar,b.barHome);
         if(b.upperHome.isConnected)b.upperHome.parentNode.insertBefore(b.upper,b.upperHome);
@@ -5812,19 +5909,30 @@ window.__minibiaBotBundle.installHotbarDockModule = function installHotbarDockMo
             const bar=document.querySelector('.main .hotbar'),upper=document.querySelector('.main .upper'),middle=bar?.parentElement;
             if(!bar||!upper||!middle||!upper.parentElement||middle===upper)return;
             const barHome=document.createComment('mb0t hotbar home'),upperHome=document.createComment('mb0t canvas home');
-            const row=document.createElement('div'),left=document.createElement('div'),right=document.createElement('div'),bottom=document.createElement('div');
+            const row=document.createElement('div'),left=document.createElement('div'),right=document.createElement('div'),bottom=document.createElement('div'),sideTray=document.createElement('div');
+            sideTray.className='mb-side-hotkey-tray';
             row.className='mb-hotbar-dock-row';left.className=right.className='mb-hotbar-dock-side';bottom.className='mb-hotbar-dock-bottom mb-bottom-hotkey-tray';
             middle.insertBefore(barHome,bar);upper.parentElement.insertBefore(upperHome,upper);upper.parentElement.insertBefore(row,upper);row.parentNode.insertBefore(bottom,row.nextSibling);
             const ownedStyles=[[bar,'order'],[bar,'max-height'],[bar,'height']].map(([el,property])=>[el,property,el.style.getPropertyValue(property),el.style.getPropertyPriority(property)]);
+            const main=row.parentElement,hadDockClass=main.classList.contains('mb-hotbar-docked');
+            main.classList.add('mb-hotbar-docked');
             const middleStyle=middle.getAttribute('style');row.appendChild(left);row.appendChild(upper);row.appendChild(right);
-            binding={bar,upper,middle,barHome,upperHome,row,left,right,bottom,middleStyle,ownedStyles,signature:null};
+            binding={bar,upper,middle,main,hadDockClass,barHome,upperHome,row,left,right,bottom,sideTray,middleStyle,ownedStyles,signature:null,observer:null};
+            if(typeof ResizeObserver==='function'){
+                binding.observer=new ResizeObserver(queueCanvasResize);
+                binding.observer.observe(upper);
+            }
         }
+        syncScale();
         const b=binding;
-        const home=config.position==='bottom'?b.bottom:config.position==='left'?b.left:b.right;
+        const sideHome=config.position==='left'?b.left:b.right;
+        if(config.position!=='bottom'&&b.sideTray.parentNode!==sideHome)sideHome.insertBefore(b.sideTray,sideHome.firstChild);
+        b.sideTray.style.display=config.position==='bottom'?'none':'';
+        const home=config.position==='bottom'?b.bottom:b.sideTray;
         if(b.bar.parentNode!==home){home.insertBefore(b.bar,home.firstChild);}
         if(!b.middle.children.length)b.middle.style.display='none';
-        if(config.position==='bottom'){b.bar.style.removeProperty('max-height');b.bar.style.removeProperty('height');} 
-        for(const e of active){const target=e.position==='bottom'?b.bottom:e.position==='left'?b.left:b.right;
+        b.bar.style.removeProperty('max-height');b.bar.style.removeProperty('height'); 
+        for(const e of active){const target=e.autoFill?home:e.position==='bottom'?b.bottom:e.position==='left'?b.left:b.right;
             e.root.dataset.horizontal=String(e.position==='bottom');if(e.root.parentNode!==target)target.appendChild(e.root);}
         // 24 slots + settings + one spare cell for the adaptive tray. Hide
         // bank two only visually; Shift hotkeys and assignments stay intact.
@@ -5833,30 +5941,43 @@ window.__minibiaBotBundle.installHotbarDockModule = function installHotbarDockMo
         const height=b.upper.getBoundingClientRect().height;
         if(height>0){
             b.left.style.maxHeight=b.right.style.maxHeight=Math.round(height)+'px';
-            if(config.position!=='bottom'){b.bar.style.setProperty('max-height',Math.round(height)+'px');b.bar.style.setProperty('height',Math.round(height)+'px','important');}else b.bar.style.removeProperty('height');
+            const geometry=sideTrayGeometry(height);
+            b.sideTray.style.setProperty('--mb-side-rows',geometry.rows);
+            b.sideTray.style.setProperty('--mb-side-columns',geometry.columns);
+            b.sideTray.style.width=(geometry.columns*36+2)+'px';
+            b.sideTray.style.height=Math.round(height)+'px';
+            b.sideTray.classList.toggle('mb-hotbar-compact',!config.showSecondBank);
             for(const e of active){e.root.style.maxHeight=e.position==='bottom'?'':Math.round(height)+'px';e.root.style.height=e.position==='bottom'?'auto':Math.round(height)+'px';}
         }
         // Size containment keeps old sidebar heights out of the canvas flex
         // calculation. Width is explicit because contained children have no
         // intrinsic contribution; each bar is 38px with a 1px gap.
         for(const rack of [b.left,b.right]){
-            const count=Array.from(rack.children).filter(el=>el.style.display!=='none').length;
-            rack.style.width=Math.max(0,count*39-1)+'px';
-            rack.style.display=count?'flex':'none';
+            const children=Array.from(rack.children).filter(el=>el.style.display!=='none');
+            const width=children.reduce((sum,el)=>sum+(el===b.sideTray?parseFloat(el.style.width)||38:38),0)+Math.max(0,children.length-1);
+            rack.style.width=width+'px';
+            rack.style.display=children.length?'flex':'none';
         }
-        b.bottom.style.setProperty('display',config.position==='bottom'||active.some(e=>e.position==='bottom')?'grid':'none','important');
-        const signature=config.position+'|'+active.map(e=>e.id+':'+e.position).join(',');
-        if(signature!==b.signature){b.signature=signature;window.dispatchEvent(new Event('resize'));}
+        b.bottom.style.setProperty('display',config.position==='bottom'||active.some(e=>!e.autoFill&&e.position==='bottom')?'grid':'none','important');
+        const signature=config.position+'|'+config.showSecondBank+'|'+b.sideTray.style.width+'|'+active.map(e=>e.id+':'+e.position).join(',');
+        if(signature!==b.signature){b.signature=signature;window.dispatchEvent(new Event('resize'));queueCanvasResize();}
+    }
+    function sideTrayGeometry(height){
+        const rows=Math.max(1,Math.floor((height-2)/36));
+        const nativeCells=config.showSecondBank?25:13; // native slots plus settings
+        const hasFill=extraBars.some(e=>e.enabled&&e.autoFill);
+        const columns=Math.max(1,Math.ceil((nativeCells+(hasFill?1:0))/rows));
+        return {rows,columns,fillCells:Math.max(1,Math.min(48,rows*columns-nativeCells))};
     }
     function updateConfig(next){if('position' in next)config.position=normalize(next.position);if('showSecondBank' in next)config.showSecondBank=next.showSecondBank!==false;bot.storage.set(key,{...config});apply();window.dispatchEvent(new Event('resize'));return {...config};}
     function mount(parent){if(!parent||parent.querySelector('[data-hotbar-dock]'))return;
         const section=document.createElement('div');section.className='mb-section';section.setAttribute('data-hotbar-dock','');
-        section.innerHTML='<div class="mb-section-title"><span class="mb-title-text">⌨ Hotbar</span></div><label class="mb-field"><span class="mb-field-label">Position</span><select><option value="bottom">Bottom</option><option value="left">Left of canvas (vertical)</option><option value="right">Right of canvas (vertical)</option></select></label><label class="mb-toggle"><input type="checkbox" data-second-bank><span>Show second hotbar bank</span></label><div class="mb-small-note">Bottom layout: hide bank two to fill the space with custom slots. Ctrl+click a custom slot to bind a hotkey.</div>';
+        section.innerHTML='<div class="mb-section-title"><span class="mb-title-text">⌨ Hotbar</span></div><label class="mb-field"><span class="mb-field-label">Position</span><select><option value="bottom">Bottom</option><option value="left">Left of canvas (vertical)</option><option value="right">Right of canvas (vertical)</option></select></label><label class="mb-toggle"><input type="checkbox" data-second-bank><span>Show second hotbar bank</span></label><div class="mb-small-note">The automatic tray follows the hotbar and fills spare space with custom slots. Ctrl+click a custom slot to bind a hotkey.</div>';
         const select=section.querySelector('select');select.value=config.position;select.addEventListener('change',()=>updateConfig({position:select.value}));const bank=section.querySelector('[data-second-bank]');bank.checked=config.showSecondBank;bank.addEventListener('change',()=>updateConfig({showSecondBank:bank.checked}));parent.appendChild(section);
     }
-    bot.hotbarDock={config,updateConfig,mount,sync:apply,getSideHeight:()=>Number(binding?.upper?.getBoundingClientRect?.()?.height)||0,getBottomWidth:()=>binding?.bottom?.clientWidth||0,getNativeBottomCells:()=>{const width=binding?.bottom?.clientWidth||0;return !config.showSecondBank||(width>0&&width<938)?13:25;},setExtraBars:entries=>{extraBars=entries;apply();}};
+    bot.hotbarDock={config,updateConfig,mount,sync:apply,getSideHeight:()=>Number(binding?.upper?.getBoundingClientRect?.()?.height)||0,getSideTrayFillCells:()=>sideTrayGeometry(Number(binding?.upper?.getBoundingClientRect?.()?.height)||0).fillCells,getBottomWidth:()=>binding?.bottom?.clientWidth||0,getNativeBottomCells:()=>{const width=binding?.bottom?.clientWidth||0;return !config.showSecondBank||(width>0&&width<938)?13:25;},setExtraBars:entries=>{extraBars=entries;apply();}};
     apply();const timer=setInterval(apply,500);
-    bot.addCleanup(()=>{disposed=true;clearInterval(timer);restore();style.remove();window.dispatchEvent(new Event('resize'));});
+    bot.addCleanup(()=>{disposed=true;clearInterval(timer);if(resizeFrame!==null)window.cancelAnimationFrame(resizeFrame);resizeFrame=null;restore();style.remove();window.dispatchEvent(new Event('resize'));});
 };
 
 window.__minibiaBotBundle.installExtraSidebarsModule = function installExtraSidebarsModule(bot){
