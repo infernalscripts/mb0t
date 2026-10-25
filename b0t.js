@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.501",
+        version: "1.6.505",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -6125,7 +6125,7 @@ window.__minibiaBotBundle.installSidebarPanelsModule = function installSidebarPa
 .window.mb-hud-window[data-mb-hud="minimap"] #minimap-container .minimap-wrapper{position:relative!important;display:block!important;width:100%!important;height:100%!important;min-height:0!important;margin:0!important;padding:0!important;border:0!important;border-radius:0!important;aspect-ratio:auto!important;overflow:hidden!important;}
 .window.mb-hud-window[data-mb-hud="minimap"] #minimap{position:absolute!important;inset:0!important;width:100%!important;height:100%!important;border:0!important;border-radius:0!important;margin:0!important;image-rendering:pixelated!important;}
 .window.mb-hud-window[data-mb-hud="minimap"] .crosshair{left:50%!important;top:50%!important;transform:translate(-50%,-50%)!important;pointer-events:none;}
-.window.mb-hud-window[data-mb-hud="minimap"]>.footer{cursor:ns-resize;touch-action:none;}
+.window.mb-hud-window[data-mb-hud="minimap"]>.footer{cursor:ns-resize;touch-action:none;height:4px!important;min-height:4px!important;max-height:4px!important;flex:0 0 4px!important;padding:0!important;margin:0!important;border:0!important;background:none!important;}
 
 #game-wrapper .oogwrap[data-mb-empty-sidebar]{display:none!important;width:0!important;min-width:0!important;max-width:0!important;flex:0 0 0!important;padding:0!important;margin:0!important;border:0!important;overflow:hidden!important;}
 #game-wrapper .oogwrap2[data-mb-empty-top]{display:none!important;height:0!important;min-height:0!important;max-height:0!important;flex:0 0 0!important;margin:0!important;padding:0!important;border:0!important;overflow:hidden!important;}
@@ -6335,7 +6335,12 @@ window.__minibiaBotBundle.installSidebarPanelsModule = function installSidebarPa
         const width=r.body.parentNode?.getBoundingClientRect().width||216;
         const singleWidth=r.shell.closest('.oogwrap')?.getBoundingClientRect().width||width;
         const height=Math.max(singleWidth,Math.min(1000,config.mapHeight||singleWidth));
-        r.body.style.width='100%';r.body.style.height=Math.round(height)+'px';if(spanState?.r===r)spanState.spacer.style.height=(height+r.header.getBoundingClientRect().height+10)+'px';
+        r.body.style.width='100%';r.body.style.height=Math.round(height)+'px';if(spanState?.r===r){
+            // Reserve only the map's actual overlap with the neighbouring stack.
+            // That stack may already begin below another original-position panel.
+            const bottom=r.shell.getBoundingClientRect().bottom,top=spanState.spacer.getBoundingClientRect().top;
+            spanState.spacer.style.height=Math.max(0,Math.ceil(bottom-top))+'px';
+        }
         const map=window.gameClient?.renderer?.minimap;
         if(!map?.minimap?.canvas||typeof map.render!=='function')return;
         if(mapBinding?.map!==map){
@@ -15835,6 +15840,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         // while lure/normal branches disagree about who owns movement.
         releaseCurrentTargetIfOffScreen(now);
 
+        if (yieldOffscreenMovementToLoot(now)) return true;
+
         if (syncIgnoredTrapEscape(now)) return true;
         if (syncFleeingTarget(now)) return true;
         if (syncKiteLurePull(now)) return true;
@@ -17766,6 +17773,28 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         if (state.offscreenLootPauseHeld)
             bot.cave?.resumeMovement?.("offscreen-loot");
         state.offscreenLootPauseHeld=false;
+    }
+
+    function yieldOffscreenMovementToLoot(now = Date.now()) {
+        if (!state.running || !config.enabled ||
+            bot.looter?.hasPendingLoot?.(now) !== true ||
+            getNearbyMonsters(false, {ignoreModeLos:true}).some(m => !isIgnoredTargetCreature(m))) {
+            clearOffscreenLootWait();
+            return false;
+        }
+        // Run before lure/kite-lure acquisition as well as ordinary Hunt.
+        // Cancel only Targeting's own paths, never the corpse path.
+        if (state.offscreenHuntActive || state.offscreenHuntPauseHeld ||
+            window.gameClient?.__mbTargetingAutoWalkOwner === "hunt")
+            clearOffscreenHunt("looting before next off-screen target", {quiet:true});
+        if (state.lureOffscreenPullActive || state.lureOffscreenPullPauseHeld ||
+            window.gameClient?.__mbTargetingAutoWalkOwner === "pull")
+            clearLureOffscreenPull("looting before next off-screen pull", {quiet:true});
+        if (!state.offscreenLootPauseHeld && bot.cave?.status?.().running)
+            state.offscreenLootPauseHeld = bot.cave.pauseMovement?.("offscreen-loot") === true;
+        state.movementOwner = null;
+        state.movementOwnedUntil = 0;
+        return true;
     }
 
     function waitForLootBeforeOffscreenHunt(target, now) {
@@ -23154,6 +23183,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     function refreshMovementOwnership(now = Date.now()) {
         if (!state.running || !config.enabled)
             return false;
+        if (yieldOffscreenMovementToLoot(now)) return false;
         // Public status reads must not recreate the owner cleared by the PZ
         // attack guard earlier in this tick, including for manual targets.
         if (isProtectionZoneBlocked(now)) {
@@ -50092,34 +50122,8 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         if (!job)
             return false;
 
-        const playerPos =
-            bot.getPlayerPosition();
-
-        if (
-            playerPos &&
-            Number(playerPos.z) ===
-                Number(job.position?.z)
-        ) {
-            const distance =
-                Math.max(
-                    Math.abs(
-                        Number(job.position?.x) -
-                        Number(playerPos.x)
-                    ),
-                    Math.abs(
-                        Number(job.position?.y) -
-                        Number(playerPos.y)
-                    )
-                );
-
-            if (
-                Number.isFinite(distance) &&
-                distance <= 1
-            ) {
-                return true;
-            }
-        }
-
+        // Hold route movement for the complete corpse job, including jobs
+        // that start adjacent. Opening/looting must not race a lure route.
         job.caveWasRunning =
             !!bot.cave?.status?.().running;
         job.attackWasRunning =
@@ -50316,6 +50320,84 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         );
 
         return true;
+    }
+
+    // Only confirmed nonempty Loot-channel results may create corpse jobs.
+    // Keep death snapshots separate: pending confirmation never owns movement.
+    const corpseLootDeaths = [];
+    const corpseLootResults = [];
+    const CORPSE_LOOT_MATCH_MS = 5000;
+    let corpseLootHook = null;
+
+    function corpseLootName(name) {
+        return String(name || "").trim().toLowerCase().replace(/^(?:an?|the)\s+/, "").replace(/\s+/g, " ");
+    }
+
+    function pruneCorpseLootMatches(now) {
+        for (const list of [corpseLootDeaths, corpseLootResults]) {
+            for (let i = list.length - 1; i >= 0; i--)
+                if (now - list[i].at > CORPSE_LOOT_MATCH_MS) list.splice(i, 1);
+            while (list.length > 128) list.shift();
+        }
+    }
+
+    function matchCorpseLoot(now) {
+        pruneCorpseLootMatches(now);
+        for (let i = 0; i < corpseLootDeaths.length;) {
+            const death = corpseLootDeaths[i];
+            const index = corpseLootResults.findIndex(result => result.name === death.name &&
+                Math.abs(result.at - death.at) <= CORPSE_LOOT_MATCH_MS);
+            if (index < 0) { i++; continue; }
+            const result = corpseLootResults.splice(index, 1)[0];
+            corpseLootDeaths.splice(i, 1);
+            if (result.hasLoot && state.runtimeRunning && state.walkToCorpses && !corpseActionsBlocked())
+                enqueueCorpseDeath(death.creature, death.at);
+        }
+    }
+
+    function observeCorpseLoot(message, now = Date.now()) {
+        if (!state.runtimeRunning || !state.walkToCorpses || corpseActionsBlocked()) return;
+        // Read the channel input, independent of popup visibility or channel focus.
+        const text = String(message || "").replace(/<[^>]*>/g, "").trim();
+        const match = /^Loot of (.+?):\s*(.*?)\s*$/i.exec(text);
+        if (!match) return;
+        const contents = match[2].trim();
+        corpseLootResults.push({ name: corpseLootName(match[1]), at: now,
+            hasLoot: !!contents && !/^nothing[.!]?$/i.test(contents) });
+        matchCorpseLoot(now);
+    }
+
+    function awaitCorpseLoot(creature, now = Date.now()) {
+        if (!state.runtimeRunning || !state.walkToCorpses || corpseActionsBlocked()) return;
+        pruneCorpseLootMatches(now);
+        if (corpseLootDeaths.some(death => death.creature.id === creature.id)) return;
+        corpseLootDeaths.push({ creature, name: corpseLootName(creature.name), at: now });
+        matchCorpseLoot(now);
+    }
+
+    function installCorpseLootHook() {
+        const owner = window.gameClient?.interface?.channelManager;
+        if (!owner || typeof owner.addLootMessage !== "function") return false;
+        if (corpseLootHook?.owner === owner && owner.addLootMessage === corpseLootHook.wrapper) return true;
+        removeCorpseLootHook();
+        const original = owner.addLootMessage;
+        const wrapper = function(message, ...args) {
+            const result = original.call(this, message, ...args);
+            try { observeCorpseLoot(message); }
+            catch (error) { bot.log("Looter: loot confirmation failed", error); }
+            return result;
+        };
+        corpseLootHook = { owner, original, wrapper };
+        owner.addLootMessage = wrapper;
+        return true;
+    }
+
+    function removeCorpseLootHook() {
+        if (corpseLootHook && corpseLootHook.owner.addLootMessage === corpseLootHook.wrapper)
+            corpseLootHook.owner.addLootMessage = corpseLootHook.original;
+        corpseLootHook = null;
+        corpseLootDeaths.length = 0;
+        corpseLootResults.length = 0;
     }
 
     function enqueueCorpseDeath(
@@ -50562,6 +50644,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
     }
 
     function ensureDeathHookOwnership() {
+        installCorpseLootHook();
         if (!state.runtimeRunning)
             return false;
 
@@ -50603,6 +50686,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
     }
 
     function installDeathHook() {
+        installCorpseLootHook();
         if (state.deathHookWrapper)
             return true;
 
@@ -50691,7 +50775,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
 
             if (deathCandidate) {
                 try {
-                    enqueueCorpseDeath(
+                    awaitCorpseLoot(
                         deathCandidate,
                         Date.now()
                     );
@@ -50722,6 +50806,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
     }
 
     function uninstallDeathHook() {
+        removeCorpseLootHook();
         if (state.deathHookRetryTimer != null) {
             window.clearTimeout(
                 state.deathHookRetryTimer
@@ -50747,9 +50832,8 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
 
         try {
             monsters =
-                bot.attack?.getNearbyMonsters?.(
-                    false
-                ) || [];
+                bot.attack?.getVisibleCombatMonsters?.() ||
+                bot.attack?.getNearbyMonsters?.(false) || [];
         } catch (e) {
             monsters = [];
         }
@@ -50811,9 +50895,9 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                     currentTarget.state?.health ??
                     currentTarget.health
                 );
-            currentTargetAlive =
-                !Number.isFinite(hp) ||
-                hp > 0;
+            // A selected off-screen creature must not starve corpse jobs.
+            currentTargetAlive = liveMonsters.some(m => m.id === currentTarget.id) &&
+                (!Number.isFinite(hp) || hp > 0);
         }
 
         if (
@@ -50999,7 +51083,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         if (!corpseInfo || job.openAttempts >= 3 || (job.lastOpenAt && now-job.lastOpenAt < 1800)) return true;
         const open = () => {
             const pos = bot.getPlayerPosition(), current = getCorpseTileInfo(job.position);
-            if (!state.runtimeRunning || state.corpseJob !== job || corpseActionsBlocked() || !pos ||
+            if (!state.runtimeRunning || state.corpseJob !== job || corpseActionsBlocked() || !getCorpseCombatGate(Date.now(),false).clear || !pos ||
                 Number(pos.z) !== Number(job.position.z) || Math.max(Math.abs(pos.x-job.position.x),Math.abs(pos.y-job.position.y)) > 1 ||
                 !current || current.item !== corpseInfo.item || typeof ItemUsePacket !== 'function' || !window.gameClient?.send ||
                 window.gameClient.networkManager?.isConnected?.() === false) return false;
@@ -51073,9 +51157,9 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                 )
             );
 
-            // Walking is between fights. A nearby corpse only needs an open
-            // and loot pass, so it can be serviced while Targeting continues.
-            if (distance > 1 && !getCorpseCombatGate(now,true).clear) return false;
+            // Nearby opening also needs a quiet movement window. Lure and
+            // kite lure must finish combat before any corpse job takes over.
+            if (!getCorpseCombatGate(now,true).clear) return false;
 
             if (distance > state.corpseMaxDistance) {
                 state.corpseQueue.shift();
@@ -51155,7 +51239,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                     false
                 );
 
-            if (distance > 1 && !ownershipCombatGate.clear) {
+            if (!ownershipCombatGate.clear) {
                 state.corpseQueue.unshift(
                     candidate
                 );
@@ -51251,7 +51335,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             Math.max(Math.abs(livePlayerPos.x-job.position.x),Math.abs(livePlayerPos.y-job.position.y)) <= 1;
         const combatGate = getCorpseCombatGate(now,false);
 
-        if (!adjacent && !combatGate.clear) {
+        if (!combatGate.clear) {
             deferCorpseJobForCombat(
                 job,
                 combatGate,
@@ -51823,6 +51907,8 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
 
     function setCorpseEnabled(enabled, options = {}) {
         if (state.disposed) return false;
+        corpseLootDeaths.length = 0;
+        corpseLootResults.length = 0;
         state.walkToCorpses = enabled === true;
         if (!state.walkToCorpses) {
             state.corpseQueue = [];
