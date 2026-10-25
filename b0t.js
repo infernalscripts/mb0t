@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.489",
+        version: "1.6.490",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -6080,7 +6080,7 @@ window.__minibiaBotBundle.installSidebarPanelsModule = function installSidebarPa
 .window.mb-hud-window[data-mb-hud="minimap"]>.mb-hud-body{align-self:center;flex:0 0 auto!important;padding:0!important;margin:0!important;width:100%!important;aspect-ratio:auto;overflow:hidden!important;}
 .window.mb-hud-window[data-mb-hud="minimap"] #minimap-container{position:relative!important;width:100%!important;height:100%!important;min-height:0!important;padding:0!important;margin:0!important;border:0!important;border-radius:0!important;}
 .window.mb-hud-window[data-mb-hud="minimap"] #minimap-container .minimap-wrapper{position:relative!important;display:block!important;width:100%!important;height:100%!important;min-height:0!important;margin:0!important;padding:0!important;border:0!important;border-radius:0!important;aspect-ratio:auto!important;overflow:hidden!important;}
-.window.mb-hud-window[data-mb-hud="minimap"] #minimap{position:absolute!important;inset:0!important;width:100%!important;height:100%!important;border:0!important;border-radius:0!important;margin:0!important;image-rendering:pixelated;}
+.window.mb-hud-window[data-mb-hud="minimap"] #minimap{position:absolute!important;inset:0!important;width:100%!important;height:100%!important;border:0!important;border-radius:0!important;margin:0!important;image-rendering:pixelated!important;}
 .window.mb-hud-window[data-mb-hud="minimap"] .crosshair{left:50%!important;top:50%!important;transform:translate(-50%,-50%)!important;pointer-events:none;}
 .window.mb-hud-window[data-mb-hud="minimap"]>.footer{cursor:ns-resize;touch-action:none;}
 
@@ -6274,12 +6274,13 @@ window.__minibiaBotBundle.installSidebarPanelsModule = function installSidebarPa
         if(mapBinding?.map!==map){
             detachMap();
             const canvas=map.minimap.canvas,scratch=document.createElement('canvas');scratch.width=scratch.height=160;
-            const context=scratch.getContext('2d');if(!context)return;
+            const context=scratch.getContext('2d');if(!context)return;context.imageSmoothingEnabled=false;
             const b={map,canvas,width:canvas.width,height:canvas.height,original:{render:map.render,cache:map.cache,__coordsToWorldPosition:map.__coordsToWorldPosition}};
             const tile={canvas:scratch,context,clear(){context.clearRect(0,0,160,160);}};
             b.render=function(chunks,skipMarker){
                 const originalCanvas=this.minimap,center=this.center,zoom=1<<this.__zoomLevel,H=canvas.height;
-                originalCanvas.context.save();originalCanvas.context.globalCompositeOperation="source-over";originalCanvas.context.clearRect(0,0,canvas.width,H);
+                context.imageSmoothingEnabled=false;
+                originalCanvas.context.save();originalCanvas.context.imageSmoothingEnabled=false;originalCanvas.context.globalCompositeOperation="source-over";originalCanvas.context.clearRect(0,0,canvas.width,H);
                 try{
                     this.minimap=tile;
                     for(let top=0;top<H;top+=160){
