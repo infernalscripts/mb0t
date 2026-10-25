@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.527",
+        version: "1.6.528",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -65174,7 +65174,7 @@ function upgradeSectionHeaders(panel) {
   <div class="mb-section mb-tools-pickup">
     <div class="mb-section-title"><input type="checkbox" id="minibia-bot-auto-pickup-enabled" class="mb-title-toggle"><span class="mb-title-text">📦 Auto Pickup Items</span></div>
     <div class="mb-tools-pickup-main">
-      <label class="mb-tools-pickup-radius"><span>Radius (tiles)</span><input type="number" id="minibia-bot-auto-pickup-radius" min="1" max="3" value="2"></label>
+      <label class="mb-tools-pickup-radius"><span>Radius (tiles)</span><input type="number" id="minibia-bot-auto-pickup-radius" min="1" max="8" value="2"></label>
       <span class="mb-small-note" id="minibia-bot-auto-pickup-status" aria-live="polite">Off</span>
     </div>
     <div class="mb-small-note">Collects during combat. While following, only the priority item takes a detour; other drops must be within reach.</div>
@@ -66810,7 +66810,7 @@ function upgradeSectionHeaders(panel) {
         }
         if (autoPickupRadius) {
             autoPickupRadius.addEventListener("change", function () {
-                const val = Math.max(1, Math.min(3, parseInt(this.value) || 2));
+                const val = Math.max(1, Math.min(8, parseInt(this.value) || 2));
                 this.value = val;
                 bot.autoPickup.updateConfig({
                     radius: val
