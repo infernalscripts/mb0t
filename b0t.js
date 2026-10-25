@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.506",
+        version: "1.6.507",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -46063,6 +46063,12 @@ window.__minibiaBotBundle.installMonkTrainerModule = function installMonkTrainer
         return (Number(health) / Number(maxHealth)) * 100;
     }
 
+    function isMonkInRange(creature) {
+        const me=bot.getPlayerPosition(),pos=creature?.getPosition?.()||creature?.__position;
+        return !!me&&!!pos&&pos.z===me.z&&
+            Math.max(Math.abs(pos.x-me.x),Math.abs(pos.y-me.y))<=config.maxTargetDistance;
+    }
+
     function getVisibleMonks() {
         const me = bot.getPlayerPosition();
         if (!me)
@@ -46072,14 +46078,7 @@ window.__minibiaBotBundle.installMonkTrainerModule = function installMonkTrainer
         }) || [];
         return monsters
         .filter(isMonk)
-        .filter(c => {
-            const pos = c.__position || c.getPosition?.();
-            if (!pos)
-                return false;
-            const dx = Math.abs(pos.x - me.x);
-            const dy = Math.abs(pos.y - me.y);
-            return dx <= config.maxTargetDistance && dy <= config.maxTargetDistance;
-        });
+        .filter(isMonkInRange);
     }
 
     function getCurrentTarget() {
@@ -46145,6 +46144,7 @@ window.__minibiaBotBundle.installMonkTrainerModule = function installMonkTrainer
 
             // Case 1: currently fighting a monk whose HP is too low → break off
             if (current && isMonk(current)) {
+                if (!isMonkInRange(current)) { clearTarget(); return; }
                 const hp = getCreatureHpPercent(current);
                 if (hp != null && hp < config.minHpPercent) {
                     clearTarget();
@@ -46275,7 +46275,7 @@ window.__minibiaBotBundle.installMonkTrainerModule = function installMonkTrainer
             next.minHpPercent = Math.max(1, Math.min(99, Number(next.minHpPercent) || 30));
         }
         if (next.maxTargetDistance !== undefined) {
-            next.maxTargetDistance = Math.max(1, Math.min(10, Number(next.maxTargetDistance) || 6));
+            next.maxTargetDistance = Math.max(1, Math.min(10, Math.trunc(Number(next.maxTargetDistance) || 6)));
         }
         if (next.monkNameContains !== undefined) {
             next.monkNameContains = String(next.monkNameContains || "monk").trim() || "monk";
@@ -55916,11 +55916,11 @@ window.__minibiaBotBundle.installItemDropperModule = function installItemDropper
 window.__minibiaBotBundle.installWoodcuttingModule = function(bot) {
     const key='minibiaBot.woodcutting.config';
     const trees=new Map([[3682,2768],[9225,10143],[3625,2711],[3616,2702],[3617,2703],[3639,2725],[3622,2708]]);
-    const config={enabled:false,delayMs:2000,range:5,attackWhileGathering:false,retryMinutes:5,minCapacity:0,stopSkill:0,goalSid:0,goalCount:0,goalLabel:'',...bot.storage.get(key,{})};
-    config.delayMs=Math.max(350,Math.min(10000,Number(config.delayMs)||2000));
+    const config={enabled:false,delayMs:750,range:5,attackWhileGathering:false,retryMinutes:5,minCapacity:0,stopSkill:0,goalSid:0,goalCount:0,goalLabel:'',...bot.storage.get(key,{})};
+    config.delayMs=Math.max(350,Math.min(10000,Number(config.delayMs)||750));
     config.range=Math.max(1,Math.min(8,Math.trunc(Number(config.range)||5)));
-    // Migrate the original default interval to the requested two seconds.
-    if(config.delayMs===1000)config.delayMs=2000;
+    // Update former defaults; retain other customized intervals.
+    if(config.delayMs===1000||config.delayMs===2000)config.delayMs=750;
     let walkDestination=null,lastWalkAt=0,walkProgressKey=null,walkProgressAt=0;const blocked=new Map();
     function stopOwnWalk(){const pf=window.gameClient?.world?.pathfinder;if(walkDestination&&pf?.__finalDestination&&tileKey(pf.__finalDestination)===tileKey(walkDestination))pf.setPathfindCache?.(null);walkDestination=null;}
     let running=false,timer=null,lastUse=0,targetKey=null,pending=null,reason='Stopped',attempts=0,disposed=false;
@@ -56081,7 +56081,7 @@ window.__minibiaBotBundle.installWoodcuttingModule = function(bot) {
     }
     function start(){if(disposed)return;bot.smithing?.stop?.();bot.cooking?.stop?.();bot.mining?.stop?.();if(!running){running=true;timer=window.setInterval(tick,150);}config.enabled=true;persist();tick();}
     function stop(options={}){stopOwnWalk();running=false;if(timer!=null)window.clearInterval(timer);timer=null;pending=null;targetKey=null;reason='Stopped';if(options.persistEnabled!==false){config.enabled=false;persist();}}
-    function updateConfig(next){normalizeGoals(next);if(next.attackWhileGathering!==undefined)config.attackWhileGathering=!!next.attackWhileGathering;if(next.range!==undefined){stopOwnWalk();targetKey=null;config.range=Math.max(1,Math.min(8,Math.trunc(Number(next.range)||5)));}if(next.delayMs!==undefined)config.delayMs=Math.max(350,Math.min(10000,Number(next.delayMs)||2000));if(next.enabled!==undefined){next.enabled?start():stop();}else persist();}
+    function updateConfig(next){normalizeGoals(next);if(next.attackWhileGathering!==undefined)config.attackWhileGathering=!!next.attackWhileGathering;if(next.range!==undefined){stopOwnWalk();targetKey=null;config.range=Math.max(1,Math.min(8,Math.trunc(Number(next.range)||5)));}if(next.delayMs!==undefined)config.delayMs=Math.max(350,Math.min(10000,Number(next.delayMs)||750));if(next.enabled!==undefined){next.enabled?start():stop();}else persist();}
     function resetTrees(){stopOwnWalk();blocked.clear();failures.clear();stripped.clear();targetKey=null;pending=null;reason=running?'Searching for trees':'Stopped';}
     function mount(panel){
         const host=panel.querySelector('[data-tab-panel="professions"]');if(!host)return;
@@ -56133,12 +56133,12 @@ window.__minibiaBotBundle.installWoodcuttingModule = function(bot) {
 window.__minibiaBotBundle.installMiningModule = function(bot) {
     const key='minibiaBot.mining.config';
     const stones=new Map([[1912,3668],[1853,3609],[1860,3616],[1778,1291],[1794,1307],[1772,1285],[1774,1287],[1776,1289],[1775,1288],[1773,1286],[1790,1303],[1789,1302],[1787,1300],[1788,1301],[1792,1305],[1793,1306],[1777,1290],[1785,1298],[1786,1299],[1784,1297],[1783,1296],[1810,1323],[1811,1324],[1791,1304],[1813,1326]]);
-    const config={enabled:false,delayMs:2000,range:5,attackWhileGathering:false,retryMinutes:5,minCapacity:0,stopSkill:0,goalSid:0,goalCount:0,goalLabel:'',...bot.storage.get(key,{})};
+    const config={enabled:false,delayMs:750,range:5,attackWhileGathering:false,retryMinutes:5,minCapacity:0,stopSkill:0,goalSid:0,goalCount:0,goalLabel:'',...bot.storage.get(key,{})};
     delete config.depletionText;
-    config.delayMs=Math.max(350,Math.min(10000,Number(config.delayMs)||2000));
+    config.delayMs=Math.max(350,Math.min(10000,Number(config.delayMs)||750));
     config.range=Math.max(1,Math.min(8,Math.trunc(Number(config.range)||5)));
-    // Migrate the original default interval to the requested two seconds.
-    if(config.delayMs===1000)config.delayMs=2000;
+    // Update former defaults; retain other customized intervals.
+    if(config.delayMs===1000||config.delayMs===2000)config.delayMs=750;
     let walkDestination=null,lastWalkAt=0,walkProgressKey=null,walkProgressAt=0;const blocked=new Map();
     function stopOwnWalk(){const pf=window.gameClient?.world?.pathfinder;if(walkDestination&&pf?.__finalDestination&&tileKey(pf.__finalDestination)===tileKey(walkDestination))pf.setPathfindCache?.(null);walkDestination=null;}
     let running=false,timer=null,lastUse=0,targetKey=null,pending=null,reason='Stopped',attempts=0,disposed=false;
@@ -56299,7 +56299,7 @@ window.__minibiaBotBundle.installMiningModule = function(bot) {
     }
     function start(){if(disposed)return;bot.smithing?.stop?.();bot.cooking?.stop?.();bot.woodcutting?.stop?.();if(!running){running=true;timer=window.setInterval(tick,150);}config.enabled=true;persist();tick();}
     function stop(options={}){stopOwnWalk();running=false;if(timer!=null)window.clearInterval(timer);timer=null;pending=null;targetKey=null;reason='Stopped';if(options.persistEnabled!==false){config.enabled=false;persist();}}
-    function updateConfig(next){normalizeGoals(next);if(next.attackWhileGathering!==undefined)config.attackWhileGathering=!!next.attackWhileGathering;if(next.range!==undefined){stopOwnWalk();targetKey=null;config.range=Math.max(1,Math.min(8,Math.trunc(Number(next.range)||5)));}if(next.delayMs!==undefined)config.delayMs=Math.max(350,Math.min(10000,Number(next.delayMs)||2000));if(next.enabled!==undefined){next.enabled?start():stop();}else persist();}
+    function updateConfig(next){normalizeGoals(next);if(next.attackWhileGathering!==undefined)config.attackWhileGathering=!!next.attackWhileGathering;if(next.range!==undefined){stopOwnWalk();targetKey=null;config.range=Math.max(1,Math.min(8,Math.trunc(Number(next.range)||5)));}if(next.delayMs!==undefined)config.delayMs=Math.max(350,Math.min(10000,Number(next.delayMs)||750));if(next.enabled!==undefined){next.enabled?start():stop();}else persist();}
     function resetStones(){stopOwnWalk();blocked.clear();failures.clear();stripped.clear();targetKey=null;pending=null;reason=running?'Searching for stones':'Stopped';}
     function mount(panel){
         const parent=panel.querySelector('[data-tab-panel="professions"]');if(!parent)return;const host=document.createElement('div');parent.appendChild(host);
@@ -56612,12 +56612,13 @@ window.__minibiaBotBundle.installFisherModule = function installFisherModule(bot
     const config = Object.assign({
         enabled: false,
         tile: null, // {x, y, z}
-        delayMs: 2000,
+        delayMs: 750,
         fishThreshold: 10,
         rodSid:2580,
     },
             bot.storage.get(configStorageKey, {}));
 
+    if(config.delayMs===2000)config.delayMs=750;
     config.rodSid=Number(config.rodSid)===14050?14050:2580;
     function persistConfig() {
         bot.storage.set(configStorageKey, {
@@ -56913,7 +56914,7 @@ window.__minibiaBotBundle.installFisherModule = function installFisherModule(bot
             }
         }
         if (next.delayMs !== undefined) {
-            config.delayMs = Math.max(500, Number(next.delayMs) || 2000);
+            config.delayMs = Math.max(500, Number(next.delayMs) || 750);
         }
         if (next.fishThreshold !== undefined) {
             config.fishThreshold = Math.max(1, Number(next.fishThreshold) || 10);
@@ -65043,7 +65044,7 @@ function upgradeSectionHeaders(panel) {
     <div class="mb-section-title"><input type="checkbox" id="minibia-bot-fisher-enabled" class="mb-title-toggle"><span class="mb-title-text">🎣 Fisher</span></div>
     <div class="mb-form-grid">
       <label class="mb-field"><span class="mb-field-label">Rod</span><select id="minibia-bot-fisher-rod" title="Uses the selected rod’s exact server ID. Equip it or open its backpack when carrying both rod types."><option value="2580">Fishing Rod</option><option value="14050">Old Rod</option></select></label>
-      <label class="mb-field"><span class="mb-field-label">Delay (s)</span><input type="number" id="minibia-bot-fisher-delay" min="0.5" step="0.5" value="2"></label>
+      <label class="mb-field"><span class="mb-field-label">Delay (s)</span><input type="number" id="minibia-bot-fisher-delay" min="0.5" step="0.001" value="0.75"></label>
       <label class="mb-field"><span class="mb-field-label">Fish limit</span><input type="number" id="minibia-bot-fisher-threshold" min="1" value="10"></label>
       <div class="mb-field"><span class="mb-field-label">Fish count</span><span class="mb-general-counter" id="minibia-bot-fisher-count">0</span></div>
     </div>
@@ -65619,6 +65620,10 @@ function upgradeSectionHeaders(panel) {
         <label class="mb-field">
           <span class="mb-field-label">Stop Below HP %</span>
           <input type="number" id="minibia-bot-monk-trainer-hp" min="1" max="99" value="30" />
+        </label>
+        <label class="mb-field">
+          <span class="mb-field-label">Range (tiles)</span>
+          <input type="number" id="minibia-bot-monk-trainer-range" min="1" max="10" step="1" value="6" />
         </label>
       </div>
       <div class="mb-small-note" id="minibia-bot-monk-trainer-status">Status: idle</div>
@@ -67488,6 +67493,7 @@ function upgradeSectionHeaders(panel) {
         const monkToggle = panel.querySelector("#minibia-bot-monk-trainer-enabled");
         const monkNameInput = panel.querySelector("#minibia-bot-monk-trainer-name");
         const monkHpInput = panel.querySelector("#minibia-bot-monk-trainer-hp");
+        const monkRangeInput = panel.querySelector("#minibia-bot-monk-trainer-range");
         const monkStatus = panel.querySelector("#minibia-bot-monk-trainer-status");
 
         function refreshMonkTrainerStatus() {
@@ -67504,6 +67510,7 @@ function upgradeSectionHeaders(panel) {
             if (monkHpInput && document.activeElement !== monkHpInput) {
                 monkHpInput.value = status.config.minHpPercent ?? 30;
             }
+            if (monkRangeInput && document.activeElement !== monkRangeInput) monkRangeInput.value=status.config.maxTargetDistance??6;
             if (monkStatus) {
                 if (!status.running) {
                     monkStatus.textContent = "Status: idle";
@@ -67552,6 +67559,12 @@ function upgradeSectionHeaders(panel) {
             });
         }
 
+        monkRangeInput?.addEventListener('change',()=>{
+            bot.monkTrainer.updateConfig({maxTargetDistance:monkRangeInput.value});
+            monkRangeInput.value=bot.monkTrainer.status().config.maxTargetDistance;
+            refreshMonkTrainerStatus();
+        });
+
         const monkTimer = window.setInterval(refreshMonkTrainerStatus, 1000);
         bot.addCleanup(() => window.clearInterval(monkTimer));
         setTimeout(refreshMonkTrainerStatus, 100);
@@ -67575,7 +67588,7 @@ function upgradeSectionHeaders(panel) {
                 fisherToggle.checked = status.running;
             }
             if (fisherDelay && document.activeElement !== fisherDelay) {
-                fisherDelay.value = (status.config.delayMs / 1000).toFixed(1);
+                fisherDelay.value = String(status.config.delayMs / 1000);
             }
             if (fisherThreshold && document.activeElement !== fisherThreshold) {
                 fisherThreshold.value = status.config.fishThreshold;
@@ -67598,7 +67611,7 @@ function upgradeSectionHeaders(panel) {
             fisherToggle.addEventListener("change", function () {
                 if (this.checked) {
                     // Read values from UI
-                    const delay = parseFloat(fisherDelay?.value) || 2;
+                    const delay = parseFloat(fisherDelay?.value) || 0.75;
                     const threshold = parseInt(fisherThreshold?.value) || 10;
                     bot.fisher.updateConfig({
                         delayMs: delay * 1000,
@@ -67624,8 +67637,8 @@ function upgradeSectionHeaders(panel) {
 
         if (fisherDelay) {
             fisherDelay.addEventListener("change", function () {
-                const val = Math.max(0.5, parseFloat(this.value) || 2);
-                this.value = val.toFixed(1);
+                const val = Math.max(0.5, parseFloat(this.value) || 0.75);
+                this.value = String(val);
                 bot.fisher.updateConfig({
                     delayMs: val * 1000
                 });
