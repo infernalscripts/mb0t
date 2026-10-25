@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.498",
+        version: "1.6.501",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -6041,7 +6041,7 @@ window.__minibiaBotBundle.installSidebarPanelsModule = function installSidebarPa
 }
 .window.mb-hud-window[data-mb-hud="equipment"]>.body>.equipment-buttons{
  display:flex!important;flex-direction:column!important;flex:0 0 48px!important;
- width:48px!important;min-width:48px!important;gap:3px!important;margin:0 0 24px!important;padding:0!important;align-self:center!important;
+ width:48px!important;min-width:48px!important;gap:3px!important;margin:0!important;padding:0!important;align-self:center!important;
 }
 .window.mb-hud-window[data-mb-hud="equipment"]>.body>.equipment-buttons>button{
  width:48px!important;min-width:0!important;max-width:48px!important;height:18px!important;
@@ -6056,28 +6056,60 @@ window.__minibiaBotBundle.installSidebarPanelsModule = function installSidebarPa
  display:flex!important;flex-direction:column!important;gap:4px!important;padding-top:0!important;
 }
 .window.mb-hud-window[data-mb-hud="equipment"] #mobile-equipment-panel .slot{margin:0!important;}
-/* Tibia's staggered gear layout: centre column half a slot above the sides. */
+/* Compact gear layout: all three equipment columns share four aligned rows. */
 .window.mb-hud-window[data-mb-hud="equipment"] #mobile-equipment-panel{
  display:grid!important;grid-template-columns:34px 34px 34px 30px!important;
- grid-template-rows:repeat(9,17px)!important;column-gap:4px!important;row-gap:2px!important;
+ grid-template-rows:repeat(4,34px)!important;column-gap:4px!important;row-gap:3px!important;
  width:144px!important;min-width:144px!important;
 }
 .window.mb-hud-window[data-mb-hud="equipment"] #mobile-equipment-panel>.equipment-column:not(.fight-mode-column){display:contents!important;}
 .window.mb-hud-window[data-mb-hud="equipment"] #mobile-equipment-panel .slot{width:34px!important;height:34px!important;align-self:center;}
-.window.mb-hud-window[data-mb-hud="equipment"] #head-slot{grid-area:1 / 2 / span 2;}
-.window.mb-hud-window[data-mb-hud="equipment"] #armor-slot{grid-area:3 / 2 / span 2;}
-.window.mb-hud-window[data-mb-hud="equipment"] #legs-slot{grid-area:5 / 2 / span 2;}
-.window.mb-hud-window[data-mb-hud="equipment"] #boots-slot{grid-area:7 / 2 / span 2;}
-.window.mb-hud-window[data-mb-hud="equipment"] #shoulder-slot{grid-area:2 / 1 / span 2;}
-.window.mb-hud-window[data-mb-hud="equipment"] #left-slot{grid-area:4 / 1 / span 2;}
-.window.mb-hud-window[data-mb-hud="equipment"] #ring-slot{grid-area:6 / 1 / span 2;}
-.window.mb-hud-window[data-mb-hud="equipment"] #backpack-slot{grid-area:2 / 3 / span 2;}
-.window.mb-hud-window[data-mb-hud="equipment"] #right-slot{grid-area:4 / 3 / span 2;}
-.window.mb-hud-window[data-mb-hud="equipment"] #quiver-slot{grid-area:6 / 3 / span 2;}
-.window.mb-hud-window[data-mb-hud="equipment"] #player-capacity{grid-area:8 / 3 / span 2;width:34px!important;align-self:center;}
-.window.mb-hud-window[data-mb-hud="equipment"] #mobile-equipment-panel>.equipment-column:nth-child(3)>.equipment-padding{grid-area:8 / 1 / span 2;width:34px!important;align-self:center;}
-.window.mb-hud-window[data-mb-hud="equipment"] #mobile-equipment-panel>.fight-mode-column{grid-area:1 / 4 / span 9;width:30px!important;min-width:0!important;margin:0!important;}
+.window.mb-hud-window[data-mb-hud="equipment"] #head-slot{grid-area:1 / 2;}
+.window.mb-hud-window[data-mb-hud="equipment"] #armor-slot{grid-area:2 / 2;}
+.window.mb-hud-window[data-mb-hud="equipment"] #legs-slot{grid-area:3 / 2;}
+.window.mb-hud-window[data-mb-hud="equipment"] #boots-slot{grid-area:4 / 2;}
+.window.mb-hud-window[data-mb-hud="equipment"] #shoulder-slot{grid-area:1 / 1;}
+.window.mb-hud-window[data-mb-hud="equipment"] #left-slot{grid-area:2 / 1;}
+.window.mb-hud-window[data-mb-hud="equipment"] #ring-slot{grid-area:3 / 1;}
+.window.mb-hud-window[data-mb-hud="equipment"] #backpack-slot{grid-area:1 / 3;}
+.window.mb-hud-window[data-mb-hud="equipment"] #right-slot{grid-area:2 / 3;}
+.window.mb-hud-window[data-mb-hud="equipment"] #quiver-slot{grid-area:3 / 3;}
+.window.mb-hud-window[data-mb-hud="equipment"] #player-capacity{grid-area:4 / 3;width:34px!important;align-self:center;}
+.window.mb-hud-window[data-mb-hud="equipment"] #mobile-equipment-panel>.equipment-column:nth-child(3)>.equipment-padding{display:none!important;}
+.window.mb-hud-window[data-mb-hud="equipment"] #mobile-equipment-panel>.fight-mode-column{grid-area:1 / 4 / span 4;width:30px!important;min-width:0!important;margin:0!important;}
 
+
+/* Keep native nodes in place; flatten only the first wrapper into this grid. */
+.window.mb-hud-window[data-mb-hud="equipment"]:not(.mb-hud-minimized)>.body.equipment-options-wrapper{
+ display:grid!important;grid-template-columns:144px minmax(48px,1fr)!important;
+ grid-template-rows:145px auto!important;gap:4px 6px!important;align-items:stretch!important;
+}
+.window.mb-hud-window[data-mb-hud="equipment"]>.body>.first-wrapper{display:contents!important;}
+.window.mb-hud-window[data-mb-hud="equipment"] #mobile-equipment-panel{grid-area:1 / 1!important;}
+.window.mb-hud-window[data-mb-hud="equipment"] #status-bar{
+ grid-area:2 / 1 / 3 / -1!important;width:100%!important;max-width:100%!important;
+ margin:0!important;position:static!important;align-self:stretch!important;
+}
+.window.mb-hud-window[data-mb-hud="equipment"]>.body>.equipment-buttons{
+ grid-area:1 / 2!important;width:100%!important;min-width:0!important;height:145px!important;
+ align-self:stretch!important;gap:3px!important;
+}
+.window.mb-hud-window[data-mb-hud="equipment"]>.body>.equipment-buttons>button{
+ flex:1 1 0!important;width:100%!important;max-width:none!important;height:auto!important;
+ min-height:0!important;line-height:normal!important;
+}
+.window.mb-hud-window[data-mb-hud="equipment"] #fight-mode-selector{
+ display:flex!important;flex-direction:column!important;gap:2px!important;
+ height:145px!important;width:30px!important;margin:0!important;padding:0!important;box-sizing:border-box!important;
+}
+.window.mb-hud-window[data-mb-hud="equipment"] #fight-mode-selector>button{
+ flex:0 0 26px!important;height:26px!important;min-height:26px!important;width:30px!important;
+ margin:0!important;padding:0!important;box-sizing:border-box!important;
+}
+.window.mb-hud-window[data-mb-hud="equipment"] #fight-mode-selector>.mode-separator{
+ visibility:hidden!important;
+ flex:0 0 5px!important;height:5px!important;margin:0!important;padding:0!important;box-sizing:border-box!important;
+}
 
 .window.mb-hud-window[data-mb-hud="vitals"] .character-status{width:100%!important;min-width:0!important;max-width:100%!important;box-sizing:border-box!important;margin:0!important;padding:4px!important;}
 .window.mb-hud-window[data-mb-hud="vitals"] .character-status>.bar{width:100%!important;min-width:0!important;max-width:100%!important;box-sizing:border-box!important;margin-left:0!important;margin-right:0!important;}
@@ -6123,8 +6155,8 @@ window.__minibiaBotBundle.installSidebarPanelsModule = function installSidebarPa
  border-right-color:#343434;border-bottom-color:#343434;box-shadow:inset 1px 1px 2px #060606;
  font:9px/14px Verdana,sans-serif!important;text-align:center!important;color:#ddd;
 }
-.window.mb-hud-window[data-mb-hud="equipment"] .mb-gear-soul{grid-area:8 / 1 / span 2;}
-.window.mb-hud-window[data-mb-hud="equipment"] .equipment-buttons>#keyring{height:18px!important;min-height:18px!important;}
+.window.mb-hud-window[data-mb-hud="equipment"] .mb-gear-soul{grid-area:4 / 1;}
+.window.mb-hud-window[data-mb-hud="equipment"] .equipment-buttons>#keyring{height:auto!important;min-height:0!important;}
 `;document.head.appendChild(style);
 
     const panels=()=>bot.extraSidebars?.getPanels?.()||[];
