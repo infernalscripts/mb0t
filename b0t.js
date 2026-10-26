@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.559",
+        version: "1.6.564",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -5911,7 +5911,27 @@ window.__minibiaBotBundle.installHotbarDockModule = function installHotbarDockMo
         const select=section.querySelector('select');select.value=config.position;select.addEventListener('change',()=>updateConfig({position:select.value}));const bank=section.querySelector('[data-second-bank]');bank.checked=config.showSecondBank;bank.addEventListener('change',()=>updateConfig({showSecondBank:bank.checked}));parent.appendChild(section);
     }
     bot.hotbarDock={config,updateConfig,mount,sync:apply,getSideHeight:()=>Number(binding?.upper?.getBoundingClientRect?.()?.height)||0,getSideTrayFillCells:()=>sideTrayGeometry(Number(binding?.upper?.getBoundingClientRect?.()?.height)||0).fillCells,getBottomWidth:()=>binding?.bottom?.clientWidth||0,getNativeBottomCells:()=>{const width=binding?.bottom?.clientWidth||0;return !config.showSecondBank||(width>0&&width<938)?13:25;},setExtraBars:entries=>{extraBars=entries;apply();}};
-    apply();const timer=setInterval(apply,500);
+    // Login can move the canvas after the client's last resize callback.
+    // Repair only overlay offsets, never invoke resize or alter canvas scaling.
+    function syncCanvasOverlayPositions(){
+        if(disposed||!binding||bot.interfaceLayout?.config.enabled===false)return;
+        const canvas=window.gameClient?.renderer?.screen?.canvas;
+        const stats=document.getElementById('debug-statistics');
+        const pk=document.getElementById('pk-lock-btn');
+        if(!canvas?.isConnected||(!stats&&!pk))return;
+        const c=canvas.getBoundingClientRect(),u=binding.upper.getBoundingClientRect();
+        if(c.width<=0||c.height<=0||u.width<=0||u.height<=0)return;
+        const top=Math.max(0,Math.max(c.top,u.top)-u.top);
+        const setOffset=(element,property,value)=>{
+            const px=value+'px';
+            if(element&&element.style[property]!==px)element.style[property]=px;
+        };
+        setOffset(stats,'left',Math.max(0,Math.max(c.left,u.left)-u.left));
+        setOffset(stats,'top',top);
+        setOffset(pk,'right',Math.max(0,u.right-Math.min(c.right,u.right))+4);
+        setOffset(pk,'top',top+4);
+    }
+    apply();const timer=setInterval(()=>{apply();syncCanvasOverlayPositions();},500);
     bot.addCleanup(()=>{disposed=true;clearInterval(timer);restore();style.remove();window.dispatchEvent(new Event('resize'));});
 };
 
@@ -50491,8 +50511,13 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         const match = /^Loot of (.+?):\s*(.*?)\s*$/i.exec(text);
         if (!match) return;
         const contents = match[2].trim();
+        // Consume food/bag-only results as empty, preserving death matching.
+        // Match whole item names so food plus any other loot still queues.
+        const items = contents.replace(/[.!]+$/, "").split(/\s*,\s*(?:and\s+)?|\s+and\s+/i);
+        const ignoredOnly = items.length > 0 && items.every(item =>
+            /^(?:(?:an?|\d+)\s+)?(?:bags?|meats?|(?:pieces? of )?meat|(?:dragon )?hams?)$/i.test(item.trim()));
         corpseLootResults.push({ name: corpseLootName(match[1]), at: now,
-            hasLoot: !!contents && !/^nothing[.!]?$/i.test(contents) });
+            hasLoot: !!contents && !/^nothing[.!]?$/i.test(contents) && !ignoredOnly });
         matchCorpseLoot(now);
     }
 
@@ -52776,7 +52801,8 @@ window.__minibiaBotBundle.installChancellorAlertModule = function installChancel
     let timer=null,seenNodes=new WeakSet(),visible=new Set();
     const signatures=new Map(),alerts=new Map();
     const named=name=>/^chancellor\s+\S/i.test(String(name||"").trim());
-    function chatNodes(){return Array.from(document.querySelectorAll("span.chat-message[name]"));}
+    // The client stamps Default chat as channel 0; ignore public/private and unstamped lines.
+    function chatNodes(){return Array.from(document.querySelectorAll('span.chat-message[name][data-channel="0"]'));}
     function signature(node){return `${String(node.getAttribute("name")||"").trim().toLowerCase()}|${node.getAttribute("data-channel")||""}|${node.textContent||node.getAttribute("data-message")||""}`;}
     function alert(name,source,now){
         const id=String(name).trim().toLowerCase();
@@ -63104,7 +63130,7 @@ function upgradeSectionHeaders(panel) {
             {id:"minibia-bot-collapsed-runemaker",headerId:null,isRunning:()=>!!bot.runemaker?.status?.().running,start:()=>bot.runemaker?.start?.(),stop:()=>bot.runemaker?.stop?.()},
             {id:"minibia-bot-collapsed-support",headerId:'minibia-bot-support-enabled',isRunning:()=>!!bot.support?.status?.().running,start:()=>bot.support?.start?.(),stop:()=>bot.support?.stop?.()},
             {id:"minibia-bot-collapsed-eat",headerId:'minibia-bot-auto-eat-enabled',isRunning:()=>!!bot.eat?.status?.().running,start:()=>bot.eat?.start?.(),stop:()=>bot.eat?.stop?.()},
-            {id:"minibia-bot-collapsed-follow",isRunning:()=>!!document.getElementById('minibia-bot-follow-enabled')?.checked,start:()=>document.getElementById('minibia-bot-follow-enabled')?.click(),stop:()=>document.getElementById('minibia-bot-follow-enabled')?.click()},
+            {id:"minibia-bot-collapsed-follow",isRunning:()=>!!bot.standaloneFollow?.isEnabled(),start:()=>bot.standaloneFollow?.start(),stop:()=>bot.standaloneFollow?.stop()},
         ].map(m=>({...m,expandedId:['heal','looter','eat','conjure-food','rune','runemaker','paladin','weapon'].includes(m.id.replace('minibia-bot-collapsed-',''))?m.id.replace('-collapsed-','-expanded-'):null}));
     }
 
@@ -64983,7 +65009,7 @@ function upgradeSectionHeaders(panel) {
     <div class="mb-alert-toggle-grid">
       <label class="mb-toggle"><input type="checkbox" id="minibia-bot-antibot-enabled"><span>Anti-bot check</span></label>
       <label class="mb-toggle"><input type="checkbox" id="minibia-bot-gm-chat-monitor"><span>GM Auto Respond</span></label>
-      <label class="mb-toggle" title="GM alarm and configured pause for a nearby Chancellor or a new Chancellor chat message. No auto-reply."><input type="checkbox" id="minibia-bot-chancellor-alert"><span>Chancellor alert</span></label>
+      <label class="mb-toggle" title="GM alarm and configured pause for a nearby Chancellor or a new Chancellor message in Default chat. No auto-reply."><input type="checkbox" id="minibia-bot-chancellor-alert"><span>Chancellor alert</span></label>
       <label class="mb-toggle"><input type="checkbox" id="minibia-bot-antibot-creature-enabled"><span>Anti-bot creature</span></label>
       <label class="mb-toggle"><input type="checkbox" id="minibia-bot-pink-skull-enabled" /><span>Pinkskull XLOG</span></label>
       <label class="mb-toggle" title="Close connection on a new Console message containing sent to temple. Disables Auto-Reconnect."><input type="checkbox" id="minibia-bot-temple-xlog-enabled" /><span>Temple XLOG</span></label>
@@ -66979,6 +67005,10 @@ function upgradeSectionHeaders(panel) {
         });
         let followInterval = null;
         let followEnabled = false;
+        // Keep quick controls independent of the detached settings DOM.
+        const standaloneFollow={isEnabled:()=>followEnabled,start:startFollow,stop:stopFollow};
+        bot.standaloneFollow=standaloneFollow;
+        bot.addCleanup(()=>{if(bot.standaloneFollow===standaloneFollow)delete bot.standaloneFollow;});
 
         function getFollowMode() {
             return followNonPvpToggle
@@ -66993,6 +67023,8 @@ function upgradeSectionHeaders(panel) {
         }
 
         function refreshFollowStatus() {
+            if(followToggle)followToggle.checked=followEnabled;
+            refreshCollapsedQuickModules();
             if(followDistanceInput)followDistanceInput.disabled=getFollowMode()==="nonpvp";
             if (followEnabled && bot.autoPickup?.isFollowPaused?.() && followStatus) {
                 followStatus.textContent="Picking up priority item…";return;
