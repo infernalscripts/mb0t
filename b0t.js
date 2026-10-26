@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.533",
+        version: "1.6.544",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -5853,6 +5853,11 @@ window.__minibiaBotBundle.installHotbarDockModule = function installHotbarDockMo
 
 `;
     document.head.appendChild(style);
+    function setDockStyle(el,key,value,priority=''){
+        value=String(value);
+        if(el.style.getPropertyValue(key)!==value||el.style.getPropertyPriority(key)!==priority)
+            el.style.setProperty(key,value,priority);
+    }
     function restoreScale(){
         if(scaleBinding && scaleBinding.ui.getResolutionScale===scaleBinding.wrapper)
             scaleBinding.ui.getResolutionScale=scaleBinding.original;
@@ -5901,7 +5906,7 @@ window.__minibiaBotBundle.installHotbarDockModule = function installHotbarDockMo
         style.media=style.disabled?'not all':'all';if(style.sheet)style.sheet.disabled=style.disabled;
         if(bot.interfaceLayout?.config.enabled===false){restore();return;}
         if(disposed)return;
-        for(const e of extraBars)e.root.style.display=e.enabled?'':'none';
+        for(const e of extraBars)setDockStyle(e.root,'display',e.enabled?'':'none');
         const active=extraBars.filter(e=>e.enabled);
         if(window.gameClient?.touch?.isMobileMode){if(binding){restore();window.dispatchEvent(new Event('resize'));}return;}
         if(binding&&(!binding.bar.isConnected||!binding.upper.isConnected))restore();
@@ -5927,27 +5932,27 @@ window.__minibiaBotBundle.installHotbarDockModule = function installHotbarDockMo
         const b=binding;
         const sideHome=config.position==='left'?b.left:b.right;
         if(config.position!=='bottom'&&b.sideTray.parentNode!==sideHome)sideHome.insertBefore(b.sideTray,sideHome.firstChild);
-        b.sideTray.style.display=config.position==='bottom'?'none':'';
+        setDockStyle(b.sideTray,'display',config.position==='bottom'?'none':'');
         const home=config.position==='bottom'?b.bottom:b.sideTray;
         if(b.bar.parentNode!==home){home.insertBefore(b.bar,home.firstChild);}
-        if(!b.middle.children.length)b.middle.style.display='none';
+        if(!b.middle.children.length)setDockStyle(b.middle,'display','none');
         b.bar.style.removeProperty('max-height');b.bar.style.removeProperty('height'); 
         for(const e of active){const target=e.autoFill?home:e.position==='bottom'?b.bottom:e.position==='left'?b.left:b.right;
-            e.root.dataset.horizontal=String(e.position==='bottom');if(e.root.parentNode!==target)target.appendChild(e.root);}
+            if(e.root.dataset.horizontal!==String(e.position==='bottom'))e.root.dataset.horizontal=String(e.position==='bottom');if(e.root.parentNode!==target)target.appendChild(e.root);}
         // 24 slots + settings + one spare cell for the adaptive tray. Hide
         // bank two only visually; Shift hotkeys and assignments stay intact.
         const bottomWidth=b.bottom.clientWidth;
         b.bottom.classList.toggle('mb-hotbar-compact',!config.showSecondBank||(bottomWidth>0&&bottomWidth<938));
         const height=b.upper.getBoundingClientRect().height;
         if(height>0){
-            b.left.style.maxHeight=b.right.style.maxHeight=Math.round(height)+'px';
+            setDockStyle(b.left,'max-height',Math.round(height)+'px');setDockStyle(b.right,'max-height',Math.round(height)+'px');
             const geometry=sideTrayGeometry(height);
-            b.sideTray.style.setProperty('--mb-side-rows',geometry.rows);
-            b.sideTray.style.setProperty('--mb-side-columns',geometry.columns);
-            b.sideTray.style.width=(geometry.columns*36+2)+'px';
-            b.sideTray.style.height=Math.round(height)+'px';
+            setDockStyle(b.sideTray,'--mb-side-rows',geometry.rows);
+            setDockStyle(b.sideTray,'--mb-side-columns',geometry.columns);
+            setDockStyle(b.sideTray,'width',(geometry.columns*36+2)+'px');
+            setDockStyle(b.sideTray,'height',Math.round(height)+'px');
             b.sideTray.classList.toggle('mb-hotbar-compact',!config.showSecondBank);
-            for(const e of active){e.root.style.maxHeight=e.position==='bottom'?'':Math.round(height)+'px';e.root.style.height=e.position==='bottom'?'auto':Math.round(height)+'px';}
+            for(const e of active){setDockStyle(e.root,'max-height',e.position==='bottom'?'':Math.round(height)+'px');setDockStyle(e.root,'height',e.position==='bottom'?'auto':Math.round(height)+'px');}
         }
         // Size containment keeps old sidebar heights out of the canvas flex
         // calculation. Width is explicit because contained children have no
@@ -5955,10 +5960,10 @@ window.__minibiaBotBundle.installHotbarDockModule = function installHotbarDockMo
         for(const rack of [b.left,b.right]){
             const children=Array.from(rack.children).filter(el=>el.style.display!=='none');
             const width=children.reduce((sum,el)=>sum+(el===b.sideTray?parseFloat(el.style.width)||38:38),0)+Math.max(0,children.length-1);
-            rack.style.width=width+'px';
-            rack.style.display=children.length?'flex':'none';
+            setDockStyle(rack,'width',width+'px');
+            setDockStyle(rack,'display',children.length?'flex':'none');
         }
-        b.bottom.style.setProperty('display',config.position==='bottom'||active.some(e=>!e.autoFill&&e.position==='bottom')?'grid':'none','important');
+        setDockStyle(b.bottom,'display',config.position==='bottom'||active.some(e=>!e.autoFill&&e.position==='bottom')?'grid':'none','important');
         const signature=config.position+'|'+config.showSecondBank+'|'+b.sideTray.style.width+'|'+active.map(e=>e.id+':'+e.position).join(',');
         if(signature!==b.signature){b.signature=signature;window.dispatchEvent(new Event('resize'));queueCanvasResize();}
     }
@@ -6166,7 +6171,7 @@ window.__minibiaBotBundle.installSidebarPanelsModule = function installSidebarPa
 .window.mb-hud-window[data-mb-hud="equipment"]:not(.mb-hud-minimized)>.body.equipment-options-wrapper{
  display:flex!important;flex-direction:row!important;flex-wrap:nowrap!important;align-items:flex-start!important;
  justify-content:center!important;gap:8px!important;width:100%!important;min-width:0!important;
- margin:0!important;padding:3px 6px 6px!important;flex:0 0 auto!important;overflow:visible!important;
+ margin:0!important;padding:4px!important;flex:0 0 auto!important;overflow:visible!important;
 }
 .window.mb-hud-window[data-mb-hud="equipment"]>.body>.first-wrapper{
  flex:0 1 auto!important;min-width:0!important;margin:0!important;padding-top:0!important;
@@ -6462,16 +6467,20 @@ window.__minibiaBotBundle.installSidebarPanelsModule = function installSidebarPa
         for(const key of ['width','max-width','left','z-index'])b.r.shell.style.removeProperty(key);
     }
     function applyMapSpan(r,available){
-        clearMapSpan();if(config.mapSpan!==2||r.shell.classList.contains('mb-hud-minimized'))return;
-        const wrap=r.shell.closest('.oogwrap');if(!wrap)return;
+        if(config.mapSpan!==2||r.shell.classList.contains('mb-hud-minimized')){clearMapSpan();return;}
+        const wrap=r.shell.closest('.oogwrap');if(!wrap){clearMapSpan();return;}
         const box=wrap.getBoundingClientRect(),side=config.minimap.startsWith('left')?'left':'right';
         const others=available.filter(p=>p.id.startsWith(side)&&p.column.closest('.oogwrap')!==wrap).map(p=>({p,box:p.column.closest('.oogwrap').getBoundingClientRect()})).filter(e=>e.box.width>0&&Math.abs(e.box.top-box.top)<40);
-        others.sort((a,b)=>Math.abs(a.box.left-box.left)-Math.abs(b.box.left-box.left));const next=others[0];if(!next)return;
-        const left=Math.min(box.left,next.box.left),right=Math.max(box.right,next.box.right);if(right-left>box.width*2+24)return;
+        others.sort((a,b)=>Math.abs(a.box.left-box.left)-Math.abs(b.box.left-box.left));const next=others[0];if(!next){clearMapSpan();return;}
+        const left=Math.min(box.left,next.box.left),right=Math.max(box.right,next.box.right);if(right-left>box.width*2+24){clearMapSpan();return;}
+        const parent=r.shell.parentElement;
+        const signature=[left,right,box.top,next.box.top,parent.getBoundingClientRect().left].join('|');
+        if(spanState?.r===r&&spanState.parent===parent&&spanState.spacer.parentNode===next.p.column&&spanState.signature===signature)return;
+        clearMapSpan();
         const spacer=document.createElement('div');spacer.setAttribute('data-mb-map-spacer','');spacer.style.flex='0 0 auto';spacer.style.pointerEvents='none';next.p.column.insertBefore(spacer,next.p.column.firstChild);
         const ancestors=[];for(let el=r.shell.parentElement;el&&el.id!=='game-wrapper';el=el.parentElement){el.classList.add('mb-map-span-overflow');ancestors.push(el);}
         r.shell.style.setProperty('width',(right-left)+'px','important');r.shell.style.setProperty('max-width',(right-left)+'px','important');r.shell.style.left=(left-r.shell.parentElement.getBoundingClientRect().left)+'px';r.shell.style.zIndex='3';
-        spanState={r,spacer,ancestors};
+        spanState={r,spacer,ancestors,parent,signature};
     }
     function updateMapSize(r){
         const width=r.body.parentNode?.getBoundingClientRect().width||216;
@@ -6623,19 +6632,21 @@ window.__minibiaBotBundle.installBackpackSizingModule = function installBackpack
         const body=container?.window?.getElement?.('.body');if(!body||window.getComputedStyle(body).display==='none')return;
         const count=Number(container.size);if(!(count>0))return;
         if(!owned.has(body))owned.set(body,['height','min-height','max-height'].map(p=>[p,body.style.getPropertyValue(p)]));
-        // Border-box body: 34px slot, 2px between rows, 2px padding each end.
-        const columns=document.body.classList.contains('mb-six-slot-rows')?6:5;
+        // Read actual spacing so row snapping matches each bag layout.
+        const columns=document.body.classList.contains('mb-four-slot-rows')?4:document.body.classList.contains('mb-six-slot-rows')?6:5;
         const fullRows=Math.max(1,Math.ceil(count/columns));
         const css=window.getComputedStyle(body);
         const border=(parseFloat(css.borderTopWidth)||0)+(parseFloat(css.borderBottomWidth)||0);
-        const extra=2+border;
-        const rowsHeight=rows=>rows*36+extra;
+        const gap=parseFloat(css.rowGap)||0;
+        const stride=34+gap;
+        const extra=(parseFloat(css.paddingTop)||0)+(parseFloat(css.paddingBottom)||0)+border-gap;
+        const rowsHeight=rows=>rows*stride+extra;
         const available=Math.max(rowsHeight(1),window.innerHeight-body.getBoundingClientRect().top-20);
-        const maxRows=Math.max(1,Math.min(fullRows,Math.floor((available-extra)/36)));
+        const maxRows=Math.max(1,Math.min(fullRows,Math.floor((available-extra)/stride)));
         body.style.setProperty('min-height',rowsHeight(1)+'px');body.style.setProperty('max-height',rowsHeight(maxRows)+'px');
         const current=Number.parseFloat(body.style.height)||body.getBoundingClientRect().height;
         const desired=event?event.clientY-body.getBoundingClientRect().top-12:current;
-        const rows=Math.max(1,Math.min(maxRows,Math.round((desired-extra)/36)));
+        const rows=Math.max(1,Math.min(maxRows,Math.round((desired-extra)/stride)));
         body.style.height=rowsHeight(rows)+'px';
     }
     function sync(event){
@@ -41053,7 +41064,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         state.teleportRecoveryLastIndex = -1;
         state.teleportRecoveryLastReason = null;
         state.teleportRecoveryLastDistance = null;
-        state.currentIndex = findStartingWaypointIndex(pos);
+        // Preserve the waypoint selected in the list when starting navigation.
+        state.currentIndex = Math.max(0, Math.min(route.length - 1, Math.trunc(Number(state.currentIndex) || 0)));
         state.direction = state.currentIndex >= route.length - 1 ? -1 : 1;
         if (route.length <= 1)
             state.direction = 1;
@@ -65919,7 +65931,7 @@ function upgradeSectionHeaders(panel) {
         <span>Wide Columns (224px)</span>
       </label>
       <div class="mb-small-note">Expands the container widths from 180px to 224px.</div>
-      <label class="mb-toggle"><input type="checkbox" id="minibia-bot-ui-six-slots" /><span>Six backpack slots per row</span></label>
+      <label class="mb-field"><span class="mb-field-label">Backpack slots per row</span><select id="minibia-bot-ui-bag-columns"><option value="4">4 · compact sidebar</option><option value="5">5</option><option value="6">6</option></select></label>
       <div class="mb-small-note">Six slots per row with 2px spacing. Keeps side panels at 228px wide.</div>
       <label class="mb-toggle" style="margin-top:8px;">
         <input type="checkbox" id="minibia-bot-ui-full-minimap" />
@@ -66508,7 +66520,7 @@ function upgradeSectionHeaders(panel) {
         if(namesSection)interfaceNames.appendChild(namesSection);
         const mapOptions=document.createElement('div');mapOptions.className='mb-section';
         mapOptions.innerHTML='<div class="mb-section-title"><span class="mb-title-text">▥ Panel appearance</span></div>';
-        for(const id of ['minibia-bot-ui-wide-columns','minibia-bot-ui-six-slots','minibia-bot-ui-full-minimap']){
+        for(const id of ['minibia-bot-ui-wide-columns','minibia-bot-ui-bag-columns','minibia-bot-ui-full-minimap']){
             const row=panel.querySelector('#'+id)?.closest('label');if(!row)continue;
             const note=row.nextElementSibling;mapOptions.appendChild(row);if(note?.classList.contains('mb-small-note'))mapOptions.appendChild(note);
         }
@@ -70755,18 +70767,81 @@ window.__minibiaBotBundle.installUiTweaksModule = function installUiTweaksModule
         soulEnabled: false,
         hideLootMessages: false,
     }, bot.storage.get(configStorageKey, {}));
+    config.bagColumns=[4,5,6].includes(Number(config.bagColumns))?Number(config.bagColumns):(config.sixSlotRows!==false?6:5);
+    const equipmentIcons=new Map();
+    function syncEquipmentIcons(){
+        const icons={openSkills:'📊',openBattle:'⚔️',openMenu:'🏠',openOutfit:'♟',openFriends:'👨‍👨',openSettings:'⚙️','logout-button':'➜]',keyring:'🗝️'};
+        for(const [id,icon] of Object.entries(icons)){
+            const el=document.getElementById(id);if(!el)continue;
+            if(!equipmentIcons.has(el))equipmentIcons.set(el,{title:el.getAttribute('title'),aria:el.getAttribute('aria-label'),icon:el.getAttribute('data-mb-gear-icon'),nodes:Array.from(el.childNodes),iconOnly:false});
+            el.setAttribute('data-mb-gear-icon',icon);
+            if(!el.title)el.title=el.textContent.trim();
+            if(!el.hasAttribute('aria-label'))el.setAttribute('aria-label',el.textContent.trim());
+            const saved=equipmentIcons.get(el),iconOnly=document.body.classList.contains('mb-four-slot-rows');
+            if(iconOnly&&!saved.iconOnly){el.textContent=icon;saved.iconOnly=true;}
+            else if(!iconOnly&&saved.iconOnly){el.replaceChildren(...saved.nodes);saved.iconOnly=false;}
+
+        }
+    }
     const bagStyle=document.createElement('style');bagStyle.textContent=`
-body.mb-custom-sidebar-width:not(.mb-six-slot-rows):not(.force-mobile) #game-wrapper .oogwrap:not([data-mb-empty-sidebar]){width:var(--mb-sidebar-width,216px)!important;min-width:var(--mb-sidebar-width,216px)!important;max-width:var(--mb-sidebar-width,216px)!important;flex:0 0 var(--mb-sidebar-width,216px)!important;box-sizing:border-box;}
+body.mb-custom-sidebar-width:not(.mb-six-slot-rows):not(.mb-four-slot-rows):not(.force-mobile) #game-wrapper .oogwrap:not([data-mb-empty-sidebar]){width:var(--mb-sidebar-width,216px)!important;min-width:var(--mb-sidebar-width,216px)!important;max-width:var(--mb-sidebar-width,216px)!important;flex:0 0 var(--mb-sidebar-width,216px)!important;box-sizing:border-box;}
 body.mb-custom-sidebar-width:not(.force-mobile) #game-wrapper .column{min-width:0;max-width:100%;box-sizing:border-box;}
-body.mb-custom-sidebar-width:not(.mb-six-slot-rows):not(.force-mobile) .column .window[containerIndex]>.body:not([style*="display: none"]):not([style*="display:none"]){display:grid!important;grid-template-columns:repeat(5,minmax(0,34px))!important;gap:2px!important;justify-content:center!important;align-content:start!important;padding:2px!important;box-sizing:border-box!important;overflow-x:hidden!important;scrollbar-width:thin;}
+body.mb-custom-sidebar-width:not(.mb-six-slot-rows):not(.mb-four-slot-rows):not(.force-mobile) .column .window[containerIndex]>.body:not([style*="display: none"]):not([style*="display:none"]){display:grid!important;grid-template-columns:repeat(5,minmax(0,34px))!important;gap:2px!important;justify-content:center!important;align-content:start!important;padding:4px!important;box-sizing:border-box!important;overflow-x:hidden!important;scrollbar-width:thin;}
 
 
-body.mb-custom-sidebar-width:not(.mb-six-slot-rows):not(.force-mobile) .column .window[containerIndex]>.body>.slot{width:100%!important;max-width:34px!important;height:34px!important;min-width:0!important;padding:0!important;margin:0!important;box-sizing:border-box!important;}
+body.mb-custom-sidebar-width:not(.mb-six-slot-rows):not(.mb-four-slot-rows):not(.force-mobile) .column .window[containerIndex]>.body>.slot{width:100%!important;max-width:34px!important;height:34px!important;min-width:0!important;padding:0!important;margin:0!important;box-sizing:border-box!important;}
 body.mb-six-slot-rows:not(.force-mobile) #game-wrapper .oogwrap:not([data-mb-empty-sidebar]){width:228px!important;min-width:228px!important;max-width:228px!important;flex:0 0 228px!important;box-sizing:border-box;}
 body.mb-six-slot-rows:not(.force-mobile) #game-wrapper .column{width:100%!important;box-sizing:border-box;}
-body.mb-six-slot-rows:not(.force-mobile) .column .window[containerIndex]>.body:not([style*="display: none"]):not([style*="display:none"]){display:grid!important;grid-template-columns:repeat(6,minmax(0,34px))!important;gap:2px!important;overflow-x:hidden!important;scrollbar-width:thin;justify-content:start;padding:2px!important;box-sizing:border-box;}
+body.mb-six-slot-rows:not(.force-mobile) .column .window[containerIndex]>.body:not([style*="display: none"]):not([style*="display:none"]){display:grid!important;grid-template-columns:repeat(6,minmax(0,34px))!important;gap:2px!important;overflow-x:hidden!important;scrollbar-width:thin;justify-content:center!important;padding:4px!important;box-sizing:border-box;}
 body.mb-six-slot-rows:not(.force-mobile) .column .window[containerIndex]>.body>.slot{width:100%!important;max-width:34px!important;height:34px!important;min-width:0!important;padding:0!important;margin:0!important;box-sizing:border-box!important;}
 body.mb-six-slot-rows:not(.force-mobile) .column .window[containerIndex]>.body::-webkit-scrollbar{width:8px;height:0;}
+
+/* Four-slot mode: 142px bag grid plus padding/scrollbar; compact gear fits 174px. */
+body.mb-four-slot-rows:not(.force-mobile) #game-wrapper .oogwrap:not([data-mb-empty-sidebar]){width:174px!important;min-width:174px!important;max-width:174px!important;flex:0 0 174px!important;box-sizing:border-box;}
+body.mb-four-slot-rows:not(.force-mobile) #game-wrapper .column{width:100%!important;min-width:0!important;box-sizing:border-box;}
+body.mb-four-slot-rows:not(.force-mobile) .column .window[containerIndex]>.body:not([style*="display: none"]):not([style*="display:none"]){display:grid!important;grid-template-columns:repeat(4,34px)!important;gap:4px!important;padding:2px!important;justify-content:center!important;align-content:start!important;box-sizing:border-box!important;overflow-x:hidden!important;scrollbar-width:thin;}
+body.mb-four-slot-rows:not(.force-mobile) .column .window[containerIndex]>.body>.slot{width:34px!important;height:34px!important;min-width:0!important;max-width:34px!important;margin:0!important;padding:0!important;box-sizing:border-box!important;}
+body.mb-four-slot-rows:not(.force-mobile) .column .window[containerIndex]>.body::-webkit-scrollbar{width:8px;}
+body.mb-four-slot-rows .window.mb-hud-window[data-mb-hud="equipment"]:not(.mb-hud-minimized)>.body.equipment-options-wrapper{grid-template-columns:138px 20px!important;gap:4px!important;grid-template-rows:148px auto!important;padding:2px!important;justify-content:center!important;}
+body.mb-four-slot-rows .window.mb-hud-window[data-mb-hud="equipment"] #mobile-equipment-panel{grid-template-columns:34px 34px 34px 24px!important;gap:4px!important;width:138px!important;min-width:138px!important;}
+body.mb-four-slot-rows .window.mb-hud-window[data-mb-hud="equipment"] #mobile-equipment-panel>.fight-mode-column,
+body.mb-four-slot-rows .window.mb-hud-window[data-mb-hud="equipment"] #fight-mode-selector,
+body.mb-four-slot-rows .window.mb-hud-window[data-mb-hud="equipment"] #fight-mode-selector>button{width:24px!important;min-width:24px!important;}
+body.mb-four-slot-rows .equipment-buttons>button[data-mb-gear-icon]{font:12px "Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",sans-serif!important;line-height:1!important;padding:0!important;min-width:0!important;overflow:hidden;}
+body.mb-four-slot-rows .equipment-buttons>button[data-mb-gear-icon]::before{content:none!important;}
+
+body.mb-four-slot-rows .window.mb-hud-window[data-mb-hud="equipment"]>.body>.equipment-buttons,
+body.mb-four-slot-rows .window.mb-hud-window[data-mb-hud="equipment"] #fight-mode-selector{height:148px!important;gap:4px!important;padding:0!important;margin:0!important;}
+body.mb-four-slot-rows .window.mb-hud-window[data-mb-hud="equipment"] #fight-mode-selector>button{flex:1 1 0!important;height:auto!important;min-height:0!important;}
+body.mb-four-slot-rows .window.mb-hud-window[data-mb-hud="equipment"] #fight-mode-selector>.mode-separator{display:none!important;}
+
+body.mb-four-slot-rows .window.mb-hud-window[data-mb-hud="equipment"]>.body>.equipment-buttons{
+ width:20px!important;min-width:0!important;max-width:20px!important;
+ position:static!important;overflow:hidden;box-sizing:border-box!important;
+ margin:0!important;padding:0!important;flex-wrap:nowrap!important;
+}
+body.mb-four-slot-rows .window.mb-hud-window[data-mb-hud="equipment"]>.body>.equipment-buttons>button{
+ display:flex!important;align-items:center!important;justify-content:center!important;
+ box-sizing:border-box!important;width:20px!important;min-width:0!important;max-width:20px!important;
+ margin:0!important;padding:0!important;position:static!important;
+ overflow:hidden!important;white-space:nowrap;
+}
+body.mb-four-slot-rows .window.mb-hud-window[data-mb-hud="equipment"] #mobile-equipment-panel,
+body.mb-four-slot-rows .window.mb-hud-window[data-mb-hud="equipment"] #fight-mode-selector{box-sizing:border-box!important;min-width:0!important;overflow:hidden;}
+body.mb-four-slot-rows #minibia-bot-panel[data-mb-docked][data-collapsed="true"] .mb-collapsed-module-row{
+ display:grid!important;grid-template-columns:repeat(4,minmax(0,1fr))!important;
+ gap:3px!important;padding:1px 2px!important;min-width:0!important;min-height:0!important;
+}
+body.mb-four-slot-rows #minibia-bot-panel[data-mb-docked][data-collapsed="true"] .mb-collapsed-module-button{
+ width:100%!important;min-width:0!important;max-width:100%!important;height:auto!important;min-height:0!important;max-height:none!important;
+ box-sizing:border-box!important;padding:2px!important;margin:0!important;top:0!important;
+ display:flex!important;align-items:center!important;justify-content:center!important;gap:3px!important;
+ font-size:10px!important;line-height:1!important;overflow:hidden;
+}
+body.mb-four-slot-rows #minibia-bot-panel[data-mb-docked][data-collapsed="true"] .mb-run-dot{
+ width:7px!important;height:7px!important;flex:0 0 7px!important;
+}
+body.mb-four-slot-rows #minibia-bot-panel[data-mb-docked][data-collapsed="true"] .mb-collapsed-module-button .mb-run-label{font-size:10px!important;line-height:10px!important;}
 `;document.head.appendChild(bagStyle);
     const minimapStyle=document.createElement('style');
     minimapStyle.textContent=`
@@ -71245,12 +71320,14 @@ body.mb-full-width-minimap:not(.force-mobile) #minimap-container .crosshair{
     function applyStyles() {
         const customDesktop=bot.interfaceLayout?.config.enabled!==false&&!window.gameClient?.touch?.isMobileMode;
         document.body.classList.toggle('mb-custom-sidebar-width',customDesktop);
-        if(customDesktop)document.body.style.setProperty('--mb-sidebar-width',config.wideColumns?'224px':'216px');
+        if(customDesktop)document.body.style.setProperty('--mb-sidebar-width',config.bagColumns===4?'174px':config.wideColumns?'224px':'216px');
         else document.body.style.removeProperty('--mb-sidebar-width');
-        document.body.classList.toggle("mb-six-slot-rows",config.sixSlotRows!==false&&bot.interfaceLayout?.config.enabled!==false&&!window.gameClient?.touch?.isMobileMode);
+        document.body.classList.toggle("mb-six-slot-rows",config.bagColumns===6&&bot.interfaceLayout?.config.enabled!==false&&!window.gameClient?.touch?.isMobileMode);
         document.body.classList.toggle("mb-full-width-minimap",config.fullWidthMinimap===true&&bot.interfaceLayout?.config.enabled!==false&&!window.gameClient?.touch?.isMobileMode);
+        document.body.classList.toggle('mb-four-slot-rows',customDesktop&&config.bagColumns===4);
+        syncEquipmentIcons();
         const columns = document.querySelectorAll("#game-wrapper .column");
-        const newWidth = config.wideColumns ? "224px" : "216px";
+        const newWidth = config.bagColumns===4 ? "174px" : config.wideColumns ? "224px" : "216px";
         columns.forEach(col => {
             if(bot.interfaceLayout?.config.enabled===false)col.style.removeProperty('width');else col.style.width = newWidth;
         });
@@ -71279,8 +71356,8 @@ function bindControls(panel) {
     if (!panel || panel.dataset.uiTweaksBound === "true") return;
     panel.dataset.uiTweaksBound = "true";
 
-    const bagCheck=panel.querySelector('#minibia-bot-ui-six-slots');
-    if(bagCheck){bagCheck.checked=config.sixSlotRows!==false;bagCheck.addEventListener('change',()=>{config.sixSlotRows=bagCheck.checked;applyAll();window.dispatchEvent(new Event('resize'));});}
+    const bagCheck=panel.querySelector('#minibia-bot-ui-bag-columns');
+    if(bagCheck){bagCheck.value=String(config.bagColumns);bagCheck.addEventListener('change',()=>{config.bagColumns=Number(bagCheck.value);config.sixSlotRows=config.bagColumns===6;applyAll();window.dispatchEvent(new Event('resize'));});}
     const minimapCheck=panel.querySelector("#minibia-bot-ui-full-minimap");
     if(minimapCheck){minimapCheck.checked=config.fullWidthMinimap===true;minimapCheck.addEventListener("change",()=>{config.fullWidthMinimap=minimapCheck.checked;applyAll();});}
     const wideCheck      = panel.querySelector("#minibia-bot-ui-wide-columns");
@@ -71402,7 +71479,8 @@ function bindControls(panel) {
     // ---- Cleanup on bot destroy ----
     bot.addCleanup(() => {
         uiTweaksDestroyed = true;
-        bagStyle.remove();document.body.classList.remove("mb-six-slot-rows","mb-custom-sidebar-width");document.body.style.removeProperty('--mb-sidebar-width');
+        bagStyle.remove();document.body.classList.remove("mb-six-slot-rows","mb-four-slot-rows","mb-custom-sidebar-width");document.body.style.removeProperty('--mb-sidebar-width');
+        for(const [el,saved] of equipmentIcons){if(saved.iconOnly)el.replaceChildren(...saved.nodes);for(const [attr,value] of [['title',saved.title],['aria-label',saved.aria],['data-mb-gear-icon',saved.icon]]){if(value===null)el.removeAttribute(attr);else el.setAttribute(attr,value);}}equipmentIcons.clear();
         minimapStyle.remove();document.body.classList.remove("mb-full-width-minimap");
         for (const timer of [nameSpoofRetryTimer, floatingTextRetryTimer, nameplateRefreshTimer]) {
             if (timer != null) clearTimeout(timer);
