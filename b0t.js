@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.528",
+        version: "1.6.533",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -6151,7 +6151,16 @@ window.__minibiaBotBundle.installSidebarPanelsModule = function installSidebarPa
  width:100%!important;min-width:0!important;max-width:100%!important;
  margin:0!important;padding:0!important;box-sizing:border-box!important;
 }
-.window.mb-hud-window>.header>.title{pointer-events:none;}
+/* Match the right-aligned controls used by the other sidebar windows. */
+.window.mb-hud-window>.header{display:flex;align-items:center;padding-right:4px;}
+.window.mb-hud-window>.header>.title{
+ order:-1!important;flex:1 1 auto!important;min-width:0;
+ padding-left:4px!important;padding-right:6px;margin-right:auto;
+ overflow:hidden;text-overflow:ellipsis;white-space:nowrap;pointer-events:none;
+}
+.window.mb-hud-window>.header>.button-stack{order:20!important;flex:0 0 auto!important;}
+.window.mb-hud-window>.header>.mb-hud-minimize{order:30!important;flex:0 0 auto!important;}
+
 .window.mb-hud-window.mb-hud-minimized>.body{display:none!important;}
 .window.mb-hud-window>.mb-hud-body{min-width:0;max-width:100%;box-sizing:border-box;}
 .window.mb-hud-window[data-mb-hud="equipment"]:not(.mb-hud-minimized)>.body.equipment-options-wrapper{
@@ -6240,7 +6249,7 @@ window.__minibiaBotBundle.installSidebarPanelsModule = function installSidebarPa
 [data-mb-extra-sidebar]>.column{flex:1 1 auto;min-height:0!important;}
 
 .window.mb-hud-window[data-mb-hud="minimap"]>.header{display:flex;align-items:center;gap:2px;}
-.window.mb-hud-window[data-mb-hud="minimap"]>.header>.title{flex:1;min-width:0;overflow:hidden;font-size:10px;}
+.window.mb-hud-window[data-mb-hud="minimap"]>.header>.title{flex:1;min-width:0;overflow:hidden;font-size:inherit;}
 .window.mb-hud-window[data-mb-hud="minimap"]>.header>.button-stack{position:static!important;display:flex!important;flex-direction:row!important;gap:1px!important;width:auto!important;height:auto!important;padding:0!important;margin:0!important;}
 .window.mb-hud-window[data-mb-hud="minimap"]>.header>.button-stack button{width:18px!important;min-width:18px!important;height:18px!important;padding:0!important;margin:0!important;}
 .window.mb-hud-window[data-mb-hud="minimap"]>.mb-hud-body{align-self:center;flex:0 0 auto!important;padding:0!important;margin:0!important;width:100%!important;aspect-ratio:auto;overflow:hidden!important;}
@@ -6308,8 +6317,8 @@ window.__minibiaBotBundle.installSidebarPanelsModule = function installSidebarPa
         const elements=selectors.map(s=>document.querySelector(s));if(elements.some(el=>!el))return null;
         const shell=document.createElement('div');shell.className='window mb-hud-window';shell.setAttribute('data-mb-hud',name);shell.draggable=true;
         const header=document.createElement('div');header.className='header';header.title='Drag to a sidebar or between backpacks';
-        const minimize=document.createElement('button');minimize.type='button';minimize.className='symbol-button small';minimize.textContent='−';minimize.title='Minimize';minimize.draggable=false;
-        const title=document.createElement('span');title.className='title';title.textContent=name==='minimap'?'Minimap':name==='vitals'?'Health & Mana':'Equipment';header.append(minimize,title);
+        const minimize=document.createElement('button');minimize.type='button';minimize.className='symbol-button small mb-hud-minimize';minimize.textContent='−';minimize.title='Minimize';minimize.draggable=false;
+        const title=document.createElement('span');title.className='title';title.textContent=name==='minimap'?'Minimap':name==='vitals'?'Health & Mana':'Equipment';header.append(title,minimize);
         const body=document.createElement('div');body.className='body mb-hud-body'+(name==='equipment'?' equipment-options-wrapper':'');shell.append(header,body);
         minimize.addEventListener('click',event=>{event.stopPropagation();const hidden=body.style.display==='none';body.style.display=hidden?'':'none';shell.classList.toggle('mb-hud-minimized',!hidden);minimize.textContent=hidden?'−':'+';});
         const nodes=elements.map(el=>{const home=document.createComment('mb0t '+name+' home');el.parentNode.insertBefore(home,el);return {el,home};});
@@ -6551,7 +6560,19 @@ window.__minibiaBotBundle.installBotSidebarModule = function installBotSidebarMo
     let binding=null,disposed=false,observer=null;
     const style=document.createElement('style');style.textContent=`
 .window.mb-bot-sidebar{display:flex;flex:0 0 auto;width:100%;min-width:0;max-width:100%;box-sizing:border-box;}
-.window.mb-bot-sidebar>.header>.title{pointer-events:none;}
+/* Window titles left; controls right: lock, back, minimize, close. */
+.window>.header{display:flex;align-items:center;padding-right:4px;}
+.window>.header>.title{
+ order:-1!important;flex:1 1 auto!important;min-width:0;
+ padding-left:4px!important;padding-right:6px;margin-right:auto;
+ overflow:hidden;text-overflow:ellipsis;white-space:nowrap;pointer-events:none;
+}
+.window>.header>button{order:25!important;flex:0 0 auto;}
+.window>.header>button[action="lock"],
+.window>.header>button.container-lock-btn{order:10!important;}
+.window>.header>button[action="up"]{order:20!important;}
+.window>.header>button[action="minimize"]{order:30!important;}
+.window>.header>button[action="close"]{order:40!important;}
 .window.mb-bot-sidebar>.body{padding:4px!important;min-width:0;box-sizing:border-box;}
 #minibia-bot-panel[data-mb-docked]{position:relative!important;inset:auto!important;transform:none!important;width:100%!important;min-width:0!important;max-width:100%!important;height:auto!important;max-height:none!important;margin:0!important;border:0!important;box-shadow:none!important;box-sizing:border-box!important;}
 #minibia-bot-panel[data-mb-docked]>.mb-titlebar{display:none!important;}
@@ -6566,7 +6587,7 @@ window.__minibiaBotBundle.installBotSidebarModule = function installBotSidebarMo
             const home=document.createComment('mb0t floating panel home');panel.parentNode.insertBefore(home,panel);
             const shell=document.createElement('div');shell.className='window mb-bot-sidebar';shell.draggable=true;shell.setAttribute('data-mb-bot-window','');shell.setAttribute('data-mb-hud','bot');
             const header=document.createElement('div');header.className='header';header.title='Drag to a sidebar or between backpacks';
-            const expand=document.createElement('button');expand.className='symbol-button small';expand.type='button';expand.textContent='+';expand.title='Expand mb0t';expand.draggable=false;
+            const expand=document.createElement('button');expand.className='symbol-button small';expand.type='button';expand.textContent='✚';expand.title='Expand mb0t';expand.draggable=false;
             const title=document.createElement('span');title.className='title';title.textContent='mb0t v'+bot.version;header.append(expand,title);
             const body=document.createElement('div');body.className='body';shell.append(header,body);body.appendChild(panel);panel.setAttribute('data-mb-docked','');
             binding={panel,home,shell};
