@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.544",
+        version: "1.6.559",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -5686,17 +5686,11 @@ window.__minibiaBotBundle.installHotbarDockModule = function installHotbarDockMo
     const key='minibiaBot.hotbarDock.config',saved=bot.storage.get(key,{});
     const normalize=value=>['left','right'].includes(value)?value:'bottom';
     const config={position:normalize(saved.position),showSecondBank:saved.showSecondBank!==false};
-    let disposed=false,binding=null,extraBars=[],scaleBinding=null,resizeFrame=null;
+    let disposed=false,binding=null,extraBars=[];
     const style=document.createElement('style');style.id='minibia-bot-hotbar-dock-style';
     style.textContent=`
-/* The native .middle spacers grow independently of the canvas. Remove
-   empty spacer boxes and allocate canvas height without its intrinsic size,
-   so resizing the transformed canvas cannot shrink its own parent. */
-#game-wrapper .main.mb-hotbar-docked>.middle:empty{display:none!important;}
-.main.mb-hotbar-docked>.mb-hotbar-dock-row{flex:1 1 0!important;min-height:0!important;}
-.main.mb-hotbar-docked>.mb-hotbar-dock-row>.upper>.canvas-wrapper{min-width:0!important;min-height:0!important;flex:0 0 auto;}
-.mb-hotbar-dock-row{display:flex;align-items:stretch;flex:1 1 0;min-width:0;min-height:0;overflow:hidden;}
-.mb-hotbar-dock-row>.upper{display:flex!important;align-items:center!important;justify-content:center!important;position:relative!important;overflow:hidden!important;flex:1 1 0!important;min-width:0!important;min-height:0!important;width:auto!important;height:auto!important;align-self:stretch!important;}
+.mb-hotbar-dock-row{display:flex;align-items:stretch;flex:1 1 auto;min-width:0;min-height:0;overflow:hidden;}
+.mb-hotbar-dock-row>.upper{flex:1 1 0!important;min-width:0!important;width:auto!important;}
 .mb-hotbar-dock-side>.hotbar{display:flex!important;flex-direction:column!important;flex-wrap:nowrap!important;align-items:center!important;justify-content:flex-start!important;width:42px!important;min-width:42px!important;flex:0 0 42px!important;height:auto!important;min-height:0!important;overflow-x:hidden!important;overflow-y:auto!important;gap:3px!important;margin:0!important;padding:4px 2px!important;box-sizing:border-box!important;position:relative!important;inset:auto!important;transform:none!important;}
 .mb-hotbar-dock-side>.hotbar>.hotbar-item{flex:0 0 34px!important;width:34px!important;height:34px!important;min-height:34px!important;box-sizing:border-box!important;margin:0!important;}
 .mb-hotbar-dock-side>.hotbar>.hotbar-presets{display:flex!important;flex-wrap:wrap!important;justify-content:center!important;flex:0 0 auto!important;width:36px!important;margin:0 0 2px!important;gap:1px!important;}
@@ -5800,15 +5794,6 @@ window.__minibiaBotBundle.installHotbarDockModule = function installHotbarDockMo
 
 `;
     style.textContent += `
-/* Remove the native grey texture from the canvas surround and spacers. */
-#game-wrapper .main.mb-hotbar-docked,
-#game-wrapper .main.mb-hotbar-docked>.middle,
-#game-wrapper .main.mb-hotbar-docked>.mb-hotbar-dock-row,
-#game-wrapper .main.mb-hotbar-docked>.mb-hotbar-dock-row>.upper,
-#game-wrapper .main.mb-hotbar-docked>.mb-hotbar-dock-row>.upper>.canvas-wrapper{
- background-color:#141414!important;
- background-image:none!important;
-}
 /* Native side tray uses the same rack and slot grid as custom side hotbars. */
 .main .mb-hotbar-dock-side>.mb-side-hotkey-tray{
  display:grid;grid-auto-flow:column;grid-template-columns:repeat(var(--mb-side-columns,1),34px);
@@ -5830,22 +5815,12 @@ window.__minibiaBotBundle.installHotbarDockModule = function installHotbarDockMo
 .main .mb-side-hotkey-tray>.hotbar.mb-native-hotbar>.mb-extra-hotbar-scroll>button:not(:last-child){display:none!important;}
 .main .mb-side-hotkey-tray>.hotbar.mb-native-hotbar>.mb-native-hotbar-controls{position:fixed;z-index:10000;padding:4px;border:1px solid #666;background:#222;}
 .main .mb-side-hotkey-tray .hotbar-bank-toggle{display:inline-block!important;}
-/* Border on the sized wrapper stays exactly one CSS pixel at every zoom. */
-#game-wrapper .main.mb-hotbar-docked>.mb-hotbar-dock-row>.upper>.canvas-wrapper{
- outline:1px solid #000!important;
- outline-offset:0;
-}
-/* Use the game's bg2 texture for the hotbar frames and canvas surround. */
-#game-wrapper .main.mb-hotbar-docked,
-#game-wrapper .main.mb-hotbar-docked>.middle,
-#game-wrapper .main.mb-hotbar-docked>.mb-hotbar-dock-row,
-#game-wrapper .main.mb-hotbar-docked>.mb-hotbar-dock-row>.upper,
-#game-wrapper .main.mb-hotbar-docked>.mb-hotbar-dock-row>.upper>.canvas-wrapper,
-#game-wrapper .main.mb-hotbar-docked .mb-hotbar-dock-side,
-#game-wrapper .main.mb-hotbar-docked .mb-bottom-hotkey-tray,
-#game-wrapper .main.mb-hotbar-docked .mb-side-hotkey-tray,
-#game-wrapper .main.mb-hotbar-docked .hotbar.mb-native-hotbar,
-#game-wrapper .main.mb-hotbar-docked .mb-extra-hotbar{
+/* Retain the chosen hotbar texture without changing the canvas surround. */
+.main .mb-hotbar-dock-side,
+.main .mb-bottom-hotkey-tray,
+.main .mb-side-hotkey-tray,
+.main .hotbar.mb-native-hotbar,
+.main .mb-extra-hotbar{
  background-color:#191919!important;
  background-image:url("https://minibia.com/png/bg2.png")!important;
  background-repeat:repeat!important;
@@ -5853,46 +5828,8 @@ window.__minibiaBotBundle.installHotbarDockModule = function installHotbarDockMo
 
 `;
     document.head.appendChild(style);
-    function setDockStyle(el,key,value,priority=''){
-        value=String(value);
-        if(el.style.getPropertyValue(key)!==value||el.style.getPropertyPriority(key)!==priority)
-            el.style.setProperty(key,value,priority);
-    }
-    function restoreScale(){
-        if(scaleBinding && scaleBinding.ui.getResolutionScale===scaleBinding.wrapper)
-            scaleBinding.ui.getResolutionScale=scaleBinding.original;
-        scaleBinding=null;
-    }
-    function syncScale(){
-        const ui=window.gameClient?.interface;
-        if(scaleBinding?.ui===ui)return;
-        restoreScale();
-        if(typeof ui?.getResolutionScale!=='function')return;
-        const original=ui.getResolutionScale;
-        const wrapper=function(){
-            const requested=original.apply(this,arguments);
-            if(!binding||disposed||bot.interfaceLayout?.config.enabled===false||window.gameClient?.touch?.isMobileMode)return requested;
-            const rect=binding.upper.getBoundingClientRect();
-            const width=Number(this.SCREEN_WIDTH_MIN)||480,height=Number(this.SCREEN_HEIGHT_MIN)||352;
-            if(rect.width<=0||rect.height<=0)return requested;
-            // Fill the actual canvas area. The native scale reserves space
-            // for the default bottom hotbar and sidebars even after docking;
-            // using it as an upper limit leaves unused borders around the view.
-            return Math.min(Math.max(1,rect.width-2)/width,Math.max(1,rect.height-2)/height);
-        };
-        scaleBinding={ui,original,wrapper};ui.getResolutionScale=wrapper;
-    }
-    function queueCanvasResize(){
-        if(disposed||resizeFrame!==null)return;
-        resizeFrame=window.requestAnimationFrame(()=>{
-            resizeFrame=null;
-            if(binding&&!disposed)window.gameClient?.interface?.handleResize?.(new Event('resize'));
-        });
-    }
     function restore(){
-        const b=binding;if(!b){restoreScale();return;}
-        b.observer?.disconnect();restoreScale();
-        if(!b.hadDockClass)b.main.classList.remove('mb-hotbar-docked');
+        const b=binding;if(!b)return;
         for(const e of extraBars)if(e.root.parentNode && e.root.parentNode!==document.body)document.body.appendChild(e.root);
         if(b.barHome.isConnected)b.barHome.parentNode.insertBefore(b.bar,b.barHome);
         if(b.upperHome.isConnected)b.upperHome.parentNode.insertBefore(b.upper,b.upperHome);
@@ -5906,7 +5843,7 @@ window.__minibiaBotBundle.installHotbarDockModule = function installHotbarDockMo
         style.media=style.disabled?'not all':'all';if(style.sheet)style.sheet.disabled=style.disabled;
         if(bot.interfaceLayout?.config.enabled===false){restore();return;}
         if(disposed)return;
-        for(const e of extraBars)setDockStyle(e.root,'display',e.enabled?'':'none');
+        for(const e of extraBars)e.root.style.display=e.enabled?'':'none';
         const active=extraBars.filter(e=>e.enabled);
         if(window.gameClient?.touch?.isMobileMode){if(binding){restore();window.dispatchEvent(new Event('resize'));}return;}
         if(binding&&(!binding.bar.isConnected||!binding.upper.isConnected))restore();
@@ -5919,40 +5856,33 @@ window.__minibiaBotBundle.installHotbarDockModule = function installHotbarDockMo
             row.className='mb-hotbar-dock-row';left.className=right.className='mb-hotbar-dock-side';bottom.className='mb-hotbar-dock-bottom mb-bottom-hotkey-tray';
             middle.insertBefore(barHome,bar);upper.parentElement.insertBefore(upperHome,upper);upper.parentElement.insertBefore(row,upper);row.parentNode.insertBefore(bottom,row.nextSibling);
             const ownedStyles=[[bar,'order'],[bar,'max-height'],[bar,'height']].map(([el,property])=>[el,property,el.style.getPropertyValue(property),el.style.getPropertyPriority(property)]);
-            const main=row.parentElement,hadDockClass=main.classList.contains('mb-hotbar-docked');
-            main.classList.add('mb-hotbar-docked');
             const middleStyle=middle.getAttribute('style');row.appendChild(left);row.appendChild(upper);row.appendChild(right);
-            binding={bar,upper,middle,main,hadDockClass,barHome,upperHome,row,left,right,bottom,sideTray,middleStyle,ownedStyles,signature:null,observer:null};
-            if(typeof ResizeObserver==='function'){
-                binding.observer=new ResizeObserver(queueCanvasResize);
-                binding.observer.observe(upper);
-            }
+            binding={bar,upper,middle,barHome,upperHome,row,left,right,bottom,sideTray,middleStyle,ownedStyles,signature:null};
         }
-        syncScale();
         const b=binding;
         const sideHome=config.position==='left'?b.left:b.right;
         if(config.position!=='bottom'&&b.sideTray.parentNode!==sideHome)sideHome.insertBefore(b.sideTray,sideHome.firstChild);
-        setDockStyle(b.sideTray,'display',config.position==='bottom'?'none':'');
+        b.sideTray.style.display=config.position==='bottom'?'none':'';
         const home=config.position==='bottom'?b.bottom:b.sideTray;
         if(b.bar.parentNode!==home){home.insertBefore(b.bar,home.firstChild);}
-        if(!b.middle.children.length)setDockStyle(b.middle,'display','none');
+        if(!b.middle.children.length)b.middle.style.display='none';
         b.bar.style.removeProperty('max-height');b.bar.style.removeProperty('height'); 
         for(const e of active){const target=e.autoFill?home:e.position==='bottom'?b.bottom:e.position==='left'?b.left:b.right;
-            if(e.root.dataset.horizontal!==String(e.position==='bottom'))e.root.dataset.horizontal=String(e.position==='bottom');if(e.root.parentNode!==target)target.appendChild(e.root);}
+            e.root.dataset.horizontal=String(e.position==='bottom');if(e.root.parentNode!==target)target.appendChild(e.root);}
         // 24 slots + settings + one spare cell for the adaptive tray. Hide
         // bank two only visually; Shift hotkeys and assignments stay intact.
         const bottomWidth=b.bottom.clientWidth;
         b.bottom.classList.toggle('mb-hotbar-compact',!config.showSecondBank||(bottomWidth>0&&bottomWidth<938));
         const height=b.upper.getBoundingClientRect().height;
         if(height>0){
-            setDockStyle(b.left,'max-height',Math.round(height)+'px');setDockStyle(b.right,'max-height',Math.round(height)+'px');
+            b.left.style.maxHeight=b.right.style.maxHeight=Math.round(height)+'px';
             const geometry=sideTrayGeometry(height);
-            setDockStyle(b.sideTray,'--mb-side-rows',geometry.rows);
-            setDockStyle(b.sideTray,'--mb-side-columns',geometry.columns);
-            setDockStyle(b.sideTray,'width',(geometry.columns*36+2)+'px');
-            setDockStyle(b.sideTray,'height',Math.round(height)+'px');
+            b.sideTray.style.setProperty('--mb-side-rows',geometry.rows);
+            b.sideTray.style.setProperty('--mb-side-columns',geometry.columns);
+            b.sideTray.style.width=(geometry.columns*36+2)+'px';
+            b.sideTray.style.height=Math.round(height)+'px';
             b.sideTray.classList.toggle('mb-hotbar-compact',!config.showSecondBank);
-            for(const e of active){setDockStyle(e.root,'max-height',e.position==='bottom'?'':Math.round(height)+'px');setDockStyle(e.root,'height',e.position==='bottom'?'auto':Math.round(height)+'px');}
+            for(const e of active){e.root.style.maxHeight=e.position==='bottom'?'':Math.round(height)+'px';e.root.style.height=e.position==='bottom'?'auto':Math.round(height)+'px';}
         }
         // Size containment keeps old sidebar heights out of the canvas flex
         // calculation. Width is explicit because contained children have no
@@ -5960,12 +5890,12 @@ window.__minibiaBotBundle.installHotbarDockModule = function installHotbarDockMo
         for(const rack of [b.left,b.right]){
             const children=Array.from(rack.children).filter(el=>el.style.display!=='none');
             const width=children.reduce((sum,el)=>sum+(el===b.sideTray?parseFloat(el.style.width)||38:38),0)+Math.max(0,children.length-1);
-            setDockStyle(rack,'width',width+'px');
-            setDockStyle(rack,'display',children.length?'flex':'none');
+            rack.style.width=width+'px';
+            rack.style.display=children.length?'flex':'none';
         }
-        setDockStyle(b.bottom,'display',config.position==='bottom'||active.some(e=>!e.autoFill&&e.position==='bottom')?'grid':'none','important');
+        b.bottom.style.setProperty('display',config.position==='bottom'||active.some(e=>!e.autoFill&&e.position==='bottom')?'grid':'none','important');
         const signature=config.position+'|'+config.showSecondBank+'|'+b.sideTray.style.width+'|'+active.map(e=>e.id+':'+e.position).join(',');
-        if(signature!==b.signature){b.signature=signature;window.dispatchEvent(new Event('resize'));queueCanvasResize();}
+        if(signature!==b.signature){b.signature=signature;window.dispatchEvent(new Event('resize'));}
     }
     function sideTrayGeometry(height){
         const rows=Math.max(1,Math.floor((height-2)/36));
@@ -5982,7 +5912,7 @@ window.__minibiaBotBundle.installHotbarDockModule = function installHotbarDockMo
     }
     bot.hotbarDock={config,updateConfig,mount,sync:apply,getSideHeight:()=>Number(binding?.upper?.getBoundingClientRect?.()?.height)||0,getSideTrayFillCells:()=>sideTrayGeometry(Number(binding?.upper?.getBoundingClientRect?.()?.height)||0).fillCells,getBottomWidth:()=>binding?.bottom?.clientWidth||0,getNativeBottomCells:()=>{const width=binding?.bottom?.clientWidth||0;return !config.showSecondBank||(width>0&&width<938)?13:25;},setExtraBars:entries=>{extraBars=entries;apply();}};
     apply();const timer=setInterval(apply,500);
-    bot.addCleanup(()=>{disposed=true;clearInterval(timer);if(resizeFrame!==null)window.cancelAnimationFrame(resizeFrame);resizeFrame=null;restore();style.remove();window.dispatchEvent(new Event('resize'));});
+    bot.addCleanup(()=>{disposed=true;clearInterval(timer);restore();style.remove();window.dispatchEvent(new Event('resize'));});
 };
 
 window.__minibiaBotBundle.installExtraSidebarsModule = function installExtraSidebarsModule(bot){
@@ -6467,20 +6397,16 @@ window.__minibiaBotBundle.installSidebarPanelsModule = function installSidebarPa
         for(const key of ['width','max-width','left','z-index'])b.r.shell.style.removeProperty(key);
     }
     function applyMapSpan(r,available){
-        if(config.mapSpan!==2||r.shell.classList.contains('mb-hud-minimized')){clearMapSpan();return;}
-        const wrap=r.shell.closest('.oogwrap');if(!wrap){clearMapSpan();return;}
+        clearMapSpan();if(config.mapSpan!==2||r.shell.classList.contains('mb-hud-minimized'))return;
+        const wrap=r.shell.closest('.oogwrap');if(!wrap)return;
         const box=wrap.getBoundingClientRect(),side=config.minimap.startsWith('left')?'left':'right';
         const others=available.filter(p=>p.id.startsWith(side)&&p.column.closest('.oogwrap')!==wrap).map(p=>({p,box:p.column.closest('.oogwrap').getBoundingClientRect()})).filter(e=>e.box.width>0&&Math.abs(e.box.top-box.top)<40);
-        others.sort((a,b)=>Math.abs(a.box.left-box.left)-Math.abs(b.box.left-box.left));const next=others[0];if(!next){clearMapSpan();return;}
-        const left=Math.min(box.left,next.box.left),right=Math.max(box.right,next.box.right);if(right-left>box.width*2+24){clearMapSpan();return;}
-        const parent=r.shell.parentElement;
-        const signature=[left,right,box.top,next.box.top,parent.getBoundingClientRect().left].join('|');
-        if(spanState?.r===r&&spanState.parent===parent&&spanState.spacer.parentNode===next.p.column&&spanState.signature===signature)return;
-        clearMapSpan();
+        others.sort((a,b)=>Math.abs(a.box.left-box.left)-Math.abs(b.box.left-box.left));const next=others[0];if(!next)return;
+        const left=Math.min(box.left,next.box.left),right=Math.max(box.right,next.box.right);if(right-left>box.width*2+24)return;
         const spacer=document.createElement('div');spacer.setAttribute('data-mb-map-spacer','');spacer.style.flex='0 0 auto';spacer.style.pointerEvents='none';next.p.column.insertBefore(spacer,next.p.column.firstChild);
         const ancestors=[];for(let el=r.shell.parentElement;el&&el.id!=='game-wrapper';el=el.parentElement){el.classList.add('mb-map-span-overflow');ancestors.push(el);}
         r.shell.style.setProperty('width',(right-left)+'px','important');r.shell.style.setProperty('max-width',(right-left)+'px','important');r.shell.style.left=(left-r.shell.parentElement.getBoundingClientRect().left)+'px';r.shell.style.zIndex='3';
-        spanState={r,spacer,ancestors,parent,signature};
+        spanState={r,spacer,ancestors};
     }
     function updateMapSize(r){
         const width=r.body.parentNode?.getBoundingClientRect().width||216;
@@ -6585,9 +6511,18 @@ window.__minibiaBotBundle.installBotSidebarModule = function installBotSidebarMo
 .window.mb-bot-sidebar>.body{padding:4px!important;min-width:0;box-sizing:border-box;}
 #minibia-bot-panel[data-mb-docked]{position:relative!important;inset:auto!important;transform:none!important;width:100%!important;min-width:0!important;max-width:100%!important;height:auto!important;max-height:none!important;margin:0!important;border:0!important;box-shadow:none!important;box-sizing:border-box!important;}
 #minibia-bot-panel[data-mb-docked]>.mb-titlebar{display:none!important;}
+#minibia-bot-panel:not([data-mb-docked]){contain:layout style;}
 `;document.head.appendChild(style);
     const manager=()=>window.gameClient?.interface?.windowManager;
-    function restore(){if(!binding)return;const b=binding;b.panel.removeAttribute('data-mb-docked');if(b.home.parentNode)b.home.parentNode.insertBefore(b.panel,b.home);b.home.remove();b.shell.remove();binding=null;}
+    function restore(){if(!binding)return;const b=binding;
+        const state=manager()?.state;
+        if(state){
+            if(state.currentDragElement===b.shell){state.currentDragElement=null;state.currentDragElementOffset=null;}
+            if(state.mouseDownTarget&&b.shell.contains(state.mouseDownTarget))state.mouseDownTarget=null;
+            const mouseWindow=state.currentMouseElement;
+            if(mouseWindow?.__element===b.shell)state.currentMouseElement=null;
+        }
+        b.panel.removeAttribute('data-mb-docked');if(b.home.parentNode)b.home.parentNode.insertBefore(b.panel,b.home);b.home.remove();b.shell.remove();binding=null;}
     function sync(){
         if(disposed)return;
         const panel=document.getElementById('minibia-bot-panel');
@@ -6643,11 +6578,11 @@ window.__minibiaBotBundle.installBackpackSizingModule = function installBackpack
         const rowsHeight=rows=>rows*stride+extra;
         const available=Math.max(rowsHeight(1),window.innerHeight-body.getBoundingClientRect().top-20);
         const maxRows=Math.max(1,Math.min(fullRows,Math.floor((available-extra)/stride)));
-        body.style.setProperty('min-height',rowsHeight(1)+'px');body.style.setProperty('max-height',rowsHeight(maxRows)+'px');
+        const minHeight=rowsHeight(1)+'px',maxHeight=rowsHeight(maxRows)+'px';if(body.style.minHeight!==minHeight)body.style.setProperty('min-height',minHeight);if(body.style.maxHeight!==maxHeight)body.style.setProperty('max-height',maxHeight);
         const current=Number.parseFloat(body.style.height)||body.getBoundingClientRect().height;
         const desired=event?event.clientY-body.getBoundingClientRect().top-12:current;
         const rows=Math.max(1,Math.min(maxRows,Math.round((desired-extra)/stride)));
-        body.style.height=rowsHeight(rows)+'px';
+        const nextHeight=rowsHeight(rows)+'px';if(body.style.height!==nextHeight)body.style.height=nextHeight;
     }
     function sync(event){
         if(disposed)return;
@@ -60704,6 +60639,13 @@ window.__minibiaBotBundle.installBankNpcModule = function installBankNpcModule(b
 };
 
 window.__minibiaBotBundle.installPanel = function installPanel(bot) {
+    // Settings UI timers must not keep mutating hidden controls after collapse.
+    function settingsAreVisible(){
+        const el=document.getElementById('minibia-bot-panel');
+        return !!el&&el.isConnected&&el.dataset.collapsed!=='true'&&el.style.display!=='none'&&el.getClientRects().length>0;
+    }
+    function settingsRefresh(refresh){return function(...args){if(settingsAreVisible())return refresh.apply(this,args);};}
+
     let worldMapEditor = null;
     let volumeControlCleanup = null;
     // Large-map waypoint editor. Terrain remains owned by the client; a separate
@@ -62931,12 +62873,18 @@ function upgradeSectionHeaders(panel) {
     function setPanelCollapsed(panel, collapsed) {
         if (!panel)
             return;
-        const body = panel.querySelector(".mb-body");
+        const body = panel.querySelector(".mb-body") || panel.__mbSettingsBody;
         const toggle = panel.querySelector("#minibia-bot-collapse");
         const next = !!collapsed;
+        // Keep the large settings subtree outside the live game/sidebar DOM
+        // while collapsed. Preserve nodes, listeners, values and scroll state.
+        if(body){
+            panel.__mbSettingsBody=body;
+            body.hidden=next;
+            if(next){if(body.parentNode===panel)body.remove();}
+            else if(body.parentNode!==panel)panel.appendChild(body);
+        }
         panel.dataset.collapsed = next ? "true" : "false";
-        if (body)
-            body.hidden = next;
         if (toggle) {
             toggle.textContent = next ? "+" : "−";
             toggle.setAttribute("aria-label", next ? "Maximize panel" : "Minimize panel");
@@ -66853,7 +66801,7 @@ function upgradeSectionHeaders(panel) {
         }
         // Initial refresh
         setTimeout(refreshAutoPickupStatus, 100);
-        const autoPickupStatusTimer = window.setInterval(refreshAutoPickupStatus, 1000);
+        const autoPickupStatusTimer = window.setInterval(settingsRefresh(refreshAutoPickupStatus), 1000);
         bot.addCleanup(() => window.clearInterval(autoPickupStatusTimer));
 
         // ---- AntiBotCreature ----
@@ -67419,7 +67367,7 @@ function upgradeSectionHeaders(panel) {
         function refreshComboStatus(){const status=bot.comboBot?.status?.();if(!status)return;for(const [key,input] of Object.entries(comboFields)){if(!input||document.activeElement===input)continue;if(input.type==='checkbox')input.checked=status.config[key]!==false;else input.value=key==='hotkeySlot'?Number(status.config[key]??11)+1:status.config[key]??'';}const toggle=panel.querySelector('#minibia-bot-combo-enabled');if(toggle)toggle.checked=status.running;panel.querySelector('[data-combo-slot-field]').hidden=status.config.rune!=='hotkey';panel.querySelector('#minibia-bot-combo-status').textContent=status.running?`Running · ${status.config.mode}${status.currentTargetId?' · Target '+status.currentTargetId:''}`:'Stopped';}
         for(const [key,input] of Object.entries(comboFields))input?.addEventListener('change',()=>{let value=input.type==='checkbox'?input.checked:input.value;if(['minMana','cooldownMs','hotkeySlot'].includes(key))value=key==='hotkeySlot'?Math.max(0,Math.min(11,Number(value)-1)):Math.max(key==='cooldownMs'?100:0,Number(value)||0);bot.comboBot?.updateConfig({[key]:value});refreshComboStatus();});
         panel.querySelector('#minibia-bot-combo-enabled')?.addEventListener('change',e=>{e.target.checked?bot.comboBot?.start():bot.comboBot?.stop();refreshComboStatus();});
-        refreshComboStatus();const comboStatusTimer=setInterval(refreshComboStatus,1000);bot.addCleanup(()=>clearInterval(comboStatusTimer));
+        refreshComboStatus();const comboStatusTimer=setInterval(settingsRefresh(refreshComboStatus),1000);bot.addCleanup(()=>clearInterval(comboStatusTimer));
 
         // ---- Outfit Randomizer ----
         const outfitToggle = panel.querySelector("#minibia-bot-outfit-randomizer-enabled");
@@ -67478,7 +67426,7 @@ function upgradeSectionHeaders(panel) {
         }
 
         // Refresh periodically (like other utility modules)
-        const outfitStatusTimer = setInterval(refreshOutfitRandomizerStatus, 5000);
+        const outfitStatusTimer = setInterval(settingsRefresh(refreshOutfitRandomizerStatus), 5000);
         bot.addCleanup(() => clearInterval(outfitStatusTimer));
 
         const playerAttackToggle = panel.querySelector("#minibia-bot-player-attack-alert");
@@ -67778,7 +67726,7 @@ function upgradeSectionHeaders(panel) {
             refreshMonkTrainerStatus();
         });
 
-        const monkTimer = window.setInterval(refreshMonkTrainerStatus, 1000);
+        const monkTimer = window.setInterval(settingsRefresh(refreshMonkTrainerStatus), 1000);
         bot.addCleanup(() => window.clearInterval(monkTimer));
         setTimeout(refreshMonkTrainerStatus, 100);
 
@@ -67869,7 +67817,7 @@ function upgradeSectionHeaders(panel) {
         }
 
         // Periodic refresh
-        const fisherTimer = window.setInterval(()=>{refreshFisherStatus();refreshItemDropperStatus();},1000);
+        const fisherTimer = window.setInterval(()=>{if(!settingsAreVisible())return;refreshFisherStatus();refreshItemDropperStatus();},1000);
         bot.addCleanup(() => window.clearInterval(fisherTimer));
 
         // ---- Item Dropper ----
@@ -69568,7 +69516,7 @@ function upgradeSectionHeaders(panel) {
         bankRun?.addEventListener("click",async()=>{saveBankInputs();try{await bot.bankNpc?.run?.(bankPreset?.value||"deposit-all",Number(bankAmount?.value)||0,bankCustom?.value||"");}catch(e){bot.log("[Bank NPC]",e?.message||e);}refreshBankStatus();});bankStop?.addEventListener("click",()=>{bot.bankNpc?.stop?.();refreshBankStatus();});bankAddWp?.addEventListener("click",()=>{saveBankInputs();bot.bankNpc?.addCaveWaypoint?.(bankPreset?.value||"deposit-all",Number(bankAmount?.value)||0,bankCustom?.value||"");});
 
         refreshDepositerStatus();refreshNpcSupplyStatus();refreshBankStatus();
-        const inventoryToolsTimer=window.setInterval(()=>{refreshDepositerStatus();refreshNpcSupplyStatus();refreshBankStatus();},750);bot.addCleanup(()=>window.clearInterval(inventoryToolsTimer));
+        const inventoryToolsTimer=window.setInterval(()=>{if(!settingsAreVisible())return;refreshDepositerStatus();refreshNpcSupplyStatus();refreshBankStatus();},750);bot.addCleanup(()=>window.clearInterval(inventoryToolsTimer));
 
         // ---- Cavebot Resupply WPT shortcuts ----
         const caveDepotWpBtn=panel.querySelector("#minibia-bot-cave-add-depot-wp");
@@ -70530,7 +70478,7 @@ function upgradeSectionHeaders(panel) {
             refreshAudioAlertInputs();
             refreshPanicItemAlertsList();
         }, 150);
-        const audioAlertRefresh = window.setInterval(() => {
+        const audioAlertRefresh = window.setInterval(() => {if(!settingsAreVisible())return;
             refreshAudioAlertInputs();
             refreshPanicItemAlertsList();
         }, 2000);
@@ -70664,21 +70612,21 @@ function upgradeSectionHeaders(panel) {
         }
 
         // Periodic refreshes
-        const supportStatus = window.setInterval(refreshSupportStatus, 2000);
+        const supportStatus = window.setInterval(settingsRefresh(refreshSupportStatus), 2000);
         bot.addCleanup(() => window.clearInterval(supportStatus));
-        const visibleTimer = window.setInterval(refreshVisibleCreatures, 1000);
+        const visibleTimer = window.setInterval(settingsRefresh(refreshVisibleCreatures), 1000);
         bot.addCleanup(() => window.clearInterval(visibleTimer));
-        const talkTimer = window.setInterval(refreshTalkStatus, 1000);
+        const talkTimer = window.setInterval(settingsRefresh(refreshTalkStatus), 1000);
         bot.addCleanup(() => window.clearInterval(talkTimer));
-        const paladinTimer = window.setInterval(refreshPaladinStatus, 2000);
+        const paladinTimer = window.setInterval(settingsRefresh(refreshPaladinStatus), 2000);
         bot.addCleanup(() => window.clearInterval(paladinTimer));
         const statusTabTimer = window.setInterval(() => { refreshCollapsedQuickModules(); }, 1000);
         bot.addCleanup(() => window.clearInterval(statusTabTimer));
-        const looterTimer = window.setInterval(refreshLooterStatus, 1000);
+        const looterTimer = window.setInterval(settingsRefresh(refreshLooterStatus), 1000);
         bot.addCleanup(() => window.clearInterval(looterTimer));
-        const runeShooterTimer = window.setInterval(refreshRuneShooterStatus, 1000);
+        const runeShooterTimer = window.setInterval(settingsRefresh(refreshRuneShooterStatus), 1000);
         bot.addCleanup(() => window.clearInterval(runeShooterTimer));
-        const antibotTimer = window.setInterval(refreshAntiBotStatus, 1000);
+        const antibotTimer = window.setInterval(settingsRefresh(refreshAntiBotStatus), 1000);
         bot.addCleanup(() => window.clearInterval(antibotTimer));
         const caveTimer = window.setInterval(() => {
             const caveTab = document.querySelector('[data-tab-panel="cave"]');
@@ -70695,12 +70643,12 @@ function upgradeSectionHeaders(panel) {
             if (learnToggle && document.activeElement !== learnToggle)
                 learnToggle.checked = bot.cave?.getLearnMode?.() === true;
         }, 1000);
-        const specialAreaTimer = window.setInterval(refreshSpecialAreas, 1000);
+        const specialAreaTimer = window.setInterval(settingsRefresh(refreshSpecialAreas), 1000);
         bot.addCleanup(() => window.clearInterval(specialAreaTimer));
         bot.addCleanup(() => window.clearInterval(caveTimer));
         const titleTimer = window.setInterval(refreshTitlebarRunIndicators, 500);
         bot.addCleanup(() => window.clearInterval(titleTimer));
-        const lightHackLegitTimer = setInterval(refreshLightHackLegitStatus, 2000);
+        const lightHackLegitTimer = setInterval(settingsRefresh(refreshLightHackLegitStatus), 2000);
         bot.addCleanup(() => clearInterval(lightHackLegitTimer));
 
         // Position, drag, collapse
