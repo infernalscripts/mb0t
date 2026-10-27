@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.596",
+        version: "1.6.597",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -18300,7 +18300,12 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
         let target = getActiveOffscreenHuntTarget();
         if (!target && (state.offscreenHuntActive || state.offscreenHuntPauseHeld)) {
+            // The client can unload a radar creature at its visibility boundary.
+            // Remember its ID before clearing Hunt so a brief reappearance cannot
+            // repeatedly steal movement back from Cavebot.
+            rememberOffscreenHuntSkippedTarget({ id: state.offscreenHuntTargetId }, now, 30000);
             clearOffscreenHunt("hunted creature is no longer available — releasing Cavebot pause");
+            return false;
         }
 
         if (target && !isAllowedOffscreenHuntCreature(target)) {
@@ -18309,8 +18314,9 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         }
 
         if (target && !isKnownMonsterForOffscreenHunt(target)) {
+            rememberOffscreenHuntSkippedTarget(target, now, 30000);
             clearOffscreenHunt("creature disappeared or changed floor");
-            target = null;
+            return false;
         }
 
         if (target && isIgnoredTargetCreature(target)) {
