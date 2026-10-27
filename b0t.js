@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.585",
+        version: "1.6.591",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -11721,13 +11721,15 @@ window.__minibiaBotBundle.installCombatRulesModule = function(bot) {
     }
     function matchOne(rule,m) {
         if(!rule?.enabled || !m) return false;
+        // Native getHealthPercentage rounds: 19.6% becomes 20%, disabling
+        // strict below-20 chase AND rune rules. Prefer the unrounded ratio.
         let hp=NaN;
-        try{if(typeof m.getHealthPercentage==='function')hp=Number(m.getHealthPercentage());}catch(e){}
-        if(!Number.isFinite(hp)){
-            const health=Number(m.state?.health??m.health),max=Number(m.maxHealth??m.state?.maxHealth);
-            if(Number.isFinite(health)&&Number.isFinite(max)&&max>0)hp=health/max*100;
-            else hp=Number(m.healthPercent??m.hpPercent??m.state?.healthPercent);
-        }
+        const health=m.state?.health??m.health,max=m.maxHealth??m.state?.maxHealth;
+        if(health!=null&&max!=null&&Number.isFinite(Number(health))&&Number.isFinite(Number(max))&&Number(max)>0)
+            hp=Number(health)/Number(max)*100;
+        if(!Number.isFinite(hp))try{if(typeof m.getHealthFraction==='function')hp=Number(m.getHealthFraction())*100;}catch(e){}
+        if(!Number.isFinite(hp))try{if(typeof m.getHealthPercentage==='function')hp=Number(m.getHealthPercentage());}catch(e){}
+        if(!Number.isFinite(hp))hp=Number(m.healthPercent??m.hpPercent??m.state?.healthPercent);
         if(Number.isFinite(hp))hp=Math.max(0,Math.min(100,hp));
         if(!Number.isFinite(hp) || hp<=0 || hp<rule.minHp || hp>rule.maxHp || (rule.maxHpExclusive && hp===rule.maxHp)) return false;
         return (!rule.names.length || rule.names.includes(String(m.name||'').trim().toLowerCase())) && distance(bot.getPlayerPosition(),position(m))<=rule.range && distance(bot.getPlayerPosition(),position(m))>=(rule.minRange||0);
@@ -16929,21 +16931,21 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function getCreatureHealthPercent(creature) {
-        if (!creature)
-            return null;
-
+        if (!creature) return null;
+        const health=creature.state?.health??creature.health;
+        const max=creature.maxHealth??creature.state?.maxHealth;
+        if(health!=null&&max!=null&&Number.isFinite(Number(health))&&Number.isFinite(Number(max))&&Number(max)>0)
+            return Math.max(0,Math.min(100,Number(health)/Number(max)*100));
         try {
-            if (typeof creature.getHealthPercentage === "function") {
-                const value = Number(creature.getHealthPercentage());
-                if (Number.isFinite(value))
-                    return Math.max(0, Math.min(100, value));
+            if(typeof creature.getHealthFraction==='function'){
+                const value=Number(creature.getHealthFraction())*100;
+                if(Number.isFinite(value))return Math.max(0,Math.min(100,value));
             }
-        } catch (e) { /* fall through */ }
-
-        const health = Number(creature.state?.health ?? creature.health);
-        const maxHealth = Number(creature.maxHealth ?? creature.state?.maxHealth);
-        if (Number.isFinite(health) && Number.isFinite(maxHealth) && maxHealth > 0)
-            return Math.max(0, Math.min(100, (health / maxHealth) * 100));
+            if(typeof creature.getHealthPercentage==='function'){
+                const value=Number(creature.getHealthPercentage());
+                if(Number.isFinite(value))return Math.max(0,Math.min(100,value));
+            }
+        } catch(e) {}
         return null;
     }
 
@@ -38242,7 +38244,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         state.timerId = window.setTimeout(() => {
             state.timerId = null;
             tick();
-        }, config.tickMs);
+        }, knightBoxState.phase==='fight' && knightBoxState.quietAt!==null
+            ? Math.min(config.tickMs,150) : config.tickMs);
     }
 
     /**
@@ -38271,12 +38274,14 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             const monsters=bot.attack?.getKnightBoxMonsters?.()||[];
             if(monsters.length)knightBoxState.quietAt=null;
             else if(knightBoxState.quietAt===null)knightBoxState.quietAt=now;
-            if(knightBoxState.quietAt!==null&&now-knightBoxState.quietAt>=1000){
+            if(knightBoxState.quietAt!==null&&now-knightBoxState.quietAt>=150){
                 const completed=state.currentIndex;advanceWaypoint();knightBoxState.index=state.currentIndex;
                 knightBoxState.phase='travel';knightBoxState.targeting=false;knightBoxState.quietAt=null;
                 knightBoxState.positionAt=now;publishKnightBox();
                 resetWaypointProgressTracking(getCurrentWaypoint(),position,now);state.lastPathAt=0;state.pausedForCombat=false;
                 bot.log(`Cave: Knight Box #${completed+1} cleared — continuing at #${state.currentIndex+1}`);
+                // The new waypoint is read below in this same Cave tick.
+                return false;
             } else {
                 resetWaypointProgressTracking(wp,position,now);state.lastPositionKey=key;state.stuckCount=0;
             }
@@ -49096,6 +49101,8 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
     // Optional corpse walking is OFF by default.
     state.walkToCorpses = stored.walkToCorpses === true;
     state.skipFoodBagCorpses = stored.skipFoodBagCorpses !== false;
+    state.corpseDebugOverlay = stored.corpseDebugOverlay === true;
+    state.includeListedCorpseLoot = stored.includeListedCorpseLoot === true;
     state.rareCorpsesOnly = stored.rareCorpsesOnly === true;
     state.corpseLootFilter = stored.corpseLootFilter === 'price' ? 'price' : 'rare';
     state.corpseMinItemPrice = Number.isFinite(Number(stored.corpseMinItemPrice)) ? Math.max(0, Number(stored.corpseMinItemPrice)) : 1000;
@@ -49177,6 +49184,8 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             dropItemIds: Array.from(state.dropItemIds.values()),
             walkToCorpses: state.walkToCorpses,
             skipFoodBagCorpses: state.skipFoodBagCorpses,
+            corpseDebugOverlay: state.corpseDebugOverlay,
+            includeListedCorpseLoot: state.includeListedCorpseLoot,
             rareCorpsesOnly: state.rareCorpsesOnly,
             corpseLootFilter: state.corpseLootFilter,
             corpseMinItemPrice: state.corpseMinItemPrice,
@@ -50562,7 +50571,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
 
         state.pendingMove = null;
         state.corpseJob = null;
-        state.corpseCombatClearSince = 0;
+        if (!success) state.corpseCombatClearSince = 0;
         resumeModulesAfterCorpse(job);
         return true;
     }
@@ -50685,6 +50694,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
     // Only confirmed nonempty Loot-channel results may create corpse jobs.
     // Keep death snapshots separate: pending confirmation never owns movement.
     const corpseLootDeaths = [];
+    const corpseDeathSeen = new Map();
     const corpseLootResults = [];
     const CORPSE_LOOT_MATCH_MS = 5000;
     let corpseLootHook = null;
@@ -50745,25 +50755,39 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
     }
     function observeCorpseLoot(message, now = Date.now()) {
         if (!state.runtimeRunning || !state.walkToCorpses || corpseActionsBlocked()) return;
-        // Read the channel input, independent of popup visibility or channel focus.
-        const text = String(message || "").replace(/<[^>]*>/g, "").trim();
+        // Native loot markup distinguishes already collected/eaten items from
+        // listed items still in the corpse. Preserve that meaning before stripping.
+        let hasListedLoot = false;
+        let remaining = String(message || "")
+            .replace(/\{(?:auto|eat)\}[\s\S]*?\{\/(?:auto|eat)\}/gi, '')
+            .replace(/\{listed\}([\s\S]*?)\{\/listed\}/gi, (_, item) => {hasListedLoot = !!item.trim() || hasListedLoot; return item;});
+        remaining = remaining.replace(/<span\b([^>]*)>([\s\S]*?)<\/span>/gi, (_, attrs, item) => {
+            if(/color\s*:\s*#(?:FFD700|FF8547)\b/i.test(attrs))return '';
+            if(/color\s*:\s*#FFFFFF\b/i.test(attrs) && /font-weight\s*:\s*bold/i.test(attrs))hasListedLoot = !!item.trim() || hasListedLoot;
+            return item;
+        });
+        const text = remaining.replace(/<[^>]*>/g, "").replace(/\{\/?(?:valuable|retro)\}/gi, '').trim();
         const match = /^Loot of (.+?):\s*(.*?)\s*$/i.exec(text);
         if (!match) return;
         const contents = match[2].trim();
         // Consume food/bag-only results as empty, preserving death matching.
         // Match whole item names so food plus any other loot still queues.
-        const items = contents.replace(/[.!]+$/, "").split(/\s*,\s*(?:and\s+)?|\s+and\s+/i);
+        const items = contents.replace(/[.!]+$/, "").split(/\s*,\s*(?:and\s+)?|\band\b/i).map(item=>item.trim()).filter(Boolean);
         const ignoredOnly = items.length > 0 && items.every(item =>
             /^(?:(?:an?|\d+)\s+)?(?:bags?|meats?|(?:pieces? of )?meat|(?:dragon )?hams?)$/i.test(item.trim()));
         corpseLootResults.push({ name: corpseLootName(match[1]), at: now,
-            hasLoot: !!contents && !/^nothing[.!]?$/i.test(contents) && !(state.skipFoodBagCorpses && ignoredOnly) && corpsePassesLootFilter(items) });
+            hasLoot: items.length > 0 && !/^nothing[.!]?$/i.test(contents) && !(state.skipFoodBagCorpses && ignoredOnly) &&
+                ((state.includeListedCorpseLoot && hasListedLoot) || corpsePassesLootFilter(items)) });
         matchCorpseLoot(now);
     }
 
     function awaitCorpseLoot(creature, now = Date.now()) {
         if (!state.runtimeRunning || !state.walkToCorpses || corpseActionsBlocked()) return;
         pruneCorpseLootMatches(now);
-        if (corpseLootDeaths.some(death => death.creature.id === creature.id)) return;
+        for(const [id,at] of corpseDeathSeen)if(now-at>120000)corpseDeathSeen.delete(id);
+        if(creature.id!=null && corpseDeathSeen.has(creature.id))return;
+        if(creature.id!=null)corpseDeathSeen.set(creature.id,now);
+        while(corpseDeathSeen.size>512)corpseDeathSeen.delete(corpseDeathSeen.keys().next().value);
         corpseLootDeaths.push({ creature, name: corpseLootName(creature.name), at: now });
         matchCorpseLoot(now);
     }
@@ -50791,6 +50815,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         corpseLootHook = null;
         corpseLootDeaths.length = 0;
         corpseLootResults.length = 0;
+        corpseDeathSeen.clear();
     }
 
     function enqueueCorpseDeath(
@@ -51451,16 +51476,11 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                 return false;
             }
             if (!state.running) {
-                // The server owns premium loot selection, destinations and moves.
-                // An acknowledged open is the handoff, not proof that every item
-                // was collected. Leave a short quiet window for native updates.
+                // Premium loot is performed server-side. The matched open ACK
+                // completes our approach handoff; no extra client delay is needed.
                 job.nativeHandoff = true;
-                if (now - job.lootStartedAt >= 750 && now - job.lastContainerActivityAt >= 500) {
-                    finishCorpseJob(true, 'corpse opened for native auto-loot');
-                    return false;
-                }
-                if (now > job.lootDeadlineAt) { finishCorpseJob(true, 'corpse opened for native auto-loot'); return false; }
-                return true;
+                finishCorpseJob(true, 'corpse opened for native auto-loot');
+                return false;
             }
             job.nativeHandoff = false;
             moveItems(container);
@@ -52144,7 +52164,10 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             );
 
             if (state.corpseJob) {
+                const completedBefore = state.corpseJobsCompleted;
                 updateCorpseJob(now);
+                if (!state.corpseJob && state.corpseJobsCompleted > completedBefore)
+                    startNextCorpseJob(now);
             } else {
                 startNextCorpseJob(now);
 
@@ -52173,7 +52196,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                 Number(delayOverride)
             )
             : (
-                state.pendingMove || state.running
+                state.pendingMove || state.running || state.corpseJob?.arrivedAdjacentAt
                     ? 50
                     : (state.corpseJob || state.corpseQueue.length ? 200 : 1000)
             );
@@ -52328,6 +52351,8 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             dropItemIds: Array.from(state.dropItemIds.values()),
             walkToCorpses: state.walkToCorpses,
             skipFoodBagCorpses: state.skipFoodBagCorpses,
+            corpseDebugOverlay: state.corpseDebugOverlay,
+            includeListedCorpseLoot: state.includeListedCorpseLoot,
             rareCorpsesOnly: state.rareCorpsesOnly,
             corpseLootFilter: state.corpseLootFilter,
             corpseMinItemPrice: state.corpseMinItemPrice,
@@ -52492,6 +52517,8 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         }
 
         if (next.walkToCorpses !== undefined) setCorpseEnabled(!!next.walkToCorpses);
+        if (next.corpseDebugOverlay !== undefined) { state.corpseDebugOverlay = next.corpseDebugOverlay === true; syncCorpseDebugOverlay(); }
+        if (next.includeListedCorpseLoot !== undefined) state.includeListedCorpseLoot = next.includeListedCorpseLoot === true;
         if (next.rareCorpsesOnly !== undefined) state.rareCorpsesOnly = !!next.rareCorpsesOnly;
         if (next.corpseLootFilter !== undefined) state.corpseLootFilter = next.corpseLootFilter === 'price' ? 'price' : 'rare';
         if (next.corpseMinItemPrice !== undefined && Number.isFinite(Number(next.corpseMinItemPrice)))
@@ -52571,6 +52598,8 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             trackedItems: Array.from(state.trackedItems.entries()),
             walkToCorpses: state.walkToCorpses,
             skipFoodBagCorpses: state.skipFoodBagCorpses,
+            corpseDebugOverlay: state.corpseDebugOverlay,
+            includeListedCorpseLoot: state.includeListedCorpseLoot,
             rareCorpsesOnly: state.rareCorpsesOnly,
             corpseLootFilter: state.corpseLootFilter,
             corpseMinItemPrice: state.corpseMinItemPrice,
@@ -52706,8 +52735,56 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         return false;
     }
 
+    let corpseDebugRoot=null,corpseDebugTimer=null,corpseDebugSignature='';
+    function removeCorpseDebugOverlay(){
+        if(corpseDebugTimer!==null)window.clearInterval(corpseDebugTimer);
+        corpseDebugTimer=null;corpseDebugRoot?.remove();corpseDebugRoot=null;corpseDebugSignature='';
+    }
+    function renderCorpseDebugOverlay(){
+        if(!state.corpseDebugOverlay||state.disposed)return;
+        const client=window.gameClient,renderer=client?.renderer,canvas=renderer?.screen?.canvas,player=bot.getPlayerPosition();
+        if(!player||!canvas||typeof renderer.getStaticScreenPosition!=='function'){
+            corpseDebugRoot?.remove();corpseDebugRoot=null;corpseDebugSignature='';return;
+        }
+        const rect=canvas.getBoundingClientRect(),upper=document.querySelector('.main .upper')?.getBoundingClientRect();
+        const left=Math.max(rect.left,upper?.left??rect.left),top=Math.max(rect.top,upper?.top??rect.top);
+        const right=Math.min(rect.right,upper?.right??rect.right),bottom=Math.min(rect.bottom,upper?.bottom??rect.bottom);
+        if(right<=left||bottom<=top||!canvas.width||!canvas.height){corpseDebugRoot?.remove();corpseDebugRoot=null;corpseDebugSignature='';return;}
+        const now=Date.now(),entries=[...(state.corpseJob?[{job:state.corpseJob,label:'ACTIVE',active:true}]:[]),
+            ...state.corpseQueue.map((job,i)=>({job,label:String(i+1),active:false}))];
+        const lines=[`Corpse queue: ${state.corpseQueue.length} · ${state.runtimeRunning&&state.walkToCorpses?'On':'Off'}`];
+        const marks=[];
+        for(const entry of entries){
+            const {job,label,active}=entry,p=job.position;if(!p)continue;
+            const sameFloor=Number(p.z)===Number(player.z),distance=sameFloor?Math.max(Math.abs(p.x-player.x),Math.abs(p.y-player.y)):null;
+            const phase=active?(job.openedContainerId!=null?'looting':job.arrivedAdjacentAt?'opening':'approaching'):`${Math.max(0,Math.ceil((job.expiresAt-now)/1000))}s left`;
+            lines.push(`${label} ${job.monsterName||'Monster'} · ${p.x},${p.y},${p.z} · ${distance===null?'other floor':distance+' sqm'} · ${phase}`);
+            if(!sameFloor)continue;
+            const screen=renderer.getStaticScreenPosition(p),w=32*rect.width/canvas.width,h=32*rect.height/canvas.height;
+            const x=rect.left+screen.x*w-left,y=rect.top+screen.y*h-top;
+            if(!Number.isFinite(x)||!Number.isFinite(y)||x+w<0||y+h<0||x>right-left||y>bottom-top)continue;
+            marks.push({label,active,x:Math.round(x),y:Math.round(y),w:Math.round(w),h:Math.round(h)});
+        }
+        const signature=JSON.stringify([left,top,right,bottom,lines,marks]);
+        if(signature===corpseDebugSignature&&corpseDebugRoot?.isConnected)return;
+        corpseDebugSignature=signature;
+        if(!corpseDebugRoot){corpseDebugRoot=document.createElement('div');corpseDebugRoot.id='mbot-corpse-debug-overlay';document.body.append(corpseDebugRoot);}
+        corpseDebugRoot.style.cssText=`position:fixed;left:${left}px;top:${top}px;width:${right-left}px;height:${bottom-top}px;overflow:hidden;pointer-events:none;z-index:9998;font:11px monospace;color:white;`;
+        corpseDebugRoot.replaceChildren();
+        for(const m of marks){const marker=document.createElement('div');marker.textContent=m.label;marker.style.cssText=`position:absolute;box-sizing:border-box;left:${m.x}px;top:${m.y}px;width:${m.w}px;height:${m.h}px;border:1px solid ${m.active?'#ffab40':'#43e5ff'};color:${m.active?'#ffab40':'#43e5ff'};text-shadow:1px 1px #000;background:#0003;`;corpseDebugRoot.append(marker);}
+        const list=document.createElement('div');list.style.cssText='position:absolute;right:4px;top:4px;max-width:95%;max-height:45%;overflow:hidden;white-space:pre-wrap;background:#000b;padding:5px;';
+        list.textContent=lines.slice(0,13).join('\n')+(lines.length>13?`\n… ${lines.length-13} more queued`:'')+(entries.length?'':'\nNo queued corpses');corpseDebugRoot.append(list);
+    }
+    function syncCorpseDebugOverlay(){
+        if(!state.corpseDebugOverlay||state.disposed){removeCorpseDebugOverlay();return;}
+        if(corpseDebugTimer===null)corpseDebugTimer=window.setInterval(renderCorpseDebugOverlay,250);
+        renderCorpseDebugOverlay();
+    }
+
+    syncCorpseDebugOverlay();
     // Covers UI capture listeners even if Looter was never started.
     bot.addCleanup(() => {
+        removeCorpseDebugOverlay();
         state.disposed = true;
         state.running = false;
         state.walkToCorpses = false;
@@ -61632,6 +61709,10 @@ function upgradeSectionHeaders(panel) {
         const status = bot.looter?.status?.();
         const rareStatus=document.getElementById('minibia-bot-looter-rares-status');
         if(rareStatus){const items=bot.clientExtras?.getLootInfo?.()?.items;rareStatus.textContent=Array.isArray(items)?'Rare list loaded':'Rare list not loaded';}
+        const corpseDebugToggle=document.getElementById('minibia-bot-looter-debug-overlay');
+        if(corpseDebugToggle&&document.activeElement!==corpseDebugToggle)corpseDebugToggle.checked=status?.corpseDebugOverlay===true;
+        const listedToggle=document.getElementById('minibia-bot-looter-include-listed');
+        if(listedToggle&&document.activeElement!==listedToggle)listedToggle.checked=status?.includeListedCorpseLoot===true;
         const rareToggle=document.getElementById('minibia-bot-looter-rare-only');
         if(rareToggle&&document.activeElement!==rareToggle)rareToggle.checked=status?.rareCorpsesOnly===true;
         const valueMode=document.getElementById('minibia-bot-looter-value-mode');
@@ -65990,6 +66071,9 @@ function upgradeSectionHeaders(panel) {
   <div class="mb-small-note">Price uses each item's NPC sell value or Hunt Analyzer custom loot price. Unknown prices are skipped. Hunt Analyzer recording can be off.</div>
   <div class="mb-inline"><button type="button" class="mb-small-button" id="minibia-bot-looter-load-rares">Load rare list</button><span class="mb-small-note" id="minibia-bot-looter-rares-status"></span></div>
   <div class="mb-small-note">Uses the game's rare item tags. Load the list after login; you can close it afterward. Unverified loot is skipped in rare-only mode.</div>
+  <label class="mb-toggle"><input type="checkbox" id="minibia-bot-looter-debug-overlay"><span>Show corpse queue debug overlay</span></label>
+  <label class="mb-toggle"><input type="checkbox" id="minibia-bot-looter-include-listed"><span>Also visit for white/listed loot</span></label>
+  <div class="mb-small-note">Includes listed items still in the corpse, even below the price filter or not rare. Already auto-looted/eaten items are excluded. Food/bag skipping still applies.</div>
   <label class="mb-toggle"><input type="checkbox" id="minibia-bot-looter-skip-food-bags"><span>Skip food/bag-only corpses</span></label>
   <div class="mb-small-note">Turn off to visit these corpses for skinning. Covers meat, ham, dragon ham and bags.</div>
   <div class="mb-small-note">Works independently of mb0t Looter. With Looter off, opens corpses for native premium auto-loot. Walking starts after combat clears.</div>
@@ -69232,6 +69316,8 @@ function upgradeSectionHeaders(panel) {
             );
         }
 
+        panel.querySelector('#minibia-bot-looter-debug-overlay')?.addEventListener('change',event=>{bot.looter?.updateConfig?.({corpseDebugOverlay:event.target.checked});refreshLooterStatus();});
+        panel.querySelector('#minibia-bot-looter-include-listed')?.addEventListener('change',event=>{bot.looter?.updateConfig?.({includeListedCorpseLoot:event.target.checked});refreshLooterStatus();});
         const rareOnlyToggle=panel.querySelector('#minibia-bot-looter-rare-only');
         if(rareOnlyToggle){
             rareOnlyToggle.checked=bot.looter?.status?.().rareCorpsesOnly===true;
