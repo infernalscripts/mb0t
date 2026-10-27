@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.597",
+        version: "1.6.598",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -50724,7 +50724,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             if (index < 0) { i++; continue; }
             const result = corpseLootResults.splice(index, 1)[0];
             corpseLootDeaths.splice(i, 1);
-            if (result.hasLoot && state.runtimeRunning && state.walkToCorpses && !corpseActionsBlocked())
+            if (result.hasLoot && !death.nativePassed && state.runtimeRunning && state.walkToCorpses && !corpseActionsBlocked())
                 enqueueCorpseDeath(death.creature, death.at);
         }
     }
@@ -51407,6 +51407,32 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         bot.log(retry ? 'Looter: combat interrupted approach — corpse kept queued' : 'Looter: interrupted corpse expired',
             {monster:job.monsterName,position:job.position,reason:combatGate?.reason||'combat active'});
         return true;
+    }
+
+    // In native-only mode, entering loot range services the corpse even while
+    // another module owns movement. Use every confirmed server step, not the
+    // predicted player position or the coalesced movement event.
+    function observeNativeCorpsePass(position, now = Date.now()) {
+        if (!state.runtimeRunning || !state.walkToCorpses || state.running || !position) return;
+        const x=Number(position.x),y=Number(position.y),z=Number(position.z);
+        if (![x,y,z].every(Number.isFinite)) return;
+        const beside = entry => entry.position && now >= entry.deathAt &&
+            Number(entry.position.z) === z &&
+            Math.max(Math.abs(Number(entry.position.x)-x),Math.abs(Number(entry.position.y)-y)) <= 1;
+        // A loot message may arrive after the step that already serviced its body.
+        for (const death of corpseLootDeaths) {
+            const pos=death.creature.getPosition?.() || death.creature.__position;
+            if (beside({position:pos,deathAt:death.at})) death.nativePassed=true;
+        }
+        const before=state.corpseQueue.length;
+        state.corpseQueue=state.corpseQueue.filter(entry=>!beside(entry));
+        const removed=before-state.corpseQueue.length;
+        state.corpseJobsCompleted+=removed;
+        if (removed) bot.log('Corpse walking: cleared corpses passed within native loot range', {count:removed});
+        if (state.corpseJob && beside(state.corpseJob)) {
+            state.corpseJob.nativeHandoff=true;
+            finishCorpseJob(true,'passed within native auto-loot range');
+        }
     }
 
     function prioritizeNearbyQueuedCorpses(now = Date.now()) {
@@ -52177,7 +52203,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             if (bot.followingItemGuard?.isHolding?.()) return;
             ensureDeathHookOwnership();
 
-            // Nearby corpses are prioritized, never discarded just for passing.
+            // Remaining corpses are prioritized after native pass-through handling.
             prioritizeNearbyQueuedCorpses(
                 now
             );
@@ -52811,6 +52837,9 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
     });
 
     // ---- Public API ----
+    const unsubscribeNativeCorpsePass = bot.clientEvents?.subscribe?.('movement-step', event =>
+        observeNativeCorpsePass(event.position, event.at));
+    bot.addCleanup(() => unsubscribeNativeCorpsePass?.());
     bot.addCleanup(() => unsubscribeLooterContainerAcks());
 
     bot.looter = {
@@ -54864,7 +54893,7 @@ window.__minibiaBotBundle.installClientEvents = function installClientEvents(bot
         const event = { ...data, type, player: window.gameClient?.player || null, client: window.gameClient, at: Date.now() };
         // Target acknowledgements are protocol transitions: preserve their exact
         // order and state, rather than merging an acceptance with a later clear.
-        if (type === "target" || type === "ground-item") {
+        if (type === "target" || type === "ground-item" || type === "movement-step") {
             for (const fn of [...listeners.get(type) || []]) {
                 try { fn(event); } catch (error) { bot.log("Client event listener failed", error?.message || String(error)); }
             }
@@ -54970,9 +54999,12 @@ window.__minibiaBotBundle.installClientEvents = function installClientEvents(bot
         hook(handler, "handleCondition", "stats", args =>
             Number(args[0]?.guid) === Number(window.gameClient?.player?.id) ? {} : null);
         hook(handler, "handleSetTarget", "target", args => ({ id: args[0] }));
-        hook(handler, "handleCreatureServerMove", "movement", args =>
-            Number(args[0]?.id ?? args[0]?.guid) === Number(window.gameClient?.player?.id)
-                ? { position: args[0]?.position } : null,
+        hook(handler, "handleCreatureServerMove", "movement", args => {
+            if (Number(args[0]?.id ?? args[0]?.guid) !== Number(window.gameClient?.player?.id)) return null;
+            const position=args[0]?.position;
+            emit("movement-step", {position});
+            return {position};
+        },
             args => window.gameClient===client && client.player===player ? bot.observeFollowLeaderEvent?.("move",args[0]) : null);
         hook(handler, "handleCancelWalk", "movement-cancel", (args, context) => ({ position: args[0], cave: context }),
             args => bot.cave?.captureMovementContext?.(args[0]) || null);
