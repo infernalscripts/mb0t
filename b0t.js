@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.564",
+        version: "1.6.585",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -5815,7 +5815,22 @@ window.__minibiaBotBundle.installHotbarDockModule = function installHotbarDockMo
 .main .mb-side-hotkey-tray>.hotbar.mb-native-hotbar>.mb-extra-hotbar-scroll>button:not(:last-child){display:none!important;}
 .main .mb-side-hotkey-tray>.hotbar.mb-native-hotbar>.mb-native-hotbar-controls{position:fixed;z-index:10000;padding:4px;border:1px solid #666;background:#222;}
 .main .mb-side-hotkey-tray .hotbar-bank-toggle{display:inline-block!important;}
-/* Retain the chosen hotbar texture without changing the canvas surround. */
+/* Background textures only; retain native canvas sizing and layout. */
+#game-wrapper .main,
+#game-wrapper .main>.middle,
+#game-wrapper .main .upper,
+#game-wrapper .main .canvas-wrapper,
+#game-wrapper .main .mb-hotbar-dock-row{
+ background-image:url("https://minibia.com/png/bg2.png")!important;
+ background-repeat:repeat!important;
+}
+#game-wrapper .oogwrap,
+#game-wrapper .oogwrap2,
+#game-wrapper .column{
+ background-image:url("https://minibia.com/png/bg3.png")!important;
+ background-repeat:repeat!important;
+}
+/* Hotbar texture. */
 .main .mb-hotbar-dock-side,
 .main .mb-bottom-hotkey-tray,
 .main .mb-side-hotkey-tray,
@@ -9732,11 +9747,11 @@ window.__minibiaBotBundle.installPlayerAttackMonitorModule = function installPla
  */
 window.__minibiaBotBundle.installRunemakerModule = function installRunemakerModule(bot, options = {}) {
     const key=options.storageKey||"minibiaBot.runemaker.config";
-    const config={enabled:false,rules:[],...options.initialConfig,...bot.storage.get(key,{})};
+    const config={enabled:false,pauseInCombat:false,rules:[],...options.initialConfig,...bot.storage.get(key,{})};
     const state={running:false,timer:null,lastCastAt:0,lastRequestAt:0,pending:null,player:null,sessionAt:0,retryAt:0,reason:"Off"};
     let editingSpellId=null;
     let disposed=false,host=null,rows=new Map(),select=null,quantity=null,enabled=null,statusLabel=null;
-    function normalize(){config.enabled=config.enabled===true;config.rules=(Array.isArray(config.rules)?config.rules:[]).filter(r=>Number.isSafeInteger(Number(r.spellId))&&Number(r.spellId)>0).map(r=>({spellId:Number(r.spellId),enabled:r.enabled!==false,count:Math.max(0,Math.min(100000,Math.trunc(Number(r.count)||0)))})).filter((r,i,list)=>list.findIndex(x=>x.spellId===r.spellId)===i).slice(0,40);}
+    function normalize(){config.pauseInCombat=config.pauseInCombat===true;config.enabled=config.enabled===true;config.rules=(Array.isArray(config.rules)?config.rules:[]).filter(r=>Number.isSafeInteger(Number(r.spellId))&&Number(r.spellId)>0).map(r=>({spellId:Number(r.spellId),enabled:r.enabled!==false,count:Math.max(0,Math.min(100000,Math.trunc(Number(r.count)||0)))})).filter((r,i,list)=>list.findIndex(x=>x.spellId===r.spellId)===i).slice(0,40);}
     normalize();
     function persist(){bot.storage.set(key,{...config,rules:config.rules.map(r=>({...r}))});}
     function catalogue(){
@@ -9747,11 +9762,19 @@ window.__minibiaBotBundle.installRunemakerModule = function installRunemakerModu
     function syncSession(now){const player=window.gameClient?.player;if(state.player!==player){state.player=player;state.sessionAt=now;state.pending=null;state.lastRequestAt=0;state.retryAt=0;state.lastCastAt=0;}return player;}
     function reading(spell,now){const r=bot.getItemCountReading?.(spell.itemId,0);return r&&Number.isFinite(Number(r.count))&&Number(r.at)>=state.sessionAt&&now-Number(r.at)<=12000?{count:Math.max(0,Number(r.count)),at:Number(r.at)}:null;}
     function deficits(now=Date.now()) {syncSession(now);const spells=catalogue();return config.rules.filter(r=>r.enabled).map(rule=>{const spell=spells.find(s=>s.sid===rule.spellId);return {rule,spell,count:spell?reading(spell,now):null};}).filter(row=>row.spell&&(!row.count||row.rule.count===0||row.count.count<row.rule.count));}
-    function needsMana(){return state.running&&config.enabled&&deficits().length>0;}
+    function combatBlocked(){
+        if(!config.pauseInCombat)return false;
+        const player=window.gameClient?.player;
+        const combatLock=typeof ConditionManager!=="undefined" ? ConditionManager.prototype.COMBAT_LOCK : 18;
+        return !!(player?.conditions?.has?.(combatLock) || player?.__target || player?.getTarget?.() ||
+            bot.attack?.getCurrentTarget?.() || bot.attack?.isCombatActive?.());
+    }
+    function needsMana(){return state.running&&config.enabled&&!combatBlocked()&&deficits().length>0;}
     function refreshCounts(now,force=false){if(!force&&now-state.lastRequestAt<2000)return;state.lastRequestAt=now;const all=catalogue();const items=config.rules.filter(r=>r.enabled).map(r=>all.find(s=>s.sid===r.spellId)).filter(Boolean).map(s=>({id:s.itemId,fluidType:0}));if(items.length)bot.requestItemCounts?.(items);}
     function permitted(row,now){
         const client=window.gameClient,player=client?.player,book=player?.spellbook;
         if(!state.running||!config.enabled||!player||player!==state.player||!(client.isConnected?.()===true||client.networkManager?.isConnected?.()===true))return false;
+        if(combatBlocked()){state.reason="Paused during combat";return false;}
         if(bot.actions?.isHalted?.()||bot.gmKillSwitch?.isActive?.()||bot.pauseHotkey?.isPaused?.())return false;
         if(!row.count||(row.rule.count>0&&row.count.count>=row.rule.count)||!config.rules.some(r=>r.spellId===row.rule.spellId&&r.enabled))return false;
         if(!book?.spells?.has(row.spell.sid))return false;
@@ -9773,6 +9796,7 @@ window.__minibiaBotBundle.installRunemakerModule = function installRunemakerModu
             else if(now-pending.at<6000){state.reason="Waiting for item count update";return false;}
             else{state.pending=null;state.retryAt=now+10000;state.reason="No item count increase; retrying later";return false;}
         }
+        if(combatBlocked()){state.reason="Paused during combat";return false;}
         const missing=deficits(now);
         if(!missing.length){state.reason=config.rules.some(r=>r.enabled)?"Stock complete":"Add a rule";return false;}
         const row=missing.find(r=>permitted(r,now));
@@ -9788,6 +9812,8 @@ window.__minibiaBotBundle.installRunemakerModule = function installRunemakerModu
     }
     function updateStatus(){
         if(enabled)enabled.checked=state.running;
+        const combatToggle=host?.querySelector('[data-rm-pause-combat]');
+        if(combatToggle)combatToggle.checked=config.pauseInCombat;
         if(statusLabel)statusLabel.textContent=state.running?state.reason:"";
         const now=Date.now(),all=catalogue();
         for(const [id,label]of rows){const spell=all.find(s=>s.sid===id),r=spell?reading(spell,now):null;label.textContent=r?String(r.count):"?";}
@@ -9814,11 +9840,12 @@ window.__minibiaBotBundle.installRunemakerModule = function installRunemakerModu
     }
     function closeEditor(){editingSpellId=null;if(host)host.querySelector('.mb-rm-add').hidden=true;}
     function mount(panel){host=panel.querySelector(options.host||'[data-runemaker-host]');if(!host)return;
-        host.innerHTML=`<div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-rm-enabled><span class="mb-title-text">Rune Crafter</span><button type="button" class="mb-small-button" data-rm-new>+ Rule</button></div><div class="mb-rm-row mb-rm-columns" aria-hidden="true"><span></span><span>Rune</span><span>Current</span><span>Target</span><span></span></div><div data-stock-runes></div><div class="mb-rm-add" hidden><label class="mb-field"><span class="mb-field-label">Rune</span><select aria-label="Rune type" data-rm-type></select></label><label class="mb-field"><span class="mb-field-label">Target count (0 = unlimited)</span><input type="number" min="0" max="100000" value="0" aria-label="Rune target count" data-rm-count></label><div class="mb-rm-editor-actions"><button type="button" class="mb-small-button" data-rm-add>Add rule</button><button type="button" class="mb-small-button" data-rm-cancel>Cancel</button></div></div><div class="mb-small-note" data-rm-status></div>`;
+        host.innerHTML=`<div class="mb-section-title"><input type="checkbox" class="mb-title-toggle" data-rm-enabled><span class="mb-title-text">Rune Crafter</span><button type="button" class="mb-small-button" data-rm-new>+ Rule</button></div><label class="mb-toggle" title="Pause while a target is selected or the game combat lock is active"><input type="checkbox" data-rm-pause-combat><span>Don't cast while in combat</span></label><div class="mb-rm-row mb-rm-columns" aria-hidden="true"><span></span><span>Rune</span><span>Current</span><span>Target</span><span></span></div><div data-stock-runes></div><div class="mb-rm-add" hidden><label class="mb-field"><span class="mb-field-label">Rune</span><select aria-label="Rune type" data-rm-type></select></label><label class="mb-field"><span class="mb-field-label">Target count (0 = unlimited)</span><input type="number" min="0" max="100000" value="0" aria-label="Rune target count" data-rm-count></label><div class="mb-rm-editor-actions"><button type="button" class="mb-small-button" data-rm-add>Add rule</button><button type="button" class="mb-small-button" data-rm-cancel>Cancel</button></div></div><div class="mb-small-note" data-rm-status></div>`;
         host.querySelector('.mb-title-text').textContent=options.title||'Rune Crafter';
         if(options.itemLabel){host.querySelector('.mb-rm-columns > span:nth-child(2)').textContent=options.itemLabel;host.querySelector('.mb-rm-add .mb-field-label').textContent=options.itemLabel;host.querySelector('[data-rm-type]').setAttribute('aria-label',options.itemLabel+' spell');}
         if(options.enabledId)host.querySelector('[data-rm-enabled]').id=options.enabledId;
         enabled=host.querySelector('[data-rm-enabled]');select=host.querySelector('[data-rm-type]');quantity=host.querySelector('[data-rm-count]');statusLabel=host.querySelector('[data-rm-status]');
+        host.querySelector('[data-rm-pause-combat]').addEventListener('change',event=>updateConfig({pauseInCombat:event.target.checked}));
         enabled.addEventListener('change',()=>enabled.checked?start():stop());select.addEventListener('focus',fillSelect);
         host.querySelector('[data-rm-new]').addEventListener('click',()=>{editingSpellId=null;fillSelect();quantity.value='0';host.querySelector('[data-rm-add]').textContent='Add rule';host.querySelector('.mb-rm-add').hidden=false;select.focus();});
         host.querySelector('[data-rm-cancel]').addEventListener('click',closeEditor);
@@ -11588,7 +11615,7 @@ window.__minibiaBotBundle.installCombatRulesModule = function(bot) {
     const modes = ['inherit','attack','melee','client-chase','kite','kite-lure','lure','ignore'];
     const runes = ['sd','gfb','fb','hmm','lmm','explo'];
     const saved = bot.storage.get(key, {});
-    const config = {...saved, enabled:true, unified:true, rules:saved.rules || []};
+    const config = {...saved, enabled:true, unified:true, rules:saved.rules || [],highestHpInBox:saved.highestHpInBox===true};
     let cached = null, cachedAt = 0;
     let matchCache = new Map(), targetCache = new Map();
     const spellState={lastAttemptAt:0,lastSpell:null,blockedReason:null};
@@ -11600,7 +11627,7 @@ window.__minibiaBotBundle.installCombatRulesModule = function(bot) {
         const minCount=Math.trunc(clamp(r.minCount,1,100,1)), maxCount=Math.trunc(clamp(r.maxCount,1,100,100));
         if(minHp>maxHp || minCount>maxCount) throw new Error('Minimum must not exceed maximum.');
         const optional=(value,min,max)=>value==null||String(value).trim()===''?null:Math.trunc(clamp(value,min,max,min));
-        return {enabled:r.enabled!==false,targetEnabled:r.targetEnabled!==false,legacyRune:r.legacyRune===true,legacyExori:r.legacyExori===true,
+        return {minRange:Math.trunc(clamp(r.minRange,0,8,0)),yieldToExori:r.yieldToExori===true,enabled:r.enabled!==false,targetEnabled:r.targetEnabled!==false,maxHpExclusive:r.maxHpExclusive===true,legacyRune:r.legacyRune===true,legacyExori:r.legacyExori===true,
             targetDistance:optional(r.targetDistance,1,10),kiteDistance:optional(r.kiteDistance,1,10),lureCount:optional(r.lureCount,1,20),lureRadius:optional(r.lureRadius,1,8),names:[...new Set((Array.isArray(r.names)?r.names:String(r.names||'').split(/[,;\n]+/)).map(n=>String(n).trim().toLowerCase()).filter(Boolean))],minHp,maxHp,minCount,maxCount,
             range:Math.trunc(clamp(r.range,1,8,8)),mode:modes.includes(r.mode)?r.mode:'inherit',rune:runes.includes(r.rune)?r.rune:'',position:['inherit','any','front','diagonal'].includes(r.position)?r.position:'inherit',
             spellWords:String(r.spellWords||(r.exori?'exori':'')).trim().replace(/\s+/g,' ').slice(0,160),spellMana:Math.trunc(clamp(r.spellMana,0,100000,0)),spellAim:String(r.spellWords||(r.exori?'exori':'')).trim().toLowerCase()==='exori'?'area':r.spellAim==='area'?'area':'target'};
@@ -11655,8 +11682,8 @@ window.__minibiaBotBundle.installCombatRulesModule = function(bot) {
         const running = bot.attack?.isRunning?.() === true && !bot.attack?.isKnightBoxSuppressed?.();
         const needsRunes = running && config.rules.some(r => r.enabled && r.rune);
         const worker = bot.runeShooter;
-        if (needsRunes && worker && !worker.status?.().running) worker.start();
-        else if (!needsRunes && worker?.status?.().running) worker.stop({ persistEnabled: false });
+        if (needsRunes && worker && !worker.status?.().running) worker.start({ quiet: true });
+        else if (!needsRunes && worker?.status?.().running) worker.stop({ persistEnabled: false, quiet: true });
         // All spell rules, including Exori, use the one spell dispatcher.
         // The former Exori module still supplies its existing safety checks.
         if (bot.exori?.status?.().running) bot.exori.stop({ persistEnabled: false });
@@ -11702,8 +11729,8 @@ window.__minibiaBotBundle.installCombatRulesModule = function(bot) {
             else hp=Number(m.healthPercent??m.hpPercent??m.state?.healthPercent);
         }
         if(Number.isFinite(hp))hp=Math.max(0,Math.min(100,hp));
-        if(!Number.isFinite(hp) || hp<=0 || hp<rule.minHp || hp>rule.maxHp) return false;
-        return (!rule.names.length || rule.names.includes(String(m.name||'').trim().toLowerCase())) && distance(bot.getPlayerPosition(),position(m))<=rule.range;
+        if(!Number.isFinite(hp) || hp<=0 || hp<rule.minHp || hp>rule.maxHp || (rule.maxHpExclusive && hp===rule.maxHp)) return false;
+        return (!rule.names.length || rule.names.includes(String(m.name||'').trim().toLowerCase())) && distance(bot.getPlayerPosition(),position(m))<=rule.range && distance(bot.getPlayerPosition(),position(m))>=(rule.minRange||0);
     }
     function matching(rule,list=monsters()){
         if(list===cached && matchCache.has(rule))return matchCache.get(rule);
@@ -11729,12 +11756,24 @@ window.__minibiaBotBundle.installCombatRulesModule = function(bot) {
         }
         return null;
     }
+    function shouldYieldRuneToExori(rule){
+        if(!rule?.yieldToExori || !config.enabled)return false;
+        const nearby=monsters().filter(m=>distance(bot.getPlayerPosition(),position(m))<=1);
+        const readyRule=config.rules.some(r=>r.enabled && r.spellWords.toLowerCase()==='exori' && meetsCount(r,nearby));
+        if(!readyRule)return false;
+        const client=window.gameClient,book=client?.player?.spellbook,spells=client?.interface?.SPELLS;
+        if(!book?.cooldowns?.has || !spells?.forEach)return true;
+        let sid=null;spells.forEach((spell,id)=>{if(String(spell?.words||'').trim().toLowerCase()==='exori')sid=Number(id);});
+        if(sid===null)return true;
+        const bucket=typeof book.__bucketFor==='function'?book.__bucketFor(sid):book.GLOBAL_COOLDOWN;
+        return !book.cooldowns.has(sid) && !(bucket!=null && book.cooldowns.has(bucket));
+    }
     function runeRules(list) {
         if(!config.enabled || !bot.attack?.isRunning?.())return [];
         const nearIds=config.rules.some(r=>r.enabled&&r.legacyRune) ? new Set((bot.attack.getNearbyMonsters?.(false)||[]).map(m=>Number(m.id))) : null;
         const result=[];
         for(const r of config.rules) {
-            if(!r.enabled||!r.rune)continue;
+            if(!r.enabled||!r.rune||shouldYieldRuneToExori(r))continue;
             if(r.legacyRune) {
                 const near=list.filter(m=>nearIds.has(Number(m.id))&&!bot.attack?.isLegacyIgnoredTarget?.(m));
                 if(near.length>=r.minCount)result.push({rune:r.rune,minCreatures:r.minCount,mobNames:r.names,monsters:near});
@@ -11798,7 +11837,33 @@ window.__minibiaBotBundle.installCombatRulesModule = function(bot) {
         const rules=next.rules===undefined?config.rules:next.rules.map(normalize);
         config.rules=next.enabled===false?rules.map(r=>({...r,enabled:false})):rules;
         config.enabled=true;config.unified=true;config.schemaVersion=1;
+        if(next.highestHpInBox!==undefined)config.highestHpInBox=next.highestHpInBox===true;
         invalidate();bot.attack?.clearCombatRuleMode?.();persist();syncActions();refreshStatus();return config;
+    }
+    function exportRules(){
+        return JSON.stringify({format:'mb0t-targeting-rules',version:1,highestHpInBox:config.highestHpInBox,rules:config.rules.map(r=>({...r,names:[...r.names]}))},null,2);
+    }
+    function importRules(text,append=false){
+        const data=JSON.parse(String(text).replace(/^\uFEFF/,''));
+        if(!Array.isArray(data) && (!data || data.format!=='mb0t-targeting-rules' || data.version!==1))
+            throw new Error('Not a supported targeting rules file.');
+        if(!Array.isArray(data) && data.highestHpInBox!==undefined && typeof data.highestHpInBox!=='boolean')throw new Error('Invalid highest-HP setting.');
+        const rows=Array.isArray(data)?data:data.rules;
+        if(!Array.isArray(rows))throw new Error('Rules must be an array.');
+        if(rows.length+(append?config.rules.length:0)>1000)throw new Error('Maximum 1000 rules.');
+        const rules=rows.map((r,i)=>{
+            if(!r || typeof r!=='object' || Array.isArray(r) || !Object.keys(r).some(k=>['names','minHp','maxHp','mode','targetEnabled','rune','spellWords'].includes(k)))throw new Error('Invalid rule '+(i+1));
+            for(const key of ['minHp','maxHp','minCount','maxCount','range','minRange','spellMana','targetDistance','kiteDistance','lureCount','lureRadius'])
+                if(r[key]!=null && r[key]!=='' && !Number.isFinite(Number(r[key])))throw new Error('Invalid '+key+' in rule '+(i+1));
+            for(const [key,allowed] of [['mode',modes],['rune',['',...runes]],['position',['inherit','any','front','diagonal']],['spellAim',['target','area']]])
+                if(r[key]!=null&&!allowed.includes(r[key]))throw new Error('Invalid '+key+' in rule '+(i+1));
+            if(r.names!=null && typeof r.names!=='string' && !(Array.isArray(r.names)&&r.names.every(n=>typeof n==='string')))throw new Error('Invalid monster names in rule '+(i+1));
+            const normalized=normalize(r);
+            if(normalized.minRange>normalized.range)throw new Error('Minimum range exceeds maximum in rule '+(i+1));
+            return normalized;
+        });
+        updateConfig({rules:append?[...config.rules,...rules]:rules,...(!Array.isArray(data)&&data.highestHpInBox!==undefined?{highestHpInBox:data.highestHpInBox}:{})});
+        return rules.length;
     }
     function mount(panel) {
         const host = panel.querySelector('[data-targeting-rules-host]');
@@ -11823,14 +11888,25 @@ window.__minibiaBotBundle.installCombatRulesModule = function(bot) {
         #minibia-bot-panel .mb-combat-rules [hidden] {display:none!important;}
         </style>
         <div class="cr-toolbar"><span style="font-weight:bold;">Monster Rules</span><button type="button" class="mb-small-button" data-cr="new">+ New Rule</button></div>
+        <div class="cr-actions" style="display:flex;gap:4px;flex-wrap:wrap;margin-top:5px">
+          <button type="button" class="mb-small-button" data-cr="export">Export JSON</button>
+          <button type="button" class="mb-small-button" data-cr="import">Import file</button>
+          <button type="button" class="mb-small-button" data-cr="clipboard">Import clipboard</button>
+          <select data-cr="importMode" aria-label="Import rules mode"><option value="replace">Replace rules</option><option value="append">Append rules</option></select>
+          <input type="file" data-cr="file" accept=".json,.txt,application/json,text/plain" hidden>
+        </div>
+        <label class="cr-check" style="margin-top:5px"><input type="checkbox" data-cr="highestHp"><span>Highest HP % inside box (1 SQM)</span></label>
         <div data-cr="list" style="margin:5px 0"></div>
         <div data-cr="editor" hidden style="border-top:1px solid rgba(255,255,255,.08);padding-top:8px">
           <div class="cr-form">
             <label class="mb-field" style="grid-column:1/-1"><span class="mb-field-label">Monster names</span><input data-cr="names" placeholder="Any monster — or Dragon Lord, Demon"></label>
             <div class="mb-field"><span class="mb-field-label">Monster HP %</span><div class="cr-range"><input data-cr="minHp" type="number" min="0" max="100" value="0" aria-label="Minimum monster HP"><span>–</span><input data-cr="maxHp" type="number" min="0" max="100" value="100" aria-label="Maximum monster HP"></div></div>
+            <label class="cr-check"><input type="checkbox" data-cr="maxHpExclusive"><span>HP strictly below maximum</span></label>
             <div class="mb-field"><span class="mb-field-label" data-cr="countLabel">Matching monsters</span><div class="cr-range"><input data-cr="minCount" type="number" min="1" max="100" value="1" aria-label="Minimum monster count"><span>–</span><input data-cr="maxCount" type="number" min="1" max="100" value="100" aria-label="Maximum monster count"></div></div>
             <label class="mb-field"><span class="mb-field-label">Rule role</span><select data-cr="role"><option value="target">Target + actions</option><option value="actions">Actions only</option></select></label>
             <label class="mb-field"><span class="mb-field-label">Match range · SQM</span><input data-cr="range" type="number" min="1" max="8" value="8"></label>
+            <label class="mb-field"><span class="mb-field-label">Minimum range · SQM</span><input data-cr="minRange" type="number" min="0" max="8" value="0"></label>
+            <label class="cr-check"><input type="checkbox" data-cr="yieldToExori"><span>Runes: yield to Exori unless on cooldown</span></label>
             <label class="mb-field" data-cr="modeField"><span class="mb-field-label">Movement</span><select data-cr="mode"><option value="inherit">Use default</option><option value="attack">Attack · no chase</option><option value="melee">Melee · bot chase</option><option value="client-chase">Client Chase</option><option value="kite">Kite</option><option value="kite-lure" title="Keep kiting while gathering monsters with offscreen pull">Kite Lure</option><option value="lure">Lure</option><option value="ignore">Ignore targeting</option></select></label>
             <label class="mb-field" data-cr="positionField"><span class="mb-field-label">Position</span><select data-cr="position"><option value="inherit">Use default</option><option value="any">Any adjacent tile</option><option value="front">Front</option><option value="diagonal">Diagonal</option></select></label>
             <label class="mb-field" data-cr="targetDistanceField"><span class="mb-field-label">Max target distance</span><input data-cr="targetDistance" type="number" min="1" max="10" placeholder="Default"></label>
@@ -11847,7 +11923,7 @@ window.__minibiaBotBundle.installCombatRulesModule = function(bot) {
         <div data-cr="message" class="mb-small-note" style="margin-top:4px"></div>
         <div class="mb-small-note" style="margin-top:6px">Top matching targeting rule takes priority. Unmatched monsters use the defaults. Spell and rune conditions run independently; healing takes priority.</div>`;
         const q = k => box.querySelector(`[data-cr="${k}"]`);
-        const fields = ['names','minHp','maxHp','minCount','maxCount','range','mode','position','targetDistance','kiteDistance','lureCount','lureRadius','rune','spellWords','spellMana','spellAim'];
+        const fields = ['names','minHp','maxHp','minCount','maxCount','range','minRange','mode','position','targetDistance','kiteDistance','lureCount','lureRadius','rune','spellWords','spellMana','spellAim'];
         let edit = null;
         function showFields() {
             const targeting = q('role').value === 'target', mode = q('mode').value;
@@ -11857,12 +11933,14 @@ window.__minibiaBotBundle.installCombatRulesModule = function(bot) {
         }
         function reset() {
             edit = null;
-            const values = {names:'',minHp:0,maxHp:100,minCount:1,maxCount:100,range:8,mode:'inherit',position:'inherit',targetDistance:'',kiteDistance:'',lureCount:'',lureRadius:'',rune:'',spellWords:'',spellMana:0,spellAim:'target'};
+            const values = {names:'',minHp:0,maxHp:100,minCount:1,maxCount:100,range:8,minRange:0,mode:'inherit',position:'inherit',targetDistance:'',kiteDistance:'',lureCount:'',lureRadius:'',rune:'',spellWords:'',spellMana:0,spellAim:'target'};
             for (const field of fields) q(field).value = values[field];
+            q('maxHpExclusive').checked=false;q('yieldToExori').checked=false;
             q('role').value = 'target'; q('ruleEnabled').checked = true; q('save').textContent = 'Add Rule'; q('editor').hidden = true; showFields();
             q('countLabel').textContent='Matching monsters';
         }
         function render() {
+            q('highestHp').checked=config.highestHpInBox;
             const list = q('list'); list.replaceChildren();
             if (!config.rules.length) { const empty = document.createElement('div'); empty.className = 'mb-small-note'; empty.textContent = 'No overrides yet. Defaults apply to every monster.'; list.appendChild(empty); }
             config.rules.forEach((r,i) => {
@@ -11880,9 +11958,9 @@ window.__minibiaBotBundle.installCombatRulesModule = function(bot) {
                     render();
                 });
                 const meta = document.createElement('div'); meta.className = 'cr-card-meta';
-                meta.textContent = `${r.targetEnabled ? (r.mode==='inherit'?'Default movement':r.mode) : 'Actions only'} · HP ${r.minHp}–${r.maxHp}% · ${r.minCount}–${r.maxCount} ${r.legacyRune||r.legacyExori?'nearby':'matching'} mobs · ${r.range} SQM${r.kiteDistance ? ' · Kite '+r.kiteDistance : ''}${r.position!=='inherit' ? ' · '+r.position : ''}${r.rune ? ' · '+r.rune.toUpperCase() : ''}${r.spellWords ? ' · '+r.spellWords : ''}`;
+                meta.textContent = `${r.targetEnabled ? (r.mode==='inherit'?'Default movement':r.mode) : 'Actions only'} · HP ${r.minHp}–${r.maxHpExclusive?'<':''}${r.maxHp}% · ${r.minCount}–${r.maxCount} ${r.legacyRune||r.legacyExori?'nearby':'matching'} mobs · ${r.minRange||0}–${r.range} SQM${r.kiteDistance ? ' · Kite '+r.kiteDistance : ''}${r.position!=='inherit' ? ' · '+r.position : ''}${r.rune ? ' · '+r.rune.toUpperCase() : ''}${r.spellWords ? ' · '+r.spellWords : ''}`;
                 const actions = document.createElement('div'); actions.className = 'cr-actions';
-                for (const [label,fn] of [['Edit',()=>{ edit=i; for(const field of fields) q(field).value = field==='names'?r.names.join(', '):r[field]??''; q('role').value=r.targetEnabled?'target':'actions'; q('countLabel').textContent=r.legacyRune||r.legacyExori?'Nearby monster count':'Matching monsters'; q('ruleEnabled').checked=r.enabled; q('save').textContent='Update Rule'; q('editor').hidden=false; showFields(); }],['↑',()=>move(i,-1)],['↓',()=>move(i,1)],['Remove',()=>{const next=config.rules.slice();next.splice(i,1);updateConfig({rules:next});reset();render();}]]) {
+                for (const [label,fn] of [['Edit',()=>{ edit=i; for(const field of fields) q(field).value = field==='names'?r.names.join(', '):r[field]??''; q('maxHpExclusive').checked=r.maxHpExclusive===true;q('yieldToExori').checked=r.yieldToExori===true;q('role').value=r.targetEnabled?'target':'actions'; q('countLabel').textContent=r.legacyRune||r.legacyExori?'Nearby monster count':'Matching monsters'; q('ruleEnabled').checked=r.enabled; q('save').textContent='Update Rule'; q('editor').hidden=false; showFields(); }],['↑',()=>move(i,-1)],['↓',()=>move(i,1)],['Remove',()=>{const next=config.rules.slice();next.splice(i,1);updateConfig({rules:next});reset();render();}]]) {
                     const button=document.createElement('button');button.type='button';button.className='mb-small-button';button.textContent=label;button.title=label==='↑'?'Move up':label==='↓'?'Move down':label;button.addEventListener('click',fn);actions.appendChild(button);
                 }
                 row.append(title,meta,actions); list.appendChild(row);
@@ -11890,14 +11968,37 @@ window.__minibiaBotBundle.installCombatRulesModule = function(bot) {
             refreshStatus();
         }
         function move(i,d) { const j=i+d;if(j<0||j>=config.rules.length)return;const next=config.rules.slice();[next[i],next[j]]=[next[j],next[i]];updateConfig({rules:next});reset();render(); }
+        function loadRules(text,append){
+            const count=importRules(text,append);reset();render();
+            q('message').textContent=(append?'Appended ':'Imported ')+count+' rules.';
+        }
+        q('export').addEventListener('click',()=>{
+            const url=URL.createObjectURL(new Blob([exportRules()],{type:'application/json'}));
+            const link=document.createElement('a');link.href=url;link.download='mb0t-targeting-rules.json';
+            try{document.body.appendChild(link);link.click();q('message').textContent='Rules exported.';}
+            finally{link.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);}
+        });
+        q('import').addEventListener('click',()=>{q('file').value='';q('file').click();});
+        q('file').addEventListener('change',async()=>{
+            const file=q('file').files?.[0],append=q('importMode').value==='append';if(!file)return;
+            try{if(file.size>2*1024*1024)throw new Error('File exceeds 2 MB.');loadRules(await file.text(),append);}
+            catch(error){q('message').textContent='Import failed: '+error.message;}
+        });
+        q('clipboard').addEventListener('click',async()=>{
+            const append=q('importMode').value==='append';
+            try{if(!navigator.clipboard?.readText)throw new Error('Clipboard unavailable; use Import file.');loadRules(await navigator.clipboard.readText(),append);}
+            catch(error){q('message').textContent='Import failed: '+error.message;}
+        });
+        q('highestHp').addEventListener('change',()=>updateConfig({highestHpInBox:q('highestHp').checked}));
         q('new').addEventListener('click',()=>{reset();q('editor').hidden=false;q('message').textContent='';q('names').focus();});
         q('role').addEventListener('change',showFields); q('mode').addEventListener('change',showFields);
         q('save').addEventListener('click',()=>{
             try {
                 const r = edit == null ? {} : {...config.rules[edit]};
                 for (const field of fields) r[field]=q(field).value;
-                for (const field of ['minHp','maxHp','minCount','maxCount','range','spellMana']) if(!String(r[field]).trim() || !Number.isFinite(Number(r[field]))) throw new Error('Enter valid HP, count, range and mana values.');
-                r.enabled=q('ruleEnabled').checked;r.targetEnabled=q('role').value==='target';
+                for (const field of ['minHp','maxHp','minCount','maxCount','range','minRange','spellMana']) if(!String(r[field]).trim() || !Number.isFinite(Number(r[field]))) throw new Error('Enter valid HP, count, range and mana values.');
+                r.enabled=q('ruleEnabled').checked;r.targetEnabled=q('role').value==='target';r.maxHpExclusive=q('maxHpExclusive').checked;r.yieldToExori=q('yieldToExori').checked;
+                if(Number(r.minRange)>Number(r.range))throw new Error('Minimum range exceeds maximum.');
                 if(!['kite','kite-lure','inherit'].includes(r.mode))r.kiteDistance=null;
                 if(!['lure','kite-lure','inherit'].includes(r.mode)){r.lureCount=null;r.lureRadius=null;}
                 if(!r.targetEnabled) {r.mode='inherit';r.position='inherit';for(const field of ['targetDistance','kiteDistance','lureCount','lureRadius'])r[field]=null;}
@@ -11912,7 +12013,7 @@ window.__minibiaBotBundle.installCombatRulesModule = function(bot) {
         });
         q('cancel').addEventListener('click',reset); reset();render();
     }
-    bot.combatRules={config,updateConfig,targetRule,targetPriority,activeTargetRule,matchOne,matching,meetsCount,runeRules,exoriRule,armActions,syncActions,mount,invalidate,trySpellRules,getDefaultMode,updateDefaults,targetingStatus,refreshStatus,status:()=>({...spellState})};
+    bot.combatRules={config,updateConfig,exportRules,importRules,targetRule,targetPriority,activeTargetRule,matchOne,matching,meetsCount,runeRules,exoriRule,armActions,syncActions,mount,invalidate,trySpellRules,shouldYieldRuneToExori,getDefaultMode,updateDefaults,targetingStatus,refreshStatus,status:()=>({...spellState})};
     const offEvents=bot.clientEvents?.subscribe(['target','creatures','session'],()=>invalidate());
     bot.addCleanup(()=>{offEvents?.();invalidate();bot.attack?.clearCombatRuleMode?.();});
 };
@@ -12713,7 +12814,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         const nextMode = rule ? JSON.stringify([rule.mode,rule.position,rule.targetDistance,rule.kiteDistance,rule.lureCount,rule.lureRadius]) : null;
         if (nextMode !== lastCombatRuleMode) {
             stopKiteAutoWalk("combat rule changed");
-            stopManualTargetPursuitAutoWalk("combat rule changed");
+            const current = getCurrentTarget();
+            const keepHuntPath = window.gameClient?.__mbTargetingAutoWalkOwner === "hunt" &&
+                (!current || (current.id === state.offscreenHuntTargetId && rule?.mode === 'melee'));
+            if (!keepHuntPath) stopManualTargetPursuitAutoWalk("combat rule changed");
             setClientChaseMode(false);
             lastCombatRuleMode = nextMode;
         }
@@ -13549,8 +13653,16 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         return index >= 0 ? index : names.length + (isPreferredCreature(creature) ? 0 : 1);
     }
 
+    function compareBoxHealth(a,b){
+        if(bot.combatRules?.config?.highestHpInBox!==true)return 0;
+        const nearA=getCreatureDistanceFromPlayer(a)<=1,nearB=getCreatureDistanceFromPlayer(b)<=1;
+        if(nearA!==nearB)return nearA?-1:1;
+        if(!nearA)return 0;
+        const ha=getCreatureHealthPercent(a),hb=getCreatureHealthPercent(b);
+        return Number.isFinite(ha)&&Number.isFinite(hb)?hb-ha:0;
+    }
     function compareTargetPriority(a, b) {
-        return getTargetPriorityRank(a) - getTargetPriorityRank(b);
+        return compareBoxHealth(a,b) || getTargetPriorityRank(a) - getTargetPriorityRank(b);
     }
 
     function getPreferredTargetNames() {
@@ -16487,6 +16599,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                         !preferredBestApproach?.reachable
                             ? probePreferredCreatureBlock(best, now)
                             : null;
+                    const boxHealthUpgrade = compareBoxHealth(best,current)<0;
                     const priorityDifference = compareTargetPriority(best, current);
                     const priorityUpgrade = priorityDifference < 0;
                     const preferredUpgrade =
@@ -16701,8 +16814,8 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                         now - state.lastRetargetAt >= retargetCooldownMs &&
                         challengerHeldMs >= confirmMs;
 
-                    if (!manualTargetProtected && (preferredUpgrade || (ordinaryRetargetReady && clearlyBetter))) {
-                        const reason = preferredUpgrade
+                    if (!manualTargetProtected && (boxHealthUpgrade || preferredUpgrade || (ordinaryRetargetReady && clearlyBetter))) {
+                        const reason = boxHealthUpgrade ? "switching to highest HP in box" : preferredUpgrade
                             ? "switching to preferred target"
                             : priorityUpgrade
                                 ? "switching to higher attack priority"
@@ -17287,41 +17400,22 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 cssTileHeight
             );
 
-        const edgePadX =
-            Math.max(
-                2,
-                cssTileWidth * 0.06
-            );
-        const edgePadY =
-            Math.max(
-                2,
-                cssTileHeight * 0.06
-            );
-
-        const minCenterX =
-            visibleLeft +
-            cssTileWidth / 2 +
-            edgePadX;
-        const maxCenterX =
-            visibleRight -
-            cssTileWidth / 2 -
-            edgePadX;
-        const minCenterY =
-            visibleTop +
-            cssTileHeight / 2 +
-            edgePadY;
-        const maxCenterY =
-            visibleBottom -
-            cssTileHeight / 2 -
-            edgePadY;
+        // Edge tiles belong to the rendered playfield too. Requiring a whole
+        // tile plus padding excluded the outer row/column and made animated
+        // creatures alternate between acquired and off-screen at the edge.
+        // Keep actual canvas/upper clipping, but test the tile center itself.
+        const minCenterX = visibleLeft;
+        const maxCenterX = visibleRight;
+        const minCenterY = visibleTop;
+        const maxCenterY = visibleBottom;
 
         const renderedVisible =
             Number.isFinite(centerX) &&
             Number.isFinite(centerY) &&
             centerX >= minCenterX &&
-            centerX <= maxCenterX &&
+            centerX < maxCenterX &&
             centerY >= minCenterY &&
-            centerY <= maxCenterY;
+            centerY < maxCenterY;
 
         const clipped =
             upperRect
@@ -17410,7 +17504,9 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         // Very short skip: this prevents same-tick stale snapshot reacquire but
         // allows the creature to become eligible again almost immediately if it
         // genuinely returns to the visible screen.
-        rememberSkippedTarget(
+        // A box runner leaving view is a hunt destination, not a failed target.
+        // Do not temporarily blacklist it between visible chase and box hunt.
+        if (!(isKnightBoxFinishing() && isKnightBoxRunner(current))) rememberSkippedTarget(
             current,
             now,
             Math.max(
@@ -17973,7 +18069,17 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         const ownedHuntAutoWalk =
             window.gameClient?.__mbTargetingAutoWalkOwner === "hunt";
 
-        if (ownedHuntAutoWalk) {
+        const combatTarget = options.handoff === true ? getCurrentTarget() : null;
+        const transferToMelee = ownedHuntAutoWalk && combatTarget && combatTarget.id === oldId &&
+            config.meleeMode && !config.useClientChase && !config.kiteMode && !config.lureMode &&
+            window.gameClient?.__mbTargetingAutoWalkActive === true;
+        if (transferToMelee) {
+            // Same runner, same path: hand ownership to bot chase without a
+            // StopWalk packet. The next chase tick revalidates the queued tiles.
+            window.gameClient.__mbTargetingAutoWalkOwner = "melee";
+            state.movementOwner = "melee";
+            state.movementOwnedUntil = Date.now() + 400;
+        } else if (ownedHuntAutoWalk) {
             stopManualTargetPursuitAutoWalk(
                 `Off-screen Hunt: ${reason}`,
                 { forceHunt: true }
@@ -18101,7 +18207,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function syncVisibleHuntPriority(now = Date.now()) {
-        if (!state.running || !config.enabled || !isOffscreenHuntEnabled() || config.lureMode)
+        if (!state.running || !config.enabled)
             return false;
         const client = window.gameClient;
         if (!state.offscreenHuntActive && !state.offscreenHuntPauseHeld && !state.offscreenLootPauseHeld &&
@@ -18110,7 +18216,16 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
         const current = getCurrentTarget();
         if (current && getNativeSmallScreenInfo(current).visible) {
-            clearOffscreenLootWait();
+            // A target can be selected by access clearing, a manual click or
+            // another acquisition path while Hunt still owns the old route.
+            // Release the hunt pause/path before normal chase runs this tick.
+            clearOffscreenHunt("visible combat target selected", { handoff: true });
+            return false;
+        }
+        // Cleanup must precede these gates: box completion or a rule change
+        // can disable Hunt while its previous ownership is still held.
+        if (!isOffscreenHuntEnabled() || config.lureMode) {
+            clearOffscreenHunt("hunt mode ended", { quiet: true });
             return false;
         }
         if (current)
@@ -18122,11 +18237,13 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
 
         const candidates = getMonsterCandidates(now);
         if (candidates.length > 0) {
-            clearOffscreenHunt("visible combat takes hunt priority", { handoff: true });
+            const sameRunner = candidates[0]?.id === state.offscreenHuntTargetId;
+            if (!sameRunner) clearOffscreenHunt("visible combat takes hunt priority", { handoff: true });
             triggerAttack(now, candidates);
-            // Acquisition cooldown may defer TargetPacket to the next tick.
-            // The old hunt walk must already be stopped during that wait.
-            return true;
+            // Keep pursuing the same runner while acquisition is cooling down.
+            // On success the setter transfers ownership and this tick continues
+            // into normal chase, rather than stopping for an acquisition tick.
+            return !getCurrentTarget();
         }
 
         const visible = getVisibleHuntPreemptionTarget(now);
@@ -24182,6 +24299,15 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         state.lastProgressAt = 0;
         state.unreachableStart = 0;
 
+        // Resolve the new target's movement permission before transferring Hunt.
+        applyCombatRuleMode();
+
+        // Complete Hunt -> combat ownership using the newly selected rule.
+        if (state.offscreenHuntActive || state.offscreenHuntPauseHeld || state.offscreenLootPauseHeld ||
+            window.gameClient?.__mbTargetingAutoWalkOwner === "hunt") {
+            clearOffscreenHunt("combat target acquired", { handoff: true });
+        }
+
         console.log("[target] accepted", {
             id: target.id,
             name: target.name,
@@ -25831,19 +25957,13 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 playerPos
             );
 
-        if (
-            !route ||
-            !Array.isArray(
-                route.pathPositions
-            ) ||
-            route.pathPositions.length ===
-                0
-        ) {
-            state.manualPursuitPathFailures++;
-            return false;
-        }
+        const hasRoute = Array.isArray(route?.pathPositions) && route.pathPositions.length > 0;
+        if (!hasRoute) state.manualPursuitPathFailures++;
 
-        let sent = sendManualTargetPursuitAutoWalk(
+        // An empty initial route must also reach the live-grid fallback below.
+        // Otherwise a selected fleeing target can remain stationary indefinitely
+        // whenever the shared route finder cannot produce an approach path.
+        let sent = hasRoute && sendManualTargetPursuitAutoWalk(
             playerPos,
             route,
             target,
@@ -27875,18 +27995,23 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
         out.sort((a,b) => b.minCreatures - a.minCreatures || a._order - b._order);
         return out.map(({rune,minCreatures,mobNames}) => ({rune,minCreatures,mobNames}));
     }
-    config.rules = normalizeRules(config.rules);
+    // Combat Rules migrates old settings before this worker is installed.
+    // Once unified, never retain or revive a second set of offensive rules.
+    const usesMonsterRules = () => bot.combatRules?.config?.unified === true;
+    config.rules = usesMonsterRules() ? [] : normalizeRules(config.rules);
+    if (usesMonsterRules()) config.enabled = false;
     config.currentTargetOnly = config.currentTargetOnly === true;
 
     function persistConfig() {
+        if (usesMonsterRules()) config.rules = [];
         bot.storage.set(configStorageKey, {
-            enabled:!!config.enabled,
+            enabled:usesMonsterRules() ? false : !!config.enabled,
             tickMs:config.tickMs,
             countRefreshMs:config.countRefreshMs,
             countFreshMs:config.countFreshMs,
             avoidPlayersInAoe:config.avoidPlayersInAoe !== false,
             currentTargetOnly:config.currentTargetOnly === true,
-            rules:config.rules.map(r => ({...r})),
+            ...(usesMonsterRules() ? {} : { rules:config.rules.map(r => ({...r})) }),
         });
     }
 
@@ -28288,6 +28413,7 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
 
     function tryRule(rule, monsters, now) {
         if(bot.combatRules?.config?.unified && !bot.attack?.isRunning?.())return false;
+        if(bot.combatRules?.shouldYieldRuneToExori?.(rule.combatRule))return false;
         const def = getDefinition(rule?.rune);
         if (!def) return false;
         const supply = getRuneCountState(def.key, now);
@@ -28328,8 +28454,9 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
         if (bot.actions && !releaseRuneGuard) return false;
 
         const action = () => {
+            if(bot.combatRules?.shouldYieldRuneToExori?.(rule.combatRule))return false;
             if (def.mode === "creature") {
-                if (config.currentTargetOnly) {
+                if (config.currentTargetOnly || rule.combatRule) {
                     if (bot.actions?.isHalted?.() ||
                         (bot.combatRules?.config?.unified && !bot.attack?.isRunning?.()) ||
                         bot.attack?.isProtectionZoneBlocked?.(Date.now()) ||
@@ -28472,12 +28599,14 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
         state.unsubscribeCounts = null;
     }
 
-    function start() {
+    function start(options = {}) {
         if (state.running) return false;
         config.enabled = true; persistConfig();
         state.running = true; state.pendingUntil = 0; state.lastCountRequestAt = 0; state.lastError = null;
         attachCountListener(); requestRuneCounts(Date.now(),true); tick();
-        bot.log("Rune Shooter started", { rules:config.rules });
+        if (!options.quiet) bot.log("Rune Shooter started", usesMonsterRules()
+            ? { source: "Monster Rules", runes: getConfiguredDefinitions().map(def => def.key) }
+            : { rules: config.rules });
         return true;
     }
     function stop(options = {}) {
@@ -28486,11 +28615,11 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
         if (state.timerId) { clearTimeout(state.timerId); state.timerId = null; }
         detachCountListener();
         if (persist) { config.enabled = false; persistConfig(); }
-        bot.log("Rune Shooter stopped");
+        if (!options.quiet && !usesMonsterRules()) bot.log("Rune Shooter stopped");
         return true;
     }
     function updateConfig(next = {}) {
-        if (next.rules !== undefined) config.rules = normalizeRules(next.rules);
+        if (next.rules !== undefined) config.rules = usesMonsterRules() ? [] : normalizeRules(next.rules);
         if (next.tickMs !== undefined) config.tickMs = Math.max(50,Math.min(500,Math.trunc(Number(next.tickMs)||100)));
         if (next.countRefreshMs !== undefined) config.countRefreshMs = Math.max(5000,Math.min(60000,Math.trunc(Number(next.countRefreshMs)||15000)));
         if (next.countFreshMs !== undefined) config.countFreshMs = Math.max(10000,Math.min(120000,Math.trunc(Number(next.countFreshMs)||30000)));
@@ -28542,7 +28671,8 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
         return RUNE_KEYS.map(key => ({...RUNE_TYPES[key], shape:RUNE_TYPES[key].shape ? [...RUNE_TYPES[key].shape] : null}));
     }
 
-    if (config.enabled) start();
+    if (usesMonsterRules()) persistConfig();
+    else if (config.enabled) start();
     bot.addCleanup(() => stop({persistEnabled:false}));
     bot.runeShooter = {
         start, stop, status, updateConfig, getRuneTypes, getRuneCountState,
@@ -29781,6 +29911,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         state._standAttempt = null;
         state._ropeUsed = null;
         state._ropeNextUseAt = null;
+        state._ropeStartAt = null;
+        state._ropeFailures = null;
         state._ropeWaitingFloorChange = null;
         state._shovelUsed = null;
         state._shovelState = null;
@@ -35646,27 +35778,136 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     }
 
     const toolCountRequests=new Map();
+    // Game definitions: only ready forms. 10512/10514/10516 are jammed.
+    const multiToolIds=[{sid:10511,id:9594},{sid:10513,id:9596},{sid:10515,id:9598}];
+    const caveToolSids={rope:2120,shovel:2554,pick:2553,scythe:2550,machete:2420};
+    function isReadyMultiTool(item){return !!item && multiToolIds.some(t=>Number(item.sid)===t.sid || Number(item.id)===t.id);}
     function findServerToolSource(kind,sid,predicate){
-        const local=findToolSource(predicate),client=window.gameClient;
-        if(typeof HotbarUsePacket!=='function'||!client?.send)return local;
+        const local=findToolSource(predicate)||findToolSource(isReadyMultiTool),client=window.gameClient;
+        // A real source slot is sufficient; do not gate open-bag tools on hotbar counts.
+        if(local)return local;
+        if(typeof HotbarUsePacket!=='function'||!client?.send)return null;
         const defs=client.itemDefinitionsBySid||{};
-        const def=defs[sid]||Object.values(defs).find(def=>String(def?.properties?.name||'').toLowerCase()===kind);
-        const cid=Number(local?.item?.id||def?.id);
-        if(!(cid>0))return {location:'server',kind,item:null};
-        return {location:'server',kind,item:local?.item||{id:cid,sid},index:null};
+        const candidates=[{sid,id:Number(defs[sid]?.id)},...multiToolIds.map(t=>({sid:t.sid,id:Number(defs[t.sid]?.id)||t.id}))];
+        if(local?.item?.id)candidates.unshift({sid:local.item.sid,id:Number(local.item.id)});
+        const now=Date.now(),seen=new Set();let pending=null;
+        for(const item of candidates){
+            if(!(item.id>0)||seen.has(item.id))continue;seen.add(item.id);
+            // Exact SID counts include closed bags and distinguish ready/jammed tools.
+            const exact=bot.sidInventory?.reading?.(item.sid);
+            if(!exact||now-Number(exact.at||0)>5000)bot.sidInventory?.request?.([item.sid]);
+            else {
+                if(Number(exact.count)>0)return {location:'server',kind,item,index:null,exactSid:true};
+                continue;
+            }
+            const reading=bot.getItemCountReading?.(item.id,0);
+            if(!reading||now-Number(reading.at||0)>5000){
+                if(now-(toolCountRequests.get(item.id)||0)>=1000){toolCountRequests.set(item.id,now);bot.requestItemCounts?.([{id:item.id,fluidType:0}]);}
+                pending=pending||item;continue;
+            }
+            if(Number(reading.count)>0)return {location:'server',kind,item,index:null};
+        }
+        // Keep manual transition waypoints waiting while counts arrive or tools unjam.
+        return {location:'server',kind,item:pending,index:null};
+    }
+    function findCaveToolSource(kind){
+        const sid=caveToolSids[kind];if(!sid)return null;
+        return findServerToolSource(kind,sid,item=>Number(item?.sid)===sid || getThingName(item).toLowerCase()===kind);
+    }
+    async function useToolAt(kind,position){
+        if(!caveToolSids[kind])throw new Error('Unknown CaveBot tool: '+kind);
+        const target=normalizePosition(position),deadline=Date.now()+20000;
+        const revision=state.routeRevision,index=state.currentIndex;
+        if(!target)throw new Error('Invalid tool target');
+        while(state.running && state.routeRevision===revision && state.currentIndex===index && Date.now()<deadline){
+            const player=normalizePosition(bot.getPlayerPosition());
+            if(!player || player.z!==target.z)throw new Error('Tool target is on another floor');
+            if(!isSameTile(player,target)&&!isAdjacentTile(player,target)){
+                const adjacent=findAdjacentWalkablePosition(target,player);
+                if(adjacent && !window.gameClient?.player?.isMoving?.())goToPosition(adjacent);
+            }else{
+                const tile=getTileAt(target),tool=findCaveToolSource(kind);
+                if(tile && sendToolUse(tool,tile,target,Date.now()))return true;
+            }
+            await new Promise(resolve=>setTimeout(resolve,250));
+        }
+        throw new Error(state.running?'Tool unavailable or target unreachable: '+kind:'CaveBot stopped');
     }
     function findRopeSource() {
-        return findServerToolSource('rope',2120,isRopeItem);
+        const client=window.gameClient,now=Date.now();
+        const rope={sid:2120,id:Number(client?.itemDefinitionsBySid?.[2120]?.id)||3003};
+
+        const pending={location:'pending',kind:'rope',item:null};
+        function scan(item){
+            const exact=bot.sidInventory?.reading?.(item.sid);
+            if(exact && now-Number(exact.at||0)<=5000)return {known:true,count:Number(exact.count),exactSid:true};
+            bot.sidInventory?.request?.([item.sid]);
+            const count=bot.getItemCountReading?.(item.id,0);
+            if(count && now-Number(count.at||0)<=5000)return {known:true,count:Number(count.count),exactSid:false};
+            if(now-(toolCountRequests.get(item.id)||0)>=1000){toolCountRequests.set(item.id,now);bot.requestItemCounts?.([{id:item.id,fluidType:0}]);}
+            return {known:false};
+        }
+        // Ready multi-tools take priority, including those inside closed bags.
+        const localTool=findToolSource(isReadyMultiTool);
+        if(localTool)return localTool;
+        let waitingForTools=false;
+        for(const entry of multiToolIds){
+            const item={sid:entry.sid,id:Number(client?.itemDefinitionsBySid?.[entry.sid]?.id)||entry.id};
+            const result=scan(item);
+            if(!result.known){waitingForTools=true;continue;}
+            if(result.count>0)return {location:'server',kind:'rope',item,exactSid:result.exactSid,index:null};
+        }
+        if(waitingForTools)return pending;
+        const localRope=findToolSource(item=>!!item && (Number(item.sid)===rope.sid || Number(item.id)===rope.id));
+        if(localRope)return localRope;
+        const normal=scan(rope);
+        // Wait for inventory confirmation before choosing the spell fallback.
+        if(!normal.known)return pending;
+        if(normal.count>0)return {location:'server',kind:'rope',item:rope,exactSid:normal.exactSid,index:null};
+        // Neither a ready multi-tool nor a rope: cast from the exact rope spot.
+        return {location:'spell',kind:'rope',item:null,spell:'exani tera'};
+    }
+    function retryRopeWaypoint(index,reason,now=Date.now()){
+        if(!state._ropeFailures)state._ropeFailures={};
+        const failures=(state._ropeFailures[index]||0)+1;
+        state._ropeFailures[index]=failures;
+        if(failures>=3){failRopeWaypoint(index,reason+' (3 attempts failed)');return;}
+        state._ropeWaitingFloorChange=null;
+        if(!state._ropeStartAt)state._ropeStartAt={};
+        state._ropeStartAt[index]=now;
+        if(!state._ropeNextUseAt)state._ropeNextUseAt={};
+        state._ropeNextUseAt[index]=now+1000;
+        bot.log('Rope waypoint: retrying attempt '+(failures+1)+'/3',{reason,index});
+    }
+    function failRopeWaypoint(index,reason){
+        bot.log('Rope waypoint failed: '+reason+' — Cavebot stopped',{index,waypoint:route[index]});
+        if(state._ropeStartAt)delete state._ropeStartAt[index];
+        if(state._ropeUsed)delete state._ropeUsed[index];
+        state._ropeWaitingFloorChange=null;
+        stop();
+        bot.playAlarm?.();
+        bot.showPanelNotification?.('ROPE FAILED',reason+' — Cavebot stopped','warning',15000);
     }
     function findShovelSource() {
         return findServerToolSource('shovel',2554,isShovelItem);
     }
     function sendToolUse(tool,targetTile,targetPosition,now=Date.now()){
         const client=window.gameClient;
+        if(tool?.location==='pending')return false;
+        if(tool?.location==='spell'){
+            const player=normalizePosition(bot.getPlayerPosition());
+            if(!player||!targetPosition||player.z!==Number(targetPosition.z))return false;
+            if(!isSameTile(player,targetPosition)){
+                if(!client?.player?.isMoving?.())goToPosition({...targetPosition,stand:true});
+                return false;
+            }
+            return bot.sendChatToChannel?.('exani tera','Default')===true;
+        }
         if(tool?.location==='server'){
             const cid=Number(tool.item?.id);if(!(cid>0))return false;
-            const reading=bot.getItemCountReading?.(cid,0);
+            const reading=tool.exactSid?bot.sidInventory?.reading?.(tool.item.sid):bot.getItemCountReading?.(cid,0);
             if(!reading||now-Number(reading.at||0)>5000){
+                if(tool.exactSid){bot.sidInventory?.request?.([tool.item.sid]);return false;}
                 if(now-(toolCountRequests.get(cid)||0)>=1000){toolCountRequests.set(cid,now);bot.requestItemCounts?.([{id:cid,fluidType:0}]);}
                 return false;
             }
@@ -35764,9 +36005,9 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                     if (state.learnMode) {
                         const item = getLearnUseObjectItem(fromObject);
                         const targetPosition = getLearnUseTargetPosition(toObject);
-                        if (isRopeItem(item))
+                        if (isRopeItem(item) || (isReadyMultiTool(item) && isRopeTargetTile(getTileAt(targetPosition))))
                             noteLearnToolUse("rope", targetPosition);
-                        else if (isShovelItem(item))
+                        else if (isShovelItem(item) || (isReadyMultiTool(item) && isShovelTargetTile(getTileAt(targetPosition))))
                             noteLearnToolUse("shovel", targetPosition);
                     }
                 } catch (e) {
@@ -35789,9 +36030,9 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                     if (state.learnMode) {
                         const item = this?.__hotbarCrosshairItem;
                         const targetPosition = getLearnUseTargetPosition(toObject);
-                        if (isRopeItem(item))
+                        if (isRopeItem(item) || (isReadyMultiTool(item) && isRopeTargetTile(getTileAt(targetPosition))))
                             noteLearnToolUse("rope", targetPosition);
-                        else if (isShovelItem(item))
+                        else if (isShovelItem(item) || (isReadyMultiTool(item) && isShovelTargetTile(getTileAt(targetPosition))))
                             noteLearnToolUse("shovel", targetPosition);
                     }
                 } catch (e) {
@@ -39363,7 +39604,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 // server to confirm an actual floor change first.
                 if (!state._ropeStartAt)
                     state._ropeStartAt = {};
-                if (!state._ropeStartAt[index])
+                if (!state._ropeStartAt[index] && position && isBesideOrSameTile(position,waypoint))
                     state._ropeStartAt[index] = now;
 
                 // Give the complete rope action a little more time than the global
@@ -39379,6 +39620,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                         state._ropeUsed[index] = true;
                         delete state._ropeStartAt[index];
                         state._ropeWaitingFloorChange = null;
+                        if(state._ropeFailures)delete state._ropeFailures[index];
                         bot.log("Rope waypoint: floor changed, advancing");
 
                         const nextWp = advanceWaypoint();
@@ -39402,60 +39644,16 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                     }
 
                     if (now - state._ropeWaitingFloorChange.usedAt > 5000) {
-                        bot.log("Rope waypoint: floor change timeout, skipping");
-                        if (!state._ropeUsed)
-                            state._ropeUsed = {};
-                        state._ropeUsed[index] = true;
-                        delete state._ropeStartAt[index];
-                        state._ropeWaitingFloorChange = null;
-
-                        const nextWp = advanceWaypoint();
-                        if (!nextWp) {
-                            stop();
-                            return;
-                        }
-                        state.lastWaypointTarget = null;
-                        state.pathAttemptStart = 0;
-                        state.lastDistanceToWaypoint = null;
-                        state.stuckCount = 0;
-                        state.positionHistory = [];
-                        state.skipAttemptCount = 0;
-                        if (nextWp.x !== undefined) {
-                            state.lastWaypointTarget = nextWp;
-                            state.pathAttemptStart = now;
-                            state.lastDistanceToWaypoint = getDistanceToWaypoint(position, nextWp);
-                            goToWaypoint(nextWp);
-                        }
+                        retryRopeWaypoint(index,'use request sent but no floor change confirmed',now);
                     }
                     return;
                 }
 
+                if(now<(state._ropeNextUseAt?.[index]||0))return;
+
                 // ---- OVERALL ROPE TIMEOUT ----
                 if (now - state._ropeStartAt[index] > ropeTimeout) {
-                    bot.log(`Rope waypoint ${index + 1} timed out after ${ropeTimeout / 1000}s – skipping`);
-                    if (!state._ropeUsed)
-                        state._ropeUsed = {};
-                    state._ropeUsed[index] = true;
-                    delete state._ropeStartAt[index];
-                    state._ropeWaitingFloorChange = null;
-
-                    const nextWp = advanceWaypoint();
-                    if (!nextWp) {
-                        stop();
-                        return;
-                    }
-                    state.lastWaypointTarget = null;
-                    state.pathAttemptStart = 0;
-                    state.lastDistanceToWaypoint = null;
-                    state.stuckCount = 0;
-                    state.positionHistory = [];
-                    state.skipAttemptCount = 0;
-                    if (nextWp.x !== undefined) {
-                        state.lastWaypointTarget = nextWp;
-                        state.pathAttemptStart = now;
-                        state.lastDistanceToWaypoint = getDistanceToWaypoint(position, nextWp);
-                        goToWaypoint(nextWp);
-                    }
+                    retryRopeWaypoint(index,'rope/tool lookup or approach timed out',now);
                     return;
                 }
 
@@ -39537,13 +39735,10 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
                 const ropeSource = findRopeSource();
                 if (!ropeSource) {
-                    bot.log("Rope waypoint: no rope found, marking as used to proceed");
-                    if (!state._ropeUsed)
-                        state._ropeUsed = {};
-                    state._ropeUsed[index] = true;
-                    delete state._ropeStartAt[index];
+                    retryRopeWaypoint(index,'rope lookup unavailable',now);
                     return;
                 }
+                if(ropeSource.location==='pending')return;
 
                 // Avoid hammering the rope action if the client/server rejected
                 // the previous attempt. A short cooldown also gives the tile and
@@ -39577,7 +39772,11 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                             fromZ: position.z,
                             usedAt: now
                         };
-                        bot.log("Rope waypoint: rope used, waiting for floor change...");
+                        bot.log("Rope waypoint: use request sent, waiting for floor change",{
+                            attempt:(state._ropeFailures?.[index]||0)+1,maxAttempts:3,
+                            tool:ropeSource.spell||getThingName(ropeSource.item),sid:ropeSource.item?.sid,cid:ropeSource.item?.id,
+                            location:ropeSource.location,target:{x:waypoint.x,y:waypoint.y,z:waypoint.z}
+                        });
                     }
                     return;
                 } catch (e) {
@@ -40992,6 +41191,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         state._standAttempt = null;
         state._ropeUsed = null;
         state._ropeNextUseAt = null;
+        state._ropeStartAt = null;
+        state._ropeFailures = null;
         state._ropeWaitingFloorChange = null;
         state._shovelUsed = null;
         state._shovelState = null;
@@ -41167,7 +41368,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         resetOffscreenFrontierTracking();
         if (state.recoveryFenceActive)
             clearRecoveryFence("CaveBot started");
-        state.currentIndex = findStartingWaypointIndex(pos);
+        // Keep the selected index established above; starting must not pick the closest waypoint.
         if (config.loopMode) {
             state.direction = 1; // always forward when looping
         } else {
@@ -42119,6 +42320,8 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         findClosestWaypointIndex,
         findRopeSource,
         findShovelSource,
+        findToolSource: findCaveToolSource,
+        useToolAt,
         moveWaypointUp,
         moveWaypointDown,
         deleteWaypoint,
@@ -48892,6 +49095,10 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
 
     // Optional corpse walking is OFF by default.
     state.walkToCorpses = stored.walkToCorpses === true;
+    state.skipFoodBagCorpses = stored.skipFoodBagCorpses !== false;
+    state.rareCorpsesOnly = stored.rareCorpsesOnly === true;
+    state.corpseLootFilter = stored.corpseLootFilter === 'price' ? 'price' : 'rare';
+    state.corpseMinItemPrice = Number.isFinite(Number(stored.corpseMinItemPrice)) ? Math.max(0, Number(stored.corpseMinItemPrice)) : 1000;
     state.corpseMaxDistance = Math.max(
         1,
         Math.min(30, Number(stored.corpseMaxDistance) || 12)
@@ -48969,6 +49176,10 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             trackedItems: Array.from(state.trackedItems.entries()),
             dropItemIds: Array.from(state.dropItemIds.values()),
             walkToCorpses: state.walkToCorpses,
+            skipFoodBagCorpses: state.skipFoodBagCorpses,
+            rareCorpsesOnly: state.rareCorpsesOnly,
+            corpseLootFilter: state.corpseLootFilter,
+            corpseMinItemPrice: state.corpseMinItemPrice,
             corpseMaxDistance: state.corpseMaxDistance,
             corpseOpenDelayMs: state.corpseOpenDelayMs,
             corpseApproachTimeoutMs: state.corpseApproachTimeoutMs,
@@ -50504,6 +50715,34 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         }
     }
 
+    let rareLootSource=null,rareLootNames=new Set();
+    function normalizeRareLootName(value){
+        return String(value||'').toLowerCase().replace(/&nbsp;|&#160;/g,' ').replace(/&amp;/g,'&')
+            .replace(/\s+/g,' ').trim().replace(/^(?:an?|the|\d+)\s+/,'').replace(/[.!]+$/,'').trim();
+    }
+    function corpseContainsRare(items){
+        const source=bot.clientExtras?.getLootInfo?.();
+        if(source!==rareLootSource){
+            rareLootSource=source;rareLootNames=new Set();
+            for(const entry of source?.items||[]){
+                if(!entry.isRare)continue;
+                const name=normalizeRareLootName(entry.name);
+                if(!name)continue;
+                rareLootNames.add(name);rareLootNames.add(name+'s');
+                const plural=window.gameClient?.itemDefinitionsBySid?.[entry.sid]?.properties?.plural;
+                if(plural)rareLootNames.add(normalizeRareLootName(plural));
+            }
+        }
+        return items.some(item=>rareLootNames.has(normalizeRareLootName(item)));
+    }
+    function corpsePassesLootFilter(items) {
+        if (!state.rareCorpsesOnly) return true;
+        if (state.corpseLootFilter !== 'price') return corpseContainsRare(items);
+        return items.some(item => {
+            const price = bot.huntAnalyzer?.lootUnitPrice?.(item);
+            return Number.isFinite(price) && price > state.corpseMinItemPrice;
+        });
+    }
     function observeCorpseLoot(message, now = Date.now()) {
         if (!state.runtimeRunning || !state.walkToCorpses || corpseActionsBlocked()) return;
         // Read the channel input, independent of popup visibility or channel focus.
@@ -50517,7 +50756,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         const ignoredOnly = items.length > 0 && items.every(item =>
             /^(?:(?:an?|\d+)\s+)?(?:bags?|meats?|(?:pieces? of )?meat|(?:dragon )?hams?)$/i.test(item.trim()));
         corpseLootResults.push({ name: corpseLootName(match[1]), at: now,
-            hasLoot: !!contents && !/^nothing[.!]?$/i.test(contents) && !ignoredOnly });
+            hasLoot: !!contents && !/^nothing[.!]?$/i.test(contents) && !(state.skipFoodBagCorpses && ignoredOnly) && corpsePassesLootFilter(items) });
         matchCorpseLoot(now);
     }
 
@@ -52088,6 +52327,10 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             trackedItems: Array.from(state.trackedItems.entries()),
             dropItemIds: Array.from(state.dropItemIds.values()),
             walkToCorpses: state.walkToCorpses,
+            skipFoodBagCorpses: state.skipFoodBagCorpses,
+            rareCorpsesOnly: state.rareCorpsesOnly,
+            corpseLootFilter: state.corpseLootFilter,
+            corpseMinItemPrice: state.corpseMinItemPrice,
             corpseMaxDistance: state.corpseMaxDistance,
             corpseOpenDelayMs: state.corpseOpenDelayMs,
             corpseApproachTimeoutMs: state.corpseApproachTimeoutMs,
@@ -52249,6 +52492,11 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         }
 
         if (next.walkToCorpses !== undefined) setCorpseEnabled(!!next.walkToCorpses);
+        if (next.rareCorpsesOnly !== undefined) state.rareCorpsesOnly = !!next.rareCorpsesOnly;
+        if (next.corpseLootFilter !== undefined) state.corpseLootFilter = next.corpseLootFilter === 'price' ? 'price' : 'rare';
+        if (next.corpseMinItemPrice !== undefined && Number.isFinite(Number(next.corpseMinItemPrice)))
+            state.corpseMinItemPrice = Math.max(0, Number(next.corpseMinItemPrice));
+        if (next.skipFoodBagCorpses !== undefined) state.skipFoodBagCorpses = !!next.skipFoodBagCorpses;
         if (next.corpseMaxDistance !== undefined) {
             state.corpseMaxDistance =
                 Math.max(
@@ -52322,6 +52570,10 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             lootMode: state.lootMode,
             trackedItems: Array.from(state.trackedItems.entries()),
             walkToCorpses: state.walkToCorpses,
+            skipFoodBagCorpses: state.skipFoodBagCorpses,
+            rareCorpsesOnly: state.rareCorpsesOnly,
+            corpseLootFilter: state.corpseLootFilter,
+            corpseMinItemPrice: state.corpseMinItemPrice,
             corpseMaxDistance: state.corpseMaxDistance,
             corpseOpenDelayMs: state.corpseOpenDelayMs,
             corpseApproachTimeoutMs: state.corpseApproachTimeoutMs,
@@ -54720,8 +54972,48 @@ window.__minibiaBotBundle.installClientImprovements = function(bot) {
 };
 
 window.__minibiaBotBundle.installClientExtras=function(bot){
- const config={};
+ const configKey='minibiaBot.clientExtras.config';
+ const savedChatConfig=bot.storage.get(configKey,{});
+ const config={autoCloseChats:savedChatConfig.autoCloseChats===true,autoOpenPrivateChats:savedChatConfig.autoOpenPrivateChats===true};
+ function closeOtherChats(){
+  const manager=window.gameClient?.interface?.channelManager;
+  if(!Array.isArray(manager?.channels)||typeof manager.closeChannel!=='function')return 0;
+  const active=manager.channels[manager.__activeIndex];let closed=0;
+  for(const channel of [...manager.channels]){
+   if(!channel || channel.id===0 || ['default','console','loot'].includes(String(channel.name||'').trim().toLowerCase()))continue;
+   if((typeof PrivateChannel!=='undefined'&&channel instanceof PrivateChannel)||channel.constructor?.name==='PrivateChannel')continue;
+   // Unidentified null-ID channels may be PMs; close only known local tabs
+   // or numbered public channels if their constructor is unavailable.
+   const local=typeof LocalChannel!=='undefined'&&channel instanceof LocalChannel;
+   if(!local && (typeof channel.id!=='number'||!Number.isFinite(channel.id)))continue;
+   manager.closeChannel(channel);
+   if(!manager.channels.includes(channel))closed++;
+  }
+  if(closed&&active&&manager.channels.includes(active))manager.setActiveChannelElement?.(active);
+  return closed;
+ }
+ function setAutoCloseChats(value){config.autoCloseChats=value===true;bot.storage.set(configKey,{...config});if(config.autoCloseChats)closeOtherChats();}
  let inventory=[],loot=null,tasks=null,quests=null,disposed=false,player=null,inventoryAt=0,tasksAt=0,questsAt=0,progressClient=null;const cleanups=[];let renderUi=()=>{},lastInventoryRequest=0;
+ function openIncomingPrivateChat(packet){
+  if(disposed||!config.autoOpenPrivateChats||typeof PrivateChannel==='undefined')return;
+  const name=typeof packet?.name==='string'?packet.name.trim():'';
+  const manager=window.gameClient?.interface?.channelManager;
+  if(!name||!Array.isArray(manager?.channels)||typeof manager.__addChannel!=='function')return;
+  if(manager.channels.some(c=>String(c?.name||'').toLowerCase()===name.toLowerCase()))return;
+  // The incoming server message already identifies its sender. Create the tab
+  // before native delivery so the first message lands there exactly once.
+  manager.__addChannel(new PrivateChannel(name),false);
+ }
+ const privateProto=typeof PacketHandler!=='undefined'?PacketHandler.prototype:null;
+ const originalPrivateHandler=privateProto?.handleReceivePrivateMessage;
+ if(typeof originalPrivateHandler==='function'){
+  const wrapper=function(packet,...args){
+   try{openIncomingPrivateChat(packet);}catch(error){bot.log('Could not open private chat',error?.message||error);}
+   return originalPrivateHandler.call(this,packet,...args);
+  };
+  privateProto.handleReceivePrivateMessage=wrapper;
+  cleanups.push(()=>{if(privateProto.handleReceivePrivateMessage===wrapper)privateProto.handleReceivePrivateMessage=originalPrivateHandler;});
+ }
  const sync=()=>{const c=window.gameClient,p=c?.player;if(p!==player||c!==progressClient){progressClient=c;player=p;inventory=[];loot=tasks=quests=null;inventoryAt=tasksAt=questsAt=0;}};
  const textCommand=cmd=>window.gameClient?.interface?.channelManager?.sendMessageText?.(cmd,undefined,true);
  function hook(name,accept){const proto=typeof PacketReader!=='undefined'?PacketReader.prototype:null,original=proto?.[name];if(typeof original!=='function')return;const wrapper=function(...args){const result=original.apply(this,args);if(!disposed){sync();accept(result);renderUi();}return result;};proto[name]=wrapper;cleanups.push(()=>{if(proto[name]===wrapper)proto[name]=original;});}
@@ -54774,6 +55066,14 @@ window.__minibiaBotBundle.installClientExtras=function(bot){
   return true;
  }
  function mount(panel){if(!panel||panel.querySelector('[data-client-extras]'))return;const sections=[];const section=(tab,title)=>{const host=panel.querySelector(`[data-tab-panel="${tab}"]`);if(!host)return null;const el=document.createElement('div');el.className='mb-section';el.setAttribute('data-client-extras','');const h=document.createElement('div');h.className='mb-section-title';const heading=document.createElement('span');heading.className='mb-title-text';heading.textContent=title;h.append(heading);el.append(h);host.prepend(el);sections.push(el);return el;};const make=(tag,parent,content)=>{const el=document.createElement(tag);if(content!=null)el.textContent=content;parent.append(el);return el;};const button=(parent,label,fn)=>{const b=make('button',parent,label);b.type='button';b.className='mb-small-button';b.addEventListener('click',()=>{try{fn();}catch(e){bot.log(e.message);message.textContent=e.message;}});return b;};const field=(parent,label,type='text',value='')=>{const l=make('label',parent);l.className='mb-field';make('span',l,label).className='mb-field-label';const i=make('input',l);i.type=type;i.value=value;if(type==='number')i.min='0';return i;};const check=(parent,label,value)=>{const l=make('label',parent);l.style.cssText='display:flex;align-items:center;gap:6px;margin:6px 0';const i=make('input',l);i.type='checkbox';i.checked=!!value;i.style.cssText='width:13px;min-width:13px;margin:0';make('span',l,label);return i;};const select=(parent,label,options)=>{const l=make('label',parent);l.className='mb-field';make('span',l,label);const s=make('select',l);for(const [value,name]of options){const o=make('option',s,name);o.value=value;}return s;};
+ const chats=section('ui','Chat cleanup');
+ const autoChats=check(chats,'Automatically close other chats',config.autoCloseChats);
+ const autoPrivate=check(chats,'Open a private chat when someone messages you',config.autoOpenPrivateChats);
+ autoPrivate.addEventListener('change',()=>{config.autoOpenPrivateChats=autoPrivate.checked;bot.storage.set(configKey,{...config});});
+ make('div',chats,'Keeps Default, Console, Loot and all private messages open.').className='mb-small-note';
+ const chatStatus=make('div',chats);chatStatus.className='mb-small-note';
+ autoChats.addEventListener('change',()=>{setAutoCloseChats(autoChats.checked);chatStatus.textContent=config.autoCloseChats?'Automatic chat cleanup enabled.':'';});
+ button(chats,'Close chats now',()=>{const count=closeOtherChats();chatStatus.textContent=`Closed ${count} chat${count===1?'':'s'}.`;});
  const inv=section('resupply','Inventory Browser');const message=make('div',inv);message.className='mb-small-note';const actions=make('div',inv);button(actions,'Refresh inventory',requestInventory);const search=field(inv,'Filter by name / SID / CID');const inventoryList=make('div',inv);inventoryList.style.cssText='max-height:260px;overflow:auto';let invSignature='';
  const routing=section('diagnostics','Server Loot Routing');
  make('div',routing,'Save lists to a file or import them here. Save to server applies the list. Fluid-specific rules stay in mb0t’s looter.').className='mb-small-note';
@@ -54841,6 +55141,7 @@ window.__minibiaBotBundle.installClientExtras=function(bot){
  cleanups.push(()=>{importSerial++;fileInput.removeEventListener('change',importLootFile);for(const[url,timer]of downloadUrls){clearTimeout(timer);URL.revokeObjectURL(url);}downloadUrls.clear();});
  function render(){
   sync();
+  if(config.autoCloseChats)closeOtherChats();
   if(draftClient!==window.gameClient||draftPlayer!==window.gameClient?.player){
    draftClient=window.gameClient;draftPlayer=window.gameClient?.player;draft=null;draftDirty=false;lootRef=null;importSerial++;routeEnabled.disabled=true;routeMessage.textContent='';renderRoutes();
   }
@@ -54849,7 +55150,7 @@ window.__minibiaBotBundle.installClientExtras=function(bot){
 if(!inv.getClientRects().length)return;const query=search.value.trim().toLowerCase(),signature=inventoryAt+':'+query;if(signature===invSignature)return;invSignature=signature;inventoryList.replaceChildren();for(const item of inventory){const def=window.gameClient?.itemDefinitionsBySid?.[item.sid];const itemName=def?.properties?.name||'Item';const desc=`${itemName} · SID ${item.sid} / CID ${item.cid} · Fluid ${item.fluidType} · Tint ${item.tintId}`;if(query&&!desc.toLowerCase().includes(query))continue;const row=make('div',inventoryList);row.style.cssText='padding:6px 0;border-bottom:1px solid #444';make('div',row,desc);button(row,'Cooking',()=>{if(item.fluidType)throw new Error('Fluid containers cannot be added as cooking food');const foods=bot.cooking.config.foods;if(!foods.some(f=>f.sid===item.sid&&f.cid===item.cid))bot.cooking.updateConfig({foods:[...foods,{sid:item.sid,cid:item.cid}]});message.textContent='Food added to Cooking.';});button(row,'Supply',()=>{const rule=bot.npcSupplyBuyer.addRule(itemName,100,10,itemName);if(rule)bot.npcSupplyBuyer.updateRule(rule.id,{sid:item.sid,cid:item.cid,fluidType:item.fluidType});message.textContent='Exact item supply rule added; edit amounts in Resupply.';});button(row,'Loot route',()=>{if(item.fluidType)throw new Error('Use mb0t looter capture for fluid-specific rules');routeSid.value=item.sid;message.textContent='SID copied to Server Loot Routing in Looter.';});}if(!inventory.length)make('div',inventoryList,'Refresh to list items in open and closed backpacks.');}
  search.addEventListener('input',render);renderUi=render;render();const timer=setInterval(()=>{render();},1000);cleanups.push(()=>{clearInterval(timer);search.removeEventListener('input',render);sections.forEach(s=>s.remove());renderUi=()=>{};});
  }
- bot.clientExtras={config,mount,requestInventory,saveLoot,applyNative,status:()=>{sync();return {inventory:inventory.map(i=>({...i})),inventoryAt,loot};}};bot.progress={rows,matches,branch:(rule,label)=>matches(rule)?bot.goToLabel(label):false};bot.addCleanup(()=>{disposed=true;cleanups.reverse().forEach(f=>f());inventory=[];});
+ bot.clientExtras={config,mount,closeOtherChats,setAutoCloseChats,getLootInfo:()=>{sync();return loot;},requestInventory,saveLoot,applyNative,status:()=>{sync();return {inventory:inventory.map(i=>({...i})),inventoryAt,loot};}};bot.progress={rows,matches,branch:(rule,label)=>matches(rule)?bot.goToLabel(label):false};bot.addCleanup(()=>{disposed=true;cleanups.reverse().forEach(f=>f());inventory=[];});
 };
 
 window.__minibiaBotBundle.installCurePoisonModule=function(bot){
@@ -60190,6 +60491,12 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
         if (!offers.length) return { value: null, source: 'Unknown' };
         return { value: purpose === 'buy' ? Math.min(...offers) : Math.max(...offers), source: 'NPC' };
     }
+    // Independent of recording: distant looting uses the same live sell prices.
+    function lootUnitPrice(text) {
+        rebuildCatalog();
+        const entry = parseLootEntry(String(text || '').replace(/&nbsp;|&#160;/g, ' ').replace(/&amp;/g, '&'));
+        return entry ? priceFor(entry.item, 'sell').value : null;
+    }
     function priced(collection, purpose) {
         return Object.entries(collection || {}).map(([key, item]) => {
             const price = priceFor(item, purpose); return { ...item, key, price: price.value, source: price.source,
@@ -60529,7 +60836,7 @@ window.__minibiaBotBundle.installHuntAnalyzerModule = function installHuntAnalyz
             if (Date.now() - lastSave >= 5000) save(); render();
         } catch (error) { bot.log?.('[Hunt Analyzer]', error.message); }
     }
-    bot.huntAnalyzer = { status, pause, resume, reset, setPrice, priceFor, refreshPrices, mount, config, overlayEnabled, setOverlayEnabled, renderOverlay };
+    bot.huntAnalyzer = { status, pause, resume, reset, setPrice, priceFor, lootUnitPrice, refreshPrices, mount, config, overlayEnabled, setOverlayEnabled, renderOverlay };
     bind(); seedSupplyCounts(); observeRingTimer();
     if (config.overlayEnabled) bot.uiTweaks?.applyTTL?.();
     if (!Object.keys(window.gameClient?.npcTrades || {}).length && window.gameClient) refreshPrices();
@@ -61323,6 +61630,16 @@ function upgradeSectionHeaders(panel) {
             document.getElementById("minibia-bot-looter-corpse-distance");
 
         const status = bot.looter?.status?.();
+        const rareStatus=document.getElementById('minibia-bot-looter-rares-status');
+        if(rareStatus){const items=bot.clientExtras?.getLootInfo?.()?.items;rareStatus.textContent=Array.isArray(items)?'Rare list loaded':'Rare list not loaded';}
+        const rareToggle=document.getElementById('minibia-bot-looter-rare-only');
+        if(rareToggle&&document.activeElement!==rareToggle)rareToggle.checked=status?.rareCorpsesOnly===true;
+        const valueMode=document.getElementById('minibia-bot-looter-value-mode');
+        if(valueMode && document.activeElement!==valueMode)valueMode.value=status?.corpseLootFilter||'rare';
+        const priceInput=document.getElementById('minibia-bot-looter-min-price');
+        if(priceInput && document.activeElement!==priceInput)priceInput.value=status?.corpseMinItemPrice??1000;
+        const priceField=document.getElementById('minibia-bot-looter-price-field');
+        if(priceField)priceField.hidden=status?.corpseLootFilter!=='price';
         const blacklistMode = status?.lootMode === "blacklist";
         const modeInput = document.getElementById("minibia-bot-looter-mode");
         if (modeInput && document.activeElement !== modeInput) modeInput.value = blacklistMode ? "blacklist" : "whitelist";
@@ -65369,7 +65686,7 @@ function upgradeSectionHeaders(panel) {
     <div class="mb-cave-field-row" style="margin-top:5px;">
       <button type="button" class="mb-small-button" id="minibia-bot-cave-map-pick" aria-pressed="false" title="Click the minimap to place waypoints. Escape to finish.">⌖ Pick on minimap</button>
       <select id="minibia-bot-cave-map-type" aria-label="Minimap waypoint type" style="flex:1;">
-        <option value="walk">Walk</option><option value="stand">Stand</option><option value="knightbox">Box</option><option value="rope">Rope</option><option value="shovel">Shovel</option><option value="ladder">Ladder</option>
+        <option value="walk">Walk</option><option value="stand">Stand</option><option value="knightbox">Box</option><option value="rope">Rope</option><option value="shovel">Shovel</option><option value="pick">Pick</option><option value="scythe">Scythe</option><option value="machete">Machete</option><option value="ladder">Ladder</option>
       </select>
     </div>
     <div id="minibia-bot-cave-map-status" class="mb-cave-note" role="status" hidden></div>
@@ -65667,6 +65984,14 @@ function upgradeSectionHeaders(panel) {
 <div class="mb-section" data-corpse-looter>
   <div class="mb-section-title"><input type="checkbox" id="minibia-bot-looter-walk-corpses" class="mb-title-toggle"><label class="mb-title-text" for="minibia-bot-looter-walk-corpses">Loot distant corpses</label></div>
   <label class="mb-field"><span class="mb-field-label">Max distance (tiles)</span><input type="number" id="minibia-bot-looter-corpse-distance" min="1" max="30" value="12"></label>
+  <label class="mb-toggle"><input type="checkbox" id="minibia-bot-looter-rare-only"><span>Filter distant loot</span></label>
+  <label class="mb-field"><span class="mb-field-label">Visit corpse for</span><select id="minibia-bot-looter-value-mode"><option value="rare">Rare items</option><option value="price">Items above price</option></select></label>
+  <label class="mb-field" id="minibia-bot-looter-price-field"><span class="mb-field-label">Item price above (gp)</span><input type="number" id="minibia-bot-looter-min-price" min="0" step="1" value="1000"></label>
+  <div class="mb-small-note">Price uses each item's NPC sell value or Hunt Analyzer custom loot price. Unknown prices are skipped. Hunt Analyzer recording can be off.</div>
+  <div class="mb-inline"><button type="button" class="mb-small-button" id="minibia-bot-looter-load-rares">Load rare list</button><span class="mb-small-note" id="minibia-bot-looter-rares-status"></span></div>
+  <div class="mb-small-note">Uses the game's rare item tags. Load the list after login; you can close it afterward. Unverified loot is skipped in rare-only mode.</div>
+  <label class="mb-toggle"><input type="checkbox" id="minibia-bot-looter-skip-food-bags"><span>Skip food/bag-only corpses</span></label>
+  <div class="mb-small-note">Turn off to visit these corpses for skinning. Covers meat, ham, dragon ham and bags.</div>
   <div class="mb-small-note">Works independently of mb0t Looter. With Looter off, opens corpses for native premium auto-loot. Walking starts after combat clears.</div>
   <div class="mb-small-note mb-looter-status" id="minibia-bot-corpse-looter-status">Status: off</div>
 </div>
@@ -68907,6 +69232,25 @@ function upgradeSectionHeaders(panel) {
             );
         }
 
+        const rareOnlyToggle=panel.querySelector('#minibia-bot-looter-rare-only');
+        if(rareOnlyToggle){
+            rareOnlyToggle.checked=bot.looter?.status?.().rareCorpsesOnly===true;
+            rareOnlyToggle.addEventListener('change',()=>{bot.looter?.updateConfig?.({rareCorpsesOnly:rareOnlyToggle.checked});refreshLooterStatus();});
+        }
+        panel.querySelector('#minibia-bot-looter-value-mode')?.addEventListener('change',event=>{
+            bot.looter?.updateConfig?.({corpseLootFilter:event.target.value});refreshLooterStatus();
+        });
+        panel.querySelector('#minibia-bot-looter-min-price')?.addEventListener('change',event=>{
+            const value=Number(event.target.value);
+            if(event.target.value!=='' && Number.isFinite(value))bot.looter?.updateConfig?.({corpseMinItemPrice:Math.max(0,value)});
+            event.target.value=bot.looter?.status?.().corpseMinItemPrice??1000;
+        });
+        panel.querySelector('#minibia-bot-looter-load-rares')?.addEventListener('click',()=>bot.sendChatToChannel?.('/lootlist','Default'));
+        const skipFoodBagsToggle=panel.querySelector('#minibia-bot-looter-skip-food-bags');
+        if(skipFoodBagsToggle){
+            skipFoodBagsToggle.checked=bot.looter?.status?.().skipFoodBagCorpses!==false;
+            skipFoodBagsToggle.addEventListener('change',()=>bot.looter?.updateConfig?.({skipFoodBagCorpses:skipFoodBagsToggle.checked}));
+        }
         if (corpseDistanceInput) {
             const looterStatus =
                 bot.looter?.status?.();
@@ -69648,6 +69992,10 @@ function upgradeSectionHeaders(panel) {
                 waypoint[kind === "knightbox" ? "knightBox" : kind] = true;
             }
 
+            if(['pick','scythe','machete'].includes(kind)){
+                waypoint.label=kind[0].toUpperCase()+kind.slice(1);
+                waypoint.script='return bot.cave.useToolAt('+JSON.stringify(kind)+','+JSON.stringify({x,y,z})+');';
+            }
             const route = bot.cave.getRoute();
             let insertIndex = route.length;
             if (selectedWaypointIndex !== null && selectedWaypointIndex >= 0 && selectedWaypointIndex < route.length)
@@ -69733,6 +70081,8 @@ function upgradeSectionHeaders(panel) {
             getSelected: () => selectedWaypointIndex,
             setSelected: index => {
                 selectedWaypointIndex = index;
+                if(Number.isInteger(index) && index>=0 && index<bot.cave.getRoute().length && !bot.cave.isRunning())
+                    bot.cave.setCurrentIndex(index);
                 lastWaypointListKey = null;
                 refreshCaveWaypointList();
                 refreshCaveStatus();
