@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.594",
+        version: "1.6.596",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -9765,9 +9765,7 @@ window.__minibiaBotBundle.installRunemakerModule = function installRunemakerModu
     function combatBlocked(){
         if(!config.pauseInCombat)return false;
         const player=window.gameClient?.player;
-        const combatLock=typeof ConditionManager!=="undefined" ? ConditionManager.prototype.COMBAT_LOCK : 18;
-        return !!(player?.conditions?.has?.(combatLock) || player?.__target || player?.getTarget?.() ||
-            bot.attack?.getCurrentTarget?.() || bot.attack?.isCombatActive?.());
+        return !!(player?.__target || player?.getTarget?.() || bot.attack?.getCurrentTarget?.());
     }
     function needsMana(){return state.running&&config.enabled&&!combatBlocked()&&deficits().length>0;}
     function refreshCounts(now,force=false){if(!force&&now-state.lastRequestAt<2000)return;state.lastRequestAt=now;const all=catalogue();const items=config.rules.filter(r=>r.enabled).map(r=>all.find(s=>s.sid===r.spellId)).filter(Boolean).map(s=>({id:s.itemId,fluidType:0}));if(items.length)bot.requestItemCounts?.(items);}
@@ -51382,30 +51380,26 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         };
     }
 
-    function deferCorpseJobForCombat(
-        job,
-        combatGate,
-        now = Date.now()
-    ) {
-        if (!job)
-            return false;
-
-        // v1.5.62: combat interruption means this corpse is unsafe to revisit.
-        // Abandon it instead of requeueing and oscillating between route/corpse.
-        abandonCorpseAfterCombat(
-            job,
-            combatGate,
-            now
-        );
-
+    function deferCorpseJobForCombat(job, combatGate, now = Date.now()) {
+        if (!job || state.corpseJob !== job) return false;
         clearCorpseApproachMovement(job);
         state.pendingMove = null;
         state.corpseJob = null;
+        // Combat interrupts travel; it does not prove the corpse was reached
+        // or looted. Keep its original identity/expiry and restart approach
+        // tracking only when the combat-clear gate allows it to run again.
+        const retry = now <= job.expiresAt && state.walkToCorpses && state.runtimeRunning;
+        if (retry && !state.corpseQueue.some(entry => entry.key === job.key)) {
+            state.corpseQueue.push({key:job.key,monsterId:job.monsterId,monsterName:job.monsterName,
+                position:{...job.position},deathAt:job.deathAt,baselineAckSeq:job.baselineAckSeq,
+                notBefore:Math.max(now,Number(job.notBefore)||0),expiresAt:job.expiresAt});
+        }
         state.corpseCombatDeferrals++;
         state.corpseCombatResumes++;
         state.corpseCombatClearSince = 0;
-
         resumeModulesAfterCorpse(job);
+        bot.log(retry ? 'Looter: combat interrupted approach — corpse kept queued' : 'Looter: interrupted corpse expired',
+            {monster:job.monsterName,position:job.position,reason:combatGate?.reason||'combat active'});
         return true;
     }
 
