@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.591",
+        version: "1.6.592",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -51412,12 +51412,30 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
     function prioritizeNearbyQueuedCorpses(now = Date.now()) {
         if (!state.walkToCorpses || !state.corpseQueue.length) return;
         const pos = bot.getPlayerPosition(); if (!pos) return;
-        // Passing a corpse is not evidence of opening it. Service nearby jobs
-        // first, without sending a walk or pausing Targeting.
-        const index = state.corpseQueue.findIndex(candidate => candidate?.position &&
-            Number(candidate.position.z) === Number(pos.z) && now <= candidate.expiresAt &&
-            Math.max(Math.abs(candidate.position.x-pos.x), Math.abs(candidate.position.y-pos.y)) <= 1);
-        if (index > 0) state.corpseQueue.unshift(state.corpseQueue.splice(index, 1)[0]);
+        const distance = job => job?.position && Number(job.position.z) === Number(pos.z)
+            ? Math.max(Math.abs(job.position.x-pos.x),Math.abs(job.position.y-pos.y)) : Infinity;
+        const ready = job => job && now >= job.notBefore && now <= job.expiresAt &&
+            Number.isFinite(distance(job)) && distance(job) <= state.corpseMaxDistance &&
+            !isCorpseCombatAbandoned(job.key,now);
+        // Stable nearest-first ordering; unready/expired entries cannot block
+        // a ready nearby body. Existing startup checks still validate the tile.
+        state.corpseQueue.sort((a,b) => Number(ready(b))-Number(ready(a)) ||
+            (ready(a)&&ready(b) ? distance(a)-distance(b) : 0) || a.deathAt-b.deathAt);
+        const next=state.corpseQueue[0],job=state.corpseJob;
+        if (!job || !ready(next) || distance(next)>1 || distance(job)<=1 ||
+            job.arrivedAdjacentAt || job.openedContainerId!=null || job.openAttempts>0 || state.pendingMove ||
+            corpseActionsBlocked() || !getCorpseCombatGate(now,false).clear || !getCorpseTileInfo(next.position)) return;
+        // Interrupt only travel, never an open/loot transaction. Preserve the
+        // original corpse's deadline and identity instead of creating a new kill.
+        clearCorpseApproachMovement(job);
+        state.corpseJob=null;
+        if(now<=job.expiresAt && !state.corpseQueue.some(entry=>entry.key===job.key))
+            state.corpseQueue.push({key:job.key,monsterId:job.monsterId,monsterName:job.monsterName,
+                position:{...job.position},deathAt:job.deathAt,baselineAckSeq:job.baselineAckSeq,
+                notBefore:job.notBefore,expiresAt:job.expiresAt});
+        resumeModulesAfterCorpse(job);
+        bot.log('Looter: looting adjacent queued corpse before distant body',{
+            nearby:next.monsterName,position:next.position,deferred:job.monsterName});
     }
 
     function corpseHasWantedItems(container) {
@@ -51522,6 +51540,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             return false;
         }
 
+        prioritizeNearbyQueuedCorpses(now);
         // Drop stale/dead candidates until we find a real corpse tile.
         while (state.corpseQueue.length) {
             const candidate =
