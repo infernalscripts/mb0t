@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.598",
+        version: "1.6.599",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -55447,9 +55447,18 @@ window.__minibiaBotBundle.installFollowingItemGuard = function(bot) {
         return {...d,position:p,player:me,at:event.at,removedAt:null};
     }
     function sourceGone(previous){
-        if(previous.removedAt!=null)return true;
         const tile=tileAt(previous.position);
-        return loaded(tile)&&quantity(tile,previous)===0;
+        // A shifted stack index or removal of only part of a stack is not
+        // evidence that this item disappeared. Prefer the live loaded tile.
+        if(loaded(tile))return quantity(tile,previous)===0;
+        return previous.removedAt!=null;
+    }
+    function followsAppearance(previous,next){
+        if(!previous||!next||!sameItem(previous,next)||previous.count!==next.count)return false;
+        const gap=next.at-previous.at;
+        return gap>=1500&&gap<=7000&&sourceGone(previous)&&
+            pkey(next.position)!==pkey(previous.position)&&distance(next.player,previous.player)>=2&&
+            distance(next.player,previous.player)<=12&&next.player.z===previous.player.z;
     }
     function tick(){
         timer=null;const h=hold;if(!h?.pending||disposed)return;
@@ -55581,13 +55590,12 @@ window.__minibiaBotBundle.installFollowingItemGuard = function(bot) {
         for(const previous of chain){
             if(event.kind!=="remove"||pkey(p)!==pkey(previous.position))continue;
             const index=Number(event.packet?.index),before=event.before?.items?.find(x=>x.index===index);
-            if(before?sameItem(identity(before),previous):index===previous.index)previous.removedAt=now;
+            if(before&&sameItem(identity(before),previous)&&count(before)===previous.count&&
+                now>=previous.at&&now-previous.at<=7000)previous.removedAt=now;
         }
         const next=candidate(event);if(!next)return;
-        const previous=chain.at(-1),gap=previous?now-previous.at:0;
-        const follows=previous&&gap>=1500&&gap<=7000&&sourceGone(previous)&&
-            pkey(next.position)!==pkey(previous.position)&&distance(next.player,previous.player)>=2&&
-            distance(next.player,previous.player)<=12&&Math.abs(next.player.z-previous.player.z)<=1;
+        const previous=chain.at(-1);
+        const follows=followsAppearance(previous,next);
         chain=follows?[...chain.slice(-2),next]:[next];
         if(chain.length===3&&chain.reduce((n,x,i)=>n+(i?distance(x.player,chain[i-1].player):0),0)>=4)detect(next);
         else{message=`Watching · ${chain.length}/3 following appearances`;render();}
