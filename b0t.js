@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.592",
+        version: "1.6.594",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -6567,7 +6567,7 @@ window.__minibiaBotBundle.installBotSidebarModule = function installBotSidebarMo
             const shell=document.createElement('div');shell.className='window mb-bot-sidebar';shell.draggable=true;shell.setAttribute('data-mb-bot-window','');shell.setAttribute('data-mb-hud','bot');
             const header=document.createElement('div');header.className='header';header.title='Drag to a sidebar or between backpacks';
             const expand=document.createElement('button');expand.className='symbol-button small';expand.type='button';expand.textContent='✚';expand.title='Expand mb0t';expand.draggable=false;
-            const title=document.createElement('span');title.className='title';title.textContent='mb0t v'+bot.version;header.append(expand,title);
+            const title=document.createElement('span');title.className='title';title.textContent='mb0t v'+bot.version;header.append(expand,title);const updateIcon=document.createElement('span');updateIcon.setAttribute('data-mbot-update-icon','');updateIcon.hidden=true;title.append(updateIcon);bot.updateNotifier?.renderIndicator?.(updateIcon);
             const body=document.createElement('div');body.className='body';shell.append(header,body);body.appendChild(panel);panel.setAttribute('data-mb-docked','');
             binding={panel,home,shell};
             expand.addEventListener('click',()=>{panel.querySelector('#minibia-bot-collapse')?.click();sync();});
@@ -55067,6 +55067,47 @@ window.__minibiaBotBundle.installClientImprovements = function(bot) {
     bot.addCleanup(()=>{disposed=true;if(requestTimer)clearTimeout(requestTimer);requestTimer=null;queued.clear();listeners.clear();readings.clear();requests.clear();});
 };
 
+window.__minibiaBotBundle.installUpdateNotifier=function(bot){
+    const url='https://raw.githubusercontent.com/infernalscripts/mb0t/refs/heads/main/b0t.js';
+    const period=5*60*1000;
+    let disposed=false,timer=null,controller=null,latest=null,lastCheckedAt=0,error=null;
+    function renderIndicator(icon){
+        const available=newer(latest,bot.version);
+        icon.hidden=!available;
+        icon.textContent=available?'⬆':'';
+        icon.title=available?`mb0t v${latest} available · running v${bot.version}. Reload when ready to update.`:'';
+        icon.setAttribute('aria-label',icon.title);
+        icon.style.cssText='margin-left:5px;color:#ffd166;font-size:12px;line-height:1;cursor:help;';
+    }
+    function render(){document.querySelectorAll('[data-mbot-update-icon]').forEach(renderIndicator);}
+    const parts=value=>/^\d+\.\d+\.\d+$/.test(String(value))?String(value).split('.').map(Number):null;
+    function newer(candidate,current){
+        const a=parts(candidate),b=parts(current);if(!a||!b)return false;
+        for(let i=0;i<3;i++){if(a[i]!==b[i])return a[i]>b[i];}return false;
+    }
+    async function check(){
+        if(disposed||controller)return false;
+        const request=new AbortController();controller=request;
+        const timeout=window.setTimeout(()=>request.abort(),15000);
+        try{
+            const response=await fetch(url+'?mb0t-check='+Date.now(),{cache:'no-store',credentials:'omit',signal:request.signal});
+            if(!response.ok)throw new Error('HTTP '+response.status);
+            const source=await response.text();
+            if(disposed)return false;
+            const match=/\bversion\s*:\s*["'](\d+\.\d+\.\d+)["']/.exec(source);
+            if(!match)throw new Error('Version not found in GitHub file');
+            latest=match[1];lastCheckedAt=Date.now();error=null;
+            render();
+            return true;
+        }catch(e){if(!disposed)error=String(e?.message||e);return false;}
+        finally{window.clearTimeout(timeout);if(controller===request)controller=null;}
+    }
+    async function tick(){timer=null;try{await check();}finally{if(!disposed)timer=window.setTimeout(tick,period);}}
+    timer=window.setTimeout(tick,10000);
+    bot.updateNotifier={check,renderIndicator,render,status:()=>({current:bot.version,latest,updateAvailable:newer(latest,bot.version),lastCheckedAt,error,url})};
+    bot.addCleanup(()=>{disposed=true;if(timer!==null)window.clearTimeout(timer);timer=null;controller?.abort();document.querySelectorAll('[data-mbot-update-icon]').forEach(icon=>{icon.hidden=true;icon.textContent='';icon.title='';});});
+};
+
 window.__minibiaBotBundle.installClientExtras=function(bot){
  const configKey='minibiaBot.clientExtras.config';
  const savedChatConfig=bot.storage.get(configKey,{});
@@ -65263,7 +65304,7 @@ function upgradeSectionHeaders(panel) {
         panel.id = "minibia-bot-panel";
         panel.innerHTML = `
 <div class="mb-titlebar">
-  <div class="mb-title">mb0t <span class="mb-title-version">v${String(bot.version || "?")}</span></div>
+  <div class="mb-title">mb0t <span class="mb-title-version">v${String(bot.version || "?")}</span><span data-mbot-update-icon hidden></span></div>
   <div class="mb-title-status">
     <button type="button" class="mb-run-indicator mb-expanded-module-button" id="minibia-bot-title-cave-status" title="Cavebot" aria-label="Cavebot" aria-pressed="false" data-running="false"><span class="mb-run-dot"></span><span class="mb-run-label">🏃</span></button>
     <button type="button" class="mb-run-indicator mb-expanded-module-button" id="minibia-bot-title-attack-status" title="Targeting" aria-label="Targeting" aria-pressed="false" data-running="false"><span class="mb-run-dot"></span><span class="mb-run-label">⚔️</span></button>
@@ -75074,6 +75115,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         currentBundle.installItemAlertItems(bot);
         currentBundle.installClientEvents(bot);
         currentBundle.installClientExtras(bot);
+        currentBundle.installUpdateNotifier(bot);
         currentBundle.installObservability(bot);
         currentBundle.installGroundSpawnLogger(bot);
         currentBundle.installFollowingItemGuard(bot);
