@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.600",
+        version: "1.6.601",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -34454,8 +34454,6 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             if (segment) return segment;
         }
         state.frontierRoutePlan = null;
-        const destinationTile = getTileAt(to);
-        const destinationUnloaded = !destinationTile || destinationTile.id === 0 || destinationTile.__isPlaceholder;
         // A frontier is an actual open edge of loaded geometry, not a floor
         // tile pressed against a known wall just because it is nearer the goal.
         const isOpenFrontier = tile => {
@@ -34517,7 +34515,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                             bestDistance = distance;
                             bestG = g;
                         }
-                        if (destinationUnloaded && isOpenFrontier(currentNode) &&
+                        if (isOpenFrontier(currentNode) &&
                             (distance < boundaryDistance || (distance === boundaryDistance && g < boundaryG))) {
                             boundaryNode = currentNode; boundaryDistance = distance; boundaryG = g;
                         }
@@ -34580,7 +34578,10 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 }
             }
 
-            if (destinationUnloaded && boundaryNode) {
+            // The destination can be cached while the connecting corridor is
+            // still unloaded. Explore an open edge unless a complete route was
+            // found; being nearer a wall is not a route around it.
+            if (bestDistance > 0 && boundaryNode) {
                 bestNode = boundaryNode; bestDistance = boundaryDistance;
             } else if (bestDistance >= startDistance) {
                 // No unexplored exit and no approach progress: don't shuffle
@@ -34604,7 +34605,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 previousDistance = nextDistance;
             }
             const endpoint = positions[positions.length-1];
-            const exits = destinationUnloaded ? [[1,0],[-1,0],[0,1],[0,-1]]
+            const exits = bestNode === boundaryNode ? [[1,0],[-1,0],[0,1],[0,-1]]
                 .map(([dx,dy]) => ({ x: endpoint.x+dx, y: endpoint.y+dy, z: endpoint.z }))
                 .filter(pos => {
                     const tile = getTileAt(pos);
