@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.623",
+        version: "1.6.626",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -28689,6 +28689,65 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
  *     overlay. Optionally loops the route.
  * ==================================================================================
  */
+window.__minibiaBotBundle.installScannedWorldMapModule=function(bot){
+ const store='minibiaBot.scannedWorldMap.v1';let saved=bot.storage.get(store,{cells:{},mobs:{}}),enabled=false,host=null,dirty=false,lastSave=0,lastDraw=null;
+ if(!saved?.cells||!saved?.mobs)saved={cells:{},mobs:{}};
+ const seen=new Map(),key=p=>`${p.x},${p.y},${p.z}`;
+ function persist(){if(dirty){bot.storage.set(store,saved);dirty=false;lastSave=Date.now();}}
+ function scan(){
+  if(!enabled)return;const snapshot=bot.observability?.tileMapSnapshot?.(20);if(!snapshot)return;
+  const now=Date.now();
+  let total=Object.keys(saved.cells).length;
+  for(const cell of snapshot.tiles){if(cell.kind==='unknown')continue;const k=key(cell);if(!saved.cells[k]&&total>=60000){enabled=false;status('60,000 tile limit reached. Export or clear the survey.');return;}
+   if(!saved.cells[k])total++;
+   saved.cells[k]={x:cell.x,y:cell.y,z:cell.z,kind:cell.kind,ground:cell.ground||'',lastAt:now};dirty=true;
+  }
+  const me=bot.getPlayerPosition(),gc=window.gameClient;
+  for(const c of Object.values(gc?.world?.activeCreatures||{})){
+   if(typeof CONST==='undefined'||c?.type!==CONST.TYPES.MONSTER)continue;
+   const p=c.getPosition?.()||c.__position;if(!p||!me||p.z!==me.z||Math.abs(p.x-me.x)>7||Math.abs(p.y-me.y)>5||c.getHealthPercentage?.()===0)continue;
+   const name=String(c.name||'').trim();if(!name)continue;
+   const id=String(c.id),now=Date.now(),old=seen.get(id);
+   // Record one first sighting per creature, not every tile it chases through.
+   if(old&&now-old<600000)continue;seen.set(id,now);if(seen.size>10000)seen.delete(seen.keys().next().value);
+   const k=`${key(p)}:${name.toLowerCase()}`;const m=saved.mobs[k]||(saved.mobs[k]={x:p.x,y:p.y,z:p.z,name,count:0,firstAt:now});m.count++;m.lastAt=now;dirty=true;
+  }
+  if(now-lastSave>10000)persist();
+ }
+ function status(text){if(host)host.querySelector('[data-status]').textContent=text;}
+ function draw(){if(!host||!host.open)return;const floor=Number(host.querySelector('[data-floor]').value),canvas=host.querySelector('canvas'),ctx=canvas.getContext('2d');ctx.fillStyle='#293440';ctx.fillRect(0,0,600,400);
+  const cells=Object.values(saved.cells).filter(c=>c.z===floor);if(!cells.length){status('No scanned tiles on this floor.');return;}
+  let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;for(const c of cells){minX=Math.min(minX,c.x);minY=Math.min(minY,c.y);maxX=Math.max(maxX,c.x);maxY=Math.max(maxY,c.y);}
+  const scale=Math.min(580/(maxX-minX+1),380/(maxY-minY+1));lastDraw={floor,minX,minY,scale};ctx.imageSmoothingEnabled=false;
+  for(const c of cells){ctx.fillStyle=c.kind==='blocked'?'#151515':c.kind==='transition'?'#6b9ed0':'#6e8759';ctx.fillRect(10+(c.x-minX)*scale,10+(c.y-minY)*scale,Math.max(1,scale),Math.max(1,scale));}
+  let count=0;for(const m of Object.values(saved.mobs)){if(m.z!==floor)continue;count++;ctx.fillStyle='#e0bd4b';ctx.beginPath();ctx.arc(10+(m.x-minX+.5)*scale,10+(m.y-minY+.5)*scale,Math.max(2,scale/2),0,Math.PI*2);ctx.fill();}
+  const me=bot.getPlayerPosition();if(me?.z===floor){ctx.fillStyle='#fff';ctx.fillRect(10+(me.x-minX)*scale-2,10+(me.y-minY)*scale-2,5,5);}
+  status(`${enabled?'Scanning · ':''}${cells.length} tiles on floor ${floor} · ${count} monster sighting locations. Green: walkable · black: blocked · blue: transition · yellow: sighting.`);
+ }
+ function mount(){const local=document.querySelector('#minibia-bot-panel .mb-tile-map');if(!local||host?.isConnected)return;
+  host=document.createElement('details');host.className='mb-section';host.innerHTML='<summary>Scanned world map ⓘ</summary><p class="mb-small-note">Accumulates loaded diagnostic terrain across your travels. Yellow markers are first monster sightings, not confirmed spawn points. Dynamic obstacles may change. Hover over the map for coordinates and sightings.</p><button type="button" data-toggle>Start scanning</button> <label>Floor <input data-floor type="number" min="0" max="15" style="width:55px"></label> <button type="button" data-export>Export survey</button> <button type="button" data-clear>Clear survey</button><canvas width="600" height="400" style="width:100%;height:auto;image-rendering:pixelated;margin-top:8px"></canvas><p data-status class="mb-small-note"></p><p data-hover class="mb-small-note"></p>';
+  local.parentNode.insertBefore(host,local.nextSibling);host.querySelector('[data-floor]').value=bot.getPlayerPosition()?.z??7;
+  host.querySelector('[data-toggle]').onclick=()=>{enabled=!enabled;host.querySelector('[data-toggle]').textContent=enabled?'Stop scanning':'Start scanning';if(!enabled)persist();draw();};host.querySelector('[data-floor]').onchange=draw;host.ontoggle=draw;
+  host.querySelector('[data-clear]').onclick=()=>{if(!confirm('Clear the scanned terrain and monster sightings?'))return;saved={cells:{},mobs:{}};seen.clear();dirty=true;persist();lastDraw=null;draw();};
+  host.querySelector('[data-export]').onclick=()=>{persist();const url=URL.createObjectURL(new Blob([JSON.stringify({schema:1,version:bot.version,...saved})],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download='mb0t-world-survey.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);};
+  host.querySelector('canvas').onmousemove=e=>{if(!lastDraw)return;const r=e.target.getBoundingClientRect(),d=lastDraw,x=Math.floor(((e.clientX-r.left)*600/r.width-10)/d.scale+d.minX),y=Math.floor(((e.clientY-r.top)*400/r.height-10)/d.scale+d.minY);const cell=saved.cells[`${x},${y},${d.floor}`];const mobs=Object.values(saved.mobs).filter(m=>m.z===d.floor&&Math.abs(m.x-x)<=1&&Math.abs(m.y-y)<=1);host.querySelector('[data-hover]').textContent=`${x}, ${y}, ${d.floor}: ${cell?.kind||'unscanned'} ${cell?.ground||''} `+mobs.map(m=>`${m.name} ×${m.count} (last seen ${new Date(m.lastAt).toLocaleString()})`).join('; ');};
+ }
+ const timer=setInterval(()=>{mount();scan();draw();},1000);bot.scannedWorldMap={routeSurvey(){
+ const nodes={},edges={},spots={};
+ for(const [k,c] of Object.entries(saved.cells))if(c.kind==='walkable'){nodes[k]={x:c.x,y:c.y,z:c.z};edges[k]=[];}
+ // Cardinal connections only: never cut diagonally through wall corners.
+ // Floor-change tiles are excluded until their actions are explicitly recorded.
+ for(const [k,p] of Object.entries(nodes))for(const [dx,dy] of [[1,0],[-1,0],[0,1],[0,-1]]){const next=`${p.x+dx},${p.y+dy},${p.z}`;if(nodes[next])edges[k].push(next);}
+ for(const [k,m] of Object.entries(saved.mobs)){
+  const anchors={};const exact=key(m);
+  if(nodes[exact])anchors[exact]=m.count;
+  else for(const [dx,dy] of [[1,0],[-1,0],[0,1],[0,-1]]){const near=`${m.x+dx},${m.y+dy},${m.z}`;if(nodes[near])anchors[near]=m.count;}
+  spots[k]={...m,anchors};
+ }
+ return {nodes,edges,spots};
+ },start(){enabled=true;},stop(){enabled=false;persist();},status:()=>({enabled,tiles:Object.keys(saved.cells).length,sightings:Object.keys(saved.mobs).length})};bot.addCleanup(()=>{clearInterval(timer);persist();host?.remove();});
+};
+
 window.__minibiaBotBundle.installMobRouteLoggerModule = function(bot) {
     const storageKey='minibiaBot.mobRouteLogger.v1';
     let data=bot.storage.get(storageKey,{nodes:{},edges:{},spots:{}});
@@ -28748,15 +28807,24 @@ window.__minibiaBotBundle.installMobRouteLoggerModule = function(bot) {
     function path(tree,end){const result=[];for(let p=end;p!=null;p=tree.parents.get(p))result.push(p);return result.reverse();}
     function generate(){
         preview=[];
+        const useScan=root.querySelector('[data-source]').value==='scan';
+        const survey=useScan?bot.scannedWorldMap?.routeSurvey?.():data;
+        if(!survey)return message('Scanned map is unavailable.');
+        const graph=survey;
+        function shortest(start){
+            const parents=new Map([[start,null]]),dist=new Map([[start,0]]),queue=[start];
+            for(let i=0;i<queue.length;i++)for(const next of graph.edges[queue[i]]||[]){if(parents.has(next)||!graph.nodes[next])continue;parents.set(next,queue[i]);dist.set(next,dist.get(queue[i])+1);queue.push(next);}
+            return {parents,dist};
+        }
         const me=position(bot.getPlayerPosition());if(!me)return message('Log in before generating a route.');
         const names=new Set(root.querySelector('[data-names]').value.split(',').map(n=>n.trim().toLowerCase()).filter(Boolean));
         const floor=Number(root.querySelector('[data-floor]').value);
-        const nodes=Object.keys(data.nodes).filter(k=>data.nodes[k].z===floor);
+        const nodes=Object.keys(graph.nodes).filter(k=>graph.nodes[k].z===floor);
         if(!nodes.length)return message('No recorded walking paths on this floor.');
-        nodes.sort((a,b)=>Math.abs(data.nodes[a].x-me.x)+Math.abs(data.nodes[a].y-me.y)-Math.abs(data.nodes[b].x-me.x)-Math.abs(data.nodes[b].y-me.y));
+        nodes.sort((a,b)=>Math.abs(graph.nodes[a].x-me.x)+Math.abs(graph.nodes[a].y-me.y)-Math.abs(graph.nodes[b].x-me.x)-Math.abs(graph.nodes[b].y-me.y));
         const start=nodes[0],component=shortest(start);
         const goals=new Map();let excluded=0;
-        for(const spot of Object.values(data.spots)){
+        for(const spot of Object.values(graph.spots)){
             if(spot.z!==floor||(names.size&&!names.has(spot.name.toLowerCase())))continue;
             const anchors=Object.keys(spot.anchors).filter(k=>component.parents.has(k));
             anchors.sort((a,b)=>spot.anchors[b]-spot.anchors[a]);
@@ -28773,8 +28841,23 @@ window.__minibiaBotBundle.installMobRouteLoggerModule = function(bot) {
             route.push(...path(tree,best).slice(1));goals.delete(best);current=best;
         }
         route.push(...path(shortest(current),start).slice(1));
-        preview=route.map(k=>({...data.nodes[k]}));
-        message(`Preview: ${preview.length} walking tiles, floor ${floor}. ${excluded} disconnected hunting spots excluded. Approximate loop using recorded paths.`);
+        // Keep short, clear segments; every skipped tile and diagonal side
+        // must belong to the surveyed walkable graph.
+        const clearSegment=(a,b)=>{
+            let x=a.x,y=a.y;const dx=Math.abs(b.x-x),dy=Math.abs(b.y-y),sx=Math.sign(b.x-x),sy=Math.sign(b.y-y);let err=dx-dy;
+            while(x!==b.x||y!==b.y){const e=2*err,ox=x,oy=y;if(e>-dy){err-=dy;x+=sx;}if(e<dx){err+=dx;y+=sy;}
+                if(!graph.nodes[`${x},${y},${a.z}`])return false;
+                if(x!==ox&&y!==oy&&(!graph.nodes[`${x},${oy},${a.z}`]||!graph.nodes[`${ox},${y},${a.z}`]))return false;
+            }return true;
+        };
+        const compact=[route[0]];
+        for(let i=0;i<route.length-1;){let end=i+1;
+            for(let j=i+2;j<route.length&&j<=i+8;j++){if(!clearSegment(graph.nodes[route[i]],graph.nodes[route[j]]))break;end=j;}
+            compact.push(route[end]);i=end;
+        }
+        if(compact.length>1000)return message('Survey produced more than 1,000 waypoints. Filter to fewer creatures before saving.');
+        preview=compact.map(k=>({...graph.nodes[k]}));
+        message(`Preview: ${preview.length} spaced waypoints, floor ${floor}. ${excluded} disconnected hunting spots excluded. Approximate loop. Review before saving; scanned obstacles may have changed.`);
         draw();
     }
     function draw(){
@@ -28786,7 +28869,7 @@ window.__minibiaBotBundle.installMobRouteLoggerModule = function(bot) {
     function mount(){
         const panel=document.querySelector('#minibia-bot-panel [data-tab-panel="cave"]');if(!panel)return;
         if(root?.isConnected)return;
-        root=document.createElement('details');root.className='mb-section';root.innerHTML=`<summary>Monster logger &amp; route generator ⓘ</summary><p class="mb-small-note">Record while hunting manually. Sightings and confirmed walking paths are saved. Generate one floor at a time; floor changes and teleports are never guessed as walking links. The preview is an approximate loop, not a proven optimal route.</p><div><button type="button" data-record>Start recording</button> <button type="button" data-clear>Clear survey</button></div><p data-count class="mb-small-note"></p><label>Creatures (comma separated; empty = all)<input data-names style="width:100%" list="mb-mob-survey-names"></label><datalist id="mb-mob-survey-names"></datalist><label>Floor <input data-floor type="number" min="0" max="15" style="width:55px"></label><select data-objective><option value="distance">Short travel</option><option value="density">Favor dense sightings</option></select><div><button type="button" data-generate>Generate preview</button></div><canvas width="380" height="200" style="width:100%;height:auto;margin-top:6px"></canvas><label>New preset name <input data-preset value="Recorded hunt"></label><button type="button" data-save>Save as new Cavebot preset</button><p data-status class="mb-small-note" role="status"></p>`;
+        root=document.createElement('details');root.className='mb-section';root.innerHTML=`<summary>Monster logger &amp; route generator ⓘ</summary><p class="mb-small-note">Record while hunting manually. Sightings and confirmed walking paths are saved. Generate from the scanned map or recorded walking paths, one floor at a time. Scanned routes avoid blocked, unknown, and transition tiles; floor changes and teleports are never guessed as walking links. The preview is an approximate loop, not a proven optimal route.</p><div><button type="button" data-record>Start recording</button> <button type="button" data-clear>Clear survey</button></div><p data-count class="mb-small-note"></p><label>Route source <select data-source><option value="scan">Scanned map + monster sightings</option><option value="walk">Recorded walking paths</option></select></label><label>Creatures (comma separated; empty = all)<input data-names style="width:100%" list="mb-mob-survey-names"></label><datalist id="mb-mob-survey-names"></datalist><label>Floor <input data-floor type="number" min="0" max="15" style="width:55px"></label><select data-objective><option value="distance">Short travel</option><option value="density">Favor dense sightings</option></select><div><button type="button" data-generate>Generate preview</button></div><canvas width="380" height="200" style="width:100%;height:auto;margin-top:6px"></canvas><label>New preset name <input data-preset value="Recorded hunt"></label><button type="button" data-save>Save as new Cavebot preset</button><p data-status class="mb-small-note" role="status"></p>`;
         panel.append(root);root.querySelector('[data-floor]').value=bot.getPlayerPosition()?.z??7;
         root.querySelector('[data-record]').onclick=()=>{recording=!recording;previous=null;preview=[];persist();root.querySelector('[data-record]').textContent=recording?'Stop recording':'Start recording';message(recording?'Recording sightings and confirmed steps.':'Recording stopped and saved.');};
         root.querySelector('[data-clear]').onclick=()=>{if(!window.confirm('Clear recorded monster sightings and walking paths?'))return;data={nodes:{},edges:{},spots:{}};previous=null;seen.clear();preview=[];dirty=true;persist();draw();message('Survey cleared.');};
@@ -28798,7 +28881,7 @@ window.__minibiaBotBundle.installMobRouteLoggerModule = function(bot) {
             if(!name)return message('Enter a new preset name.');
             if(bot.cave.getPresetNames().includes(name))return message('That preset already exists. Choose a new name.');
             if(!bot.cave.createPreset(name))return message('Could not create the preset.');
-            for(const p of preview)bot.cave.addWaypoint({...p});
+            bot.cave.setGeneratedRoute(preview);
             bot.cave.savePreset(name);message(`Saved ${preview.length} waypoints as “${name}”. Review the route before starting Cavebot.`);
         };
     }
@@ -42430,6 +42513,18 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     });
 
     bot.cave = {
+        setGeneratedRoute(points) {
+            if (!Array.isArray(points) || points.length > 1000) return false;
+            const next = normalizeRoute(points);
+            if (next.length !== points.length) return false;
+            if (state.running) stop();
+            route = next;
+            state.currentIndex = 0;
+            state.direction = 1;
+            resetRecoveryContext("generated route loaded");
+            persistRoute();
+            return true;
+        },
         start,
         stop,
         status,
@@ -75364,6 +75459,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         currentBundle.installRuneShooterModule(bot);
         currentBundle.installCaveModule(bot);
         currentBundle.installMobRouteLoggerModule(bot);
+        currentBundle.installScannedWorldMapModule(bot);
         currentBundle.installSpecialAreasModule(bot);
         currentBundle.installEquipRingModule(bot);
         currentBundle.installBootsSwapperModule(bot);
