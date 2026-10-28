@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.609",
+        version: "1.6.621",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -6512,9 +6512,12 @@ window.__minibiaBotBundle.installSidebarPanelsModule = function installSidebarPa
             mapBinding=b;for(const name of ['render','cache','__coordsToWorldPosition'])map[name]=b[name];
         }
         const b=mapBinding;
-        // Fixed horizontal tile scale, additional vertical pixels = more terrain.
-        // Multiples of 32 keep every native zoom level aligned at strip seams.
-        const internalWidth=config.mapSpan===2&&spanState?320:160,internalHeight=Math.max(160,Math.round(internalWidth*height/width/32)*32);
+        // Render at the displayed pixel density so the browser does not stretch
+        // the native 160px minimap when it fills a wide sidebar. Keep dimensions
+        // aligned to 32px so every native zoom level stays clean at strip seams.
+        const pixelRatio=Math.max(1,Number(window.devicePixelRatio)||1);
+        const internalWidth=Math.max(160,Math.ceil(width*pixelRatio/32)*32);
+        const internalHeight=Math.max(160,Math.round(internalWidth*height/width/32)*32);
         if(b.canvas.height!==internalHeight||b.canvas.width!==internalWidth){b.canvas.width=internalWidth;b.canvas.height=internalHeight;map.cache();}
     }
     function resizeMap(event){if(!mapDrag)return;if(mapDrag.horizontal){const delta=(event.clientX-mapDrag.x)*(mapDrag.side==='left'?-1:1);config.mapSpan=delta>35?2:delta< -35?1:mapDrag.start;sync();return;}const {r,y,size}=mapDrag;const width=r.shell.closest('.oogwrap')?.getBoundingClientRect().width||r.shell.getBoundingClientRect().width/(spanState?2:1);config.mapHeight=Math.round(Math.max(width,Math.min(1000,size+event.clientY-y)));updateMapSize(r);}
@@ -6685,7 +6688,8 @@ window.__minibiaBotBundle.installSidebarDropGuardModule = function installSideba
 
 window.__minibiaBotBundle.installTabTitleModule = function installTabTitleModule(bot) {
     const key="minibiaBot.tabTitle.config",saved=bot.storage.get(key,{});
-    const config={enabled:saved.enabled===true,alerts:saved.alerts!==false};
+    const config={enabled:false,character:saved.character===undefined?saved.enabled===true:saved.character===true,status:saved.status===undefined?saved.enabled===true:saved.status===true,alerts:saved.alerts!==false};
+    config.enabled=config.character||config.status;
     let original=document.title,lastWritten=null,timer=null,disposed=false,alertUntil=0,alertLabel="";
     const clean=value=>String(value||"").replace(/[\r\n\t]+/g," ").trim().slice(0,80);
     function render(){
@@ -6704,8 +6708,7 @@ window.__minibiaBotBundle.installTabTitleModule = function installTabTitleModule
         const activity=cave?.movement?.safetyStopped ? "safety stopped" : cave?.learnMode ? "recording" :
             caveOn ? clean(cave?.movement?.mode || "Walking").toLowerCase() : "idle";
         const progress=total ? ` (${index}/${total})` : "";
-        const base=[name,`CaveBot: ${caveOn ? 'ON' : 'OFF'}`,
-            `Targeting: ${targetingOn ? 'ON' : 'OFF'}`,`Status: ${activity}${progress}`].filter(Boolean).join(' | ');
+        const base=[config.character?name:null,...(config.status?[`CaveBot: ${caveOn ? 'ON' : 'OFF'}`,`Targeting: ${targetingOn ? 'ON' : 'OFF'}`,`Status: ${activity}${progress}`]:[])].filter(Boolean).join(' | ')||original;
         const title=config.alerts && Date.now()<alertUntil ? `⚠ ${alertLabel || "ALERT"} | ${base}` : base;
         if(document.title!==title)document.title=title;
         lastWritten=title;
@@ -6717,7 +6720,10 @@ window.__minibiaBotBundle.installTabTitleModule = function installTabTitleModule
         render();
     }
     function updateConfig(next={}){
-        if(next.enabled!==undefined)config.enabled=next.enabled===true;
+        if(next.enabled!==undefined){config.character=next.enabled===true;config.status=next.enabled===true;}
+        if(next.character!==undefined)config.character=next.character===true;
+        if(next.status!==undefined)config.status=next.status===true;
+        config.enabled=config.character||config.status;
         if(next.alerts!==undefined)config.alerts=next.alerts===true;
         if(!config.enabled || !config.alerts){alertUntil=0;alertLabel="";}
         bot.storage.set(key,{...config});
@@ -6728,10 +6734,11 @@ window.__minibiaBotBundle.installTabTitleModule = function installTabTitleModule
     function mount(parent){
         if(!parent || parent.querySelector('[data-tab-title]'))return;
         const section=document.createElement('div');section.className='mb-section';section.setAttribute('data-tab-title','');
-        section.innerHTML='<div class="mb-section-title"><span class="mb-title-text">🌐 Browser title</span></div><div class="mb-alert-toggle-grid"><label class="mb-toggle"><input type="checkbox" data-title-enabled><span>Character &amp; bot status in title</span></label><label class="mb-toggle"><input type="checkbox" data-title-alerts><span>Show alerts in title</span></label></div>';
-        const enabled=section.querySelector('[data-title-enabled]'),alerts=section.querySelector('[data-title-alerts]');
-        const refresh=()=>{enabled.checked=config.enabled;alerts.checked=config.alerts;alerts.disabled=!config.enabled;};
-        enabled.addEventListener('change',()=>{updateConfig({enabled:enabled.checked});refresh();});
+        section.innerHTML='<div class="mb-section-title"><span class="mb-title-text">🌐 Browser title</span></div><div class="mb-alert-toggle-grid"><label class="mb-toggle"><input type="checkbox" data-title-character><span>Character name in title</span></label><label class="mb-toggle"><input type="checkbox" data-title-status><span>Bot status in title</span></label><label class="mb-toggle"><input type="checkbox" data-title-alerts><span>Show alerts in title</span></label></div>';
+        const character=section.querySelector('[data-title-character]'),status=section.querySelector('[data-title-status]'),alerts=section.querySelector('[data-title-alerts]');
+        const refresh=()=>{character.checked=config.character;status.checked=config.status;alerts.checked=config.alerts;alerts.disabled=!config.enabled;};
+        character.addEventListener('change',()=>{updateConfig({character:character.checked});refresh();});
+        status.addEventListener('change',()=>{updateConfig({status:status.checked});refresh();});
         alerts.addEventListener('change',()=>{updateConfig({alerts:alerts.checked});refresh();});
         refresh();parent.appendChild(section);
     }
@@ -29357,7 +29364,10 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             if (event.cave && event.cave.index === state.currentIndex && event.cave.revision === state.routeRevision) {
                 const tile = getTileAt(event.cave.next);
                 if (tile && !isFloorChangeTile(tile)) {
-                    recentRejectedCaveTiles.set(getPositionKey(event.cave.next), Date.now() + 1500);
+                    // A server-rejected step is authoritative even when local tile flags
+                    // incorrectly mark water/shore terrain as walkable. Keep it out
+                    // of fresh A* routes long enough to prevent shoreline oscillation.
+                    recentRejectedCaveTiles.set(getPositionKey(event.cave.next), Date.now() + 30000);
                     while (recentRejectedCaveTiles.size > 32) recentRejectedCaveTiles.delete(recentRejectedCaveTiles.keys().next().value);
                 }
                 releaseCavePacketBatch();
@@ -37724,6 +37734,14 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             if (distance <= limit)
                 return wp;
 
+            // Relocation must choose a reachable route point, not consume
+            // remote waypoints until a loop Script jumps back to the start.
+            stopCaveMovementNow();
+            bot.log("Cave: waypoint exceeds distance limit — selecting nearby recovery waypoint");
+            const nearby = skipToClosestWaypoint({ allowTransitionFallback: false });
+            if (!nearby) haltCaveNavigationForSafety();
+            return nearby || null;
+
             const oldIndex = state.currentIndex;
             bot.log(`Cave: skipping waypoint #${oldIndex + 1} – ${distance} tiles away (limit ${limit})`);
 
@@ -37805,6 +37823,14 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
 
             if (distance <= limit)
                 return wp;
+
+            // Relocation must choose a reachable route point, not consume
+            // remote waypoints until a loop Script jumps back to the start.
+            stopCaveMovementNow();
+            bot.log("Cave: waypoint exceeds distance limit — selecting nearby recovery waypoint");
+            const nearby = skipToClosestWaypoint({ allowTransitionFallback: false });
+            if (!nearby) haltCaveNavigationForSafety();
+            return nearby || null;
 
             const oldIndex = state.currentIndex;
             bot.log(
@@ -40333,6 +40359,30 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                         ? " – forcing waypoint recovery"
                         : " – forcing clean repath")
                 );
+                // A second confirmed oscillation is a failed route, even if one
+                // leg happens to reduce straight-line distance by a tile. Do not
+                // let that small change restart repath recovery indefinitely.
+                const oscillatingWaypoint = getCurrentWaypoint();
+                if (movementOscillation.repeat >= 2 && oscillatingWaypoint &&
+                    !oscillatingWaypoint.script && !isRecoveryTransitionWaypoint(oscillatingWaypoint)) {
+                    const failedIndex = state.currentIndex;
+                    if (setRecoveryReason("STUCK", now, oscillatingWaypoint)) return;
+                    quarantineRecoveryTile(oscillatingWaypoint, now);
+                    stopCaveMovementNow();
+                    const recovered = skipToClosestWaypoint({
+                        excludeIndex: failedIndex,
+                        avoidIndex: state.recoveryLastTargetIndex,
+                        avoidKey: state.recoveryLastTargetKey,
+                        allowTransitionFallback: false
+                    });
+                    if (recovered) {
+                        state.lastProgressAt = now;
+                        state.lastPathAt = 0;
+                        state.lastWaypointTarget = null;
+                        state._stuckLogged = false;
+                        return;
+                    }
+                }
             }
 
             // Check if we've moved to a new tile. Movement by itself is not
@@ -40400,29 +40450,26 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                         if (!Number.isFinite(state.recoveryBestDistance) || recoveryDist < state.recoveryBestDistance) {
                             state.recoveryBestDistance = recoveryDist;
                             state.recoveryNoProgressAt = now;
-                            // Only real route progress resets the global stall timer
-                            // while recovery is active. A monster pushing us around
-                            // must not keep postponing waypoint recovery indefinitely.
+                            // Real progress toward the waypoint starts a fresh,
+                            // bounded recovery cycle. A↔B movement or a stalled
+                            // path must keep its attempts so it reaches waypoint
+                            // selection instead of restarting repaths forever.
+                            state.stuckRecoveryAttempts = 0;
+                            state.lastRecoveryAt = 0;
+                            state.recoverySideStepAt = 0;
+                            state.recoverySideStepAttempts = 0;
+                            state.recoverySideStepLastKey = null;
+                            state.recoverySideStepOriginKey = null;
+                            state.recoveryBlockerWaitAt = 0;
+                            state.recoveryBlockerWaitKey = null;
                             state.lastProgressAt = now;
                         } else if (!state.recoveryNoProgressAt) {
                             state.recoveryNoProgressAt = now;
                         }
                     }
-                    // Once recovery has failed to make any measurable route progress
-                    // for the whole window, allow a genuinely successful movement cycle
-                    // to reset the counters again.
-                    if (state.recoveryNoProgressAt && now - state.recoveryNoProgressAt >= windowMs) {
-                        state.stuckRecoveryAttempts = 0;
-                        state.lastRecoveryAt = 0;
-                        state.recoverySideStepAt = 0;
-                        state.recoverySideStepAttempts = 0;
-                        state.recoverySideStepLastKey = null;
-                        state.recoverySideStepOriginKey = null;
-                        state.recoveryBlockerWaitAt = 0;
-                        state.recoveryBlockerWaitKey = null;
-                        state.recoveryBestDistance = recoveryDist;
-                        state.recoveryNoProgressAt = now;
-                    }
+                    // Do not clear retry counters just because time passed. If
+                    // the route is blocked, the next stall must advance to the
+                    // bounded closest-waypoint recovery below.
                 }
                 state.positionHistory = [];
             }
@@ -61804,7 +61851,11 @@ function upgradeSectionHeaders(panel) {
         const priceInput=document.getElementById('minibia-bot-looter-min-price');
         if(priceInput && document.activeElement!==priceInput)priceInput.value=status?.corpseMinItemPrice??1000;
         const priceField=document.getElementById('minibia-bot-looter-price-field');
-        if(priceField)priceField.hidden=status?.corpseLootFilter!=='price';
+        if(priceField)priceField.hidden=!status?.rareCorpsesOnly||status?.corpseLootFilter!=='price';
+        const filterOptions=document.querySelector('[data-loot-filter-options]');
+        if(filterOptions)filterOptions.hidden=status?.rareCorpsesOnly!==true;
+        const rareOptions=document.querySelector('[data-loot-rare-options]');
+        if(rareOptions)rareOptions.hidden=status?.corpseLootFilter==='price';
         const blacklistMode = status?.lootMode === "blacklist";
         const modeInput = document.getElementById("minibia-bot-looter-mode");
         if (modeInput && document.activeElement !== modeInput) modeInput.value = blacklistMode ? "blacklist" : "whitelist";
@@ -64089,6 +64140,8 @@ function upgradeSectionHeaders(panel) {
 #minibia-bot-panel .mb-support-rule-actions button {padding:3px 7px;}
 #minibia-bot-panel [data-support-rules] > .mb-section-title::after {order:1;}
 #minibia-bot-panel [data-support-add] {order:2;}
+#minibia-bot-panel [data-area-heading]::after {order:1;}
+#minibia-bot-panel #mb-area-editor[hidden] {display:none!important;}
 #minibia-bot-panel [data-target-name-rules] > .mb-section-title::after {order:1;}
 #minibia-bot-panel [data-target-list-add] {order:2;}
 #minibia-bot-panel .mb-support-rule > span {min-width:0;overflow-wrap:anywhere;}
@@ -64096,6 +64149,19 @@ function upgradeSectionHeaders(panel) {
 #minibia-bot-panel .mb-support-editor[hidden] {display:none!important;}
 #minibia-bot-panel .mb-support-editor .mb-field {min-width:0;}
 #minibia-bot-panel .mb-looter-compact .mb-section {padding:8px 10px;}
+#minibia-bot-panel .mb-interface-compact .mb-section {padding:8px 10px;}
+#minibia-bot-panel .mb-interface-settings > summary,#minibia-bot-panel .mb-interface-tips > summary {cursor:pointer;padding:4px 0;font-size:11px;color:#bcb6a4;}
+#minibia-bot-panel .mb-interface-settings-body {padding-top:5px;display:grid;gap:7px;min-width:0;}
+#minibia-bot-panel .mb-interface-settings-body .mb-field {margin:0;min-width:0;}
+#minibia-bot-panel .mb-interface-settings-body .mb-toggle {margin:2px 0;}
+#minibia-bot-panel .mb-interface-settings-body .mb-form-grid {gap:6px 10px;}
+#minibia-bot-panel .mb-interface-tips .mb-small-note {margin:5px 0;font-size:10px;}
+
+#minibia-bot-panel .mb-loot-settings-grid {display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:6px 10px;margin-bottom:7px;}
+#minibia-bot-panel .mb-looter-compact [hidden] {display:none!important;}
+#minibia-bot-panel .mb-looter-fold {margin:7px 0;}
+#minibia-bot-panel .mb-looter-fold > summary {cursor:pointer;padding:3px 0;}
+#minibia-bot-panel .mb-looter-fold .mb-toggle {margin-top:5px;}
 #minibia-bot-panel .mb-looter-compact .mb-section-title {margin-bottom:7px;}
 #minibia-bot-panel .mb-looter-destination {display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:10px;}
 #minibia-bot-panel .mb-looter-destination > span {min-width:0;overflow-wrap:anywhere;}
@@ -66129,26 +66195,27 @@ function upgradeSectionHeaders(panel) {
 <div class="mb-tab-panel mb-looter-compact" data-tab-panel="looter">
 <div class="mb-section" data-corpse-looter>
   <div class="mb-section-title"><input type="checkbox" id="minibia-bot-looter-walk-corpses" class="mb-title-toggle"><label class="mb-title-text" for="minibia-bot-looter-walk-corpses">Loot distant corpses</label></div>
-  <label class="mb-field"><span class="mb-field-label">Max distance (tiles)</span><input type="number" id="minibia-bot-looter-corpse-distance" min="1" max="30" value="12"></label>
-  <label class="mb-toggle"><input type="checkbox" id="minibia-bot-looter-rare-only"><span>Filter distant loot</span></label>
-  <label class="mb-field"><span class="mb-field-label">Visit corpse for</span><select id="minibia-bot-looter-value-mode"><option value="rare">Rare items</option><option value="price">Items above price</option></select></label>
-  <label class="mb-field" id="minibia-bot-looter-price-field"><span class="mb-field-label">Item price above (gp)</span><input type="number" id="minibia-bot-looter-min-price" min="0" step="1" value="1000"></label>
-  <div class="mb-small-note">Price uses each item's NPC sell value or Hunt Analyzer custom loot price. Unknown prices are skipped. Hunt Analyzer recording can be off.</div>
-  <div class="mb-inline"><button type="button" class="mb-small-button" id="minibia-bot-looter-load-rares">Load rare list</button><span class="mb-small-note" id="minibia-bot-looter-rares-status"></span></div>
-  <div class="mb-small-note">Uses the game's rare item tags. Load the list after login; you can close it afterward. Unverified loot is skipped in rare-only mode.</div>
-  <label class="mb-toggle"><input type="checkbox" id="minibia-bot-looter-debug-overlay"><span>Show corpse queue debug overlay</span></label>
-  <label class="mb-toggle"><input type="checkbox" id="minibia-bot-looter-include-listed"><span>Also visit for white/listed loot</span></label>
-  <div class="mb-small-note">Includes listed items still in the corpse, even below the price filter or not rare. Already auto-looted/eaten items are excluded. Food/bag skipping still applies.</div>
-  <label class="mb-toggle"><input type="checkbox" id="minibia-bot-looter-skip-food-bags"><span>Skip food/bag-only corpses</span></label>
-  <div class="mb-small-note">Turn off to visit these corpses for skinning. Covers meat, ham, dragon ham and bags.</div>
-  <div class="mb-small-note">Works independently of mb0t Looter. With Looter off, opens corpses for native premium auto-loot. Walking starts after combat clears.</div>
+  <div class="mb-loot-settings-grid">
+    <label class="mb-field"><span class="mb-field-label">Distance · SQM</span><input type="number" id="minibia-bot-looter-corpse-distance" min="1" max="30" value="12"></label>
+    <label class="mb-toggle" style="align-self:end"><input type="checkbox" id="minibia-bot-looter-rare-only"><span>Filter loot</span></label>
+  </div>
+  <div data-loot-filter-options class="mb-loot-settings-grid">
+    <label class="mb-field"><span class="mb-field-label">Visit for</span><select id="minibia-bot-looter-value-mode"><option value="rare">Rare items</option><option value="price">Items above price</option></select></label>
+    <label class="mb-field" id="minibia-bot-looter-price-field" title="Each item's NPC sell value or custom Hunt Analyzer price must exceed this amount. Unknown prices are skipped."><span class="mb-field-label">Above · GP</span><input type="number" id="minibia-bot-looter-min-price" min="0" step="1" value="1000"></label>
+    <div data-loot-rare-options class="mb-inline" style="grid-column:1/-1" title="Load the game's rare item list after login. You can close it afterward."><button type="button" class="mb-small-button" id="minibia-bot-looter-load-rares">Load rare list</button><span class="mb-small-note" id="minibia-bot-looter-rares-status"></span></div>
+  </div>
+  <details class="mb-looter-fold"><summary>Corpse options</summary>
+    <label class="mb-toggle" title="Visit for white/listed items even when they fail the rare or price filter. Already collected items are excluded."><input type="checkbox" id="minibia-bot-looter-include-listed"><span>Include white/listed loot</span></label>
+    <label class="mb-toggle" title="Skip bodies containing only meat, ham, dragon ham or bags. Turn off when visiting bodies for skinning."><input type="checkbox" id="minibia-bot-looter-skip-food-bags"><span>Skip food/bag-only corpses</span></label>
+    <label class="mb-toggle"><input type="checkbox" id="minibia-bot-looter-debug-overlay"><span>Corpse queue debug overlay</span></label>
+  </details>
   <div class="mb-small-note mb-looter-status" id="minibia-bot-corpse-looter-status">Status: off</div>
 </div>
  <div class="mb-section">
   <div class="mb-section-title"><input type="checkbox" id="minibia-bot-looter-enabled" class="mb-title-toggle"><span class="mb-title-text">💰 Looter</span></div>
   <label class="mb-field"><span class="mb-field-label">Loot destination</span><select id="minibia-bot-looter-destination-mode"><option value="auto">Equipped backpack (auto)</option><option value="manual">Selected container</option></select></label><div class="mb-looter-destination"><span class="mb-small-note" id="minibia-bot-looter-dest-status">No destination selected</span><button type="button" class="mb-small-button" id="minibia-bot-looter-select-dest" title="Choose the main loot container. Full containers overflow into child bags automatically.">Set Destination</button></div>
   <label class="mb-field"><span class="mb-field-label">Loot mode</span><select id="minibia-bot-looter-mode"><option value="whitelist">Loot listed items</option><option value="blacklist">Blacklist — loot everything except listed items</option></select></label>
-  <div class="mb-small-note" id="minibia-bot-looter-mode-note">Loots only from containers whose names contain “dead”. Container items are always skipped.</div>
+  <div class="mb-small-note" id="minibia-bot-looter-mode-note" hidden>Loots only from containers whose names contain “dead”. Container items are always skipped.</div>
   <div class="mb-section-title mb-section-title--sub"><span class="mb-title-text" id="minibia-bot-looter-list-title">Tracked Items</span></div>
   <div class="mb-looter-add"><input type="text" id="minibia-bot-looter-manual-input" placeholder="Item name" aria-label="Item name"><button type="button" class="mb-small-button" id="minibia-bot-looter-manual-add">Add</button><button type="button" class="mb-small-button" id="minibia-bot-looter-capture-item" title="Click an item to track its exact identity" aria-label="Pick item">🔍</button></div>
   <div id="minibia-bot-looter-item-list" class="mb-looter-items"></div>
@@ -66220,10 +66287,10 @@ function upgradeSectionHeaders(panel) {
 <!-- Special Areas -->
 <div class="mb-tab-panel" data-tab-panel="blacklist">
   <div class="mb-section">
-    <div class="mb-section-title"><span class="mb-title-text">🗺️ Special Areas</span></div>
+    <div class="mb-section-title" data-area-heading><span class="mb-title-text">🗺️ Special Areas</span><button type="button" class="mb-small-button" id="mb-area-new" style="margin-left:auto;order:2">+ Area</button></div>
     <div class="mb-stack">
-      <div class="mb-small-note">Areas belong to the active Cave preset and floor. Avoid / Prefer change path cost; Never Step, Combat Only and No Combat are hard movement rules. Targeting Wall blocks Targeting movement while CaveBot can pass.</div>
       <label class="mb-toggle"><input type="checkbox" id="minibia-bot-special-area-enabled" checked /><span>Enable Special Area policies</span></label>
+      <div id="mb-area-editor" hidden>
       <div class="mb-form-grid">
         <label class="mb-field"><span class="mb-field-label">Area Name</span><input type="text" id="minibia-bot-special-area-name" maxlength="64" placeholder="Optional name" /></label>
         <label class="mb-field"><span class="mb-field-label">Area Type</span><select id="minibia-bot-special-area-type"><option value="avoid">Avoid</option><option value="never-step">Never Step</option><option value="prefer">Prefer</option><option value="combat-only">Combat Only</option><option value="targeting-wall">Targeting Wall</option><option value="no-combat">No Combat</option><option value="lure-destination">Lure Destination</option></select></label>
@@ -66232,15 +66299,19 @@ function upgradeSectionHeaders(panel) {
       <div class="mb-special-area-actions">
         <button type="button" class="mb-small-button" id="minibia-bot-special-area-pick">Pick Two Corners</button>
         <button type="button" class="mb-small-button" id="minibia-bot-special-area-current">Current Tile</button>
-        <button type="button" class="mb-small-button" id="minibia-bot-special-area-test">Test Path</button>
+      </div></div>
+      <details class="mb-looter-fold"><summary>Overlay &amp; path tools</summary>
+      <div class="mb-special-area-actions">
+        <button type="button" class="mb-small-button" id="minibia-bot-special-area-test" title="Draw a route to a clicked tile without moving your character">Test Path</button>
         <button type="button" class="mb-small-button" id="minibia-bot-special-area-overlay">Hide Overlay</button>
         <button type="button" class="mb-small-button" id="minibia-bot-special-area-test-clear">Clear Test Path</button>
       </div>
+      <div class="mb-small-note" id="minibia-bot-special-area-test-status">Test path: none</div>
+      </details>
       <div class="mb-small-note" id="minibia-bot-special-area-summary">Special Areas: loading</div>
       <div class="mb-small-note" id="minibia-bot-special-area-capture">Pick two corners to record an area.</div>
-      <div class="mb-small-note" id="minibia-bot-special-area-test-status">Test path: none</div>
       <div class="mb-special-area-list" id="minibia-bot-special-area-list"></div>
-      <div class="mb-small-note">Test Path only draws the route from your current tile to the clicked destination. It does not start CaveBot or move the character.</div>
+
     </div>
   </div>
 </div>
@@ -66973,6 +67044,22 @@ function upgradeSectionHeaders(panel) {
             const note=row.nextElementSibling;mapOptions.appendChild(row);if(note?.classList.contains('mb-small-note'))mapOptions.appendChild(note);
         }
         interfaceWindows.prepend(mapOptions);
+        // Keep Interface modules consistent and make secondary settings opt-in.
+        for(const tab of [interfacePanel,interfaceWindows,interfaceHotbars,interfaceNames]){
+            if(!tab)continue;tab.classList.add('mb-interface-compact');
+            const sections=Array.from(tab.querySelectorAll(':scope > .mb-section'));
+            sections.forEach((section,index)=>{
+                const header=section.querySelector(':scope > .mb-section-title');if(!header)return;
+                const fold=document.createElement('details');fold.className='mb-interface-settings';fold.open=index===0;
+                const summary=document.createElement('summary');summary.textContent='Settings';fold.append(summary);
+                const body=document.createElement('div');body.className='mb-interface-settings-body';
+                for(const child of Array.from(section.childNodes))if(child!==header)body.append(child);
+                const tips=Array.from(body.querySelectorAll('.mb-small-note')).filter(note=>!note.id&&!note.querySelector('input,button,select')&&note.textContent.trim());
+                if(tips.length){const help=document.createElement('details');help.className='mb-interface-tips';const label=document.createElement('summary');label.textContent='Help & tips';help.append(label);tips.forEach(note=>help.append(note));body.append(help);}
+                fold.append(body);section.append(fold);
+            });
+        }
+
         const followPanel=panel.querySelector('[data-tab-panel="utility"]');
         const followSection=panel.querySelector('#minibia-bot-follow-enabled')?.closest('.mb-section');
         if(followSection)followPanel.appendChild(followSection);
@@ -71041,7 +71128,42 @@ function upgradeSectionHeaders(panel) {
                 label.dataset.headingIcon=icons[title]||'⚙️';
             });
         }
+        const areaNew=panel.querySelector('#mb-area-new'),areaEditor=panel.querySelector('#mb-area-editor');
+        areaNew?.addEventListener('click',()=>{areaEditor.hidden=!areaEditor.hidden;areaNew.textContent=areaEditor.hidden?'+ Area':'Cancel';if(!areaEditor.hidden)panel.querySelector('#minibia-bot-special-area-name')?.focus();else bot.specialAreas?.cancelCapture?.();});
         decorateSectionHeaders();
+
+        // Context help uses the existing module headings and also covers panels
+        // mounted later. Buttons contain no text nodes, preserving title lookups.
+        const moduleHelp = {"Cave Bot": "Follows your saved waypoint route. Add or record waypoints, select the waypoint to start from, then enable Cave Bot. Use Stand for exact positions and Rope, Shovel or Ladder for floor actions. Combat and other movement modules can pause the route.", "Targeting": "Selects monsters and applies your movement settings. Set the default behavior, then add Monster Rules for exceptions. Attack Order ranks names, Preferred Mobs gives a preference, and Ignored Mobs excludes names. Enable Targeting to run it.", "Monster Rules": "Rules match monster names, HP, count and distance. The first matching targeting rule controls movement; unmatched monsters use Default Behavior. Spell and rune actions have their own conditions. Add a rule, choose its conditions and actions, then save. Move rules up or down to change priority.", "Default Behavior": "Sets movement and target distance for monsters without a matching targeting rule. Choose no chase, bot chase, client chase, kite or lure, then adjust position and distance.", "Attack Order · highest first": "Ranks matching monsters from top to bottom. Add one creature name per rule, choose Exact or Contains, and use the arrows to change the order. Disabled rules do not apply. Highest HP inside box can override this ranking.", "Preferred Mobs": "Gives matching monsters preference over ordinary monsters without ranking preferred names against each other. Add a name and choose Exact or Contains. Explicit Attack Order entries rank first. Preferred mobs also influence lure behavior.", "Ignored Mobs": "Excludes matching creatures from targeting. Add a name and choose Exact or Contains. Enable Attack ignored mobs when trapped if you want the bot to clear an ignored creature that blocks your route.", "Target Lists": "Attack Order sets a ranking, Preferred Mobs gives a general preference, and Ignored Mobs excludes names. Add or edit rules in each list. Contains matches any name containing your text; Exact matches the complete name.", "Healing": "Casts healing spells or uses healing items when your rule conditions match. Add a rule, set HP and mana ranges and the action, then enable Healing. Put urgent rules first. Healing has priority over utility and combat actions.", "Heal Friend": "Uses healing items on matching party or trusted players. Add a rule, choose the item, target name if needed, resource threshold and cooldown. Configure allowed targets below the list, then enable Heal Friend. Rules run from top to bottom.", "Mana Trainer": "Casts the configured spells when their mana and item-count conditions match. Add a spell rule, set the mana range and optional stock condition, then enable the module. Reorder rules to choose which is considered first.", "Rune Crafter": "Creates runes using the spells in your rules. Add a rune and target count; 0 means no item limit. Enable the crafter. Don’t cast while in combat pauses only while a target is selected. Mana, soul, cooldown and healing priority still apply.", "Ammo Crafter": "Creates ammunition using your rules. Add an ammunition spell and target count; 0 means no item limit. Enable the crafter. Don’t cast while in combat pauses while a target is selected. Casting still requires mana, soul and spell readiness.", "Looter": "Moves configured loot items from open corpse windows into your chosen destination. Select the destination bag, add tracked items and enable Looter. Corpse windows matching dead, slain or remains are recognized. Loot distant corpses can run separately when using the game’s native auto-loot.", "Loot distant corpses": "Queues eligible corpses and approaches them after combat clears. Enable this separately from the item-moving Looter. Set maximum distance and optional rare or price filters. In native auto-loot mode, passing within 1 SQM clears the corpse from the queue.", "Tracked Items": "Items the Looter is allowed to move. Add or pick an item, choose its destination options and enable the rule. Items outside this list are left alone.", "Off-screen Hunt": "Approaches known monsters outside normal targeting range. Choose All mobs or Alpha Hunter, set Hunt range, and enable Targeting. Loot first finishes pending looting before hunting another monster. Only creatures known to the client can be pursued.", "Lure": "Gathers monsters while coordinating movement with Cave Bot. Set pack size and radius, then select Lure or Kite Lure as the movement mode. Smart Lure and low-HP options control how the pack is handled. Off-screen Pull can bring known distant monsters into range.", "Anti-Killsteal": "Restricts targeting when other players are near a monster. Enable it and set your own and other-player ranges. This can make otherwise visible monsters unavailable as targets.", "Action Safety": "Safety settings for combat runes and Exori. Choose whether runes require the current target and whether area attacks should avoid nearby players. Set the player avoidance distance before enabling area attacks.", "Ring Equipper": "Swaps the configured rings according to mana thresholds. Pick the high- and low-mana items, set the lower and upper thresholds, and enable the module. Use different thresholds to avoid repeated switching near one value.", "Boot Swapper": "Swaps the configured boots when the selected conditions match. Pick the items, adjust the displayed conditions and enable the module.", "Helmet Swapper": "Swaps the configured helmets according to the displayed resource conditions. Pick both items, set the thresholds and enable the module.", "Weapon Equipper": "Keeps the configured weapon or ammunition supplied. Choose the item and refill conditions, then enable it. The bot checks available item counts before attempting to equip.", "Auto Pickup Items": "Picks matching loose items from nearby ground tiles. Add or pick the items to collect, set the allowed distance up to 8 SQM, then enable pickup. Movement can be delayed by combat or another module owning the route.", "Item mover": "Moves selected items into the arrow-slot bag and its child bags. Add an item rule and a destination total. Move up to 0 means unlimited. Enable the module once the destination is configured.", "Item Dropper": "Drops items according to your rules. Add or pick an item, set the count and destination, then enable it. My position uses your current tile each time; a fixed tile uses the selected coordinates.", "Depositer / Depot Room": "Deposits loot into depot storage. Configure the loot backpack and destination backpacks, then choose Depot Room or manual mode. Depot Room finds a reachable locker and waits for item moves to be confirmed. Use a Depot cave waypoint to run it on your route.", "NPC Supply / Trade": "Buys and sells items through an NPC trade conversation. Set the NPC name and supply rules. LOW below controls supply checks; Refill to is the total stock to buy up to. Use Refill Now or add a Cave Bot supply waypoint.", "Bank NPC": "Runs a bank conversation. Set the NPC name, choose deposit all, withdrawal or custom dialogue, and run the action. You can add it as a Cave Bot waypoint.", "Fisher": "Automates fishing with the configured equipment and location settings. Set the displayed item and fishing options, then enable it. Keep the required rod, bait and supplies available.", "Slime Trainer": "Maintains a slime-training setup using the configured training conditions. Set the thresholds and target options shown here, then enable it. Monitor the first session to confirm the setup fits your character.", "Monk Trainer": "Runs the configured monk-training behavior. Set the target and resource options shown in the panel, then enable it. Keep Healing configured for your training setup.", "Woodcutting": "Performs woodcutting using the selected tool and target settings. Configure the fields in this panel, keep the required tool available and enable the module.", "Mining": "Performs mining using the selected tool and target settings. Configure the fields in this panel, keep the required tool available and enable the module.", "Smithing": "Performs the configured smithing task. Select the recipe or item and required options, keep materials available and enable the module.", "Cooking": "Performs the configured cooking task. Select the food or recipe and required options, keep ingredients available and enable the module.", "Auto Follow": "Follows the configured player. Enter or select the leader and adjust follow options, then enable it. Follow can compete with route movement, so check which movement mode you want active.", "Hold Target": "Keeps the chosen target according to the settings shown here. Select the creature and enable the module. Disable it when you want ordinary targeting to freely choose another creature.", "ComboBot": "Coordinates the configured combat combination. Set the trigger, targets and actions shown here, then enable it. Required spells and items must be available.", "Auto Responder": "Replies to messages using your configured rules and response options. Set the message conditions, response text and limits, then enable it. Review your responses before leaving it running.", "Random Outfit": "Changes your outfit using the configured timing and choices. Set the interval and permitted outfit options, then enable it.", "Profiles": "Saves and loads bot configurations. Save the current setup under a recognizable name, then load that profile when needed. Check the loaded settings before starting automation.", "Setup File": "Imports or exports a bot setup file. Export to keep a backup; import a compatible file to restore its settings. Review the resulting configuration before enabling modules.", "Storage Manager": "Manages saved bot data in this browser. Use the listed save, export, restore or removal actions for the selected data. Export a backup before deleting saved configurations.", "Special Areas": "Adds map areas that influence pathfinding and targeting. Pick two corners, choose the area type and strength, and save it in the current cave preset. Use Test Path and the overlay to inspect the effect.", "Waypoint Properties": "Edits the selected waypoint. Set its label, action and optional script, then save. Stand requires the exact tile; action waypoints handle their selected floor transition.", "Panic Runner": "Moves toward your configured safety destination when a panic condition triggers. Set the destination and trigger conditions, then enable the module. Check that your route to safety is usable.", "Trusted Names": "Defines players treated as trusted by modules that support trusted-player checks. Add the exact character names and save them. Heal Friend can use this list when trusted targets are enabled.", "Item Count Alerts": "Alerts when configured item counts meet your conditions. Add or pick the item, set its threshold and alert options, then enable the rule.", "Alerts": "Configures notifications and sounds for game events. Enable the events you want, adjust thresholds and test their sounds. Browser audio may require a click in the page first.", "Audio": "Controls bot alert volume and sound options. Set the level and use a sound test to confirm it is audible. A browser interaction may be required before sounds can play.", "Following Item": "Watches for repeated appearances of the same movable item beside you as you move. A detection pauses Cave Bot and Targeting for 10 seconds, alerts you and tries moving the item onto your tile. Resume now ends the pause early.", "Ground Spawn Logger": "Records ground-item changes for debugging. Enable it before reproducing an issue, then use the snapshot or export controls to inspect what appeared or disappeared.", "Hunt Analyzer": "Tracks the hunt’s loot, supplies and performance statistics. Start or reset a session as needed. Item price settings determine the calculated value and profit.", "Overlays": "Displays selected bot information over the game. Enable the statistics or debugging overlays you want and configure their placement here.", "X-Ray": "Changes the client’s display to reveal the configured view information. Enable it and adjust its visual options. This affects what is displayed by the client.", "Name Spoofer": "Changes the displayed name locally according to this panel’s settings. Enter the desired display name and apply or enable it.", "User Interface Tweaks": "Customizes the game interface. Choose sidebar width, panel placement, hotbars and appearance options. Apply one layout change at a time when adjusting your setup.", "Hotbar": "Places the main hotbar at the bottom or sides. Choose a position and enable the second bank if wanted. The automatic tray fills available space with custom slots.", "Extra hotbars": "Adds custom hotbars. Create a bar, choose its position and slot count, then bind slots with Ctrl+click. Drag the header to reposition it; Escape cancels binding and Backspace clears it.", "Extra sidebars": "Adds extra sidebar columns. Choose the number of columns on each side, then place supported panels in them.", "Side panels": "Selects which sidebar contains Health & Mana, Equipment and Minimap. Choose a destination for each panel.", "mb0t panel": "Controls docking of the collapsed mb0t panel. Enable sidebar docking or drag the floating header to move it. Use the expand button to open the settings window.", "Panel appearance": "Changes the mb0t panel’s appearance and layout options. Adjust the controls here to your preferred size and style.", "Browser title": "Shows character and bot status in the browser tab title. Enable status text and optional alert titles to help identify the game tab.", "Staff markers": "Marks recognized staff or ghost creatures on screen. Enable markers and optional sound, then use the test control to check the alert.", "Stop / resume shortcut": "Sets the shortcut used to pause and resume automation. Choose the key combination and use it to quickly suspend the configured modules.", "Follow Diagnostics": "Shows follow-state and movement diagnostics. Use it when investigating a leader or follow problem; inspect the reported status while reproducing the issue.", "Task & Quest Tracker": "Tracks the configured tasks and quests. Add or select the objectives you want to monitor and review progress in this panel.", "Anti-Bot & GM Protection": "Groups the available anti-bot and staff alert settings. Read each option and enable the notifications or stop actions appropriate for your setup. Use the test controls to check alerts.", "Tools": "Contains optional utility modules. Open the relevant settings, configure the action and enable only the tools you want running."};
+        const helpStyle=document.createElement('style');helpStyle.textContent=`
+          #minibia-bot-panel button.mb-module-info{display:inline-flex!important;align-items:center!important;justify-content:center!important;align-self:center;flex:0 0 20px!important;width:20px!important;min-width:20px!important;max-width:20px!important;height:20px!important;min-height:20px!important;padding:0!important;margin:0!important;border:0!important;border-radius:0!important;background:transparent!important;box-shadow:none!important;position:relative!important;top:auto!important;left:auto!important;transform:none!important;line-height:1!important;cursor:pointer;order:0;}
+          #minibia-bot-panel button.mb-module-info::before{content:"ⓘ"!important;display:block!important;position:static!important;inset:auto!important;transform:none!important;width:auto!important;height:auto!important;padding:0!important;margin:0!important;font-family:Arial,sans-serif!important;font-size:17px!important;line-height:1!important;color:#c8b97f;}
+          #minibia-bot-panel button.mb-module-info::after{content:none!important;display:none!important;}
+          .mb-module-help-dialog{color:#ddd;background:#242424;border:1px solid #655b40;border-radius:8px;padding:16px;max-width:440px;width:calc(100vw - 40px);box-sizing:border-box;box-shadow:0 12px 48px #0009;}
+          .mb-module-help-dialog::backdrop{background:#0008;}
+          .mb-module-help-dialog h3{margin:0 0 10px;color:#e3c66b;font-size:15px;}
+          .mb-module-help-dialog p{font:13px/1.6 sans-serif;white-space:pre-line;margin:0 0 14px;}
+          .mb-module-help-dialog button{display:block;margin-left:auto;padding:5px 16px;color:#eee;background:#333;border:1px solid #666;border-radius:4px;cursor:pointer;}
+        `;panel.append(helpStyle);
+        const helpDialog=document.createElement('dialog');helpDialog.className='mb-module-help-dialog';
+        const helpTitle=document.createElement('h3'),helpBody=document.createElement('p'),helpClose=document.createElement('button');helpClose.type='button';helpClose.textContent='Close';helpDialog.append(helpTitle,helpBody,helpClose);document.body.append(helpDialog);helpClose.addEventListener('click',()=>helpDialog.close());
+        helpDialog.addEventListener('click',event=>{if(event.target===helpDialog){const r=helpDialog.getBoundingClientRect();if(event.clientX<r.left||event.clientX>r.right||event.clientY<r.top||event.clientY>r.bottom)helpDialog.close();}});
+        const cleanHelpTitle=value=>String(value||'').replace(/^[^\p{L}\p{N}]+/u,'').replace(/\s+/g,' ').trim();
+        function addModuleHelp(root){
+            const headers=[...(root.matches?.('.mb-section-title,.mb-section-header')?[root]:[]),...root.querySelectorAll?.('.mb-section-title,.mb-section-header')||[]];
+            for(const header of headers){
+                if(header.querySelector(':scope > .mb-module-info'))continue;
+                const label=header.querySelector('.mb-title-text,.mb-label');if(!label)continue;
+                const title=cleanHelpTitle(label.textContent);if(!title)continue;
+                const section=header.closest('.mb-section')||header.parentElement;
+                const text=moduleHelp[title]||`${title} settings. Configure the options shown in this panel, then use its enable control or action button. Hover individual controls for their specific hints.`;
+                const info=document.createElement('button');info.type='button';info.className='mb-module-info';info.title=text;info.setAttribute('aria-label',`How to use ${title}`);info.addEventListener('click',event=>{event.preventDefault();event.stopPropagation();helpTitle.textContent=title;helpBody.textContent=text;if(!helpDialog.open)helpDialog.showModal();});label.after(info);
+            }
+        }
+        addModuleHelp(panel);
+        const helpObserver=new MutationObserver(records=>{for(const record of records)for(const node of record.addedNodes)if(node.nodeType===1&&!node.classList.contains('mb-module-info'))addModuleHelp(node);});
+        helpObserver.observe(panel,{childList:true,subtree:true});
+        bot.addCleanup(()=>{helpObserver.disconnect();helpDialog.remove();helpStyle.remove();});
 
         // ---- INITIAL REFRESHES ----
         try {
@@ -71760,17 +71882,19 @@ body.mb-full-width-minimap:not(.force-mobile) #minimap-container .crosshair{
 
     function applyStyles() {
         const customDesktop=bot.interfaceLayout?.config.enabled!==false&&!window.gameClient?.touch?.isMobileMode;
-        document.body.classList.toggle('mb-custom-sidebar-width',customDesktop);
-        if(customDesktop)document.body.style.setProperty('--mb-sidebar-width',config.bagColumns===4?'174px':config.wideColumns?'224px':'216px');
+        const desktop=!window.gameClient?.touch?.isMobileMode;
+        const sidebarWidthEnabled=customDesktop||(desktop&&config.wideColumns===true);
+        document.body.classList.toggle('mb-custom-sidebar-width',sidebarWidthEnabled);
+        if(sidebarWidthEnabled)document.body.style.setProperty('--mb-sidebar-width',customDesktop&&config.bagColumns===4?'174px':config.wideColumns?'224px':'216px');
         else document.body.style.removeProperty('--mb-sidebar-width');
         document.body.classList.toggle("mb-six-slot-rows",config.bagColumns===6&&bot.interfaceLayout?.config.enabled!==false&&!window.gameClient?.touch?.isMobileMode);
-        document.body.classList.toggle("mb-full-width-minimap",config.fullWidthMinimap===true&&bot.interfaceLayout?.config.enabled!==false&&!window.gameClient?.touch?.isMobileMode);
+        document.body.classList.toggle("mb-full-width-minimap",config.fullWidthMinimap===true&&desktop);
         document.body.classList.toggle('mb-four-slot-rows',customDesktop&&config.bagColumns===4);
         syncEquipmentIcons();
         const columns = document.querySelectorAll("#game-wrapper .column");
-        const newWidth = config.bagColumns===4 ? "174px" : config.wideColumns ? "224px" : "216px";
+        const newWidth = customDesktop&&config.bagColumns===4 ? "174px" : config.wideColumns ? "224px" : "216px";
         columns.forEach(col => {
-            if(bot.interfaceLayout?.config.enabled===false)col.style.removeProperty('width');else col.style.width = newWidth;
+            if(!sidebarWidthEnabled)col.style.removeProperty('width');else col.style.width = newWidth;
         });
 
         bot.sidebarPanels?.sync?.();
