@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.621",
+        version: "1.6.622",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -34729,6 +34729,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         state.frontierRoutePlan = null;
         state.frontierMotionWatch = null;
         state.offscreenFrontierKey = null;
+        state.frontierVisitedTiles = new Set();
         state.offscreenFrontierAttempts = 0;
         state.offscreenFrontierBestDistance = Infinity;
         state.offscreenFrontierLastDistance = Infinity;
@@ -34913,8 +34914,17 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             watch.key=getPositionKey(position);
             // A real step along the issued detour counts even if direct
             // distance to the waypoint temporarily increases.
-            state.lastProgressAt=now;state.nativePathWatchAt=now;
-            state.offscreenFrontierLastImprovedAt=now;state.offscreenFrontierAttempts=0;
+            const visited = state.frontierVisitedTiles || (state.frontierVisitedTiles = new Set());
+            const freshTile = !visited.has(watch.key);
+            visited.add(watch.key);
+            // Replaying a previous detour is movement, but cannot keep the
+            // waypoint recovery counter alive forever. Only new terrain earns
+            // detour progress; actual best-distance improvements are tracked
+            // separately by noteOffscreenFrontierState.
+            if (freshTile) {
+                state.lastProgressAt=now;state.nativePathWatchAt=now;
+                state.offscreenFrontierLastImprovedAt=now;state.offscreenFrontierAttempts=0;
+            }
             const plan=state.frontierRoutePlan;
             if (plan && plan.key===watch.planKey) plan.progressAt=now;
         }
