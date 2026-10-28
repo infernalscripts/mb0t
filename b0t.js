@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.601",
+        version: "1.6.609",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -11871,6 +11871,7 @@ window.__minibiaBotBundle.installCombatRulesModule = function(bot) {
         const box = document.createElement('div'); box.className = 'mb-combat-rules'; host.appendChild(box);
         box.innerHTML = `<style>
         #minibia-bot-panel .mb-combat-rules {font-size:11px;}
+        #minibia-bot-panel [data-monster-rules-heading]::after {order:1;}
         #minibia-bot-panel .mb-combat-rules .cr-toolbar {display:flex;align-items:center;justify-content:space-between;gap:8px;}
         #minibia-bot-panel .mb-combat-rules .cr-form {display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:7px;}
         #minibia-bot-panel .mb-combat-rules .cr-range {display:flex;align-items:center;gap:5px;}
@@ -11887,7 +11888,7 @@ window.__minibiaBotBundle.installCombatRulesModule = function(bot) {
         #minibia-bot-panel .mb-combat-rules .cr-actions button {padding:3px 7px;font-size:10px;}
         #minibia-bot-panel .mb-combat-rules [hidden] {display:none!important;}
         </style>
-        <div class="cr-toolbar"><span style="font-weight:bold;">Monster Rules</span><button type="button" class="mb-small-button" data-cr="new">+ New Rule</button></div>
+        <div class="mb-section-title" data-monster-rules-heading><span class="mb-title-text">⚔️ Monster Rules</span><button type="button" class="mb-small-button" data-cr="new" style="margin-left:auto;order:2">+ Rule</button></div>
         <div class="cr-actions" style="display:flex;gap:4px;flex-wrap:wrap;margin-top:5px">
           <button type="button" class="mb-small-button" data-cr="export">Export JSON</button>
           <button type="button" class="mb-small-button" data-cr="import">Import file</button>
@@ -12586,11 +12587,9 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         offscreenHuntNoProgressMs: 5000,
         meleeMode: true,
         enabled: false,
-        preferredTargetNames: [],
-        preferredMatchMode: "exact",
-        targetPriorityNames: [],
-        targetPriorityMatchMode: "exact",
-        ignoredTargetNames: [],
+        preferredTargetNames: [], preferredMatchMode: "exact", preferredTargetRules: [],
+        targetPriorityNames: [], targetPriorityMatchMode: "exact", targetPriorityRules: [],
+        ignoredTargetNames: [], ignoredTargetMatchMode: "exact", ignoredTargetRules: [],
         attackIgnoredWhenTrapped: false,
         antiKSEnabled: true,
         antiKSSelfRange: 2,
@@ -13378,26 +13377,10 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         return String(name || "").trim().toLowerCase();
     }
 
-    function getIgnoredTargetNameSet() {
-        return new Set(
-            (Array.isArray(config.ignoredTargetNames)
-                ? config.ignoredTargetNames
-                : []
-            )
-                .map(name => normalizeCreatureName(name))
-                .filter(Boolean)
-        );
-    }
-
+    function getIgnoredTargetNameSet() { return new Set(config.ignoredTargetRules.filter(r=>r.enabled&&r.matchMode!=="includes").map(r=>normalizeCreatureName(r.name)).filter(Boolean)); }
     function isIgnoredTargetName(name) {
-        const normalized =
-            normalizeCreatureName(name);
-        if (!normalized)
-            return false;
-
-        return getIgnoredTargetNameSet().has(
-            normalized
-        );
+        const normalized=normalizeCreatureName(name);
+        return !!normalized&&config.ignoredTargetRules.some(r=>r.enabled&&targetNameRuleMatches(normalized,r));
     }
 
     function isConfiguredIgnoredCreature(creature) {
@@ -13640,17 +13623,31 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             }).slice(0, 100);
     }
 
+    function normalizeTargetNameRules(value,names=[],mode="exact") {
+        const source=Array.isArray(value)&&value.length?value:(Array.isArray(names)?names:[]),seen=new Set();
+        return source.map(r=>typeof r==="string"?{name:r,enabled:true,matchMode:mode}:r)
+            .map(r=>({name:String(r?.name??"").trim().slice(0,64),enabled:r?.enabled!==false,matchMode:r?.matchMode==="includes"||r?.mode==="includes"?"includes":"exact"}))
+            .filter(r=>{const k=normalizeCreatureName(r.name);if(!k||seen.has(k))return false;seen.add(k);return true;}).slice(0,100);
+    }
+    function targetNameRuleMatches(name,rule) {
+        const n=normalizeCreatureName(name),r=normalizeCreatureName(rule?.name);
+        return !!n&&!!r&&(rule?.matchMode==="includes"?n.includes(r):n===r);
+    }
+    config.targetPriorityRules=normalizeTargetNameRules(config.targetPriorityRules,config.targetPriorityNames,config.targetPriorityMatchMode);
+    config.preferredTargetRules=normalizeTargetNameRules(config.preferredTargetRules,config.preferredTargetNames,config.preferredMatchMode);
+    config.ignoredTargetRules=normalizeTargetNameRules(config.ignoredTargetRules,config.ignoredTargetNames,config.ignoredTargetMatchMode);
+    config.targetPriorityNames=config.targetPriorityRules.filter(r=>r.enabled).map(r=>r.name);
+    config.preferredTargetNames=config.preferredTargetRules.filter(r=>r.enabled).map(r=>r.name);
+    config.ignoredTargetNames=config.ignoredTargetRules.filter(r=>r.enabled).map(r=>r.name);
+
     function getTargetPriorityRank(creature) {
-        const names = config.targetPriorityNames;
-        if (!names.length) return 0;
+        const rules = config.targetPriorityRules.filter(rule=>rule.enabled);
+        if (!rules.length) return 0;
         const name = normalizeCreatureName(creature?.name);
-        const index = names.findIndex(value => {
-            const entry = normalizeCreatureName(value);
-            return name === entry || (config.targetPriorityMatchMode === "includes" && name.includes(entry));
-        });
+        const index = rules.findIndex(rule => targetNameRuleMatches(name,rule));
         // Explicit attack order comes first. Preserve the existing preferred
         // tier and ordinary targeting among monsters absent from the list.
-        return index >= 0 ? index : names.length + (isPreferredCreature(creature) ? 0 : 1);
+        return index >= 0 ? index : rules.length + (isPreferredCreature(creature) ? 0 : 1);
     }
 
     function compareBoxHealth(a,b){
@@ -13665,26 +13662,9 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         return compareBoxHealth(a,b) || getTargetPriorityRank(a) - getTargetPriorityRank(b);
     }
 
-    function getPreferredTargetNames() {
-        if (!Array.isArray(config.preferredTargetNames))
-            return [];
-        return config.preferredTargetNames.map(n => String(n || "").trim()).filter(Boolean);
-    }
-
+    function getPreferredTargetNames() { return config.preferredTargetRules.filter(rule=>rule.enabled).map(rule=>rule.name); }
     function isPreferredCreature(creature) {
-        const preferred = getPreferredTargetNames();
-        if (!creature?.name || !preferred.length)
-            return false;
-        const name = normalizeCreatureName(creature.name);
-        return preferred.some(p => {
-            const pnorm = normalizeCreatureName(p);
-            if (!pnorm)
-                return false;
-            if (config.preferredMatchMode === "includes") {
-                return name === pnorm || name.includes(pnorm);
-            }
-            return name === pnorm;
-        });
+        return !!creature?.name&&config.preferredTargetRules.some(rule=>rule.enabled&&targetNameRuleMatches(creature.name,rule));
     }
 
     // ---- Helper ----
@@ -19643,11 +19623,6 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
     }
 
     function getLureVisibleMonsters() {
-        const ignoredNames = new Set(
-            (config.ignoredTargetNames || [])
-                .map(name => normalizeCreatureName(name))
-                .filter(Boolean)
-        );
         const me = normalizePosition(bot.getPlayerPosition());
         const radius = Math.max(
             1,
@@ -19668,7 +19643,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         // off-screen creatures made Lure believe the pack was already full and
         // stop route/pull movement before the mobs were truly acquired.
         return getNearbyMonsters(false).filter(monster => {
-            if (ignoredNames.has(normalizeCreatureName(monster?.name)))
+            if (isIgnoredTargetName(monster?.name))
                 return false;
 
             const screen = getNativeSmallScreenInfo(monster);
@@ -20890,11 +20865,6 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         if (!me)
             return null;
 
-        const ignoredNames = new Set(
-            (config.ignoredTargetNames || [])
-                .map(name => normalizeCreatureName(name))
-                .filter(Boolean)
-        );
         const maxDist = Math.max(1, Number(config.maxTargetDistance) || 5);
         const antiKS = getAntiKSContext(now);
 
@@ -20904,7 +20874,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                     return false;
                 if ((state.skippedTargetIds.get(monster.id) || 0) > now)
                     return false;
-                if (ignoredNames.has(normalizeCreatureName(monster?.name)))
+                if (isIgnoredTargetName(monster?.name))
                     return false;
                 if (!isStrictPreferredScreenVisible(monster))
                     return false;
@@ -24677,10 +24647,6 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         }
 
         // --- BUILD IGNORED SET (Normalized) ---
-        const ignoredNames = new Set(
-                (config.ignoredTargetNames || [])
-                .map(n => normalizeCreatureName(n))
-                .filter(Boolean));
         const antiKS = getAntiKSContext(now);
         const maxDist = Math.max(1, Number(config.maxTargetDistance) || 5);
         const skipped = state.skippedTargetIds;
@@ -24696,7 +24662,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                 return false;
 
             const monsterName = normalizeCreatureName(monster.name);
-            if (ignoredNames.has(monsterName) || bot.combatRules?.targetRule?.(monster)?.mode === 'ignore')
+            if (isIgnoredTargetName(monsterName) || bot.combatRules?.targetRule?.(monster)?.mode === 'ignore')
                 return false;
 
             // Check the acquisition radius before any approach search. A mob
@@ -26573,6 +26539,20 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         if (config.kiteLureMode) Object.assign(config,{kiteMode:true,lureMode:false,meleeMode:false,useClientChase:false});
         config.targetPriorityNames = normalizeTargetPriorityNames(config.targetPriorityNames);
         config.targetPriorityMatchMode = config.targetPriorityMatchMode === "includes" ? "includes" : "exact";
+        const startRuleLists=[
+            ["targetPriorityRules","targetPriorityNames","targetPriorityMatchMode"],
+            ["preferredTargetRules","preferredTargetNames","preferredMatchMode"],
+            ["ignoredTargetRules","ignoredTargetNames","ignoredTargetMatchMode"]
+        ];
+        for(const [rulesKey,namesKey,modeKey] of startRuleLists){
+            if(Array.isArray(overrides[rulesKey]))config[rulesKey]=normalizeTargetNameRules(overrides[rulesKey],[],config[modeKey]);
+            else if(Array.isArray(overrides[namesKey])||overrides[modeKey]!==undefined){
+                const names=Array.isArray(overrides[namesKey])?overrides[namesKey]:config[namesKey];
+                const mode=overrides[modeKey]==="includes"?"includes":overrides[modeKey]!==undefined?"exact":config[modeKey];
+                config[rulesKey]=normalizeTargetNameRules(null,names,mode).map(rule=>({...rule,matchMode:mode}));
+            }
+            config[namesKey]=config[rulesKey].filter(rule=>rule.enabled).map(rule=>rule.name);
+        }
         if (config.kiteMode)
             config.useClientChase = false;
 
@@ -27723,7 +27703,15 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
             const value = Number(nextConfig.fastReacquireMs);
             nextConfig.fastReacquireMs = Number.isFinite(value) ? Math.max(50, Math.min(500, value)) : config.fastReacquireMs;
         }
-        const priorityChanged = nextConfig.targetPriorityNames !== undefined || nextConfig.targetPriorityMatchMode !== undefined;
+        const syncNameRules=(ruleKey,namesKey,modeKey)=>{
+            const hasRules=nextConfig[ruleKey]!==undefined,hasNames=nextConfig[namesKey]!==undefined,hasMode=nextConfig[modeKey]!==undefined;
+            if(hasRules){const rules=normalizeTargetNameRules(nextConfig[ruleKey],[],config[modeKey]);nextConfig[ruleKey]=rules;nextConfig[namesKey]=rules.filter(r=>r.enabled).map(r=>r.name);if(rules.length)nextConfig[modeKey]=rules[0].matchMode;}
+            else if(hasNames||hasMode){const names=Array.isArray(nextConfig[namesKey])?nextConfig[namesKey]:config[namesKey];const mode=hasMode?(nextConfig[modeKey]==="includes"?"includes":"exact"):config[modeKey];nextConfig[ruleKey]=normalizeTargetNameRules(null,names,mode).map(r=>({...r,matchMode:mode}));nextConfig[namesKey]=nextConfig[ruleKey].filter(r=>r.enabled).map(r=>r.name);}
+        };
+        syncNameRules("targetPriorityRules","targetPriorityNames","targetPriorityMatchMode");
+        syncNameRules("preferredTargetRules","preferredTargetNames","preferredMatchMode");
+        syncNameRules("ignoredTargetRules","ignoredTargetNames","ignoredTargetMatchMode");
+        const priorityChanged = nextConfig.targetPriorityRules !== undefined || nextConfig.targetPriorityNames !== undefined || nextConfig.targetPriorityMatchMode !== undefined;
         if (nextConfig.targetPriorityNames !== undefined)
             nextConfig.targetPriorityNames = normalizeTargetPriorityNames(nextConfig.targetPriorityNames);
         if (nextConfig.targetPriorityMatchMode !== undefined)
@@ -27737,8 +27725,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
                  ? nextConfig.preferredTargetNames.map(n => String(n).trim()).filter(Boolean)
                  : [];
         }
-        const ignoredNamesChanged =
-            nextConfig.ignoredTargetNames !== undefined;
+        const ignoredNamesChanged = nextConfig.ignoredTargetNames !== undefined || nextConfig.ignoredTargetRules !== undefined;
         if (ignoredNamesChanged) {
             nextConfig.ignoredTargetNames = Array.isArray(nextConfig.ignoredTargetNames)
                  ? nextConfig.ignoredTargetNames.map(n => String(n).trim()).filter(Boolean)
@@ -27850,6 +27837,7 @@ window.__minibiaBotBundle.installAutoAttackModule = function installAutoAttackMo
         clearCombatRuleMode,
         getBaseConfig: () => ({...config, ...(combatRuleModeBase || {})}),
         isLegacyIgnoredTarget: creature => !!creature && isIgnoredTargetName(creature.name),
+        isIgnoredName: name => isIgnoredTargetName(name),
         getVisibleCombatMonsters: () => Object.values(window.gameClient?.world?.activeCreatures || {}).filter(m => isNativeVisibleMonster(m, true)),
         getProjectileLineOfSightToPosition: (position) => {
             if (!position) return false;
@@ -30714,11 +30702,6 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             (typeof CONST !== "undefined" && CONST.TYPES)
                 ? CONST.TYPES.MONSTER
                 : undefined;
-        const ignoredNames = new Set(
-            (bot.attack?.config?.ignoredTargetNames || [])
-                .map(name => String(name || "").trim().toLowerCase())
-                .filter(Boolean)
-        );
 
         const result = [];
         for (const id in creatures) {
@@ -30734,9 +30717,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             if (bot.isPlayerSummon(creature))
                 continue;
             if (
-                ignoredNames.has(
-                    String(creature.name || "").trim().toLowerCase()
-                )
+                bot.attack?.isIgnoredName?.(creature.name)
             ) {
                 continue;
             }
@@ -61678,6 +61659,7 @@ function upgradeSectionHeaders(panel) {
     
     // ---- REFRESH FUNCTIONS (tie UI to bot state) ----
     function refreshAutoAttackPriorityStatus(options = {}) {
+        refreshTargetNameRuleEditors();
         const input = document.getElementById("minibia-bot-auto-attack-priority-names");
         const mode = document.getElementById("minibia-bot-auto-attack-priority-match-mode");
         const config = bot.attack?.config || {};
@@ -61698,7 +61680,7 @@ function upgradeSectionHeaders(panel) {
     }
 
     function refreshAutoAttackPreferredStatus(options = {}) {
-        refreshAutoAttackPriorityStatus(options);
+        refreshAutoAttackPriorityStatus(options);refreshTargetNameRuleEditors();
         const force = options.force === true;
         const input = document.getElementById("minibia-bot-auto-attack-preferred-names");
         const modeSelect = document.getElementById("minibia-bot-auto-attack-preferred-match-mode");
@@ -61722,6 +61704,7 @@ function upgradeSectionHeaders(panel) {
     }
 
     function refreshAutoAttackIgnoredStatus(options = {}) {
+        refreshTargetNameRuleEditors();
         const force = options.force === true;
         const input = document.getElementById("minibia-bot-auto-attack-ignored-names");
         const statusLabel = document.getElementById("minibia-bot-auto-attack-ignored-status");
@@ -61974,6 +61957,40 @@ function upgradeSectionHeaders(panel) {
         bot.log?.("auto attack ignored targets updated", {
             ignoredTargetNames: ignored
         });
+    }
+
+    let refreshTargetNameRuleEditors=()=>{};
+    function mountTargetNameRuleEditors(panel){
+        const defs=[
+            {id:"priority",title:"Attack Order · highest first",key:"targetPriorityRules",names:"targetPriorityNames",mode:"targetPriorityMatchMode",hint:"Earlier rules rank first."},
+            {id:"preferred",title:"Preferred Mobs",key:"preferredTargetRules",names:"preferredTargetNames",mode:"preferredMatchMode",hint:"Preferred targets rank ahead of other mobs."},
+            {id:"ignored",title:"Ignored Mobs",key:"ignoredTargetRules",names:"ignoredTargetNames",mode:"ignoredTargetMatchMode",hint:"Matching mobs are excluded from targeting."}
+        ];
+        const editors=new Map();
+        const liveNames=()=>{const all=window.gameClient?.world?.activeCreatures;const rows=all instanceof Map?[...all.values()]:Object.values(all||{});const mt=typeof CONST!=="undefined"?CONST.TYPES?.MONSTER:undefined;return [...new Set(rows.filter(c=>c&&c.name&&(mt===undefined?c.type!==0:c.type===mt)).map(c=>String(c.name).trim()).filter(Boolean))].sort((a,b)=>a.localeCompare(b));};
+        function render(){for(const d of defs){const host=panel.querySelector(`[data-target-name-rules="${d.id}"]`);if(!host)continue;
+            const cfg=bot.attack?.config||{};const rules=Array.isArray(cfg[d.key])?cfg[d.key]:[];let ui=editors.get(d.id);
+            if(!ui){host.replaceChildren();const header=document.createElement("div");header.className="mb-section-title mb-section-title--sub";header.style.cssText="margin:0 0 4px";const title=document.createElement("span");title.className="mb-title-text";title.textContent=d.title;const add=document.createElement("button");add.type="button";add.className="mb-small-button";add.textContent="+ Rule";add.style.marginLeft="auto";add.setAttribute("data-target-list-add","");header.append(title,add);
+                const details=document.createElement("details"),summary=document.createElement("summary"),list=document.createElement("div"),editor=document.createElement("div");details.style.cssText="margin:2px 0 5px";summary.style.cssText="cursor:pointer;font-size:10px;color:#aaa;padding:3px 5px";summary.textContent=`${rules.length} rules`;details.append(summary,list);details.open=!(d.id==="ignored"&&rules.length>6);editor.hidden=true;editor.style.cssText="display:none;grid-template-columns:minmax(0,1fr) 125px;gap:5px;border:1px solid rgba(255,255,255,.1);border-radius:5px;padding:6px;margin-top:4px";
+                const wrap=document.createElement("label");wrap.className="mb-field";const caption=document.createElement("span");caption.className="mb-field-label";caption.textContent="Creature";const input=document.createElement("input");input.type="text";input.maxLength=64;input.placeholder="Start typing a creature name";input.setAttribute("list",`mb-target-creatures-${d.id}`);const dl=document.createElement("datalist");dl.id=`mb-target-creatures-${d.id}`;wrap.append(caption,input,dl);
+                const modeWrap=document.createElement("label");modeWrap.className="mb-field";const modeCaption=document.createElement("span");modeCaption.className="mb-field-label";modeCaption.textContent="Match";const mode=document.createElement("select");mode.innerHTML='<option value="exact">Exact name</option><option value="includes">Contains text</option>';modeWrap.append(modeCaption,mode);
+                const buttons=document.createElement("div");buttons.style.cssText="grid-column:1/-1;display:flex;justify-content:flex-end;gap:5px";const save=document.createElement("button"),cancel=document.createElement("button");save.type=cancel.type="button";save.className=cancel.className="mb-small-button";save.textContent="Add rule";cancel.textContent="Cancel";buttons.append(save,cancel);editor.append(wrap,modeWrap,buttons);host.append(header,editor,details);
+                ui={list,details,summary,editor,input,dl,mode,save,editIndex:null};editors.set(d.id,ui);
+                const open=index=>{ui.editIndex=index;const current=bot.attack?.config?.[d.key]||[];const r=index==null?{name:"",matchMode:"exact"}:current[index];ui.input.value=r?.name||"";ui.mode.value=r?.matchMode||"exact";ui.save.textContent=index==null?"Add rule":"Save rule";ui.editor.hidden=false;ui.editor.style.display="grid";updateSuggestions();ui.input.focus();};
+                const updateSuggestions=()=>{const names=liveNames(),needle=ui.input.value.trim().toLowerCase();ui.dl.replaceChildren();for(const n of names.filter(n=>!needle||n.toLowerCase().includes(needle)).slice(0,80)){const o=document.createElement("option");o.value=n;ui.dl.append(o);}};
+                add.addEventListener("click",()=>open(null));ui.input.addEventListener("input",updateSuggestions);cancel.addEventListener("click",()=>{ui.editor.hidden=true;ui.editor.style.display="none";ui.editIndex=null;});
+                save.addEventListener("click",()=>{const name=ui.input.value.trim();if(!name)return;const latest=[...(bot.attack?.config?.[d.key]||[])];const rule={name,enabled:ui.editIndex==null?true:latest[ui.editIndex]?.enabled!==false,matchMode:ui.mode.value==="includes"?"includes":"exact"};if(ui.editIndex==null)latest.push(rule);else latest[ui.editIndex]=rule;bot.attack?.updateConfig?.({[d.key]:latest});ui.editor.hidden=true;ui.editor.style.display="none";ui.editIndex=null;render();});
+            }
+            ui.summary.textContent=`${rules.length} rule${rules.length===1?"":"s"}`;ui.list.replaceChildren();if(!rules.length){const empty=document.createElement("div");empty.className="mb-small-note";empty.textContent="No rules yet. Add a creature rule.";ui.list.append(empty);}
+            rules.forEach((rule,i)=>{const row=document.createElement("div");row.className="mb-support-rule";const enabled=document.createElement("input");enabled.type="checkbox";enabled.checked=rule.enabled!==false;const label=document.createElement("span");label.textContent=`${d.id==="priority"?`${i+1}. `:""}${rule.name}`;label.title=rule.name;label.style.cssText="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap";const button=(row,text,title,fn)=>{const b=document.createElement("button");b.type="button";b.className="mb-small-button";b.textContent=text;b.title=title;b.setAttribute("aria-label",title);b.addEventListener("click",fn);row.append(b);};
+                enabled.addEventListener("change",()=>{const next=rules.map((r,j)=>j===i?{...r,enabled:enabled.checked}:r);bot.attack?.updateConfig?.({[d.key]:next});render();});
+                label.style.opacity=enabled.checked?"1":".5";row.append(enabled,label);const actions=document.createElement("div");actions.className="mb-support-rule-actions";row.append(actions);if(rule.matchMode==="includes")label.textContent+=` · Contains`;
+                if(d.id==="priority"){const move=delta=>{const n=[...rules],to=i+delta;if(to<0||to>=n.length)return;[n[i],n[to]]=[n[to],n[i]];bot.attack?.updateConfig?.({[d.key]:n});render();};button(actions,"↑","Move rule up",()=>move(-1));button(actions,"↓","Move rule down",()=>move(1));}
+                button(actions,"Edit","Edit rule",()=>{const current=bot.attack?.config?.[d.key]||[];ui.editIndex=i;ui.input.value=current[i]?.name||rule.name;ui.mode.value=current[i]?.matchMode||"exact";ui.save.textContent="Save rule";ui.editor.hidden=false;ui.editor.style.display="grid";ui.input.focus();});
+                button(actions,"✕","Remove rule",()=>{bot.attack?.updateConfig?.({[d.key]:rules.filter((_,j)=>j!==i)});render();});ui.list.append(row);
+            });
+        }}
+        refreshTargetNameRuleEditors=render;render();
     }
 
     // ---- HEAL UI ----
@@ -64072,6 +64089,8 @@ function upgradeSectionHeaders(panel) {
 #minibia-bot-panel .mb-support-rule-actions button {padding:3px 7px;}
 #minibia-bot-panel [data-support-rules] > .mb-section-title::after {order:1;}
 #minibia-bot-panel [data-support-add] {order:2;}
+#minibia-bot-panel [data-target-name-rules] > .mb-section-title::after {order:1;}
+#minibia-bot-panel [data-target-list-add] {order:2;}
 #minibia-bot-panel .mb-support-rule > span {min-width:0;overflow-wrap:anywhere;}
 #minibia-bot-panel .mb-support-editor {margin-top:8px;padding:8px;border:1px solid var(--mb-hub-edge);border-radius:4px;}
 #minibia-bot-panel .mb-support-editor[hidden] {display:none!important;}
@@ -66041,65 +66060,10 @@ function upgradeSectionHeaders(panel) {
       </div>
     </div>
     <!-- Target lists -->
-    <div style="border-top:1px solid rgba(255,255,255,0.08); margin-top:10px; padding-top:8px;">
-      <div class="mb-section-title mb-section-title--sub" style="margin:0 0 6px 0;">
-        <span class="mb-title-text">Target Lists</span>
-      </div>
-
-      <div style="display:grid; gap:8px;">
-        <div style="display:flex; gap:6px; align-items:end; flex-wrap:wrap;">
-          <label class="mb-field" style="flex:1; min-width:120px;">
-            <span class="mb-field-label" style="font-size:10px;">Attack Order · highest first</span>
-            <textarea id="minibia-bot-auto-attack-priority-names" aria-label="Attack order, one mob per line, highest first" placeholder="Dragon Lord&#10;Dragon&#10;Dragon Hatchling" style="min-height:54px;padding:3px 4px;font-size:11px;resize:vertical;"></textarea>
-          </label>
-          <label class="mb-field" style="flex:0 0 104px;">
-            <span class="mb-field-label" style="font-size:10px;">Match Mode</span>
-            <select id="minibia-bot-auto-attack-priority-match-mode" style="padding:3px 4px;font-size:11px;">
-              <option value="exact">Exact</option><option value="includes">Contains</option>
-            </select>
-          </label>
-          <button type="button" class="mb-small-button" id="minibia-bot-auto-attack-priority-save" style="padding:3px 10px;font-size:11px;width:auto;">Save</button>
-        </div>
-
-        <div>
-          <div style="display:flex; gap:6px; align-items:end; flex-wrap:wrap;">
-            <label class="mb-field" style="flex:1; min-width:120px;">
-              <span class="mb-field-label" style="font-size:10px;">Preferred Mobs</span>
-              <textarea id="minibia-bot-auto-attack-preferred-names" placeholder="Orc Shaman, Amazon" style="min-height:30px;padding:3px 4px;font-size:11px;resize:vertical;"></textarea>
-            </label>
-
-            <label class="mb-field" style="flex:0 0 104px;">
-              <span class="mb-field-label" style="font-size:10px;">Match Mode</span>
-              <select id="minibia-bot-auto-attack-preferred-match-mode" style="padding:3px 4px;font-size:11px;">
-                <option value="exact">Exact</option>
-                <option value="includes">Contains</option>
-              </select>
-            </label>
-
-            <button type="button" class="mb-small-button" id="minibia-bot-auto-attack-preferred-save" style="padding:3px 10px;font-size:11px;width:auto;">Save</button>
-          </div>
-
-          <div style="display:flex; gap:8px; margin-top:3px; flex-wrap:wrap;">
-            <div class="mb-small-note" id="minibia-bot-auto-attack-preferred-status" style="font-size:10px;">Preferred: none</div>
-            <div class="mb-small-note" style="font-size:10px;">Ranked first; other mobs still allowed.</div>
-          </div>
-        </div>
-
-        <div style="border-top:1px solid rgba(255,255,255,0.06); padding-top:7px;">
-          <div style="display:flex; gap:6px; align-items:end; flex-wrap:wrap;">
-            <label class="mb-field" style="flex:1; min-width:120px;">
-              <span class="mb-field-label" style="font-size:10px;">Ignored Mobs</span>
-              <textarea id="minibia-bot-auto-attack-ignored-names" placeholder="Dragon, Demon, Ghost" style="min-height:30px;padding:3px 4px;font-size:11px;resize:vertical;"></textarea>
-            </label>
-
-            <button type="button" class="mb-small-button" id="minibia-bot-auto-attack-ignored-save" style="padding:3px 10px;font-size:11px;width:auto;">Save</button>
-          </div>
-
-          <div class="mb-small-note" id="minibia-bot-auto-attack-ignored-status" style="font-size:10px; margin-top:3px;">Ignored: none</div>
-          <label class="mb-toggle" title="Temporarily attack an ignored monster that traps you or blocks your CaveBot route. Resume movement as soon as the path opens."><input type="checkbox" id="minibia-bot-auto-attack-ignored-trap"><span>Attack ignored mobs when trapped</span></label>
-        </div>
-
-      </div>
+    <div style="border-top:1px solid rgba(255,255,255,0.08);margin-top:10px;padding-top:8px">
+      <div class="mb-section-title mb-section-title--sub"><span class="mb-title-text">Target Lists</span></div>
+      <div data-target-name-rules="priority"></div><div data-target-name-rules="preferred" style="margin-top:7px"></div><div data-target-name-rules="ignored" style="margin-top:7px"></div>
+      <label class="mb-toggle" title="Temporarily attack an ignored monster that traps you or blocks your CaveBot route."><input type="checkbox" id="minibia-bot-auto-attack-ignored-trap"><span>Attack ignored mobs when trapped</span></label>
     </div>
 
     </details>
@@ -71053,47 +71017,7 @@ function upgradeSectionHeaders(panel) {
         }, 2000);
         bot.addCleanup(() => window.clearInterval(audioAlertRefresh));
 
-        const priorityInput = document.getElementById("minibia-bot-auto-attack-priority-names");
-        const priorityMode = document.getElementById("minibia-bot-auto-attack-priority-match-mode");
-        priorityInput?.addEventListener("blur", saveAutoAttackPriorityConfig);
-        priorityInput?.addEventListener("keydown", event => {
-            if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
-                event.preventDefault();
-                saveAutoAttackPriorityConfig();
-            }
-        });
-        priorityMode?.addEventListener("change", saveAutoAttackPriorityConfig);
-        document.getElementById("minibia-bot-auto-attack-priority-save")?.addEventListener("click", saveAutoAttackPriorityConfig);
-
-        // Save match-mode changes immediately, before periodic status refresh.
-        // The explicit Save button also commits the current names and mode.
-        const prefModeSelect = document.getElementById("minibia-bot-auto-attack-preferred-match-mode");
-        const prefSaveButton = document.getElementById("minibia-bot-auto-attack-preferred-save");
-        prefModeSelect?.addEventListener("change", saveAutoAttackPreferredConfig);
-        prefSaveButton?.addEventListener("click", saveAutoAttackPreferredConfig);
-
-        // ---- Auto-save preferred names on blur ----
-        const prefInput = document.getElementById("minibia-bot-auto-attack-preferred-names");
-        if (prefInput) {
-            prefInput.addEventListener("blur", function () {
-                // Only save if the content actually changed
-                const current = bot.attack?.config?.preferredTargetNames || [];
-                const newNames = parsePreferredTargetNames(this.value);
-                // Compare arrays (simple length + content check)
-                const changed = current.length !== newNames.length ||
-                    current.some((n, i) => n !== newNames[i]);
-                if (changed) {
-                    saveAutoAttackPreferredConfig();
-                }
-            });
-            // Also save on Enter key (Ctrl+Enter or just Enter if you want)
-            prefInput.addEventListener("keydown", function (e) {
-                if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
-                    e.preventDefault();
-                    saveAutoAttackPreferredConfig();
-                }
-            });
-        }
+        mountTargetNameRuleEditors(panel);
         
         // ---- OLDER EXISTING LISTENERS (reload, trusted, GM, rune, eat, invisible, shield, equip, talk, panic, xray, home) ----
 
