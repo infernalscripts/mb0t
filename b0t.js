@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.622",
+        version: "1.6.623",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -28689,6 +28689,126 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
  *     overlay. Optionally loops the route.
  * ==================================================================================
  */
+window.__minibiaBotBundle.installMobRouteLoggerModule = function(bot) {
+    const storageKey='minibiaBot.mobRouteLogger.v1';
+    let data=bot.storage.get(storageKey,{nodes:{},edges:{},spots:{}});
+    if(!data||!data.nodes||!data.edges||!data.spots)data={nodes:{},edges:{},spots:{}};
+    let recording=false,previous=null,seen=new Map(),preview=[],root=null,dirty=false,lastSave=0,disposed=false;
+    const key=p=>`${p.x},${p.y},${p.z}`;
+    const position=p=>p&&[p.x,p.y,p.z].every(Number.isInteger)?{x:p.x,y:p.y,z:p.z}:null;
+    const adjacent=(a,b)=>a.z===b.z&&Math.max(Math.abs(a.x-b.x),Math.abs(a.y-b.y))===1;
+    function persist(){if(dirty){bot.storage.set(storageKey,data);dirty=false;lastSave=Date.now();}}
+    function step(p){
+        if(!recording||!p)return;
+        const k=key(p);
+        if(!data.nodes[k]&&Object.keys(data.nodes).length>=15000){recording=false;message('Recording stopped: 15,000 tile limit reached. Save or clear this survey.');return;}
+        data.nodes[k]=p;data.edges[k]||=[];
+        if(previous&&adjacent(previous,p)){
+            const before=key(previous);
+            if(!data.edges[before].includes(k))data.edges[before].push(k);
+            if(!data.edges[k].includes(before))data.edges[k].push(before);
+        }
+        previous=p;dirty=true;
+    }
+    // Only authoritative server movement creates graph edges. Polling never
+    // guesses a link across a missed step, teleport, or floor change.
+    const unsubscribe=bot.clientEvents?.subscribe(['movement-step','session'],event=>{
+        if(event.type==='session'){previous=null;seen.clear();return;}
+        step(position(event.position));
+    });
+    function message(text){if(root)root.querySelector('[data-status]').textContent=text;}
+    function recordMobs(){
+        if(!recording)return;
+        const me=position(bot.getPlayerPosition());if(!me)return;
+        if(!previous)step(me);
+        const creatures=window.gameClient?.world?.activeCreatures||{};
+        for(const c of Object.values(creatures)){
+            if(typeof CONST==='undefined'||c?.type!==CONST.TYPES.MONSTER)continue;
+            const p=position(c.getPosition?.()||c.__position);
+            if(!p||p.z!==me.z||Math.abs(p.x-me.x)>7||Math.abs(p.y-me.y)>5||c.getHealthPercentage?.()===0)continue;
+            const name=String(c.name||'').trim();if(!name)continue;
+            const id=String(c.id),now=Date.now();if(seen.has(id))continue;
+            seen.set(id,now);if(seen.size>10000)seen.delete(seen.keys().next().value);
+            // Associate a sighting with a proven reachable observation tile,
+            // rather than requiring the player to step on the monster's tile.
+            const cell=`${name.toLowerCase()}:${Math.floor(p.x/5)},${Math.floor(p.y/5)},${p.z}`;
+            const spot=data.spots[cell]||(data.spots[cell]={name,x:p.x,y:p.y,z:p.z,count:0,anchors:{},lastAt:0});
+            spot.count++;spot.lastAt=now;spot.anchors[key(me)]=(spot.anchors[key(me)]||0)+1;dirty=true;
+        }
+        if(Date.now()-lastSave>5000)persist();
+    }
+    function shortest(start){
+        const parents=new Map([[start,null]]),dist=new Map([[start,0]]),queue=[start];
+        for(let i=0;i<queue.length;i++)for(const next of data.edges[queue[i]]||[]){
+            if(parents.has(next)||!data.nodes[next])continue;
+            parents.set(next,queue[i]);dist.set(next,dist.get(queue[i])+1);queue.push(next);
+        }
+        return {parents,dist};
+    }
+    function path(tree,end){const result=[];for(let p=end;p!=null;p=tree.parents.get(p))result.push(p);return result.reverse();}
+    function generate(){
+        preview=[];
+        const me=position(bot.getPlayerPosition());if(!me)return message('Log in before generating a route.');
+        const names=new Set(root.querySelector('[data-names]').value.split(',').map(n=>n.trim().toLowerCase()).filter(Boolean));
+        const floor=Number(root.querySelector('[data-floor]').value);
+        const nodes=Object.keys(data.nodes).filter(k=>data.nodes[k].z===floor);
+        if(!nodes.length)return message('No recorded walking paths on this floor.');
+        nodes.sort((a,b)=>Math.abs(data.nodes[a].x-me.x)+Math.abs(data.nodes[a].y-me.y)-Math.abs(data.nodes[b].x-me.x)-Math.abs(data.nodes[b].y-me.y));
+        const start=nodes[0],component=shortest(start);
+        const goals=new Map();let excluded=0;
+        for(const spot of Object.values(data.spots)){
+            if(spot.z!==floor||(names.size&&!names.has(spot.name.toLowerCase())))continue;
+            const anchors=Object.keys(spot.anchors).filter(k=>component.parents.has(k));
+            anchors.sort((a,b)=>spot.anchors[b]-spot.anchors[a]);
+            if(!anchors.length){excluded++;continue;}
+            goals.set(anchors[0],(goals.get(anchors[0])||0)+spot.count);
+        }
+        if(!goals.size)return message('No matching sightings connected to this survey. Record a continuous walking path near the monsters.');
+        const density=root.querySelector('[data-objective]').value==='density';
+        const route=[start];let current=start;
+        while(goals.size){
+            const tree=shortest(current);let best=null,score=Infinity;
+            for(const [goal,weight] of goals){const distance=tree.dist.get(goal);if(distance===undefined)continue;const candidate=density?distance/Math.sqrt(weight):distance;if(candidate<score){score=candidate;best=goal;}}
+            if(best===null)break;
+            route.push(...path(tree,best).slice(1));goals.delete(best);current=best;
+        }
+        route.push(...path(shortest(current),start).slice(1));
+        preview=route.map(k=>({...data.nodes[k]}));
+        message(`Preview: ${preview.length} walking tiles, floor ${floor}. ${excluded} disconnected hunting spots excluded. Approximate loop using recorded paths.`);
+        draw();
+    }
+    function draw(){
+        const canvas=root?.querySelector('canvas');if(!canvas)return;const ctx=canvas.getContext('2d');ctx.clearRect(0,0,canvas.width,canvas.height);ctx.fillStyle='#151b22';ctx.fillRect(0,0,canvas.width,canvas.height);
+        if(!preview.length)return;
+        const xs=preview.map(p=>p.x),ys=preview.map(p=>p.y),minX=Math.min(...xs),minY=Math.min(...ys),scale=Math.min((canvas.width-24)/Math.max(1,Math.max(...xs)-minX),(canvas.height-24)/Math.max(1,Math.max(...ys)-minY));
+        ctx.strokeStyle='#55c9e9';ctx.lineWidth=2;ctx.beginPath();preview.forEach((p,i)=>ctx[i?'lineTo':'moveTo'](12+(p.x-minX)*scale,12+(p.y-minY)*scale));ctx.stroke();ctx.fillStyle='#ffc65a';ctx.beginPath();ctx.arc(12+(preview[0].x-minX)*scale,12+(preview[0].y-minY)*scale,4,0,Math.PI*2);ctx.fill();
+    }
+    function mount(){
+        const panel=document.querySelector('#minibia-bot-panel [data-tab-panel="cave"]');if(!panel)return;
+        if(root?.isConnected)return;
+        root=document.createElement('details');root.className='mb-section';root.innerHTML=`<summary>Monster logger &amp; route generator ⓘ</summary><p class="mb-small-note">Record while hunting manually. Sightings and confirmed walking paths are saved. Generate one floor at a time; floor changes and teleports are never guessed as walking links. The preview is an approximate loop, not a proven optimal route.</p><div><button type="button" data-record>Start recording</button> <button type="button" data-clear>Clear survey</button></div><p data-count class="mb-small-note"></p><label>Creatures (comma separated; empty = all)<input data-names style="width:100%" list="mb-mob-survey-names"></label><datalist id="mb-mob-survey-names"></datalist><label>Floor <input data-floor type="number" min="0" max="15" style="width:55px"></label><select data-objective><option value="distance">Short travel</option><option value="density">Favor dense sightings</option></select><div><button type="button" data-generate>Generate preview</button></div><canvas width="380" height="200" style="width:100%;height:auto;margin-top:6px"></canvas><label>New preset name <input data-preset value="Recorded hunt"></label><button type="button" data-save>Save as new Cavebot preset</button><p data-status class="mb-small-note" role="status"></p>`;
+        panel.append(root);root.querySelector('[data-floor]').value=bot.getPlayerPosition()?.z??7;
+        root.querySelector('[data-record]').onclick=()=>{recording=!recording;previous=null;preview=[];persist();root.querySelector('[data-record]').textContent=recording?'Stop recording':'Start recording';message(recording?'Recording sightings and confirmed steps.':'Recording stopped and saved.');};
+        root.querySelector('[data-clear]').onclick=()=>{if(!window.confirm('Clear recorded monster sightings and walking paths?'))return;data={nodes:{},edges:{},spots:{}};previous=null;seen.clear();preview=[];dirty=true;persist();draw();message('Survey cleared.');};
+        root.querySelector('[data-generate]').onclick=generate;
+        root.querySelector('[data-save]').onclick=()=>{
+            const name=root.querySelector('[data-preset]').value.trim();
+            if(recording)return message('Stop recording before saving a route.');
+            if(preview.length<2)return message('Generate a route preview first.');
+            if(!name)return message('Enter a new preset name.');
+            if(bot.cave.getPresetNames().includes(name))return message('That preset already exists. Choose a new name.');
+            if(!bot.cave.createPreset(name))return message('Could not create the preset.');
+            for(const p of preview)bot.cave.addWaypoint({...p});
+            bot.cave.savePreset(name);message(`Saved ${preview.length} waypoints as “${name}”. Review the route before starting Cavebot.`);
+        };
+    }
+    function refresh(){mount();recordMobs();if(!root)return;root.querySelector('[data-count]').textContent=`${recording?'Recording · ':''}${Object.keys(data.nodes).length} walking tiles · ${Object.keys(data.spots).length} hunting spots`;
+        const names=[...new Set(Object.values(data.spots).map(s=>s.name))].sort();const list=root.querySelector('datalist');if(list.dataset.names!==names.join('|')){list.replaceChildren(...names.map(n=>{const o=document.createElement('option');o.value=n;return o;}));list.dataset.names=names.join('|');}}
+    const timer=setInterval(()=>{if(!disposed)refresh();},500);
+    bot.mobRouteLogger={start(){recording=true;previous=null;},stop(){recording=false;persist();},status:()=>({recording,tiles:Object.keys(data.nodes).length,spots:Object.keys(data.spots).length})};
+    bot.addCleanup(()=>{disposed=true;clearInterval(timer);unsubscribe?.();persist();root?.remove();});
+};
+
 window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     // Some NPC replies appear in Default chat without updating the popup.
     // Read only typed NPC messages, never player text or console announcements.
@@ -75243,6 +75363,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         currentBundle.installAutoAttackModule(bot);
         currentBundle.installRuneShooterModule(bot);
         currentBundle.installCaveModule(bot);
+        currentBundle.installMobRouteLoggerModule(bot);
         currentBundle.installSpecialAreasModule(bot);
         currentBundle.installEquipRingModule(bot);
         currentBundle.installBootsSwapperModule(bot);
