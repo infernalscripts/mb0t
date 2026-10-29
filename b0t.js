@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.645",
+        version: "1.6.648",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -34341,6 +34341,26 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             .filter(next => next && next.id !== 0 && !next.__isPlaceholder);
     }
 
+    function findCaveIndependentLoadedPath(fromPosition,toPosition) {
+        const from=normalizePosition(fromPosition),to=normalizePosition(toPosition);
+        if(!from||!to||from.z!==to.z)return null;
+        const start=getTileAt(from),goal=getTileAt(to);
+        if(!start||!goal||goal.__isPlaceholder||!goal.id)return null;
+        const queue=[start],parents=new Map([[start,null]]);
+        for(let i=0;i<queue.length && i<8000;i++){
+            const current=queue[i];
+            if(current===goal){const path=[];for(let tile=goal;tile!==start;tile=parents.get(tile))path.push(tile);return {path:path.reverse()};}
+            for(const next of getCaveRouteNeighbours(current)){
+                if(parents.has(next)||!isCaveRoutePassable(next,goal))continue;
+                const p=next.__position,c=current.__position,dx=p.x-c.x,dy=p.y-c.y;
+                if(bot.specialAreas?.getPositionPolicy?.(p,{purpose:'route'})?.allowed===false)continue;
+                if(dx&&dy&&[{x:c.x+dx,y:c.y,z:c.z},{x:c.x,y:c.y+dy,z:c.z}].some(side=>bot.specialAreas?.getPositionPolicy?.(side,{purpose:'route'})?.allowed===false))continue;
+                parents.set(next,current);queue.push(next);
+            }
+        }
+        return null;
+    }
+
     function findCaveFieldAwarePath(
         fromPosition,
         toPosition
@@ -35680,7 +35700,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             }
         }
 
-        const routeInfo = findCaveFieldAwarePath(from, to);
+        const routeInfo = findCaveIndependentLoadedPath(from, to) || findCaveFieldAwarePath(from, to);
         if (routeInfo?.path?.length) {
             if (sendCaveFieldRouteStep({ ...routeInfo, path: routeInfo.path.slice(0, 10), goal: waypoint }, now)) {
                 state.fieldRouteManualRoutes++;
@@ -42734,6 +42754,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     });
 
     bot.cave = {
+        decodePresets: unpackCavePresets,
         setGeneratedRoute(points) {
             if (!Array.isArray(points) || points.length > 1000) return false;
             const next = normalizeRoute(points);
@@ -54343,6 +54364,12 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
                     if (!CONFIG_KEYS.some(k => k in data))
                         return reject(new Error("Invalid profile: no recognized config keys"));
 
+                    if (Object.prototype.hasOwnProperty.call(data,'minibiaBot.cave.presets')) {
+                        const decoded=bot.cave.decodePresets(data['minibiaBot.cave.presets']);
+                        if(!Array.isArray(decoded)||decoded.some(p=>!p||typeof p.name!=='string'||!Array.isArray(p.route)))
+                            throw new Error('Invalid Cavebot preset catalog in profile.');
+                    }
+
                     const name = (profileName?.trim()
                          || file.name.replace(/\.profile\.json$/i, "")
                          || "imported");
@@ -54473,7 +54500,7 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
                     if (typeof data !== "object" || data === null)
                         return reject(new Error("Invalid file format – not an object."));
                     const presetsData = Object.prototype.hasOwnProperty.call(data, "minibiaBot.cave.presets")
-                        ? data["minibiaBot.cave.presets"]
+                        ? bot.cave.decodePresets(data["minibiaBot.cave.presets"])
                         : convertExternalWaypointRoute(data, file.name);
                     if (!Array.isArray(presetsData) || presetsData.length === 0)
                         return reject(new Error("Cave presets array is empty or invalid."));
@@ -54533,7 +54560,7 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
     function validateSetup(value) {
         const data = setupClone(value);
         if (!setupObject(data) || data.format !== 'mb0t-setup' || data.version !== 1) throw new Error('Choose an mb0t setup file.');
-        if (data.waypoints != null && (!setupObject(data.waypoints) || !Array.isArray(data.waypoints.route) || !data.waypoints.route.length || !data.waypoints.route.every(w => setupObject(w) && Number.isFinite(w.x) && Number.isFinite(w.y) && Number.isFinite(w.z)))) throw new Error('Invalid waypoint route.');
+        if (data.waypoints != null && (!setupObject(data.waypoints) || !Array.isArray(data.waypoints.route) || !data.waypoints.route.length || !data.waypoints.route.every(w => setupObject(w) && ((typeof w.script==='string' && w.script.trim().length>0) || (Number.isInteger(w.x) && Number.isInteger(w.y) && Number.isInteger(w.z) && w.x>=0 && w.x<=65535 && w.y>=0 && w.y<=65535 && w.z>=0 && w.z<=15))))) throw new Error('Invalid waypoint route.');
         for (const [group, modules] of Object.entries(setupGroups)) {
             if (data[group] == null) continue;
             if (!setupObject(data[group]) || !Object.keys(data[group]).length || Object.keys(data[group]).some(key => !modules.includes(key))) throw new Error('Invalid '+group+' settings.');
@@ -69315,7 +69342,7 @@ function upgradeSectionHeaders(panel) {
                 } catch (err) {
                     if (routeImportStatus)
                         routeImportStatus.textContent = `Import failed: ${err.message}`;
-                    bot.log("Waypoint import error", err);
+                    bot.log("Waypoint import error", err?.message || String(err));
                 }
 
                 // Reset file input so the same file can be re-selected
