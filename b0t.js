@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.626",
+        version: "1.6.632",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -34048,6 +34048,16 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         return false;
     }
 
+    function isUseOnlyWalkableLadder(thing) {
+        return isLadderThing(thing) && thing.isWalkable?.() === true &&
+            !getThingDefinition(thing.id)?.properties?.floorchange &&
+            !teleporterItemIds.has(Number(thing.id));
+    }
+    function isCaveStepTransitionTile(tile) {
+        return getTileThings(tile).some(thing =>
+            isFloorChangeThing(thing) && !isUseOnlyWalkableLadder(thing));
+    }
+
     function caveFieldPassableStatic(tile, destination = null) {
         if (!tile || tile.id === 0 || bot.hasNavigationObstacle(tile))
             return false;
@@ -34056,7 +34066,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         // A manually placed transition waypoint may still be the destination.
         if (
             tile !== destination &&
-            isFloorChangeTile(tile)
+            isCaveStepTransitionTile(tile)
         ) {
             return false;
         }
@@ -34077,7 +34087,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 continue;
             if (typeof item.isWalkable === "function" && !item.isWalkable())
                 return false;
-            if (!bot.isWalkableParcel?.(item) && typeof item.hasFlag === "function" &&
+            if (!isUseOnlyWalkableLadder(item) && !bot.isWalkableParcel?.(item) && typeof item.hasFlag === "function" &&
                 typeof PropBitFlag !== "undefined" &&
                 item.hasFlag(PropBitFlag.prototype.flags.DatFlagNotPathable)) {
                 if (tile !== destination)
@@ -34095,7 +34105,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
                 onlyFieldNotPathable = false;
             }
             for (const item of items) {
-                if (isMagicFieldItem(item) || bot.isWalkableParcel?.(item)) continue;
+                if (isMagicFieldItem(item) || bot.isWalkableParcel?.(item) || isUseOnlyWalkableLadder(item)) continue;
                 if (typeof item.hasFlag === "function" && typeof PropBitFlag !== "undefined" &&
                     item.hasFlag(PropBitFlag.prototype.flags.DatFlagNotPathable)) {
                     onlyFieldNotPathable = false;
@@ -34572,7 +34582,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         const pos = normalizePosition(tile?.__position);
         if (!tile || !pos || tile.id === 0 || tile.__isPlaceholder)
             return false;
-        if (isFloorChangeTile(tile))
+        if (isCaveStepTransitionTile(tile))
             return false;
         if (bot.blacklist?.isBlacklisted(pos.x, pos.y, pos.z))
             return false;
@@ -35365,6 +35375,11 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     }
 
     function goToWaypoint(waypoint) {
+        // Recovery can change the active index inside a nested movement call.
+        // An older caller must never send its superseded route waypoint.
+        if (waypoint && route.includes(waypoint) && waypoint !== getCurrentWaypoint()) {
+            return false;
+        }
         if (bot.pauseHotkey?.isPaused?.()) return false;
         // If this is a script-only waypoint, nothing to move
         if (!waypoint || waypoint.x === undefined || waypoint.x === null) {
@@ -49257,6 +49272,29 @@ window.__minibiaBotBundle.installPaladinModule = function installPaladinModule(b
 // Looter
 
 window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot) {
+    let printLootedItems = bot.storage.get('minibiaBot.looter.printLootedItems', false) === true;
+    const lootPrintTimer = setInterval(() => {
+        const panel=document.querySelector('#minibia-bot-panel [data-tab-panel="looter"]');
+        if(!panel || panel.querySelector('[data-print-looted-items]'))return;
+        const label=document.createElement('label');label.className='mb-toggle';label.setAttribute('data-print-looted-items','');
+        const input=document.createElement('input');input.type='checkbox';input.checked=printLootedItems;
+        input.onchange=()=>{printLootedItems=input.checked;bot.storage.set('minibiaBot.looter.printLootedItems',printLootedItems);};
+        label.append(input,document.createTextNode('Print successfully looted items'));
+        const mode=panel.querySelector('#minibia-bot-looter-mode')?.closest('label');
+        if(mode)mode.insertAdjacentElement('afterend',label);else panel.prepend(label);
+    },250);
+    bot.addCleanup(()=>{clearInterval(lootPrintTimer);document.querySelector('[data-print-looted-items]')?.remove();});
+
+    const lootErrorTimes = new Map();
+    function printLootError(reason) {
+        const text=String(reason || 'Unknown loot failure');
+        const now=Date.now();
+        if(now-(lootErrorTimes.get(text)||0)<30000)return;
+        lootErrorTimes.set(text,now);
+        if(lootErrorTimes.size>64)lootErrorTimes.delete(lootErrorTimes.keys().next().value);
+        bot.sendServerMessage?.('Looter error: '+text, 255, 1);
+    }
+
     const configStorageKey = "minibiaBot.looter.config";
 
     const state = {
@@ -49590,6 +49628,10 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             Number(event.slot)===Number(pending.slot) &&
             (!event.container || event.container===pending.sourceContainer)) {
             pending.sourceAcknowledged=true;
+            if (pending.kind === 'move' && !pending.lootPrinted) {
+                pending.lootPrinted=true;
+                if(printLootedItems)bot.sendServerMessage?.('Looted item: '+(pending.itemName || 'Unknown item'), 255, 1);
+            }
             const job=state.corpseJob;
             if(job && Number(job.openedContainerId)===Number(pending.sourceId))
                 job.lootDeadlineAt=Math.min(job.lootStartedAt+30000,
@@ -50810,8 +50852,10 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
             state.corpseJobsCompleted++;
             state.nearbyCorpseReadyUntil=Math.max(state.nearbyCorpseReadyUntil,Date.now()+750);
         }
-        else
+        else {
             state.corpseJobsFailed++;
+            printLootError(`${job.monsterName || 'Corpse'}: ${reason || 'Looting failed'}`);
+        }
 
         bot.log(
             success
@@ -52241,6 +52285,17 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         const overflow = root ? resolveLootDestination(root,now) : null;
 
         if (!root) {
+            const needsDestination = containers.some(container => {
+                if (onlyContainer && container !== onlyContainer) return false;
+                if (!isCorpseLootSource(container)) return false;
+                for (let slot=0;slot<container.size;slot++) {
+                    const item=container.getSlotItem(slot);
+                    if (shouldLootItem(item) && !isDropTrackedItem(exactItemKey(item))) return true;
+                }
+                return false;
+            });
+            if (!needsDestination) return false;
+            printLootError('No open destination container. Open and select a destination backpack.');
             if (
                 !state._lastDestLog ||
                 now -
@@ -52284,6 +52339,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                 const targetSlot = target.slot;
 
                 if (targetSlot === -1) {
+                    if (!target.waiting) printLootError('Destination backpack and available child containers are full.');
                     if (
                         now -
                             state.lastFullLogAt >
@@ -52358,6 +52414,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                             )
                             : sendMove();
                 } catch (e) {
+                    printLootError('Item move failed.');
                     bot.log(
                         "Looter: move failed",
                         e
@@ -52394,6 +52451,9 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
 
                 state.pendingMove = {
                     kind: "move",
+                    itemName: String(item.getName?.() || item.name ||
+                        window.gameClient?.itemDefinitionsBySid?.[item.sid]?.properties?.name ||
+                        window.gameClient?.itemDefinitionsByCid?.[item.id]?.properties?.name || `Item ${item.id}`),
                     sourceItem: item,
                     sourceContainer: container,
                     sourceId:
@@ -52474,6 +52534,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
                     moveItems();
             }
         } catch (e) {
+            printLootError('Loot processing failed: '+String(e?.message || e));
             bot.log("Looter tick failed", e);
         } finally {
             scheduleNextTick();
@@ -52602,6 +52663,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
     function start() {
         if (state.disposed || state.running) return false;
         state.running = true;
+        bot.storage.set('minibiaBot.looter.enabled',true);
         state.pendingMove = null;
         resetLooterContainerCache();
         if (!startRuntime()) tick();
@@ -52611,6 +52673,7 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
 
     function stop() {
         state.running = false;
+        bot.storage.set('minibiaBot.looter.enabled',false);
         state.pendingMove = null;
         resetOverflow();
         looterContainerCache.clear();
@@ -53080,6 +53143,10 @@ window.__minibiaBotBundle.installLooterModule = function installLooterModule(bot
         renderCorpseDebugOverlay();
     }
 
+    const restoreLooterTimer=setTimeout(()=>{
+        if(!state.disposed && bot.storage.get('minibiaBot.looter.enabled',false)===true)start();
+    },0);
+    bot.addCleanup(()=>clearTimeout(restoreLooterTimer));
     syncCorpseDebugOverlay();
     // Covers UI capture listeners even if Looter was never started.
     bot.addCleanup(() => {
