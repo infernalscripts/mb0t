@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.652",
+        version: "1.6.654",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -30095,7 +30095,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         }
     } catch(error) {bot.log('Cave: preset storage upgrade deferred',error);}
     let presetBaseline=cloneValue(presets),sharedUpdatePending=false;
-    let sharedDurableRaw=window.localStorage[presetStorageKey] ?? null,sharedWaitAt=0;
+    let sharedDurableRaw=window.localStorage[presetStorageKey] ?? null,sharedWaitAt=0,previousCatalogBytes=0;
     if (!presets.length && (route.length || transitions.length)) {
         presets = [{
                 name: defaultPresetName,
@@ -30111,7 +30111,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         // compare the actual durable value, bypassing a stale unsaved overlay.
         const durableRaw=window.localStorage[presetStorageKey] ?? null;
         if(durableRaw!==sharedDurableRaw){
-            sharedDurableRaw=durableRaw;sharedUpdatePending=true;sharedWaitAt=Date.now();
+            previousCatalogBytes=sharedDurableRaw?.length||0;sharedDurableRaw=durableRaw;sharedUpdatePending=true;sharedWaitAt=Date.now();
             // Pending writes remain recoverable until successfully persisted.
             if(state.running)stopCaveMovementNow();
         }
@@ -30122,9 +30122,24 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         const name=String(config.activePresetName||getActivePresetName()),old=presets.find(p=>p.name.toLowerCase()===name.toLowerCase());
         let stored;try{stored=JSON.parse(durableRaw||'[]');}catch(_){return false;}
         const next=normalizePresets(stored);
-        if(!next.length && presets.length){
+        const missing=presets.filter(p=>!next.some(n=>n.name.toLowerCase()===p.name.toLowerCase()));
+        if(missing.length){
             sharedUpdatePending=false;
-            bot.showPanelNotification?.('Cave presets protected','An empty shared catalog was received. Current presets were kept in memory. Export a backup before closing this client.','cave-preset-protection');
+            const details={version:bot.version,missing:missing.map(p=>p.name),previousBytes:previousCatalogBytes,receivedBytes:durableRaw?.length||0};
+            console.error('[mbot] PRESET LOSS DETECTED outside guarded setter',details);
+            // Repair the durable catalog, not only the displayed in-memory copy.
+            // Preserve incoming unrelated edits while restoring missing entries.
+            try {
+                persistPresets();
+                const saved=normalizePresets(JSON.parse(window.localStorage[presetStorageKey]||'[]'));
+                if(missing.some(p=>!saved.some(n=>n.name.toLowerCase()===p.name.toLowerCase())))throw new Error('Repair is not durable (storage may be full)');
+                bot.showPanelNotification?.('Cave presets restored',`Restored ${missing.length} missing presets. Details are in the console.`,'cave-preset-protection');
+                bot.log('Cave: damaged shared catalog repaired',details);
+            } catch(error){
+                console.error('[mbot] Preset repair could not be saved',error);
+                bot.showPanelNotification?.('Export cave presets now','Presets remain in memory, but storage repair failed. Export before closing.','cave-preset-protection');
+                sharedUpdatePending=true;sharedWaitAt=Date.now();
+            }
             return false;
         }
         let active=next.find(p=>p.name.toLowerCase()===name.toLowerCase());
@@ -30202,7 +30217,9 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             bot.storage.set(presetStorageKey+'.lastGoodBackup',packCavePresets(latest));
         }
         presets=next;presetBaseline=cloneValue(presets);
-        bot.storage.set(presetStorageKey,packCavePresets(presets));
+        window.__mbotExplicitPresetRemovals=new Set(explicitPresetRemovals);
+        try {bot.storage.set(presetStorageKey,packCavePresets(presets));}
+        finally {window.__mbotExplicitPresetRemovals=null;}
         explicitPresetRemovals.clear();
         sharedDurableRaw=window.localStorage[presetStorageKey] ?? null;
     }
@@ -75575,12 +75592,13 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
             window.__minibiaBotCurrentCharacter = characterName;
         }
 
-        if (window.__minibiaBotStoragePatched && window.__minibiaBotStorageVersion === 409)
+        if (window.__minibiaBotStoragePatched && window.__minibiaBotStorageVersion === 411)
             return;
 
         const origGet = Storage.prototype.getItem;
         const origSet = Storage.prototype.setItem;
         const origRemove = Storage.prototype.removeItem;
+        const origClear = Storage.prototype.clear;
         // Preserve unsaved settings across mb0t reinjection (not a page refresh).
         const pending = window.__minibiaBotUnsavedStorage || (window.__minibiaBotUnsavedStorage = new Map());
         let retryAt=0,lastWarning=null;
@@ -75609,9 +75627,9 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         function scheduleStorageRetry() {
             if(window.__minibiaBotStorageRetryTimer!=null || !pending.size)return;
             window.__minibiaBotStorageRetryTimer=setTimeout(()=>{
-                window.__minibiaBotStorageRetryTimer=null;
+                window.__minibiaBotStorageRetryTimer=null;retryAt=0;
                 for(const [key,value]of pending){
-                    try{reclaimDuplicateRoute(key);origSet.call(window.localStorage,key,value);pending.delete(key);}
+                    try{reclaimDuplicateRoute(key);window.localStorage.setItem(key,value);if(pending.has(key))break;}
                     catch(error){if(quotaError(error)){retryAt=Date.now()+30000;break;}console.warn('[mbot] Storage retry failed',error?.message);break;}
                 }
                 if(pending.size)scheduleStorageRetry();
@@ -75627,6 +75645,19 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         Storage.prototype.setItem = function (key, value) {
             if (this !== window.localStorage) return origSet.call(this,key,value);
             key=scopedKey(key);value=String(value);
+            if(key==='minibiaBot.char.__shared__.cave.presets'){
+                const names=raw=>{const d=JSON.parse(raw||'[]');const list=Array.isArray(d)?d:d?.format==='mb0t-cave-packed'&&d.version===1?d.presets:null;if(!Array.isArray(list))throw new Error('Invalid preset catalog');return list.map(p=>String(p.name).toLowerCase());};
+                try {
+                    const before=names(origGet.call(this,key)),after=new Set(names(value));
+                    const allowed=window.__mbotExplicitPresetRemovals;
+                    const lost=before.filter(n=>!after.has(n)&&!allowed?.has(n));
+                    if(lost.length){
+                        console.error('[mbot] BLOCKED preset catalog shrink',{lost,version:window.minibiaBot?.version,stack:new Error('Preset writer').stack});
+                        window.minibiaBot?.showPanelNotification?.('Preset overwrite blocked',`Prevented removal of ${lost.length} presets. Writer details are in the console.`,'cave-preset-protection');
+                        throw new Error('Preset overwrite blocked: '+lost.join(', '));
+                    }
+                }catch(error){console.error('[mbot] Preset storage write rejected',error);throw error;}
+            }
             if(!String(key).startsWith(BASE_PREFIX))return origSet.call(this,key,value);
             if(pending.size && Date.now()<retryAt){pending.set(key,value);warnStorageFull();scheduleStorageRetry();return;}
             try {
@@ -75643,12 +75674,26 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
             }
         };
         Storage.prototype.removeItem = function (key) {
-            if (this === window.localStorage) {key=scopedKey(key);pending.delete(key);}
+            if (this === window.localStorage) {
+                key=scopedKey(key);
+                if(key==='minibiaBot.char.__shared__.cave.presets'){
+                    console.error('[mbot] BLOCKED preset catalog removal',{stack:new Error('Preset remover').stack});
+                    throw new Error('Preset catalog removal blocked; use the preset editor');
+                }
+                pending.delete(key);
+            }
             return origRemove.call(this, key);
         };
 
+        Storage.prototype.clear = function () {
+            if(this===window.localStorage && (origGet.call(this,'minibiaBot.char.__shared__.cave.presets') || pending.has('minibiaBot.char.__shared__.cave.presets'))){
+                console.error('[mbot] BLOCKED storage clear containing cave presets',{stack:new Error('Storage clearer').stack});
+                throw new Error('Storage clear blocked: cave presets are present');
+            }
+            return origClear.call(this);
+        };
         window.__minibiaBotStoragePatched = true;
-        window.__minibiaBotStorageVersion = 409;
+        window.__minibiaBotStorageVersion = 411;
         console.log("[minibia-bot] Character-scoped storage installed for:", characterName || "(global)");
     }
 
