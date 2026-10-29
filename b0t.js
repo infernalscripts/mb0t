@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.649",
+        version: "1.6.650",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -54179,7 +54179,16 @@ window.__minibiaBotBundle.installProfileModule = function installProfileModule(b
         return snapshot;
     }
     function setAllConfigs(snapshot) {
+        // Shared route libraries must survive loading character profiles.
+        // Merge profile presets explicitly, rather than replacing/removing them.
+        const incoming=snapshot['minibiaBot.cave.presets'];
+        if(incoming!==undefined){
+            const decoded=bot.cave.decodePresets(incoming);
+            if(!Array.isArray(decoded))throw new Error('Invalid profile preset catalog');
+            if(decoded.length)bot.cave.mergePresets(decoded,true,{renameConflicts:true});
+        }
         for (const key of CONFIG_KEYS) {
+            if(key==='minibiaBot.cave.presets')continue;
             const value = snapshot[key];
             if (value === undefined) {
                 localStorage.removeItem(key);
