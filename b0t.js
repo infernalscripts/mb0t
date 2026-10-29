@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.650",
+        version: "1.6.651",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -30122,6 +30122,11 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         const name=String(config.activePresetName||getActivePresetName()),old=presets.find(p=>p.name.toLowerCase()===name.toLowerCase());
         let stored;try{stored=JSON.parse(durableRaw||'[]');}catch(_){return false;}
         const next=normalizePresets(stored);
+        if(!next.length && presets.length){
+            sharedUpdatePending=false;
+            bot.showPanelNotification?.('Cave presets protected','An empty shared catalog was received. Current presets were kept in memory. Export a backup before closing this client.','cave-preset-protection');
+            return false;
+        }
         let active=next.find(p=>p.name.toLowerCase()===name.toLowerCase());
         if(!active&&old)active=next.find(p=>presetContent(p)===presetContent(old));
         sharedUpdatePending=false;presets=next;presetBaseline=cloneValue(next);
@@ -30169,6 +30174,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         return configured || defaultPresetName;
     }
 
+    const explicitPresetRemovals=new Set();
     function persistPresets() {
         // Apply local deltas to the latest shared library, retaining edits to
         // unrelated presets made in another tab since our last read.
@@ -30176,10 +30182,16 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         const merged=new Map(latest.map(p=>[p.name.toLowerCase(),p]));
         const local=new Map(presets.map(p=>[p.name.toLowerCase(),p]));
         const baseline=new Map(presetBaseline.map(p=>[p.name.toLowerCase(),p]));
-        for(const [key]of baseline)if(!local.has(key))merged.delete(key);
+        for(const key of explicitPresetRemovals)merged.delete(key);
         for(const [key,p]of local)if(!baseline.has(key)||JSON.stringify(baseline.get(key))!==JSON.stringify(p))merged.set(key,p);
-        presets=[...merged.values()];presetBaseline=cloneValue(presets);
+        const next=[...merged.values()];
+        if(latest.length){
+            // Keep the previous valid catalog recoverable across reloads.
+            bot.storage.set(presetStorageKey+'.lastGoodBackup',packCavePresets(latest));
+        }
+        presets=next;presetBaseline=cloneValue(presets);
         bot.storage.set(presetStorageKey,packCavePresets(presets));
+        explicitPresetRemovals.clear();
         sharedDurableRaw=window.localStorage[presetStorageKey] ?? null;
     }
 
@@ -33216,6 +33228,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             return false;
         }
         const deletingActive = preset.name.toLowerCase() === String(config.activePresetName || getActivePresetName()).toLowerCase();
+        explicitPresetRemovals.add(preset.name.toLowerCase());
         presets = presets.filter(p => p.name.toLowerCase() !== preset.name.toLowerCase());
         persistPresets();
         if (deletingActive) {
@@ -33269,6 +33282,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             areas: normalizePresetAreas(preset.areas),
         };
         // Remove old and add new
+        explicitPresetRemovals.add(old.toLowerCase());
         presets = presets.filter(p => p.name.toLowerCase() !== old.toLowerCase());
         presets.push(newPreset);
         persistPresets();
