@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.632",
+        version: "1.6.644",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -8026,6 +8026,58 @@ window.__minibiaBotBundle.installItemAlertItems = function(bot) {
 
 
 window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) {
+    const rulesKey='minibiaBot.panic.triggerRules';
+    let triggerRules=bot.storage.get(rulesKey,[]);if(!Array.isArray(triggerRules))triggerRules=[];
+    let ruleHost=null,ruleRequestAt=0,rulePlayer=null,ruleSessionAt=Date.now();
+    function saveTriggerRules(){bot.storage.set(rulesKey,triggerRules);}
+    function checkTriggerRules(){
+        const player=window.gameClient?.player,now=Date.now();if(!player)return false;
+        if(player!==rulePlayer){rulePlayer=player;ruleSessionAt=now;ruleRequestAt=0;}
+        if(now-ruleRequestAt>=2000){ruleRequestAt=now;const items=triggerRules.filter(r=>r.enabled&&r.type==='item').map(r=>({id:r.itemId,fluidType:0}));if(items.length)bot.requestItemCounts?.(items);}
+        for(const r of triggerRules){if(!r.enabled)continue;let value=null;
+            const st=player.state||{};
+            if(r.type==='health'){const hp=Number(st.health),max=Number(st.healthMax??st.maxHealth);if(Number.isFinite(hp)&&max>0)value=100*hp/max;}
+            if(r.type==='capacity')value=st.capacity??st.cap;
+            if(r.type==='soul')value=st.soul;
+            if(r.type==='item'){const reading=bot.getItemCountReading?.(r.itemId,0);if(reading&&reading.at>=ruleSessionAt&&now-reading.at<=10000)value=reading.count;}
+            if(value==null||!Number.isFinite(Number(value)))continue;
+            if(Number(value)<r.threshold)return triggerPanic('rule-'+r.type,{rule:r.type,value:Number(value),threshold:r.threshold,itemId:r.itemId});
+        }return false;
+    }
+    function mountTriggerRules(){
+        const parent=document.querySelector('#minibia-bot-home')?.closest('.mb-section');if(!parent||ruleHost?.isConnected)return;
+        ruleHost=document.createElement('div');ruleHost.innerHTML='<div class="mb-section-title"><span class="mb-title-text">Escape Rules</span><button type="button" data-add style="margin-left:auto">+ Rule</button></div><div data-editor hidden><label>Trigger <select data-type><option value="health">Health (%)</option><option value="capacity">Free capacity</option><option value="soul">Soul</option><option value="item">Item count</option></select></label><label data-item-label hidden>Item ID or name <input data-item type="text" list="mb-panic-item-suggestions" autocomplete="off" placeholder="Type a name or CID"><datalist id="mb-panic-item-suggestions"></datalist><span data-item-error class="mb-small-note" role="status"></span></label><label>Below <input data-threshold type="number" min="0" step="1" value="20"></label><button type="button" data-save>Save</button><button type="button" data-cancel>Cancel</button><p class="mb-small-note">Any enabled rule triggers the existing Panic Runner escape to Home. Item rules use confirmed server counts; unavailable counts do not trigger.</p></div><div data-list></div>';
+        parent.append(ruleHost);let editing=-1;const q=s=>ruleHost.querySelector(s);
+        function itemCatalogue(){
+            return Object.entries(window.gameClient?.itemDefinitionsByCid||{}).map(([id,d])=>({id:Number(id),name:String(d?.properties?.name||'').trim()})).filter(d=>d.id>0&&d.name);
+        }
+        q('[data-item]').oninput=()=>{
+            const text=q('[data-item]').value.trim().toLowerCase();q('[data-item-error]').textContent='';
+            const list=q('datalist');list.replaceChildren();if(!text)return;
+            const matches=itemCatalogue().filter(d=>d.name.toLowerCase().includes(text)||String(d.id).startsWith(text)).slice(0,40);
+            for(const d of matches){const option=document.createElement('option');option.value=`${d.name} [CID ${d.id}]`;list.append(option);}
+        };
+        function resolveRuleItem(){
+            const text=q('[data-item]').value.trim(),tag=text.match(/\[CID (\d+)\]$/i);
+            const id=tag?Number(tag[1]):/^\d+$/.test(text)?Number(text):null;
+            if(id!==null)return {id,name:itemCatalogue().find(d=>d.id===id)?.name||''};
+            const matches=itemCatalogue().filter(d=>d.name.toLowerCase()===text.toLowerCase());
+            if(matches.length===1)return matches[0];
+            q('[data-item-error]').textContent=matches.length?'Several items have that name. Select a suggestion with its CID.':'Select an item suggestion or enter a numeric CID.';
+            return {id:NaN,name:''};
+        }
+        const show=()=>{q('[data-item-label]').hidden=q('[data-type]').value!=='item';q('[data-threshold]').max=q('[data-type]').value==='health'?'100':'';};
+        function render(){const list=q('[data-list]');list.replaceChildren();for(const [i,r] of triggerRules.entries()){
+            const row=document.createElement('div');row.className='mb-inline';const enabled=document.createElement('input');enabled.type='checkbox';enabled.checked=r.enabled;enabled.onchange=()=>{r.enabled=enabled.checked;saveTriggerRules();};
+            const label=document.createElement('span');label.textContent=`${r.type==='item'?(r.itemName?`${r.itemName} [CID ${r.itemId}]`:'Item '+r.itemId):r.type==='health'?'Health (%)':r.type==='soul'?'Soul':'Free capacity'} below ${r.threshold}`;
+            const edit=document.createElement('button');edit.textContent='Edit';edit.onclick=()=>{editing=i;q('[data-type]').value=r.type;q('[data-item]').value=r.itemName?`${r.itemName} [CID ${r.itemId}]`:r.itemId||'';q('[data-threshold]').value=r.threshold;q('[data-editor]').hidden=false;show();};
+            const remove=document.createElement('button');remove.textContent='×';remove.title='Delete rule';remove.onclick=()=>{triggerRules.splice(i,1);editing=-1;q('[data-editor]').hidden=true;saveTriggerRules();render();};row.append(enabled,label,edit,remove);list.append(row);
+        }}
+        q('[data-add]').onclick=()=>{editing=-1;q('[data-editor]').hidden=false;show();};q('[data-cancel]').onclick=()=>q('[data-editor]').hidden=true;q('[data-type]').onchange=show;
+        q('[data-save]').onclick=()=>{const type=q('[data-type]').value,threshold=Number(q('[data-threshold]').value),resolved=type==='item'?resolveRuleItem():{id:null,name:''},itemId=resolved.id;if(!Number.isFinite(threshold)||threshold<0||(type==='health'&&threshold>100)||(type==='item'&&(!Number.isInteger(itemId)||itemId<1||itemId>65535)))return;const rule={enabled:editing<0?true:triggerRules[editing].enabled,type,threshold,itemId:type==='item'?itemId:null,itemName:type==='item'?resolved.name:''};if(editing<0)triggerRules.push(rule);else triggerRules[editing]=rule;saveTriggerRules();q('[data-editor]').hidden=true;render();};render();
+    }
+    const triggerRulesTimer=setInterval(mountTriggerRules,500);bot.addCleanup(()=>{clearInterval(triggerRulesTimer);ruleHost?.remove();});
+
     const configStorageKey = "minibiaBot.panic.config";
     const state = {
         running: false,
@@ -9279,7 +9331,7 @@ window.__minibiaBotBundle.installPanicModule = function installPanicModule(bot) 
             return;
         const now = Date.now();
         try {
-            const triggered = checkGameMasters() || checkUnknownPlayers() || checkHealthLoss();
+            const triggered = checkGameMasters() || checkUnknownPlayers() || checkHealthLoss() || checkTriggerRules();
             if (!triggered && positionMovementAllowed())
                 tryReturnToOrigin(now);
             syncPosition(now);
@@ -28690,10 +28742,52 @@ window.__minibiaBotBundle.installRuneShooterModule = function installRuneShooter
  * ==================================================================================
  */
 window.__minibiaBotBundle.installScannedWorldMapModule=function(bot){
- const store='minibiaBot.scannedWorldMap.v1';let saved=bot.storage.get(store,{cells:{},mobs:{}}),enabled=false,host=null,dirty=false,lastSave=0,lastDraw=null;
- if(!saved?.cells||!saved?.mobs)saved={cells:{},mobs:{}};
+ const store='minibiaBot.shared.scannedWorldMap.v2';
+ const kinds=['walkable','blocked','transition'];
+ function unpack(raw){
+  if(!raw)return {cells:{},mobs:{}};
+  if(raw.version===3){
+   const cells={},mobs={};
+   for(const [k,entry] of Object.entries(raw.chunks||{})){
+    const [cx,cy,z]=k.split(',').map(Number),bytes=atob(entry[0]),lastAt=entry[1]*1000;
+    for(let i=0;i<1024;i++){const code=(bytes.charCodeAt(i>>2)>>((i&3)*2))&3;if(!code)continue;
+     const x=cx*32+(i%32),y=cy*32+Math.floor(i/32);cells[`${x},${y},${z}`]={x,y,z,kind:kinds[code-1],ground:'',lastAt};}
+   }
+   for(const v of raw.sightings||[]){const [x,y,z,n,count,first,last]=v,name=raw.names[n]||'Monster';mobs[`${x},${y},${z}:${name.toLowerCase()}`]={x,y,z,name,count,firstAt:first*1000,lastAt:last*1000};}
+   return {cells,mobs};
+  }
+  if(raw.version!==2)return raw.cells&&raw.mobs?raw:{cells:{},mobs:{}};
+  const cells={},mobs={};
+  for(const [k,v] of Object.entries(raw.tiles||{})){const [x,y,z]=k.split(',').map(Number);cells[k]={x,y,z,kind:kinds[v[0]],ground:raw.names[v[1]]||'',lastAt:v[2]*1000};}
+  for(const v of raw.sightings||[]){const [x,y,z,n,count,first,last]=v,name=raw.names[n]||'Monster';mobs[`${x},${y},${z}:${name.toLowerCase()}`]={x,y,z,name,count,firstAt:first*1000,lastAt:last*1000};}
+  return {cells,mobs};
+ }
+ function pack(map){
+  const blocks=new Map(),names=[],ids=new Map();
+  for(const c of Object.values(map.cells)){
+   const code=kinds.indexOf(c.kind)+1;if(!code)continue;
+   const cx=Math.floor(c.x/32),cy=Math.floor(c.y/32),k=`${cx},${cy},${c.z}`;
+   if(!blocks.has(k))blocks.set(k,{bytes:new Uint8Array(256),at:0});
+   const block=blocks.get(k),i=(c.y-cy*32)*32+c.x-cx*32;
+   block.bytes[i>>2]|=code<<((i&3)*2);block.at=Math.max(block.at,Math.floor(c.lastAt/1000)||0);
+  }
+  const chunks={};for(const [k,b] of blocks)chunks[k]=[btoa(String.fromCharCode(...b.bytes)),b.at];
+  const sightings=Object.values(map.mobs).map(m=>{if(!ids.has(m.name)){ids.set(m.name,names.length);names.push(m.name);}return [m.x,m.y,m.z,ids.get(m.name),m.count,Math.floor(m.firstAt/1000),Math.floor(m.lastAt/1000)];});
+  return {version:3,names,chunks,sightings};
+ }
+ function readShared(){try{return unpack(JSON.parse(localStorage.getItem(store)));}catch{return {cells:{},mobs:{}};}}
+ function merge(target,other){for(const field of ['cells','mobs'])for(const [k,v] of Object.entries(other[field]||{}))if(!target[field][k]||(v.lastAt||0)>(target[field][k].lastAt||0))target[field][k]=v;return target;}
+ // Rewrite an existing compact-v2 map in place; leave it untouched if quota fails.
+ try{const old=JSON.parse(localStorage.getItem(store));if(old?.version===2)localStorage.setItem(store,JSON.stringify(pack(unpack(old))));}catch(e){bot.log('Packed map migration deferred',e);}
+ let saved=readShared(),enabled=true,host=null,dirty=false,lastSave=0,lastDraw=null;
+ const legacy=[];
+ for(let i=0;i<localStorage.length;i++){const k=localStorage.key(i);if(k==='minibiaBot.scannedWorldMap.v1'||/^minibiaBot\.char\..+\.scannedWorldMap\.v1$/.test(k)){try{merge(saved,unpack(JSON.parse(localStorage.getItem(k))));legacy.push(k);}catch{}}}
+ // Remove old character copies only after the shared write succeeds.
+ if(legacy.length){try{localStorage.setItem(store,JSON.stringify(pack(saved)));for(const k of legacy)localStorage.removeItem(k);}catch(e){bot.log('Map migration could not save shared map',e);}}
  const seen=new Map(),key=p=>`${p.x},${p.y},${p.z}`;
- function persist(){if(dirty){bot.storage.set(store,saved);dirty=false;lastSave=Date.now();}}
+ function persist(){if(dirty){try{merge(saved,readShared());localStorage.setItem(store,JSON.stringify(pack(saved)));dirty=false;lastSave=Date.now();}catch(e){bot.log('Shared map save failed',e);}}}
+ const syncShared=e=>{if(e.key===store){if(!dirty)saved=readShared();else merge(saved,readShared());}};
+ window.addEventListener('storage',syncShared);bot.addCleanup(()=>window.removeEventListener('storage',syncShared));
  function scan(){
   if(!enabled)return;const snapshot=bot.observability?.tileMapSnapshot?.(20);if(!snapshot)return;
   const now=Date.now();
@@ -28726,13 +28820,23 @@ window.__minibiaBotBundle.installScannedWorldMapModule=function(bot){
  }
  function mount(){const local=document.querySelector('#minibia-bot-panel .mb-tile-map');if(!local||host?.isConnected)return;
   host=document.createElement('details');host.className='mb-section';host.innerHTML='<summary>Scanned world map ⓘ</summary><p class="mb-small-note">Accumulates loaded diagnostic terrain across your travels. Yellow markers are first monster sightings, not confirmed spawn points. Dynamic obstacles may change. Hover over the map for coordinates and sightings.</p><button type="button" data-toggle>Start scanning</button> <label>Floor <input data-floor type="number" min="0" max="15" style="width:55px"></label> <button type="button" data-export>Export survey</button> <button type="button" data-clear>Clear survey</button><canvas width="600" height="400" style="width:100%;height:auto;image-rendering:pixelated;margin-top:8px"></canvas><p data-status class="mb-small-note"></p><p data-hover class="mb-small-note"></p>';
-  local.parentNode.insertBefore(host,local.nextSibling);host.querySelector('[data-floor]').value=bot.getPlayerPosition()?.z??7;
+  local.parentNode.insertBefore(host,local.nextSibling);host.querySelector('[data-toggle]').textContent=enabled?'Stop scanning':'Start scanning';host.querySelector('[data-floor]').value=bot.getPlayerPosition()?.z??7;
   host.querySelector('[data-toggle]').onclick=()=>{enabled=!enabled;host.querySelector('[data-toggle]').textContent=enabled?'Stop scanning':'Start scanning';if(!enabled)persist();draw();};host.querySelector('[data-floor]').onchange=draw;host.ontoggle=draw;
-  host.querySelector('[data-clear]').onclick=()=>{if(!confirm('Clear the scanned terrain and monster sightings?'))return;saved={cells:{},mobs:{}};seen.clear();dirty=true;persist();lastDraw=null;draw();};
+  host.querySelector('[data-clear]').onclick=()=>{if(!confirm('Clear the shared scanned terrain and monster sightings for all characters?'))return;saved={cells:{},mobs:{}};seen.clear();localStorage.setItem(store,JSON.stringify(pack(saved)));dirty=false;lastDraw=null;draw();};
   host.querySelector('[data-export]').onclick=()=>{persist();const url=URL.createObjectURL(new Blob([JSON.stringify({schema:1,version:bot.version,...saved})],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download='mb0t-world-survey.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);};
   host.querySelector('canvas').onmousemove=e=>{if(!lastDraw)return;const r=e.target.getBoundingClientRect(),d=lastDraw,x=Math.floor(((e.clientX-r.left)*600/r.width-10)/d.scale+d.minX),y=Math.floor(((e.clientY-r.top)*400/r.height-10)/d.scale+d.minY);const cell=saved.cells[`${x},${y},${d.floor}`];const mobs=Object.values(saved.mobs).filter(m=>m.z===d.floor&&Math.abs(m.x-x)<=1&&Math.abs(m.y-y)<=1);host.querySelector('[data-hover]').textContent=`${x}, ${y}, ${d.floor}: ${cell?.kind||'unscanned'} ${cell?.ground||''} `+mobs.map(m=>`${m.name} ×${m.count} (last seen ${new Date(m.lastAt).toLocaleString()})`).join('; ');};
  }
- const timer=setInterval(()=>{mount();scan();draw();},1000);bot.scannedWorldMap={routeSurvey(){
+ const timer=setInterval(()=>{mount();scan();draw();},1000);bot.scannedWorldMap={findSavedPath(from,to){
+ if(!from||!to||from.z!==to.z)return null;
+ const start=key(from),goal=key(to);if(saved.cells[goal]?.kind!=='walkable')return null;
+ const queue=[start],parents=new Map([[start,null]]);
+ for(let i=0;i<queue.length && i<60000;i++){
+  const current=queue[i];if(current===goal){const path=[];for(let k=goal;k!==start;k=parents.get(k)){const c=saved.cells[k];path.push({x:c.x,y:c.y,z:c.z});}return path.reverse();}
+  const [x,y,z]=current.split(',').map(Number);
+  for(const [dx,dy] of [[1,0],[-1,0],[0,1],[0,-1]]){const k=`${x+dx},${y+dy},${z}`;if(parents.has(k)||saved.cells[k]?.kind!=='walkable')continue;parents.set(k,current);queue.push(k);}
+ }
+ return null;
+ },routeSurvey(){
  const nodes={},edges={},spots={};
  for(const [k,c] of Object.entries(saved.cells))if(c.kind==='walkable'){nodes[k]={x:c.x,y:c.y,z:c.z};edges[k]=[];}
  // Cardinal connections only: never cut diagonally through wall corners.
@@ -29898,8 +30002,29 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         };
     }
 
+    const compactWaypointFlags=['stand','rope','shovel','ladder','knightBox'];
+    function packCavePresets(list){
+        return {format:'mb0t-cave-packed',version:1,presets:list.map(p=>({
+            name:p.name,transitions:p.transitions,areas:p.areas,
+            route:p.route.map(w=>{
+                let flags=0;compactWaypointFlags.forEach((f,i)=>{if(w[f])flags|=1<<i;});
+                const extra={};for(const [k,v] of Object.entries(w))if(!['x','y','z','label',...compactWaypointFlags].includes(k))extra[k]=v;
+                const row=[w.x??null,w.y??null,w.z??null,flags,w.label||'',extra];
+                if(!Object.keys(extra).length)row.pop();if(row.length===5&&!row[4])row.pop();if(row.length===4&&!flags)row.pop();
+                return row;
+            })
+        }))};
+    }
+    function unpackCavePresets(value){
+        if(value?.format!=='mb0t-cave-packed'||value.version!==1)return value;
+        return (value.presets||[]).map(p=>({...p,route:(p.route||[]).map(r=>{
+            const w={...(r[5]||{})};if(r[0]!=null)w.x=r[0];if(r[1]!=null)w.y=r[1];if(r[2]!=null)w.z=r[2];
+            compactWaypointFlags.forEach((f,i)=>{if((r[3]||0)&(1<<i))w[f]=true;});if(r[4])w.label=r[4];return w;
+        })}));
+    }
     function normalizePresets(value) {
-        const entries = Array.isArray(value) ? value : [];
+        const decoded=unpackCavePresets(value);
+        const entries = Array.isArray(decoded) ? decoded : [];
         const deduped = new Map();
         entries.map(normalizePreset).filter(Boolean).forEach(p => deduped.set(p.name.toLowerCase(), p));
         return Array.from(deduped.values());
@@ -29939,7 +30064,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             migrated.push(key);migratedSources[key]=true;
         }
         if(migrated.length){
-            const payload=JSON.stringify(presets);bot.storage.set(presetStorageKey,presets);
+            const payload=JSON.stringify(presets);bot.storage.set(presetStorageKey,packCavePresets(presets));
             // Only retire old character copies after the complete shared library
             // is durably saved. Quota failures retain every original copy.
             if(store[presetStorageKey]===payload){
@@ -29949,6 +30074,20 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         }
     }
     migrateSharedPresets();
+    // Upgrade the existing catalog immediately, without requiring a preset
+    // edit. Validate the codec before replacing the original stored value.
+    try {
+        const oldCatalog=bot.storage.get(presetStorageKey,[]);
+        if(Array.isArray(oldCatalog) && oldCatalog.length){
+            const decoded=normalizePresets(oldCatalog);
+            const compact=packCavePresets(decoded);
+            if(JSON.stringify(normalizePresets(compact))!==JSON.stringify(decoded))
+                throw new Error('Preset compression round-trip did not match');
+            bot.storage.set(presetStorageKey,compact);
+            presets=decoded;
+            bot.log('Cave: old presets automatically converted to compact storage',{presets:decoded.length});
+        }
+    } catch(error) {bot.log('Cave: preset storage upgrade deferred',error);}
     let presetBaseline=cloneValue(presets),sharedUpdatePending=false;
     let sharedDurableRaw=window.localStorage[presetStorageKey] ?? null,sharedWaitAt=0;
     if (!presets.length && (route.length || transitions.length)) {
@@ -30034,12 +30173,12 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         for(const [key]of baseline)if(!local.has(key))merged.delete(key);
         for(const [key,p]of local)if(!baseline.has(key)||JSON.stringify(baseline.get(key))!==JSON.stringify(p))merged.set(key,p);
         presets=[...merged.values()];presetBaseline=cloneValue(presets);
-        bot.storage.set(presetStorageKey,presets);
+        bot.storage.set(presetStorageKey,packCavePresets(presets));
         sharedDurableRaw=window.localStorage[presetStorageKey] ?? null;
     }
 
     function persistLegacyActivePreset() {
-        const saved = bot.storage.get(presetStorageKey, []);
+        const saved = unpackCavePresets(bot.storage.get(presetStorageKey, []));
         const active = Array.isArray(saved) ? saved.find(p => String(p.name).toLowerCase() === String(getActivePresetName()).toLowerCase()) : null;
         const mirror = (key, value, canonical) => {
             if (Array.isArray(canonical) && JSON.stringify(value) === JSON.stringify(canonical)) {
@@ -35123,6 +35262,13 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         if (at<0) return false;
         const advanced=at>watch.progressIndex;
         if (advanced) {
+            const budgetKey=getOffscreenFrontierKey(waypoint);
+            if(state.frontierStepBudget?.key!==budgetKey)
+                state.frontierStepBudget={key:budgetKey,best:getDistanceToWaypoint(watch.positions[0],waypoint),steps:0};
+            const budget=state.frontierStepBudget;
+            const distance=getDistanceToWaypoint(position,waypoint);
+            if(distance<budget.best){budget.best=distance;budget.steps=0;}
+            else budget.steps+=Math.max(1,at-watch.progressIndex);
             watch.progressIndex=at;watch.progressAt=now;watch.at=now;
             watch.key=getPositionKey(position);
             // A real step along the issued detour counts even if direct
@@ -35209,6 +35355,13 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             waypoint.stand || waypoint.rope || waypoint.shovel || waypoint.ladder)
             return false;
 
+        const budget=state.frontierStepBudget;
+        if(budget?.key===getOffscreenFrontierKey(waypoint) && budget.steps>=20){
+            const distance=getDistanceToWaypoint(current,waypoint);
+            if(distance<budget.best){budget.best=distance;budget.steps=0;}
+            else if(forceLoadedFrontierWalkRecovery(waypoint,now,'20 frontier steps without a new best waypoint distance'))return true;
+        }
+
         // A failed complete search still needs a partial route when the goal
         // lies within the viewport. A fixed distance gate previously stranded
         // CaveBot after its first frontier batch, before any retry was sent.
@@ -35223,6 +35376,23 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         const routeInfo = findCaveLoadedFrontierPath(current, waypoint, 10);
         if (!routeInfo?.path?.length)
             return false;
+
+        // Track full frontier destinations across short batches and combat
+        // pauses. A→B→A without a new best distance is a failed detour loop,
+        // even when every batch produces real player movement.
+        const loopKey=getOffscreenFrontierKey(waypoint);
+        if(state.frontierLoopWatch?.key!==loopKey)
+            state.frontierLoopWatch={key:loopKey,best:Infinity,goals:[]};
+        const loop=state.frontierLoopWatch;
+        const distance=getDistanceToWaypoint(current,waypoint);
+        if(distance<loop.best){loop.best=distance;loop.goals=[];}
+        const fullGoal=getPositionKey(routeInfo.frontierGoal || routeInfo.endpoint);
+        if(fullGoal && loop.goals[loop.goals.length-1]!==fullGoal){
+            loop.goals.push(fullGoal);
+            if(loop.goals.length>6)loop.goals.shift();
+            if(loop.goals.slice(0,-1).includes(fullGoal) &&
+                forceLoadedFrontierWalkRecovery(waypoint,now,"repeated frontier destination loop"))return true;
+        }
 
         state.offscreenFrontierAttempts++;
         state.offscreenFrontierLastAttemptAt = now;
@@ -35514,6 +35684,26 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             return false;
         }
         if (isSameTile(from, waypoint)) return true;
+
+        // Saved terrain can connect loaded regions around a wall. Send only
+        // the currently loaded and live-validated prefix, never cached geometry
+        // directly to the server or a guessed floor transition.
+        if (!isSpecialWaypoint && bot.scannedWorldMap?.findSavedPath) {
+            const cachedPath=bot.scannedWorldMap.findSavedPath(from,waypoint);
+            if(cachedPath?.length){
+                const prefix=[];
+                for(const pos of cachedPath.slice(0,10)){
+                    const tile=getTileAt(pos);
+                    if(!isCaveFrontierPassableTile(tile))break;
+                    prefix.push(tile);
+                }
+                if(prefix.length && sendCaveFieldRouteStep({path:prefix,goal:waypoint},now)){
+                    state.lastWaypointTarget={x:waypoint.x,y:waypoint.y,z:waypoint.z};
+                    if(now-(state.savedMapRouteLogAt||0)>5000){state.savedMapRouteLogAt=now;bot.log('Cave: following explored-map route',{steps:cachedPath.length,sentSteps:prefix.length});}
+                    return true;
+                }
+            }
+        }
 
         // A distant endpoint may be unloaded. Use loaded geometry first, rather
         // than waiting for native minimap failure/NO_WAY to start the frontier.
@@ -36912,7 +37102,16 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         };
     }
 
+    function notifyCaveRecovery(reason, now=Date.now()) {
+        const noticeKey=`${state.currentIndex}:${reason}`;
+        if(state.recoveryNoticeKey===noticeKey && now-(state.recoveryNoticeAt||0)<15000)return;
+        state.recoveryNoticeKey=noticeKey;state.recoveryNoticeAt=now;
+        const labels={STUCK:'Movement stuck',NO_WAY:'No usable path',NATIVE_STALL:'Movement stalled',TELEPORT:'Position changed',UNKNOWN:'Route recovery'};
+        bot.showPanelNotification?.('Cavebot recovery',`${labels[reason]||reason||'Route recovery'} · waypoint #${state.currentIndex+1}`,'cave-recovery');
+    }
+
     function setRecoveryReason(reason, now = Date.now(), waypoint = getCurrentWaypoint()) {
+        if(reason && reason!=='TEMP_BLOCKER')notifyCaveRecovery(reason,now);
         state.recoveryReason = reason || null;
         state.recoveryReasonAt = now;
         state.recoveryReasonIndex = state.currentIndex;
@@ -37297,6 +37496,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         }
 
         state.currentIndex = result.bestIdx;
+        notifyCaveRecovery(state.recoveryReason || 'UNKNOWN',now);
         // Preserve the route direction during recovery. Recovery changes the
         // waypoint index, not the user's intended traversal direction. For
         // reverse/non-loop routes, forcing direction back to +1 could make the
@@ -42614,6 +42814,18 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         getRecoveryHistory,
         getMovementSummary,
         clearRouteHealth,
+        setWaypointType(index,type) {
+            const wp=route[index];
+            if(!wp || wp.script || !['walk','stand','rope','shovel','ladder','box'].includes(type))return false;
+            if(![wp.x,wp.y,wp.z].every(Number.isInteger))return false;
+            if(state.running && index===state.currentIndex)stopCaveMovementNow();
+            for(const flag of ['stand','rope','shovel','ladder','knightBox'])wp[flag]=false;
+            if(type!=='walk')wp[type==='box'?'knightBox':type]=true;
+            resetSpecialWaypointStateForTeleportRecovery();
+            resetRecoveryContext('waypoint type edited');
+            persistRoute();
+            return true;
+        },
         moveWaypointPosition,
         updateWaypoint,
         mergePresets: mergePresets,
@@ -42641,7 +42853,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             }
 
             // Otherwise pull the snapshot from storage
-            const all = bot.storage.get(presetStorageKey, []);
+            const all = unpackCavePresets(bot.storage.get(presetStorageKey, []));
             const found = (Array.isArray(all) ? all : [])
             .find(p => p && String(p.name).toLowerCase() === wanted.toLowerCase());
             if (!found)
@@ -56834,11 +57046,9 @@ window.__minibiaBotBundle.installItemDropperModule = function installItemDropper
 window.__minibiaBotBundle.installWoodcuttingModule = function(bot) {
     const key='minibiaBot.woodcutting.config';
     const trees=new Map([[3682,2768],[9225,10143],[3625,2711],[3616,2702],[3617,2703],[3639,2725],[3622,2708]]);
-    const config={enabled:false,delayMs:750,range:5,attackWhileGathering:false,retryMinutes:5,minCapacity:0,stopSkill:0,goalSid:0,goalCount:0,goalLabel:'',...bot.storage.get(key,{})};
-    config.delayMs=Math.max(350,Math.min(10000,Number(config.delayMs)||750));
+    const config={enabled:false,delayMs:2000,range:5,attackWhileGathering:false,retryMinutes:5,minCapacity:0,stopSkill:0,goalSid:0,goalCount:0,goalLabel:'',...bot.storage.get(key,{})};
+    config.delayMs=Math.max(350,Math.min(10000,Number(config.delayMs)||2000));
     config.range=Math.max(1,Math.min(8,Math.trunc(Number(config.range)||5)));
-    // Update former defaults; retain other customized intervals.
-    if(config.delayMs===1000||config.delayMs===2000)config.delayMs=750;
     let walkDestination=null,lastWalkAt=0,walkProgressKey=null,walkProgressAt=0;const blocked=new Map();
     function stopOwnWalk(){const pf=window.gameClient?.world?.pathfinder;if(walkDestination&&pf?.__finalDestination&&tileKey(pf.__finalDestination)===tileKey(walkDestination))pf.setPathfindCache?.(null);walkDestination=null;}
     let running=false,timer=null,lastUse=0,targetKey=null,pending=null,reason='Stopped',attempts=0,disposed=false;
@@ -56999,7 +57209,7 @@ window.__minibiaBotBundle.installWoodcuttingModule = function(bot) {
     }
     function start(){if(disposed)return;bot.smithing?.stop?.();bot.cooking?.stop?.();bot.mining?.stop?.();if(!running){running=true;timer=window.setInterval(tick,150);}config.enabled=true;persist();tick();}
     function stop(options={}){stopOwnWalk();running=false;if(timer!=null)window.clearInterval(timer);timer=null;pending=null;targetKey=null;reason='Stopped';if(options.persistEnabled!==false){config.enabled=false;persist();}}
-    function updateConfig(next){normalizeGoals(next);if(next.attackWhileGathering!==undefined)config.attackWhileGathering=!!next.attackWhileGathering;if(next.range!==undefined){stopOwnWalk();targetKey=null;config.range=Math.max(1,Math.min(8,Math.trunc(Number(next.range)||5)));}if(next.delayMs!==undefined)config.delayMs=Math.max(350,Math.min(10000,Number(next.delayMs)||750));if(next.enabled!==undefined){next.enabled?start():stop();}else persist();}
+    function updateConfig(next){normalizeGoals(next);if(next.attackWhileGathering!==undefined)config.attackWhileGathering=!!next.attackWhileGathering;if(next.range!==undefined){stopOwnWalk();targetKey=null;config.range=Math.max(1,Math.min(8,Math.trunc(Number(next.range)||5)));}if(next.delayMs!==undefined)config.delayMs=Math.max(350,Math.min(10000,Number(next.delayMs)||2000));if(next.enabled!==undefined){next.enabled?start():stop();}else persist();}
     function resetTrees(){stopOwnWalk();blocked.clear();failures.clear();stripped.clear();targetKey=null;pending=null;reason=running?'Searching for trees':'Stopped';}
     function mount(panel){
         const host=panel.querySelector('[data-tab-panel="professions"]');if(!host)return;
@@ -57051,12 +57261,10 @@ window.__minibiaBotBundle.installWoodcuttingModule = function(bot) {
 window.__minibiaBotBundle.installMiningModule = function(bot) {
     const key='minibiaBot.mining.config';
     const stones=new Map([[1912,3668],[1853,3609],[1860,3616],[1778,1291],[1794,1307],[1772,1285],[1774,1287],[1776,1289],[1775,1288],[1773,1286],[1790,1303],[1789,1302],[1787,1300],[1788,1301],[1792,1305],[1793,1306],[1777,1290],[1785,1298],[1786,1299],[1784,1297],[1783,1296],[1810,1323],[1811,1324],[1791,1304],[1813,1326]]);
-    const config={enabled:false,delayMs:750,range:5,attackWhileGathering:false,retryMinutes:5,minCapacity:0,stopSkill:0,goalSid:0,goalCount:0,goalLabel:'',...bot.storage.get(key,{})};
+    const config={enabled:false,delayMs:2000,range:5,attackWhileGathering:false,retryMinutes:5,minCapacity:0,stopSkill:0,goalSid:0,goalCount:0,goalLabel:'',...bot.storage.get(key,{})};
     delete config.depletionText;
-    config.delayMs=Math.max(350,Math.min(10000,Number(config.delayMs)||750));
+    config.delayMs=Math.max(350,Math.min(10000,Number(config.delayMs)||2000));
     config.range=Math.max(1,Math.min(8,Math.trunc(Number(config.range)||5)));
-    // Update former defaults; retain other customized intervals.
-    if(config.delayMs===1000||config.delayMs===2000)config.delayMs=750;
     let walkDestination=null,lastWalkAt=0,walkProgressKey=null,walkProgressAt=0;const blocked=new Map();
     function stopOwnWalk(){const pf=window.gameClient?.world?.pathfinder;if(walkDestination&&pf?.__finalDestination&&tileKey(pf.__finalDestination)===tileKey(walkDestination))pf.setPathfindCache?.(null);walkDestination=null;}
     let running=false,timer=null,lastUse=0,targetKey=null,pending=null,reason='Stopped',attempts=0,disposed=false;
@@ -57217,7 +57425,7 @@ window.__minibiaBotBundle.installMiningModule = function(bot) {
     }
     function start(){if(disposed)return;bot.smithing?.stop?.();bot.cooking?.stop?.();bot.woodcutting?.stop?.();if(!running){running=true;timer=window.setInterval(tick,150);}config.enabled=true;persist();tick();}
     function stop(options={}){stopOwnWalk();running=false;if(timer!=null)window.clearInterval(timer);timer=null;pending=null;targetKey=null;reason='Stopped';if(options.persistEnabled!==false){config.enabled=false;persist();}}
-    function updateConfig(next){normalizeGoals(next);if(next.attackWhileGathering!==undefined)config.attackWhileGathering=!!next.attackWhileGathering;if(next.range!==undefined){stopOwnWalk();targetKey=null;config.range=Math.max(1,Math.min(8,Math.trunc(Number(next.range)||5)));}if(next.delayMs!==undefined)config.delayMs=Math.max(350,Math.min(10000,Number(next.delayMs)||750));if(next.enabled!==undefined){next.enabled?start():stop();}else persist();}
+    function updateConfig(next){normalizeGoals(next);if(next.attackWhileGathering!==undefined)config.attackWhileGathering=!!next.attackWhileGathering;if(next.range!==undefined){stopOwnWalk();targetKey=null;config.range=Math.max(1,Math.min(8,Math.trunc(Number(next.range)||5)));}if(next.delayMs!==undefined)config.delayMs=Math.max(350,Math.min(10000,Number(next.delayMs)||2000));if(next.enabled!==undefined){next.enabled?start():stop();}else persist();}
     function resetStones(){stopOwnWalk();blocked.clear();failures.clear();stripped.clear();targetKey=null;pending=null;reason=running?'Searching for stones':'Stopped';}
     function mount(panel){
         const parent=panel.querySelector('[data-tab-panel="professions"]');if(!parent)return;const host=document.createElement('div');parent.appendChild(host);
@@ -63344,6 +63552,7 @@ function upgradeSectionHeaders(panel) {
     function refreshCaveWaypointList() {
         const container = document.getElementById("minibia-bot-cave-waypoint-list");
         if (!container || !container.getClientRects().length) return;
+        if(container.contains(document.activeElement) && document.activeElement?.tagName==='SELECT')return;
         const meta = bot.cave?.getWaypointListMeta?.() || { revision: 0, index: 0 };
         const current = meta.index;
         const playerPos = bot.getPlayerPosition?.();
@@ -63415,6 +63624,19 @@ function upgradeSectionHeaders(panel) {
             row.appendChild(num);
             row.appendChild(coords);
             row.appendChild(distSpan);
+            const typeSelect=document.createElement('select');
+            typeSelect.setAttribute('aria-label',`Waypoint ${idx+1} type`);
+            typeSelect.style.cssText='width:76px;min-width:76px;margin:0;padding:1px;font-size:10px;';
+            for(const [value,label] of [['walk','Walk'],['stand','Stand'],['rope','Rope'],['shovel','Shovel'],['ladder','Ladder'],['box','Box'],...(wp.script?[['script','Script']]:[])]){
+                const option=document.createElement('option');option.value=value;option.textContent=label;typeSelect.append(option);
+            }
+            typeSelect.value=wp.script?'script':wp.knightBox?'box':wp.rope?'rope':wp.shovel?'shovel':wp.ladder?'ladder':wp.stand?'stand':'walk';
+            typeSelect.disabled=!!wp.script;
+            typeSelect.title=wp.script?'Use the script editor for Script waypoints':'Change waypoint type';
+            typeSelect.addEventListener('click',e=>e.stopPropagation());
+            typeSelect.addEventListener('pointerdown',e=>e.stopPropagation());
+            typeSelect.onchange=()=>{typeSelect.blur();if(bot.cave.setWaypointType(idx,typeSelect.value)){lastWaypointListKey=null;refreshCaveWaypointList();}};
+            row.append(typeSelect);
             row.addEventListener("click", () => {
                 container.querySelectorAll("[data-selected]").forEach(el => el.dataset.selected = "false");
                 row.dataset.selected = "true";
