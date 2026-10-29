@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.648",
+        version: "1.6.649",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -34346,16 +34346,26 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         if(!from||!to||from.z!==to.z)return null;
         const start=getTileAt(from),goal=getTileAt(to);
         if(!start||!goal||goal.__isPlaceholder||!goal.id)return null;
-        const queue=[start],parents=new Map([[start,null]]);
-        for(let i=0;i<queue.length && i<8000;i++){
-            const current=queue[i];
+        // Independent Dijkstra search: match the native 3x diagonal cost.
+        const heap=[],parents=new Map([[start,null]]),costs=new Map([[start,0]]);
+        let sequence=0;
+        const less=(a,b)=>a.cost<b.cost||(a.cost===b.cost&&a.order<b.order);
+        const push=(tile,cost)=>{const entry={tile,cost,order:sequence++};heap.push(entry);let i=heap.length-1;while(i>0){const p=(i-1)>>1;if(!less(heap[i],heap[p]))break;[heap[i],heap[p]]=[heap[p],heap[i]];i=p;}};
+        const pop=()=>{const first=heap[0],last=heap.pop();if(heap.length){heap[0]=last;let i=0;while(true){let j=i,l=i*2+1,r=l+1;if(l<heap.length&&less(heap[l],heap[j]))j=l;if(r<heap.length&&less(heap[r],heap[j]))j=r;if(j===i)break;[heap[i],heap[j]]=[heap[j],heap[i]];i=j;}}return first;};
+        push(start,0);
+        for(let i=0;heap.length && i<8000;i++){
+            const entry=pop(),current=entry.tile;
+            if(entry.cost!==costs.get(current))continue;
             if(current===goal){const path=[];for(let tile=goal;tile!==start;tile=parents.get(tile))path.push(tile);return {path:path.reverse()};}
             for(const next of getCaveRouteNeighbours(current)){
-                if(parents.has(next)||!isCaveRoutePassable(next,goal))continue;
+                if(!isCaveRoutePassable(next,goal))continue;
                 const p=next.__position,c=current.__position,dx=p.x-c.x,dy=p.y-c.y;
                 if(bot.specialAreas?.getPositionPolicy?.(p,{purpose:'route'})?.allowed===false)continue;
                 if(dx&&dy&&[{x:c.x+dx,y:c.y,z:c.z},{x:c.x,y:c.y+dy,z:c.z}].some(side=>bot.specialAreas?.getPositionPolicy?.(side,{purpose:'route'})?.allowed===false))continue;
-                parents.set(next,current);queue.push(next);
+                const terrainCost=Number(next.getCost?.(current));
+                const cost=entry.cost+(dx&&dy?3:1)*(Number.isFinite(terrainCost)&&terrainCost>0?terrainCost:1);
+                if(cost>=(costs.get(next)??Infinity))continue;
+                costs.set(next,cost);parents.set(next,current);push(next,cost);
             }
         }
         return null;
