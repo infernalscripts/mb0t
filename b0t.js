@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.644",
+        version: "1.6.645",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -30030,9 +30030,15 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         return Array.from(deduped.values());
     }
 
+    // Preserve the on-disk catalog before any startup migration or save.
+    try {
+        const raw=window.localStorage.getItem(presetStorageKey);
+        const backupKey=presetStorageKey+'.preRepairBackup';
+        if(raw && !window.localStorage.getItem(backupKey))window.localStorage.setItem(backupKey,raw);
+    } catch(error){bot.log('Cave: could not preserve preset repair backup',error);}
     let route = normalizeRoute(bot.storage.get(routeStorageKey, []));
     let transitions = normalizeTransitions(bot.storage.get(transitionStorageKey, []));
-    let presets = normalizePresets(bot.storage.get(presetStorageKey, []));
+    let presets = normalizePresets(bot.storage.get(presetStorageKey, null));
     const presetContent=p=>JSON.stringify([p.route,p.transitions,p.areas]);
     function migrateSharedPresets() {
         const store=window.localStorage,current=String(window.__minibiaBotCurrentCharacter||'').replace(/[^A-Za-z0-9_.-]/g,'_');
@@ -30077,7 +30083,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     // Upgrade the existing catalog immediately, without requiring a preset
     // edit. Validate the codec before replacing the original stored value.
     try {
-        const oldCatalog=bot.storage.get(presetStorageKey,[]);
+        const oldCatalog=bot.storage.get(presetStorageKey,null);
         if(Array.isArray(oldCatalog) && oldCatalog.length){
             const decoded=normalizePresets(oldCatalog);
             const compact=packCavePresets(decoded);
@@ -30166,7 +30172,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     function persistPresets() {
         // Apply local deltas to the latest shared library, retaining edits to
         // unrelated presets made in another tab since our last read.
-        const latest=normalizePresets(bot.storage.get(presetStorageKey,[]));
+        const latest=normalizePresets(bot.storage.get(presetStorageKey,null));
         const merged=new Map(latest.map(p=>[p.name.toLowerCase(),p]));
         const local=new Map(presets.map(p=>[p.name.toLowerCase(),p]));
         const baseline=new Map(presetBaseline.map(p=>[p.name.toLowerCase(),p]));
@@ -30178,7 +30184,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     }
 
     function persistLegacyActivePreset() {
-        const saved = unpackCavePresets(bot.storage.get(presetStorageKey, []));
+        const saved = unpackCavePresets(bot.storage.get(presetStorageKey, null));
         const active = Array.isArray(saved) ? saved.find(p => String(p.name).toLowerCase() === String(getActivePresetName()).toLowerCase()) : null;
         const mirror = (key, value, canonical) => {
             if (Array.isArray(canonical) && JSON.stringify(value) === JSON.stringify(canonical)) {
@@ -42853,7 +42859,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             }
 
             // Otherwise pull the snapshot from storage
-            const all = unpackCavePresets(bot.storage.get(presetStorageKey, []));
+            const all = unpackCavePresets(bot.storage.get(presetStorageKey, null));
             const found = (Array.isArray(all) ? all : [])
             .find(p => p && String(p.name).toLowerCase() === wanted.toLowerCase());
             if (!found)
