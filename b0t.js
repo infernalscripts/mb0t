@@ -4154,7 +4154,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.651",
+        version: "1.6.652",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -30070,7 +30070,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
             migrated.push(key);migratedSources[key]=true;
         }
         if(migrated.length){
-            const payload=JSON.stringify(presets);bot.storage.set(presetStorageKey,packCavePresets(presets));
+            const packed=packCavePresets(presets),payload=JSON.stringify(packed);bot.storage.set(presetStorageKey,packed);
             // Only retire old character copies after the complete shared library
             // is durably saved. Quota failures retain every original copy.
             if(store[presetStorageKey]===payload){
@@ -30112,7 +30112,7 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
         const durableRaw=window.localStorage[presetStorageKey] ?? null;
         if(durableRaw!==sharedDurableRaw){
             sharedDurableRaw=durableRaw;sharedUpdatePending=true;sharedWaitAt=Date.now();
-            window.__minibiaBotUnsavedStorage?.delete(presetStorageKey);
+            // Pending writes remain recoverable until successfully persisted.
             if(state.running)stopCaveMovementNow();
         }
         if(!sharedUpdatePending)return false;
@@ -30178,12 +30178,24 @@ window.__minibiaBotBundle.installCaveModule = function installCaveModule(bot) {
     function persistPresets() {
         // Apply local deltas to the latest shared library, retaining edits to
         // unrelated presets made in another tab since our last read.
-        const latest=normalizePresets(bot.storage.get(presetStorageKey,null));
+        // Parse directly: the generic settings reader turns invalid JSON into
+        // null, which must not silently become permission to overwrite it.
+        const rawCatalog=window.localStorage.getItem(presetStorageKey);
+        let catalog=null;
+        try {
+            catalog=rawCatalog===null?null:JSON.parse(rawCatalog);
+            if(catalog!==null && !Array.isArray(catalog) && !(catalog.format==='mb0t-cave-packed' && catalog.version===1 && Array.isArray(catalog.presets)))
+                throw new Error('Unknown preset storage format');
+        } catch(error){
+            bot.showPanelNotification?.('Preset save blocked','Stored presets could not be read. Export storage before continuing.','cave-preset-protection');
+            throw error;
+        }
+        const latest=normalizePresets(catalog);
         const merged=new Map(latest.map(p=>[p.name.toLowerCase(),p]));
         const local=new Map(presets.map(p=>[p.name.toLowerCase(),p]));
         const baseline=new Map(presetBaseline.map(p=>[p.name.toLowerCase(),p]));
         for(const key of explicitPresetRemovals)merged.delete(key);
-        for(const [key,p]of local)if(!baseline.has(key)||JSON.stringify(baseline.get(key))!==JSON.stringify(p))merged.set(key,p);
+        for(const [key,p]of local)if(!explicitPresetRemovals.has(key)&&(!merged.has(key)||!baseline.has(key)||JSON.stringify(baseline.get(key))!==JSON.stringify(p)))merged.set(key,p);
         const next=[...merged.values()];
         if(latest.length){
             // Keep the previous valid catalog recoverable across reloads.
