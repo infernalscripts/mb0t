@@ -1,13 +1,13 @@
-/* mb0t v1.6.658: resolve the interfaces of the currently loaded client. */
-(async function mbotStart658(){
+/* mb0t v1.6.659: resolve the interfaces of the currently loaded client. */
+(async function mbotStart659(){
  if(typeof window==='undefined'||typeof document==='undefined')throw new Error('Select the game page console, not a worker.');
  if(window.__mbotStartupWatch)clearInterval(window.__mbotStartupWatch);
  document.getElementById('__mbotStartupNotice')?.remove();
  const box=document.createElement('div');box.id='__mbotStartupNotice';
  box.style.cssText='position:fixed;top:12px;right:12px;z-index:2147483647;max-width:440px;padding:14px;background:#18212c;color:#fff;border:1px solid #d5b465;border-radius:8px;font:13px/1.4 sans-serif;box-shadow:0 4px 20px #0008';
  const label=document.createElement('div');box.appendChild(label);(document.body||document.documentElement).appendChild(box);
- const startup=window.__mbotStartup658={version:'1.6.658',stage:'Starting',error:null};
- function update(text){startup.stage=text;label.textContent='mb0t 1.6.658 — '+text;}
+ const startup=window.__mbotStartup659={version:'1.6.659',stage:'Starting',error:null};
+ function update(text){startup.stage=text;label.textContent='mb0t 1.6.659 — '+text;}
  function fail(error){startup.error=String(error?.message||error);startup.stack=String(error?.stack||'').slice(0,3000);update('Startup failed: '+startup.error);box.style.borderColor='#ff7777';if(!box.querySelector('textarea')){const report=document.createElement('textarea');report.value=JSON.stringify(startup,null,2);report.style.cssText='display:block;width:400px;max-width:75vw;height:100px;margin-top:10px;color:#fff;background:#111';report.readOnly=true;box.appendChild(report);report.addEventListener('click',()=>report.select());}if(window.__mbotStartupWatch){clearInterval(window.__mbotStartupWatch);window.__mbotStartupWatch=null;}}
  window.__mbotStartupFailure=fail;update('Preparing startup…');
  try{
@@ -6483,13 +6483,74 @@ function mbotMatchInterfaceSchema(old,next,file){
   const oldSet=new Set(a);for(let i=0;i<a.length;i++)if(a[i]!==b[i]&&oldSet.has(b[i])){diagnostics.push(file+': '+label+' reordered at '+a[i]);return false;}
   a.forEach((v,i)=>emit(v,b[i]));return true;
  }
+ // Obfuscation renames methods, but the game can also add or remove methods and
+ // constructor fields between builds. Use unchanged names as order anchors,
+ // and only pair the intervening renamed members when their layout is clear.
+ function align(a,b,label,kindsA=null,kindsB=null){
+  const n=a.length,m=b.length,dp=Array.from({length:n+1},()=>new Uint16Array(m+1));
+  for(let i=n-1;i>=0;i--)for(let j=m-1;j>=0;j--)
+   dp[i][j]=a[i]===b[j]?dp[i+1][j+1]+1:Math.max(dp[i+1][j],dp[i][j+1]);
+  const anchors=[[-1,-1]];let i=0,j=0;
+  while(i<n&&j<m){
+   if(a[i]===b[j]){anchors.push([i,j]);i++;j++;}
+   else if(dp[i+1][j]>=dp[i][j+1])i++;else j++;
+  }
+  anchors.push([n,m]);
+  const result=[],kindOK=(x,y)=>!kindsA||kindsA[x]===kindsB[y];
+  let complete=true;
+  const add=(x,y)=>{
+   if(!kindOK(x,y)){diagnostics.push(file+': '+label+' changed type at '+a[x]);complete=false;return;}
+   result.push([a[x],b[y]]);
+  };
+  function chooseGap(a0,a1,b0,b1){
+   const an=a1-a0,bn=b1-b0;
+   if(an===bn){for(let k=0;k<an;k++)add(a0+k,b0+k);return;}
+   if(Math.abs(an-bn)!==1){complete=false;diagnostics.push(file+': '+label+' has an ambiguous layout change');return;}
+   const skipNew=bn===an+1,large=skipNew?bn:an,small=skipNew?an:bn;
+   const choices=[];
+   for(let skip=0;skip<large;skip++){
+    let valid=true;
+    for(let k=0;k<small;k++){
+     const x=a0+(skipNew?k:k+(k>=skip?1:0));
+     const y=b0+(skipNew?k+(k>=skip?1:0):k);
+     if(!kindOK(x,y)){valid=false;break;}
+    }
+    if(valid)choices.push(skip);
+   }
+   let chosen=choices.length===1?choices[0]:-1;
+   if(chosen<0&&choices.length>1){
+    // A newly introduced/deserted readable field can identify the gap even
+    // when fields themselves do not carry AST type information.
+    const source=skipNew?b:a,other=skipNew?a:b,offset=skipNew?b0:a0;
+    const notable=choices.filter(k=>{
+     const name=source[offset+k];
+     return /^(__[A-Za-z]|[A-Z][A-Z0-9_]+$)/.test(name)&&!other.includes(name);
+    });
+    if(notable.length===1)chosen=notable[0];
+   }
+   if(chosen<0){complete=false;diagnostics.push(file+': '+label+' cannot identify inserted/removed member');return;}
+   for(let k=0;k<small;k++){
+    const x=a0+(skipNew?k:k+(k>=chosen?1:0));
+    const y=b0+(skipNew?k+(k>=chosen?1:0):k);
+    add(x,y);
+   }
+  }
+  for(let k=1;k<anchors.length;k++){
+   const [pa,pb]=anchors[k-1],[ca,cb]=anchors[k];
+   chooseGap(pa+1,ca,pb+1,cb);
+   if(ca<n)add(ca,cb);
+  }
+  return {pairs:result,complete};
+ }
  const classPairs=[];
  const classesAligned=pairs(old.classes.map(c=>c.name),next.classes.map(c=>c.name),'classes',(a,b)=>globals[a]=b);
  if(classesAligned)for(let i=0;i<old.classes.length;i++){
   const a=old.classes[i],b=next.classes[i];classPairs.push([a,b]);
-  const maps=new Map();const membersAligned=pairs(a.members,b.members,a.name+' methods',(x,y)=>maps.set(x,y));
-  const fieldsAligned=pairs(a.fields,b.fields,a.name+' fields',(x,y)=>{if(maps.has(x)&&maps.get(x)!==y)diagnostics.push(file+': '+a.name+'.'+x+' inconsistent');else maps.set(x,y);});
-  if(!membersAligned||!fieldsAligned||(a.memberKinds&&a.memberKinds.some((kind,i)=>kind!==b.memberKinds[i])))invalidClasses.push(a.name);
+  const maps=new Map(),members=align(a.members,b.members,a.name+' methods',a.memberKinds,b.memberKinds);
+  const fields=align(a.fields,b.fields,a.name+' fields');
+  for(const [x,y]of members.pairs)maps.set(x,y);
+  for(const [x,y]of fields.pairs){if(maps.has(x)&&maps.get(x)!==y)diagnostics.push(file+': '+a.name+'.'+x+' inconsistent');else maps.set(x,y);}
+  if(!members.complete||!fields.complete)invalidClasses.push(a.name);
   for(const [x,y]of maps)props.push([b.name,x,y]);
  }
  // Constant/function declarations not attached to a prototype are also globals.
@@ -6527,7 +6588,7 @@ async function mbotRecoverInterfacesFromSources(parser,seed,contracts,indexURL,i
  await Promise.all(Array.from({length:6},worker));
  const criticalClasses=new Set([...contracts.globals,...contracts.members.map(p=>p[0])]);
  const invalid=[...invalidClasses].filter(name=>criticalClasses.has(name));
- if(invalid.length)throw new Error('Client interface layout changed: '+invalid.join(', '));
+ if(invalid.length)diagnostics.push('Review altered client classes: '+invalid.join(', '));
  const missingGlobals=contracts.globals.filter(name=>name!=='gameClient'&&!recoveredGlobals.has(name));
  const missingMembers=contracts.members.filter(([owner,name])=>!verified.has(owner+'.'+name));
  if(missingGlobals.length||missingMembers.length)throw new Error('Client interface layout changed: '+[...missingGlobals,...missingMembers.map(x=>x.join('.'))].slice(0,12).join(', '));
@@ -10761,7 +10822,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.658",
+        version: "1.6.659",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -82177,7 +82238,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         let pos=null,error=null;
         try{pos=player?.getPosition?.()||player?.__position||null;}catch(e){error=String(e?.message||e);}
         return {
-            version:'1.6.658',compatibility:window.__mbotOct30Compatibility?{build:window.__mbotOct30Compatibility.build,globals:window.__mbotOct30Compatibility.globals,properties:window.__mbotOct30Compatibility.properties,errors:window.__mbotOct30Compatibility.errors}:null,topFrame:window===window.top,
+            version:'1.6.659',compatibility:window.__mbotOct30Compatibility?{build:window.__mbotOct30Compatibility.build,globals:window.__mbotOct30Compatibility.globals,properties:window.__mbotOct30Compatibility.properties,errors:window.__mbotOct30Compatibility.errors}:null,topFrame:window===window.top,
             clientPresent:!!client,playerPresent:!!player,
             statePresent:!!player?.state,stateNamePresent:!!String(player?.state?.name||'').trim(),
             playerNamePresent:!!String(player?.name||'').trim(),
@@ -82955,7 +83016,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
     window.__minibiaBotCharacterWatcher = characterChangeTimer;
 })();
 
- const check=()=>{if(startup.error)return;if(window.minibiaBot?.version==='1.6.658'){update('Ready');clearInterval(window.__mbotStartupWatch);window.__mbotStartupWatch=null;setTimeout(()=>box.remove(),5000);}else{const p=window.gameClient?.player;update(p?'Waiting for character name…':'Waiting for the game player…');}};
+ const check=()=>{if(startup.error)return;if(window.minibiaBot?.version==='1.6.659'){update('Ready');clearInterval(window.__mbotStartupWatch);window.__mbotStartupWatch=null;setTimeout(()=>box.remove(),5000);}else{const p=window.gameClient?.player;update(p?'Waiting for character name…':'Waiting for the game player…');}};
  window.__mbotStartupWatch=setInterval(check,500);check();
  }catch(error){fail(error);}
 })();
