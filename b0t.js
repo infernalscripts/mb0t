@@ -1,13 +1,13 @@
-/* mb0t v1.6.659: resolve the interfaces of the currently loaded client. */
-(async function mbotStart659(){
+/* mb0t v1.6.660: resolve the interfaces of the currently loaded client. */
+(async function mbotStart660(){
  if(typeof window==='undefined'||typeof document==='undefined')throw new Error('Select the game page console, not a worker.');
  if(window.__mbotStartupWatch)clearInterval(window.__mbotStartupWatch);
  document.getElementById('__mbotStartupNotice')?.remove();
  const box=document.createElement('div');box.id='__mbotStartupNotice';
  box.style.cssText='position:fixed;top:12px;right:12px;z-index:2147483647;max-width:440px;padding:14px;background:#18212c;color:#fff;border:1px solid #d5b465;border-radius:8px;font:13px/1.4 sans-serif;box-shadow:0 4px 20px #0008';
  const label=document.createElement('div');box.appendChild(label);(document.body||document.documentElement).appendChild(box);
- const startup=window.__mbotStartup659={version:'1.6.659',stage:'Starting',error:null};
- function update(text){startup.stage=text;label.textContent='mb0t 1.6.659 — '+text;}
+ const startup=window.__mbotStartup660={version:'1.6.660',stage:'Starting',error:null};
+ function update(text){startup.stage=text;label.textContent='mb0t 1.6.660 — '+text;}
  function fail(error){startup.error=String(error?.message||error);startup.stack=String(error?.stack||'').slice(0,3000);update('Startup failed: '+startup.error);box.style.borderColor='#ff7777';if(!box.querySelector('textarea')){const report=document.createElement('textarea');report.value=JSON.stringify(startup,null,2);report.style.cssText='display:block;width:400px;max-width:75vw;height:100px;margin-top:10px;color:#fff;background:#111';report.readOnly=true;box.appendChild(report);report.addEventListener('click',()=>report.select());}if(window.__mbotStartupWatch){clearInterval(window.__mbotStartupWatch);window.__mbotStartupWatch=null;}}
  window.__mbotStartupFailure=fail;update('Preparing startup…');
  try{
@@ -6542,10 +6542,31 @@ function mbotMatchInterfaceSchema(old,next,file){
   }
   return {pairs:result,complete};
  }
- const classPairs=[];
- const classesAligned=pairs(old.classes.map(c=>c.name),next.classes.map(c=>c.name),'classes',(a,b)=>globals[a]=b);
- if(classesAligned)for(let i=0;i<old.classes.length;i++){
-  const a=old.classes[i],b=next.classes[i];classPairs.push([a,b]);
+ // The protocol can gain a packet class without changing the constructors
+ // around it. Match a single insertion only when its complete structural
+ // signature gives a unique, exact sequence alignment.
+ const signature=c=>JSON.stringify([c.memberKinds,c.fields]);
+ let classPairs=[];
+ let classIndexes=null;
+ if(old.classes.length===next.classes.length){
+  classIndexes=old.classes.map((_,i)=>[i,i]);
+ }else if(next.classes.length===old.classes.length+1){
+  const options=[];
+  for(let skip=0;skip<next.classes.length;skip++){
+   const matching=old.classes.every((c,i)=>signature(c)===signature(next.classes[i+(i>=skip?1:0)]));
+   if(matching)options.push(skip);
+  }
+  if(options.length===1){
+   const skip=options[0];
+   classIndexes=old.classes.map((_,i)=>[i,i+(i>=skip?1:0)]);
+   diagnostics.push(file+': verified one inserted class at index '+skip);
+  }else diagnostics.push(file+': cannot safely identify inserted class ('+options.length+' alignments)');
+ }else diagnostics.push(file+': classes count '+old.classes.length+'/'+next.classes.length);
+ if(classIndexes)for(const [oi,ni] of classIndexes){
+  const a=old.classes[oi],b=next.classes[ni];
+  if(globals[a.name]&&globals[a.name]!==b.name)diagnostics.push(file+': conflicting class name '+a.name);
+  else globals[a.name]=b.name;
+  classPairs.push([a,b]);
   const maps=new Map(),members=align(a.members,b.members,a.name+' methods',a.memberKinds,b.memberKinds);
   const fields=align(a.fields,b.fields,a.name+' fields');
   for(const [x,y]of members.pairs)maps.set(x,y);
@@ -6553,9 +6574,32 @@ function mbotMatchInterfaceSchema(old,next,file){
   if(!members.complete||!fields.complete)invalidClasses.push(a.name);
   for(const [x,y]of maps)props.push([b.name,x,y]);
  }
- // Constant/function declarations not attached to a prototype are also globals.
- if(old.decls.length===next.decls.length&&old.decls.every((d,i)=>d.kind===next.decls[i].kind))pairs(old.decls.map(d=>d.name),next.decls.map(d=>d.name),'globals',(a,b)=>{if(!globals[a]||globals[a]===b)globals[a]=b;else diagnostics.push(file+': conflicting global '+a);});
- else diagnostics.push(file+': declaration layout changed');
+ // Declarators include constants as well as packet classes. Align them using
+ // the verified class identity where possible, never shift blindly.
+ if(old.decls.length===next.decls.length&&old.decls.every((d,i)=>d.kind===next.decls[i].kind))
+  pairs(old.decls.map(d=>d.name),next.decls.map(d=>d.name),'globals',(a,b)=>{if(!globals[a]||globals[a]===b)globals[a]=b;else diagnostics.push(file+': inconsistent global '+a);});
+ else if(classIndexes&&next.decls.length===old.decls.length+1){
+  const anchors=classIndexes.map(([i,j])=>[old.classes[i].name,next.classes[j].name]);
+  const valid=[];
+  for(let skip=0;skip<next.decls.length;skip++){
+   const ok=old.decls.every((d,i)=>{
+    const n=next.decls[i+(i>=skip?1:0)];
+    if(d.kind!==n.kind)return false;
+    const known=anchors.find(([name])=>name===d.name);
+    return !known||known[1]===n.name;
+   });
+   if(ok)valid.push(skip);
+  }
+  if(valid.length===1){
+   const skip=valid[0];
+   old.decls.forEach((d,i)=>{
+    const n=next.decls[i+(i>=skip?1:0)];
+    if(!globals[d.name]||globals[d.name]===n.name)globals[d.name]=n.name;
+    else diagnostics.push(file+': inconsistent global '+d.name);
+   });
+   diagnostics.push(file+': verified one inserted declaration at index '+skip);
+  }else diagnostics.push(file+': declaration insertion ambiguous ('+valid.length+' alignments)');
+ }else diagnostics.push(file+': declaration layout changed');
  return {globals,props,diagnostics,invalidClasses};
 }
 
@@ -10822,7 +10866,7 @@ addCleanup(() => {
 
     // ---- PUBLIC API ----
     return {
-        version: "1.6.659",
+        version: "1.6.660",
         // Native duration is frames, not milliseconds; it already includes
         // ground friction, current speed/paralysis, and diagonal step cost.
         getMovementStallTimeout(baseMs = 1500) {
@@ -82238,7 +82282,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
         let pos=null,error=null;
         try{pos=player?.getPosition?.()||player?.__position||null;}catch(e){error=String(e?.message||e);}
         return {
-            version:'1.6.659',compatibility:window.__mbotOct30Compatibility?{build:window.__mbotOct30Compatibility.build,globals:window.__mbotOct30Compatibility.globals,properties:window.__mbotOct30Compatibility.properties,errors:window.__mbotOct30Compatibility.errors}:null,topFrame:window===window.top,
+            version:'1.6.660',compatibility:window.__mbotOct30Compatibility?{build:window.__mbotOct30Compatibility.build,globals:window.__mbotOct30Compatibility.globals,properties:window.__mbotOct30Compatibility.properties,errors:window.__mbotOct30Compatibility.errors}:null,topFrame:window===window.top,
             clientPresent:!!client,playerPresent:!!player,
             statePresent:!!player?.state,stateNamePresent:!!String(player?.state?.name||'').trim(),
             playerNamePresent:!!String(player?.name||'').trim(),
@@ -83016,7 +83060,7 @@ window.__minibiaBotBundle.installItemIdDisplayModule = function installItemIdDis
     window.__minibiaBotCharacterWatcher = characterChangeTimer;
 })();
 
- const check=()=>{if(startup.error)return;if(window.minibiaBot?.version==='1.6.659'){update('Ready');clearInterval(window.__mbotStartupWatch);window.__mbotStartupWatch=null;setTimeout(()=>box.remove(),5000);}else{const p=window.gameClient?.player;update(p?'Waiting for character name…':'Waiting for the game player…');}};
+ const check=()=>{if(startup.error)return;if(window.minibiaBot?.version==='1.6.660'){update('Ready');clearInterval(window.__mbotStartupWatch);window.__mbotStartupWatch=null;setTimeout(()=>box.remove(),5000);}else{const p=window.gameClient?.player;update(p?'Waiting for character name…':'Waiting for the game player…');}};
  window.__mbotStartupWatch=setInterval(check,500);check();
  }catch(error){fail(error);}
 })();
